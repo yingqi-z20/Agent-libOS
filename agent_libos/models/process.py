@@ -362,6 +362,9 @@ class AgentProcess:
     execution_generation: int = 0
     execution_owner_id: str | None = None
     execution_lease_id: str | None = None
+    task_run_id: str | None = None
+    task_run_epoch: int | None = None
+    task_run_role: str | None = None
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -468,6 +471,7 @@ class ProcessExecutionToken:
     generation: int
     owner_id: str
     lease_id: str
+    task_run_epoch: int | None = None
 
 
 @dataclass(frozen=True, order=True, slots=True)

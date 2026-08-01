@@ -1,7 +1,7 @@
 # Electron GUI
 
 Agent libOS includes a local desktop management console for supervising
-processes, messages, human approvals, AgentImage selection/registration/commit,
+Durable Task Runs, processes, messages, human approvals, AgentImage selection/registration/commit,
 checkpoints, capabilities, Skills, JSON-RPC endpoints, MCP servers, audit
 records, persisted LLM calls, and human Agent ratings.
 
@@ -54,6 +54,12 @@ original event, and require a fresh `GET /api/snapshot` rather than applying the
 replacement as a delta. The bundled renderer refreshes on either event. Cursor
 invalidation additionally carries `reason: sse_cursor_not_replayable` and the
 available/reset cursor metadata.
+
+`task_run.updated` carries only the redacted `TaskRunSummary`, never a goal,
+follow-up, transcript, credential, or resume payload. Its `revision` is
+monotonic for that Run. The renderer ignores a revision older than or equal to
+the one already rendered and fetches the HTTP snapshot when the stream reports
+invalidation instead of treating that marker as a delta.
 
 Append-event de-duplication is bounded by the GUI event-buffer configuration.
 Append-only events and audit records use their durable ids. Message and LLM-call
@@ -328,6 +334,24 @@ source-object version change no longer turns the already fixed message into a
 protected-output false positive. Digest mismatch and uncertain delivery remain
 withheld.
 
+Durable Task Runs add a server-persisted task identity above the process tree.
+When a Run is selected, the user page keys state by `selectedRunId`, displays
+the persisted title, requirements, blockers, pending Human work, result
+retention, and only the controls returned in `allowed_actions`. A
+`needs_attention` Run with an unknown external effect never shows an ordinary
+Retry or Resume action. The server-derived `payloads_purged` summary flag, not
+the configured retention policy alone, controls whether rerun requires a
+replacement goal; this also covers a `permanent` Run that a Host explicitly
+purged. Legacy processes remain selectable, and the operator
+console keeps their process grouping. Its **Task Runs** tab pages through the
+selected Run ledger and resolves linked Operation/evidence rows through
+**Explain**. The former generic Tasks panel is labeled **Object tasks** so its
+runtime-local single-tool contract cannot be confused with Durable Task Runs.
+After default terminal cleanup or an explicit Host purge, linked Human-history
+cards may contain only request identity, type, status, timestamps, hashes, and
+audit linkage; the GUI does not reconstruct or imply retention of readable
+prompt/answer/decision content.
+
 The operator console is a three-column process workspace with a grouped runtime
 toolbar and progressively disclosed configuration:
 
@@ -517,7 +541,7 @@ Either kind of lookahead becomes a `source_limited` lower-bound entry in
 Event and audit rows persist a derived `gui_snapshot_visible` flag. Snapshot
 queries filter that indexed flag before applying `LIMIT`, preventing internal
 GUI-presentation evidence from displacing causal runtime rows. The flag is
-required by store schema v3; missing or malformed persisted visibility state is
+required by store schema v4; missing or malformed persisted visibility state is
 rejected rather than repaired during open. Bounded event/audit page endpoints
 can still include presentation evidence when requested.
 The process window orders non-terminal processes before the most recently
@@ -547,6 +571,7 @@ operations before invoking the runtime:
 - JSON-RPC endpoint registration and method calls,
 - MCP server registration and tool calls,
 - Skill registration, activation, and unload.
+- Durable Task Run cancellation and evidence-constrained recovery.
 
 The bundled renderer provides confirmation dialogs for process exec and exit,
 image package registration and checkpoint-to-image commit, checkpoint restore
@@ -611,10 +636,14 @@ configuration.
 The Electron renderer and Python server are shipped and tested as one build.
 The local `/api` surface is not a complete, independently versioned public REST
 API, and compatibility for arbitrary external clients is not promised. The
-machine-readable [GUI API contract subset v1](gui_api_schema.json)
+machine-readable [GUI API contract subset v2](gui_api_schema.json)
 deliberately covers the snapshot's required top-level collections, the minimal
-process/scheduler shape consumed during bootstrap, the JSON error envelope, and
-payloads for every operation that the server gates with explicit confirmation.
+process/scheduler shape consumed during bootstrap, redacted Task Run
+summary/detail state, the JSON error envelope, and payloads for every operation
+that the server gates with explicit confirmation.
+`GET /api/snapshot` emits `schema_version: 2`; this same-build renderer rejects
+the older v1 snapshot shape instead of treating missing Task Run state as an
+empty collection.
 Other snapshot collection item schemas and renderer routes remain same-build
 implementation details. It is JSON Schema, not a complete OpenAPI document.
 
@@ -627,6 +656,16 @@ with a fragment such as
 resolved Tool has side effects; `confirmed` is therefore an optional boolean in
 that definition. The server still requires it to equal `true` whenever runtime
 risk classification says the workflow is high risk.
+
+The process-wait schema's `stale_execution` branch is a diagnostic projection
+of `StaleExecutionProcessWait`. It contains canonical identity hashes and
+generation values, not prior raw owner/lease tokens or TaskRun epoch,
+safe-point, or live-binding evidence. The renderer may use its typed `kind` to
+present a conservatively paused process, but it must not infer that a Task Run
+is resumable or synthesize a recovery action from that receipt. Run controls
+continue to follow the server's `allowed_actions` and recovery options.
+`status_message`, including `stale_execution_recovery`, is presentation-only
+compatibility text and is never a client control protocol.
 
 `tests/unit/test_gui_api_schema.py` parses that schema, validates representative
 payloads, and compares its high-risk operation map with the server's
@@ -655,6 +694,60 @@ Important endpoints:
   operation explanations. List/detail responses support cursor pagination;
   ambiguous evidence resolution returns `409` with candidate causal roots.
 - `POST /api/workflows/run`
+- `GET /api/task-runs`, `POST /api/task-runs`, and
+  `GET /api/task-runs/{run_id}` for Durable Task Run collection/detail state.
+  Collection POST only creates queued state and requires a stable
+  `client_request_id`; it rejects create-time `auto_run`/`max_quanta` so bounded
+  execution always goes through the revision-fenced `/run` mutation.
+  Detail includes the redacted summary, server-generated recovery options, and
+  a bounded requirements page; `requirements_limit` and opaque
+  `requirements_cursor` page that embedded collection.
+- `GET /api/task-runs/{run_id}/ledger` and
+  `GET /api/task-runs/{run_id}/human-requests` for bounded Run-scoped pages.
+  Collection, ledger, and Human pages accept opaque `cursor` values and return
+  `next_cursor`; clients must not parse or synthesize them. The embedded
+  requirements page also returns `next_cursor`. Requirement changes are linked
+  ledger items, and 1.1.0 has no independent Task Run requirements or wait HTTP
+  route.
+- `POST /api/task-runs/{run_id}/run|pause|resume|cancel|follow-ups|recover|rerun`.
+  Every existing-Run mutation carries a command id and expected revision.
+  Rerun additionally carries a stable `client_request_id` for creation of the
+  linked Run; the bundled client derives it deterministically from the stable
+  rerun command id when the caller does not supply one.
+  Cancel/recover require explicit confirmation, and revision/idempotency
+  conflicts return `409` rather than applying to newer state.
+  If an HTTP mutation response is lost or otherwise ambiguous, the client must
+  retry the identical request body with its original command id and expected
+  revision; a new command id is not a transport retry. A matching provisional
+  receipt permits only local settlement and stored-result completion, never a
+  second scheduler quantum, LLM, tool, Provider, or external-effect dispatch.
+  A linked recovery with a missing outer receipt is the other local-only case:
+  exact retry validates its request-bound nested rerun, target create receipt,
+  and causal link and returns the same target rather than creating another Run.
+  The client first reconciles an authoritative detail snapshot, but that read
+  does not authorize it to synthesize a new command id. In the two-stage
+  create-then-run flow, it retains both the create `client_request_id` and the
+  separate run command id and original Run revision until the run mutation has
+  a non-ambiguous result; successful creation alone does not retire the run
+  intent. Follow-up intent is cleared only by the HTTP 200 for that exact
+  command; matching body content, a newly visible requirement, or SSE is not
+  command-specific admission evidence.
+  The Runtime/SDK exact replay remains an immutable historical command receipt.
+  After every successful private-HTTP mutation, however, the server performs
+  an exact `manager.get(result_run_id)` and returns and publishes the latest
+  summary observed by that read. For linked rerun/recovery, `result_run_id` is
+  the target/new Run rather than the source; a later concurrent mutation may
+  still advance the revision.
+  A Task Run `409` includes redacted `command_admitted` only when Store evidence
+  proves it and includes a current summary when available; the client still
+  performs an exact detail GET. Only `task_run_revision_conflict` together
+  with `command_admitted=false` and successful authoritative reconciliation
+  lets the client retire the old intent so a later user action can receive a
+  new command id. Command conflict, admitted, and indeterminate cases preserve
+  the exact old intent and fail closed; no conflict path automatically retries,
+  rebases, or invents a new id.
+- `GET /api/human-requests/{request_id}` for exact Human-request reconciliation
+  when a bounded snapshot no longer contains that request.
 - `POST /api/scheduler/auto`, `POST /api/scheduler/pause`
 - `GET /api/processes/{pid}`
 - `POST /api/processes/{pid}/run|step|pause|resume|signal|message|interrupt|cd|exec|exit`

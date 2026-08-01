@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.models.process_state import (
+    StaleExecutionProcessWait,
     legacy_status_message,
     process_outcome_from_json,
     process_outcome_to_mapping,
@@ -93,8 +94,11 @@ class SnapshotRemapper:
             if value is not None and str(value) in selected_map:
                 remapped[field_name] = selected_map[str(value)]
         if "wait_state_json" in remapped and "outcome_json" in remapped:
+            source_wait_state = process_wait_state_from_json(
+                remapped["wait_state_json"]
+            )
             wait_state = remap_process_wait_state(
-                process_wait_state_from_json(remapped["wait_state_json"]),
+                source_wait_state,
                 pids=identities.pids,
                 objects=identities.objects,
             )
@@ -109,7 +113,11 @@ class SnapshotRemapper:
             remapped["status_message"] = legacy_status_message(
                 wait_state,
                 outcome,
-                remapped.get("status_message"),
+                (
+                    None
+                    if isinstance(source_wait_state, StaleExecutionProcessWait)
+                    else remapped.get("status_message")
+                ),
             )
         return remapped
 

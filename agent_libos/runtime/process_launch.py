@@ -196,6 +196,13 @@ class ProcessLaunchService:
     ) -> tuple[str, str, tuple[str, ...]]:
         parent_process = self._process.get(parent)
         selected_image = image or parent_process.image_id
+        # This early check prevents a stale Runtime from reserving finite-use
+        # launch authority. ProcessManager repeats the same epoch fence in the
+        # final publication transaction to close the preflight/commit race.
+        self._process.require_task_run_launch_fence(
+            parent,
+            action=operation,
+        )
         decisions = [self.require_spawn_authority(
             parent,
             image_id=selected_image,

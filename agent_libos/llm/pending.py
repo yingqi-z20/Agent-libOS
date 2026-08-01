@@ -10,6 +10,7 @@ from agent_libos.storage.repositories import EvidenceRepository, ProcessReposito
 from agent_libos.utils.ids import new_id
 
 PENDING_METADATA_FILTER_KEY = "__agent_libos_pending_metadata__"
+PENDING_TASK_RUN_TRANSCRIPT_KEY = "task_run_transcript_call_id"
 
 
 class LLMPendingActionService:
@@ -268,6 +269,26 @@ def pending_data_flow_metadata(pending: dict[str, Any]) -> dict[str, Any]:
 
 
 def pending_metadata(pending: dict[str, Any]) -> dict[str, Any]:
+    selected = _raw_pending_metadata(pending)
+    selected.pop(PENDING_TASK_RUN_TRANSCRIPT_KEY, None)
+    return selected
+
+
+def pending_task_run_transcript_call_id(pending: dict[str, Any]) -> str | None:
+    direct = pending.get(PENDING_TASK_RUN_TRANSCRIPT_KEY)
+    value = (
+        direct
+        if direct is not None
+        else _raw_pending_metadata(pending).get(PENDING_TASK_RUN_TRANSCRIPT_KEY)
+    )
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise RuntimeError("durable TaskRun pending transcript call id is invalid")
+    return value
+
+
+def _raw_pending_metadata(pending: dict[str, Any]) -> dict[str, Any]:
     direct = pending.get("pending_metadata")
     if isinstance(direct, dict):
         return dict(direct)
@@ -297,4 +318,7 @@ def _hydrated_common(pending: dict[str, Any]) -> dict[str, Any]:
         "tool_name": str(pending["tool_name"]) if pending.get("tool_name") else None,
         "data_flow_context": dict(pending.get("data_flow_context") or {}),
         "pending_metadata": pending_metadata(pending),
+        PENDING_TASK_RUN_TRANSCRIPT_KEY: pending_task_run_transcript_call_id(
+            pending
+        ),
     }

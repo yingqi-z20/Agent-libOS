@@ -92,9 +92,13 @@ Restore never deletes:
 - events,
 - LLM call records,
 - checkpoint records,
-- human interaction history,
+- Human request identity, type, status, timestamps, audit linkage, and retained
+  content hashes (Task Run terminal retention may separately remove readable
+  prompt/response/decision bodies),
 - Sink trust registry generations/history, data-flow decisions, and file label
-  binding/tombstone history.
+  binding/tombstone history,
+- Durable Task Run ledgers, requirements, command receipts, or their links to
+  external-effect history.
 
 Restore itself appends new audit and event records.
 
@@ -194,8 +198,10 @@ tables: processes, Objects, capabilities, parent/child resource reservations,
 process messages, pending LLM actions, JIT candidates, and compatibility Skill
 rows. It does not claim a field-by-field diff for namespaces, Object links,
 tool rows, payload bodies, images/artifacts, JIT source bodies, Runtime Modules,
-ObjectTasks, human history, or append-only evidence. Inspect the corresponding
-domain when one of those categories matters.
+ObjectTasks, Human request rows, or append-only evidence. A retained Human row
+may contain only identity/status/timestamp/hash/audit projections after Task Run
+terminal cleanup, not readable prompt/answer/decision content. Inspect the
+corresponding domain when one of those categories matters.
 
 For each compared table, `diff_preview_items` bounds the returned `added`,
 `removed`, and `changed` identity lists; the accompanying counts describe the
@@ -260,6 +266,14 @@ Checkpoint inspect process rows expose the snapshot's canonical tagged
 manager strictly decodes the persisted snapshot JSON before projecting these
 fields; CLI, GUI, Tool, and JIT callers therefore observe the frozen snapshot
 state rather than a reconstructed compatibility message or current live state.
+An inspected snapshot can consequently show a frozen
+`StaleExecutionProcessWait`, but that hash-and-generation receipt is diagnostic
+state, not transferable resume authority. Before either restore or fork
+publishes a new process concurrency identity, it replaces that receipt with
+`PausedProcessWait(reason_oid=None)` and clears the
+`stale_execution_recovery` compatibility `status_message`. Neither operation
+can use or preserve the captured takeover provenance to authorize execution;
+the replacement process is also detached from any captured TaskRun binding.
 
 JIT syscalls:
 
@@ -565,6 +579,15 @@ no `previous_response_id`; the generation fence prevents a future or alternate
 continuation path from chaining to a response made from post-checkpoint local
 state.
 
+Durable Task Run state is outside the checkpoint snapshot. A checkpoint does
+not package a Run's spec payload, requirement ledger, resume bundles, command
+receipts, or retention policy. Restore refuses a scope that intersects a
+nonterminal Run before it mutates process or Object state. Forking from a
+checkpoint creates ordinary processes and never clones or implicitly joins the
+source Run. A caller that wants the fork supervised must create a new Run
+through the Task Run Host API. Restore cannot rewind or erase a terminal Run or
+any external-effect evidence linked from its ledger.
+
 A restored full-I/O `image_only` conditional release keeps its exact persisted
 approved messages/tools and Sink/flow/resume binding. Immediately before the
 one claimed dispatch, the executor rebinds only the frozen transcript/request
@@ -754,9 +777,10 @@ are not upserted into host Skill state.
 
 Fork intentionally drops all captured `llm_pending_actions`. A pending action
 contains source-process provider/tool/request identities and resume tokens that
-must not be replayed under the forked PID. Forked transient wait states are
-normalized to `runnable`, and the new process must issue fresh requests under
-its own identity.
+must not be replayed under the forked PID. Ordinary forked transient wait states
+are normalized to `runnable`, and the new process must issue fresh requests
+under its own identity. The non-transferable stale-execution receipt instead
+keeps the conservative ordinary paused posture described above.
 
 The forked subtree must not gain authority wider than the checkpointed subtree
 held. It does not share the original process private namespace or result
@@ -901,7 +925,7 @@ Independent version namespaces appear in this document:
 Changing one of these versions does not change or authorize either of the
 others.
 
-Git does not add another checkpoint schema. RuntimeStore remains schema v3 and
+Git does not add another checkpoint schema. RuntimeStore uses schema v4 and
 checkpoint snapshots remain v4. Image packages continue to reject `.git`
 metadata and do not embed managed worktrees or remote state.
 

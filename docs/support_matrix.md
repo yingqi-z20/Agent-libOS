@@ -37,7 +37,7 @@ Legend:
 | --- | --- | --- |
 | React/Vitest | Ubuntu, Node 24 with the npm version supplied by that toolchain, source tests | The package declares Node `>=22.12.0` and npm `>=8`, but those lower compatibility bounds are not separate per-change CI jobs; browser accessibility and operator usability studies are not automated |
 | Web and Electron TypeScript | Typecheck and production build on Ubuntu | Native Electron packaging/signing/notarization are not configured release jobs |
-| Python GUI HTTP/SSE server | Providers lane exercises auth, route validation, bounded event windows, shutdown, CORS, and snapshots | Native desktop process lifecycle remains platform-specific |
+| Python GUI HTTP/SSE server | Providers lane exercises auth, route validation, bounded event windows, shutdown, CORS, schema-v2 snapshots, Durable Task Run pagination/mutations, stable 409 conflicts, confirmation gates, and redacted monotonic SSE summaries | Native desktop process lifecycle remains platform-specific |
 | Headless Electron main-process smoke | Not in the default GUI lane | Run `AGENT_LIBOS_GUI_SMOKE=1 npm --prefix gui run electron:dev` |
 | Production-build custom-protocol BrowserWindow smoke | Not in CI | On a desktop/GPU runner use `AGENT_LIBOS_GUI_SMOKE=1 AGENT_LIBOS_GUI_SMOKE_WINDOW=1 npm --prefix gui run electron:dev`; this does not package, sign, or notarize an Electron application |
 | Local GUI API compatibility | Server and renderer tests cover the matching checkout | The unversioned `/api` surface is an internal same-build contract, not a stable third-party REST API |

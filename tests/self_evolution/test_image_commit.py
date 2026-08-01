@@ -345,6 +345,9 @@ class TestImageCommit:
             artifact, _metadata = found
             assert 'resource_budget_json' not in artifact['source_process']
             assert 'resource_usage_json' not in artifact['source_process']
+            assert 'task_run_id' not in artifact['source_process']
+            assert 'task_run_epoch' not in artifact['source_process']
+            assert 'task_run_role' not in artifact['source_process']
 
             spawned = runtime.process.spawn(
                 image='resource-state:v0',
@@ -357,6 +360,71 @@ class TestImageCommit:
             assert process.resource_budget.max_llm_total_tokens == 30
             assert process.resource_usage.tool_calls == 0
             assert process.resource_usage.llm_total_tokens == 0
+
+    def test_committed_image_does_not_capture_task_run_goal_marker(self) -> None:
+        with _runtime() as runtime:
+            marker = {
+                '$task_run_ref': {
+                    'run_id': 'trun_source',
+                    'payload_sha256': 'b' * 64,
+                    'schema_version': 1,
+                }
+            }
+            source = runtime.process.spawn(
+                image='base-agent:v0',
+                goal=marker,
+            )
+            source_process = runtime.process.get(source)
+            assert source_process.goal_oid is not None
+            checkpoint_id = runtime.checkpoint.create(
+                source,
+                'task run marker image boundary',
+                actor=source,
+            )
+            runtime.image_registry.grant_register(
+                source,
+                'task-run-marker-free:v0',
+                issued_by='test',
+            )
+
+            result = runtime.image_registry.commit_from_checkpoint(
+                actor=source,
+                checkpoint_id=checkpoint_id,
+                image_id='task-run-marker-free:v0',
+                name='task-run-marker-free',
+            )
+            found = runtime.store.get_image_artifact(
+                result.image.boot['artifact_id']
+            )
+            assert found is not None
+            artifact, _metadata = found
+
+            assert artifact['source_process']['goal_oid'] is None
+            assert all(
+                root.get('oid') != source_process.goal_oid
+                for root in json.loads(
+                    artifact['source_process']['memory_view_json']
+                ).get('roots', [])
+            )
+            assert source_process.goal_oid not in artifact['object_oids']
+            assert all(
+                payload != marker
+                for payload in artifact['object_payloads'].values()
+            )
+
+            spawned = runtime.process.spawn(
+                image='task-run-marker-free:v0',
+                goal='fresh goal',
+            )
+            spawned_process = runtime.process.get(spawned)
+            assert spawned_process.goal_oid is not None
+            assert runtime.store.get_object(spawned_process.goal_oid).payload == {
+                'text': 'fresh goal'
+            }
+            assert all(
+                runtime.store.get_object(handle.oid).payload != marker
+                for handle in spawned_process.memory_view.roots
+            )
 
     def test_committed_jit_tool_remains_process_local(self) -> None:
         with _runtime() as runtime:

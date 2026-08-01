@@ -19,7 +19,7 @@ from agent_libos.models import ExternalEffectRecoveryQuery
 from agent_libos.runtime import RuntimeBuilder
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage.postgres import PostgresStore
-from agent_libos.storage.sql import SQLRuntimeStore, _V3_REQUIRED_COLUMNS
+from agent_libos.storage.sql import SQLRuntimeStore, _V4_REQUIRED_COLUMNS
 from benchmarks.external_effect_recovery import (
     BENCHMARK_PROFILES,
     run_recovery_scale_benchmark,
@@ -223,9 +223,11 @@ def test_scale_benchmark_traces_connect_wrapper_prefix_select(
         nonlocal connection_calls
         connection_calls += 1
         connection = real_connect(*args, **kwargs)
-        # The first connection creates/seeds the benchmark database.  The
-        # second is the read-only preflight connection on the measured reopen.
-        if connection_calls == 2:
+        # Seed creation is first. The supported-store preflight now validates
+        # an isolated safety snapshot second; the third connection is the
+        # measured main database and must have tracing installed before this
+        # wrapper can execute a prefix query.
+        if connection_calls == 3:
             connection.execute(
                 "SELECT effect_id FROM external_effects LIMIT 1"
             ).fetchone()
@@ -309,8 +311,8 @@ def test_runtime_assembly_select_allowlist_is_exact() -> None:
     )
 
 
-def test_startup_v3_manifest_schema_probe_allowlist_is_exact() -> None:
-    manifest_tables = sorted(_V3_REQUIRED_COLUMNS)
+def test_startup_v4_manifest_schema_probe_allowlist_is_exact() -> None:
+    manifest_tables = sorted(_V4_REQUIRED_COLUMNS)
 
     def manifest_probe(tables: list[str]) -> str:
         names = ", ".join(f"'{name}'" for name in tables)
@@ -322,7 +324,7 @@ def test_startup_v3_manifest_schema_probe_allowlist_is_exact() -> None:
     exact_probe = manifest_probe(manifest_tables)
     assert (
         recovery_runner._startup_statement_kind(exact_probe)
-        == "v3_manifest_schema_probe"
+        == "v4_manifest_schema_probe"
     )
 
     near_or_arbitrary_probes = (

@@ -1124,6 +1124,7 @@ def test_mutating_backend_bool_protocol_inventory_is_exact_and_transactional() -
         if inspect.signature(method).return_annotation in {bool, "bool"}
     }
     read_only_bool_methods = {
+        "external_effect_transition_matches",
         "has_object_payload",
         "namespace_exists",
         "operation_has_unknown_external_effect",

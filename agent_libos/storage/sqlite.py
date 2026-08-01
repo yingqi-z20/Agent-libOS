@@ -14,8 +14,8 @@ from agent_libos.config import AgentLibOSConfig
 from agent_libos.models.exceptions import UnsupportedStoreVersion, ValidationError
 from agent_libos.storage.sql import (
     SQLRuntimeStore,
-    _V3_KEYSET_TEXT_COLUMNS,
-    _V3_REQUIRED_COLUMNS,
+    _V4_KEYSET_TEXT_COLUMNS,
+    _V4_REQUIRED_COLUMNS,
 )
 from agent_libos.utils.ids import utc_now
 
@@ -23,6 +23,170 @@ try:  # pragma: no cover - Windows fallback is exercised only on non-POSIX hosts
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None
+
+
+def _sqlite_ignored_sql_end(sql: str, index: int) -> int | None:
+    """Return the end of whitespace or a comment beginning at ``index``."""
+
+    if sql[index].isspace():
+        end = index + 1
+        while end < len(sql) and sql[end].isspace():
+            end += 1
+        return end
+    if sql.startswith("--", index):
+        newline = sql.find("\n", index + 2)
+        return len(sql) if newline < 0 else newline + 1
+    if sql.startswith("/*", index):
+        closing = sql.find("*/", index + 2)
+        return len(sql) if closing < 0 else closing + 2
+    return None
+
+
+def _sqlite_delimited_value(
+    sql: str,
+    index: int,
+    closing: str,
+) -> tuple[str, int]:
+    """Consume a SQLite string or quoted identifier with doubled escapes."""
+
+    value: list[str] = []
+    index += 1
+    while index < len(sql):
+        if sql[index] != closing:
+            value.append(sql[index])
+            index += 1
+            continue
+        if index + 1 < len(sql) and sql[index + 1] == closing:
+            value.append(closing)
+            index += 2
+            continue
+        return "".join(value), index + 1
+    return "".join(value), index
+
+
+def _sqlite_word_end(sql: str, index: int) -> int:
+    end = index + 1
+    while end < len(sql) and (sql[end].isalnum() or sql[end] in {"_", "$"}):
+        end += 1
+    return end
+
+
+def _sqlite_schema_token(sql: str, index: int) -> tuple[tuple[str, str], int]:
+    char = sql[index]
+    if char == "'":
+        _, end = _sqlite_delimited_value(sql, index, char)
+        return ("literal", ""), end
+    if char in {'"', "`", "["}:
+        closing = "]" if char == "[" else char
+        value, end = _sqlite_delimited_value(sql, index, closing)
+        return ("quoted", value), end
+    if char.isalnum() or char in {"_", "$"}:
+        end = _sqlite_word_end(sql, index)
+        return ("word", sql[index:end]), end
+    return ("symbol", char), index + 1
+
+
+def _sqlite_schema_tokens(sql: str) -> list[tuple[str, str]]:
+    """Tokenize SQLite DDL without treating comments or literals as code."""
+
+    tokens: list[tuple[str, str]] = []
+    index = 0
+    while index < len(sql):
+        ignored_end = _sqlite_ignored_sql_end(sql, index)
+        if ignored_end is not None:
+            index = ignored_end
+            continue
+        token, index = _sqlite_schema_token(sql, index)
+        tokens.append(token)
+    return tokens
+
+
+def _sqlite_column_definitions(
+    tokens: list[tuple[str, str]],
+) -> list[list[tuple[str, str]]]:
+    try:
+        opening = tokens.index(("symbol", "("))
+    except ValueError:
+        return []
+    definitions: list[list[tuple[str, str]]] = []
+    current: list[tuple[str, str]] = []
+    depth = 1
+    for token in tokens[opening + 1 :]:
+        if token == ("symbol", "("):
+            depth += 1
+        elif token == ("symbol", ")"):
+            depth -= 1
+            if depth == 0:
+                if current:
+                    definitions.append(current)
+                break
+        if token == ("symbol", ",") and depth == 1:
+            definitions.append(current)
+            current = []
+        else:
+            current.append(token)
+    return definitions
+
+
+def _sqlite_top_level_collations(
+    definition: list[tuple[str, str]],
+) -> list[str] | None:
+    collations: list[str] = []
+    nested_depth = 0
+    position = 2
+    while position < len(definition):
+        kind, value = definition[position]
+        if (kind, value) == ("symbol", "("):
+            nested_depth += 1
+        elif (kind, value) == ("symbol", ")"):
+            nested_depth = max(0, nested_depth - 1)
+        elif (
+            kind == "word"
+            and value.upper() == "COLLATE"
+            and nested_depth == 0
+        ):
+            if position + 1 >= len(definition):
+                return None
+            collation_kind, collation_name = definition[position + 1]
+            if collation_kind not in {"word", "quoted"}:
+                return None
+            collations.append(collation_name.upper())
+            position += 1
+        position += 1
+    return collations
+
+
+def _sqlite_text_column_collation(
+    definition: list[tuple[str, str]],
+) -> tuple[str, str] | None:
+    if len(definition) < 2:
+        return None
+    name_kind, name = definition[0]
+    type_kind, declared_type = definition[1]
+    if name_kind not in {"word", "quoted"}:
+        return None
+    if type_kind != "word" or declared_type.upper() != "TEXT":
+        return None
+    collations = _sqlite_top_level_collations(definition)
+    if collations is None:
+        return None
+    return name, collations[-1] if collations else "BINARY"
+
+
+def _sqlite_column_collations(sql: str) -> dict[str, str]:
+    """Return effective declared collations for TEXT columns in table DDL.
+
+    ``sqlite_master.sql`` preserves comments and literals.  Parsing tokens keeps
+    non-code ``COLLATE BINARY`` text from disguising a later NOCASE constraint.
+    """
+
+    result: dict[str, str] = {}
+    definitions = _sqlite_column_definitions(_sqlite_schema_tokens(sql))
+    for definition in definitions:
+        declared = _sqlite_text_column_collation(definition)
+        if declared is not None:
+            result[declared[0]] = declared[1]
+    return result
 
 
 class _SQLiteRuntimeLease:
@@ -238,30 +402,158 @@ class SQLiteStore(SQLRuntimeStore):
         return errors
 
     def _preflight_existing_store(self, db_path: Path) -> bool:
-        """Reject an incompatible store through a read-only connection."""
+        """Reject an incompatible store without opening the original in SQLite.
+
+        A SQLite ``mode=ro`` connection is not physically read-only for a WAL
+        database: SQLite may create or update ``-shm`` read marks while opening
+        it.  ``immutable=1`` avoids that write, but also ignores an uncheckpointed
+        WAL and can therefore inspect a stale schema marker.  Copy the validated
+        database family into a private temporary directory and let SQLite apply
+        any WAL or hot-journal recovery only to that disposable snapshot.
+        """
 
         conn: sqlite3.Connection | None = None
-        try:
-            conn = sqlite3.connect(
-                f"{db_path.as_uri()}?mode=ro",
-                timeout=0.0,
-                uri=True,
-            )
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA schema_version").fetchone()
-            return self._require_supported_store_version_for(conn)
-        except sqlite3.Error as exc:
-            busy_codes = {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
-            if getattr(exc, "sqlite_errorcode", None) in busy_codes:
+        with tempfile.TemporaryDirectory(
+            prefix="agent-libos-sqlite-preflight-"
+        ) as snapshot_directory:
+            snapshot_path = Path(snapshot_directory) / db_path.name
+            self._copy_preflight_database_family(db_path, snapshot_path)
+            try:
+                conn = sqlite3.connect(
+                    f"{snapshot_path.as_uri()}?mode=rw",
+                    timeout=0.0,
+                    uri=True,
+                )
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA schema_version").fetchone()
+                return self._require_supported_store_version_for(conn)
+            except sqlite3.Error as exc:
+                busy_codes = {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+                if getattr(exc, "sqlite_errorcode", None) in busy_codes:
+                    raise ValidationError(
+                        f"runtime store is already open: {db_path}"
+                    ) from exc
                 raise ValidationError(
-                    f"runtime store is already open: {db_path}"
+                    f"unable to read SQLite store schema: {db_path}"
                 ) from exc
-            raise ValidationError(
-                f"unable to read SQLite store schema: {db_path}"
-            ) from exc
+            finally:
+                if conn is not None:
+                    conn.close()
+
+    def _copy_preflight_database_family(
+        self,
+        db_path: Path,
+        snapshot_path: Path,
+    ) -> None:
+        """Copy a stable, validated database and its recovery sidecars."""
+
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            source = Path(f"{db_path}{suffix}")
+            destination = Path(f"{snapshot_path}{suffix}")
+            try:
+                self._copy_preflight_file(source, destination)
+            except FileNotFoundError as exc:
+                if not suffix:
+                    raise ValidationError(
+                        "SQLite database path changed or disappeared while "
+                        f"opening: {db_path}"
+                    ) from exc
+
+    def _copy_preflight_file(self, source: Path, destination: Path) -> None:
+        """Copy one SQLite file and reject identity/content races."""
+
+        source_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOINHERIT", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        source_fd = os.open(str(source), source_flags)
+        try:
+            before = os.fstat(source_fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise ValidationError(
+                    f"SQLite preflight source must be a regular file: {source}"
+                )
+            self._require_owned_file(before, source, label="SQLite preflight source")
+            self._require_single_link(before, source, label="SQLite preflight source")
+            self._require_open_path_identity(source_fd, source)
+
+            destination_flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOINHERIT", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            destination_fd = os.open(str(destination), destination_flags, 0o600)
+            try:
+                while True:
+                    block = os.read(source_fd, 1024 * 1024)
+                    if not block:
+                        break
+                    remaining = memoryview(block)
+                    while remaining:
+                        written = os.write(destination_fd, remaining)
+                        if written <= 0:  # pragma: no cover - defensive OS guard.
+                            raise OSError("short write while copying SQLite preflight snapshot")
+                        remaining = remaining[written:]
+            finally:
+                os.close(destination_fd)
+
+            after = os.fstat(source_fd)
+            self._require_open_path_identity(source_fd, source)
+            before_fingerprint = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            after_fingerprint = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if after_fingerprint != before_fingerprint:
+                raise ValidationError(
+                    f"SQLite preflight source changed while copying: {source}"
+                )
         finally:
-            if conn is not None:
-                conn.close()
+            os.close(source_fd)
+
+    def _require_open_path_identity(self, fd: int, path: Path) -> None:
+        """Require ``path`` still names the regular file held by ``fd``."""
+
+        opened_stat = os.fstat(fd)
+        try:
+            path_stat = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise ValidationError(
+                f"unsafe SQLite preflight source changed while opening: {path}"
+            ) from exc
+        reparse_attribute = int(
+            getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+        )
+        path_attributes = int(getattr(path_stat, "st_file_attributes", 0))
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or path_attributes & reparse_attribute
+            or path_stat.st_dev != opened_stat.st_dev
+            or path_stat.st_ino != opened_stat.st_ino
+        ):
+            raise ValidationError(
+                f"unsafe SQLite preflight source changed while opening: {path}"
+            )
+        self._require_single_link(
+            path_stat,
+            path,
+            label="SQLite preflight source",
+        )
 
     @classmethod
     def _require_supported_store_version_for(cls, conn: Any) -> bool:
@@ -282,10 +574,18 @@ class SQLiteStore(SQLRuntimeStore):
         return {str(row["name"]) for row in rows}
 
     @classmethod
-    def _require_v3_schema_shape(cls, conn: Any) -> None:
+    def _probe_user_tables(cls, conn: Any) -> set[str]:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+        return {str(row["name"]) for row in rows}
+
+    @classmethod
+    def _require_v4_schema_shape(cls, conn: Any) -> None:
         """Require every manifest relation to have SQLite type ``table``."""
 
-        required_tables = sorted(_V3_REQUIRED_COLUMNS)
+        required_tables = sorted(_V4_REQUIRED_COLUMNS)
         placeholders = ", ".join("?" for _ in required_tables)
         rows = conn.execute(
             "SELECT name, type FROM sqlite_master "
@@ -303,18 +603,18 @@ class SQLiteStore(SQLRuntimeStore):
         }
         if invalid_relations:
             raise UnsupportedStoreVersion(
-                "unsupported or incomplete Agent libOS store schema v3 "
+                "unsupported or incomplete Agent libOS store schema v4 "
                 "manifest relation types: "
                 f"{invalid_relations}; expected type 'table'"
             )
-        super()._require_v3_schema_shape(conn)
+        super()._require_v4_schema_shape(conn)
 
     @classmethod
     def _probe_text_column_collations(
         cls,
         conn: Any,
     ) -> Mapping[tuple[str, str], str]:
-        tables = sorted(_V3_KEYSET_TEXT_COLUMNS)
+        tables = sorted(_V4_KEYSET_TEXT_COLUMNS)
         placeholders = ", ".join("?" for _ in tables)
         rows = conn.execute(
             "SELECT name, sql FROM sqlite_master "
@@ -326,29 +626,73 @@ class SQLiteStore(SQLRuntimeStore):
             for row in rows
         }
         result: dict[tuple[str, str], str] = {}
-        for table, columns in _V3_KEYSET_TEXT_COLUMNS.items():
+        for table, columns in _V4_KEYSET_TEXT_COLUMNS.items():
             ddl = ddl_by_table.get(table)
             if ddl is None:
                 continue
+            declared_collations = _sqlite_column_collations(ddl)
             for column in columns:
-                declaration = re.search(
-                    rf"(?im)^\s*[\"`\[]?{re.escape(column)}[\"`\]]?\s+TEXT\b(?P<tail>[^,\n]*)",
-                    ddl,
-                )
-                if declaration is None:
-                    continue
-                explicit = re.search(
-                    r"\bCOLLATE\s+(?:[\"`\[])?(?P<name>[A-Za-z0-9_.-]+)",
-                    declaration.group("tail"),
-                    re.IGNORECASE,
-                )
-                # SQLite TEXT columns use BINARY without an explicit clause.
-                result[(table, column)] = (
-                    explicit.group("name").upper()
-                    if explicit is not None
-                    else "BINARY"
-                )
+                collation = declared_collations.get(column)
+                if collation is not None:
+                    result[(table, column)] = collation
         return result
+
+    @classmethod
+    def _probe_index_shapes(
+        cls,
+        conn: Any,
+        tables: set[str],
+    ) -> Mapping[str, Mapping[str, Any]]:
+        shapes: dict[str, dict[str, Any]] = {}
+        for table in sorted(tables):
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table) is None:
+                raise UnsupportedStoreVersion("invalid table identity in v4 manifest")
+            for row in conn.execute(f"PRAGMA index_list({table})"):
+                name = str(row["name"])
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+                    raise UnsupportedStoreVersion(
+                        "invalid index identity in v4 manifest"
+                    )
+                key_rows = [
+                    item
+                    for item in conn.execute(f"PRAGMA index_xinfo({name})")
+                    if int(item["key"]) == 1
+                ]
+                key_rows.sort(key=lambda item: int(item["seqno"]))
+                definition = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                    (name,),
+                ).fetchone()
+                definition_sql = (
+                    str(definition["sql"])
+                    if definition is not None and definition["sql"] is not None
+                    else ""
+                )
+                predicate_match = re.search(
+                    r"\bWHERE\b(?P<predicate>.*)\Z",
+                    definition_sql,
+                    re.IGNORECASE | re.DOTALL,
+                )
+                shapes[name] = {
+                    "table": table,
+                    "columns": tuple(str(item["name"]) for item in key_rows),
+                    "unique": bool(row["unique"]),
+                    "partial": bool(row["partial"]),
+                    "descending": tuple(bool(item["desc"]) for item in key_rows),
+                    "collations": tuple(
+                        str(item["coll"]).upper() if item["coll"] is not None else None
+                        for item in key_rows
+                    ),
+                    "origin": (
+                        "declared" if str(row["origin"]) == "c" else "constraint"
+                    ),
+                    "predicate": cls._canonical_index_predicate(
+                        predicate_match.group("predicate")
+                        if predicate_match is not None
+                        else None
+                    ),
+                }
+        return shapes
 
     def close(self) -> None:
         errors: list[BaseException] = []

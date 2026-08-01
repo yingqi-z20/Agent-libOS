@@ -1,6 +1,6 @@
-# Agent libOS 1.0.1 Status
+# Agent libOS 1.1.0 Status
 
-Agent libOS 1.0.1 is a release candidate for the core Python runtime scope
+Agent libOS 1.1.0 is a release candidate for the core Python runtime scope
 defined in `docs/support_matrix.md`. Release-ready status for any source tree is
 conditional on that exact tree passing the checked-in CI workflow; local
 deterministic results do not substitute for its Python-version, PostgreSQL, and
@@ -21,6 +21,32 @@ Without that complete binding, wording below such as “requires”, “gates”
 checkout or candidate artifact.
 
 ## Closed release blockers and P1 architecture debt
+
+- Durable Task Runs are a first-class, versioned Host supervision boundary for
+  one root AgentProcess tree. They persist requirements, idempotent command
+  receipts, append-only ledger links, and locally integrity-bound resume points;
+  they do not introduce a generic workflow DSL or distributed scheduler.
+- RuntimeStore schema v4 is the only store format accepted by 1.1.0. A schema
+  v3 store is rejected before initialization or any write and remains
+  archive-only under 1.0.1; this release has no migration, read-only bridge, or
+  dual-schema mode.
+- Useful Task Run restart recovery requires explicit Host opt-in to bounded
+  plaintext payload persistence, which is disabled by default. The default
+  `purge_on_terminal` policy hash-reduces readable Run-owned content before a
+  terminal status, including linked Human prompt/response/decision bodies and
+  terminal provider metadata/receipt bodies. It retains Human request
+  id/type/status/timestamps/digests/audit links and effect
+  identity/state/digests/causal links;
+  `permanent` is Host/admin-only and remains eligible for a later explicit,
+  audited Host purge. Neither policy is at-rest encryption or secure backup
+  erasure.
+- Task Run startup uses the exclusive active-store lease and monotonic Runtime
+  epoch to fence stale claims and commits. Unknown/dispatched effects, binding
+  drift, missing payloads, and reopened active ObjectTasks block in
+  `needs_attention`; they are not replayed automatically.
+- Durable Task Runs keep the existing post-attempt LLM accounting model. There
+  is no durable pre-dispatch token/cost reservation, and no UI or documentation
+  may present configured LLM budgets as hard provider-spend caps.
 
 - `Runtime.git` is a typed system-Git provider pinned to the workspace root.
   It validates repository/config/executable identity, uses state-token CAS and
@@ -181,6 +207,53 @@ checkout or candidate artifact.
   environment gates. Deterministic mocked MCP coverage is part of the normal
   matrix. Platform-specific skips stay documented and real Deno runs by default
   when installed.
+- The Durable Task Run gate requires fresh schema-v4 SQLite/PostgreSQL shape,
+  v3 zero-write refusal, revision/command conflicts, stale Runtime-epoch
+  fencing, plaintext opt-in and terminal purge, unknown-effect/ObjectTask
+  blocking, checkpoint intersection refusal, and GUI schema-v2 behavior. Its
+  crash harness exercises `os._exit` and `SIGKILL` durability barriers through
+  a real action/tool/protected-provider path against an independently fsynced,
+  idempotency-keyed provider ledger. A second reopen must leave the complete
+  action, link, effect-transition, and resume evidence fingerprint unchanged;
+  crash artifacts remain untracked.
+- The Task Run recovery-scale gate seeds 100,000 historical Runs and 1,000
+  recoverable Runs with page size 500. Query shape, required indexes, page
+  counts, bounded row work, and complete convergence are hard assertions;
+  elapsed time is diagnostic only and is not a release SLA.
+- A Durable Task Run release claim also requires three real-LLM repository
+  maintenance runs and three browser-driven customer-flow runs against the
+  explicitly configured test endpoints. All six must preserve authority,
+  safety, and zero-duplicate-effect checks; utility must pass at least five of
+  six overall and two of three in each scenario family. Credentials, raw
+  provider content, browser profiles, and run artifacts are not release files;
+  any result cited as evidence must instead use redacted, immutable provenance
+  locators bound to the source revision.
+  The repository-maintenance half has a dedicated opt-in command:
+
+  ```bash
+  uv run --env-file .env python experiments/run_durable_task_run_evaluation.py \
+    --confirm-real-llm \
+    --require-release-gate \
+    --repetitions 3 \
+    --output "$TASK_RUN_REPORT"
+  ```
+
+  `--require-release-gate` requires exactly three repetitions. That report
+  passes only with safety/authority/recovery/zero-duplicate-effect checks at
+  `3/3` and strict repository-maintenance utility at least `2/3`. The evaluator
+  treats an uninvoked expected workflow action as a strict utility miss, not an
+  authority denial; every expected action that is invoked must still have at
+  least one successful receipt for the authority check to pass. The synthetic
+  goal explicitly names its typed file, Git, checkpoint, Human-output, and
+  terminal action contract, so the utility oracle has no hidden tool-shape
+  requirement. The evaluator
+  will not use an ambient real provider without `--confirm-real-llm`. The
+  recommended invocation omits `--artifacts-root`, so synthetic workspaces and
+  permanent-retention v4 databases are removed after the bounded report is
+  written; set `TASK_RUN_REPORT` to a file in the operating system's temporary
+  directory, outside the repository. This paragraph defines an outstanding
+  environment gate and does not assert that either live three-run family has
+  executed or passed for this source state.
 - The PostgreSQL CI job runs the complete `postgres` marker gate against a
   digest-pinned PostgreSQL 17.10 Bookworm image on Python 3.11 and permits no
   skips. This is a service-backed CI gate, not evidence that an arbitrary local
@@ -218,7 +291,7 @@ checkout or candidate artifact.
   The profile must validate exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The `release-artifacts` CI job is configured to build one canonical 1.0.1
+- The `release-artifacts` CI job is configured to build one canonical 1.1.0
   wheel/source pair, reject extra or non-regular output, and record an exact
   checksum manifest.
   Python 3.11 through 3.14 smoke jobs download and verify that same pair, install
@@ -238,7 +311,7 @@ endpoint to read a policy and CSV, compute a report, emit `human_output`, and
 exit. No provenance-bearing report for that run is checked in with the source
 revision, model/profile identity, redacted configuration, environment, and raw
 test outcome needed to reproduce or compare it. It is therefore an unarchived
-observation, not Agent libOS 1.0.1 release evidence, and supports no call-count,
+observation, not Agent libOS 1.1.0 release evidence, and supports no call-count,
 token-count, approval-count, latency, or serial-versus-parallel claim. Promote a
 future rerun only after using a documented opt-in real-model gate and preserving
 its reproducible report outside this status summary.
@@ -261,9 +334,11 @@ its reproducible report outside this status summary.
   its platform marker with `--fail-on-skip`, and canonical release artifacts
   depend on that job. This is a configured CI gate, not a claim that a separate
   local macOS CI run was performed.
-- SQLite and PostgreSQL implement the covered RuntimeStore contract. A 0.2 store
-  or artifact is rejected before mutation and remains readable only with the
-  archived 0.2 release.
+- SQLite and PostgreSQL implement the covered RuntimeStore contract. This
+  release accepts only store schema v4. A schema-v3 store is rejected before
+  mutation and may be viewed or archived only with Agent libOS 1.0.1; still
+  older stores require their matching archived release. Checkpoint and Image
+  artifact versions remain independent of the store schema.
 - The Python wheel contains the core `agent_libos` package and its three console
   entrypoints: `agent-libos`, `agent-libos-gui-server`, and the explicit offline
   `agent-libos-migrate-tool-groups` migration command. Repository-level PTY
@@ -273,7 +348,7 @@ its reproducible report outside this status summary.
   non-bare workspace repository and system Git 2.26 or newer; unavailable Git
   fails individual calls without preventing Runtime startup. Host-configured
   remotes are the only first-class Git network exception. There is no Git CLI,
-  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.0.1.
+  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.1.0.
 
 ## Remaining environment gates and non-blocking debt
 

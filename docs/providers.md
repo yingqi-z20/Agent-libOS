@@ -105,6 +105,50 @@ token usage uncharged. Missing or invalid billable usage fails the completed
 action closed when a token budget is configured, and an over-budget completion
 is retained without dispatching its model-selected tools.
 
+Durable Task Runs use that same accounting contract. A Run may persist a local
+resume point after a complete LLM action and all paired tool results, but it does not
+reserve provider calls, tokens, or money before dispatch. Its configured budget
+therefore remains a local post-attempt enforcement control, not a hard
+provider-spend cap. Product surfaces must not relabel it as a guaranteed cost
+limit.
+
+Task Run recovery also does not weaken protected-operation classification. A
+provider-certified non-dispatch may be continued, and a complete durable
+provider success may finish local settlement. A dispatched or unknown effect
+instead blocks the Run in `needs_attention` until a Host selects a recovery
+action derived from authoritative evidence. Merely reopening, pausing,
+cancelling, or rerunning a Run never authorizes an automatic provider retry.
+Caller-supplied receipt JSON is not authoritative evidence: receipt recovery
+requires the trusted provider's verifier to authenticate and normalize the
+receipt, followed by an exact Run/effect/Runtime-epoch/state compare-and-swap.
+For a Durable Task Run, the provisional recovery-command receipt and that
+normalized effect settlement commit atomically. If they committed but the
+later public command-result update was lost, an exact replay checks the stored
+settlement and finishes local Run projection without invoking the verifier or
+provider effect again. Its content-free command receipt binds the admission
+Runtime epoch, exact finalized external-effect transition sequence, and the
+matching append-only `external_effect.recovery_settled` audit record whose
+source is `host_verified_receipt`. The audit binds the prior/settled state,
+provider outcome, transition sequence, and canonical provider-receipt digest.
+That transition/audit chain remains available after terminal retention removes
+readable provider metadata and receipt bodies, so replay never depends on
+purgeable content. This is a post-commit guarantee, not unconditional
+at-most-once verifier execution: if the whole verification transaction rolled
+back, no durable pending command or normalized settlement exists and a later
+fresh attempt may verify again.
+
+Once a Run can safely terminalize, default Task Run retention reduces provider
+metadata and receipt bodies for its linked terminal external effects through
+the same canonical `full -> summary -> hash_only` state machine. The reducer
+retains effect identity, state, classification, canonical-argument hash,
+original payload digest, receipt digest, and causal links. It never reduces a
+dispatched/unknown or otherwise nonterminal effect merely to make cancellation
+or cleanup appear complete. The same Run cleanup replaces linked Human request
+prompt, response, and decision bodies with content-free hash projections while
+retaining request identity, type, status, timestamps, audit linkage, and
+content digests; a retained Human row must not be mistaken for retained Human
+plaintext.
+
 LLM responses also cross a fixed inbound trust boundary that is independent of
 the outbound `max_tokens` preference. Before provider-authored content or tool
 arguments are joined or copied into durable Runtime state, content is limited

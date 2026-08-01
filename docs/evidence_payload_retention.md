@@ -11,6 +11,28 @@ The implementation lives in
 default `PayloadRetentionPolicy()` is disabled. Runtime startup never runs
 retention implicitly.
 
+Durable Task Run retention is a separate lifecycle contract. Its default
+`purge_on_terminal` policy hash-reduces Run-owned goal, follow-up, resume, and
+persisted completion material while the Run is `finalizing`. The same
+transaction invokes a dedicated terminal reducer for linked LLM request,
+response, tool-call, and tool-output bodies and deletes pending continuation
+actions. It also deletes durable messages automatically bound from their
+Run-member recipient; ordinary callers cannot suppress, override, or forge
+that binding. Run-linked Human request prompt, response, and decision bodies
+are replaced by content-free hash projections; request id, type, status,
+timestamps, audit linkage, and content digests remain. The transaction also
+reduces every linked, terminal external effect's provider metadata and provider
+receipt body through the canonical
+`full -> summary -> hash_only` transitions. It does not run the age-based
+`PayloadRetentionMaintenance` scan or delete Human, LLM, or effect rows. Effect
+identity, state, classification, canonical-argument hash, original payload
+digest, receipt digest, and causal links remain, but readable receipt content
+does not. Nonterminal effects are never reduced. `permanent` skips this
+automatic Run-terminal cleanup, although ordinary evidence-retention policy
+remains independently applicable; a Host/admin may later invoke the same
+audited purge explicitly for a terminal permanent Run.
+See [Durable Task Runs](durable_task_runs.md).
+
 ## Monotonic tiers
 
 Payloads move in one direction:

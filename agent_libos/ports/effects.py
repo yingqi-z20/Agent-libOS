@@ -5,10 +5,12 @@ from collections.abc import Iterable
 from typing import Any, Protocol
 
 from agent_libos.models import (
+    AuditRecord,
     Capability,
     ExternalEffectPage,
     ExternalEffectRecord,
     ExternalEffectRecoveryQuery,
+    ExternalEffectRecoverySettlement,
     OperationEvidenceLink,
     OperationRecord,
 )
@@ -69,6 +71,28 @@ class ProtectedEffectPort(Protocol):
         provider_receipt: dict[str, Any] | None = None,
         updated_at: str,
     ) -> bool:
+        ...
+
+    def settle_external_effect_recovery(
+        self,
+        effect_id: str,
+        *,
+        expected_transaction_state: str,
+        provider_state: str,
+        provider_metadata: dict[str, Any],
+        provider_receipt: dict[str, Any],
+        audit_record: AuditRecord,
+        updated_at: str,
+        run_id: str | None = None,
+        runtime_epoch: int | None = None,
+    ) -> ExternalEffectRecoverySettlement | None:
+        """Atomically settle one provider-verified recovery conclusion.
+
+        Supplying ``run_id`` and ``runtime_epoch`` adds an exact TaskRun
+        membership/epoch fence.  The provider verification itself deliberately
+        lives above this persistence port.
+        """
+
         ...
 
     def abandon_external_effect_intent(self, effect_id: str) -> bool:

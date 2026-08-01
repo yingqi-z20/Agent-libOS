@@ -45,7 +45,10 @@ Product entrypoints use this order:
    - `git.ref_list_limit`, `git.pull_request_list_limit`, all six
      `memory.query_scan_*`/`memory.metadata_*` bounds, and
      `skills.max_package_directories`, `skills.max_package_depth`, and
-     `skills.catalog_scan_limit`.
+     `skills.catalog_scan_limit`;
+   - every numeric field in `task_runs`: `payload_max_bytes`,
+     `command_result_max_bytes`, all list/recovery/ledger page sizes and hard
+     limits, and `recovery_sample_limit`.
 
    Strict integer fields require integers; strict floating fields accept numeric
    integer or floating-point values. Post-construction checks then reject
@@ -236,6 +239,7 @@ same change.
 | `image_commit` | `artifact_version`, `artifact_hard_limit_bytes`, `payload_capture_limit_bytes`, `max_required_capabilities`, `max_committed_tools`, `max_committed_jit_sources`, `metadata_preview_chars` |
 | `memory` | `object_schema_version`, `materialize_budget_tokens`, `query_limit`, `context_policy`, `metadata_sensitivity`, `metadata_retention_policy`, `process_namespace_prefix`, `query_scan_page_size`, `query_scan_ceiling`, `metadata_text_max_chars`, `metadata_collection_max_items`, `metadata_collection_item_max_chars`, `metadata_max_bytes` |
 | `object_tasks` | `max_running_global`, `max_running_per_object`, `notification_channel`, `owner_watch_channel`, `owner_watch_events`, `shutdown_join_timeout_s` |
+| `task_runs` | `enabled`, `plaintext_payloads_enabled`, `payload_max_bytes`, `command_result_max_bytes`, `recovery_page_size`, `recovery_page_hard_limit`, `list_page_size`, `list_hard_limit`, `ledger_page_size`, `ledger_page_hard_limit`, `recovery_sample_limit` |
 | `llm_context` | `policy`, `schema_version`, `object_name_prefix`, `recent_event_limit`, `prompt_event_payload_max_chars`, `storage_compaction_threshold_bytes`, `storage_compaction_max_chunks`, `storage_compaction_preserve_recent_entries` |
 | `checkpoint` | `list_limit`, `payload_capture_limit_bytes`, `snapshot_hard_limit_bytes`, `diff_preview_items` |
 | `skills` | `schema_version`, `registry_resource`, `trust_resource`, `global_dirs`, `workspace_dirs`, `resource_dirs`, `trusted_global_package_sha256`, `global_requires_trust`, `skill_md_max_bytes`, `skill_md_hard_limit_bytes`, `resource_read_max_bytes`, `package_max_bytes`, `max_package_files`, `max_prompt_instruction_chars`, `max_jit_source_chars`, `discover_limit`, `id_max_chars`, `name_max_chars`, `description_max_chars`, `version_max_chars`, `max_tools`, `max_actions`, `max_jit_tools`, `max_required_capabilities`, `max_package_directories`, `max_package_depth`, `catalog_scan_limit` |
@@ -359,6 +363,27 @@ configurable. A runtime release emits only the snapshot version it can decode.
   content-free identity, size, and hash fields and therefore cannot support a
   later CLI `run` after reopen. Terminal cleanup and failed-launch compensation
   reduce a reversible envelope to the same hash-only form.
+- `task_runs.enabled` defaults to true and controls admission of new Run
+  creation. The manager and startup reconciliation remain assembled when it is
+  false so existing durable state cannot evade recovery.
+  `task_runs.plaintext_payloads_enabled` defaults to false, and Durable Task Run
+  creation is rejected while it is false because a
+  restartable Run requires a readable goal and resume material. Enabling it
+  permits bounded plaintext Task Run payloads in the SQL store; it is
+  independent of `llm.persist_full_io` and provides no at-rest encryption.
+  `task_runs.payload_max_bytes` defaults to `1,048,576` serialized bytes per
+  canonical payload and must be positive. `task_runs.command_result_max_bytes`
+  separately bounds persisted idempotent command results at `262,144` bytes.
+  Normal Host lists default to `list_page_size=100` and are bounded by
+  `list_hard_limit=1000`; ledger pages default to and are capped at `500`.
+  `recovery_sample_limit=100` bounds the in-memory diagnostic sample returned
+  after startup reconciliation, not the number of Runs reconciled. A
+  version-1 Task Run title and opaque identity are fixed to 256 characters,
+  while public blocker/summary metadata is fixed to 16 KiB. Those versioned
+  interchange bounds are not Host configuration knobs. A Run's default
+  `purge_on_terminal` policy reduces readable Run-owned payloads
+  to hashes before terminalization; `permanent` is a Host/admin-only per-Run
+  choice.
 - Provider-side Responses storage policy remains opt-in through `llm.store`.
   `llm.responses_previous_response_id` permits low-level client chaining policy,
   but the current full-snapshot AgentProcess executor records it as configured
@@ -367,7 +392,7 @@ configurable. A runtime release emits only the snapshot version it can decode.
   increase provider retention.
 - `runtime.launch_authority_mode: manifest_required` treats image capability
   requirements as declarations, not grants. It is the only accepted value in
-  the current 1.0.x contract.
+  the current 1.1.x contract.
 - `runtime.publication_recovery_max_attempts` bounds durable compensation
   retries. Exceeding it persists a `manual` publication disposition and fails
   every startup closed instead of silently repeating an uncertain cleanup
@@ -418,6 +443,12 @@ configurable. A runtime release emits only the snapshot version it can decode.
   indexed pending/unknown effects; each page then performs only a bounded
   primary-key membership read. Recovery processes the full backlog but exposes
   only a page-bounded ID sample plus the exact total count.
+  Durable Task Run startup work is independently keyset-paged by
+  `task_runs.recovery_page_size`, which defaults to `500` and cannot exceed
+  `task_runs.recovery_page_hard_limit` (default `5000`). These
+  values bound each query and diagnostic sample, not the number of eligible
+  Runs that startup must reconcile. Payload integrity and stale Runtime epochs
+  are checked before any Run is returned to scheduling.
   Terminal-process cleanup recovery uses the independent
   `runtime.process_terminal_cleanup_recovery_page_size` setting, which defaults
   to `500`; its store-enforced hard limit

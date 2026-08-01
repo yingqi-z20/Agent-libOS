@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -47,7 +49,7 @@ from agent_libos.storage import (
     SQLiteStore,
 )
 from agent_libos.storage.postgres import PostgresStore
-from agent_libos.storage.sql import _V3_REQUIRED_COLUMNS
+from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS, _V4_REQUIRED_INDEXES
 from agent_libos.process_transition import ProcessTransitionService
 from agent_libos.utils.ids import utc_now
 from tests.support.external_effects import begin_external_effect_intent
@@ -1240,21 +1242,178 @@ class TestPostgresRuntimeLeaseIsolation:
 
 
 class TestUnsupportedStoreVersion:
-    def test_v3_schema_manifest_matches_fresh_store(self) -> None:
+    def test_v4_schema_manifest_matches_fresh_store(self) -> None:
         store = SQLiteStore(":memory:")
         try:
-            assert set(_V3_REQUIRED_COLUMNS) == {
+            assert set(_V4_REQUIRED_COLUMNS) == {
                 "runtime_schema",
                 *store.ALLOWED_TABLES,
             }
-            for table, expected_columns in _V3_REQUIRED_COLUMNS.items():
+            for table, expected_columns in _V4_REQUIRED_COLUMNS.items():
                 actual_columns = {
                     str(row["name"])
                     for row in store.conn.execute(f"PRAGMA table_info({table})")
                 }
                 assert actual_columns == expected_columns, table
+
+            shapes = SQLiteStore._probe_index_shapes(
+                store.conn,
+                {spec[0] for spec in _V4_REQUIRED_INDEXES.values()},
+            )
+            for name, (table, columns, unique, partial) in _V4_REQUIRED_INDEXES.items():
+                shape = shapes[name]
+                assert shape["table"] == table
+                assert shape["columns"] == columns
+                assert shape["unique"] is unique
+                assert shape["partial"] is partial
+                assert shape["descending"] == tuple(False for _ in columns)
         finally:
             store.close()
+
+    @pytest.mark.parametrize(
+        ("case", "mutation"),
+        [
+            (
+                "missing",
+                "DROP INDEX idx_task_runs_recovery",
+            ),
+            (
+                "column-order",
+                "DROP INDEX idx_task_runs_recovery; "
+                "CREATE INDEX idx_task_runs_recovery "
+                "ON task_runs(run_id COLLATE BINARY, created_at COLLATE BINARY) "
+                "WHERE status NOT IN ('succeeded', 'failed', 'cancelled')",
+            ),
+            (
+                "descending",
+                "DROP INDEX idx_task_runs_recovery; "
+                "CREATE INDEX idx_task_runs_recovery "
+                "ON task_runs(created_at COLLATE BINARY DESC, run_id COLLATE BINARY) "
+                "WHERE status NOT IN ('succeeded', 'failed', 'cancelled')",
+            ),
+            (
+                "collation",
+                "DROP INDEX idx_task_runs_recovery; "
+                "CREATE INDEX idx_task_runs_recovery "
+                "ON task_runs(created_at COLLATE NOCASE, run_id COLLATE BINARY) "
+                "WHERE status NOT IN ('succeeded', 'failed', 'cancelled')",
+            ),
+            (
+                "unique",
+                "DROP INDEX idx_task_runs_root_pid; "
+                "CREATE INDEX idx_task_runs_root_pid "
+                "ON task_runs(root_pid) WHERE root_pid IS NOT NULL",
+            ),
+            (
+                "partial-predicate",
+                "DROP INDEX idx_task_runs_recovery; "
+                "CREATE INDEX idx_task_runs_recovery "
+                "ON task_runs(created_at COLLATE BINARY, run_id COLLATE BINARY) "
+                "WHERE status = 'queued'",
+            ),
+            (
+                "partial-predicate-residue",
+                "DROP INDEX idx_task_runs_recovery; "
+                "CREATE INDEX idx_task_runs_recovery "
+                "ON task_runs(created_at COLLATE BINARY, run_id COLLATE BINARY) "
+                "WHERE status NOT IN ('succeeded', 'failed', 'cancelled') AND 1 = 1",
+            ),
+            (
+                "extra-declared-index",
+                "CREATE INDEX idx_task_runs_unexpected ON task_runs(status)",
+            ),
+            (
+                "extra-declared-index-arbitrary-name",
+                "CREATE INDEX unexpected_title_lookup "
+                "ON task_runs(display_title)",
+            ),
+            (
+                "extra-unique-constraint",
+                "CREATE UNIQUE INDEX unexpected_title_identity "
+                "ON task_runs(display_title)",
+            ),
+        ],
+    )
+    def test_v4_index_manifest_corruption_is_zero_write_rejected_before_initializer(
+        self,
+        case: str,
+        mutation: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / f"v4-index-{case}.sqlite"
+        SQLiteStore(db_path).close()
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.executescript(mutation)
+            connection.commit()
+        finally:
+            connection.close()
+        before = db_path.read_bytes()
+        initialized = False
+
+        def forbidden_initialize(_store: SQLRuntimeStore) -> None:
+            nonlocal initialized
+            initialized = True
+            raise AssertionError("invalid v4 must be rejected before initializer")
+
+        monkeypatch.setattr(SQLRuntimeStore, "initialize", forbidden_initialize)
+        with pytest.raises(
+            UnsupportedStoreVersion,
+            match=r"schema v4 index manifest",
+        ):
+            SQLiteStore(db_path)
+
+        assert initialized is False
+        assert db_path.read_bytes() == before
+
+    @pytest.mark.parametrize(
+        ("case", "mutation"),
+        [
+            (
+                "missing",
+                "DELETE FROM runtime_counters "
+                "WHERE counter_name = 'task_run_runtime_epoch'",
+            ),
+            (
+                "invalid",
+                "UPDATE runtime_counters SET value = -1 "
+                "WHERE counter_name = 'task_run_ledger'",
+            ),
+        ],
+    )
+    def test_v4_counter_seed_is_zero_write_rejected_before_initializer(
+        self,
+        case: str,
+        mutation: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / f"v4-counter-{case}.sqlite"
+        SQLiteStore(db_path).close()
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute(mutation)
+            connection.commit()
+        finally:
+            connection.close()
+        before = db_path.read_bytes()
+        initialized = False
+
+        def forbidden_initialize(_store: SQLRuntimeStore) -> None:
+            nonlocal initialized
+            initialized = True
+            raise AssertionError("invalid v4 counters must precede the initializer")
+
+        monkeypatch.setattr(SQLRuntimeStore, "initialize", forbidden_initialize)
+        with pytest.raises(
+            UnsupportedStoreVersion,
+            match=r"schema v4 counter seed",
+        ):
+            SQLiteStore(db_path)
+
+        assert initialized is False
+        assert db_path.read_bytes() == before
 
     def test_fresh_schema_rejects_a_second_schema_marker(self) -> None:
         store = SQLiteStore(":memory:")
@@ -1352,12 +1511,129 @@ class TestUnsupportedStoreVersion:
             connection.close()
         before = db_path.read_bytes()
 
-        with pytest.raises(UnsupportedStoreVersion, match="expected 3"):
+        with pytest.raises(UnsupportedStoreVersion, match="expected 4"):
             SQLiteStore(db_path)
 
         assert db_path.read_bytes() == before
 
-    def test_incomplete_v3_schema_is_rejected_without_mutation(self, tmp_path: Path) -> None:
+    def test_schema_v3_is_zero_write_rejected_with_101_archive_hint(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "schema-v3.sqlite"
+        SQLiteStore(db_path).close()
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute("UPDATE runtime_schema SET schema_version = 3")
+            connection.commit()
+        finally:
+            connection.close()
+        before = db_path.read_bytes()
+
+        initialized = False
+
+        def forbidden_initialize(_store: SQLRuntimeStore) -> None:
+            nonlocal initialized
+            initialized = True
+            raise AssertionError("v3 rejection must precede the initializer")
+
+        monkeypatch.setattr(SQLRuntimeStore, "initialize", forbidden_initialize)
+        with pytest.raises(
+            UnsupportedStoreVersion,
+            match=r"schema v3.*1\.0\.1.*view or archive",
+        ):
+            SQLiteStore(db_path)
+
+        assert initialized is False
+        assert db_path.read_bytes() == before
+        connection = sqlite3.connect(db_path)
+        try:
+            assert connection.execute(
+                "SELECT schema_version FROM runtime_schema WHERE singleton = 1"
+            ).fetchone() == (3,)
+        finally:
+            connection.close()
+
+    @pytest.mark.parametrize(
+        ("mutation", "error_pattern"),
+        [
+            (
+                "UPDATE runtime_schema SET schema_version = 3",
+                r"schema v3.*1\.0\.1.*view or archive",
+            ),
+            (
+                "DROP INDEX idx_task_runs_recovery",
+                r"schema v4 index manifest",
+            ),
+        ],
+        ids=("v3", "damaged-v4"),
+    )
+    def test_wal_schema_rejection_preserves_database_sidecar_bytes_and_modes(
+        self,
+        mutation: str,
+        error_pattern: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if os.name != "posix" or not hasattr(os, "chmod"):
+            pytest.skip("exact file mode preservation requires POSIX chmod")
+        db_path = tmp_path / "wal-schema-preflight.sqlite"
+        SQLiteStore(db_path).close()
+
+        # Exit without sqlite3_close so the schema mutation remains only in WAL
+        # and a real shared-memory sidecar survives for the rejected reopen.
+        child = "\n".join(
+            (
+                "import os",
+                "import sqlite3",
+                "import sys",
+                "connection = sqlite3.connect(sys.argv[1])",
+                "connection.execute('PRAGMA journal_mode = WAL')",
+                "connection.execute(sys.argv[2])",
+                "connection.commit()",
+                "os._exit(0)",
+            )
+        )
+        subprocess.run(
+            [sys.executable, "-c", child, str(db_path), mutation],
+            check=True,
+        )
+
+        paths = {
+            "database": db_path,
+            "wal": Path(f"{db_path}-wal"),
+            "shm": Path(f"{db_path}-shm"),
+            "lease": db_path.with_suffix(db_path.suffix + ".runtime.lock"),
+        }
+        assert all(path.exists() for path in paths.values())
+        paths["database"].chmod(0o640)
+        paths["wal"].chmod(0o604)
+        paths["shm"].chmod(0o620)
+        paths["lease"].chmod(0o600)
+
+        def snapshot() -> dict[str, tuple[bytes, int]]:
+            return {
+                name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                for name, path in paths.items()
+            }
+
+        before = snapshot()
+        initialized = False
+
+        def forbidden_initialize(_store: SQLRuntimeStore) -> None:
+            nonlocal initialized
+            initialized = True
+            raise AssertionError("invalid WAL schema must precede the initializer")
+
+        monkeypatch.setattr(SQLRuntimeStore, "initialize", forbidden_initialize)
+        with pytest.raises(UnsupportedStoreVersion, match=error_pattern):
+            SQLiteStore(db_path)
+
+        assert initialized is False
+        assert snapshot() == before
+
+    def test_incomplete_v4_schema_is_rejected_without_mutation(self, tmp_path: Path) -> None:
         db_path = tmp_path / "incomplete-v3.sqlite"
         SQLiteStore(db_path).close()
         connection = sqlite3.connect(db_path)
@@ -1373,7 +1649,7 @@ class TestUnsupportedStoreVersion:
 
         assert db_path.read_bytes() == before
 
-    def test_incomplete_v3_column_is_rejected_without_mutation(self, tmp_path: Path) -> None:
+    def test_incomplete_v4_column_is_rejected_without_mutation(self, tmp_path: Path) -> None:
         db_path = tmp_path / "incomplete-v3-column.sqlite"
         SQLiteStore(db_path).close()
         connection = sqlite3.connect(db_path)
@@ -1389,7 +1665,7 @@ class TestUnsupportedStoreVersion:
 
         assert db_path.read_bytes() == before
 
-    def test_v3_manifest_view_is_rejected_without_mutation(
+    def test_v4_manifest_view_is_rejected_without_mutation(
         self,
         tmp_path: Path,
     ) -> None:

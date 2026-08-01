@@ -20,7 +20,7 @@ from agent_libos.runtime.process_manager import ProcessManager
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import sqlite as sqlite_storage
 from agent_libos.storage.repositories import CheckpointRestorePublicationWriter
-from agent_libos.storage.sql import _V3_REQUIRED_COLUMNS
+from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS
 from agent_libos.storage.sqlite import SQLiteStore
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import dumps
@@ -41,10 +41,10 @@ _PUBLICATION_DOMAIN_SELECT = " ".join(
 )
 _SQL_TEXT_LITERAL_RE = re.compile(r"'(?:''|[^'])*'")
 _SQL_INTEGER_LITERAL_RE = re.compile(r"(?<![A-Z0-9_?])-?\d+(?![A-Z0-9_?])")
-_SQLITE_V3_MANIFEST_TABLES = tuple(sorted(_V3_REQUIRED_COLUMNS))
-_SQLITE_V3_MANIFEST_SCHEMA_PROBE_SHAPE = (
+_SQLITE_V4_MANIFEST_TABLES = tuple(sorted(_V4_REQUIRED_COLUMNS))
+_SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE = (
     "SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN ("
-    + ", ".join("?" for _ in _SQLITE_V3_MANIFEST_TABLES)
+    + ", ".join("?" for _ in _SQLITE_V4_MANIFEST_TABLES)
     + ")"
 )
 _OPERATION_RECONCILIATION_SELECT_RE = re.compile(
@@ -1826,13 +1826,13 @@ def _publication_statement_shape(sql: str) -> str | None:
     raw_sql = str(sql)
     raw_normalized = " ".join(raw_sql.upper().split()).rstrip(";")
     raw_normalized_literals = _normalize_publication_select(raw_normalized)
-    if raw_normalized_literals == _SQLITE_V3_MANIFEST_SCHEMA_PROBE_SHAPE:
+    if raw_normalized_literals == _SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE:
         manifest_tables = tuple(
             literal[1:-1].replace("''", "'")
             for literal in _SQL_TEXT_LITERAL_RE.findall(raw_sql)
         )
-        if manifest_tables == _SQLITE_V3_MANIFEST_TABLES:
-            return "v3_manifest_schema_probe"
+        if manifest_tables == _SQLITE_V4_MANIFEST_TABLES:
+            return "v4_manifest_schema_probe"
     uncommented = _strip_sql_comments(raw_sql)
     normalized = " ".join(uncommented.upper().split()).rstrip(";")
     normalized_literals = _normalize_publication_select(normalized)
@@ -2344,12 +2344,14 @@ def _assert_publication_trace_contract(
     expected_handler_query_calls: int,
     expected_payload_delivery_page_calls: int,
 ) -> None:
+    # Existing-store validation runs against an isolated safety snapshot. This
+    # ledger covers only the subsequently opened measured main connection.
     expected = Counter(
         {
-            "schema_probe": 2,
-            "payload_attempt_schema_probe": 2,
-            "keyset_collation_schema_probe": 2,
-            "v3_manifest_schema_probe": 2,
+            "schema_probe": 1,
+            "payload_attempt_schema_probe": 1,
+            "keyset_collation_schema_probe": 1,
+            "v4_manifest_schema_probe": 1,
             "schema_table": 1,
             "schema_payload_attempt_table": 1,
             "domain_validation": 1,
@@ -2479,8 +2481,8 @@ def _assert_structural_contract(result: PublicationScaleResult) -> None:
         raise AssertionError(
             "direct publication SELECTs bypassed repository row accounting"
         )
-    if result.publication_schema_probe_calls != 2:
-        raise AssertionError("publication preflight/main schema probes changed")
+    if result.publication_schema_probe_calls != 1:
+        raise AssertionError("publication measured-main schema probe changed")
     if result.publication_ddl_calls != 12:
         raise AssertionError("publication initialization DDL ledger changed")
     if result.publication_update_calls != result.unreconciled_records:

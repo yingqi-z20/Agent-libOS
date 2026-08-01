@@ -1,5 +1,5 @@
-import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LLMProfileInput, LLMProfileSummary, McpServerSummary, ModuleSummary, ObjectTask, OperationListResponse, RuntimeHealth, RuntimeSnapshot, SchedulerStatus, SkillSummary, SseMessage, StreamConnectionStatus, WorkflowRunResult } from "./types";
-import { assertRuntimeSnapshot, assertSchedulerStatus } from "./types";
+import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LLMProfileInput, LLMProfileSummary, McpServerSummary, ModuleSummary, ObjectTask, OperationListResponse, RuntimeHealth, RuntimeSnapshot, SchedulerStatus, SkillSummary, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunPage, TaskRunSpecV1, TaskRunStatus, TaskRunSummary, WorkflowRunResult } from "./types";
+import { assertRuntimeSnapshot, assertSchedulerStatus, assertTaskRunDetail, assertTaskRunSummary } from "./types";
 import type { OptionalQuanta } from "../quanta";
 
 type JsonBody = Record<string, unknown>;
@@ -34,6 +34,172 @@ export class LibOSClient {
 
   async health(): Promise<RuntimeHealth> {
     return this.request<RuntimeHealth>("GET", "/api/health");
+  }
+
+  async listTaskRuns(params: { statuses?: TaskRunStatus[]; limit?: number; cursor?: string } = {}): Promise<TaskRunPage> {
+    const query = new URLSearchParams();
+    if (params.statuses?.length) query.set("status", params.statuses.join(","));
+    if (params.limit !== undefined) query.set("limit", String(params.limit));
+    if (params.cursor) query.set("cursor", params.cursor);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return taskRunPage(await this.request<unknown>("GET", `/api/task-runs${suffix}`));
+  }
+
+  async createTaskRun(
+    spec: TaskRunSpecV1,
+    clientRequestId: string
+  ): Promise<TaskRunSummary> {
+    const payload = await this.request<unknown>("POST", "/api/task-runs", {
+      spec,
+      client_request_id: requiredCommandId(clientRequestId, "clientRequestId")
+    });
+    return taskRunSummary(payload);
+  }
+
+  async getTaskRun(
+    runId: string,
+    options: { requirementsLimit?: number; requirementsCursor?: string } = {}
+  ): Promise<TaskRunDetail> {
+    const query = new URLSearchParams();
+    if (options.requirementsLimit !== undefined) query.set("requirements_limit", String(options.requirementsLimit));
+    if (options.requirementsCursor) query.set("requirements_cursor", options.requirementsCursor);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const value = await this.request<unknown>("GET", `/api/task-runs/${encodeURIComponent(runId)}${suffix}`);
+    assertTaskRunDetail(value);
+    if (value.summary.run_id !== runId) {
+      throw new Error("GUI task run detail identity does not match the requested run id.");
+    }
+    return value;
+  }
+
+  async listTaskRunLedger(runId: string, limit = 100, cursor?: string): Promise<TaskRunLedgerPage> {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (cursor) query.set("cursor", cursor);
+    return taskRunLedgerPage(await this.request<unknown>(
+      "GET",
+      `/api/task-runs/${encodeURIComponent(runId)}/ledger?${query.toString()}`
+    ));
+  }
+
+  async listTaskRunHumanRequests(
+    runId: string,
+    limit = 100,
+    cursor?: string,
+    statuses?: readonly string[]
+  ): Promise<TaskRunHumanRequestPage> {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (cursor) query.set("cursor", cursor);
+    if (statuses?.length) query.set("status", statuses.join(","));
+    return taskRunHumanRequestPage(await this.request<unknown>(
+      "GET",
+      `/api/task-runs/${encodeURIComponent(runId)}/human-requests?${query.toString()}`
+    ));
+  }
+
+  async getHumanRequest(requestId: string): Promise<HumanRequest> {
+    const value = await this.request<unknown>("GET", `/api/human-requests/${encodeURIComponent(requestId)}`);
+    const request = humanRequest(value);
+    if (request.request_id !== requestId) throw new Error("GUI human request identity does not match the requested id.");
+    return request;
+  }
+
+  async runTaskRun(runId: string, expectedRevision: number, commandId: string, maxQuanta: OptionalQuanta): Promise<TaskRunSummary> {
+    return this.taskRunMutation(runId, "run", withOptionalQuanta(
+      taskRunCommand(expectedRevision, commandId),
+      maxQuanta
+    ));
+  }
+
+  async pauseTaskRun(runId: string, expectedRevision: number, commandId: string): Promise<TaskRunSummary> {
+    return this.taskRunMutation(runId, "pause", taskRunCommand(expectedRevision, commandId));
+  }
+
+  async resumeTaskRun(runId: string, expectedRevision: number, commandId: string): Promise<TaskRunSummary> {
+    return this.taskRunMutation(runId, "resume", taskRunCommand(expectedRevision, commandId));
+  }
+
+  async cancelTaskRun(runId: string, expectedRevision: number, commandId: string, confirmed: boolean, reason = "cancelled from GUI"): Promise<TaskRunSummary> {
+    return this.taskRunMutation(runId, "cancel", {
+      ...taskRunCommand(expectedRevision, commandId),
+      confirmed,
+      reason
+    });
+  }
+
+  async followUpTaskRun(
+    runId: string,
+    body: string,
+    expectedRevision: number,
+    commandId: string,
+    options: { kind?: "normal" | "interrupt"; required?: boolean } = {}
+  ): Promise<TaskRunSummary> {
+    return this.taskRunMutation(runId, "follow-ups", {
+      ...taskRunCommand(expectedRevision, commandId),
+      body,
+      kind: options.kind ?? "normal",
+      required: options.required ?? true
+    });
+  }
+
+  async recoverTaskRun(
+    runId: string,
+    optionId: string,
+    expectedRevision: number,
+    commandId: string,
+    confirmed: boolean,
+    receipt?: Record<string, unknown>
+  ): Promise<TaskRunSummary> {
+    return this.taskRunMutation(runId, "recover", {
+      ...taskRunCommand(expectedRevision, commandId),
+      option_id: optionId,
+      confirmed,
+      ...(receipt ? { receipt } : {})
+    });
+  }
+
+  async rerunTaskRun(
+    runId: string,
+    expectedRevision: number,
+    commandId: string,
+    options: { clientRequestId?: string; specOverrides?: Partial<TaskRunSpecV1> } = {}
+  ): Promise<TaskRunSummary> {
+    return this.taskRunMutation(runId, "rerun", {
+      ...taskRunCommand(expectedRevision, commandId),
+      // The linked create has its own idempotency namespace. Deriving its
+      // default from the stable command id keeps transport retries identical.
+      client_request_id: options.clientRequestId ?? `${commandId}:create`,
+      ...(options.specOverrides ? { spec_overrides: options.specOverrides } : {})
+    });
+  }
+
+  private async taskRunMutation(runId: string, action: string, body: JsonBody): Promise<TaskRunSummary> {
+    try {
+      const value = await this.request<unknown>(
+        "POST",
+        `/api/task-runs/${encodeURIComponent(runId)}/${action}`,
+        body
+      );
+      return taskRunSummary(value);
+    } catch (error) {
+      if (!isTaskRunConflict(error)) throw error;
+      let currentSummary = taskRunConflictSummary(error);
+      try {
+        const detail = await this.getTaskRun(runId);
+        if (
+          !currentSummary
+          || (
+            detail.summary.run_id === currentSummary.run_id
+            && detail.summary.revision > currentSummary.revision
+          )
+        ) {
+          currentSummary = detail.summary;
+        }
+      } catch {
+        // Keep the original stable 409. The App-level snapshot refresh is the
+        // final reconciliation fallback when this exact detail read fails.
+      }
+      throw new TaskRunMutationError(error, currentSummary);
+    }
   }
 
   async listOperations(pid: string, limit = 100, cursor?: string, options: RequestOptions = {}): Promise<OperationListResponse> {
@@ -683,6 +849,51 @@ export class ApiError extends Error {
   }
 }
 
+export class TaskRunMutationError extends ApiError {
+  constructor(
+    readonly original: ApiError,
+    readonly currentSummary: TaskRunSummary | null
+  ) {
+    super(original.message, original.status, original.payload);
+    this.name = "TaskRunMutationError";
+  }
+}
+
+export function isTaskRunConflict(error: unknown): error is ApiError {
+  if (!(error instanceof ApiError) || error.status !== 409) return false;
+  const envelope = taskRunErrorEnvelope(error);
+  return typeof envelope?.code === "string" && envelope.code.startsWith("task_run_")
+    && envelope.code.endsWith("conflict");
+}
+
+export function isUnadmittedTaskRunRevisionConflict(error: unknown): boolean {
+  if (!isTaskRunConflict(error)) return false;
+  const envelope = taskRunErrorEnvelope(error);
+  return envelope?.code === "task_run_revision_conflict"
+    && envelope.command_admitted === false
+    && taskRunConflictSummary(error) !== null;
+}
+
+export function taskRunConflictSummary(error: unknown): TaskRunSummary | null {
+  if (error instanceof TaskRunMutationError) return error.currentSummary;
+  if (!isTaskRunConflict(error)) return null;
+  const envelope = taskRunErrorEnvelope(error);
+  try {
+    return taskRunSummary(envelope?.current_summary);
+  } catch {
+    return null;
+  }
+}
+
+function taskRunErrorEnvelope(error: ApiError): Record<string, unknown> | null {
+  const payload = error.payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const envelope = (payload as { error?: unknown }).error;
+  return envelope && typeof envelope === "object" && !Array.isArray(envelope)
+    ? envelope as Record<string, unknown>
+    : null;
+}
+
 function withOptionalQuanta(body: JsonBody, maxQuanta: OptionalQuanta): JsonBody {
   return maxQuanta === null ? body : { ...body, max_quanta: maxQuanta };
 }
@@ -740,6 +951,91 @@ export function objectTaskWaitDeadlineMs(timeoutS?: number): number | null {
     throw new Error("GUI object-task wait timeout exceeds the supported deadline range.");
   }
   return deadlineMs;
+}
+
+function taskRunCommand(expectedRevision: number, commandId: string): JsonBody {
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+    throw new Error("GUI task-run expected revision must be a non-negative safe integer.");
+  }
+  return {
+    expected_revision: expectedRevision,
+    command_id: requiredCommandId(commandId, "commandId")
+  };
+}
+
+function requiredCommandId(value: string, name: string): string {
+  const selected = value.trim();
+  if (!selected) throw new Error(`GUI task-run ${name} must be non-empty.`);
+  return selected;
+}
+
+function taskRunSummary(value: unknown): TaskRunSummary {
+  assertTaskRunSummary(value);
+  return value;
+}
+
+function taskRunPage(value: unknown): TaskRunPage {
+  const page = pagedItems(value, "task run");
+  for (const item of page.items) assertTaskRunSummary(item);
+  return page as TaskRunPage;
+}
+
+function taskRunLedgerPage(value: unknown): TaskRunLedgerPage {
+  const page = pagedItems(value, "task run ledger");
+  for (const item of page.items) {
+    if (!isJsonObject(item)
+        || item.schema_version !== 1
+        || typeof item.item_id !== "string"
+        || typeof item.run_id !== "string"
+        || !Number.isSafeInteger(item.seq)
+        || Number(item.seq) < 0
+        || !["requirement", "process", "llm_turn", "tool_call", "human_wait", "message_wait", "checkpoint", "effect", "status_transition"].includes(String(item.kind))
+        || typeof item.status !== "string"
+        || typeof item.label !== "string"
+        || typeof item.occurred_at !== "string"
+        || !isJsonObject(item.metadata)) {
+      throw new Error("GUI task run ledger page contains a malformed item.");
+    }
+  }
+  return page as TaskRunLedgerPage;
+}
+
+function taskRunHumanRequestPage(value: unknown): TaskRunHumanRequestPage {
+  const page = pagedItems(value, "task run human request");
+  if (!isJsonObject(value) || typeof value.presentation_truncated !== "boolean") {
+    throw new Error("GUI task run human request page truncation state is malformed.");
+  }
+  for (const item of page.items) humanRequest(item);
+  return { ...page, presentation_truncated: value.presentation_truncated } as TaskRunHumanRequestPage;
+}
+
+function humanRequest(value: unknown): HumanRequest {
+  if (!isJsonObject(value)
+      || typeof value.request_id !== "string" || !value.request_id
+      || typeof value.pid !== "string" || !value.pid
+      || typeof value.human !== "string" || !value.human
+      || !isJsonObject(value.payload)
+      || typeof value.status !== "string" || !value.status
+      || !(value.decision === null || isJsonObject(value.decision))
+      || typeof value.blocking !== "boolean"
+      || typeof value.created_at !== "string" || !value.created_at
+      || typeof value.updated_at !== "string" || !value.updated_at
+      || (value.release_request_id !== undefined && typeof value.release_request_id !== "string")
+      || (value.release_for_request_id !== undefined && typeof value.release_for_request_id !== "string")) {
+    throw new Error("GUI human request response is malformed.");
+  }
+  return value as HumanRequest;
+}
+
+function pagedItems(value: unknown, label: string): { items: unknown[]; next_cursor: string | null; has_more: boolean } {
+  if (!isJsonObject(value) || !Array.isArray(value.items) || typeof value.has_more !== "boolean") {
+    throw new Error(`GUI ${label} page response is malformed.`);
+  }
+  const cursor = value.next_cursor;
+  if (!(cursor === null || typeof cursor === "string")) {
+    throw new Error(`GUI ${label} page cursor is malformed.`);
+  }
+  return { items: value.items, next_cursor: cursor, has_more: value.has_more };
 }
 
 function capabilityPageResponse(payload: unknown): CapabilityPageResponse {

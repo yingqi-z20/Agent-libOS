@@ -618,10 +618,14 @@ class TestCLIBuiltinCommand:
     def test_cli_unsupported_store_version_uses_structured_error_and_exit_one(
         self,
     ) -> None:
-        message = "unsupported Agent libOS store schema: 2; expected 3"
+        message = (
+            "Agent libOS store schema v3 is not writable or readable by 1.1.0; "
+            "expected 4. Use Agent libOS 1.0.1 to view or archive this store. "
+            "No migration was attempted."
+        )
         with tempfile.TemporaryDirectory() as temp_dir:
             db = Path(temp_dir) / "unsupported.sqlite"
-            _create_store_with_schema_version(db, 2)
+            _create_store_with_schema_version(db, 3)
             stdout = io.StringIO()
             stderr = io.StringIO()
 
@@ -641,10 +645,14 @@ class TestCLIBuiltinCommand:
             }
 
     def test_python_module_entrypoint_uses_structured_error_boundary(self) -> None:
-        message = "unsupported Agent libOS store schema: 2; expected 3"
+        message = (
+            "Agent libOS store schema v3 is not writable or readable by 1.1.0; "
+            "expected 4. Use Agent libOS 1.0.1 to view or archive this store. "
+            "No migration was attempted."
+        )
         with tempfile.TemporaryDirectory() as temp_dir:
             db = Path(temp_dir) / "unsupported.sqlite"
-            _create_store_with_schema_version(db, 2)
+            _create_store_with_schema_version(db, 3)
 
             result = subprocess.run(
                 [sys.executable, "-m", "agent_libos", "--db", str(db), "init"],

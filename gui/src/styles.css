@@ -1440,6 +1440,262 @@ textarea {
   min-width: 0;
 }
 
+.taskRunLedger {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.taskRunsPanel,
+.taskRunsPanel > *,
+.taskRunRecoveryControls {
+  min-width: 0;
+}
+
+.taskRunsPanel {
+  overflow-wrap: anywhere;
+}
+
+.taskRunsPanel select,
+.taskRunsPanel input,
+.taskRunsPanel textarea,
+.taskRunsPanel button {
+  max-width: 100%;
+}
+
+.taskRunLifecycleActions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 8rem), 1fr));
+}
+
+.taskRunLifecycleActions > button {
+  width: 100%;
+  min-width: 0;
+  white-space: normal;
+}
+
+.taskRunStatusDetail {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+}
+
+.taskRunStatusDetail svg {
+  flex: 0 0 auto;
+}
+
+.taskRunBlockerSection h4 {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.taskRunBlockers {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.taskRunBlockers li {
+  min-width: 0;
+  padding: 0.65rem;
+  border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.25));
+  border-radius: 0.55rem;
+}
+
+.taskRunBlockers p {
+  margin: 0.35rem 0 0;
+  white-space: pre-wrap;
+}
+
+.taskRunBlockers dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.2rem 0.55rem;
+  margin: 0.45rem 0 0;
+  font-size: 0.76rem;
+}
+
+.taskRunBlockers dt {
+  color: var(--text-muted, #6b7280);
+}
+
+.taskRunBlockers dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.taskRunLedger li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.25));
+  border-radius: 0.55rem;
+}
+
+.taskRunLedger li > span {
+  overflow-wrap: anywhere;
+}
+
+.taskRunLedgerIdentity {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.taskRunLedgerIdentity small,
+.taskRunLedgerStatus {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.taskRunLedgerIdentity small {
+  color: var(--text-muted, #6b7280);
+}
+
+.taskRunLedgerStatus {
+  font-size: 0.78rem;
+}
+
+.taskRetention,
+.taskPayloadState,
+.taskRequirements {
+  margin: 0.35rem 0 0;
+  font-size: 0.78rem;
+  color: var(--text-muted, #6b7280);
+}
+
+.userRunRequirements {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.55rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.userRunRequirements li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.2rem 0.5rem;
+  min-width: 0;
+  padding-top: 0.45rem;
+  border-top: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.2));
+  font-size: 0.76rem;
+}
+
+.userRunRequirements p,
+.userRunRequirements small {
+  grid-column: 1 / -1;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.taskRunRequirements ol {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.taskRunRequirements li {
+  min-width: 0;
+  padding: 0.65rem;
+  border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.25));
+  border-radius: 0.55rem;
+}
+
+.taskRunRequirements li > div {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.taskRunRequirements li > div > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.taskRunRequirements pre,
+.taskRunRequirements small {
+  display: block;
+  max-width: 100%;
+  margin: 0.45rem 0 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.taskRunRequirementCounts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 8rem), 1fr));
+  gap: 0.4rem;
+  margin: 0.5rem 0;
+}
+
+.taskRunRequirementCounts > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.65rem;
+  min-width: 0;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.2));
+  border-radius: 0.45rem;
+}
+
+.taskRunRequirementCounts dt,
+.taskRunRequirementCounts dd,
+.taskRunRetentionPolicy,
+.taskRunPayloadState {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.taskRunsPanel .adminInlineForm {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.taskRunsPanel .adminInlineForm > button {
+  white-space: normal;
+}
+
+@media (max-width: 420px) {
+  .taskRunsPanel .adminPanelHeader,
+  .taskRunsPanel .adminInlineForm,
+  .taskRunRequirements li > div {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .taskRunsPanel .adminInlineForm > button,
+  .taskRunRequirements > button,
+  .taskRunRecoveryControls .adminActions > button {
+    width: 100%;
+  }
+
+  .taskRunLedger li {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .taskRunLedger li > button {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+}
+
 .factGrid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

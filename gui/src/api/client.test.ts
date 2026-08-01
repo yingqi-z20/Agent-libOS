@@ -3,6 +3,7 @@ import {
   ApiError,
   capabilityInventoryMaxItems,
   capabilityInventoryMaxPages,
+  isUnadmittedTaskRunRevisionConflict,
   LibOSClient,
   objectTaskWaitDeadlineMarginMs,
   objectTaskWaitDeadlineMs,
@@ -298,7 +299,7 @@ describe("LibOSClient", () => {
   });
 
   it("rejects malformed snapshots and retains structured API error context", async () => {
-    const malformedFetch = mockFetch({ db: "local", scheduler: {}, processes: [] });
+    const malformedFetch = mockFetch({ schema_version: 2, db: "local", scheduler: {}, processes: [] });
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
     await expect(client.snapshot()).rejects.toThrow(/scheduler/);
     expect(malformedFetch).toHaveBeenCalledTimes(1);
@@ -470,6 +471,206 @@ describe("LibOSClient", () => {
 
     expect(urls[1]).toContain("cursor=7");
   });
+
+  it("uses revision-fenced, idempotent durable run mutations and explicit confirmations", async () => {
+    const fetchMock = mockFetch(taskRunSummary());
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.createTaskRun({
+      schema_version: 1,
+      goal: "finish",
+      display_title: "Finish",
+      image_id: "coding-agent:v0",
+      retention: "purge_on_terminal"
+    }, "create-1");
+    await client.runTaskRun("run/1", 4, "run-1", 8);
+    await client.cancelTaskRun("run/1", 4, "cancel-1", true, "stop");
+    await client.followUpTaskRun("run/1", "durable follow-up", 4, "follow-up-1", {
+      kind: "interrupt",
+      required: true
+    });
+    await client.recoverTaskRun("run/1", "register-receipt", 4, "recover-1", true, { receipt_id: "r1" });
+    await client.rerunTaskRun("run/1", 4, "rerun-1", {
+      specOverrides: { goal: "replacement goal" }
+    });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "http://127.0.0.1:1/api/task-runs", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({
+        spec: { schema_version: 1, goal: "finish", display_title: "Finish", image_id: "coding-agent:v0", retention: "purge_on_terminal" },
+        client_request_id: "create-1"
+      })
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "http://127.0.0.1:1/api/task-runs/run%2F1/run", expect.objectContaining({
+      body: JSON.stringify({ expected_revision: 4, command_id: "run-1", max_quanta: 8 })
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "http://127.0.0.1:1/api/task-runs/run%2F1/cancel", expect.objectContaining({
+      body: JSON.stringify({ expected_revision: 4, command_id: "cancel-1", confirmed: true, reason: "stop" })
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(4, "http://127.0.0.1:1/api/task-runs/run%2F1/follow-ups", expect.objectContaining({
+      body: JSON.stringify({
+        expected_revision: 4,
+        command_id: "follow-up-1",
+        body: "durable follow-up",
+        kind: "interrupt",
+        required: true
+      })
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(5, "http://127.0.0.1:1/api/task-runs/run%2F1/recover", expect.objectContaining({
+      body: JSON.stringify({ expected_revision: 4, command_id: "recover-1", option_id: "register-receipt", confirmed: true, receipt: { receipt_id: "r1" } })
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(6, "http://127.0.0.1:1/api/task-runs/run%2F1/rerun", expect.objectContaining({
+      body: JSON.stringify({
+        expected_revision: 4,
+        command_id: "rerun-1",
+        client_request_id: "rerun-1:create",
+        spec_overrides: { goal: "replacement goal" }
+      })
+    }));
+  });
+
+  it("sends durable pause without an unsupported reason field", async () => {
+    const fetchMock = mockFetch(taskRunSummary());
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.pauseTaskRun("run/1", 4, "pause-1");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/task-runs/run%2F1/pause",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ expected_revision: 4, command_id: "pause-1" })
+      })
+    );
+  });
+
+  it("reconciles a stable TaskRun 409 through an exact detail read without retrying the mutation", async () => {
+    const conflictSummary = { ...taskRunSummary(), revision: 5 };
+    const latestSummary = { ...taskRunSummary(), revision: 6 };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(errorJsonResponse(409, {
+        ok: false,
+        error: {
+          type: "TaskRunRevisionConflict",
+          code: "task_run_revision_conflict",
+          message: "stale TaskRun revision",
+          command_admitted: false,
+          current_summary: conflictSummary
+        }
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        summary: latestSummary,
+        requirements: { items: [], next_cursor: null, has_more: false },
+        recovery_options: []
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    let rejected: unknown;
+    try {
+      await client.pauseTaskRun("run_1", 4, "pause-stale");
+    } catch (error) {
+      rejected = error;
+    }
+
+    expect(rejected).toBeInstanceOf(ApiError);
+    expect(isUnadmittedTaskRunRevisionConflict(rejected)).toBe(true);
+    expect((rejected as { currentSummary?: unknown }).currentSummary).toEqual(latestSummary);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://127.0.0.1:1/api/task-runs/run_1/pause",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ expected_revision: 4, command_id: "pause-stale" })
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:1/api/task-runs/run_1",
+      expect.objectContaining({ method: "GET" })
+    );
+  });
+
+  it("never rotates a command conflict or an admitted revision conflict", () => {
+    const commandConflict = new ApiError("conflict", 409, {
+      error: { code: "task_run_command_conflict", command_admitted: true }
+    });
+    const admittedRevision = new ApiError("conflict", 409, {
+      error: { code: "task_run_revision_conflict", command_admitted: true }
+    });
+
+    expect(isUnadmittedTaskRunRevisionConflict(commandConflict)).toBe(false);
+    expect(isUnadmittedTaskRunRevisionConflict(admittedRevision)).toBe(false);
+  });
+
+  it("uses exact human-request reconciliation and authorized run-detail pages", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        summary: { ...taskRunSummary(), run_id: "run/1" },
+        requirements: { items: [], next_cursor: null, has_more: false },
+        recovery_options: []
+      }))
+      .mockResolvedValueOnce(jsonResponse({ items: [], next_cursor: null, has_more: false }))
+      .mockResolvedValueOnce(jsonResponse({
+        items: [{
+          request_id: "human/1",
+          pid: "pid_1",
+          human: "owner",
+          payload: { type: "approval" },
+          status: "pending",
+          decision: null,
+          blocking: true,
+          created_at: "2030-01-01T00:00:00Z",
+          updated_at: "2030-01-01T00:00:00Z"
+        }],
+        next_cursor: "human-cursor/2",
+        has_more: true,
+        presentation_truncated: false
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        request_id: "human/1",
+        pid: "pid_1",
+        human: "owner",
+        payload: { type: "approval" },
+        status: "pending",
+        decision: null,
+        blocking: true,
+        created_at: "2030-01-01T00:00:00Z",
+        updated_at: "2030-01-01T00:00:00Z"
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.getTaskRun("run/1");
+    await client.listTaskRunLedger("run/1", 50, "cursor/1");
+    await client.listTaskRunHumanRequests("run/1", 25, "human-cursor/1", ["pending"]);
+    await client.getHumanRequest("human/1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "http://127.0.0.1:1/api/task-runs/run%2F1", expect.objectContaining({ method: "GET" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "http://127.0.0.1:1/api/task-runs/run%2F1/ledger?limit=50&cursor=cursor%2F1", expect.objectContaining({ method: "GET" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "http://127.0.0.1:1/api/task-runs/run%2F1/human-requests?limit=25&cursor=human-cursor%2F1&status=pending", expect.objectContaining({ method: "GET" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(4, "http://127.0.0.1:1/api/human-requests/human%2F1", expect.objectContaining({ method: "GET" }));
+  });
+
+  it("rejects an exact Human response with a mismatched identity", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
+      request_id: "human-other",
+      pid: "pid_1",
+      human: "owner",
+      payload: { type: "approval" },
+      status: "pending",
+      decision: null,
+      blocking: true,
+      created_at: "2030-01-01T00:00:00Z",
+      updated_at: "2030-01-01T00:00:00Z"
+    })));
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await expect(client.getHumanRequest("human-requested")).rejects.toThrow(
+      "identity does not match"
+    );
+  });
 });
 
 function mockFetch(payload: unknown) {
@@ -486,11 +687,35 @@ function jsonResponse(payload: unknown) {
   };
 }
 
+function errorJsonResponse(status: number, payload: unknown) {
+  return {
+    ok: false,
+    status,
+    json: vi.fn().mockResolvedValue(payload)
+  };
+}
+
 function capability(capId: string) {
   return {
     cap_id: capId,
     subject: "pid/1",
     resource: `object:${capId}`,
     rights: ["read"]
+  };
+}
+
+function taskRunSummary() {
+  return {
+    schema_version: 1,
+    run_id: "run_1",
+    revision: 4,
+    status: "paused",
+    display_title: "Finish",
+    root_pid: "pid_1",
+    active_pid: "pid_1",
+    allowed_actions: ["resume", "cancel", "recover"],
+    blockers: [],
+    retention: "purge_on_terminal",
+    payloads_purged: false
   };
 }

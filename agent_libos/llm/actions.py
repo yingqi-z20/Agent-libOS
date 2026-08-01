@@ -6,7 +6,7 @@ from typing import Any
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.action_parser import parse_json_action
 from agent_libos.llm.tool_protocol import tool_call_to_action
-from agent_libos.models import ResourceUsage, ToolCallResult
+from agent_libos.models import ResourceUsage, ToolCallResult, ToolHandle
 from agent_libos.models.exceptions import ResourceLimitExceeded
 from agent_libos.storage.repositories import ProcessRepository
 from agent_libos.tools.base import model_safe_tool_error_message
@@ -28,7 +28,10 @@ class LLMActionService:
         tool_call_args_hard_limit_bytes: int = (
             DEFAULT_CONFIG.tools.tool_call_args_hard_limit_bytes
         ),
-        pre_tool_notice: Callable[[str, str, dict[str, Any]], dict[str, Any] | None],
+        pre_tool_notice: Callable[
+            [str, str, dict[str, Any], dict[str, Any] | None],
+            dict[str, Any] | None,
+        ],
         post_tool_notice: Callable[[str], dict[str, Any] | None],
         publish_result: Callable[[str, Any], None],
     ) -> None:
@@ -188,11 +191,13 @@ class LLMActionService:
         action: dict[str, Any],
         *,
         context_metadata: dict[str, Any] | None = None,
+        expected_tool_id: str | None = None,
     ) -> dict[str, Any]:
         name, args = split_action(action)
-        if notice := self._pre_tool_notice(pid, name, args):
+        if notice := self._pre_tool_notice(pid, name, args, context_metadata):
             return notice
-        result = self._tools.call(pid, name, args, context_metadata=context_metadata)
+        tool = self._exact_tool_binding(pid, name, expected_tool_id)
+        result = self._tools.call(pid, tool, args, context_metadata=context_metadata)
         return self._result(
             pid,
             result,
@@ -208,11 +213,18 @@ class LLMActionService:
         action: dict[str, Any],
         *,
         context_metadata: dict[str, Any] | None = None,
+        expected_tool_id: str | None = None,
     ) -> dict[str, Any]:
         name, args = split_action(action)
-        if notice := self._pre_tool_notice(pid, name, args):
+        if notice := self._pre_tool_notice(pid, name, args, context_metadata):
             return notice
-        result = await self._tools.acall(pid, name, args, context_metadata=context_metadata)
+        tool = self._exact_tool_binding(pid, name, expected_tool_id)
+        result = await self._tools.acall(
+            pid,
+            tool,
+            args,
+            context_metadata=context_metadata,
+        )
         return self._result(
             pid,
             result,
@@ -228,6 +240,7 @@ class LLMActionService:
         action: dict[str, Any],
         *,
         context_metadata: dict[str, Any] | None = None,
+        expected_tool_id: str | None = None,
     ) -> dict[str, Any]:
         """Dispatch only the executor's verified empty-response wait fallback."""
 
@@ -236,7 +249,37 @@ class LLMActionService:
             pid,
             action,
             context_metadata=context_metadata,
+            expected_tool_id=expected_tool_id,
         )
+
+    def _exact_tool_binding(
+        self,
+        pid: str,
+        name: str,
+        expected_tool_id: str | None,
+    ) -> ToolHandle | str:
+        if expected_tool_id is None:
+            return name
+        if not isinstance(expected_tool_id, str) or not expected_tool_id:
+            raise ValueError("expected durable tool identity is invalid")
+        process = self._processes.get_process(pid)
+        if process is None:
+            raise ValueError(f"selected action process does not exist: {pid}")
+        if process.tool_table.get(name) != expected_tool_id:
+            raise ValueError(
+                f"durable TaskRun tool binding changed before dispatch: {name}"
+            )
+        try:
+            handle = self._tools.resolve(expected_tool_id, pid=pid)
+        except Exception as exc:
+            raise ValueError(
+                f"durable TaskRun exact tool binding cannot be resolved: {name}"
+            ) from exc
+        if handle.tool_id != expected_tool_id or handle.name != name:
+            raise ValueError(
+                f"durable TaskRun exact tool identity changed before dispatch: {name}"
+            )
+        return handle
 
     def _result(
         self,

@@ -8,6 +8,7 @@ from agent_libos.models.base import EventID, StrEnum
 
 class EventType(StrEnum):
     RUNTIME_SHUTDOWN = "runtime_shutdown"
+    TASK_RUN_CREATED = "task_run_created"
     PROCESS_CREATED = "process_created"
     PROCESS_FORKED = "process_forked"
     PROCESS_EXEC = "process_exec"

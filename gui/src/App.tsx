@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, AlertTriangle, ChevronDown, CirclePlus, PanelRight, Send, Settings } from "lucide-react";
-import { LibOSClient } from "./api/client";
-import { assertSchedulerStatus, runtimeSnapshotFromSseData } from "./api/types";
-import type { GuiConnection, HumanRequest, HumanResponseInput, RuntimeProcess, RuntimeSnapshot, SchedulerStatus, StreamConnectionStatus } from "./api/types";
+import {
+  isUnadmittedTaskRunRevisionConflict,
+  LibOSClient,
+  taskRunConflictSummary
+} from "./api/client";
+import { allowedTaskRunActions, assertSchedulerStatus, runtimeSnapshotFromSseData, taskRunSummaryFromSseData } from "./api/types";
+import type { GuiConnection, HumanRequest, HumanResponseInput, RuntimeProcess, RuntimeSnapshot, SchedulerStatus, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunSpecV1, TaskRunSummary } from "./api/types";
 import { AppNotices, LoadingScreen } from "./components/AppNotices";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { DetailTabs } from "./components/DetailTabs";
@@ -16,12 +20,12 @@ import { processStatusLabel, processStatusTone, UserPage } from "./components/Us
 import type { TaskLaunchSettings } from "./components/UserTaskSettingsDialog";
 import { useI18n } from "./i18n";
 import { parseQuantaDraft } from "./quanta";
-import { processFromMutationResult, reconcileSelectedPid, upsertRuntimeProcess } from "./selection";
+import { mergeRuntimeTaskRuns, processFromMutationResult, reconcileSelectedPid, reconcileSelectedRunId, upsertRuntimeProcess, upsertRuntimeTaskRun } from "./selection";
 import { runOrResumeProcess } from "./runControl";
 import type { LLMProfileInput } from "./api/types";
 import type { ConfirmationRequest } from "./adminTypes";
 import { developmentConnection } from "./developmentConnection";
-import { buildGuiTaskAuthorityManifest, DEFAULT_CONTEXT_MAINTENANCE, type CommandAccess, type WorkspaceAccess } from "./taskAuthority";
+import { buildGuiDurableTaskAuthority, buildGuiTaskAuthorityManifest, DEFAULT_DURABLE_TASK_LAUNCH, type CommandAccess, type WorkspaceAccess } from "./taskAuthority";
 import {
   shortProcessId,
   taskDisplayLabel,
@@ -30,10 +34,24 @@ import {
   taskLabelsFromStorage
 } from "./taskPresentation";
 import { SnapshotEpoch } from "./snapshotEpoch";
+import {
+  createAndRunTaskRun,
+  clearTaskRunFollowUpDraft,
+  rotateUnadmittedTaskRunStartCommand,
+  submitTaskRunFollowUp,
+  taskRunFollowUpIntent,
+  taskRunMutationIntent,
+  taskRunStartIntent,
+  type TaskRunFollowUpIntent,
+  type TaskRunMutationIntent,
+  type TaskRunMutationKind,
+  type TaskRunStartIntent
+} from "./taskRunControl";
 
 type PendingConfirm = ConfirmationRequest;
 const TASK_LABELS_STORAGE_KEY = "agent-libos.gui.task-labels";
 const SELECTED_PID_STORAGE_KEY = "agent-libos.gui.selected-pid";
+const SELECTED_RUN_STORAGE_KEY = "agent-libos.gui.selected-run-id";
 
 export function App() {
   const { t } = useI18n();
@@ -42,15 +60,22 @@ export function App() {
   const [client, setClient] = useState<LibOSClient | null>(null);
   const [snapshot, setSnapshot] = useState<RuntimeSnapshot | null>(null);
   const [selectedPid, setSelectedPid] = useState<string | null>(readStoredSelectedPid);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(readStoredSelectedRunId);
+  const [selectedRunDetail, setSelectedRunDetail] = useState<TaskRunDetail | null>(null);
+  const [selectedRunHumanPage, setSelectedRunHumanPage] = useState<(
+    TaskRunHumanRequestPage & { run_id: string; revision: number }
+  ) | null>(null);
+  const [selectedRunHumanLoading, setSelectedRunHumanLoading] = useState(false);
   const [maxQuantaInput, setMaxQuantaInput] = useState("");
   const [spawnGoal, setSpawnGoal] = useState("");
-  const [spawnImage, setSpawnImage] = useState("coding-agent:v0");
-  const [spawnLlmProfile, setSpawnLlmProfile] = useState("");
-  const [spawnWorkingDirectory, setSpawnWorkingDirectory] = useState("");
-  const [spawnWorkspaceAccess, setSpawnWorkspaceAccess] = useState<WorkspaceAccess>("edit");
-  const [spawnAllowGitRequests, setSpawnAllowGitRequests] = useState(true);
-  const [spawnCommandAccess, setSpawnCommandAccess] = useState<CommandAccess>("none");
-  const [spawnContextMaintenance, setSpawnContextMaintenance] = useState(DEFAULT_CONTEXT_MAINTENANCE);
+  const [spawnImage, setSpawnImage] = useState<string>(DEFAULT_DURABLE_TASK_LAUNCH.imageId);
+  const [spawnLlmProfile, setSpawnLlmProfile] = useState<string>(DEFAULT_DURABLE_TASK_LAUNCH.llmProfileId);
+  const [spawnWorkingDirectory, setSpawnWorkingDirectory] = useState<string>(DEFAULT_DURABLE_TASK_LAUNCH.workingDirectory);
+  const [spawnWorkspaceAccess, setSpawnWorkspaceAccess] = useState<WorkspaceAccess>(DEFAULT_DURABLE_TASK_LAUNCH.workspaceAccess);
+  const [spawnAllowGitRequests, setSpawnAllowGitRequests] = useState<boolean>(DEFAULT_DURABLE_TASK_LAUNCH.allowGitRequests);
+  const [spawnCommandAccess, setSpawnCommandAccess] = useState<CommandAccess>(DEFAULT_DURABLE_TASK_LAUNCH.commandAccess);
+  const [spawnContextMaintenance, setSpawnContextMaintenance] = useState<boolean>(DEFAULT_DURABLE_TASK_LAUNCH.contextMaintenance);
+  const [spawnAuthorityManifestId, setSpawnAuthorityManifestId] = useState<string>(DEFAULT_DURABLE_TASK_LAUNCH.authorityManifestId);
   const [spawnPanelOpen, setSpawnPanelOpen] = useState(false);
   const [taskLabels, setTaskLabels] = useState<Record<string, string>>(readStoredTaskLabels);
   const [messageDrafts, setMessageDrafts] = useState<Record<string, string>>({});
@@ -73,12 +98,18 @@ export function App() {
   const abortRef = useRef<AbortController | null>(null);
   const requestAbortRef = useRef<AbortController | null>(null);
   const activeClientRef = useRef<LibOSClient | null>(null);
+  const snapshotStateRef = useRef<RuntimeSnapshot | null>(null);
   const initializationInFlightRef = useRef<Promise<void> | null>(null);
   const refreshInFlightRef = useRef<Promise<boolean> | null>(null);
   const actionGuardRef = useRef(false);
   const confirmGuardRef = useRef(false);
   const snapshotEpochRef = useRef(new SnapshotEpoch());
   const ambiguousHumanRequestsRef = useRef(new Set<string>());
+  const taskRunDetailEpochRef = useRef(0);
+  const taskRunHumanEpochRef = useRef(0);
+  const taskRunStartIntentRef = useRef<TaskRunStartIntent | null>(null);
+  const taskRunFollowUpIntentsRef = useRef(new Map<string, TaskRunFollowUpIntent>());
+  const taskRunMutationIntentsRef = useRef(new Map<string, TaskRunMutationIntent>());
   const quantaDraft = useMemo(() => parseQuantaDraft(maxQuantaInput), [maxQuantaInput]);
   const maxQuanta = quantaDraft.value;
   const taskLaunchSettings = useMemo<TaskLaunchSettings>(() => ({
@@ -89,17 +120,31 @@ export function App() {
     workspaceAccess: spawnWorkspaceAccess,
     allowGitRequests: spawnAllowGitRequests,
     commandAccess: spawnCommandAccess,
-    contextMaintenance: spawnContextMaintenance
+    contextMaintenance: spawnContextMaintenance,
+    authorityManifestId: spawnAuthorityManifestId
   }), [
     maxQuantaInput,
     spawnAllowGitRequests,
     spawnCommandAccess,
     spawnContextMaintenance,
+    spawnAuthorityManifestId,
     spawnImage,
     spawnLlmProfile,
     spawnWorkingDirectory,
     spawnWorkspaceAccess
   ]);
+
+  function replaceSnapshotState(next: RuntimeSnapshot | null): RuntimeSnapshot | null {
+    snapshotStateRef.current = next;
+    setSnapshot(next);
+    return next;
+  }
+
+  function updateSnapshotState(
+    updater: (current: RuntimeSnapshot | null) => RuntimeSnapshot | null
+  ): RuntimeSnapshot | null {
+    return replaceSnapshotState(updater(snapshotStateRef.current));
+  }
 
   function applyTaskLaunchSettings(next: TaskLaunchSettings) {
     setSpawnImage(next.image);
@@ -110,6 +155,7 @@ export function App() {
     setSpawnAllowGitRequests(next.allowGitRequests);
     setSpawnCommandAccess(next.commandAccess);
     setSpawnContextMaintenance(next.contextMaintenance);
+    setSpawnAuthorityManifestId(next.authorityManifestId);
   }
 
   useEffect(() => {
@@ -136,6 +182,15 @@ export function App() {
       // Selection persistence is optional in restricted renderer environments.
     }
   }, [selectedPid]);
+
+  useEffect(() => {
+    try {
+      if (selectedRunId) globalThis.sessionStorage?.setItem(SELECTED_RUN_STORAGE_KEY, selectedRunId);
+      else globalThis.sessionStorage?.removeItem(SELECTED_RUN_STORAGE_KEY);
+    } catch {
+      // Selection persistence is optional in restricted renderer environments.
+    }
+  }, [selectedRunId]);
 
   useEffect(() => {
     if (pendingConfirm) setConfirmError(null);
@@ -171,11 +226,28 @@ export function App() {
         try {
           const next = runtimeSnapshotFromSseData(message.data);
           snapshotEpochRef.current.acceptStreamSnapshot();
-          setSnapshot(next);
-          setSelectedPid((current) => reconcileSelectedPid(next, current));
+          const merged = updateSnapshotState((current) => current ? mergeRuntimeTaskRuns(next, current) : next);
+          if (!merged) return;
+          setSelectedPid((current) => reconcileSelectedPid(merged, current));
+          setSelectedRunId((current) => reconcileSelectedRunId(merged, current));
           setLastUpdatedAt(new Date());
         } catch (reason) {
           setError(describeError(reason, t("app.confirmationRequiredSuffix")));
+        }
+      }
+      if (message.event === "task_run.updated") {
+        try {
+          const run = taskRunSummaryFromSseData(message.data);
+          const current = snapshotStateRef.current;
+          const previous = current?.task_runs.find((item) => item.run_id === run.run_id);
+          if (!current || (previous && previous.revision >= run.revision)) return;
+          snapshotEpochRef.current.acceptStreamSnapshot();
+          updateSnapshotState((value) => value ? upsertRuntimeTaskRun(value, run) : value);
+          setSelectedRunId((current) => current ?? run.run_id);
+          setLastUpdatedAt(new Date());
+        } catch (reason) {
+          setError(describeError(reason, t("app.confirmationRequiredSuffix")));
+          void refresh();
         }
       }
       if (message.event === "snapshot_truncated" || message.event === "event.invalidated") {
@@ -204,14 +276,68 @@ export function App() {
     () => snapshot?.processes.find((process) => process.pid === selectedPid) ?? null,
     [snapshot, selectedPid]
   );
-  const message = selectedPid ? messageDrafts[selectedPid] ?? "" : "";
+  const selectedRun = useMemo(
+    () => snapshot?.task_runs.find((run) => run.run_id === selectedRunId) ?? null,
+    [snapshot, selectedRunId]
+  );
+  const visibleSelectedRunHumanPage = selectedRunHumanPage
+    && selectedRun
+    && selectedRunHumanPage.run_id === selectedRun.run_id
+    && selectedRunHumanPage.revision === selectedRun.revision
+    ? selectedRunHumanPage
+    : null;
+  useEffect(() => {
+    if (view !== "user" || !selectedRun) return;
+    const pid = selectedRun.active_pid ?? selectedRun.root_pid;
+    if (pid && pid !== selectedPid) setSelectedPid(pid);
+  }, [selectedRun?.run_id, selectedRun?.revision, selectedPid, view]);
+  useEffect(() => {
+    const requestClient = client;
+    const run = selectedRun;
+    const epoch = ++taskRunDetailEpochRef.current;
+    if (!requestClient || !run) {
+      setSelectedRunDetail(null);
+      return;
+    }
+    void requestClient.getTaskRun(run.run_id, { requirementsLimit: 100 }).then((detail) => {
+      if (taskRunDetailEpochRef.current !== epoch || activeClientRef.current !== requestClient) return;
+      if (detail.summary.run_id !== run.run_id || detail.summary.revision < run.revision) return;
+      if (detail.summary.revision > run.revision) {
+        snapshotEpochRef.current.acceptAuthoritativeSnapshot();
+        updateSnapshotState((current) => current
+          ? upsertRuntimeTaskRun(current, detail.summary)
+          : current);
+      }
+      setSelectedRunDetail(detail);
+    }).catch((reason) => {
+      if (taskRunDetailEpochRef.current === epoch && activeClientRef.current === requestClient) {
+        setSelectedRunDetail(null);
+        setError(describeError(reason, t("app.confirmationRequiredSuffix")));
+      }
+    });
+  }, [client, selectedRun?.run_id, selectedRun?.revision]);
+  useEffect(() => {
+    taskRunHumanEpochRef.current += 1;
+    setSelectedRunHumanPage(null);
+    setSelectedRunHumanLoading(false);
+    if (client && selectedRun) void loadSelectedRunHumanRequests(false);
+    return () => {
+      taskRunHumanEpochRef.current += 1;
+    };
+    // The loader snapshots both identities and is fenced by taskRunHumanEpochRef.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [client, selectedRun?.run_id, selectedRun?.revision]);
+  const messageDraftKey = selectedRun
+    ? `run:${selectedRun.run_id}`
+    : selectedPid;
+  const message = messageDraftKey ? messageDrafts[messageDraftKey] ?? "" : "";
   const cwd = selectedPid ? cwdDrafts[selectedPid] ?? "" : "";
   const execGoal = selectedPid ? execGoalDrafts[selectedPid] ?? "" : "";
   const selectedExplainLookup = explainLookup?.pid === selectedPid ? explainLookup : null;
 
   function setMessage(value: string) {
-    if (!selectedPid) return;
-    setMessageDrafts((current) => ({ ...current, [selectedPid]: value }));
+    if (!messageDraftKey) return;
+    setMessageDrafts((current) => ({ ...current, [messageDraftKey]: value }));
   }
 
   function setCwd(value: string) {
@@ -222,6 +348,43 @@ export function App() {
   function setExecGoal(value: string) {
     if (!selectedPid) return;
     setExecGoalDrafts((current) => ({ ...current, [selectedPid]: value }));
+  }
+
+  async function loadSelectedRunHumanRequests(append: boolean): Promise<void> {
+    const requestClient = client;
+    const run = selectedRun;
+    const currentPage = selectedRunHumanPage;
+    if (!requestClient || !run || (append && (
+      currentPage?.run_id !== run.run_id
+      || currentPage.revision !== run.revision
+      || !currentPage.has_more
+      || !currentPage.next_cursor
+    ))) return;
+    const epoch = ++taskRunHumanEpochRef.current;
+    setSelectedRunHumanLoading(true);
+    try {
+      const page = await requestClient.listTaskRunHumanRequests(
+        run.run_id,
+        100,
+        append ? currentPage?.next_cursor ?? undefined : undefined,
+        ["pending"]
+      );
+      if (taskRunHumanEpochRef.current !== epoch || activeClientRef.current !== requestClient) return;
+      setSelectedRunHumanPage({
+        ...page,
+        run_id: run.run_id,
+        revision: run.revision,
+        items: append && currentPage
+          ? dedupeHumanRequests([...currentPage.items, ...page.items])
+          : page.items
+      });
+    } catch (reason) {
+      if (taskRunHumanEpochRef.current === epoch && activeClientRef.current === requestClient) {
+        setError(describeError(reason, t("app.confirmationRequiredSuffix")));
+      }
+    } finally {
+      if (taskRunHumanEpochRef.current === epoch) setSelectedRunHumanLoading(false);
+    }
   }
 
   function initialize(): Promise<void> {
@@ -250,8 +413,9 @@ export function App() {
       setConnection(conn);
       setClient(nextClient);
       setConnectionEpoch((current) => current + 1);
-      setSnapshot(nextSnapshot);
+      replaceSnapshotState(nextSnapshot);
       setSelectedPid((current) => reconcileSelectedPid(nextSnapshot, current));
+      setSelectedRunId((current) => reconcileSelectedRunId(nextSnapshot, current));
       setMaxQuantaInput(nextSnapshot.scheduler.default_max_quanta?.toString() ?? "");
       setLastUpdatedAt(new Date());
     } catch (reason) {
@@ -271,8 +435,12 @@ export function App() {
     request = requestClient.snapshot({ signal: requestAbortRef.current?.signal, timeoutMs: 15_000 }).then((next) => {
       if (activeClientRef.current !== requestClient) return false;
       if (!snapshotEpochRef.current.acceptHttpResponse(requestEpoch)) return true;
-      setSnapshot(next);
-      setSelectedPid((current) => reconcileSelectedPid(next, current));
+      const merged = snapshotStateRef.current
+        ? mergeRuntimeTaskRuns(next, snapshotStateRef.current)
+        : next;
+      replaceSnapshotState(merged);
+      setSelectedPid((current) => reconcileSelectedPid(merged, current));
+      setSelectedRunId((current) => reconcileSelectedRunId(merged, current));
       setLastUpdatedAt(new Date());
       return true;
     }).catch((reason) => {
@@ -305,9 +473,13 @@ export function App() {
     setRefreshing(false);
     setConnection(next);
     setClient(nextClient);
+    taskRunStartIntentRef.current = null;
+    taskRunFollowUpIntentsRef.current.clear();
+    taskRunMutationIntentsRef.current.clear();
     setConnectionEpoch((current) => current + 1);
-    setSnapshot(nextSnapshot);
+    replaceSnapshotState(nextSnapshot);
     setSelectedPid(reconcileSelectedPid(nextSnapshot, null, { preserveExisting: false }));
+    setSelectedRunId(reconcileSelectedRunId(nextSnapshot, null, { preserveExisting: false }));
     setMaxQuantaInput(nextSnapshot.scheduler.default_max_quanta?.toString() ?? "");
     setLastUpdatedAt(new Date());
     setError(null);
@@ -344,7 +516,11 @@ export function App() {
       await action();
       return refreshAfter ? await refresh() : true;
     } catch (reason) {
-      setError(describeError(reason, t("app.confirmationRequiredSuffix")));
+      const message = describeError(reason, t("app.confirmationRequiredSuffix"));
+      const reconciled = taskRunConflictSummary(reason);
+      if (reconciled) mergeTaskRunResult(reconciled);
+      if (refreshAfter) await refresh();
+      setError(message);
       return false;
     } finally {
       actionGuardRef.current = false;
@@ -380,7 +556,7 @@ export function App() {
     if (!pid) return;
     if (spawnedProcess) {
       snapshotEpochRef.current.acceptAuthoritativeSnapshot();
-      setSnapshot((current) => current ? upsertRuntimeProcess(current, spawnedProcess!) : current);
+      updateSnapshotState((current) => current ? upsertRuntimeProcess(current, spawnedProcess!) : current);
     }
     setTaskLabels((current) => ({ ...current, [pid]: submittedLabel }));
     setSelectedPid(pid);
@@ -388,7 +564,171 @@ export function App() {
     setSpawnPanelOpen(false);
   }
 
+  async function startTaskRun() {
+    if (!client || !requireValidQuanta()) return;
+    const submittedGoal = spawnGoal.trim();
+    if (!submittedGoal) return;
+    const durableAuthority = buildGuiDurableTaskAuthority({
+      workingDirectory: spawnWorkingDirectory,
+      workspaceAccess: spawnWorkspaceAccess,
+      allowGitRequests: spawnAllowGitRequests,
+      commandAccess: spawnCommandAccess,
+      contextMaintenance: spawnContextMaintenance
+    });
+    const authorityManifestId = spawnAuthorityManifestId.trim();
+    if (durableAuthority.requiresAuthorityManifest && !authorityManifestId) {
+      setError(t("taskRuns.authorityManifestRequired"));
+      return;
+    }
+    const spec: TaskRunSpecV1 = {
+      schema_version: 1,
+      goal: submittedGoal,
+      display_title: taskLabelFromGoal(submittedGoal),
+      image_id: spawnImage,
+      launch_options: {
+        ...(spawnLlmProfile ? { llm_profile_id: spawnLlmProfile } : {}),
+        ...(spawnWorkingDirectory.trim() ? { working_directory: spawnWorkingDirectory.trim() } : {}),
+        capabilities: durableAuthority.capabilities
+      },
+      ...(authorityManifestId ? { authority_manifest_id: authorityManifestId } : {}),
+      retention: "purge_on_terminal"
+    };
+    const intent = taskRunStartIntent(
+      taskRunStartIntentRef.current,
+      spec,
+      maxQuanta,
+      (kind) => newTaskRunCommandId(kind, "new")
+    );
+    taskRunStartIntentRef.current = intent;
+    let created: TaskRunSummary | null = null;
+    let unadmittedConflict = false;
+    const succeeded = await safe(async () => {
+      try {
+        await createAndRunTaskRun(client, spec, intent, maxQuanta, {
+          onCreated: (summary) => {
+            created = summary;
+          },
+          onIntent: (bound) => {
+            if (taskRunStartIntentRef.current === intent) {
+              taskRunStartIntentRef.current = bound;
+            }
+          },
+          onSummary: mergeTaskRunResult
+        });
+      } catch (error) {
+        unadmittedConflict = isUnadmittedTaskRunRevisionConflict(error);
+        throw error;
+      }
+    }, "task_run.create", false);
+    const run = created as TaskRunSummary | null;
+    if (!succeeded || !run) {
+      const current = taskRunStartIntentRef.current;
+      if (unadmittedConflict && current?.fingerprint === intent.fingerprint) {
+        taskRunStartIntentRef.current = rotateUnadmittedTaskRunStartCommand(
+          current,
+          () => newTaskRunCommandId("run", "new")
+        );
+      }
+      return;
+    }
+    if (taskRunStartIntentRef.current?.fingerprint === intent.fingerprint) {
+      taskRunStartIntentRef.current = null;
+    }
+    setSpawnGoal("");
+    setSpawnPanelOpen(false);
+  }
+
+  function selectTaskRun(runId: string) {
+    setSelectedRunId(runId || null);
+    const run = snapshot?.task_runs.find((item) => item.run_id === runId);
+    const pid = run?.active_pid ?? run?.root_pid;
+    setSelectedPid(pid ?? null);
+  }
+
+  function mergeTaskRunResult(run: TaskRunSummary) {
+    snapshotEpochRef.current.acceptAuthoritativeSnapshot();
+    updateSnapshotState((current) => current ? upsertRuntimeTaskRun(current, run) : current);
+    setSelectedRunId(run.run_id);
+    const pid = run.active_pid ?? run.root_pid;
+    setSelectedPid(pid ?? null);
+  }
+
+  function durableMutationIntent(
+    run: TaskRunSummary,
+    action: TaskRunMutationKind,
+    request: unknown = {}
+  ): TaskRunMutationIntent {
+    const key = taskRunMutationIntentKey(run.run_id, action);
+    const intent = taskRunMutationIntent(
+      taskRunMutationIntentsRef.current.get(key) ?? null,
+      {
+        runId: run.run_id,
+        action,
+        expectedRevision: run.revision,
+        request
+      },
+      () => newTaskRunCommandId(action, run.run_id)
+    );
+    taskRunMutationIntentsRef.current.set(key, intent);
+    return intent;
+  }
+
+  function clearDurableMutationIntent(intent: TaskRunMutationIntent) {
+    const key = taskRunMutationIntentKey(intent.runId, intent.action);
+    if (taskRunMutationIntentsRef.current.get(key) === intent) {
+      taskRunMutationIntentsRef.current.delete(key);
+    }
+  }
+
+  function selectLegacyProcess(pid: string) {
+    setSelectedRunId(null);
+    setSelectedPid(pid || null);
+  }
+
   async function send(kind: "message" | "interrupt"): Promise<boolean> {
+    if (view === "user" && client && selectedRun && message.trim()) {
+      const run = selectedRun;
+      const actions = allowedTaskRunActions(run);
+      if (!actions.has("follow_up")) return false;
+      let submitted: TaskRunFollowUpIntent | null = null;
+      let unadmittedConflict = false;
+      const succeeded = await safe(async () => {
+        const intent = await taskRunFollowUpIntent(
+          taskRunFollowUpIntentsRef.current.get(run.run_id) ?? null,
+          {
+            runId: run.run_id,
+            expectedRevision: run.revision,
+            body: message,
+            kind: kind === "interrupt" ? "interrupt" : "normal",
+            required: true
+          },
+          () => newTaskRunCommandId("follow-up", run.run_id)
+        );
+        submitted = intent;
+        taskRunFollowUpIntentsRef.current.set(run.run_id, intent);
+        try {
+          const response = await submitTaskRunFollowUp(client, intent);
+          mergeTaskRunResult(response);
+        } catch (error) {
+          unadmittedConflict = isUnadmittedTaskRunRevisionConflict(error);
+          throw error;
+        }
+        if (taskRunFollowUpIntentsRef.current.get(run.run_id) === intent) {
+          taskRunFollowUpIntentsRef.current.delete(run.run_id);
+        }
+        setMessageDrafts((current) => clearTaskRunFollowUpDraft(current, intent));
+      }, "task_run.follow_up");
+      const intent = submitted as TaskRunFollowUpIntent | null;
+      if (
+        !succeeded
+        && unadmittedConflict
+        && intent
+        && taskRunFollowUpIntentsRef.current.get(intent.runId) === intent
+      ) {
+        taskRunFollowUpIntentsRef.current.delete(intent.runId);
+      }
+      return succeeded;
+    }
     if (!client || !selectedProcess || !message.trim() || !requireValidQuanta()) return false;
     const pid = selectedProcess.pid;
     return safe(async () => {
@@ -399,6 +739,31 @@ export function App() {
   }
 
   async function runSelectedProcess(): Promise<boolean> {
+    if (view === "user" && client && selectedRun && requireValidQuanta()) {
+      const run = selectedRun;
+      const actions = allowedTaskRunActions(run);
+      if (!actions.has("run") && !actions.has("resume")) return false;
+      const action = actions.has("resume") ? "resume" : "run";
+      const intent = durableMutationIntent(
+        run,
+        action,
+        action === "run" ? { max_quanta: maxQuanta } : {}
+      );
+      let unadmittedConflict = false;
+      const succeeded = await safe(async () => {
+        try {
+          const response = action === "resume"
+            ? await client.resumeTaskRun(intent.runId, intent.expectedRevision, intent.commandId)
+            : await client.runTaskRun(intent.runId, intent.expectedRevision, intent.commandId, maxQuanta);
+          mergeTaskRunResult(response);
+        } catch (error) {
+          unadmittedConflict = isUnadmittedTaskRunRevisionConflict(error);
+          throw error;
+        }
+      }, `task_run.${action}`);
+      if (succeeded || unadmittedConflict) clearDurableMutationIntent(intent);
+      return succeeded;
+    }
     if (!client || !selectedProcess || !requireValidQuanta()) return false;
     const pid = selectedProcess.pid;
     return safe(async () => {
@@ -407,10 +772,57 @@ export function App() {
   }
 
   async function pauseSelectedProcess(): Promise<boolean> {
+    if (view === "user" && client && selectedRun && allowedTaskRunActions(selectedRun).has("pause")) {
+      const run = selectedRun;
+      const intent = durableMutationIntent(run, "pause");
+      let unadmittedConflict = false;
+      const succeeded = await safe(async () => {
+        try {
+          mergeTaskRunResult(await client.pauseTaskRun(
+            intent.runId,
+            intent.expectedRevision,
+            intent.commandId
+          ));
+        } catch (error) {
+          unadmittedConflict = isUnadmittedTaskRunRevisionConflict(error);
+          throw error;
+        }
+      }, "task_run.pause");
+      if (succeeded || unadmittedConflict) clearDurableMutationIntent(intent);
+      return succeeded;
+    }
     if (!client || !selectedProcess) return false;
     return safe(async () => {
       mergeProcessResult(await client.pauseProcess(selectedProcess.pid));
     }, "process.pause", false);
+  }
+
+  function confirmCancelSelectedRun() {
+    if (!client || !selectedRun || !allowedTaskRunActions(selectedRun).has("cancel")) return;
+    const run = selectedRun;
+    const reason = "cancelled from GUI";
+    const intent = durableMutationIntent(run, "cancel", { reason });
+    setPendingConfirm({
+      title: t("taskRuns.cancelTitle"),
+      message: t("taskRuns.cancelMessage"),
+      details: { run_id: intent.runId, expected_revision: intent.expectedRevision },
+      action: async () => {
+        mergeTaskRunResult(await client.cancelTaskRun(
+          intent.runId,
+          intent.expectedRevision,
+          intent.commandId,
+          true,
+          reason
+        ));
+        clearDurableMutationIntent(intent);
+        setPendingConfirm(null);
+      },
+      onErrorReconciled: (error) => {
+        if (!isUnadmittedTaskRunRevisionConflict(error)) return false;
+        clearDurableMutationIntent(intent);
+        return true;
+      }
+    });
   }
 
   async function resumeSelectedProcess(): Promise<boolean> {
@@ -425,7 +837,7 @@ export function App() {
     const process = processFromMutationResult(result);
     if (process) {
       snapshotEpochRef.current.acceptAuthoritativeSnapshot();
-      setSnapshot((current) => current ? upsertRuntimeProcess(current, process) : current);
+      updateSnapshotState((current) => current ? upsertRuntimeProcess(current, process) : current);
     }
     return process;
   }
@@ -444,7 +856,7 @@ export function App() {
   }
 
   function mergeSchedulerStatus(status: SchedulerStatus) {
-    setSnapshot((current) => current ? { ...current, scheduler: status } : current);
+    updateSnapshotState((current) => current ? { ...current, scheduler: status } : current);
   }
 
   function requireValidQuanta(): boolean {
@@ -470,6 +882,7 @@ export function App() {
       setError(null);
       const result = await client.respondHumanRequest(request.request_id, response, Boolean(snapshot?.scheduler.auto_run), maxQuanta);
       mergeProcessResult(result);
+      void loadSelectedRunHumanRequests(false);
       return "accepted";
     } catch (reason) {
       setError(describeError(reason, t("app.confirmationRequiredSuffix")));
@@ -485,13 +898,20 @@ export function App() {
     const requestClient = client;
     if (!requestClient) return null;
     try {
-      const next = await requestClient.snapshot({ signal: requestAbortRef.current?.signal, timeoutMs: 10_000 });
+      const request = await requestClient.getHumanRequest(requestId);
       if (activeClientRef.current !== requestClient) return null;
-      snapshotEpochRef.current.acceptAuthoritativeSnapshot();
-      setSnapshot(next);
-      setSelectedPid((current) => reconcileSelectedPid(next, current));
+      updateSnapshotState((current) => current ? {
+        ...current,
+        human_requests: [request, ...current.human_requests.filter((item) => item.request_id !== request.request_id)]
+      } : current);
+      setSelectedRunHumanPage((current) => current ? {
+        ...current,
+        items: request.status === "pending"
+          ? dedupeHumanRequests([request, ...current.items])
+          : current.items.filter((item) => item.request_id !== request.request_id)
+      } : current);
       setLastUpdatedAt(new Date());
-      return next.human_requests.some((item) => item.request_id === requestId && item.status === "pending");
+      return request.status === "pending";
     } catch {
       return null;
     }
@@ -622,15 +1042,25 @@ export function App() {
 
   async function confirmPendingAction() {
     if (!pendingConfirm || confirmGuardRef.current) return;
+    const confirmation = pendingConfirm;
     confirmGuardRef.current = true;
     setConfirmBusy(true);
     setError(null);
     setConfirmError(null);
     try {
       if (refreshInFlightRef.current) await refreshInFlightRef.current;
-      await pendingConfirm.action();
+      await confirmation.action();
     } catch (reason) {
-      setConfirmError(describeError(reason, t("app.confirmationRequiredSuffix")));
+      const message = describeError(reason, t("app.confirmationRequiredSuffix"));
+      const reconciled = taskRunConflictSummary(reason);
+      if (reconciled) mergeTaskRunResult(reconciled);
+      await refresh();
+      if (confirmation.onErrorReconciled?.(reason)) {
+        setPendingConfirm(null);
+        setError(message);
+      } else {
+        setConfirmError(message);
+      }
     } finally {
       confirmGuardRef.current = false;
       setConfirmBusy(false);
@@ -754,6 +1184,14 @@ export function App() {
           snapshot={snapshot}
           selectedPid={selectedPid}
           selectedProcess={selectedProcess}
+          selectedRunId={selectedRunId}
+          selectedRun={selectedRun}
+          selectedRunDetail={selectedRunDetail}
+          taskRunHumanRequests={visibleSelectedRunHumanPage?.items ?? null}
+          taskRunHumanHasMore={Boolean(visibleSelectedRunHumanPage?.has_more)}
+          taskRunHumanPresentationTruncated={Boolean(visibleSelectedRunHumanPage?.presentation_truncated)}
+          taskRunHumanLoading={selectedRunHumanLoading}
+          taskRuns={snapshot?.task_runs ?? []}
           taskLabels={taskLabels}
           taskSettings={taskLaunchSettings}
           quantaValid={quantaDraft.valid}
@@ -761,13 +1199,15 @@ export function App() {
           message={message}
           images={snapshot?.images ?? []}
           llmProfiles={snapshot?.llm_profiles ?? []}
-          onSelectPid={setSelectedPid}
+          onSelectPid={selectLegacyProcess}
+          onSelectRun={selectTaskRun}
+          onLoadMoreTaskRunHumanRequests={() => void loadSelectedRunHumanRequests(true)}
           onMaxQuantaChange={setMaxQuantaInput}
           onSpawnGoalChange={setSpawnGoal}
           onSpawnImageChange={setSpawnImage}
           onApplyTaskSettings={applyTaskLaunchSettings}
           onMessageChange={setMessage}
-          onSpawn={() => void spawnProcess()}
+          onSpawn={() => void startTaskRun()}
           onImportImage={() => void chooseAndConfirmImageImport(false)}
           onCommitImage={confirmCommitImage}
           onSend={(kind) => void send(kind)}
@@ -781,7 +1221,7 @@ export function App() {
           onRefresh={() => void refreshAndClearError()}
           onOpenDb={() => void openDatabase()}
           onShowOperator={() => setView("operator")}
-          onStop={confirmExit}
+          onStop={selectedRun ? confirmCancelSelectedRun : confirmExit}
           busy={interactionBusy}
           streamStatus={streamStatus}
           lastUpdatedAt={lastUpdatedAt}
@@ -865,6 +1305,16 @@ export function App() {
                       <option value="edit">{t("taskAuthority.edit")}</option>
                       <option value="manage">{t("taskAuthority.manage")}</option>
                     </select>
+                  </label>
+                  <label className="fieldStack">
+                    <span>{t("taskAuthority.manifestId")}</span>
+                    <input
+                      value={spawnAuthorityManifestId}
+                      disabled={interactionBusy}
+                      onChange={(event) => setSpawnAuthorityManifestId(event.currentTarget.value)}
+                      placeholder={t("taskAuthority.manifestIdPlaceholder")}
+                    />
+                    <small className="fieldHint">{t("taskAuthority.manifestIdHint")}</small>
                   </label>
                   <label className="taskAuthorityToggle operatorAuthorityToggle">
                     <input
@@ -1113,6 +1563,30 @@ function readStoredSelectedPid(): string | null {
   } catch {
     return null;
   }
+}
+
+function readStoredSelectedRunId(): string | null {
+  try {
+    const runId = globalThis.sessionStorage?.getItem(SELECTED_RUN_STORAGE_KEY) ?? "";
+    return /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,191}$/.test(runId) ? runId : null;
+  } catch {
+    return null;
+  }
+}
+
+function newTaskRunCommandId(action: string, runId: string): string {
+  const random = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `gui:${action}:${runId}:${random}`;
+}
+
+function taskRunMutationIntentKey(runId: string, action: TaskRunMutationKind): string {
+  return `${runId}\u0000${action}`;
+}
+
+function dedupeHumanRequests(requests: readonly HumanRequest[]): HumanRequest[] {
+  const selected = new Map<string, HumanRequest>();
+  for (const request of requests) selected.set(request.request_id, request);
+  return [...selected.values()];
 }
 
 function sameConnection(left: GuiConnection, right: GuiConnection): boolean {

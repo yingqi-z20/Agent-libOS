@@ -10,8 +10,8 @@ from agent_libos.models.exceptions import UnsupportedStoreVersion, ValidationErr
 from agent_libos.storage.engine import split_sql_script
 from agent_libos.storage.sql import (
     SQLRuntimeStore,
-    _V3_KEYSET_TEXT_COLUMNS,
-    _V3_REQUIRED_COLUMNS,
+    _V4_KEYSET_TEXT_COLUMNS,
+    _V4_REQUIRED_COLUMNS,
 )
 
 
@@ -179,6 +179,7 @@ class PostgresStore(SQLRuntimeStore):
     """PostgreSQL runtime store backend."""
 
     KEYSET_TEXT_COLLATION = "C"
+    REQUIRE_V4_INDEX_OPERABILITY = True
 
     def __init__(
         self,
@@ -280,10 +281,24 @@ class PostgresStore(SQLRuntimeStore):
         return {str(row["name"]) for row in rows}
 
     @classmethod
-    def _require_v3_schema_shape(cls, conn: Any) -> None:
+    def _probe_user_tables(cls, conn: Any) -> set[str]:
+        rows = conn.execute(
+            """
+            SELECT relation.relname AS name
+            FROM pg_catalog.pg_class AS relation
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND relation.relkind IN ('r', 'p')
+            """
+        )
+        return {str(row["name"]) for row in rows}
+
+    @classmethod
+    def _require_v4_schema_shape(cls, conn: Any) -> None:
         """Require every manifest relation to be an ordinary PostgreSQL table."""
 
-        required_tables = sorted(_V3_REQUIRED_COLUMNS)
+        required_tables = sorted(_V4_REQUIRED_COLUMNS)
         placeholders = ", ".join("?" for _ in required_tables)
         rows = conn.execute(
             f"""
@@ -308,18 +323,18 @@ class PostgresStore(SQLRuntimeStore):
         }
         if invalid_relations:
             raise UnsupportedStoreVersion(
-                "unsupported or incomplete Agent libOS store schema v3 "
+                "unsupported or incomplete Agent libOS store schema v4 "
                 "manifest relation types: "
                 f"{invalid_relations}; expected PostgreSQL relkind 'r'"
             )
-        super()._require_v3_schema_shape(conn)
+        super()._require_v4_schema_shape(conn)
 
     @classmethod
     def _probe_text_column_collations(
         cls,
         conn: Any,
     ) -> Mapping[tuple[str, str], str]:
-        tables = sorted(_V3_KEYSET_TEXT_COLUMNS)
+        tables = sorted(_V4_KEYSET_TEXT_COLUMNS)
         placeholders = ", ".join("?" for _ in tables)
         rows = conn.execute(
             f"""
@@ -352,7 +367,7 @@ class PostgresStore(SQLRuntimeStore):
             )
         required = {
             (table, column)
-            for table, columns in _V3_KEYSET_TEXT_COLUMNS.items()
+            for table, columns in _V4_KEYSET_TEXT_COLUMNS.items()
             for column in columns
         }
         return {
@@ -361,6 +376,103 @@ class PostgresStore(SQLRuntimeStore):
             )
             for row in selected_rows
             if (str(row["table_name"]), str(row["column_name"])) in required
+        }
+
+    @classmethod
+    def _probe_index_shapes(
+        cls,
+        conn: Any,
+        tables: set[str],
+    ) -> Mapping[str, Mapping[str, Any]]:
+        selected_tables = sorted(tables)
+        if not selected_tables:
+            return {}
+        placeholders = ", ".join("?" for _ in selected_tables)
+        rows = conn.execute(
+            f"""
+            SELECT index_relation.relname AS index_name,
+                   table_relation.relname AS table_name,
+                   index_row.indisunique AS is_unique,
+                   index_row.indisvalid AS is_valid,
+                   index_row.indisready AS is_ready,
+                   index_row.indislive AS is_live,
+                   (index_row.indpred IS NOT NULL) AS is_partial,
+                   pg_catalog.pg_get_expr(
+                     index_row.indpred, index_row.indrelid
+                   ) AS predicate_sql,
+                   key_row.ordinality AS key_ordinal,
+                   attribute.attname AS column_name,
+                   collation_row.collname AS collation_name,
+                   ((index_row.indoption[key_row.ordinality - 1] & 1) = 1)
+                     AS is_descending,
+                   (constraint_row.oid IS NOT NULL) AS is_constraint
+              FROM pg_catalog.pg_index AS index_row
+              JOIN pg_catalog.pg_class AS index_relation
+                ON index_relation.oid = index_row.indexrelid
+              JOIN pg_catalog.pg_class AS table_relation
+                ON table_relation.oid = index_row.indrelid
+              JOIN pg_catalog.pg_namespace AS namespace
+                ON namespace.oid = table_relation.relnamespace
+              JOIN LATERAL unnest(index_row.indkey)
+                   WITH ORDINALITY AS key_row(attnum, ordinality) ON true
+              LEFT JOIN pg_catalog.pg_attribute AS attribute
+                ON attribute.attrelid = table_relation.oid
+               AND attribute.attnum = key_row.attnum
+              LEFT JOIN pg_catalog.pg_collation AS collation_row
+                ON collation_row.oid =
+                   index_row.indcollation[key_row.ordinality - 1]
+              LEFT JOIN pg_catalog.pg_constraint AS constraint_row
+                ON constraint_row.conindid = index_row.indexrelid
+               AND constraint_row.contype IN ('p', 'u')
+             WHERE namespace.nspname = current_schema()
+               AND table_relation.relname IN ({placeholders})
+               AND key_row.ordinality <= index_row.indnkeyatts
+             ORDER BY index_relation.relname, key_row.ordinality
+            """,
+            selected_tables,
+        )
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            name = str(row["index_name"])
+            shape = grouped.setdefault(
+                name,
+                {
+                    "table": str(row["table_name"]),
+                    "columns": [],
+                    "unique": bool(row["is_unique"]),
+                    "valid": bool(row["is_valid"]),
+                    "ready": bool(row["is_ready"]),
+                    "live": bool(row["is_live"]),
+                    "partial": bool(row["is_partial"]),
+                    "descending": [],
+                    "collations": [],
+                    "origin": (
+                        "constraint" if bool(row["is_constraint"]) else "declared"
+                    ),
+                    "predicate": cls._canonical_index_predicate(
+                        row["predicate_sql"]
+                    ),
+                },
+            )
+            shape["columns"].append(
+                str(row["column_name"])
+                if row["column_name"] is not None
+                else "<expression>"
+            )
+            shape["descending"].append(bool(row["is_descending"]))
+            shape["collations"].append(
+                str(row["collation_name"])
+                if row["collation_name"] is not None
+                else None
+            )
+        return {
+            name: {
+                **shape,
+                "columns": tuple(shape["columns"]),
+                "descending": tuple(shape["descending"]),
+                "collations": tuple(shape["collations"]),
+            }
+            for name, shape in grouped.items()
         }
 
     def _acquire_runtime_lease(self, conn: _PostgresConnection) -> None:

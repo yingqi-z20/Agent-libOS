@@ -12,8 +12,8 @@ permissions:
   contents: read
 
 env:
-  RELEASE_WHEEL: dist/agent_libos-1.0.1-py3-none-any.whl
-  RELEASE_SDIST: dist/agent_libos-1.0.1.tar.gz
+  RELEASE_WHEEL: dist/agent_libos-1.1.0-py3-none-any.whl
+  RELEASE_SDIST: dist/agent_libos-1.1.0.tar.gz
   RELEASE_CHECKSUMS: dist/SHA256SUMS
 
 jobs:
@@ -502,6 +502,17 @@ jobs:
           uv run python experiments/run_publication_reconciliation_scale.py
           --profile ci
           --output .benchmark_runs/publication-reconciliation-ci.json
+
+      - name: Run Durable TaskRun six-barrier crash gate
+        run: >-
+          uv run python experiments/run_task_run_crash_matrix.py
+          --output .benchmark_runs/task-run-crash-matrix-ci.json
+
+      - name: Run 100k Durable TaskRun recovery scale gate
+        run: >-
+          uv run python experiments/run_task_run_recovery_scale.py
+          --profile ci
+          --output .benchmark_runs/task-run-recovery-scale-ci.json
 
   postgres:
     runs-on: ubuntu-latest

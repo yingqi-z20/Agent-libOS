@@ -51,6 +51,18 @@ class ProcessRevisionConflict(ProcessError):
     pass
 
 
+class TaskRunRevisionConflict(ProcessError):
+    """A durable TaskRun mutation lost its revision or epoch fence."""
+
+    pass
+
+
+class TaskRunCommandConflict(TaskRunRevisionConflict):
+    """A TaskRun idempotency key was reused for a different request."""
+
+    pass
+
+
 class ProcessTerminalCleanupRequired(ProcessError):
     """A terminal outcome committed, but its durable cleanup is incomplete."""
 
@@ -122,6 +134,27 @@ class ResourceLimitExceeded(ProcessError):
 
 class ValidationError(LibOSError):
     pass
+
+
+class TaskRunCompletionContractError(ValidationError):
+    """A Durable TaskRun completion contract failed local integrity checks.
+
+    The exception deliberately carries only the Run identity and an already
+    sanitized blocker projection.  Callers may validate the contract while a
+    Store critical section is held, then persist ``needs_attention`` only after
+    that critical section has unwound.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        run_id: str,
+        blocker: dict,
+    ) -> None:
+        self.run_id = str(run_id)
+        self.blocker = dict(blocker)
+        super().__init__(message)
 
 
 class SkillPackageChanged(ValidationError):

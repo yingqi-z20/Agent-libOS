@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 import pytest
 
@@ -21,11 +21,17 @@ from agent_libos.evidence.payload_retention import (
     content_free_payload_envelope,
     external_effect_payload_retention_tier,
     external_effect_payload_sha256,
+    human_request_payload_sha256,
     llm_call_payload_is_runtime_dependency,
     llm_call_payload_retention_tier,
     llm_call_payload_sha256,
+    redact_task_run_external_effects,
+    redact_task_run_human_requests,
+    redact_terminal_task_run_human_request,
     retain_external_effect_payload,
     retain_llm_call_payload,
+    validate_external_effect_payload_retention_update,
+    validate_terminal_task_run_human_redaction,
 )
 from agent_libos.llm.records import observable_llm_call_fields
 from agent_libos.models.audit import AuditRecord
@@ -34,6 +40,7 @@ from agent_libos.models.external_effect import (
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
 )
+from agent_libos.models.human import HumanRequest, HumanRequestStatus
 from agent_libos.models.llm import LLMCallRecord
 
 
@@ -103,6 +110,24 @@ def _effect(
         idempotency_key="stable-idempotency-key",
         effect_state=effect_state,
         transaction_state=transaction_state,
+        created_at=_OLD,
+        updated_at=_OLD,
+    )
+
+
+def _human_request(request_id: str = "human-run-terminal") -> HumanRequest:
+    return HumanRequest(
+        request_id=request_id,
+        pid="pid-retention",
+        human="host",
+        payload={
+            "type": "question",
+            "question": f"prompt {_SENTINEL}",
+            "context": {"secret": _SENTINEL},
+        },
+        status=HumanRequestStatus.APPROVED,
+        decision={"answer": f"answer {_SENTINEL}"},
+        blocking=True,
         created_at=_OLD,
         updated_at=_OLD,
     )
@@ -274,6 +299,143 @@ class _Store:
             return False
         self.effects[record.effect_id] = record
         self.update_count += 1
+        return True
+
+
+class _TaskRunEffectStore:
+    def __init__(
+        self,
+        effects: list[ExternalEffectRecord],
+        *,
+        conflict_at: int | None = None,
+    ) -> None:
+        self.run_id = "run-retention"
+        self.owned_pids = {"pid-retention"}
+        self.links = {record.effect_id for record in effects}
+        self.effects = {record.effect_id: record for record in effects}
+        self.conflict_at = conflict_at
+        self.cas_calls: list[tuple[str, str, str]] = []
+        self.listed_override: list[Any] | None = None
+
+    def list_task_run_external_effects(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str] = (),
+    ) -> list[ExternalEffectRecord]:
+        if run_id != self.run_id:
+            raise ValueError("unknown TaskRun")
+        selected = tuple(linked_pids)
+        if selected and not set(selected).issubset(self.owned_pids):
+            raise ValueError("unowned TaskRun PID")
+        if self.listed_override is not None:
+            return list(self.listed_override)
+        scope = set(selected) or self.owned_pids
+        return [
+            record
+            for effect_id, record in sorted(self.effects.items())
+            if effect_id in self.links and record.pid in scope
+        ]
+
+    def redact_task_run_external_effect_payload(
+        self,
+        record: ExternalEffectRecord,
+        *,
+        run_id: str,
+        expected_payload_sha256: str,
+        expected_tier: str,
+        expected_effect_state: str,
+        expected_transaction_state: str,
+    ) -> bool:
+        current = self.effects.get(record.effect_id)
+        if (
+            run_id != self.run_id
+            or current is None
+            or current.pid not in self.owned_pids
+            or record.effect_id not in self.links
+        ):
+            return False
+        self.cas_calls.append(
+            (record.effect_id, expected_tier, record.payload_retention_tier)
+        )
+        if self.conflict_at == len(self.cas_calls):
+            return False
+        try:
+            validate_external_effect_payload_retention_update(
+                current,
+                record,
+                expected_payload_sha256=expected_payload_sha256,
+                expected_tier=PayloadRetentionTier(expected_tier),
+                expected_effect_state=expected_effect_state,
+                expected_transaction_state=expected_transaction_state,
+            )
+        except (TypeError, ValueError):
+            return False
+        self.effects[record.effect_id] = record
+        return True
+
+
+class _TaskRunHumanStore:
+    def __init__(
+        self,
+        requests: list[HumanRequest],
+        *,
+        conflict: bool = False,
+    ) -> None:
+        self.run_id = "run-retention"
+        self.owned_pids = {"pid-retention"}
+        self.links = {request.request_id for request in requests}
+        self.requests = {request.request_id: request for request in requests}
+        self.conflict = conflict
+        self.cas_calls = 0
+        self.listed_override: list[Any] | None = None
+
+    def list_task_run_human_requests(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str] = (),
+    ) -> list[HumanRequest]:
+        if run_id != self.run_id:
+            raise ValueError("unknown TaskRun")
+        selected = tuple(linked_pids)
+        if selected and not set(selected).issubset(self.owned_pids):
+            raise ValueError("unowned TaskRun PID")
+        if self.listed_override is not None:
+            return list(self.listed_override)
+        scope = set(selected) or self.owned_pids
+        return [
+            request
+            for request_id, request in sorted(self.requests.items())
+            if request_id in self.links and request.pid in scope
+        ]
+
+    def redact_task_run_human_request_payload(
+        self,
+        request: HumanRequest,
+        *,
+        run_id: str,
+        expected_payload_sha256: str,
+        expected_status: str,
+    ) -> bool:
+        current = self.requests.get(request.request_id)
+        self.cas_calls += 1
+        if (
+            self.conflict
+            or run_id != self.run_id
+            or current is None
+            or current.pid not in self.owned_pids
+            or request.request_id not in self.links
+        ):
+            return False
+        try:
+            validate_terminal_task_run_human_redaction(
+                current,
+                request,
+                expected_payload_sha256=expected_payload_sha256,
+                expected_status=HumanRequestStatus(expected_status),
+            )
+        except (TypeError, ValueError):
+            return False
+        self.requests[request.request_id] = request
         return True
 
 
@@ -552,6 +714,213 @@ def test_external_effect_reduction_preserves_core_evidence_identity_and_hashes()
     assert external_effect_payload_retention_tier(summary) is PayloadRetentionTier.SUMMARY
     assert external_effect_payload_retention_tier(hash_only) is PayloadRetentionTier.HASH_ONLY
     assert _SENTINEL not in json.dumps(summary.__dict__, sort_keys=True)
+
+
+def test_task_run_external_effect_redaction_uses_two_canonical_cas_steps() -> None:
+    original = _effect("effect-run-terminal")
+    store = _TaskRunEffectStore([original])
+
+    assert redact_task_run_external_effects(
+        store,
+        store.run_id,
+        [original.pid],
+    ) == 1
+
+    persisted = store.effects[original.effect_id]
+    assert external_effect_payload_retention_tier(
+        persisted
+    ) is PayloadRetentionTier.HASH_ONLY
+    assert store.cas_calls == [
+        (original.effect_id, "full", "summary"),
+        (original.effect_id, "summary", "hash_only"),
+    ]
+    assert store.links == {original.effect_id}
+    assert replace(
+        persisted,
+        provider_metadata=original.provider_metadata,
+        provider_receipt=original.provider_receipt,
+        payload_retention_schema_version=(
+            original.payload_retention_schema_version
+        ),
+        payload_retention_tier=original.payload_retention_tier,
+        payload_retention_sha256=original.payload_retention_sha256,
+    ) == original
+    assert _SENTINEL not in json.dumps(persisted.__dict__, sort_keys=True)
+
+
+def test_task_run_external_effect_redaction_is_resumable_and_idempotent() -> None:
+    summary = retain_external_effect_payload(
+        _effect("effect-run-summary"),
+        PayloadRetentionTier.SUMMARY,
+    )
+    store = _TaskRunEffectStore([summary])
+
+    assert redact_task_run_external_effects(
+        store,
+        store.run_id,
+        [summary.pid],
+    ) == 1
+    assert store.cas_calls == [
+        (summary.effect_id, "summary", "hash_only"),
+    ]
+    assert redact_task_run_external_effects(
+        store,
+        store.run_id,
+        [summary.pid],
+    ) == 0
+    assert len(store.cas_calls) == 1
+
+
+@pytest.mark.parametrize("conflict_at", [1, 2])
+def test_task_run_external_effect_redaction_conflict_fails_closed(
+    conflict_at: int,
+) -> None:
+    effect = _effect(f"effect-run-conflict-{conflict_at}")
+    store = _TaskRunEffectStore([effect], conflict_at=conflict_at)
+
+    with pytest.raises(RuntimeError, match="redaction conflicted"):
+        redact_task_run_external_effects(
+            store,
+            store.run_id,
+            [effect.pid],
+        )
+
+    assert len(store.cas_calls) == conflict_at
+
+
+def test_task_run_external_effect_redaction_rejects_unlinked_and_nonterminal_rows() -> None:
+    effect = _effect("effect-run-membership")
+    store = _TaskRunEffectStore([effect])
+    store.listed_override = [replace(effect, pid="pid-other-run")]
+
+    with pytest.raises(RuntimeError, match="unlinked row"):
+        redact_task_run_external_effects(
+            store,
+            store.run_id,
+            [effect.pid],
+        )
+    assert store.cas_calls == []
+
+    store.listed_override = [
+        replace(
+            effect,
+            effect_state="pending",
+            transaction_state="unknown",
+        )
+    ]
+    with pytest.raises(ValueError, match="nonterminal"):
+        redact_task_run_external_effects(
+            store,
+            store.run_id,
+            [effect.pid],
+        )
+    assert store.cas_calls == []
+
+
+def test_task_run_external_effect_redaction_rechecks_link_membership_at_cas() -> None:
+    effect = _effect("effect-run-link-race")
+    store = _TaskRunEffectStore([effect])
+    store.listed_override = [effect]
+    store.links.clear()
+
+    with pytest.raises(RuntimeError, match="redaction conflicted"):
+        redact_task_run_external_effects(
+            store,
+            store.run_id,
+            [effect.pid],
+        )
+    assert store.effects[effect.effect_id] == effect
+
+
+def test_terminal_task_run_human_redaction_is_canonical_and_content_free() -> None:
+    original = _human_request()
+    original_sha256 = human_request_payload_sha256(original)
+
+    redacted = redact_terminal_task_run_human_request(original)
+
+    assert human_request_payload_sha256(redacted) == original_sha256
+    assert redacted.request_id == original.request_id
+    assert redacted.pid == original.pid
+    assert redacted.human == original.human
+    assert redacted.status is original.status
+    assert redacted.blocking is original.blocking
+    assert redacted.created_at == original.created_at
+    assert redacted.updated_at == original.updated_at
+    assert redacted.payload[
+        "$agent_libos_task_run_human_redaction"
+    ]["request_type"] == "question"
+    assert _SENTINEL not in json.dumps(redacted.__dict__, sort_keys=True)
+    assert redact_terminal_task_run_human_request(redacted) is redacted
+
+
+def test_task_run_human_redaction_is_linked_and_idempotent() -> None:
+    original = _human_request("human-run-linked")
+    store = _TaskRunHumanStore([original])
+
+    assert redact_task_run_human_requests(
+        store,
+        store.run_id,
+        [original.pid],
+    ) == 1
+
+    persisted = store.requests[original.request_id]
+    assert store.cas_calls == 1
+    assert _SENTINEL not in json.dumps(persisted.__dict__, sort_keys=True)
+    assert human_request_payload_sha256(persisted) == human_request_payload_sha256(
+        original
+    )
+    assert redact_task_run_human_requests(
+        store,
+        store.run_id,
+        [original.pid],
+    ) == 0
+    assert store.cas_calls == 1
+
+
+def test_task_run_human_redaction_conflict_and_link_race_fail_closed() -> None:
+    original = _human_request("human-run-conflict")
+    conflict = _TaskRunHumanStore([original], conflict=True)
+    with pytest.raises(RuntimeError, match="redaction conflicted"):
+        redact_task_run_human_requests(
+            conflict,
+            conflict.run_id,
+            [original.pid],
+        )
+    assert conflict.requests[original.request_id] == original
+
+    unlinked = _TaskRunHumanStore([original])
+    unlinked.listed_override = [original]
+    unlinked.links.clear()
+    with pytest.raises(RuntimeError, match="redaction conflicted"):
+        redact_task_run_human_requests(
+            unlinked,
+            unlinked.run_id,
+            [original.pid],
+        )
+    assert unlinked.requests[original.request_id] == original
+
+
+def test_task_run_human_redaction_rejects_wrong_pid_and_preserves_null_decision() -> None:
+    original = replace(
+        _human_request("human-run-null"),
+        status=HumanRequestStatus.CANCELLED,
+        decision=None,
+    )
+    redacted = redact_terminal_task_run_human_request(original)
+    assert redacted.decision is None
+    assert human_request_payload_sha256(redacted) == human_request_payload_sha256(
+        original
+    )
+
+    store = _TaskRunHumanStore([original])
+    store.listed_override = [replace(original, pid="pid-other-run")]
+    with pytest.raises(RuntimeError, match="unlinked row"):
+        redact_task_run_human_requests(
+            store,
+            store.run_id,
+            [original.pid],
+        )
+    assert store.cas_calls == 0
 
 
 @pytest.mark.parametrize(

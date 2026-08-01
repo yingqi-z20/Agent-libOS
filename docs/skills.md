@@ -36,7 +36,7 @@ skills/review-helper/
 name: review-helper
 description: Focused code-review workflow helpers.
 license: Apache-2.0
-compatibility: agent-libos==1.0.1
+compatibility: agent-libos==1.1.0
 allowed-tools: read_text_file read_directory
 metadata:
   agent-libos.version: v0
@@ -421,6 +421,16 @@ discards its unpublished candidates and executable aliases, including when
 authority settlement fails. Reactivation retires only the superseded JIT ids
 after the replacement and its authority settlement commit.
 
+For Durable Task Runs, v1 can certify this binding change only when
+`activate_skill` is the single action in a non-parallel validated model
+response. Its request binding is checked on both sides of the Provider call,
+and the dispatch target is the exact pre-action `tool_id`. The
+committed result plus exact post-action tool and loaded-Skill bindings become
+part of the safe resume evidence. Other actions that change Image, tool,
+provider, or Skill bindings are not certified by v1; they fail closed into
+`needs_attention` before a Run may continue or reopen, with no automatic
+replay.
+
 Host-private loaded records retain the provenance needed to distinguish a
 registered activation from an immutable packaged projection. That field is not
 rendered into prompts or model tool results. An immutable projection must
@@ -470,7 +480,7 @@ are rejected before a result set can become unbounded.
 The workspace includes `skills/swe-agent`, named and registerable as
 `swe-agent`. It reproduces the useful SWE-Agent Agent Computer Interface shape
 inside Agent libOS. The shipped package pins `compatibility` to
-`agent-libos==1.0.1`: its JIT manifest uses extension fields from this release,
+`agent-libos==1.1.0`: its JIT manifest uses extension fields from this release,
 so older parsers must not be promised compatibility merely because the
 frontmatter itself can be read. This exact pin is a publisher/Host-facing
 declaration, not a Runtime-enforced version gate.

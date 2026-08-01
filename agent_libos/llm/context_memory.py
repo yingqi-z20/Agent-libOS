@@ -608,6 +608,80 @@ class LLMContextMemory:
             lines.append(_stable_json(_model_facing_entry(entry)))
         return "\n".join(lines).rstrip()
 
+    def latest_validated_compaction(self, pid: str) -> dict[str, Any] | None:
+        """Return the locally committed semantic compaction for ``pid``.
+
+        TaskRun recovery may copy this projection into its own durable payload,
+        but only while the context generation still names the exact compaction
+        entry.  Returning a deep copy prevents a caller from mutating the live
+        Object payload after validation.
+        """
+
+        context_oid = self._context_oid(pid)
+        if context_oid is None:
+            return None
+        context = self._objects.get_object(context_oid)
+        if context is None:
+            raise ValidationError(
+                f"LLM context object disappeared during compaction read: {context_oid}"
+            )
+        payload = self._payload(context)
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            raise ValidationError("LLM context entries are invalid")
+        generation = self._processes.get_llm_context_generation(pid)
+        matching = [
+            entry
+            for entry in entries
+            if isinstance(entry, Mapping)
+            and entry.get("kind") == "context_compacted"
+            and entry.get("at") == generation
+        ]
+        if not matching:
+            return None
+        if len(matching) != 1:
+            raise ValidationError(
+                "LLM context contains ambiguous current compaction entries"
+            )
+        entry = dict(matching[0])
+        cache_strategy = payload.get("cache_strategy")
+        if (
+            not isinstance(cache_strategy, Mapping)
+            or cache_strategy.get("mode") != "compacted_stable_prefix"
+            or cache_strategy.get("compacted_at") != generation
+        ):
+            raise ValidationError(
+                "LLM context compaction generation is not locally bound"
+            )
+        source_entry_count = entry.get("source_entry_count")
+        source_version = entry.get("source_version")
+        if (
+            type(source_entry_count) is not int
+            or source_entry_count < 0
+            or type(source_version) is not int
+            or source_version < 0
+            or entry.get("source_oid") != context_oid
+        ):
+            raise ValidationError("LLM context compaction coverage is invalid")
+        summary = self._validate_compact_summary(entry.get("summary"))
+        selected_summary = deepcopy(summary)
+        return {
+            "schema_version": 1,
+            "context_oid": context_oid,
+            "context_version": context.version,
+            "context_generation": generation,
+            "compacted_at": generation,
+            "source_version": source_version,
+            "source_entry_count": source_entry_count,
+            "summary": selected_summary,
+            "data_labels": DataLabels.from_object_metadata(
+                context.metadata
+            ).to_dict(),
+            "summary_sha256": hashlib.sha256(
+                _stable_json(selected_summary).encode("utf-8")
+            ).hexdigest(),
+        }
+
     def replace_with_compacted_summary(
         self,
         pid: str,

@@ -23,6 +23,7 @@ export type TaskLaunchSettings = {
   allowGitRequests: boolean;
   commandAccess: CommandAccess;
   contextMaintenance: boolean;
+  authorityManifestId: string;
 };
 
 export type UserTaskSettingsDialogProps = {
@@ -58,6 +59,7 @@ export function UserTaskSettingsDialog({
   const formId = useId();
   const quantaHintId = useId();
   const workingDirectoryErrorId = useId();
+  const authorityManifestErrorId = useId();
   const quanta = useMemo(() => parseQuantaDraft(draft.maxQuantaInput), [draft.maxQuantaInput]);
   const workingDirectoryValid = useMemo(() => {
     try {
@@ -67,7 +69,9 @@ export function UserTaskSettingsDialog({
       return false;
     }
   }, [draft.workingDirectory]);
-  const valid = quanta.valid && workingDirectoryValid;
+  const requiresAuthorityManifest = draft.workspaceAccess !== "none" || draft.allowGitRequests;
+  const authorityManifestValid = !requiresAuthorityManifest || Boolean(draft.authorityManifestId.trim());
+  const valid = quanta.valid && workingDirectoryValid && authorityManifestValid;
 
   useEffect(() => {
     if (!draft.llmProfile) return;
@@ -87,7 +91,10 @@ export function UserTaskSettingsDialog({
 
   function apply() {
     if (busy || !valid) return;
-    onApply({ ...draft });
+    onApply({
+      ...draft,
+      authorityManifestId: draft.authorityManifestId.trim()
+    });
     onClose();
   }
 
@@ -221,6 +228,29 @@ export function UserTaskSettingsDialog({
                   <option value="edit">{t("taskAuthority.edit")}</option>
                   <option value="manage">{t("taskAuthority.manage")}</option>
                 </select>
+              </label>
+              <label className="fieldStack taskSettingsField">
+                <span>{t("taskAuthority.manifestId")}</span>
+                <input
+                  value={draft.authorityManifestId}
+                  disabled={busy}
+                  aria-invalid={!authorityManifestValid || undefined}
+                  aria-describedby={!authorityManifestValid ? authorityManifestErrorId : undefined}
+                  placeholder={t("taskAuthority.manifestIdPlaceholder")}
+                  onChange={(event) => {
+                    const authorityManifestId = event.currentTarget.value;
+                    setDraft((current) => ({ ...current, authorityManifestId }));
+                  }}
+                />
+                <small
+                  id={authorityManifestErrorId}
+                  className={authorityManifestValid ? "fieldHint" : "taskSettingsInlineError"}
+                  role={authorityManifestValid ? undefined : "alert"}
+                >
+                  {authorityManifestValid
+                    ? t("taskAuthority.manifestIdHint")
+                    : t("taskRuns.authorityManifestRequired")}
+                </small>
               </label>
               <label className="taskAuthorityToggle taskSettingsField">
                 <input

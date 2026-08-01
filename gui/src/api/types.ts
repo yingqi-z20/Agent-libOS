@@ -35,7 +35,80 @@ export type ProcessWaitState =
   | { schema_version: 1; kind: "human"; request_ids: string[] }
   | { schema_version: 1; kind: "tool"; operation_id: string }
   | { schema_version: 1; kind: "paused"; reason_oid: string | null }
-  | { schema_version: 1; kind: "host_resume"; reason_oid: string };
+  | { schema_version: 1; kind: "host_resume"; reason_oid: string }
+  | {
+      schema_version: 1;
+      kind: "stale_execution";
+      pid: string;
+      recovered_by_owner_sha256: string;
+      prior_owner_sha256: string | null;
+      prior_lease_sha256: string | null;
+      prior_execution_generation: number;
+      recovered_execution_generation: number;
+      recovered_state_generation: number;
+    };
+
+const canonicalSha256 = /^[0-9a-f]{64}$/;
+
+/** Reject malformed/private process wait projections before React sees them. */
+export function assertProcessWaitState(value: unknown): asserts value is ProcessWaitState {
+  if (!isRecord(value) || value.schema_version !== 1 || typeof value.kind !== "string") {
+    throw new Error("GUI process wait state is malformed.");
+  }
+  const exactKeys = (...keys: string[]) => {
+    const expected = new Set(["schema_version", "kind", ...keys]);
+    return Object.keys(value).every((key) => expected.has(key)) && Object.keys(value).length === expected.size;
+  };
+  const nonEmpty = (item: unknown): item is string => typeof item === "string" && item.trim().length > 0;
+  const sha256OrNull = (item: unknown) => item === null || (typeof item === "string" && canonicalSha256.test(item));
+  const nonNegativeInteger = (item: unknown) => Number.isSafeInteger(item) && Number(item) >= 0;
+  const positiveInteger = (item: unknown) => Number.isSafeInteger(item) && Number(item) > 0;
+  let valid = false;
+  switch (value.kind) {
+    case "child":
+      valid = exactKeys("child_pid") && nonEmpty(value.child_pid);
+      break;
+    case "message":
+      valid = exactKeys("filters") && isRecord(value.filters);
+      break;
+    case "human":
+      valid = exactKeys("request_ids")
+        && Array.isArray(value.request_ids)
+        && value.request_ids.length > 0
+        && value.request_ids.every(nonEmpty)
+        && new Set(value.request_ids).size === value.request_ids.length;
+      break;
+    case "tool":
+      valid = exactKeys("operation_id") && nonEmpty(value.operation_id);
+      break;
+    case "paused":
+      valid = exactKeys("reason_oid") && (value.reason_oid === null || nonEmpty(value.reason_oid));
+      break;
+    case "host_resume":
+      valid = exactKeys("reason_oid") && nonEmpty(value.reason_oid);
+      break;
+    case "stale_execution":
+      valid = exactKeys(
+        "pid",
+        "recovered_by_owner_sha256",
+        "prior_owner_sha256",
+        "prior_lease_sha256",
+        "prior_execution_generation",
+        "recovered_execution_generation",
+        "recovered_state_generation"
+      )
+        && nonEmpty(value.pid)
+        && typeof value.recovered_by_owner_sha256 === "string"
+        && canonicalSha256.test(value.recovered_by_owner_sha256)
+        && sha256OrNull(value.prior_owner_sha256)
+        && sha256OrNull(value.prior_lease_sha256)
+        && nonNegativeInteger(value.prior_execution_generation)
+        && positiveInteger(value.recovered_execution_generation)
+        && positiveInteger(value.recovered_state_generation);
+      break;
+  }
+  if (!valid) throw new Error("GUI process wait state is malformed.");
+}
 
 export type ProcessOutcome =
   | { schema_version: 1; kind: "exited"; result_oid: string | null }
@@ -219,6 +292,205 @@ export type HumanRequest = {
   updated_at: string;
   release_request_id?: string;
   release_for_request_id?: string;
+};
+
+export const taskRunStatuses = [
+  "queued",
+  "running",
+  "waiting_human",
+  "waiting_process",
+  "waiting_message",
+  "waiting_tool",
+  "paused",
+  "cancelling",
+  "finalizing",
+  "needs_attention",
+  "succeeded",
+  "failed",
+  "cancelled"
+] as const;
+
+export type TaskRunStatus = (typeof taskRunStatuses)[number];
+
+export const taskRunActions = [
+  "run",
+  "wait",
+  "pause",
+  "resume",
+  "cancel",
+  "follow_up",
+  "recover",
+  "rerun"
+] as const;
+
+export type TaskRunAction = (typeof taskRunActions)[number];
+export type TaskRunRetention = "purge_on_terminal" | "permanent";
+
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+export type TaskRunSpecV1 = {
+  schema_version: 1;
+  goal: JsonValue;
+  display_title: string;
+  image_id?: string;
+  launch_options?: Record<string, unknown>;
+  authority_manifest_id?: string | null;
+  deadline_at?: string | null;
+  retention?: TaskRunRetention;
+};
+
+export const taskRunBlockerKinds = [
+  "unknown_effect",
+  "effect_unknown",
+  "payload_missing",
+  "payload_corrupt",
+  "binding_drift",
+  "pending_action_unreplayable",
+  "active_object_task",
+  "requirements_unsatisfied",
+  "cleanup_failed",
+  "authority_revoked",
+  "deadline_reached",
+  "effect_unsettled",
+  "reservation_unsettled",
+  "publication_unsettled",
+  "manual_recovery_required"
+] as const;
+
+export type TaskRunBlockerKind = (typeof taskRunBlockerKinds)[number];
+
+export type TaskRunBlocker = {
+  kind: TaskRunBlockerKind;
+  code?: string;
+  message?: string;
+  evidence_ref?: string;
+  process_id?: string;
+  effect_id?: string;
+};
+
+export type TaskRunRequirement = {
+  schema_version: 1;
+  requirement_id: string;
+  run_id: string;
+  ordinal: number;
+  kind: "initial" | "follow_up";
+  status: "pending" | "in_progress" | "satisfied" | "blocked" | "waived";
+  requirement_sha256: string;
+  label: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  waived_by: string | null;
+  content_available: boolean;
+  content_retention: "plaintext" | "hash_only";
+  content_sha256: string;
+  content_text?: string;
+  content_truncated?: boolean;
+};
+
+/**
+ * Redacted current-state projection. Full goal/follow-up/transcript payloads are
+ * deliberately absent so this shape is safe to carry over SSE.
+ */
+export type TaskRunSummary = Record<string, unknown> & {
+  schema_version: 1;
+  run_id: string;
+  revision: number;
+  status: TaskRunStatus;
+  display_title: string;
+  root_pid: string | null;
+  active_pid: string | null;
+  allowed_actions: TaskRunAction[];
+  blockers: TaskRunBlocker[];
+  retention: TaskRunRetention;
+  payloads_purged: boolean;
+  requirement_counts?: Record<string, number>;
+  step_counts?: Record<string, number>;
+  step_count?: number;
+  completed_step_count?: number;
+  result_ref?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+};
+
+export type TaskRunDetail = {
+  summary: TaskRunSummary;
+  requirements: {
+    items: TaskRunRequirement[];
+    next_cursor: string | null;
+    has_more: boolean;
+  };
+  recovery_options: TaskRunRecoveryOption[];
+};
+
+export type TaskRunLedgerItem = {
+  schema_version: 1;
+  item_id: string;
+  run_id: string;
+  seq: number;
+  kind: "requirement" | "process" | "llm_turn" | "tool_call" | "human_wait" | "message_wait" | "checkpoint" | "effect" | "status_transition";
+  status: string;
+  label: string;
+  occurred_at: string;
+  requirement_id?: string;
+  pid?: string;
+  operation_id?: string;
+  effect_id?: string;
+  human_request_id?: string;
+  llm_call_id?: string;
+  checkpoint_id?: string;
+  object_task_id?: string;
+  metadata: Record<string, string | number | boolean>;
+};
+
+export type TaskRunPage = {
+  items: TaskRunSummary[];
+  next_cursor: string | null;
+  has_more: boolean;
+};
+
+export type TaskRunLedgerPage = {
+  items: TaskRunLedgerItem[];
+  next_cursor: string | null;
+  has_more: boolean;
+};
+
+export type TaskRunHumanRequestPage = {
+  items: HumanRequest[];
+  next_cursor: string | null;
+  has_more: boolean;
+  presentation_truncated: boolean;
+};
+
+export const taskRunEffectTransactionStates = [
+  "prepared",
+  "authorized",
+  "approved",
+  "dispatched",
+  "committed",
+  "failed",
+  "unknown",
+  "compensated"
+] as const;
+
+export type TaskRunEffectTransactionState = (typeof taskRunEffectTransactionStates)[number];
+
+export type TaskRunRecoveryOption = {
+  schema_version?: 1;
+  option_id: string;
+  kind?: string;
+  label?: string;
+  description?: string;
+  requires_confirmation?: boolean;
+  requires_receipt?: boolean;
+  receipt_fields?: string[];
+  effect_id?: string;
+  expected_transaction_state?: TaskRunEffectTransactionState;
+  runtime_epoch?: number;
 };
 
 export type HumanPermissionPolicy = "always_allow" | "ask_each_time" | "always_deny";
@@ -419,6 +691,7 @@ export type ImageMutationResult = {
 };
 
 export type RuntimeSnapshot = {
+  schema_version: 2;
   db: string;
   scheduler: SchedulerStatus;
   processes: RuntimeProcess[];
@@ -427,6 +700,7 @@ export type RuntimeSnapshot = {
   audit: AuditRecord[];
   llm_calls: LlmCall[];
   object_tasks: ObjectTask[];
+  task_runs: TaskRunSummary[];
   tools: ToolSummary[];
   llm_profiles: LLMProfileSummary[];
   images: ImageSummary[];
@@ -540,6 +814,7 @@ const snapshotCollections = [
   "audit",
   "llm_calls",
   "object_tasks",
+  "task_runs",
   "tools",
   "llm_profiles",
   "images",
@@ -552,6 +827,7 @@ const snapshotCollections = [
 /** Fail closed on a malformed same-build response before React consumes it. */
 export function assertRuntimeSnapshot(value: unknown): asserts value is RuntimeSnapshot {
   if (!isRecord(value)) throw new Error("GUI snapshot must be a JSON object.");
+  if (value.schema_version !== 2) throw new Error("GUI snapshot schema_version must be 2.");
   if (typeof value.db !== "string") throw new Error("GUI snapshot is missing db.");
   try {
     assertSchedulerStatus(value.scheduler);
@@ -567,7 +843,11 @@ export function assertRuntimeSnapshot(value: unknown): asserts value is RuntimeS
     if (!isRecord(process) || typeof process.pid !== "string" || !process.pid) {
       throw new Error("GUI snapshot contains a process without a valid pid.");
     }
+    if ("wait_state" in process && process.wait_state !== null) {
+      assertProcessWaitState(process.wait_state);
+    }
   }
+  for (const run of value.task_runs as unknown[]) assertTaskRunSummary(run);
 }
 
 /** Validate snapshots delivered inside an SSE event before replacing visible state. */
@@ -578,6 +858,277 @@ export function runtimeSnapshotFromSseData(value: unknown): RuntimeSnapshot {
   const snapshot = value.snapshot;
   assertRuntimeSnapshot(snapshot);
   return snapshot;
+}
+
+export function assertTaskRunSummary(value: unknown): asserts value is TaskRunSummary {
+  if (!isRecord(value)) throw new Error("GUI task run summary must be an object.");
+  if (value.schema_version !== 1) throw new Error("GUI task run summary schema_version must be 1.");
+  const unknownKey = Object.keys(value).find((key) => !taskRunSummaryKeys.has(key));
+  if (unknownKey) throw new Error(`GUI task run summary contains private field: $.${unknownKey}.`);
+  const forbiddenPath = forbiddenTaskRunSummaryPath(value);
+  if (forbiddenPath) throw new Error(`GUI task run summary contains private field: ${forbiddenPath}.`);
+  if (typeof value.run_id !== "string" || !value.run_id) {
+    throw new Error("GUI task run summary is missing run_id.");
+  }
+  if (!Number.isSafeInteger(value.revision) || Number(value.revision) < 0) {
+    throw new Error("GUI task run revision must be a non-negative safe integer.");
+  }
+  if (typeof value.status !== "string" || !(taskRunStatuses as readonly string[]).includes(value.status)) {
+    throw new Error("GUI task run status is malformed.");
+  }
+  if (typeof value.display_title !== "string" || !value.display_title.trim()) {
+    throw new Error("GUI task run title is malformed.");
+  }
+  if (!(value.root_pid === null || typeof value.root_pid === "string")) {
+    throw new Error("GUI task run root_pid is malformed.");
+  }
+  if (!(value.active_pid === null || typeof value.active_pid === "string")) {
+    throw new Error("GUI task run active_pid is malformed.");
+  }
+  if (!Array.isArray(value.allowed_actions)
+      || value.allowed_actions.some((action) => typeof action !== "string" || !(taskRunActions as readonly string[]).includes(action))) {
+    throw new Error("GUI task run allowed_actions is malformed.");
+  }
+  if (!Array.isArray(value.blockers) || value.blockers.some((blocker) => (
+    !isRecord(blocker)
+    || typeof blocker.kind !== "string"
+    || !(taskRunBlockerKinds as readonly string[]).includes(blocker.kind)
+    || Object.keys(blocker).some((key) => !taskRunBlockerKeys.has(key))
+    || ["code", "message", "evidence_ref", "process_id", "effect_id"].some(
+      (key) => key in blocker && typeof blocker[key] !== "string"
+    )
+  ))) {
+    throw new Error("GUI task run blockers are malformed.");
+  }
+  if (value.retention !== "purge_on_terminal" && value.retention !== "permanent") {
+    throw new Error("GUI task run retention is malformed.");
+  }
+  if (typeof value.payloads_purged !== "boolean") {
+    throw new Error("GUI task run payload purge state is malformed.");
+  }
+  for (const key of ["step_count", "completed_step_count"] as const) {
+    if (value[key] !== undefined && (!Number.isSafeInteger(value[key]) || Number(value[key]) < 0)) {
+      throw new Error(`GUI task run ${key} is malformed.`);
+    }
+  }
+  for (const key of ["requirement_counts", "step_counts"] as const) {
+    const counts = value[key];
+    if (counts !== undefined && (
+      !isRecord(counts)
+      || Object.values(counts).some((count) => !Number.isSafeInteger(count) || Number(count) < 0)
+    )) {
+      throw new Error(`GUI task run ${key} is malformed.`);
+    }
+  }
+  if (!(value.result_ref === undefined || value.result_ref === null || typeof value.result_ref === "string")) {
+    throw new Error("GUI task run result_ref is malformed.");
+  }
+}
+
+const taskRunSummaryKeys = new Set([
+  "schema_version",
+  "run_id",
+  "revision",
+  "status",
+  "display_title",
+  "root_pid",
+  "active_pid",
+  "allowed_actions",
+  "blockers",
+  "retention",
+  "payloads_purged",
+  "requirement_counts",
+  "step_counts",
+  "step_count",
+  "completed_step_count",
+  "result_ref",
+  "created_at",
+  "updated_at",
+  "started_at",
+  "completed_at"
+]);
+
+const taskRunBlockerKeys = new Set([
+  "kind",
+  "code",
+  "message",
+  "evidence_ref",
+  "process_id",
+  "effect_id"
+]);
+
+export function assertTaskRunDetail(value: unknown): asserts value is TaskRunDetail {
+  if (!isRecord(value)) throw new Error("GUI task run detail must be an object.");
+  assertTaskRunSummary(value.summary);
+  if (!isRecord(value.requirements)
+      || !Array.isArray(value.requirements.items)
+      || typeof value.requirements.has_more !== "boolean"
+      || !(value.requirements.next_cursor === null || typeof value.requirements.next_cursor === "string")) {
+    throw new Error("GUI task run requirement page is malformed.");
+  }
+  for (const item of value.requirements.items) assertTaskRunRequirement(item);
+  if (!Array.isArray(value.recovery_options) || value.recovery_options.some((item) => !isTaskRunRecoveryOption(item))) {
+    throw new Error("GUI task run recovery options are malformed.");
+  }
+}
+
+const taskRunRecoveryOptionKeys = new Set([
+  "schema_version",
+  "option_id",
+  "kind",
+  "label",
+  "description",
+  "requires_confirmation",
+  "requires_receipt",
+  "receipt_fields",
+  "effect_id",
+  "expected_transaction_state",
+  "runtime_epoch"
+]);
+
+function isTaskRunRecoveryOption(value: unknown): value is TaskRunRecoveryOption {
+  if (!isRecord(value)
+      || Object.keys(value).some((key) => !taskRunRecoveryOptionKeys.has(key))
+      || typeof value.option_id !== "string"
+      || !value.option_id
+      || (value.schema_version !== undefined && value.schema_version !== 1)
+      || (value.kind !== undefined && (typeof value.kind !== "string" || !value.kind))
+      || (value.label !== undefined && typeof value.label !== "string")
+      || (value.description !== undefined && typeof value.description !== "string")
+      || (value.requires_confirmation !== undefined && typeof value.requires_confirmation !== "boolean")
+      || (value.requires_receipt !== undefined && typeof value.requires_receipt !== "boolean")
+      || (value.effect_id !== undefined && (typeof value.effect_id !== "string" || !value.effect_id))
+      || (value.expected_transaction_state !== undefined && (
+        typeof value.expected_transaction_state !== "string"
+        || !(taskRunEffectTransactionStates as readonly string[]).includes(value.expected_transaction_state)
+      ))
+      || (value.runtime_epoch !== undefined && (
+        !Number.isSafeInteger(value.runtime_epoch) || Number(value.runtime_epoch) < 0
+      ))
+      || (value.receipt_fields !== undefined && (
+        !Array.isArray(value.receipt_fields)
+        || value.receipt_fields.some((field) => typeof field !== "string" || !field)
+      ))) {
+    return false;
+  }
+  if (value.kind === "effect_receipt") {
+    return typeof value.effect_id === "string"
+      && typeof value.expected_transaction_state === "string"
+      && Number.isSafeInteger(value.runtime_epoch)
+      && value.requires_receipt === true;
+  }
+  return true;
+}
+
+function assertTaskRunRequirement(value: unknown): asserts value is TaskRunRequirement {
+  if (!isRecord(value)
+      || value.schema_version !== 1
+      || typeof value.requirement_id !== "string"
+      || !value.requirement_id
+      || typeof value.run_id !== "string"
+      || !value.run_id
+      || !Number.isSafeInteger(value.ordinal)
+      || Number(value.ordinal) < 0
+      || (value.kind !== "initial" && value.kind !== "follow_up")
+      || !["pending", "in_progress", "satisfied", "blocked", "waived"].includes(String(value.status))
+      || typeof value.requirement_sha256 !== "string"
+      || !/^[0-9a-f]{64}$/.test(value.requirement_sha256)
+      || typeof value.label !== "string"
+      || typeof value.created_by !== "string"
+      || typeof value.created_at !== "string"
+      || typeof value.updated_at !== "string"
+      || !(value.started_at === null || typeof value.started_at === "string")
+      || !(value.completed_at === null || typeof value.completed_at === "string")
+      || !(value.waived_by === null || typeof value.waived_by === "string")
+      || typeof value.content_available !== "boolean"
+      || (value.content_retention !== "plaintext" && value.content_retention !== "hash_only")
+      || typeof value.content_sha256 !== "string"
+      || !/^[0-9a-f]{64}$/.test(value.content_sha256)) {
+    throw new Error("GUI task run requirement is malformed.");
+  }
+  if (value.content_text !== undefined && typeof value.content_text !== "string") {
+    throw new Error("GUI task run requirement content text is malformed.");
+  }
+  if (value.content_truncated !== undefined && typeof value.content_truncated !== "boolean") {
+    throw new Error("GUI task run requirement truncation state is malformed.");
+  }
+  if (value.content_retention === "hash_only" && (value.content_available || "content_text" in value)) {
+    throw new Error("GUI hash-only task run requirement contains plaintext content.");
+  }
+  if (value.content_retention === "plaintext" && value.content_available !== (typeof value.content_text === "string")) {
+    throw new Error("GUI task run requirement availability disagrees with plaintext content.");
+  }
+}
+
+const forbiddenTaskRunSummaryKeys = new Set([
+  "goal",
+  "objective",
+  "body",
+  "payload",
+  "transcript",
+  "provider_payload",
+  "provider_request",
+  "provider_response",
+  "tool_input",
+  "tool_output",
+  "llm_input",
+  "llm_output",
+  "internal_error",
+  "exception",
+  "traceback",
+  "requirements",
+  "recovery_options"
+]);
+
+function forbiddenTaskRunSummaryPath(value: unknown, path = "$", seen = new Set<object>()): string | null {
+  if (!value || typeof value !== "object") return null;
+  if (seen.has(value)) return null;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const found = forbiddenTaskRunSummaryPath(value[index], `${path}[${index}]`, seen);
+      if (found) return found;
+    }
+    return null;
+  }
+  for (const [key, item] of Object.entries(value)) {
+    const next = `${path}.${key}`;
+    if (forbiddenTaskRunSummaryKeys.has(key)) return next;
+    const found = forbiddenTaskRunSummaryPath(item, next, seen);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Return only server-authorized controls, with needs-attention fail-closed. */
+export function allowedTaskRunActions(value: unknown): ReadonlySet<TaskRunAction> {
+  try {
+    assertTaskRunSummary(value);
+  } catch {
+    return new Set<TaskRunAction>();
+  }
+  const selected = new Set<TaskRunAction>(value.allowed_actions);
+  if (value.status === "needs_attention") {
+    selected.delete("run");
+    selected.delete("resume");
+  }
+  return selected;
+}
+
+export function taskRunSummaryFromSseData(value: unknown): TaskRunSummary {
+  const summary = isRecord(value) && "summary" in value ? value.summary : value;
+  assertTaskRunSummary(summary);
+  return summary;
+}
+
+/** Ignore stale/equal revisions so reconnect replay cannot roll visible state backward. */
+export function upsertTaskRunSummary(
+  summaries: readonly TaskRunSummary[],
+  candidate: TaskRunSummary
+): TaskRunSummary[] {
+  const current = summaries.find((item) => item.run_id === candidate.run_id);
+  if (current && current.revision >= candidate.revision) return [...summaries];
+  return [candidate, ...summaries.filter((item) => item.run_id !== candidate.run_id)];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

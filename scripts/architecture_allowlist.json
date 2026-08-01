@@ -1,6 +1,6 @@
 {
   "complexity_budgets": {
-    "agent_libos/api/gui/server.py::GuiRequestHandler._dispatch": 59,
+    "agent_libos/api/gui/server.py::GuiRequestHandler._dispatch": 51,
     "agent_libos/api/gui/server.py::GuiRequestHandler._dispatch_object_tasks": 37,
     "agent_libos/api/gui/server.py::GuiRequestHandler._dispatch_process": 52,
     "agent_libos/human/manager.py::HumanObjectManager._terminal_question": 24,
@@ -15,7 +15,6 @@
     "agent_libos/runtime/authority_manifest_manager.py::AuthorityManifestManager.prepare_launch": 23,
     "agent_libos/runtime/checkpoint_manager.py::CheckpointManager._remap_snapshot": 25,
     "agent_libos/runtime/explain_manager.py::ExplainManager._deterministic_summary": 25,
-    "agent_libos/runtime/image_registry.py::ImageRegistryPrimitive._build_commit_artifact": 22,
     "agent_libos/runtime/image_registry.py::ImageRegistryPrimitive._image_package_from_files": 26,
     "agent_libos/runtime/resource_manager.py::ResourceManager.remaining_budgets": 25,
     "agent_libos/runtime/scheduler.py::AsyncProcessScheduler._run_until_idle_locked": 23,
@@ -36,7 +35,7 @@
     "agent_libos/primitives/filesystem.py::FilesystemAdapter._delete_directory_serialized": 243,
     "agent_libos/primitives/mcp.py::McpPrimitive._call_tool": 375,
     "agent_libos/primitives/shell.py::ShellAdapter.run": 257,
-    "agent_libos/storage/sql.py::SQLRuntimeStore.initialize": 492
+    "agent_libos/storage/sql.py::SQLRuntimeStore.initialize": 402
   },
   "schema_version": 1,
   "violation_budgets": {
@@ -60,7 +59,7 @@
     "cross-component-private-access": {},
     "runtime-service-locator": {
       "agent_libos/api/gui/server.py::GuiRuntimeService::audit": 1,
-      "agent_libos/api/gui/server.py::GuiRuntimeService::config": 30,
+      "agent_libos/api/gui/server.py::GuiRuntimeService::config": 22,
       "agent_libos/api/gui/server.py::GuiRuntimeService::events": 1,
       "agent_libos/api/gui/server.py::GuiRuntimeService::human": 3,
       "agent_libos/api/gui/server.py::GuiRuntimeService::image_registry": 1,

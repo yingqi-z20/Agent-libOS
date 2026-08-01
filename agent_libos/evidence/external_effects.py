@@ -18,6 +18,7 @@ from agent_libos.models import (
     ExternalEffectCursor,
     ExternalEffectRecord,
     ExternalEffectRecoveryQuery,
+    ExternalEffectRecoverySettlement,
     ExternalEffectRecoverySummary,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
@@ -427,18 +428,29 @@ def mark_external_effect_unknown(
     current = store.get_external_effect(effect_id)
     if current is None:
         raise ValidationError(f"external effect intent not found: {effect_id}")
+    selected_receipt = (
+        provider_receipt
+        if provider_receipt is not None
+        else dict(current.provider_receipt)
+    )
     metadata = {
         **dict(current.provider_metadata),
         "outcome": "unknown",
         "reconciliation_reason": reason,
         "transaction_state": "unknown",
     }
+    if (
+        current.transaction_state == "unknown"
+        and current.provider_metadata == metadata
+        and current.provider_receipt == selected_receipt
+    ):
+        return current
     if not store.transition_external_effect(
         effect_id,
         expected_states=("prepared", "authorized", "approved", "dispatched", "unknown"),
         transaction_state="unknown",
         provider_metadata=metadata,
-        provider_receipt=provider_receipt,
+        provider_receipt=selected_receipt,
         updated_at=utc_now(),
     ):
         raise ValidationError(f"external effect intent cannot become unknown: {effect_id}")
@@ -467,75 +479,12 @@ def reconcile_pending_external_effects(
             # domain-state restoration. Never ask a provider about a boundary
             # that was durably proven not to have been dispatched.
             continue
-        provider = (
-            provider_overrides[effect.provider]
-            if provider_overrides is not None and effect.provider in provider_overrides
-            else getattr(substrate, effect.provider, None)
+        _reconcile_pending_external_effect(
+            store,
+            substrate,
+            effect,
+            provider_overrides=provider_overrides,
         )
-        reconcile = getattr(provider, "reconcile_external_effect", None)
-        if not callable(reconcile):
-            mark_external_effect_unknown(
-                store,
-                effect.effect_id,
-                reason="provider_does_not_support_reconciliation",
-            )
-            reconciled_total += 1
-            if len(reconciled_sample) < page_size:
-                reconciled_sample.append(effect.effect_id)
-            continue
-        try:
-            result = reconcile(effect)
-        except Exception as exc:
-            mark_external_effect_unknown(
-                store,
-                effect.effect_id,
-                reason=f"provider_reconciliation_error:{type(exc).__name__}",
-            )
-            reconciled_total += 1
-            if len(reconciled_sample) < page_size:
-                reconciled_sample.append(effect.effect_id)
-            continue
-        if not isinstance(result, dict):
-            mark_external_effect_unknown(
-                store,
-                effect.effect_id,
-                reason="invalid_reconciliation_result",
-            )
-            reconciled_total += 1
-            if len(reconciled_sample) < page_size:
-                reconciled_sample.append(effect.effect_id)
-            continue
-        state = str(result.get("state") or "unknown")
-        receipt = result.get("provider_receipt")
-        if state not in {"committed", "failed", "compensated", "unknown"}:
-            state = "unknown"
-        metadata = {
-            **dict(effect.provider_metadata),
-            "reconciled": True,
-            "transaction_state": state,
-            "outcome": state,
-        }
-        selected_receipt = dict(receipt) if isinstance(receipt, dict) else {}
-        if state in {"committed", "failed", "compensated"}:
-            settled = replace(
-                effect,
-                effect_state="finalized",
-                transaction_state=state,
-                provider_metadata=metadata,
-                provider_receipt=selected_receipt,
-                updated_at=utc_now(),
-            )
-            if not store.finalize_external_effect(effect.effect_id, settled):
-                raise ValidationError(f"external effect reconciliation raced: {effect.effect_id}")
-        elif not store.transition_external_effect(
-            effect.effect_id,
-            expected_states=("prepared", "authorized", "approved", "dispatched", "unknown"),
-            transaction_state=state,
-            provider_metadata=metadata,
-            provider_receipt=selected_receipt,
-            updated_at=utc_now(),
-        ):
-            raise ValidationError(f"external effect reconciliation raced: {effect.effect_id}")
         reconciled_total += 1
         if len(reconciled_sample) < page_size:
             reconciled_sample.append(effect.effect_id)
@@ -543,6 +492,299 @@ def reconcile_pending_external_effects(
         total_count=reconciled_total,
         sample_effect_ids=tuple(reconciled_sample),
     )
+
+
+def _reconcile_pending_external_effect(
+    store: ProtectedEffectPort,
+    substrate: Any,
+    effect: ExternalEffectRecord,
+    *,
+    provider_overrides: Mapping[str, Any] | None,
+) -> None:
+    provider = (
+        provider_overrides[effect.provider]
+        if provider_overrides is not None and effect.provider in provider_overrides
+        else getattr(substrate, effect.provider, None)
+    )
+    reconcile = getattr(provider, "reconcile_external_effect", None)
+    if not callable(reconcile):
+        mark_external_effect_unknown(
+            store,
+            effect.effect_id,
+            reason="provider_does_not_support_reconciliation",
+        )
+        return
+    try:
+        result = reconcile(effect)
+    except Exception as exc:
+        mark_external_effect_unknown(
+            store,
+            effect.effect_id,
+            reason=f"provider_reconciliation_error:{type(exc).__name__}",
+        )
+        return
+    if not isinstance(result, Mapping):
+        mark_external_effect_unknown(
+            store,
+            effect.effect_id,
+            reason="invalid_reconciliation_result",
+        )
+        return
+    _persist_provider_reconciliation_result(store, effect, result)
+
+
+def _persist_provider_reconciliation_result(
+    store: ProtectedEffectPort,
+    effect: ExternalEffectRecord,
+    result: Mapping[str, Any],
+) -> None:
+    receipt = result.get("provider_receipt")
+    state = _normalized_provider_reconciliation_state(
+        result.get("state"),
+        receipt,
+    )
+    if state not in {
+        "committed",
+        "failed",
+        "compensated",
+        "not_started",
+        "unknown",
+    }:
+        state = "unknown"
+    if effect.transaction_state == "prepared" and state not in {
+        "not_started",
+        "unknown",
+    }:
+        mark_external_effect_unknown(
+            store,
+            effect.effect_id,
+            reason="prepared_effect_requires_certified_not_started",
+            provider_receipt=(
+                dict(receipt) if isinstance(receipt, Mapping) else None
+            ),
+        )
+        return
+    if state in {"committed", "failed", "compensated", "not_started"}:
+        _persist_provider_terminal_reconciliation(store, effect, state, receipt)
+        return
+    metadata = {
+        **dict(effect.provider_metadata),
+        "reconciled": True,
+        "transaction_state": state,
+        "outcome": state,
+    }
+    selected_receipt = dict(receipt) if isinstance(receipt, Mapping) else {}
+    if (
+        effect.transaction_state == "unknown"
+        and effect.provider_metadata == metadata
+        and effect.provider_receipt == selected_receipt
+    ):
+        return
+    if not store.transition_external_effect(
+        effect.effect_id,
+        expected_states=("prepared", "authorized", "approved", "dispatched", "unknown"),
+        transaction_state=state,
+        provider_metadata=metadata,
+        provider_receipt=selected_receipt,
+        updated_at=utc_now(),
+    ):
+        raise ValidationError(
+            f"external effect reconciliation raced: {effect.effect_id}"
+        )
+
+
+def _persist_provider_terminal_reconciliation(
+    store: ProtectedEffectPort,
+    effect: ExternalEffectRecord,
+    provider_state: str,
+    receipt: Any,
+) -> None:
+    if not isinstance(receipt, Mapping) or not receipt:
+        mark_external_effect_unknown(
+            store,
+            effect.effect_id,
+            reason="provider_terminal_state_without_authoritative_receipt",
+        )
+        return
+    _settle_external_effect_recovery(
+        store,
+        effect=effect,
+        provider_state=provider_state,
+        provider_receipt=dict(receipt),
+        source="provider_reconciliation",
+    )
+
+
+def settle_external_effect_from_authoritative_receipt(
+    store: ProtectedEffectPort,
+    *,
+    provider: Any,
+    run_id: str,
+    effect_id: str,
+    expected_transaction_state: str,
+    provider_receipt: Mapping[str, Any],
+    runtime_epoch: int,
+    require_recovery_lease: Callable[[], None],
+) -> ExternalEffectRecoverySettlement:
+    """Verify and atomically settle one Host-selected provider receipt.
+
+    The caller-provided receipt is never itself a certificate.  A configured
+    provider must implement ``verify_external_effect_receipt`` and return the
+    authoritative state plus the normalized receipt that should be retained.
+    The SQL boundary then repeats the exact effect/state/Run epoch checks.
+    """
+
+    require_recovery_lease()
+    if not isinstance(effect_id, str) or not effect_id:
+        raise ValidationError("authoritative receipt requires an effect id")
+    if expected_transaction_state not in {
+        "prepared",
+        "authorized",
+        "approved",
+        "dispatched",
+        "unknown",
+    }:
+        raise ValidationError(
+            "authoritative receipt expected state is not recoverable"
+        )
+    if not isinstance(provider_receipt, Mapping) or not provider_receipt:
+        raise ValidationError("authoritative provider receipt is required")
+    effect = store.get_external_effect(effect_id)
+    if effect is None:
+        raise ValidationError(f"external effect intent not found: {effect_id}")
+    if (
+        effect.effect_state != "pending"
+        or effect.transaction_state != expected_transaction_state
+    ):
+        raise ValidationError(
+            "authoritative receipt no longer matches the expected effect state"
+        )
+    verify = getattr(provider, "verify_external_effect_receipt", None)
+    if not callable(verify):
+        raise ValidationError(
+            "configured provider cannot verify authoritative effect receipts"
+        )
+    verified = verify(effect, dict(provider_receipt))
+    provider_state, normalized_receipt = _verified_provider_receipt(verified)
+    settled = _settle_external_effect_recovery(
+        store,
+        effect=effect,
+        provider_state=provider_state,
+        provider_receipt=normalized_receipt,
+        source="host_verified_receipt",
+        run_id=run_id,
+        runtime_epoch=runtime_epoch,
+    )
+    return settled
+
+
+def _verified_provider_receipt(value: Any) -> tuple[str, dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        raise ValidationError(
+            "provider receipt verifier must return an authoritative result object"
+        )
+    receipt = value.get("provider_receipt")
+    if not isinstance(receipt, Mapping) or not receipt:
+        raise ValidationError(
+            "provider receipt verifier returned no authoritative receipt"
+        )
+    state = _normalized_provider_reconciliation_state(value.get("state"), receipt)
+    if state not in {"committed", "failed", "compensated", "not_started"}:
+        raise ValidationError(
+            "provider receipt verifier returned an unsupported effect state"
+        )
+    return state, dict(receipt)
+
+
+def _normalized_provider_reconciliation_state(
+    value: Any,
+    receipt: Any,
+) -> str:
+    state = str(value or "unknown")
+    if state == "failed" and _provider_receipt_certifies_not_started(receipt):
+        return "not_started"
+    return state
+
+
+def _provider_receipt_certifies_not_started(receipt: Any) -> bool:
+    if not isinstance(receipt, Mapping):
+        return False
+    return bool(
+        (
+            receipt.get("dispatch_status") == "not_started"
+            and receipt.get("certified") is True
+        )
+        or receipt.get("certified_not_started") is True
+    )
+
+
+def _settle_external_effect_recovery(
+    store: ProtectedEffectPort,
+    *,
+    effect: ExternalEffectRecord,
+    provider_state: str,
+    provider_receipt: dict[str, Any],
+    source: str,
+    run_id: str | None = None,
+    runtime_epoch: int | None = None,
+) -> ExternalEffectRecoverySettlement:
+    receipt_sha256 = hashlib.sha256(
+        dumps(provider_receipt).encode("utf-8")
+    ).hexdigest()
+    settled_transaction_state = (
+        "failed" if provider_state == "not_started" else provider_state
+    )
+    metadata = {
+        **dict(effect.provider_metadata),
+        "reconciled": True,
+        "reconciliation_source": source,
+        "provider_reconciliation_state": provider_state,
+        "transaction_state": settled_transaction_state,
+        "outcome": provider_state,
+        "provider_receipt_sha256": receipt_sha256,
+    }
+    if provider_state == "not_started":
+        metadata.update(
+            {
+                "certified_not_started": True,
+                "dispatch_status": "not_started",
+            }
+        )
+    now = utc_now()
+    audit = AuditRecord(
+        record_id=new_id("audit"),
+        timestamp=now,
+        actor="runtime.recovery",
+        action="external_effect.recovery_settled",
+        target=f"external_effect:{effect.effect_id}",
+        input_refs=[],
+        output_refs=[],
+        capability_refs=[],
+        decision={
+            "source": source,
+            "provider": effect.provider,
+            "operation": effect.operation,
+            "provider_state": provider_state,
+            "provider_receipt_sha256": receipt_sha256,
+        },
+        correlation_id=effect.effect_id,
+    )
+    settled = store.settle_external_effect_recovery(
+        effect.effect_id,
+        expected_transaction_state=effect.transaction_state,
+        provider_state=provider_state,
+        provider_metadata=metadata,
+        provider_receipt=provider_receipt,
+        audit_record=audit,
+        updated_at=now,
+        run_id=run_id,
+        runtime_epoch=runtime_epoch,
+    )
+    if settled is None:
+        raise ValidationError(
+            f"external effect recovery raced or failed its fence: {effect.effect_id}"
+        )
+    return settled
 
 
 def abandon_external_effect_intent(

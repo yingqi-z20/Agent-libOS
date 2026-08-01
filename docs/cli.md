@@ -191,6 +191,7 @@ resources     print process resource budget, usage, and remaining budget
 tools         print registered tools
 workflow      run a user-facing workflow tool directly
 object-task   start, get, list, cancel, wait, or watch-owner Object tasks
+task-run      create, supervise, recover, or rerun a Durable Task Run
 spawn         spawn a process
 cd            set a process working directory
 exec          replace a process image and goal
@@ -208,6 +209,15 @@ mcp           MCP server and tool-call subcommands
 modules       startup Runtime Module inspection and verification
 human         process pending human messages manually
 ```
+
+The `processes` and `resources` responses, and the resulting process state from
+`exit`, include canonical `wait_state`, `outcome`, and `state_generation`
+fields. A stale takeover appears as the readable typed
+`StaleExecutionProcessWait`/`kind: stale_execution` projection with identity
+hashes and generations; it is diagnostic evidence, not client-held permission
+to resume. CLI automation must inspect the typed fields and must not parse
+`status_message` (including `stale_execution_recovery`) as a control protocol.
+The stale wait never contains the pre-takeover raw owner or lease token.
 
 Run `uv run agent-libos <command> --help` for that parser's generated options
 and subcommand list. For nested command groups, continue with
@@ -235,6 +245,10 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint --actor-pid <actor_pid> i
 ```
 
 ## Persistent Runtime Basics
+
+Agent libOS 1.1.0 opens only store schema v4. A schema-v3 database from 1.0.1
+is rejected before `init`, recovery, audit, or any other write; use 1.0.1 to
+inspect/archive it. There is no v3 migration or read-only compatibility mode.
 
 `run`, `llm-once`, and `exec --run` invoke the configured real LLM and may
 consume provider tokens. Process rows and capabilities survive a file-backed
@@ -372,6 +386,107 @@ By default the process goal is `workflow:<tool>`, so tool arguments are not
 copied into the goal object. Use `--goal` only when the workflow process needs a
 human-readable label. `ok:false` is still printed as JSON and exits the CLI with
 status code 1.
+
+## Durable Task Runs
+
+`task-run` is the Host CLI for a first-class Durable Task Run. It is separate
+from both the one-tool `workflow run` command and Object-bound background
+tasks. A Run supervises a root AgentProcess tree, persists a versioned goal and
+requirements, and exposes safe restart recovery through store schema v4.
+
+```text
+task-run start
+task-run get <run_id>
+task-run list
+task-run wait <run_id>
+task-run recovery-options <run_id>
+task-run pause <run_id>
+task-run resume <run_id>
+task-run cancel <run_id>
+task-run follow-up <run_id>
+task-run recover <run_id>
+task-run rerun <run_id>
+```
+
+Useful leaf options are:
+
+| Command | Durable controls |
+| --- | --- |
+| `start` | Exactly one of `--goal`/`--goal-json`, required `--title`, optional Image/launch/authority/deadline/retention fields, stable `--client-request-id`, and explicit `--run [--max-quanta N] [--run-command-id ID]`; launch JSON accepts only `capabilities`, `resource_budget`, `working_directory`, and `llm_profile_id` and must not contain credentials |
+| `list` | Repeated or comma-separated `--status`, opaque `--cursor`, and bounded `--limit` |
+| `wait` | Optional finite `--timeout`; it has no run command id because it never mutates or dispatches |
+| `recovery-options` | Read-only, server-derived recovery choices for the Run; use the returned opaque `option_id` with `recover` |
+| `pause` / `resume` | Required `--expected-revision`; optional stable `--command-id` is generated for a one-shot invocation when omitted |
+| `cancel` | Revision/command identity, optional `--reason`, and required `--confirm` |
+| `follow-up` | Text or strict JSON content, optional `--interrupt` or `--optional`, and revision/command identity |
+| `recover` | An exact server-provided option, optional provider-verifiable `--receipt-json`, revision/command identity, and required `--confirm` |
+| `rerun` | Revision/command identity, optional linked-create `--client-request-id`, and optional `--spec-overrides-json` |
+
+For example, after enabling `task_runs.plaintext_payloads_enabled` in the Host
+configuration:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite task-run start \
+  --goal "inspect the repository and fix the reported failure" \
+  --title "repair reported failure" \
+  --retention purge_on_terminal
+
+uv run agent-libos --db .agent_libos.sqlite task-run start \
+  --goal "continue until the acceptance checks pass" \
+  --title "release validation" --run --max-quanta 20
+
+uv run agent-libos --db .agent_libos.sqlite task-run follow-up <run_id> \
+  "also document the compatibility boundary" \
+  --expected-revision <revision> --command-id <stable-id>
+```
+
+`start` creates a queued Run by default. `--client-request-id` supplies the
+stable create identity; omission generates one for that invocation. Creation
+does not require an existing revision. Pass `--run` to
+consume scheduler quanta in the current CLI process; `--max-quanta` is the
+explicit per-command bound. Omitting it supplies no quantum-count cap to the
+Task Run command, which then runs only until a typed wait, terminal, pause,
+deadline, or `needs_attention` boundary. Creation does not install a daemon.
+Likewise, `wait` cannot keep work running after the one-shot CLI exits and
+never dispatches scheduler quanta, provider calls, or tools. Its observation
+may still persist safe deadline cancellation, settlement projection, and
+terminal-retention housekeeping. Waiting states and
+`needs_attention` are successful structured command responses rather than
+uncaught internal errors.
+
+Every mutation carries the current `expected_revision` and a stable
+`command_id`. Retrying the same canonical command is idempotent; reusing its id
+for different arguments fails. Cancel and evidence-constrained recovery require
+explicit confirmation. A dispatched or unknown external effect offers no
+ordinary Retry/Resume shortcut.
+
+After a timeout, connection loss, or CLI crash with an ambiguous result, retry
+with the exact same command id and arguments; generating a new id is a new
+mutation, not a safe transport retry. For operations whose durable command
+receipt is still pending, that exact retry can finish only local settlement and
+return the stored revision-bound result. It does not consume another quantum or
+repeat an LLM, tool, Provider, or external effect. Callers that may need this
+recovery should supply `--command-id` explicitly (or `--run-command-id` for
+`start --run`) rather than rely on a one-shot generated value they did not
+retain. A retryable `start --run` invocation must retain and reuse both its
+`--client-request-id` and its distinct `--run-command-id`.
+For `recover` with a linked-Run option, the same exact retry may reconstruct a
+lost outer receipt only from the request-hash-bound nested rerun, target create
+receipt, and causal link already in the Store. It does not create a second Run;
+submitting a new command id is a new recovery request and has no such identity
+guarantee.
+
+Durable payload persistence is disabled by default. Until the Host opts into
+the documented plaintext-at-rest boundary, Run creation is rejected. The
+default `purge_on_terminal` retention removes readable Run payloads before the
+terminal status commits; `permanent` is a Host/admin-only creation option. See
+[Durable Task Runs](durable_task_runs.md) for the complete lifecycle and
+recovery contract.
+
+For rerun, use the summary's `payloads_purged` field rather than assuming that
+only `purge_on_terminal` can remove content. A terminal `permanent` Run may
+also have been explicitly purged; in either case supply a replacement goal,
+for example `--spec-overrides-json '{"goal":"rebuild from current state"}'`.
 
 ## Object Tasks
 

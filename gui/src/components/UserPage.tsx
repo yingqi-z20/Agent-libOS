@@ -34,8 +34,14 @@ import type {
   LLMProfileSummary,
   RuntimeProcess,
   RuntimeSnapshot,
-  StreamConnectionStatus
+  StreamConnectionStatus,
+  TaskRunBlockerKind,
+  TaskRunDetail,
+  TaskRunRequirement,
+  TaskRunRetention,
+  TaskRunSummary
 } from "../api/types";
+import { allowedTaskRunActions } from "../api/types";
 import { useI18n, type TranslationKey } from "../i18n";
 import { shortProcessId, taskDisplayLabel } from "../taskPresentation";
 import { deriveUserConversation, humanRequestPrompt, type UserConversationItem } from "../userConversation";
@@ -66,6 +72,53 @@ const processStatusKeys: Partial<Record<string, TranslationKey>> = {
   killed: "process.status.killed"
 };
 
+const taskRunStatusKeys: Record<TaskRunSummary["status"], TranslationKey> = {
+  queued: "taskRun.status.queued",
+  running: "taskRun.status.running",
+  waiting_human: "taskRun.status.waiting_human",
+  waiting_process: "taskRun.status.waiting_process",
+  waiting_message: "taskRun.status.waiting_message",
+  waiting_tool: "taskRun.status.waiting_tool",
+  paused: "taskRun.status.paused",
+  cancelling: "taskRun.status.cancelling",
+  finalizing: "taskRun.status.finalizing",
+  needs_attention: "taskRun.status.needs_attention",
+  succeeded: "taskRun.status.succeeded",
+  failed: "taskRun.status.failed",
+  cancelled: "taskRun.status.cancelled"
+};
+
+const taskRunRetentionKeys: Record<TaskRunRetention, TranslationKey> = {
+  purge_on_terminal: "taskRun.retention.purge_on_terminal",
+  permanent: "taskRun.retention.permanent"
+};
+
+const taskRunRequirementStatusKeys: Record<TaskRunRequirement["status"], TranslationKey> = {
+  pending: "taskRun.requirementStatus.pending",
+  in_progress: "taskRun.requirementStatus.in_progress",
+  satisfied: "taskRun.requirementStatus.satisfied",
+  blocked: "taskRun.requirementStatus.blocked",
+  waived: "taskRun.requirementStatus.waived"
+};
+
+const taskRunBlockerKeys: Record<TaskRunBlockerKind, TranslationKey> = {
+  unknown_effect: "taskRun.blocker.unknown_effect",
+  effect_unknown: "taskRun.blocker.effect_unknown",
+  payload_missing: "taskRun.blocker.payload_missing",
+  payload_corrupt: "taskRun.blocker.payload_corrupt",
+  binding_drift: "taskRun.blocker.binding_drift",
+  pending_action_unreplayable: "taskRun.blocker.pending_action_unreplayable",
+  active_object_task: "taskRun.blocker.active_object_task",
+  requirements_unsatisfied: "taskRun.blocker.requirements_unsatisfied",
+  cleanup_failed: "taskRun.blocker.cleanup_failed",
+  authority_revoked: "taskRun.blocker.authority_revoked",
+  deadline_reached: "taskRun.blocker.deadline_reached",
+  effect_unsettled: "taskRun.blocker.effect_unsettled",
+  reservation_unsettled: "taskRun.blocker.reservation_unsettled",
+  publication_unsettled: "taskRun.blocker.publication_unsettled",
+  manual_recovery_required: "taskRun.blocker.manual_recovery_required"
+};
+
 const workspaceAccessTranslationKeys: Record<TaskLaunchSettings["workspaceAccess"], TranslationKey> = {
   none: "taskAuthority.none",
   read: "taskAuthority.read",
@@ -79,6 +132,14 @@ type UserPageProps = {
   snapshot: RuntimeSnapshot | null;
   selectedPid: string | null;
   selectedProcess: RuntimeProcess | null;
+  selectedRunId?: string | null;
+  selectedRun?: TaskRunSummary | null;
+  selectedRunDetail?: TaskRunDetail | null;
+  taskRunHumanRequests?: HumanRequest[] | null;
+  taskRunHumanHasMore?: boolean;
+  taskRunHumanPresentationTruncated?: boolean;
+  taskRunHumanLoading?: boolean;
+  taskRuns?: TaskRunSummary[];
   taskLabels: Readonly<Record<string, string>>;
   taskSettings: TaskLaunchSettings;
   quantaValid?: boolean;
@@ -87,6 +148,8 @@ type UserPageProps = {
   images: ImageSummary[];
   llmProfiles: LLMProfileSummary[];
   onSelectPid(pid: string): void;
+  onSelectRun?(runId: string): void;
+  onLoadMoreTaskRunHumanRequests?(): void;
   onMaxQuantaChange(value: string): void;
   onSpawnGoalChange(value: string): void;
   onSpawnImageChange(value: string): void;
@@ -118,6 +181,14 @@ export function UserPage({
   snapshot,
   selectedPid,
   selectedProcess,
+  selectedRunId = null,
+  selectedRun = null,
+  selectedRunDetail = null,
+  taskRunHumanRequests = null,
+  taskRunHumanHasMore = false,
+  taskRunHumanPresentationTruncated = false,
+  taskRunHumanLoading = false,
+  taskRuns = [],
   taskLabels,
   taskSettings,
   quantaValid = true,
@@ -126,6 +197,8 @@ export function UserPage({
   images,
   llmProfiles,
   onSelectPid,
+  onSelectRun,
+  onLoadMoreTaskRunHumanRequests,
   onMaxQuantaChange,
   onSpawnGoalChange,
   onSpawnImageChange,
@@ -154,17 +227,22 @@ export function UserPage({
   const [commitImageId, setCommitImageId] = useState("");
   const [commitName, setCommitName] = useState("");
   const [commitVersion, setCommitVersion] = useState("v0");
-  const [showNewTask, setShowNewTask] = useState(!selectedProcess);
+  const [showNewTask, setShowNewTask] = useState(!selectedRun && !selectedProcess);
   const [taskSettingsOpen, setTaskSettingsOpen] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const sidebarQuantaErrorId = useId();
   const newTaskStatusId = useId();
   const conversation = useMemo(() => deriveUserConversation(snapshot, selectedPid), [snapshot, selectedPid]);
-  const pendingRequests = conversation.filter((item): item is Extract<UserConversationItem, { role: "request" }> => item.role === "request");
+  const conversationPendingRequests = conversation.filter((item): item is Extract<UserConversationItem, { role: "request" }> => item.role === "request");
+  const pendingRequests = selectedRun && taskRunHumanRequests !== null
+    ? taskRunHumanRequests.filter((request) => request.status === "pending")
+    : conversationPendingRequests.map(({ request }) => request);
   const allPendingRequests = useMemo(
-    () => (snapshot?.human_requests ?? []).filter((request) => request.status === "pending"),
-    [snapshot?.human_requests]
+    () => selectedRun && taskRunHumanRequests !== null
+      ? taskRunHumanRequests.filter((request) => request.status === "pending")
+      : (snapshot?.human_requests ?? []).filter((request) => request.status === "pending"),
+    [selectedRun, snapshot?.human_requests, taskRunHumanRequests]
   );
   const pendingRequestsByPid = useMemo(() => {
     const counts = new Map<string, number>();
@@ -172,26 +250,46 @@ export function UserPage({
     return counts;
   }, [allPendingRequests]);
   const schedulerRunning = Boolean(snapshot?.scheduler.running);
-  const hasProcess = Boolean(selectedProcess);
+  const hasProcess = Boolean(selectedRun || selectedProcess);
+  const runActions = allowedTaskRunActions(selectedRun);
   const processTerminal = Boolean(
-    selectedProcess?.terminal || (selectedProcess && ["exited", "failed", "killed"].includes(selectedProcess.status))
+    selectedRun
+      ? ["succeeded", "failed", "cancelled"].includes(selectedRun.status)
+      : selectedProcess?.terminal || (selectedProcess && ["exited", "failed", "killed"].includes(selectedProcess.status))
   );
   const showTaskComposer = !hasProcess || showNewTask;
-  const commitReady = Boolean(hasProcess && commitImageId.trim() && commitName.trim() && commitVersion.trim());
+  const commitReady = Boolean(selectedProcess && commitImageId.trim() && commitName.trim() && commitVersion.trim());
   const conversationRef = useRef<HTMLElement>(null);
   const goalInputRef = useRef<HTMLTextAreaElement>(null);
   const taskSettingsButtonRef = useRef<HTMLButtonElement>(null);
   const workspaceRef = useRef<HTMLElement>(null);
   const followConversationRef = useRef(true);
-  const processRunning = selectedProcess?.status === "running";
-  const statusTone = selectedProcess ? processStatusTone(selectedProcess.status) : "idle";
-  const selectedStatusLabel = selectedProcess
-    ? processStatusLabel(selectedProcess.status, t)
+  const processRunning = selectedRun?.status === "running" || selectedProcess?.status === "running";
+  const canRun = selectedRun
+    ? runActions.has("run") || runActions.has("resume")
+    : Boolean(selectedProcess && !processRunning && !processTerminal);
+  const canPause = selectedRun ? runActions.has("pause") : processRunning;
+  const canCancel = selectedRun ? runActions.has("cancel") : Boolean(selectedProcess && !processTerminal);
+  const canFollowUp = selectedRun ? runActions.has("follow_up") : Boolean(selectedProcess && !processTerminal);
+  const statusTone = selectedRun ? taskRunStatusTone(selectedRun.status) : selectedProcess ? processStatusTone(selectedProcess.status) : "idle";
+  const selectedStatusLabel = selectedRun
+    ? taskRunStatusLabel(selectedRun.status, t)
+    : selectedProcess
+      ? processStatusLabel(selectedProcess.status, t)
     : t("process.status.created");
-  const selectedTaskLabel = selectedProcess
-    ? taskLabels[selectedProcess.pid]?.trim() || t("user.untitledTask")
+  const selectedTaskLabel = selectedRun
+    ? selectedRun.display_title
+    : selectedProcess
+      ? taskLabels[selectedProcess.pid]?.trim() || t("user.untitledTask")
     : t("user.workspaceLabel");
-  const selectedStatusDetail = selectedProcess ? processStatusDetail(selectedProcess, t) : null;
+  const selectedStatusDetail = selectedRun
+    ? taskRunStatusDetail(selectedRun, t)
+    : selectedProcess ? processStatusDetail(selectedProcess, t) : null;
+  const selectedRunRequirements = selectedRunDetail
+    && selectedRunDetail.summary.run_id === selectedRun?.run_id
+    && selectedRunDetail.summary.revision === selectedRun?.revision
+    ? selectedRunDetail.requirements.items
+    : [];
   const taskSettingsWorkspaceLabel = t(workspaceAccessTranslationKeys[taskSettings.workspaceAccess]);
 
   function closeTaskSettings() {
@@ -200,8 +298,8 @@ export function UserPage({
   }
 
   useEffect(() => {
-    setShowNewTask(!selectedProcess);
-  }, [selectedProcess?.pid]);
+    setShowNewTask(!selectedRun && !selectedProcess);
+  }, [selectedRun?.run_id, selectedProcess?.pid]);
 
   useEffect(() => {
     if (!showTaskComposer) setTaskSettingsOpen(false);
@@ -227,7 +325,14 @@ export function UserPage({
   function openNextPendingRequest() {
     const next = allPendingRequests[0];
     if (!next) return;
-    onSelectPid(next.pid);
+    const containingRun = taskRuns.find((run) => (
+      run.active_pid === next.pid || run.root_pid === next.pid
+    ));
+    if (containingRun) onSelectRun?.(containingRun.run_id);
+    else {
+      onSelectRun?.("");
+      onSelectPid(next.pid);
+    }
     setShowNewTask(false);
     setMobileSidebarOpen(false);
     globalThis.requestAnimationFrame?.(() => document.getElementById("user-pending-requests")?.focus());
@@ -329,44 +434,90 @@ export function UserPage({
           </div>
 
           <label className="taskPicker">
-            <span>{t("user.process")}</span>
-            <select value={selectedPid ?? ""} disabled={busy} onChange={(event) => {
-              onSelectPid(event.currentTarget.value);
+            <span>{taskRuns.length ? t("taskRuns.selected") : t("user.process")}</span>
+            <select value={taskRuns.length ? selectedRunId ?? "" : selectedPid ?? ""} disabled={busy} onChange={(event) => {
+              if (taskRuns.length) onSelectRun?.(event.currentTarget.value);
+              else onSelectPid(event.currentTarget.value);
               setMobileSidebarOpen(false);
               if (globalThis.matchMedia?.("(max-width: 820px)").matches) {
                 globalThis.setTimeout(() => workspaceRef.current?.focus(), 0);
               }
             }}>
-              {(snapshot?.processes.length ?? 0) === 0 ? <option value="">{t("user.noProcess")}</option> : null}
-              {(snapshot?.processes ?? []).map((process) => (
+              {(taskRuns.length ? taskRuns : snapshot?.processes ?? []).length === 0 ? <option value="">{taskRuns.length ? t("taskRuns.empty") : t("user.noProcess")}</option> : null}
+              {taskRuns.map((run) => (
+                <option key={run.run_id} value={run.run_id}>
+                  {run.display_title} · {taskRunStatusLabel(run.status, t)}
+                  {run.status === "needs_attention" || run.status === "waiting_human" ? " · ⚠" : ""}
+                </option>
+              ))}
+              {!taskRuns.length ? (snapshot?.processes ?? []).map((process) => (
                 <option key={process.pid} value={process.pid}>
                   {taskDisplayLabel(process, taskLabels)} · {processStatusLabel(process.status, t)}
                   {pendingRequestsByPid.has(process.pid) ? ` · ⚠ ${pendingRequestsByPid.get(process.pid)}` : ""}
                 </option>
-              ))}
+              )) : null}
             </select>
           </label>
 
-          {selectedProcess ? (
+          {taskRuns.length && (snapshot?.processes.length ?? 0) > 0 ? (
+            <details className="sidebarDisclosure legacyProcesses">
+              <summary>{t("taskRuns.legacyProcesses")}</summary>
+              <div className="sidebarDisclosureBody">
+                <select value={selectedRun ? "" : selectedPid ?? ""} onChange={(event) => {
+                  onSelectRun?.("");
+                  onSelectPid(event.currentTarget.value);
+                }}>
+                  {selectedRun ? <option value="">{t("taskRuns.legacyProcesses")}</option> : null}
+                  {(snapshot?.processes ?? []).map((process) => <option key={process.pid} value={process.pid}>{shortProcessId(process.pid)} · {process.status}</option>)}
+                </select>
+              </div>
+            </details>
+          ) : null}
+
+          {hasProcess ? (
             <>
               <section className="taskSummaryCard" aria-label={t("user.processDetails")}>
                 <div className="taskSummaryHeader">
                   <span className={`statusPill ${statusTone}`}>
                     <span className="statusDot" />{selectedStatusLabel}
                   </span>
-                  <span className="taskPid" title={selectedProcess.pid}>{shortProcessId(selectedProcess.pid)}</span>
+                  <span className="taskPid" title={selectedRun?.run_id ?? selectedProcess?.pid}>{selectedRun ? selectedRun.run_id : selectedProcess ? shortProcessId(selectedProcess.pid) : ""}</span>
                 </div>
-                <strong className="taskDisplayLabel" title={selectedProcess.pid}>{selectedTaskLabel}</strong>
-                <div className="taskRuntime">
+                <strong className="taskDisplayLabel" title={selectedRun?.run_id ?? selectedProcess?.pid}>{selectedTaskLabel}</strong>
+                {selectedProcess ? <div className="taskRuntime">
                   <Cpu size={15} aria-hidden="true" />
                   <span>{selectedProcess.image_id}</span>
                   <small>{selectedProcess.llm_profile_id}</small>
-                </div>
+                </div> : null}
                 {selectedStatusDetail ? <p className="taskStatusDetail">{selectedStatusDetail}</p> : null}
-                <div className="metricGrid">
+                {selectedRun?.blockers.length ? <div className="inlineWarning"><AlertTriangle size={14} />{selectedRun.blockers.map((item) => t(taskRunBlockerKeys[item.kind])).join(", ")}</div> : null}
+                {selectedRun ? <p className="taskRetention">{t("taskRuns.retentionConfigured")}: <strong>{t(taskRunRetentionKeys[selectedRun.retention])}</strong></p> : null}
+                {selectedRun ? <p className="taskPayloadState">{t("taskRuns.payloadState")}: <strong>{t(selectedRun.payloads_purged ? "taskRuns.payloadPurged" : "taskRuns.payloadAvailable")}</strong></p> : null}
+                {selectedRun?.requirement_counts ? (
+                  <p className="taskRequirements">
+                    {t("taskRuns.requirementProgress", {
+                      satisfied: taskRunRequirementCount(selectedRun, "satisfied"),
+                      total: taskRunRequirementCount(selectedRun, "total")
+                    })}
+                  </p>
+                ) : null}
+                {selectedRunRequirements.length ? (
+                  <ul className="userRunRequirements" aria-label={t("taskRuns.requirements")}>
+                    {selectedRunRequirements.map((requirement) => (
+                      <li key={requirement.requirement_id}>
+                        <strong>{requirement.label}</strong>
+                        <span>{t(taskRunRequirementStatusKeys[requirement.status])}</span>
+                        {requirement.content_available && requirement.content_text !== undefined
+                          ? <p>{requirement.content_text}{requirement.content_truncated ? "…" : ""}</p>
+                          : <small>{t("taskRuns.hashOnly")}: {requirement.content_sha256}</small>}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+                {selectedProcess ? <div className="metricGrid">
                   <div><strong>{selectedProcess.llm_call_count}</strong><span>{t("user.metricCalls")}</span></div>
                   <div><strong>{selectedProcess.token_total.toLocaleString()}</strong><span>{t("user.metricTokens")}</span></div>
-                </div>
+                </div> : null}
               </section>
 
               <section className="taskControlCard" aria-label={t("user.taskControls")}>
@@ -390,9 +541,9 @@ export function UserPage({
                   {!quantaValid ? <small id={sidebarQuantaErrorId} className="inlineError" role="alert">{t("scheduler.invalidQuanta")}</small> : null}
                 </label>
                 <div className="sidebarRunControls">
-                  <button type="button" className="primary" disabled={busy || !quantaValid || schedulerRunning || processRunning || processTerminal} onClick={onRun}><Play size={15} />{t("user.run")}</button>
-                  <button type="button" disabled={busy || !processRunning} onClick={onPause}><Pause size={15} />{t("user.pause")}</button>
-                  <button type="button" className="dangerGhost" disabled={busy || processTerminal} onClick={onStop}><Square size={13} />{t("user.stop")}</button>
+                  <button type="button" className="primary" disabled={busy || !quantaValid || (!selectedRun && schedulerRunning) || !canRun} onClick={onRun}><Play size={15} />{runActions.has("resume") ? t("taskRuns.resume") : t("user.run")}</button>
+                  <button type="button" disabled={busy || !canPause} onClick={onPause}><Pause size={15} />{t("user.pause")}</button>
+                  <button type="button" className="dangerGhost" disabled={busy || !canCancel} onClick={onStop}><Square size={13} />{t("user.stop")}</button>
                 </div>
               </section>
 
@@ -573,8 +724,8 @@ export function UserPage({
               <header className="conversationHeader">
                 <div className="conversationTitle">
                   <span className="eyebrow"><Activity size={12} />{t("user.activity")}</span>
-                  <h1 title={selectedProcess?.pid}>{selectedTaskLabel}</h1>
-                  <p>{selectedProcess ? `${shortProcessId(selectedProcess.pid)} · ${selectedProcess.image_id} · ${selectedProcess.llm_profile_id}` : ""}</p>
+                  <h1 title={selectedRun?.run_id ?? selectedProcess?.pid}>{selectedTaskLabel}</h1>
+                  <p>{selectedRun ? `${selectedRun.run_id} · r${selectedRun.revision} · ${t(taskRunRetentionKeys[selectedRun.retention])} · ${t(selectedRun.payloads_purged ? "taskRuns.payloadPurged" : "taskRuns.payloadAvailable")}` : selectedProcess ? `${shortProcessId(selectedProcess.pid)} · ${selectedProcess.image_id} · ${selectedProcess.llm_profile_id}` : ""}</p>
                   {selectedStatusDetail ? <span className="conversationStatusDetail">{selectedStatusDetail}</span> : null}
                 </div>
                 <div className="conversationHeaderMeta">
@@ -583,12 +734,22 @@ export function UserPage({
                 </div>
               </header>
 
-              {pendingRequests.length > 0 ? (
+              {pendingRequests.length > 0 || taskRunHumanHasMore || taskRunHumanPresentationTruncated ? (
                 <section id="user-pending-requests" className="userPendingRequests" aria-label={t("user.pendingRequests")} tabIndex={-1}>
                   <div className="pendingRequestsHeading"><AlertTriangle size={15} /><strong>{t("user.pendingRequests")}</strong><span>{pendingRequests.length}</span></div>
-                  {pendingRequests.map(({ request }) => (
+                  {pendingRequests.map((request) => (
                     <HumanRequestCard className="userRequestCard" key={request.request_id} request={request} onRespond={onRespond} />
                   ))}
+                  {taskRunHumanPresentationTruncated ? <p className="inlineWarning">{t("taskRuns.humanPresentationTruncated")}</p> : null}
+                  {taskRunHumanHasMore ? (
+                    <button
+                      type="button"
+                      disabled={busy || taskRunHumanLoading}
+                      onClick={onLoadMoreTaskRunHumanRequests}
+                    >
+                      {t("taskRuns.loadMore")}
+                    </button>
+                  ) : null}
                 </section>
               ) : null}
 
@@ -632,7 +793,7 @@ export function UserPage({
                   <textarea
                     rows={1}
                     value={message}
-                    disabled={busy || !hasProcess}
+                    disabled={busy || !hasProcess || !canFollowUp}
                     aria-label={t("user.messageAgent")}
                     aria-describedby="composer-hint"
                     onChange={(event) => onMessageChange(event.currentTarget.value)}
@@ -640,18 +801,18 @@ export function UserPage({
                     onKeyDown={(event) => {
                       if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                         event.preventDefault();
-                        if (quantaValid && message.trim()) onSend("message");
+                        if (quantaValid && canFollowUp && message.trim()) onSend("message");
                       }
                     }}
                   />
                   <span id="composer-hint">{t("user.sendHint")}</span>
                 </div>
-                <button type="button" className="primary sendButton" disabled={busy || !quantaValid || !hasProcess || !message.trim()} onClick={() => onSend("message")}>
+                <button type="button" className="primary sendButton" disabled={busy || !quantaValid || !hasProcess || !canFollowUp || !message.trim()} onClick={() => onSend("message")}>
                   <Send size={15} />{t("user.send")}
                 </button>
                 <button
                   type="button"
-                  disabled={busy || !quantaValid || !hasProcess || !message.trim()}
+                  disabled={busy || !quantaValid || !hasProcess || !canFollowUp || !message.trim()}
                   className="iconOnly warning"
                   aria-label={t("user.interrupt")}
                   title={t("user.interrupt")}
@@ -690,6 +851,43 @@ export function processStatusTone(status: string, schedulerRunning = false): Pro
   return "idle";
 }
 
+export function taskRunStatusLabel(
+  status: TaskRunSummary["status"],
+  t: (key: TranslationKey, vars?: Record<string, string | number>) => string
+): string {
+  return t(taskRunStatusKeys[status]);
+}
+
+export function taskRunStatusTone(status: TaskRunSummary["status"]): ProcessStatusTone {
+  if (status === "succeeded") return "completed";
+  if (["failed", "cancelled", "needs_attention"].includes(status)) return "terminal";
+  if (status === "paused") return "paused";
+  if (status.startsWith("waiting")) return "waiting";
+  if (["running", "cancelling", "finalizing"].includes(status)) return "running";
+  return "idle";
+}
+
+export function taskRunStatusDetail(
+  run: TaskRunSummary,
+  t: (key: TranslationKey, vars?: Record<string, string | number>) => string
+): string | null {
+  if (run.status === "needs_attention") {
+    return run.blockers.map((blocker) => blocker.message?.trim() || t(taskRunBlockerKeys[blocker.kind])).join(" · ") || t("taskRun.detail.needs_attention");
+  }
+  if (run.status.startsWith("waiting_")) return taskRunStatusLabel(run.status, t);
+  if (run.status === "cancelling") return t("taskRun.detail.cancelling");
+  if (run.status === "finalizing") return t("taskRun.detail.finalizing");
+  return null;
+}
+
+function taskRunRequirementCount(
+  run: TaskRunSummary,
+  key: "satisfied" | "total"
+): number {
+  const value = run.requirement_counts?.[key];
+  return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : 0;
+}
+
 export function processStatusDetail(
   process: RuntimeProcess,
   t: (key: TranslationKey, vars?: Record<string, string | number>) => string
@@ -701,6 +899,7 @@ export function processStatusDetail(
   if (wait?.kind === "tool") return t("user.statusWaitingTool");
   if (wait?.kind === "paused") return t("user.statusPaused");
   if (wait?.kind === "host_resume") return t("user.statusWaitingResume");
+  if (wait?.kind === "stale_execution") return t("user.statusPaused");
   if (process.status.startsWith("waiting_human")) return t("user.statusWaitingHuman");
   if (process.status.startsWith("waiting_message")) return t("user.statusWaitingMessage");
   if (process.status === "paused") return t("user.statusPaused");

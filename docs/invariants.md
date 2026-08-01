@@ -100,6 +100,12 @@ longer defines.
 - `effect-transactions-are-idempotent-and-reconcilable`: provider intents bind
   canonical arguments and idempotency keys, approval leases bind exact effects,
   and startup reconciliation queries but never replays providers.
+- `authoritative-effect-recovery-is-provider-bound-and-atomic`: Host recovery
+  options bind one effect, expected transaction state, and Runtime epoch;
+  registered-provider verification is required before a receipt can settle it.
+  Certified non-dispatch atomically restores reserved authority, releases the
+  matching resource envelope, and appends the effect transition and audit;
+  prepared effects accept no other terminal recovery conclusion.
 - `external-effect-recovery-is-keyset-bounded`: startup recovery scans only
   nonterminal external effects through bounded indexed keyset pages and
   converges the full backlog without materializing the full effect history.
@@ -312,12 +318,60 @@ longer defines.
   pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
   typed boundaries compute the next state generation, preventing a direct-write
   rewind from reviving a stale token.
-- `v3-persisted-state-is-strict-and-versioned`: a 0.3 store accepts only the
-  frozen release version-3 physical schema (including typed process state) and
-  canonical security carriers. Older, draft-v3, incomplete, or malformed state
-  is rejected before mutation; no draft-v3 compatibility path is represented
-  as a migration. Active wait cleanup and provider-effect recovery operate only
-  on valid 0.3 state.
+- `v4-persisted-state-is-strict-and-versioned`: a 1.1.0 store accepts only the
+  frozen version-4 physical schema (including Durable Task Run and typed process
+  state) and canonical security carriers. Schema-v3, older, incomplete, or
+  malformed state is rejected before mutation; no compatibility path is
+  represented as a migration. Recovery operates only on valid schema-v4 state.
+- `durable-task-run-ledger-is-versioned-and-generation-fenced`: mutable Run
+  projections advance through revision CAS under the current monotonic Runtime
+  epoch. Stable command identities make retries idempotent, while requirements,
+  links, and ledger history append rather than being rewritten. Recovery uses a
+  bounded `(created_at, run_id)` keyset index and stale owners cannot claim,
+  spawn, or commit work. Pause and interrupt persist a new control generation
+  before blocking provider/tool admission, drain only calls admitted by the
+  prior generation through local settlement, and never take over a live
+  execution lease; interrupt requirements and their ProcessMessage commit in
+  the same transaction.
+- `durable-task-run-local-resume-is-integrity-bound`: a safe resume point exists
+  only after one complete model action and all paired tool results are locally
+  committed. Its canonical payload hash binds the Run, process revision,
+  context generation, epoch, Image, tool and provider identities, and latest
+  effect sequence; missing, malformed, or drifting bindings fail closed.
+- `durable-task-run-never-replays-unknown-effects`: recovery distinguishes
+  locally pure work, authoritative non-dispatch, already-durable provider
+  success, and dispatched/unknown outcomes. Only the first three evidence
+  classes may converge automatically; unknown provider truth blocks the Run
+  without another downstream dispatch.
+- `durable-task-run-payload-retention-is-explicit-and-complete`: durable
+  plaintext is disabled by default and requires explicit Host configuration.
+  Default terminal finalization hash-reduces Run-owned goal, follow-up,
+  transcript, retained model/tool I/O content, and linked terminal Human request
+  payload/decision bodies, then deletes resume points, pending continuation
+  actions, and messages automatically bound from a Run-member recipient; an
+  ordinary sender cannot suppress or forge that binding. Append-only event and
+  audit rows receive only separate subject/body/payload hashes, labels, and
+  identifiers for those bound messages at admission time, while their readable
+  mailbox row remains available until purge; ordinary non-Run message evidence
+  is unchanged. Human identity, type, status, timestamps, hashes, and audit
+  linkage remain without readable prompt/answer/decision content. It also
+  hash-reduces linked external-effect
+  provider metadata and receipt bodies; hashes, labels, usage, effect state,
+  links, and audit projections remain.
+  `permanent` is an explicit Host/admin choice and purge failure prevents
+  terminalization.
+- `durable-task-run-cancellation-never-fakes-effect-settlement`: pause,
+  cancellation, and deadline intent are persisted before new dispatch stops.
+  Descendants converge before the root, but dispatched or unknown effects must
+  still settle; ambiguity moves the Run to `needs_attention` and can never be
+  presented as `cancelled`.
+- `checkpoint-restore-never-erases-durable-task-effect-history`: Task Run
+  payloads, ledgers, durable messages, and pending actions are outside
+  Checkpoint/Image snapshots. Restore refuses active intersections; fork strips
+  historical Run bindings and goal markers and cannot attach an unbound child
+  below an active Run member. Neither operation rewinds append-only Run links or
+  external-effect history, and a terminal purge cannot be reversed through a
+  retained checkpoint artifact.
 - `human-approval-is-blocking-and-audited`: human questions and approvals block,
   resume, reserve and consume one-shot grants exactly once, are decided exactly
   once from pending state, and route through primitives. Concurrent terminal

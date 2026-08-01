@@ -162,7 +162,8 @@ async function renderUserPage(snapshot: RuntimeSnapshot): Promise<string> {
           workspaceAccess: "edit",
           allowGitRequests: true,
           commandAccess: "none",
-          contextMaintenance: true
+          contextMaintenance: true,
+          authorityManifestId: "authm_test"
         }}
         spawnGoal="goal"
         message=""
@@ -202,6 +203,7 @@ async function renderWithSuspense(node: ReactNode): Promise<string> {
 
 function userPageSnapshot(): RuntimeSnapshot {
   return {
+    schema_version: 2,
     db: "local",
     scheduler: {
       auto_run: true,
@@ -271,6 +273,7 @@ function userPageSnapshot(): RuntimeSnapshot {
     audit: [],
     llm_calls: [],
     object_tasks: [],
+    task_runs: [],
     tools: [],
     llm_profiles: [],
     images: [],

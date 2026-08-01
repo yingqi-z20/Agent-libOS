@@ -147,6 +147,7 @@ describe("deriveUserConversation", () => {
 
 function snapshot(): RuntimeSnapshot {
   return {
+    schema_version: 2,
     db: "local",
     scheduler: {
       auto_run: true,
@@ -300,6 +301,7 @@ function snapshot(): RuntimeSnapshot {
     ],
     tools: [],
     object_tasks: [],
+    task_runs: [],
     llm_profiles: [],
     images: [],
     skills: [],

@@ -6,17 +6,19 @@ import tempfile
 import threading
 import hashlib
 import os
+import sqlite3
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 import pytest
 
-from agent_libos import AgentImage, Runtime
-from agent_libos.config import AgentLibOSConfig, CheckpointDefaults
-from agent_libos.models import CapabilityEffect, CapabilityRight, CapabilityStatus, DataFlowContext, DataLabels, EventType, ExternalEffectRecord, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus, ObjectMetadata, ObjectOwnerKind, ObjectPatch, ObjectTask, ObjectTaskStatus, ObjectType, ProcessMessageStatus, ProcessStatus
-from agent_libos.models import HumanProcessWait, MessageProcessWait, PausedProcessWait, ToolProcessWait
+from agent_libos import AgentImage, Runtime, TaskRunSpecV1
+from agent_libos.config import AgentLibOSConfig, CheckpointDefaults, DEFAULT_CONFIG
+from agent_libos.models import CapabilityEffect, CapabilityRight, CapabilityStatus, DataFlowContext, DataLabels, EventType, ExternalEffectRecord, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus, ObjectMetadata, ObjectOwnerKind, ObjectPatch, ObjectTask, ObjectTaskStatus, ObjectType, ProcessMessageStatus, ProcessStatus, TaskRunRetention, TaskRunStatus
+from agent_libos.models import HumanProcessWait, MessageProcessWait, PausedProcessWait, StaleExecutionProcessWait, ToolProcessWait
 from agent_libos.models.exceptions import (
     CapabilityDenied,
     NotFound,
@@ -42,6 +44,7 @@ from agent_libos.storage.repositories import SnapshotCheckpointRepository
 from agent_libos.tools.builtin.checkpoint import RestoreCheckpointOutput
 from agent_libos.utils.serde import dumps, loads, to_jsonable
 from tests.support.checkpoints import ClassifiedShellProvider
+from tests.support.fakes import RecordingActionClient
 
 
 _OBJECT_TASK_SYNC_TIMEOUT_S = 30.0
@@ -547,6 +550,94 @@ def _assert_selective_payload_retry_after_mark_open_failure(
 
 
 class TestCheckpointRestore:
+    def test_restore_and_fork_drop_stale_execution_receipt_across_concurrency_identity(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        database = tmp_path / 'checkpoint-stale-execution-receipt.sqlite'
+        crashed = Runtime.open(database)
+        try:
+            pid = crashed.process.spawn(
+                image='base-agent:v0',
+                goal='checkpoint a recovered stale execution',
+            )
+            token = crashed.store.claim_execution(
+                pid,
+                owner_id='checkpoint-crashed-worker',
+            )
+            assert token is not None
+        finally:
+            crashed.close()
+
+        runtime = Runtime.open(database)
+        try:
+            recovered = runtime.process.get(pid)
+            assert recovered.status is ProcessStatus.PAUSED
+            assert isinstance(
+                recovered.wait_state,
+                StaleExecutionProcessWait,
+            )
+            assert recovered.status_message == 'stale_execution_recovery'
+            receipt = recovered.wait_state
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'stale execution takeover receipt',
+                actor=pid,
+            )
+
+            runtime.process.resume(pid)
+            advanced = runtime.process.get(pid)
+            assert advanced.status is ProcessStatus.RUNNABLE
+            assert advanced.state_generation > receipt.recovered_state_generation
+
+            forked = runtime.checkpoint.fork_from_checkpoint(
+                'host',
+                checkpoint_id,
+                require_capability=False,
+            )
+            fork_process = runtime.process.get(forked['fork_root_pid'])
+            assert fork_process.status is ProcessStatus.PAUSED
+            assert fork_process.wait_state == PausedProcessWait()
+            assert not isinstance(
+                fork_process.wait_state,
+                StaleExecutionProcessWait,
+            )
+            assert fork_process.status_message is None
+            assert fork_process.task_run_id is None
+            assert fork_process.task_run_epoch is None
+
+            restored_result = runtime.checkpoint.restore(
+                'host',
+                checkpoint_id,
+                require_capability=False,
+            )
+            assert restored_result['main_state_committed'] is True
+            restored = runtime.process.get(pid)
+            assert restored.status is ProcessStatus.PAUSED
+            assert restored.wait_state == PausedProcessWait()
+            assert not isinstance(restored.wait_state, StaleExecutionProcessWait)
+            assert restored.status_message is None
+            assert restored.task_run_id is None
+            assert restored.task_run_epoch is None
+            assert restored.revision > advanced.revision
+            assert (
+                restored.execution_generation
+                > receipt.recovered_execution_generation
+            )
+            assert restored.state_generation > advanced.state_generation
+
+            for selected_pid in (pid, fork_process.pid):
+                row = runtime.store._query(  # noqa: SLF001 - persisted receipt boundary
+                    'SELECT wait_state_json, status_message FROM processes WHERE pid = ?',
+                    (selected_pid,),
+                )[0]
+                assert receipt.recovered_by_owner_sha256 not in row['wait_state_json']
+                assert receipt.prior_owner_sha256 not in row['wait_state_json']
+                assert receipt.prior_lease_sha256 not in row['wait_state_json']
+                assert row['status_message'] is None
+        finally:
+            runtime.close()
+
 
     def test_checkpoint_captures_actual_core_module_source_sha256(self) -> None:
         runtime = Runtime.open('local')
@@ -2556,6 +2647,444 @@ class TestCheckpointRestore:
                 for publication in runtime.store.list_runtime_publications()
                 if publication['kind'] == 'checkpoint_restore'
             } == restore_publications_before
+        finally:
+            runtime.close()
+
+    def test_restore_refuses_scoped_active_durable_task_run_before_publication(
+        self,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            task_runs=replace(
+                DEFAULT_CONFIG.task_runs,
+                plaintext_payloads_enabled=True,
+            ),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            task_run = runtime.task_runs.create(
+                TaskRunSpecV1(
+                    goal='durable task restore guard',
+                    display_title='checkpoint restore guard',
+                    image_id='base-agent:v0',
+                ),
+                client_request_id='checkpoint-restore-active-task-run',
+            )
+            pid = task_run.root_pid
+            assert pid is not None
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'before durable task restore',
+                actor=pid,
+            )
+            restore_publications_before = {
+                str(publication['publication_id'])
+                for publication in runtime.store.list_runtime_publications()
+                if publication['kind'] == 'checkpoint_restore'
+            }
+            process_before = runtime.process.get(pid)
+
+            with pytest.raises(
+                ValidationError,
+                match=f'Durable TaskRuns are active: {task_run.run_id}',
+            ):
+                runtime.checkpoint.restore(
+                    'cli',
+                    checkpoint_id,
+                    require_capability=False,
+                )
+            assert runtime.process.get(pid) == process_before
+            assert runtime.task_runs.get(task_run.run_id) == task_run
+            assert {
+                str(publication['publication_id'])
+                for publication in runtime.store.list_runtime_publications()
+                if publication['kind'] == 'checkpoint_restore'
+            } == restore_publications_before
+        finally:
+            runtime.close()
+
+    def test_task_run_private_rows_never_enter_checkpoint_or_reappear_after_terminal_restore_and_fork(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        database = tmp_path / 'task-run-checkpoint-private-rows.sqlite'
+        config = replace(
+            DEFAULT_CONFIG,
+            task_runs=replace(
+                DEFAULT_CONFIG.task_runs,
+                plaintext_payloads_enabled=True,
+            ),
+        )
+        canary = 'TASK_RUN_CHECKPOINT_REPLAY_PRIVATE_CANARY'
+        runtime = Runtime.open(database, config=config)
+        try:
+            task_run = runtime.task_runs.create(
+                TaskRunSpecV1(
+                    goal={'private': canary},
+                    display_title='checkpoint replay privacy',
+                    image_id='base-agent:v0',
+                ),
+                client_request_id='checkpoint-private-row-source',
+            )
+            pid = task_run.root_pid
+            assert pid is not None
+            runtime.human.send_process_message(
+                pid,
+                canary,
+                subject='private checkpoint message',
+                payload={'private': canary},
+            )
+            runtime.store.upsert_llm_pending_action(
+                pid,
+                {
+                    'resume_token': 'task-run-checkpoint-private-token',
+                    'wait_type': 'message',
+                    'filters': {'private': canary},
+                    'action': {
+                        'action': 'receive_process_messages',
+                        'private': canary,
+                    },
+                    'data_flow_context': DataFlowContext().to_dict(),
+                    'content_preview': canary,
+                    'tool_call_count': 1,
+                    'status': 'pending',
+                },
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'TaskRun checkpoint excludes private replay rows',
+                actor=pid,
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            assert snapshot['rows']['process_messages'] == []
+            assert snapshot['rows']['llm_pending_actions'] == []
+            assert canary not in dumps(snapshot)
+
+            terminal = runtime.task_runs.cancel(
+                task_run.run_id,
+                expected_revision=task_run.revision,
+                command_id='cancel-before-checkpoint-replay',
+            )
+            assert terminal.status is TaskRunStatus.CANCELLED
+            forked = runtime.checkpoint.fork_from_checkpoint(
+                'host',
+                checkpoint_id,
+                require_capability=False,
+            )
+            fork_pid = str(forked['fork_root_pid'])
+            assert runtime.store.list_process_messages(fork_pid) == []
+            assert runtime.store.get_llm_pending_action(fork_pid) is None
+
+            restored = runtime.checkpoint.restore(
+                'host',
+                checkpoint_id,
+                require_capability=False,
+            )
+            assert restored['main_state_committed'] is True
+            assert runtime.store.list_process_messages(pid) == []
+            assert runtime.store.get_llm_pending_action(pid) is None
+        finally:
+            runtime.close()
+
+        with sqlite3.connect(database) as connection:
+            logical_store = '\n'.join(connection.iterdump())
+        assert canary not in logical_store
+
+    def test_checkpoint_restore_and_fork_reject_historical_task_run_private_rows_without_mutation(
+        self,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='reject historical TaskRun replay plaintext',
+            )
+            message = runtime.messages.post(
+                sender='historical.sender',
+                recipient_pid=pid,
+                subject='historical TaskRun private message',
+                body='must not be replayed by restore or fork',
+            )
+            runtime.store.upsert_llm_pending_action(
+                pid,
+                {
+                    'resume_token': 'historical-task-run-private-token',
+                    'wait_type': 'message',
+                    'filters': {'subject': 'historical TaskRun private message'},
+                    'action': {'action': 'receive_process_messages'},
+                    'data_flow_context': DataFlowContext().to_dict(),
+                    'content_preview': 'historical TaskRun private action',
+                    'tool_call_count': 1,
+                    'status': 'pending',
+                },
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'historical TaskRun private replay rows',
+                actor=pid,
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            process_row = next(
+                row for row in snapshot['rows']['processes'] if row['pid'] == pid
+            )
+            process_row.update(
+                {
+                    'task_run_id': 'tr_historical_private_rows',
+                    'task_run_epoch': 1,
+                    'task_run_role': 'root',
+                }
+            )
+            runtime.store._execute(
+                'UPDATE checkpoints SET snapshot_json = ? WHERE checkpoint_id = ?',
+                (dumps(snapshot), checkpoint_id),
+            )
+            before_process = runtime.process.get(pid)
+            before_pids = {process.pid for process in runtime.process.list()}
+            before_publications = tuple(runtime.store.list_runtime_publications())
+
+            with pytest.raises(ValidationError, match='private replay rows'):
+                runtime.checkpoint.restore(
+                    'host',
+                    checkpoint_id,
+                    require_capability=False,
+                )
+            with pytest.raises(ValidationError, match='private replay rows'):
+                runtime.checkpoint.fork_from_checkpoint(
+                    'host',
+                    checkpoint_id,
+                    require_capability=False,
+                )
+
+            assert runtime.process.get(pid) == before_process
+            assert {process.pid for process in runtime.process.list()} == before_pids
+            assert tuple(runtime.store.list_runtime_publications()) == before_publications
+            assert runtime.store.get_process_message(message.message_id) is not None
+            assert runtime.store.get_llm_pending_action(pid)['status'] == 'pending'
+        finally:
+            runtime.close()
+
+    def test_permanent_task_run_explicit_purge_remains_truthful_after_checkpoint_restore(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        database = tmp_path / 'task-run-permanent-restore-purge.sqlite'
+        config = replace(
+            DEFAULT_CONFIG,
+            task_runs=replace(
+                DEFAULT_CONFIG.task_runs,
+                plaintext_payloads_enabled=True,
+            ),
+        )
+        canary = 'TASK_RUN_PERMANENT_RESTORE_PURGE_PRIVATE_CANARY'
+        runtime = Runtime.open(database, config=config)
+        try:
+            task_run = runtime.task_runs.create(
+                TaskRunSpecV1(
+                    goal={'private': canary},
+                    display_title='permanent restore purge',
+                    image_id='base-agent:v0',
+                    retention=TaskRunRetention.PERMANENT,
+                ),
+                client_request_id='permanent-restore-purge-source',
+            )
+            pid = task_run.root_pid
+            assert pid is not None
+            runtime.human.send_process_message(
+                pid,
+                canary,
+                payload={'private': canary},
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'permanent TaskRun checkpoint privacy',
+                actor=pid,
+            )
+            terminal = runtime.task_runs.cancel(
+                task_run.run_id,
+                expected_revision=task_run.revision,
+                command_id='cancel-permanent-before-restore',
+            )
+            assert terminal.status is TaskRunStatus.CANCELLED
+            assert runtime.store.list_process_messages(pid)
+
+            runtime.checkpoint.restore(
+                'host',
+                checkpoint_id,
+                require_capability=False,
+            )
+            assert runtime.process.get(pid).task_run_id is None
+            assert runtime.store.list_process_messages(pid)
+
+            purged = runtime.task_runs.purge_payloads(
+                task_run.run_id,
+                expected_revision=terminal.revision,
+                command_id='purge-permanent-after-restore',
+            )
+            persisted_run = runtime.store.get_task_run(task_run.run_id)
+            assert purged.revision > terminal.revision
+            assert persisted_run is not None
+            assert persisted_run.payloads_purged_at is not None
+            assert runtime.store.list_process_messages(pid) == []
+        finally:
+            runtime.close()
+
+        with sqlite3.connect(database) as connection:
+            logical_store = '\n'.join(connection.iterdump())
+        assert canary not in logical_store
+
+    def test_unrelated_restore_preserves_task_run_ledger_links_and_effect_history_fingerprint(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        database = tmp_path / 'task-run-effect-history-restore.sqlite'
+        workspace = tmp_path / 'task-run-effect-history-workspace'
+        workspace.mkdir()
+        config = replace(
+            DEFAULT_CONFIG,
+            task_runs=replace(
+                DEFAULT_CONFIG.task_runs,
+                plaintext_payloads_enabled=True,
+            ),
+        )
+        runtime = Runtime.open(
+            database,
+            config=config,
+            substrate=LocalResourceProviderSubstrate(workspace),
+        )
+        try:
+            checkpoint_pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='restore an unrelated checkpoint scope',
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                checkpoint_pid,
+                'before an unrelated durable TaskRun effect',
+                actor=checkpoint_pid,
+            )
+            runtime.register_image(
+                AgentImage(
+                    image_id='checkpoint-task-run-effect:v0',
+                    name='checkpoint-task-run-effect',
+                    default_tools=['write_text_file'],
+                ),
+                actor='test',
+            )
+            runtime.llm.client = RecordingActionClient(
+                [
+                    {
+                        'action': 'write_text_file',
+                        'path': 'run-effect.txt',
+                        'content': 'durable TaskRun external effect',
+                    }
+                ]
+            )
+            created = runtime.task_runs.create(
+                TaskRunSpecV1(
+                    goal='commit one effect before unrelated checkpoint restore',
+                    display_title='TaskRun restore effect history',
+                    image_id='checkpoint-task-run-effect:v0',
+                    retention=TaskRunRetention.PERMANENT,
+                ),
+                client_request_id='checkpoint-effect-history-create',
+            )
+            root_pid = created.root_pid
+            assert root_pid is not None
+            runtime.filesystem.grant_path(
+                root_pid,
+                'run-effect.txt',
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            advanced = runtime.task_runs.run_until_blocked(
+                created.run_id,
+                expected_revision=created.revision,
+                command_id='checkpoint-effect-history-run',
+                max_quanta=1,
+            )
+            terminal = runtime.task_runs.cancel(
+                created.run_id,
+                expected_revision=advanced.revision,
+                command_id='checkpoint-effect-history-cancel',
+            )
+            assert terminal.status is TaskRunStatus.CANCELLED
+
+            effect_ids = {
+                effect.effect_id
+                for effect in runtime.store.list_external_effects(pid=root_pid)
+            }
+            assert effect_ids
+            task_ledger = runtime.store.list_task_run_ledger(
+                created.run_id,
+                after=None,
+                limit=500,
+            )
+            assert task_ledger.next_cursor is None
+            links = runtime.store.list_task_run_links(created.run_id)
+            assert any(item.kind.value == 'effect' for item in task_ledger.records)
+            assert any(
+                link.evidence_type == 'external_effect'
+                and link.evidence_id in effect_ids
+                for link in links
+            )
+
+            def evidence_fingerprint() -> str:
+                ledger_page = runtime.store.list_task_run_ledger(
+                    created.run_id,
+                    after=None,
+                    limit=500,
+                )
+                assert ledger_page.next_cursor is None
+                effects = runtime.store.list_external_effects(pid=root_pid)
+                selected_effect_ids = {effect.effect_id for effect in effects}
+                transitions = [
+                    dict(row)
+                    for row in runtime.store._query(  # noqa: SLF001 - append-only evidence assertion
+                        'SELECT seq, effect_id, effect_state, transaction_state, '
+                        'occurred_at FROM external_effect_transitions ORDER BY seq'
+                    )
+                    if str(row['effect_id']) in selected_effect_ids
+                ]
+                projection = {
+                    'schema_version': 1,
+                    'task_run': to_jsonable(
+                        runtime.store.get_task_run(created.run_id)
+                    ),
+                    'requirements': to_jsonable(
+                        runtime.store.list_task_run_requirements(created.run_id)
+                    ),
+                    'payloads': to_jsonable(
+                        runtime.store.list_task_run_payloads(created.run_id)
+                    ),
+                    'ledger': to_jsonable(ledger_page.records),
+                    'links': to_jsonable(
+                        runtime.store.list_task_run_links(created.run_id)
+                    ),
+                    'effects': to_jsonable(effects),
+                    'effect_transitions': transitions,
+                }
+                return hashlib.sha256(dumps(projection).encode('utf-8')).hexdigest()
+
+            before = evidence_fingerprint()
+            restore = runtime.checkpoint.restore(
+                'host',
+                checkpoint_id,
+                require_capability=False,
+            )
+            assert restore['main_state_committed'] is True
+            assert evidence_fingerprint() == before
+            assert runtime.store.list_task_run_links(created.run_id) == links
+            assert runtime.store.list_task_run_ledger(
+                created.run_id,
+                after=None,
+                limit=500,
+            ).records == task_ledger.records
+            assert (workspace / 'run-effect.txt').read_text(
+                encoding='utf-8'
+            ) == 'durable TaskRun external effect'
         finally:
             runtime.close()
 

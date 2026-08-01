@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RuntimeProcess, RuntimeSnapshot } from "./api/types";
-import { processFromMutationResult, reconcileSelectedPid, upsertRuntimeProcess } from "./selection";
+import { mergeRuntimeTaskRuns, processFromMutationResult, reconcileSelectedPid, reconcileSelectedRunId, upsertRuntimeProcess, upsertRuntimeTaskRun } from "./selection";
 
 describe("reconcileSelectedPid", () => {
   it("preserves an existing selected process", () => {
@@ -74,8 +74,36 @@ describe("reconcileSelectedPid", () => {
   });
 });
 
+describe("durable run selection", () => {
+  it("prefers attention, preserves selection, and ignores stale revisions", () => {
+    const value = snapshot(["pid_1"]);
+    const queued = taskRun("run_queued", 2, "queued");
+    const attention = taskRun("run_attention", 4, "needs_attention");
+    value.task_runs = [queued, attention];
+
+    expect(reconcileSelectedRunId(value, null)).toBe("run_attention");
+    expect(reconcileSelectedRunId(value, "run_queued")).toBe("run_queued");
+    expect(upsertRuntimeTaskRun(value, { ...attention, revision: 3, status: "running" }).task_runs[1]).toBe(attention);
+    expect(upsertRuntimeTaskRun(value, { ...attention, revision: 5, status: "cancelled" }).task_runs[0]).toMatchObject({ revision: 5, status: "cancelled" });
+  });
+
+  it("does not let a stale full snapshot roll back a locally observed run", () => {
+    const current = snapshot(["pid_1"]);
+    current.task_runs = [taskRun("run_1", 5, "needs_attention")];
+    const stale = snapshot(["pid_1"]);
+    stale.task_runs = [taskRun("run_1", 4, "running")];
+
+    expect(mergeRuntimeTaskRuns(stale, current).task_runs[0]).toMatchObject({
+      run_id: "run_1",
+      revision: 5,
+      status: "needs_attention"
+    });
+  });
+});
+
 function snapshot(pids: string[]): RuntimeSnapshot {
   return {
+    schema_version: 2,
     db: "local",
     scheduler: {
       auto_run: true,
@@ -118,6 +146,7 @@ function snapshot(pids: string[]): RuntimeSnapshot {
     audit: [],
     llm_calls: [],
     object_tasks: [],
+    task_runs: [],
     tools: [],
     llm_profiles: [],
     images: [],
@@ -125,5 +154,21 @@ function snapshot(pids: string[]): RuntimeSnapshot {
     jsonrpc_endpoints: [],
     mcp_servers: [],
     modules: []
+  };
+}
+
+function taskRun(runId: string, revision: number, status: "queued" | "running" | "needs_attention") {
+  return {
+    schema_version: 1 as const,
+    run_id: runId,
+    revision,
+    status,
+    display_title: runId,
+    root_pid: "pid_1",
+    active_pid: "pid_1",
+    allowed_actions: status === "needs_attention" ? ["recover" as const, "cancel" as const] : ["run" as const],
+    blockers: status === "needs_attention" ? [{ kind: "unknown_effect" as const }] : [],
+    retention: "purge_on_terminal" as const,
+    payloads_purged: false
   };
 }

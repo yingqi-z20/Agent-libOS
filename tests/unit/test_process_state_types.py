@@ -23,6 +23,7 @@ from agent_libos.models import (
     ProcessWaitState,
     ResourceBudget,
     ResourceUsage,
+    StaleExecutionProcessWait,
     ToolProcessWait,
     process_outcome_from_mapping,
     process_outcome_to_mapping,
@@ -30,6 +31,7 @@ from agent_libos.models import (
     process_wait_state_from_mapping,
     process_wait_state_to_mapping,
     remap_process_outcome,
+    remap_process_wait_state,
     upcast_legacy_process_state,
 )
 from agent_libos.models.exceptions import ProcessError, ProcessRevisionConflict, ValidationError
@@ -179,6 +181,15 @@ def test_process_transition_repository_port_covers_the_service_surface() -> None
         ToolProcessWait(operation_id="op_1"),
         PausedProcessWait(reason_oid="obj_pause"),
         HostResumeProcessWait(reason_oid="obj_host"),
+        StaleExecutionProcessWait(
+            pid="pid_stale",
+            recovered_by_owner_sha256="a" * 64,
+            prior_owner_sha256="b" * 64,
+            prior_lease_sha256="c" * 64,
+            prior_execution_generation=7,
+            recovered_execution_generation=8,
+            recovered_state_generation=9,
+        ),
     ],
 )
 def test_wait_state_codec_is_strict_and_lossless(value: object) -> None:
@@ -188,6 +199,75 @@ def test_wait_state_codec_is_strict_and_lossless(value: object) -> None:
     encoded["unknown"] = True
     with pytest.raises(ValidationError, match="not canonical"):
         process_wait_state_from_mapping(encoded)
+
+
+def test_stale_execution_receipt_is_hash_only_and_nontransferable() -> None:
+    receipt = StaleExecutionProcessWait(
+        pid="pid_stale",
+        recovered_by_owner_sha256="a" * 64,
+        prior_owner_sha256="b" * 64,
+        prior_lease_sha256="c" * 64,
+        prior_execution_generation=11,
+        recovered_execution_generation=12,
+        recovered_state_generation=13,
+    )
+
+    encoded = process_wait_state_to_mapping(receipt)
+    assert encoded is not None
+    assert legacy_status_message(receipt, None) == "stale_execution_recovery"
+    assert "owner-token" not in repr(encoded)
+    assert "lease-token" not in repr(encoded)
+    validate_process_state(ProcessStatus.PAUSED, receipt, None)
+    assert remap_process_wait_state(
+        receipt,
+        pids={"pid_stale": "pid_fork"},
+        objects={},
+    ) == PausedProcessWait(reason_oid=None)
+
+
+def test_stale_execution_receipt_rejects_noncanonical_identity_hashes() -> None:
+    encoded = process_wait_state_to_mapping(
+        StaleExecutionProcessWait(
+            pid="pid_stale",
+            recovered_by_owner_sha256="a" * 64,
+            prior_owner_sha256="b" * 64,
+            prior_lease_sha256="c" * 64,
+            prior_execution_generation=1,
+            recovered_execution_generation=2,
+            recovered_state_generation=3,
+        )
+    )
+    assert encoded is not None
+    encoded["prior_lease_sha256"] = "C" * 64
+
+    with pytest.raises(ValidationError, match="canonical SHA-256"):
+        process_wait_state_from_mapping(encoded)
+
+
+def test_process_transition_cannot_forge_store_recovery_receipt() -> None:
+    repository = _ProcessRepository(_process())
+    transitions = ProcessTransitionService(repository)
+    before = repository.get_process("pid_1")
+    receipt = StaleExecutionProcessWait(
+        pid="pid_1",
+        recovered_by_owner_sha256="a" * 64,
+        prior_owner_sha256="b" * 64,
+        prior_lease_sha256="c" * 64,
+        prior_execution_generation=1,
+        recovered_execution_generation=2,
+        recovered_state_generation=1,
+    )
+
+    with pytest.raises(ValidationError, match="reserved for Store recovery"):
+        transitions.transition(
+            "pid_1",
+            ProcessStatus.PAUSED,
+            expected_revision=0,
+            expected_state_generation=0,
+            wait_state=receipt,
+        )
+
+    assert repository.get_process("pid_1") == before
 
 
 @pytest.mark.parametrize(

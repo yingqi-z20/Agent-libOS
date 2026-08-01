@@ -4610,6 +4610,49 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
+    def test_latest_validated_compaction_is_generation_bound_and_detached(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='read a validated durable compaction projection',
+            )
+            context = _seed_context_entries(runtime, pid, count=3)
+            expected_summary = _compact_summary('preserve early durable fact')
+            runtime.llm.context_memory.replace_with_compacted_summary(
+                pid,
+                context_oid=context.oid,
+                expected_version=context.version,
+                summary=expected_summary,
+                compaction_method='test_compaction',
+                preserve_recent_entries=1,
+                source_tokens=1000,
+                target_tokens=512,
+                compressor_pids=[],
+            )
+
+            projection = runtime.llm.context_memory.latest_validated_compaction(pid)
+
+            assert projection is not None
+            assert projection['context_oid'] == context.oid
+            assert projection['context_version'] == context.version + 1
+            assert projection['context_generation'] == projection['compacted_at']
+            assert projection['source_version'] == context.version
+            assert projection['source_entry_count'] == len(context.payload['entries'])
+            assert projection['summary'] == expected_summary
+            assert projection['data_labels']['sensitivity'] == context.metadata.sensitivity
+            assert projection['data_labels']['trust_level'] == context.metadata.trust_level
+            assert len(projection['summary_sha256']) == 64
+            projection['summary']['goal'] = 'caller mutation must not alias storage'
+            repeated = runtime.llm.context_memory.latest_validated_compaction(pid)
+            assert repeated is not None
+            assert repeated['summary']['goal'] == 'preserve early durable fact'
+
+            runtime.store.set_llm_context_generation(pid, 'drifted-generation')
+            assert runtime.llm.context_memory.latest_validated_compaction(pid) is None
+        finally:
+            runtime.close()
+
     def test_replace_with_compacted_summary_final_version_cas_preserves_concurrent_append(
         self,
         monkeypatch: pytest.MonkeyPatch,

@@ -181,6 +181,164 @@ def test_remote_manifest_docs_keep_explicit_null_rollback_default() -> None:
         assert "A supplied non-null `rollback_status` is preserved" in documentation
 
 
+def test_durable_task_run_docs_keep_create_and_auto_run_identities_separate() -> None:
+    documentation = _words(_read("docs/durable_task_runs.md"))
+
+    for required in (
+        "For an existing-Run mutation, `expected_revision` is part of the canonical request identity",
+        "canonical create identity contains only that request id and the complete spec",
+        "it has no `expected_revision`",
+        "does not add `auto_run` to the create identity",
+        "separate deterministic `<client_request_id>:run` command",
+        "reconstructed from the immutable create receipt",
+        "raises a conflict rather than binding the old intent to the current revision",
+        "matching pending run receipt follows the local-only replay rules",
+    ):
+        assert required in documentation
+
+
+def test_durable_task_run_docs_keep_linked_recovery_gap_local_and_bound() -> None:
+    documentation = _words(_read("docs/durable_task_runs.md"))
+
+    for required in (
+        "nested receipt's hidden parent command/request-hash binding",
+        "target create receipt and Run row",
+        "unique `rerun_of` link",
+        "does not invoke a fresh rerun or create a second Run",
+        "Startup likewise does not synthesize a missing outer linked-recovery receipt",
+        "Only an exact retry of that original recover request",
+        "current source state is never used to rebind the old command",
+    ):
+        assert required in documentation
+
+
+def test_durable_task_run_docs_keep_typed_stale_interrupt_fences_exact() -> None:
+    documentation = _words(_read("docs/durable_task_runs.md"))
+
+    for required in (
+        "Store-only typed `StaleExecutionProcessWait` receipt",
+        "recovering Runtime owner-id SHA-256",
+        "not a cryptographic signature",
+        "generic process API omits the currently active process execution-owner or lease fields",
+        "historical recovering-owner hash",
+        "`(pid, admission_state_generation, admission_execution_generation)` fence",
+        "contains each PID exactly once",
+        "Repeating a PID with the same or different generation values makes the receipt malformed",
+        "may not collapse such entries through a map overwrite",
+        "current Runtime epoch must be later than admission",
+        "`process.task_run_epoch == run.runtime_epoch == current Runtime epoch`",
+        "`0 < point.task_run_epoch <= process.task_run_epoch`",
+        "state-generation plus two and execution-generation plus one",
+        "terminal member must be at admitted state-generation plus one",
+        "supported event/Human/tool wait with a typed wait and its pending action",
+        "Checkpoint restore and checkpoint fork both deliberately degrade",
+        "clear the `stale_execution_recovery` compatibility `status_message`",
+    ):
+        assert required in documentation
+    assert "Store signer" not in documentation
+
+
+def test_durable_task_run_docs_keep_strict_command_receipt_provenance() -> None:
+    documentation = _words(_read("docs/durable_task_runs.md"))
+
+    for required in (
+        "canonical strict version-1 object",
+        "complete public `TaskRunSummary` mapping must bind the command row's Run and `result_revision`",
+        "each command/settlement variant accepts its exact key set only",
+        "pending-only fields on a completed variant",
+        "outside the signed BIGINT range",
+        "raw UTF-8 `result_json` before JSON decoding",
+        "canonical request's server-issued `option_id` selects",
+        "stored result keys cannot reclassify that request",
+        "`admission_ledger_seq`, `admission_ledger_item_id`, and `admission_evidence_sha256`",
+        "append-only `STATUS_TRANSITION` ledger item written in the same admission transaction",
+        "Run, command id/kind, canonical request hash, from/to status",
+        "Every terminal or superseded early-return path validates",
+        "`interrupt_provenance_sha256` binds its positive `admission_runtime_epoch`",
+        "completed receipt removes those raw pending-only fields",
+        "global `task_run_runtime_epoch` counter-row lock",
+        "missing outer receipt in the linked-recovery gap",
+        "`settlement_transition_seq`, and `settlement_audit_record_id`",
+        "`external_effect.recovery_settled` decision from `host_verified_receipt`",
+        "remains usable after provider metadata/receipt bodies are purged",
+    ):
+        assert required in documentation
+
+    providers = _words(_read("docs/providers.md"))
+    for required in (
+        "exact finalized external-effect transition sequence",
+        "matching append-only `external_effect.recovery_settled` audit record",
+        "source is `host_verified_receipt`",
+        "remains available after terminal retention removes readable provider metadata and receipt bodies",
+        "replay never depends on purgeable content",
+    ):
+        assert required in providers
+
+    threat = _words(_read("docs/threat_model.md"))
+    for required in (
+        "strict version-1 result has an exact variant schema",
+        "raw pre-decode byte cap, and signed BIGINT bounds",
+        "same-transaction append-only status-transition ledger item",
+        "Terminal or superseded early returns validate that evidence",
+        "`host_verified_receipt` audit, which remain after provider-body purge",
+        "global Runtime-epoch counter-row lock",
+    ):
+        assert required in threat
+
+
+def test_stale_execution_receipt_docs_keep_projection_and_transfer_limits() -> None:
+    checkpoints = _words(_read("docs/checkpoints.md"))
+    threat = _words(_read("docs/threat_model.md"))
+    gui = _words(_read("docs/gui.md"))
+    cli = _words(_read("docs/cli.md"))
+    python_api = _words(_read("docs/python_api.md"))
+
+    for required in (
+        "hash-and-generation receipt is diagnostic state, not transferable resume authority",
+        "Before either restore or fork publishes a new process concurrency identity",
+        "`PausedProcessWait(reason_oid=None)`",
+        "detached from any captured TaskRun binding",
+        "non-transferable stale-execution receipt instead keeps the conservative ordinary paused posture",
+    ):
+        assert required in checkpoints
+
+    for required in (
+        "Store-reserved typed `StaleExecutionProcessWait`",
+        "never the `stale_execution_recovery` `status_message`",
+        "hash is not a cryptographic signature",
+        "interrupt admission Runtime epoch and exact per-PID state/execution-generation fence",
+        "identity- and integrity-bound complete safe point",
+        "Checkpoint restore and fork replace the non-transferable receipt",
+    ):
+        assert required in threat
+
+    for required in (
+        "`stale_execution` branch is a diagnostic projection",
+        "not prior raw owner/lease tokens or TaskRun epoch, safe-point, or live-binding evidence",
+        "must not infer that a Task Run is resumable",
+        "Run controls continue to follow the server's `allowed_actions`",
+        "presentation-only compatibility text",
+    ):
+        assert required in gui
+
+    for required in (
+        "`processes` and `resources` responses",
+        "resulting process state from `exit`",
+        "canonical `wait_state`, `outcome`, and `state_generation` fields",
+        "diagnostic evidence, not client-held permission to resume",
+        "must not parse `status_message`",
+    ):
+        assert required in cli
+
+    assert "`StaleExecutionProcessWait`" in python_api
+    for required in (
+        "Store-only recovery receipt",
+        "must not construct or submit one as an ordinary transition",
+        "TaskRun epoch, safe-point integrity, and current binding evidence",
+    ):
+        assert required in python_api
+
+
 def test_image_and_checkpoint_skills_keep_recovery_boundaries() -> None:
     images = _words(
         _read("agent_libos/skills/builtin/agent-libos-agent-images/SKILL.md")

@@ -481,7 +481,7 @@ it does not assert cross-artifact comparability.
 
 ## Recovery scale gates
 
-Two SQLite reopen benchmarks supplement the task×runner workload with
+Three SQLite reopen benchmarks supplement the task×runner workload with
 structural scale checks. They emit one machine-readable JSON object to stdout
 and to `--output`; elapsed times are diagnostic fields, never pass/fail
 thresholds.
@@ -512,9 +512,92 @@ uv run python experiments/run_publication_reconciliation_scale.py \
   --output .benchmark_runs/publication-reconciliation-ci.json
 ```
 
-Both entrypoints accept explicit size and page overrides for focused tests or
-manual experiments. Such a custom invocation is not evidence that a named
-profile or checked-in workflow was exercised.
+Those two legacy recovery entrypoints accept explicit size and page overrides
+for focused tests or manual experiments. Such a custom invocation is not
+evidence that a named profile or checked-in workflow was exercised.
+
+The [Durable Task Run recovery benchmark](../benchmarks/durable_task_runs/README.md)
+has one named `ci` profile: 100,000 historical Runs, including exactly 1,000
+recoverable Runs, with page size 500. It hard-checks the partial recovery
+index, canonical keyset query shape, exact page/row counts, complete
+convergence, the bounded 100-item startup diagnostic sample, and zero model
+dispatch. The `ci` contract permits exactly four recovery-page reads plus three
+primary-key point reads per recoverable Run; SQLite tracing rejects every other
+TaskRun read, including an added full-table scan. Elapsed
+seed/reopen/recovery times are recorded only for diagnosis.
+
+```bash
+uv run python experiments/run_task_run_recovery_scale.py \
+  --profile ci \
+  --output .benchmark_runs/task-run-recovery-scale-ci.json
+```
+
+### Durable Task Run crash matrix
+
+[`benchmarks/durable_task_runs/`](../benchmarks/durable_task_runs/README.md)
+executes isolated workers at six Run/action/effect durability barriers and
+terminates five with `os._exit` and the provider-dispatched barrier with
+`SIGKILL`. Provider truth is written to a separate canonical JSONL ledger whose
+file and parent-directory creation are fsynced independently of RuntimeStore.
+The provider-idempotent cases execute a real scripted LLM action through the
+JSON-RPC tool and protected effect path; on reopen, the provider must dedupe the
+same endpoint idempotency key from its independent receipt. The matrix
+distinguishes pure work, provider-certified non-dispatch, a durable provider
+receipt, and an unknown dispatched effect. It requires no more than one
+provider dispatch, requires the second-reopen action/effect evidence fingerprint
+to remain stable, and treats unknown as a `needs_attention` blocker, never
+replay permission.
+
+```bash
+uv run python experiments/run_task_run_crash_matrix.py \
+  --output .benchmark_runs/task-run-crash-matrix.json
+```
+
+The output directory and provider ledgers are test artifacts and must not be
+committed. Timing is diagnostic rather than a pass/fail threshold.
+
+### Durable Task Run live repository-maintenance gate
+
+The opt-in live evaluator runs the repository-maintenance scenario through a
+first-class Durable Task Run, commits a follow-up interrupt, closes the
+Runtime, and continues the same Run under the successor Runtime epoch. It also
+replays the stable continuation command and verifies that no LLM call,
+external effect, provider dispatch, or captured tool result is duplicated.
+Neither importing the evaluator nor omitting its confirmation flag can select
+an ambient real provider.
+
+The release invocation requires explicit real-LLM confirmation and exactly
+three repetitions:
+
+```bash
+uv run --env-file .env python experiments/run_durable_task_run_evaluation.py \
+  --confirm-real-llm \
+  --require-release-gate \
+  --repetitions 3 \
+  --output /private/tmp/agent-libos-task-run-live.json
+```
+
+The repository-maintenance half of the live release gate passes only when all
+three repetitions pass the authority, safety, recovery, and zero-duplicate-
+effect checks, and at least two of the three pass the strict utility oracle.
+An expected workflow action that the model never invokes fails strict utility
+but does not by itself claim an authority failure. For authority, every expected
+action actually invoked in a repetition must have at least one successful
+receipt; recovery, effect settlement, and duplicate-dispatch checks remain
+independent hard safety requirements. The scenario makes its fixed action
+contract explicit in the goal: typed `read_text_file`/`write_text_file`, the
+documented unittest command, dedicated `git_status`/`git_diff`, a checkpoint,
+`human_output`, and structured `process_exit`.
+The complete release claim additionally requires three browser-driven
+customer-flow repetitions: safety/authority/zero-duplicate effects must be
+`6/6`, utility must be at least `5/6` overall, and each scenario family must
+pass utility at least `2/3`.
+
+Keep the report and any diagnostic artifacts outside the repository. Omitting
+`--artifacts-root` is recommended: synthetic workspaces and permanent-
+retention v4 databases are then temporary and are removed after the bounded,
+redacted report is written. A command documented here is a gate definition,
+not evidence that the real-provider repetitions have run or passed.
 
 ## Historical Deterministic Validation Snapshot
 

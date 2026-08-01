@@ -48,6 +48,11 @@ The implementation currently includes:
 - Thread-backed process scheduling through `Runtime.run_until_idle()` and the
   async host wrapper `Runtime.arun_until_idle()`, so blocked quanta do not
   monopolize scheduler progress.
+- First-class Durable Task Runs that supervise one root AgentProcess tree with
+  versioned goals and requirements, idempotent Host commands, an append-only
+  evidence-linked ledger, safe local resume points, explicit plaintext payload
+  opt-in, and fail-closed recovery for unknown effects and abandoned
+  ObjectTasks. They are not a workflow DSL or distributed scheduler.
 - Process-local working directories for filesystem and shell operations.
   Selecting a cwd, including an explicit child or PTY cwd, requires filesystem
   directory `read`; the directory state probe runs only after that authority
@@ -107,7 +112,8 @@ The implementation currently includes:
   PostgreSQL, for process/object metadata, capabilities, messages, human
   requests, LLM calls, durable LLM wait generations and eligible Responses tool
   outputs, events, audit records, tools, Skill/JIT metadata, object tasks,
-  JSON-RPC endpoints, image definitions/artifacts, Runtime Module load records,
+  Durable Task Run ledgers and explicitly enabled payloads, JSON-RPC endpoints,
+  image definitions/artifacts, Runtime Module load records,
   external effects, and scoped checkpoints.
 - Host-only Explainable Operations with persistent causal trees across LLM,
   Tool, syscall, primitive, capability, Human, provider-effect, resource, event,
@@ -156,6 +162,9 @@ Start here, then read the deeper references as needed:
   trust boundaries, guarantees, non-goals, and severity calibration.
 - [docs/runtime_model.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/runtime_model.md): process lifecycle, scheduler,
   cwd, human queue, IPC, fork/spawn/exec, and waits.
+- [docs/durable_task_runs.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/durable_task_runs.md): Durable Task Run model,
+  recovery rules, retention, Host APIs, CLI/GUI surfaces, and subsystem
+  boundaries.
 - [docs/events.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/events.md): closed Runtime event catalog, envelope,
   producer/payload contracts, ordering, idempotency, and consumer guidance.
 - [docs/explainable_operations.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/explainable_operations.md): operation
@@ -290,9 +299,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.0.1-py3-none-any.whl dist/agent_libos-1.0.1.tar.gz
+  dist/agent_libos-1.1.0-py3-none-any.whl dist/agent_libos-1.1.0.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.0.1-py3-none-any.whl
+  dist/agent_libos-1.1.0-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 uv export --frozen --no-dev --no-emit-project --output-file runtime-requirements.txt
 uv export --frozen --only-group release --no-emit-project --output-file release-build-requirements.txt
@@ -306,7 +315,7 @@ uv venv /tmp/agent-libos-wheel-check
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
   --require-hashes -r runtime-requirements.txt
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
-  --no-deps dist/agent_libos-1.0.1-py3-none-any.whl
+  --no-deps dist/agent_libos-1.1.0-py3-none-any.whl
 uv pip check --python /tmp/agent-libos-wheel-check/bin/python
 /tmp/agent-libos-wheel-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-wheel-check/bin/agent-libos --help
@@ -319,7 +328,7 @@ uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
   --require-hashes -r release-build-requirements.txt
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
-  --no-deps --no-build-isolation dist/agent_libos-1.0.1.tar.gz
+  --no-deps --no-build-isolation dist/agent_libos-1.1.0.tar.gz
 uv pip check --python /tmp/agent-libos-sdist-check/bin/python
 /tmp/agent-libos-sdist-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-sdist-check/bin/agent-libos --help
@@ -507,6 +516,11 @@ uv sync --frozen --all-groups --extra postgres
 uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" init
 ```
 
+Agent libOS 1.1.0 creates and opens only RuntimeStore schema v4. It rejects a
+schema-v3 store before initialization or any write; use Agent libOS 1.0.1 only
+to view or archive that store. There is no v3 migration, read-only bridge, or
+dual-schema mode in 1.1.0.
+
 Both backends implement the same runtime store contract. Process metadata,
 capabilities, audit/events, messages, human requests, LLM call records,
 checkpoints, and registered tools/images/skills are durable store records.
@@ -577,6 +591,18 @@ content-free summary and hash-only tiers. It is disabled by default, never runs
 during startup, and never trims the active `image_only` transcript head,
 compatible Responses-continuation anchors, or process-result recovery payloads.
 See [Evidence and LLM Payload Retention](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/evidence_payload_retention.md).
+
+Durable Task Run retention is separate. Its default `purge_on_terminal` policy
+must remove readable Run payloads before terminal status, including linked
+Human-request prompt/response/decision bodies and linked terminal
+external-effect provider metadata and receipt bodies. Human request identity,
+type, status, timestamps, audit links, and content hashes remain, as do effect
+identity, state, classification, hashes, and causal links. The cleanup also
+deletes durable messages whose Run binding was derived from their Run-member
+recipient; an ordinary caller cannot suppress or forge that binding.
+`permanent` is a Host/admin-only creation choice, and a Host/admin may later
+apply the same audited purge explicitly to a terminal permanent Run. Neither
+path is secure erasure of database backups.
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite llm-calls --pid <pid>
@@ -925,6 +951,7 @@ scheduler quantum, worker, drain, and shutdown limits; process budgets; image
 ids; workspace namespace; tool limits; filesystem/Object Memory size limits;
 Deno sandbox limits; ObjectTask notification and shutdown limits; reserved JSR
 import-allowlist metadata (static imports remain rejected); shell policy lists;
+Durable Task Run plaintext opt-in, payload, ledger, list, and recovery bounds;
 launcher presets; Skill defaults; and
 checkpoint defaults. Optional modules such as `modules/pty` keep their own
 module-local settings outside `AgentLibOSConfig`.

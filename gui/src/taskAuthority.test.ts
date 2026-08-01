@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildGuiDurableTaskAuthority,
   buildGuiTaskAuthorityManifest,
   DEFAULT_CONTEXT_MAINTENANCE,
+  DEFAULT_DURABLE_TASK_LAUNCH,
   normalizeWorkspaceDirectory,
   workspaceResourceForDirectory
 } from "./taskAuthority";
@@ -9,6 +11,32 @@ import {
 describe("GUI task authority", () => {
   it("keeps persistent context enrichment disabled by default", () => {
     expect(DEFAULT_CONTEXT_MAINTENANCE).toBe(false);
+  });
+
+  it("ships an immediately runnable least-authority Durable Task Run default", () => {
+    expect(DEFAULT_DURABLE_TASK_LAUNCH).toEqual({
+      imageId: "base-agent:v0",
+      llmProfileId: "",
+      workingDirectory: "",
+      workspaceAccess: "none",
+      allowGitRequests: false,
+      commandAccess: "none",
+      contextMaintenance: false,
+      authorityManifestId: ""
+    });
+
+    const authority = buildGuiDurableTaskAuthority({
+      workingDirectory: DEFAULT_DURABLE_TASK_LAUNCH.workingDirectory,
+      workspaceAccess: DEFAULT_DURABLE_TASK_LAUNCH.workspaceAccess,
+      allowGitRequests: DEFAULT_DURABLE_TASK_LAUNCH.allowGitRequests,
+      commandAccess: DEFAULT_DURABLE_TASK_LAUNCH.commandAccess,
+      contextMaintenance: DEFAULT_DURABLE_TASK_LAUNCH.contextMaintenance
+    });
+
+    expect(authority.requiresAuthorityManifest).toBe(false);
+    expect(authority.capabilities).toEqual([
+      { resource: "human:owner", rights: ["write"], delegable: false }
+    ]);
   });
 
   it("normalizes the task directory with the runtime's workspace-relative rules", () => {
@@ -84,6 +112,35 @@ describe("GUI task authority", () => {
       contextMaintenance: false
     });
     expect(manifest.approval_policy).toEqual({ requestable_capabilities: [] });
+  });
+
+  it("projects durable authority as direct capabilities plus a template requirement", () => {
+    const simple = buildGuiDurableTaskAuthority({
+      workingDirectory: ".",
+      workspaceAccess: "none",
+      allowGitRequests: false,
+      commandAccess: "reviewed",
+      contextMaintenance: false
+    });
+    const policyBacked = buildGuiDurableTaskAuthority({
+      workingDirectory: "packages/gui",
+      workspaceAccess: "edit",
+      allowGitRequests: true,
+      commandAccess: "none",
+      contextMaintenance: false
+    });
+
+    expect(simple.requiresAuthorityManifest).toBe(false);
+    expect(simple.capabilities).toEqual(expect.arrayContaining([
+      expect.objectContaining({ resource: "human:owner" }),
+      expect.objectContaining({ resource: "shell:*" })
+    ]));
+    expect(policyBacked.requiresAuthorityManifest).toBe(true);
+    expect(policyBacked.capabilities).toEqual([
+      { resource: "human:owner", rights: ["write"], delegable: false }
+    ]);
+    expect(JSON.stringify(policyBacked)).not.toContain("approval_policy");
+    expect(JSON.stringify(policyBacked)).not.toContain("requestable_capabilities");
   });
 
   it("adds only the constrained reviewed-command policy when explicitly enabled", () => {

@@ -97,6 +97,7 @@ class ProcessManager:
     TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
     TERMINAL_CLEANUP_PHASES = ("terminal_notify", "process_finalize")
     _TERMINAL_CLEANUP_LOCK_STRIPES = 64
+    _TASK_RUN_ROLES = frozenset({"root", "child"})
 
     def __init__(
         self,
@@ -119,6 +120,9 @@ class ProcessManager:
             Callable[[str], AbstractContextManager[Any]] | None
         ) = None,
         transitions: ProcessTransitionService | None = None,
+        task_run_fence_checker: (
+            Callable[[str | None, str, int, str], None] | None
+        ) = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.store = unit_of_work.processes
@@ -138,6 +142,11 @@ class ProcessManager:
         self._after_spawn_hooks: builtins.list[Callable[[str, str, str], None]] = []
         self._object_task_terminal_notifier = object_task_terminal_notifier
         self._host_managed_runner_checker: Callable[[str], bool] | None = None
+        if task_run_fence_checker is not None and not callable(
+            task_run_fence_checker
+        ):
+            raise ValidationError("process TaskRun fence checker must be callable")
+        self._task_run_fence_checker = task_run_fence_checker
         self._failed_launch_artifact_cleanup = failed_launch_artifact_cleanup
         self.owner_instance_id = str(owner_instance_id)
         self._terminal_cleanup_locks = tuple(
@@ -172,6 +181,34 @@ class ProcessManager:
         """Identify published ObjectTask runners with Host-owned lifecycle."""
 
         self._host_managed_runner_checker = checker
+
+    def bind_task_run_fence(
+        self,
+        checker: Callable[[str | None, str, int, str], None],
+    ) -> None:
+        """Bind the durable TaskRun epoch/status admission fence.
+
+        TaskRun orchestration is assembled after the process primitive.  A
+        bound process fails closed until this callback proves that the exact
+        run incarnation may still publish a root or descendant launch.
+        """
+
+        if not callable(checker):
+            raise ValidationError("process TaskRun fence checker must be callable")
+        if self._task_run_fence_checker is not None:
+            raise ValidationError("process TaskRun fence checker is already bound")
+        self._task_run_fence_checker = checker
+
+    def require_task_run_launch_fence(self, pid: str, *, action: str) -> None:
+        """Fail closed before spending child-launch authority for a bound PID."""
+
+        process = self._require_active_parent(pid, f"start {action} from")
+        binding = self._task_run_binding_from_process(process)
+        self._require_task_run_binding_fence(
+            pid,
+            binding,
+            action=action,
+        )
 
     def add_after_spawn_hook(self, hook: Callable[..., None]) -> None:
         """Register a spawn hook, adapting the legacy two-argument shape."""
@@ -214,12 +251,14 @@ class ProcessManager:
         """Validate inherited/explicit child image artifacts before evidence."""
 
         parent_process = self._require_active_parent(parent, "fork")
+        self.require_task_run_launch_fence(parent, action="process.fork")
         self._run_before_spawn_hooks(image or parent_process.image_id)
 
     def preflight_spawn_child(self, parent: str, image: str | None = None) -> None:
         """Validate a fresh child image artifact before operation evidence."""
 
         parent_process = self._require_active_parent(parent, "spawn child from")
+        self.require_task_run_launch_fence(parent, action="process.spawn_child")
         self._run_before_spawn_hooks(image or parent_process.image_id)
 
     def preflight_exec(self, image: str) -> None:
@@ -241,12 +280,27 @@ class ProcessManager:
         authority_manifest: Any | None = None,
         _claim_owner_id: str | None = None,
         _execution_token_out: builtins.list[ProcessExecutionToken] | None = None,
+        _task_run_id: str | None = None,
+        _task_run_epoch: int | None = None,
+        _task_run_role: str | None = "root",
+        _task_run_commit: Callable[[str, str, str, str], None] | None = None,
     ) -> str:
         if (_claim_owner_id is None) != (_execution_token_out is None):
             raise ValidationError(
                 "claimed process spawn requires both an owner id and token receiver"
             )
         selected_image = image or self.config.runtime.default_image_id
+        task_run_binding = self._validated_root_task_run_binding(
+            _task_run_id,
+            _task_run_epoch,
+            _task_run_role,
+        )
+        if (task_run_binding is None) != (_task_run_commit is None):
+            raise ValidationError(
+                "root process TaskRun binding and commit callback must be supplied together"
+            )
+        if _task_run_commit is not None and not callable(_task_run_commit):
+            raise ValidationError("root process TaskRun commit callback must be callable")
         selected_root_budget = (
             self._coerce_resource_budget(resource_budget)
             if resource_budget is not None
@@ -278,6 +332,9 @@ class ProcessManager:
                 updated_at=now,
                 working_directory=cwd,
                 llm_profile_id=selected_llm_profile,
+                task_run_id=(task_run_binding[0] if task_run_binding else None),
+                task_run_epoch=(task_run_binding[1] if task_run_binding else None),
+                task_run_role=(task_run_binding[2] if task_run_binding else None),
             )
             self.store.insert_process(process)
             self._publication_phase(publication_id, "process_inserted")
@@ -323,16 +380,6 @@ class ProcessManager:
                     expected_status=ProcessStatus.CREATED,
                 )
                 execution_token: ProcessExecutionToken | None = None
-                if _claim_owner_id is not None:
-                    execution_token = self.store.claim_execution(
-                        pid,
-                        owner_id=_claim_owner_id,
-                    )
-                    if execution_token is None:
-                        raise ProcessError(
-                            f"new process could not be atomically claimed: {pid}"
-                        )
-                    process = self._get(pid)
                 event = self.events.emit(
                     EventType.PROCESS_CREATED,
                     source="runtime",
@@ -351,6 +398,36 @@ class ProcessManager:
                     target=f"process:{pid}",
                     output_refs=[goal_handle.oid],
                     decision={"image": selected_image, "working_directory": cwd, "llm_profile_id": selected_llm_profile},
+                )
+                if _task_run_commit is not None:
+                    task_run_commit_result = _task_run_commit(
+                        pid,
+                        publication_id,
+                        event.event_id,
+                        audit.record_id,
+                    )
+                    if task_run_commit_result is not None:
+                        raise ValidationError(
+                            "root process TaskRun commit callback must return None"
+                        )
+                # A bound claim is admitted only after its TaskRun row is
+                # atomically installed by the callback above. The event,
+                # audit, callback, claim, fence, and publication commit all
+                # remain inside this one transaction.
+                if _claim_owner_id is not None:
+                    execution_token = self.store.claim_execution(
+                        pid,
+                        owner_id=_claim_owner_id,
+                    )
+                    if execution_token is None:
+                        raise ProcessError(
+                            f"new process could not be atomically claimed: {pid}"
+                        )
+                    process = self._get(pid)
+                self._require_task_run_binding_fence(
+                    pid,
+                    task_run_binding,
+                    action="process.spawn",
                 )
                 self._commit_launch_publication(
                     publication_id,
@@ -381,6 +458,10 @@ class ProcessManager:
         working_directory: str | None = None,
         llm_profile_id: str | None = None,
         authority_manifest: Any | None = None,
+        _task_run_id: str | None = None,
+        _task_run_epoch: int | None = None,
+        _task_run_role: str | None = "root",
+        _task_run_commit: Callable[[str, str, str, str], None] | None = None,
     ) -> tuple[str, ProcessExecutionToken]:
         """Publish a root process already owned by one execution controller.
 
@@ -403,6 +484,10 @@ class ProcessManager:
             authority_manifest=authority_manifest,
             _claim_owner_id=selected_owner,
             _execution_token_out=tokens,
+            _task_run_id=_task_run_id,
+            _task_run_epoch=_task_run_epoch,
+            _task_run_role=_task_run_role,
+            _task_run_commit=_task_run_commit,
         )
         if len(tokens) != 1:
             raise ProcessError(f"claimed process spawn returned no execution token: {pid}")
@@ -428,6 +513,7 @@ class ProcessManager:
         _validated_working_directory: str | None = None,
     ) -> str:
         parent_proc = self._require_active_parent(parent, "fork")
+        task_run_binding = self._child_task_run_binding(parent_proc)
         launch_authority_reservations = tuple(_launch_authority_reservations)
         fork_mode = ForkMode(mode)
         selected_image = image or parent_proc.image_id
@@ -471,6 +557,9 @@ class ProcessManager:
                 updated_at=now,
                 working_directory=cwd,
                 llm_profile_id=selected_llm_profile,
+                task_run_id=(task_run_binding[0] if task_run_binding else None),
+                task_run_epoch=(task_run_binding[1] if task_run_binding else None),
+                task_run_role=(task_run_binding[2] if task_run_binding else None),
             )
             self.store.insert_process(child)
             self._publication_phase(publication_id, "process_inserted")
@@ -528,6 +617,11 @@ class ProcessManager:
                 self._require_parent_launch_fence(
                     parent_proc,
                     action="fork",
+                )
+                self._require_task_run_binding_fence(
+                    child_pid,
+                    task_run_binding,
+                    action="process.fork",
                 )
                 self._commit_launch_authority_reservations(
                     launch_authority_reservations,
@@ -602,6 +696,7 @@ class ProcessManager:
         _validated_working_directory: str | None = None,
     ) -> str:
         parent_proc = self._require_active_parent(parent, "spawn child from")
+        task_run_binding = self._child_task_run_binding(parent_proc)
         launch_authority_reservations = tuple(_launch_authority_reservations)
         selected_image = image or parent_proc.image_id
         self._require_child_budget(parent_proc)
@@ -647,6 +742,9 @@ class ProcessManager:
                 updated_at=now,
                 working_directory=cwd,
                 llm_profile_id=selected_llm_profile,
+                task_run_id=(task_run_binding[0] if task_run_binding else None),
+                task_run_epoch=(task_run_binding[1] if task_run_binding else None),
+                task_run_role=(task_run_binding[2] if task_run_binding else None),
             )
             self.store.insert_process(child)
             self._publication_phase(publication_id, "process_inserted")
@@ -703,6 +801,11 @@ class ProcessManager:
                 self._require_parent_launch_fence(
                     parent_proc,
                     action="spawn child from",
+                )
+                self._require_task_run_binding_fence(
+                    child_pid,
+                    task_run_binding,
+                    action="process.spawn_child",
                 )
                 self._commit_launch_authority_reservations(
                     launch_authority_reservations,
@@ -2238,6 +2341,104 @@ class ProcessManager:
             raise ProcessError(f"cannot {action} terminated process: {pid}")
         return process
 
+    @classmethod
+    def _validated_root_task_run_binding(
+        cls,
+        run_id: str | None,
+        epoch: int | None,
+        role: str | None,
+    ) -> tuple[str, int, str] | None:
+        if run_id is None:
+            if epoch is not None or role not in {None, "root"}:
+                raise ValidationError(
+                    "root process TaskRun binding must be entirely absent"
+                )
+            return None
+        binding = cls._validated_task_run_binding(run_id, epoch, role)
+        if binding[2] != "root":
+            raise ValidationError("TaskRun root process role must be 'root'")
+        return binding
+
+    @classmethod
+    def _validated_task_run_binding(
+        cls,
+        run_id: str | None,
+        epoch: int | None,
+        role: str | None,
+    ) -> tuple[str, int, str]:
+        if (
+            type(run_id) is not str
+            or not run_id
+            or run_id != run_id.strip()
+            or "\x00" in run_id
+        ):
+            raise ValidationError("process TaskRun id must be canonical text")
+        if type(epoch) is not int or epoch <= 0:
+            raise ValidationError("process TaskRun epoch must be a positive integer")
+        if role not in cls._TASK_RUN_ROLES:
+            raise ValidationError(
+                "process TaskRun role must be one of: child, root"
+            )
+        return run_id, epoch, role
+
+    @classmethod
+    def _task_run_binding_from_process(
+        cls,
+        process: AgentProcess,
+    ) -> tuple[str, int, str] | None:
+        fields = (
+            process.task_run_id,
+            process.task_run_epoch,
+            process.task_run_role,
+        )
+        if all(value is None for value in fields):
+            return None
+        if any(value is None for value in fields):
+            raise ProcessError(
+                f"process has an incomplete TaskRun binding: {process.pid}"
+            )
+        try:
+            return cls._validated_task_run_binding(*fields)
+        except ValidationError as exc:
+            raise ProcessError(
+                f"process has an invalid TaskRun binding: {process.pid}"
+            ) from exc
+
+    @classmethod
+    def _child_task_run_binding(
+        cls,
+        parent: AgentProcess,
+    ) -> tuple[str, int, str] | None:
+        parent_binding = cls._task_run_binding_from_process(parent)
+        if parent_binding is None:
+            return None
+        return parent_binding[0], parent_binding[1], "child"
+
+    def _require_task_run_binding_fence(
+        self,
+        pid: str | None,
+        binding: tuple[str, int, str] | None,
+        *,
+        action: str,
+    ) -> None:
+        if binding is None:
+            return
+        run_id, epoch, role = self._validated_task_run_binding(*binding)
+        if pid is not None:
+            current = self._get(pid)
+            current_binding = self._task_run_binding_from_process(current)
+            if current_binding != (run_id, epoch, role):
+                raise ProcessError(
+                    "process TaskRun binding changed during launch publication: "
+                    f"{pid}"
+                )
+        checker = self._task_run_fence_checker
+        if checker is None:
+            raise ProcessError(
+                "durable TaskRun launch fence is unavailable for bound process"
+            )
+        checker(pid, run_id, epoch, action)
+
     def _require_parent_launch_fence(
         self,
         expected: AgentProcess,
@@ -2248,12 +2449,19 @@ class ProcessManager:
         if (
             current.status != expected.status
             or current.state_generation != expected.state_generation
+            or current.task_run_id != expected.task_run_id
+            or current.task_run_epoch != expected.task_run_epoch
+            or current.task_run_role != expected.task_run_role
         ):
             raise ProcessError(
-                "parent process changed during child publication: "
+                "parent process or TaskRun binding changed during child publication: "
                 f"{expected.pid} expected={expected.status.value}/"
-                f"{expected.state_generation} found={current.status.value}/"
-                f"{current.state_generation}"
+                f"{expected.state_generation}/"
+                f"{expected.task_run_id}@{expected.task_run_epoch}:"
+                f"{expected.task_run_role} found={current.status.value}/"
+                f"{current.state_generation}/"
+                f"{current.task_run_id}@{current.task_run_epoch}:"
+                f"{current.task_run_role}"
             )
         return current
 

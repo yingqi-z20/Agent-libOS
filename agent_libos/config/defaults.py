@@ -839,6 +839,50 @@ class ObjectTaskDefaults:
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
+class TaskRunDefaults:
+    """Host-owned durable TaskRun persistence and bounded recovery controls."""
+
+    enabled: bool = True
+    plaintext_payloads_enabled: bool = False
+    payload_max_bytes: StrictInt = 1_048_576
+    command_result_max_bytes: StrictInt = 262_144
+    recovery_page_size: StrictInt = 500
+    recovery_page_hard_limit: StrictInt = 5_000
+    list_page_size: StrictInt = 100
+    list_hard_limit: StrictInt = 1_000
+    ledger_page_size: StrictInt = 500
+    ledger_page_hard_limit: StrictInt = 500
+    recovery_sample_limit: StrictInt = 100
+
+    def __post_init__(self) -> None:
+        for name in (
+            "payload_max_bytes",
+            "command_result_max_bytes",
+            "recovery_page_size",
+            "recovery_page_hard_limit",
+            "list_page_size",
+            "list_hard_limit",
+            "ledger_page_size",
+            "ledger_page_hard_limit",
+            "recovery_sample_limit",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"task_runs.{name} must be greater than zero")
+        for prefix in ("recovery", "ledger"):
+            selected = getattr(self, f"{prefix}_page_size")
+            hard_limit = getattr(self, f"{prefix}_page_hard_limit")
+            if selected > hard_limit:
+                raise ValueError(
+                    f"task_runs.{prefix}_page_size must not exceed "
+                    f"task_runs.{prefix}_page_hard_limit"
+                )
+        if self.list_page_size > self.list_hard_limit:
+            raise ValueError(
+                "task_runs.list_page_size must not exceed task_runs.list_hard_limit"
+            )
+
+
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class LLMContextDefaults:
     policy: str = "source_only"
     schema_version: int = 1
@@ -979,6 +1023,7 @@ class AgentLibOSConfig:
     image_commit: ImageCommitDefaults = field(default_factory=ImageCommitDefaults)
     memory: ObjectMemoryDefaults = field(default_factory=ObjectMemoryDefaults)
     object_tasks: ObjectTaskDefaults = field(default_factory=ObjectTaskDefaults)
+    task_runs: TaskRunDefaults = field(default_factory=TaskRunDefaults)
     llm_context: LLMContextDefaults = field(default_factory=LLMContextDefaults)
     checkpoint: CheckpointDefaults = field(default_factory=CheckpointDefaults)
     skills: SkillDefaults = field(default_factory=SkillDefaults)

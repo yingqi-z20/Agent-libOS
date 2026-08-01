@@ -157,8 +157,29 @@ def test_startup_reconciliation_failure_keeps_runtime_available_and_effect_unkno
         assert recovered.effect_state == "pending"
         assert recovered.transaction_state == "unknown"
         assert recovered.provider_metadata["reconciliation_reason"] == "provider_reconciliation_error:RuntimeError"
+        transition_count = len(
+            reopened.store._query(  # noqa: SLF001 - exact append-only evidence assertion
+                "SELECT seq FROM external_effect_transitions WHERE effect_id = ?",
+                (pending.effect_id,),
+            )
+        )
     finally:
         reopened.close()
+
+    repeated_substrate = LocalResourceProviderSubstrate(workspace)
+    repeated_substrate.jsonrpc = _FailingReconciler()
+    repeated = Runtime.open(database, substrate=repeated_substrate)
+    try:
+        unchanged = repeated.store.get_external_effect(pending.effect_id)
+        assert unchanged == recovered
+        assert len(
+            repeated.store._query(  # noqa: SLF001 - exact append-only evidence assertion
+                "SELECT seq FROM external_effect_transitions WHERE effect_id = ?",
+                (pending.effect_id,),
+            )
+        ) == transition_count
+    finally:
+        repeated.close()
 
 
 def test_approval_binding_rejects_changed_arguments_and_target_version() -> None:

@@ -11,6 +11,7 @@ from agent_libos.models import (
     AgentObject,
     AgentImage,
     AgentProcess,
+    AuditRecord,
     Capability,
     CapabilityUseReservationRecoverySummary,
     Checkpoint,
@@ -19,6 +20,7 @@ from agent_libos.models import (
     CheckpointPayloadDeliveryAttemptState,
     Event,
     ExternalEffectRecord,
+    ExternalEffectRecoverySettlement,
     HumanRequest,
     HumanRequestStatus,
     JITRehydrationArtifact,
@@ -66,6 +68,19 @@ from agent_libos.models import (
     RuntimePublicationState,
     ToolCandidate,
     ToolSpec,
+    TaskRunCommand,
+    TaskRunCursor,
+    TaskRunLedgerCursor,
+    TaskRunLedgerItem,
+    TaskRunLedgerPage,
+    TaskRunLink,
+    TaskRunPage,
+    TaskRunPayload,
+    TaskRunRecord,
+    TaskRunRequirement,
+    TaskRunRequirementStatus,
+    TaskRunResumePoint,
+    TaskRunStatus,
 )
 from agent_libos.ports.processes import ProcessRestoreEpochRepositoryPort
 
@@ -126,6 +141,15 @@ class ProcessStateRepository(ProcessRestoreEpochRepositoryPort, Protocol):
     def list_child_processes(self, parent_pid: str) -> list[AgentProcess]: ...
 
     def get_human_request(self, request_id: str) -> HumanRequest | None: ...
+
+    def list_human_requests_for_pids(
+        self,
+        pids: Iterable[str],
+        *,
+        statuses: Iterable[HumanRequestStatus | str] | None = None,
+        limit: int,
+        cursor: str | tuple[str, str] | None = None,
+    ) -> Mapping[str, Any]: ...
 
     def get_object_task(self, task_id: str) -> ObjectTask | None: ...
 
@@ -345,6 +369,261 @@ class ProcessStateRepository(ProcessRestoreEpochRepositoryPort, Protocol):
         namespace: str,
         namespace_resource: str,
     ) -> ProcessScaffoldCleanup: ...
+
+
+class TaskRunBackendProtocol(Protocol):
+    """Durable TaskRun current rows, append-only evidence, and epoch fences."""
+
+    @property
+    def runtime_epoch(self) -> int | None: ...
+
+    def claim_runtime_epoch(self, instance_id: str) -> int: ...
+
+    def insert_task_run(self, run: TaskRunRecord, *, cursor: Any | None = None) -> None: ...
+
+    def get_task_run(self, run_id: str) -> TaskRunRecord | None: ...
+
+    def list_task_runs(
+        self,
+        *,
+        statuses: Iterable[TaskRunStatus | str] | None = None,
+        after: TaskRunCursor | None = None,
+        limit: int | None = None,
+    ) -> TaskRunPage: ...
+
+    def list_recoverable_task_runs(
+        self,
+        *,
+        after: TaskRunCursor | None,
+        limit: int,
+    ) -> TaskRunPage: ...
+
+    def update_task_run_cas(
+        self,
+        run_id: str,
+        expected_revision: int,
+        *,
+        updates: Mapping[str, Any],
+        expected_runtime_epoch: int | None = None,
+    ) -> TaskRunRecord: ...
+
+    def claim_task_run_epoch(
+        self,
+        run_id: str,
+        expected_revision: int,
+        runtime_epoch: int | None = None,
+    ) -> TaskRunRecord: ...
+
+    def claim_terminal_task_run_epoch(
+        self,
+        run_id: str,
+        expected_revision: int,
+        runtime_epoch: int | None = None,
+    ) -> TaskRunRecord: ...
+
+    def insert_task_run_requirement(
+        self,
+        requirement: TaskRunRequirement,
+        *,
+        cursor: Any | None = None,
+    ) -> None: ...
+
+    def list_task_run_requirements(
+        self,
+        run_id: str,
+        *,
+        after: tuple[int, str] | None = None,
+        limit: int | None = None,
+    ) -> list[TaskRunRequirement]: ...
+
+    def update_task_run_requirement_cas(
+        self,
+        requirement_id: str,
+        *,
+        expected_status: TaskRunRequirementStatus | str,
+        status: TaskRunRequirementStatus | str,
+        updated_at: str,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        waived_by: str | None = None,
+        waiver_reason: str | None = None,
+    ) -> TaskRunRequirement | None: ...
+
+    def insert_task_run_payload(
+        self,
+        payload: TaskRunPayload,
+        *,
+        cursor: Any | None = None,
+    ) -> None: ...
+
+    def get_task_run_payload(self, payload_id: str) -> TaskRunPayload | None: ...
+
+    def list_task_run_payloads(self, run_id: str) -> list[TaskRunPayload]: ...
+
+    def purge_task_run_payloads(self, run_id: str, *, purged_at: str) -> int: ...
+
+    def upsert_task_run_resume_point(self, point: TaskRunResumePoint) -> None: ...
+
+    def get_task_run_resume_point(
+        self,
+        pid: str,
+        *,
+        complete_only: bool = True,
+    ) -> TaskRunResumePoint | None: ...
+
+    def list_task_run_resume_points(
+        self,
+        run_id: str,
+        *,
+        complete_only: bool = True,
+        limit: int | None = None,
+    ) -> list[TaskRunResumePoint]: ...
+
+    def delete_task_run_resume_point(self, pid: str) -> bool: ...
+
+    def insert_task_run_command(
+        self,
+        command: TaskRunCommand,
+        *,
+        cursor: Any | None = None,
+        expected_runtime_epoch: int | None = None,
+    ) -> TaskRunCommand: ...
+
+    def get_task_run_command(
+        self,
+        run_id: str,
+        command_id: str,
+    ) -> TaskRunCommand | None: ...
+
+    def list_task_run_commands(
+        self,
+        run_id: str,
+        *,
+        limit: int,
+    ) -> list[TaskRunCommand]: ...
+
+    def get_task_run_command_by_client_request_id(
+        self,
+        client_request_id: str,
+    ) -> TaskRunCommand | None: ...
+
+    def update_task_run_command_result(
+        self,
+        run_id: str,
+        command_id: str,
+        *,
+        expected_result_revision: int,
+        result: Mapping[str, Any],
+        result_revision: int,
+        expected_runtime_epoch: int | None = None,
+    ) -> TaskRunCommand: ...
+
+    def append_task_run_ledger_item(
+        self,
+        item: Any,
+        *,
+        cursor: Any | None = None,
+    ) -> Any: ...
+
+    def get_task_run_ledger_item(
+        self,
+        run_id: str,
+        item_id: str,
+    ) -> TaskRunLedgerItem | None: ...
+
+    def list_task_run_ledger(
+        self,
+        run_id: str,
+        *,
+        after: TaskRunLedgerCursor | None,
+        limit: int,
+    ) -> TaskRunLedgerPage: ...
+
+    def insert_task_run_link(
+        self,
+        link: TaskRunLink,
+        *,
+        cursor: Any | None = None,
+    ) -> None: ...
+
+    def list_task_run_links(
+        self,
+        run_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[TaskRunLink]: ...
+
+    def list_processes_for_task_run(self, run_id: str) -> list[AgentProcess]: ...
+
+    def list_task_run_process_ids(self, run_id: str) -> tuple[str, ...]: ...
+
+    def list_active_capability_use_reservations_for_pids(
+        self,
+        pids: Iterable[str],
+    ) -> list[dict[str, Any]]: ...
+
+    def list_human_requests_for_pids(
+        self,
+        pids: Iterable[str],
+        *,
+        statuses: Iterable[HumanRequestStatus | str] | None = None,
+        limit: int,
+        cursor: str | tuple[str, str] | None = None,
+    ) -> Mapping[str, Any]: ...
+
+    def list_task_run_human_requests(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str] = (),
+    ) -> list[HumanRequest]: ...
+
+    def redact_task_run_human_request_payload(
+        self,
+        record: HumanRequest,
+        *,
+        run_id: str,
+        expected_payload_sha256: str,
+        expected_status: str,
+    ) -> bool: ...
+
+    def purge_task_run_messages(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str],
+        *,
+        purged_at: str,
+    ) -> int: ...
+
+    def purge_task_run_llm_pending_actions(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str],
+        *,
+        purged_at: str,
+        cursor: Any | None = None,
+    ) -> int: ...
+
+    def list_task_run_external_effects(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str] = (),
+    ) -> list[ExternalEffectRecord]: ...
+
+    def redact_task_run_external_effect_payload(
+        self,
+        record: ExternalEffectRecord,
+        *,
+        run_id: str,
+        expected_payload_sha256: str,
+        expected_tier: str,
+        expected_effect_state: str,
+        expected_transaction_state: str,
+    ) -> bool: ...
+
+    def list_active_task_run_ids_for_pids(
+        self,
+        pids: Iterable[str],
+    ) -> tuple[str, ...]: ...
 
 
 class ResourceRepositoryProtocol(Protocol):
@@ -619,7 +898,30 @@ class OperationRepositoryProtocol(Protocol):
 
     def get_external_effect(self, effect_id: str) -> ExternalEffectRecord | None: ...
 
+    def settle_external_effect_recovery(
+        self,
+        effect_id: str,
+        *,
+        expected_transaction_state: str,
+        provider_state: str,
+        provider_metadata: dict[str, Any],
+        provider_receipt: dict[str, Any],
+        audit_record: AuditRecord,
+        updated_at: str,
+        run_id: str | None = None,
+        runtime_epoch: int | None = None,
+    ) -> ExternalEffectRecoverySettlement | None: ...
+
     def current_effect_ledger_seq(self) -> int: ...
+
+    def external_effect_transition_matches(
+        self,
+        transition_seq: int,
+        effect_id: str,
+        *,
+        effect_state: str,
+        transaction_state: str,
+    ) -> bool: ...
 
     def list_external_effects_changed_after(
         self,
@@ -981,6 +1283,22 @@ class ProcessBackendProtocol(
     def list_child_processes(self, parent_pid: str) -> list[AgentProcess]: ...
 
     def get_human_request(self, request_id: str) -> HumanRequest | None: ...
+
+    def list_human_requests_for_pids(
+        self,
+        pids: Iterable[str],
+        *,
+        statuses: Iterable[HumanRequestStatus | str] | None = None,
+        limit: int,
+        cursor: str | tuple[str, str] | None = None,
+    ) -> Mapping[str, Any]: ...
+
+    def list_llm_pending_action_validation_rows(
+        self,
+        *,
+        after_pid: str | None = None,
+        limit: int | None = None,
+    ) -> Mapping[str, Any]: ...
 
     def count_process_messages(
         self,
@@ -1595,6 +1913,7 @@ class SnapshotCheckpointBackendProtocol(
         statuses: Iterable[ProcessMessageStatus | str] | None = None,
         kind: ProcessMessageKind | str | None = None,
         sender: str | None = None,
+        sender_prefix: str | None = None,
         channel: str | None = None,
         correlation_id: str | None = None,
         reply_to: str | None = None,
@@ -1812,6 +2131,15 @@ class OperationEvidenceBackendProtocol(TransactionBackendProtocol, Protocol):
 
     def current_effect_ledger_seq(self) -> int: ...
 
+    def external_effect_transition_matches(
+        self,
+        transition_seq: int,
+        effect_id: str,
+        *,
+        effect_state: str,
+        transaction_state: str,
+    ) -> bool: ...
+
     def list_external_effects_changed_after(
         self,
         effect_ledger_seq: int,
@@ -1822,6 +2150,7 @@ class OperationEvidenceBackendProtocol(TransactionBackendProtocol, Protocol):
 
 class UnitOfWorkBackendProtocol(
     ProcessBackendProtocol,
+    TaskRunBackendProtocol,
     ObjectQueryBackendProtocol,
     ObjectRecoveryBackendProtocol,
     AuthorityRecoveryBackendProtocol,

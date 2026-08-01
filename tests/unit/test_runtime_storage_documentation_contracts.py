@@ -70,6 +70,63 @@ def test_runtime_lifecycle_docs_cover_typed_waits_and_non_scheduler_running() ->
         assert required in documentation
 
 
+def test_runtime_and_storage_docs_keep_typed_stale_recovery_boundary() -> None:
+    runtime = _words(_read("docs/runtime_model.md"))
+    storage = _words(_read("docs/storage.md"))
+
+    for required in (
+        "typed `StaleExecutionProcessWait` receipt is resumed",
+        "`stale_execution_recovery` `status_message` is compatibility display text",
+        "is not a control input",
+    ):
+        assert required in runtime
+    assert "`stale_execution_recovery` pause is resumed" not in runtime
+
+    for required in (
+        "owner/lease-identity-hash-only",
+        "canonical recovering-Runtime owner-id/prior-owner/prior-lease SHA-256 values",
+        "identity hash rather than a cryptographic signature",
+        "historical recovering-owner hash",
+        "TaskRun admission/current epochs",
+        "safe-point integrity, and current bindings remain authoritative",
+        "including stale execution",
+        "never parsed as the control protocol",
+    ):
+        assert required in storage
+
+
+def test_runtime_and_storage_docs_keep_command_receipts_evidence_fenced() -> None:
+    runtime = _words(_read("docs/runtime_model.md"))
+    storage = _words(_read("docs/storage.md"))
+
+    for required in (
+        "split local-control pending and completed receipt retains its exact `admission_ledger_seq`",
+        "`admission_ledger_item_id`, and `admission_evidence_sha256`",
+        "even on terminal or superseded early-return paths",
+        "Interrupt completion retains its `interrupt_provenance_sha256` while removing the raw admission epoch/fence list",
+        "append-only effect transition plus `host_verified_receipt` audit",
+        "global Runtime-epoch counter-row fence",
+        "linked-recovery gap repair",
+    ):
+        assert required in runtime
+
+    for required in (
+        "rejects an oversized raw UTF-8 `result_json` before parsing",
+        "complete canonical public TaskRun summary bound to `run_id` and `result_revision`",
+        "exact key set for the command/request-selected variant",
+        "pending-only fields on a completed receipt",
+        "outside signed BIGINT bounds",
+        "`admission_ledger_seq`, `admission_ledger_item_id`, and `admission_evidence_sha256`",
+        "append-only `STATUS_TRANSITION` item",
+        "completion drops the raw epoch/fences but retains that digest",
+        "exact `settlement_transition_seq` and `settlement_audit_record_id`",
+        "replay does not depend on purgeable provider metadata or receipt bodies",
+        "conditional no-op update of the global `task_run_runtime_epoch` counter row",
+        "linked-recovery missing-parent receipt path",
+    ):
+        assert required in storage
+
+
 def test_runtime_docs_bound_cwd_human_and_object_task_resume_contracts() -> None:
     documentation = _words(_read("docs/runtime_model.md"))
 
@@ -135,10 +192,11 @@ def test_data_flow_docs_do_not_promise_decisions_for_pre_flow_denials() -> None:
 def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() -> None:
     documentation = _words(_read("docs/storage.md"))
 
-    assert "Agent libOS 1.0.1 stores durable runtime state" in documentation
-    assert "## Strict store schema v3" in documentation
+    assert "Agent libOS 1.1.0 stores durable runtime state" in documentation
+    assert "## Strict store schema v4" in documentation
     assert "Product version and store schema version are independent" in documentation
-    assert "legacy Agent libOS 0.3 product release" in documentation
+    assert "There are no migrations, backfills, read-only compatibility modes, or dual schema paths from schema v3 to v4" in documentation
+    assert "must be opened with Agent libOS 1.0.1" in documentation
     for required in (
         "## Backup and restore runbook",
         "SQLite's own backup command",

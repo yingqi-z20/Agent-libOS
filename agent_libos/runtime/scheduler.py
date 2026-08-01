@@ -864,7 +864,6 @@ class AsyncProcessScheduler:
                 return True
         return False
 
-
 class SimpleScheduler(AsyncProcessScheduler):
     pass
 

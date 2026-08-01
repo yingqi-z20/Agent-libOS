@@ -16,6 +16,7 @@ from uuid import uuid4
 
 import pytest
 
+from agent_libos import TaskRunSpecV1
 from agent_libos.config import AgentLibOSConfig, RuntimeDefaults
 from agent_libos.models import (
     PERMITTED_EFFECTS_POLICY_PROVENANCE_KEY,
@@ -71,6 +72,9 @@ from agent_libos.models import (
     ResourceBudget,
     ResourceUsage,
     SinkTrustSpec,
+    StaleExecutionProcessWait,
+    TaskRunRetention,
+    TaskRunStatus,
     ToolProcessWait,
     ToolCandidateStatus,
 )
@@ -3235,6 +3239,29 @@ def test_reopen_fails_closed_stale_running_execution_with_audit(
             process = reopened.process.get(pid)
             assert process.status == ProcessStatus.PAUSED
             assert process.status_message == "stale_execution_recovery"
+            assert isinstance(process.wait_state, StaleExecutionProcessWait)
+            assert process.wait_state.pid == pid
+            assert process.wait_state.recovered_by_owner_sha256 == hashlib.sha256(
+                reopened.instance_id.encode("utf-8")
+            ).hexdigest()
+            assert process.wait_state.prior_owner_sha256 == hashlib.sha256(
+                token.owner_id.encode("utf-8")
+            ).hexdigest()
+            assert process.wait_state.prior_lease_sha256 == hashlib.sha256(
+                token.lease_id.encode("utf-8")
+            ).hexdigest()
+            assert process.wait_state.prior_execution_generation == token.generation
+            assert (
+                process.wait_state.recovered_execution_generation
+                == process.execution_generation
+                == token.generation + 1
+            )
+            assert (
+                process.wait_state.recovered_state_generation
+                == process.state_generation
+            )
+            assert token.owner_id not in repr(process.wait_state)
+            assert token.lease_id not in repr(process.wait_state)
             assert process.execution_owner_id is None
             assert process.execution_lease_id is None
             assert process.execution_generation > token.generation
@@ -3242,6 +3269,144 @@ def test_reopen_fails_closed_stale_running_execution_with_audit(
             assert any(record.action == "stale_execution_recovery" for record in records)
         finally:
             reopened.close()
+
+
+@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
+def test_checkpoint_restore_and_fork_discard_stale_execution_takeover_receipt(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    with _persistent_target(kind, tmp_path) as (target, config):
+        crashed = Runtime.open(target, config=config)
+        pid = crashed.process.spawn(
+            image="base-agent:v0",
+            goal="checkpoint a stale execution receipt",
+        )
+        token = crashed.store.claim_execution(
+            pid,
+            owner_id="checkpoint-stale-contract-worker",
+        )
+        assert token is not None
+        crashed.close()
+
+        reopened = Runtime.open(target, config=config)
+        try:
+            recovered = reopened.process.get(pid)
+            assert recovered.status is ProcessStatus.PAUSED
+            assert isinstance(
+                recovered.wait_state,
+                StaleExecutionProcessWait,
+            )
+            checkpoint_id = reopened.checkpoint.create(
+                pid,
+                "stale execution receipt concurrency boundary",
+                actor=pid,
+            )
+            reopened.process.resume(pid)
+            advanced = reopened.process.get(pid)
+
+            forked = reopened.checkpoint.fork_from_checkpoint(
+                "host",
+                checkpoint_id,
+                require_capability=False,
+            )
+            fork_process = reopened.process.get(forked["fork_root_pid"])
+            assert fork_process.status is ProcessStatus.PAUSED
+            assert fork_process.wait_state == PausedProcessWait()
+            assert fork_process.status_message is None
+            assert fork_process.execution_owner_id is None
+            assert fork_process.execution_lease_id is None
+
+            result = reopened.checkpoint.restore(
+                "host",
+                checkpoint_id,
+                require_capability=False,
+            )
+            assert result["main_state_committed"] is True
+            restored = reopened.process.get(pid)
+            assert restored.status is ProcessStatus.PAUSED
+            assert restored.wait_state == PausedProcessWait()
+            assert restored.status_message is None
+            assert restored.execution_owner_id is None
+            assert restored.execution_lease_id is None
+            assert restored.revision > advanced.revision
+            assert (
+                restored.execution_generation
+                > recovered.wait_state.recovered_execution_generation
+            )
+            assert restored.state_generation > advanced.state_generation
+        finally:
+            reopened.close()
+
+
+@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
+def test_stale_execution_recovery_cas_does_not_pause_a_new_execution_owner(
+    kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _persistent_target(kind, tmp_path) as (target, config):
+        runtime = Runtime.open(target, config=config)
+        try:
+            pid = runtime.process.spawn(goal="race stale execution recovery")
+            original = runtime.store.claim_execution(
+                pid,
+                owner_id="crashed-owner",
+            )
+            assert original is not None
+            replacement_owner = "replacement-owner"
+            replacement_lease = "replacement-lease"
+            receipt_type = StaleExecutionProcessWait
+            interleaved = False
+
+            def interleaving_receipt(**values: object) -> StaleExecutionProcessWait:
+                nonlocal interleaved
+                if not interleaved:
+                    interleaved = True
+                    runtime.store._execute(  # noqa: SLF001 - exact SQL race injection
+                        """
+                        UPDATE processes
+                           SET execution_owner_id = ?, execution_lease_id = ?,
+                               execution_generation = execution_generation + 1,
+                               state_generation = state_generation + 1,
+                               revision = revision + 1
+                         WHERE pid = ? AND status = ?
+                        """,
+                        (
+                            replacement_owner,
+                            replacement_lease,
+                            pid,
+                            ProcessStatus.RUNNING.value,
+                        ),
+                    )
+                return receipt_type(**values)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(
+                "agent_libos.storage.sql.StaleExecutionProcessWait",
+                interleaving_receipt,
+            )
+            try:
+                summary = runtime.store.recover_stale_executions(
+                    owner_id=runtime.instance_id,
+                    require_recovery_lease=lambda: None,
+                    on_recovered=lambda _pid: None,
+                )
+            finally:
+                monkeypatch.setattr(
+                    "agent_libos.storage.sql.StaleExecutionProcessWait",
+                    receipt_type,
+                )
+
+            current = runtime.process.get(pid)
+            assert interleaved is True
+            assert summary.total_count == 0
+            assert current.status is ProcessStatus.RUNNING
+            assert current.wait_state is None
+            assert current.execution_owner_id == replacement_owner
+            assert current.execution_lease_id == replacement_lease
+            assert current.execution_generation == original.generation + 1
+        finally:
+            runtime.close()
 
 
 @pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
@@ -4316,6 +4481,86 @@ def test_llm_cache_usage_counters_survive_backend_reopen(
                 "cache_read_tokens": 0,
                 "cache_write_tokens": 32,
             }
+        finally:
+            reopened.close()
+
+
+@pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
+def test_task_run_command_result_read_cap_fails_closed_across_backends(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    result_limit = 8_192
+    with _persistent_target(kind, tmp_path) as (target, config):
+        selected_config = replace(
+            config,
+            task_runs=replace(
+                config.task_runs,
+                plaintext_payloads_enabled=True,
+                command_result_max_bytes=result_limit,
+            ),
+        )
+        runtime = Runtime.open(target, config=selected_config)
+        try:
+            created = runtime.task_runs.create(
+                TaskRunSpecV1(
+                    goal={"goal": "raw command result read cap"},
+                    display_title="Raw command result read cap",
+                    image_id="base-agent:v0",
+                    retention=TaskRunRetention.PERMANENT,
+                ),
+                client_request_id=f"raw-command-result-cap-{kind}",
+            )
+            assert created.root_pid is not None
+            command_id = f"create:raw-command-result-cap-{kind}"
+            command = runtime.store.get_task_run_command(
+                created.run_id,
+                command_id,
+            )
+            assert command is not None
+            raw = json.dumps(
+                command.result,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            oversized = raw + " " * (result_limit + 1 - len(raw.encode("utf-8")))
+            assert len(oversized.encode("utf-8")) == result_limit + 1
+        finally:
+            runtime.close()
+
+        if kind == "sqlite-file":
+            assert isinstance(target, Path)
+            with sqlite3.connect(target) as connection:
+                connection.execute(
+                    "UPDATE task_run_commands SET result_json = ? "
+                    "WHERE run_id = ? AND command_id = ?",
+                    (oversized, created.run_id, command_id),
+                )
+                connection.commit()
+        else:
+            import psycopg
+
+            with psycopg.connect(str(target), autocommit=True) as connection:
+                connection.execute(
+                    "UPDATE task_run_commands SET result_json = %s "
+                    "WHERE run_id = %s AND command_id = %s",
+                    (oversized, created.run_id, command_id),
+                )
+
+        reopened = Runtime.open(target, config=selected_config)
+        try:
+            attention = reopened.task_runs.get(created.run_id)
+            assert attention.status is TaskRunStatus.NEEDS_ATTENTION
+            assert "manual_recovery_required" in {
+                blocker["kind"] for blocker in attention.blockers
+            }
+            with pytest.raises(ValidationError, match="max_bytes=8192"):
+                reopened.store.get_task_run_command(created.run_id, command_id)
+            usage = reopened.process.get(created.root_pid).resource_usage
+            assert usage.llm_calls == 0
+            assert usage.tool_calls == 0
+            assert reopened.run_next_process_once() is None
         finally:
             reopened.close()
 

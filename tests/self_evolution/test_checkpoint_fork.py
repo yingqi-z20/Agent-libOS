@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
-from agent_libos import AgentImage, Runtime
+from agent_libos import AgentImage, Runtime, TaskRunSpecV1
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
@@ -174,6 +176,96 @@ class TestCheckpointFork:
         assert output.main_state_committed is True
         assert output.reconciliation_pending is False
         assert output.post_commit_failures == []
+
+    def test_fork_remap_does_not_clone_durable_task_run_binding(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='do not clone durable execution identity',
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'task run binding boundary',
+                actor=pid,
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _checkpoint, snapshot = found
+            source_row = next(
+                row
+                for row in snapshot['rows']['processes']
+                if row['pid'] == pid
+            )
+            source_row.update(
+                {
+                    'task_run_id': 'trun_source',
+                    'task_run_epoch': 7,
+                    'task_run_role': 'root',
+                }
+            )
+
+            remapped = runtime.checkpoint._remap_snapshot(
+                snapshot,
+                parent_pid=None,
+                root_pid=pid,
+            )
+            fork_pid = remapped['pid_map'][pid]
+            fork_row = next(
+                row
+                for row in remapped['rows']['processes']
+                if row['pid'] == fork_pid
+            )
+
+            assert fork_row['task_run_id'] is None
+            assert fork_row['task_run_epoch'] is None
+            assert fork_row['task_run_role'] is None
+        finally:
+            runtime.close()
+
+    def test_fork_does_not_clone_durable_task_run_goal_marker(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            marker = {
+                '$task_run_ref': {
+                    'run_id': 'trun_source',
+                    'payload_sha256': 'a' * 64,
+                    'schema_version': 1,
+                }
+            }
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal=marker,
+            )
+            source = runtime.process.get(pid)
+            assert source.goal_oid is not None
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'task run marker boundary',
+                actor=pid,
+            )
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+
+            result = runtime.checkpoint.fork_from_checkpoint(
+                pid,
+                checkpoint_id,
+            )
+            forked = runtime.process.get(result['fork_root_pid'])
+
+            assert source.goal_oid not in result['object_map']
+            assert forked.goal_oid is None
+            assert forked.memory_view is not None
+            assert all(
+                runtime.store.get_object(handle.oid).payload != marker
+                for handle in forked.memory_view.roots
+            )
+        finally:
+            runtime.close()
 
     def test_fork_rejects_nested_outer_store_transaction(self) -> None:
         runtime = Runtime.open('local')
@@ -1667,6 +1759,58 @@ class TestCheckpointFork:
             runtime.capability.grant(owner, runtime.checkpoint.process_resource(other), [CapabilityRight.ADMIN], issued_by='test')
             forked = runtime.checkpoint.fork_from_checkpoint(owner, checkpoint_id, parent_pid=other)
             assert runtime.process.get(forked['fork_root_pid']).parent_pid == other
+        finally:
+            runtime.close()
+
+    def test_checkpoint_fork_rejects_active_task_run_parent_without_runnable_bypass(
+        self,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            task_runs=replace(
+                DEFAULT_CONFIG.task_runs,
+                plaintext_payloads_enabled=True,
+            ),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            source = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='ordinary checkpoint fork source',
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                source,
+                'ordinary source for TaskRun parent rejection',
+                actor=source,
+            )
+            task_run = runtime.task_runs.create(
+                TaskRunSpecV1(
+                    goal='remain supervised while a fork is attempted',
+                    display_title='fork parent TaskRun guard',
+                    image_id='base-agent:v0',
+                ),
+                client_request_id='fork-active-task-run-parent',
+            )
+            parent_pid = task_run.root_pid
+            assert parent_pid is not None
+            parent_before = runtime.process.get(parent_pid)
+            pids_before = {process.pid for process in runtime.process.list()}
+
+            with pytest.raises(
+                ValidationError,
+                match='cannot attach to a Durable TaskRun process',
+            ):
+                runtime.checkpoint.fork_from_checkpoint(
+                    parent_pid,
+                    checkpoint_id,
+                    parent_pid=parent_pid,
+                    require_capability=False,
+                )
+
+            assert {process.pid for process in runtime.process.list()} == pids_before
+            assert runtime.process.get(parent_pid) == parent_before
+            assert runtime.task_runs.get(task_run.run_id) == task_run
+            assert runtime.scheduler.next_runnable(pids=[parent_pid]) is None
         finally:
             runtime.close()
 

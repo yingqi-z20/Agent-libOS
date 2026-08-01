@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
+import re
 import threading
 import weakref
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
@@ -28,13 +30,18 @@ from agent_libos.evidence.payload_retention import (
     PayloadRetentionTier,
     external_effect_payload_retention_tier,
     llm_call_payload_can_be_image_only_transcript_head,
+    llm_call_payload_sha256,
     llm_call_payload_requires_latest_guard,
     llm_call_payload_retention_tier,
+    redact_terminal_task_run_llm_tool_output,
     validate_external_effect_payload_retention_update,
     validate_llm_call_payload_retention_update,
+    validate_terminal_task_run_llm_redaction,
 )
 from agent_libos.models.exceptions import (
     ProcessRevisionConflict,
+    TaskRunCommandConflict,
+    TaskRunRevisionConflict,
     UnsupportedStoreVersion,
     ValidationError,
 )
@@ -78,6 +85,7 @@ from agent_libos.models import (
     ExternalEffectCursor,
     ExternalEffectPage,
     ExternalEffectRecoveryQuery,
+    ExternalEffectRecoverySettlement,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
     FileLabelBinding,
@@ -136,8 +144,30 @@ from agent_libos.models import (
     ProcessToolBindingRecord,
     ProcessStatus,
     ProcessWaitState,
+    StaleExecutionProcessWait,
     StaleExecutionRecoverySummary,
     ProcessExecutionToken,
+    TASK_RUN_DISPATCHABLE_STATUSES,
+    TASK_RUN_TERMINAL_STATUSES,
+    TaskRunCommand,
+    TaskRunCursor,
+    TaskRunLedgerCursor,
+    TaskRunLedgerItem,
+    TaskRunLedgerKind,
+    TaskRunLedgerPage,
+    TaskRunLink,
+    TaskRunPage,
+    TaskRunPayload,
+    TaskRunPayloadRetention,
+    TaskRunRecord,
+    TaskRunRequirement,
+    TaskRunRequirementKind,
+    TaskRunRequirementStatus,
+    TaskRunResumePoint,
+    TaskRunRetention,
+    TaskRunStatus,
+    canonical_task_run_json,
+    task_run_payload_sha256,
     PausedProcessWait,
     legacy_status_message,
     process_outcome_from_json,
@@ -192,7 +222,7 @@ from agent_libos.storage.gui_visibility import (
     is_gui_presentation_audit_fields,
     is_gui_presentation_event_fields,
 )
-from agent_libos.utils.serde import dumps, loads
+from agent_libos.utils.serde import bounded_json_loads, dumps, loads
 
 _RUNTIME_OBJECT_PRESENT_PAYLOAD_MARKERS = (
     '{"present": true, "storage": "runtime_memory"}',
@@ -670,6 +700,30 @@ def _process_message_status_filter(
     return f"status IN ({', '.join('?' for _ in selected)})", selected
 
 
+def _process_message_sender_filter(
+    sender: str | None,
+    sender_prefix: str | None,
+) -> tuple[str | None, tuple[Any, ...]]:
+    """Build the mutually exclusive exact/prefix sender predicate."""
+
+    if sender is not None and sender_prefix is not None:
+        raise ValidationError(
+            "process message sender and sender_prefix are mutually exclusive"
+        )
+    if sender is not None:
+        return "sender COLLATE BINARY = ? COLLATE BINARY", (sender,)
+    if sender_prefix is None:
+        return None, ()
+    if not isinstance(sender_prefix, str) or not sender_prefix:
+        raise ValidationError(
+            "process message sender_prefix must be a non-empty string"
+        )
+    return (
+        "substr(sender, 1, ?) COLLATE BINARY = ? COLLATE BINARY",
+        (len(sender_prefix), sender_prefix),
+    )
+
+
 _MISSING_OBJECT_PAYLOAD = object()
 _MISSING_PAYLOAD_BEFORE_IMAGE = object()
 _LLM_CONTEXT_LABEL_SCHEMA_VERSION = 1
@@ -743,19 +797,21 @@ def _dumps_strict_checkpoint_snapshot(snapshot: Any) -> str:
         ) from exc
 
 
-STORE_SCHEMA_VERSION = 3
+STORE_SCHEMA_VERSION = 4
 # Python cursor models compare strings by Unicode code point.  SQLite BINARY
 # and PostgreSQL "C" are the backend collations that preserve that ordering for
 # UTF-8 text.  Every durable text component used by a startup/recovery keyset
 # is canonical schema, rather than inheriting a deployment locale.
-_V3_KEYSET_TEXT_COLUMNS: dict[str, frozenset[str]] = {
+_V4_KEYSET_TEXT_COLUMNS: dict[str, frozenset[str]] = {
     "capability_use_reservations": frozenset({"created_at", "reservation_id"}),
     "checkpoint_payload_delivery_attempts": frozenset(
         {"attempt_id", "started_at"}
     ),
     "events": frozenset({"created_at", "event_id"}),
     "external_effects": frozenset({"created_at", "effect_id"}),
+    "human_requests": frozenset({"created_at", "request_id"}),
     "llm_calls": frozenset({"call_id", "created_at"}),
+    "llm_pending_actions": frozenset({"pid"}),
     "objects": frozenset({"created_at", "oid"}),
     "object_namespaces": frozenset({"namespace", "parent_namespace"}),
     "object_tasks": frozenset({"created_at", "task_id"}),
@@ -771,7 +827,9 @@ _V3_KEYSET_TEXT_COLUMNS: dict[str, frozenset[str]] = {
             "started_at",
         }
     ),
-    "processes": frozenset({"created_at", "parent_pid", "pid"}),
+    "processes": frozenset(
+        {"created_at", "parent_pid", "pid", "task_run_id"}
+    ),
     "process_terminal_cleanups": frozenset({"created_at", "pid"}),
     "process_tool_bindings": frozenset({"pid", "tool_name"}),
     "resource_usage_reservations": frozenset(
@@ -785,6 +843,23 @@ _V3_KEYSET_TEXT_COLUMNS: dict[str, frozenset[str]] = {
             "pid",
             "publication_id",
         }
+    ),
+    "task_runs": frozenset(
+        {"created_at", "deadline_at", "run_id", "updated_at"}
+    ),
+    "task_run_requirements": frozenset(
+        {"requirement_id", "run_id"}
+    ),
+    "task_run_payloads": frozenset({"payload_id", "run_id"}),
+    "task_run_resume_points": frozenset(
+        {"context_generation", "pid", "run_id"}
+    ),
+    "task_run_commands": frozenset(
+        {"client_request_id", "command_id", "created_at", "run_id"}
+    ),
+    "task_run_ledger": frozenset({"item_id", "run_id"}),
+    "task_run_links": frozenset(
+        {"evidence_id", "link_id", "run_id"}
     ),
 }
 _PROCESS_REVISION_COUNTER_PREFIX = "process_revision:"
@@ -862,7 +937,7 @@ def _checkpoint_object_task_query_scope(
     return selected_pids, selected_oids
 
 
-_V3_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
+_V4_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     "runtime_schema": frozenset("singleton schema_version".split()),
     "agent_ratings": frozenset(
         "rating_id pid score comment rater source metadata_json created_at updated_at".split()
@@ -1005,7 +1080,8 @@ _V3_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
         "checkpoint_head status_message wait_state_json outcome_json state_generation "
         "resource_budget_json resource_usage_json "
         "working_directory llm_profile_id revision execution_generation "
-        "execution_owner_id execution_lease_id created_at updated_at".split()
+        "execution_owner_id execution_lease_id task_run_id task_run_epoch "
+        "task_run_role created_at updated_at".split()
     ),
     "process_terminal_cleanups": frozenset(
         "pid terminal_status state completed_phases_json attempt_count owner_id "
@@ -1038,7 +1114,133 @@ _V3_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     "tools": frozenset(
         "tool_id name spec_json scope registered_by created_at ephemeral".split()
     ),
+    "task_runs": frozenset(
+        "run_id spec_schema_version display_title image_id launch_options_json "
+        "authority_manifest_id status revision runtime_epoch root_pid active_pid "
+        "pause_generation cancel_generation binding_hash deadline_at retention "
+        "blockers_json requirement_count satisfied_requirement_count step_count "
+        "completed_step_count result_ref created_at updated_at started_at completed_at "
+        "finalized_at payloads_purged_at".split()
+    ),
+    "task_run_requirements": frozenset(
+        "requirement_id run_id ordinal kind status payload_id requirement_sha256 "
+        "label created_by created_at updated_at started_at completed_at waived_by "
+        "waiver_reason".split()
+    ),
+    "task_run_payloads": frozenset(
+        "payload_id run_id role label canonical_json sha256 size_bytes retention_state "
+        "created_at updated_at purged_at".split()
+    ),
+    "task_run_resume_points": frozenset(
+        "pid run_id task_run_epoch process_revision context_generation safe_point_seq "
+        "binding_hash image_binding_hash tool_binding_hash provider_binding_hash "
+        "transcript_payload_id summary_payload_id pending_action_payload_id "
+        "last_effect_seq integrity_sha256 complete created_at updated_at".split()
+    ),
+    "task_run_commands": frozenset(
+        "command_id client_request_id run_id command_kind request_hash result_json "
+        "result_revision created_at".split()
+    ),
+    "task_run_ledger": frozenset(
+        "seq item_id run_id kind status label requirement_id pid operation_id effect_id "
+        "human_request_id llm_call_id checkpoint_id object_task_id payload_id "
+        "metadata_json occurred_at".split()
+    ),
+    "task_run_links": frozenset(
+        "link_id run_id ledger_seq evidence_type evidence_id role metadata_json "
+        "created_at".split()
+    ),
 }
+
+# Canonical declared indexes introduced or changed by schema v4.  Column order,
+# uniqueness, direction and partial/full shape are part of the on-disk
+# contract; an existing v4 store is rejected before CREATE IF NOT EXISTS can
+# repair any of them.
+_V4_REQUIRED_INDEXES: dict[
+    str,
+    tuple[str, tuple[str, ...], bool, bool],
+] = {
+    "idx_task_runs_status_created": (
+        "task_runs", ("status", "created_at", "run_id"), False, False
+    ),
+    "idx_task_runs_recovery": (
+        "task_runs", ("created_at", "run_id"), False, True
+    ),
+    "idx_task_runs_root_pid": (
+        "task_runs", ("root_pid",), True, True
+    ),
+    "idx_task_run_requirements_run_ordinal": (
+        "task_run_requirements",
+        ("run_id", "ordinal", "requirement_id"),
+        False,
+        False,
+    ),
+    "idx_task_run_requirements_pending": (
+        "task_run_requirements", ("run_id", "status", "ordinal"), False, True
+    ),
+    "idx_task_run_payloads_run_role": (
+        "task_run_payloads", ("run_id", "role", "payload_id"), False, False
+    ),
+    "idx_task_run_payloads_retention": (
+        "task_run_payloads",
+        ("run_id", "retention_state", "payload_id"),
+        False,
+        False,
+    ),
+    "idx_task_run_resume_points_recovery": (
+        "task_run_resume_points", ("run_id", "complete", "pid"), False, False
+    ),
+    "idx_task_run_commands_run_created": (
+        "task_run_commands", ("run_id", "created_at", "command_id"), False, False
+    ),
+    "idx_task_run_commands_client_request": (
+        "task_run_commands", ("client_request_id",), True, True
+    ),
+    "idx_task_run_ledger_run_seq": (
+        "task_run_ledger", ("run_id", "seq", "item_id"), False, False
+    ),
+    "idx_task_run_links_run_seq": (
+        "task_run_links", ("run_id", "ledger_seq", "link_id"), False, False
+    ),
+    "idx_task_run_links_evidence": (
+        "task_run_links", ("evidence_type", "evidence_id", "run_id"), False, False
+    ),
+    "idx_processes_task_run": (
+        "processes", ("task_run_id", "created_at", "pid"), False, True
+    ),
+}
+
+_V4_REQUIRED_UNIQUE_CONSTRAINTS: dict[str, frozenset[tuple[str, ...]]] = {
+    "task_runs": frozenset({("run_id",), ("root_pid",)}),
+    "task_run_requirements": frozenset(
+        {("requirement_id",), ("run_id", "ordinal")}
+    ),
+    "task_run_payloads": frozenset({("payload_id",)}),
+    "task_run_resume_points": frozenset({("pid",)}),
+    "task_run_commands": frozenset({("command_id",), ("client_request_id",)}),
+    "task_run_ledger": frozenset({("seq",), ("item_id",)}),
+    "task_run_links": frozenset(
+        {("link_id",), ("run_id", "evidence_type", "evidence_id", "role")}
+    ),
+}
+
+_V4_REQUIRED_INDEX_PREDICATES: dict[str, str] = {
+    "idx_task_runs_recovery": "status:not_in:cancelled,failed,succeeded",
+    "idx_task_runs_root_pid": "root_pid:is_not_null",
+    "idx_task_run_requirements_pending": "status:in:blocked,in_progress,pending",
+    "idx_task_run_commands_client_request": "client_request_id:is_not_null",
+    "idx_processes_task_run": "task_run_id:is_not_null",
+}
+
+_V4_REQUIRED_COUNTERS = frozenset(
+    {
+        "external_effect_ledger",
+        "jsonrpc_registry_generation",
+        "mcp_registry_generation",
+        "task_run_ledger",
+        "task_run_runtime_epoch",
+    }
+)
 
 
 class _StoreRLock:
@@ -1098,6 +1300,7 @@ class SQLRuntimeStore:
 
     SYSTEM_NAMESPACE = "system"
     KEYSET_TEXT_COLLATION: str | None = None
+    REQUIRE_V4_INDEX_OPERABILITY = False
     ALLOWED_TABLES = frozenset(
         {
             "objects",
@@ -1143,6 +1346,13 @@ class SQLRuntimeStore:
             "tool_candidates",
             "runtime_modules",
             "runtime_counters",
+            "task_runs",
+            "task_run_requirements",
+            "task_run_payloads",
+            "task_run_resume_points",
+            "task_run_commands",
+            "task_run_ledger",
+            "task_run_links",
         }
     )
 
@@ -1193,10 +1403,12 @@ class SQLRuntimeStore:
         with self.transaction(include_object_payloads=True):
             self.initialize()
             if fresh_store:
-                # Existing v3 stores were checked by the version gate.  Only a
-                # fresh store needs its canonical DDL checked after creation.
-                self._require_v3_keyset_text_collations(conn)
                 self._write_store_schema_version()
+                # Validate the exact fresh contract inside the bootstrap
+                # transaction. A failed DDL surface rolls back to an empty
+                # database; existing v4 stores were already checked before
+                # initializer entry and cannot be repaired opportunistically.
+                self._require_v4_schema_shape(conn)
 
     def _issue_checkpoint_restore_writer_token(self) -> object:
         """Issue the internal checkpoint publication mutation capability."""
@@ -1204,7 +1416,7 @@ class SQLRuntimeStore:
         return self.__checkpoint_restore_writer_token
 
     def _require_supported_store_version(self) -> bool:
-        """Reject stores older than schema v3 before initialization can mutate them."""
+        """Reject every non-v4 store before initialization can mutate it."""
 
         return self._require_supported_store_version_for(self.conn)
 
@@ -1214,38 +1426,52 @@ class SQLRuntimeStore:
         if marker_exists:
             version = marker_row.get("schema_version") if marker_row is not None else None
             if version != STORE_SCHEMA_VERSION:
+                if version == 3:
+                    raise UnsupportedStoreVersion(
+                        "Agent libOS store schema v3 is not writable or readable by "
+                        "1.1.0; expected 4. Use Agent libOS 1.0.1 to view or "
+                        "archive this store. No migration was attempted."
+                    )
                 raise UnsupportedStoreVersion(
                     f"unsupported Agent libOS store schema: {version!r}; "
-                    f"expected {STORE_SCHEMA_VERSION}"
+                    f"expected {STORE_SCHEMA_VERSION}. Agent libOS 1.0.1 "
+                    "expected 3; use that version only to view or archive v3 stores"
                 )
-            cls._require_v3_schema_shape(conn)
+            cls._require_v4_schema_shape(conn)
             return False
         if cls._probe_user_schema_objects(conn):
             raise UnsupportedStoreVersion(
-                "unversioned Agent libOS store detected; pre-v3 stores are archive-only "
-                "and cannot be opened by the current runtime"
+                "unversioned Agent libOS store detected; pre-v4 stores are "
+                "archive-only and cannot be opened by 1.1.0; use Agent libOS "
+                "1.0.1 to view or archive a v3 store"
             )
         return True
 
     @classmethod
-    def _require_v3_schema_shape(cls, conn: SqlEngine) -> None:
-        missing: dict[str, list[str]] = {}
-        for table, required in _V3_REQUIRED_COLUMNS.items():
+    def _require_v4_schema_shape(cls, conn: SqlEngine) -> None:
+        mismatched: dict[str, dict[str, list[str]]] = {}
+        for table, required in _V4_REQUIRED_COLUMNS.items():
             columns = cls._probe_columns(conn, table)
-            absent = sorted(required - columns)
-            if absent:
-                missing[table] = absent
-        if cls._probe_table(conn, "storage_migrations"):
-            missing["storage_migrations"] = ["obsolete table must be absent"]
-        if missing:
+            missing = sorted(required - columns)
+            extra = sorted(columns - required)
+            if missing or extra:
+                mismatched[table] = {"missing": missing, "extra": extra}
+        extra_tables = sorted(
+            cls._probe_user_tables(conn) - set(_V4_REQUIRED_COLUMNS)
+        )
+        if extra_tables:
+            mismatched["<tables>"] = {"missing": [], "extra": extra_tables}
+        if mismatched:
             raise UnsupportedStoreVersion(
-                "unsupported or incomplete Agent libOS store schema v3: "
-                f"{missing}"
+                "unsupported or incomplete Agent libOS store schema v4: "
+                f"{mismatched}"
             )
-        cls._require_v3_keyset_text_collations(conn)
+        cls._require_v4_keyset_text_collations(conn)
+        cls._require_v4_index_manifest(conn)
+        cls._require_v4_counter_seed(conn)
 
     @classmethod
-    def _require_v3_keyset_text_collations(cls, conn: SqlEngine) -> None:
+    def _require_v4_keyset_text_collations(cls, conn: SqlEngine) -> None:
         expected = cls.KEYSET_TEXT_COLLATION
         if expected is None:
             raise NotImplementedError(
@@ -1253,7 +1479,7 @@ class SQLRuntimeStore:
             )
         incompatible: dict[str, list[str]] = {}
         collations = cls._probe_text_column_collations(conn)
-        for table, columns in _V3_KEYSET_TEXT_COLUMNS.items():
+        for table, columns in _V4_KEYSET_TEXT_COLUMNS.items():
             for column in sorted(columns):
                 actual = collations.get((table, column))
                 if actual != expected:
@@ -1262,7 +1488,7 @@ class SQLRuntimeStore:
                     )
         if incompatible:
             raise UnsupportedStoreVersion(
-                "unsupported Agent libOS store schema v3 keyset collation: "
+                "unsupported Agent libOS store schema v4 keyset collation: "
                 f"{incompatible}"
             )
 
@@ -1274,6 +1500,282 @@ class SQLRuntimeStore:
         raise NotImplementedError(
             f"{cls.__name__} must inspect durable text column collations in bulk"
         )
+
+    @classmethod
+    def _require_v4_index_manifest(cls, conn: SqlEngine) -> None:
+        shapes = cls._probe_index_shapes(
+            conn,
+            set(_V4_REQUIRED_UNIQUE_CONSTRAINTS)
+            | {spec[0] for spec in _V4_REQUIRED_INDEXES.values()},
+        )
+        problems: dict[str, Any] = {}
+        for name, expected in _V4_REQUIRED_INDEXES.items():
+            problem = cls._v4_index_shape_problem(name, expected, shapes.get(name))
+            if problem is not None:
+                problems[name] = problem
+
+        extra = sorted(cls._declared_task_run_indexes(shapes) - set(_V4_REQUIRED_INDEXES))
+        if extra:
+            problems["<extra indexes>"] = extra
+
+        for table, required in _V4_REQUIRED_UNIQUE_CONSTRAINTS.items():
+            problem = cls._v4_unique_shape_problem(table, required, shapes)
+            if problem is not None:
+                problems[f"{table}.unique"] = problem
+        if problems:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v4 index "
+                f"manifest: {problems}"
+            )
+
+    @classmethod
+    def _v4_index_shape_problem(
+        cls,
+        name: str,
+        expected: tuple[str, tuple[str, ...], bool, bool],
+        shape: Mapping[str, Any] | None,
+    ) -> Any | None:
+        if shape is None:
+            return "missing"
+        table, columns, unique, partial = expected
+        expected_shape = {
+            "table": table,
+            "columns": columns,
+            "unique": unique,
+            "partial": partial,
+            "descending": tuple(False for _ in columns),
+        }
+        actual_shape = {
+            key: shape.get(key)
+            for key in ("table", "columns", "unique", "partial", "descending")
+        }
+        if actual_shape != expected_shape:
+            return {"expected": expected_shape, "actual": actual_shape}
+        operability_problem = cls._v4_index_operability_problem(shape)
+        if operability_problem is not None:
+            return operability_problem
+        expected_predicate = _V4_REQUIRED_INDEX_PREDICATES.get(name)
+        actual_predicate = shape.get("predicate")
+        if actual_predicate != expected_predicate:
+            return {
+                "expected_predicate": expected_predicate,
+                "actual_predicate": actual_predicate,
+            }
+        bad_collations = cls._v4_index_collation_problems(table, columns, shape)
+        return {"collations": bad_collations} if bad_collations else None
+
+    @classmethod
+    def _v4_index_operability_problem(
+        cls,
+        shape: Mapping[str, Any],
+    ) -> dict[str, dict[str, bool | None]] | None:
+        if not cls.REQUIRE_V4_INDEX_OPERABILITY:
+            return None
+        expected: dict[str, bool | None] = {
+            "valid": True,
+            "ready": True,
+            "live": True,
+        }
+        actual: dict[str, bool | None] = {
+            key: value if type(value := shape.get(key)) is bool else None
+            for key in expected
+        }
+        if actual == expected:
+            return None
+        return {
+            "expected_operability": expected,
+            "actual_operability": actual,
+        }
+
+    @classmethod
+    def _v4_index_collation_problems(
+        cls,
+        table: str,
+        columns: tuple[str, ...],
+        shape: Mapping[str, Any],
+    ) -> list[str]:
+        collations = tuple(shape.get("collations", ()))
+        if len(collations) != len(columns):
+            return [f"arity={len(collations)} expected {len(columns)}"]
+        keyset_columns = _V4_KEYSET_TEXT_COLUMNS.get(table, frozenset())
+        return [
+            f"{column}={actual or 'missing'} expected {cls.KEYSET_TEXT_COLLATION}"
+            for column, actual in zip(columns, collations)
+            if column in keyset_columns and actual != cls.KEYSET_TEXT_COLLATION
+        ]
+
+    @staticmethod
+    def _declared_task_run_indexes(
+        shapes: Mapping[str, Mapping[str, Any]],
+    ) -> set[str]:
+        task_run_tables = frozenset(_V4_REQUIRED_UNIQUE_CONSTRAINTS)
+        return {
+            name
+            for name, shape in shapes.items()
+            if shape.get("origin") == "declared"
+            and (
+                shape.get("table") in task_run_tables
+                or (
+                    shape.get("table") == "processes"
+                    and "task_run_id" in tuple(shape.get("columns", ()))
+                )
+            )
+        }
+
+    @classmethod
+    def _v4_unique_shape_problem(
+        cls,
+        table: str,
+        required: frozenset[tuple[str, ...]],
+        shapes: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any] | None:
+        actual = {
+            tuple(shape.get("columns", ()))
+            for shape in shapes.values()
+            if shape.get("table") == table and shape.get("unique") is True
+        }
+        missing = sorted(required - actual)
+        extra = sorted(actual - required)
+        unusable = sorted(
+            name
+            for name, shape in shapes.items()
+            if shape.get("table") == table
+            and shape.get("unique") is True
+            and cls._v4_index_operability_problem(shape) is not None
+        )
+        return (
+            {"missing": missing, "extra": extra, "unusable": unusable}
+            if missing or extra or unusable
+            else None
+        )
+
+    @classmethod
+    def _probe_index_shapes(
+        cls,
+        conn: SqlEngine,
+        tables: set[str],
+    ) -> Mapping[str, Mapping[str, Any]]:
+        raise NotImplementedError(
+            f"{cls.__name__} must inspect the v4 index manifest"
+        )
+
+    @classmethod
+    def _require_v4_counter_seed(cls, conn: SqlEngine) -> None:
+        placeholders = ", ".join("?" for _ in _V4_REQUIRED_COUNTERS)
+        rows = conn.execute(
+            "SELECT counter_name, value FROM runtime_counters "
+            f"WHERE counter_name IN ({placeholders})",
+            sorted(_V4_REQUIRED_COUNTERS),
+        )
+        found: dict[str, int] = {}
+        invalid: dict[str, object] = {}
+        for row in rows:
+            name = str(row["counter_name"])
+            value = row["value"]
+            if type(value) is not int or value < 0:
+                invalid[name] = value
+            else:
+                found[name] = value
+        missing = sorted(_V4_REQUIRED_COUNTERS - set(found) - set(invalid))
+        if missing or invalid:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v4 counter "
+                f"seed: missing={missing}, invalid={invalid}"
+            )
+
+    @staticmethod
+    def _canonical_index_predicate(predicate: object) -> str | None:
+        """Parse exactly the five closed v4 partial-index predicate grammars."""
+
+        if predicate is None:
+            return None
+        text = str(predicate).strip().lower()
+        if not text:
+            return None
+        text = text.replace('"', "")
+        # pg_get_expr adds type casts to literal values; no other cast is part
+        # of the v4 grammar.  Strip only a complete scalar/array type name.
+        text = re.sub(
+            r"::\s*(?:[a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*"
+            r"(?:\s*\[\s*\])?",
+            "",
+            text,
+        )
+        text = re.sub(r"\s+", " ", text).strip()
+
+        def strip_outer_parentheses(value: str) -> str:
+            while value.startswith("(") and value.endswith(")"):
+                depth = 0
+                encloses_all = True
+                in_literal = False
+                for index, char in enumerate(value):
+                    if char == "'":
+                        in_literal = not in_literal
+                    elif not in_literal:
+                        if char == "(":
+                            depth += 1
+                        elif char == ")":
+                            depth -= 1
+                            if depth == 0 and index != len(value) - 1:
+                                encloses_all = False
+                                break
+                    if depth < 0:
+                        encloses_all = False
+                        break
+                if not encloses_all or depth != 0 or in_literal:
+                    break
+                value = value[1:-1].strip()
+            return value
+
+        text = strip_outer_parentheses(text)
+        identifier = r"[a-z_][a-z0-9_]*"
+        literal_list = r"'[^']+'(?:\s*,\s*'[^']+')*"
+        null_match = re.fullmatch(
+            rf"(?P<column>{identifier})\s+is\s+not\s+null",
+            text,
+        )
+        if null_match is not None:
+            return f"{null_match.group('column')}:is_not_null"
+
+        sqlite_match = re.fullmatch(
+            rf"(?P<column>{identifier})\s+"
+            rf"(?P<operator>not\s+in|in)\s*"
+            rf"\((?P<values>{literal_list})\)",
+            text,
+        )
+        if sqlite_match is not None:
+            operator = (
+                "not_in"
+                if re.fullmatch(r"not\s+in", sqlite_match.group("operator"))
+                else "in"
+            )
+            values = tuple(
+                sorted(set(re.findall(r"'([^']+)'", sqlite_match.group("values"))))
+            )
+            return f"{sqlite_match.group('column')}:{operator}:{','.join(values)}"
+
+        postgres_match = re.fullmatch(
+            rf"(?P<column>{identifier})\s*(?P<comparator><>|=)\s*"
+            rf"(?P<quantifier>all|any)\s*\(\s*array\s*\["
+            rf"(?P<values>{literal_list})\]\s*\)",
+            text,
+        )
+        if postgres_match is not None:
+            pair = (
+                postgres_match.group("comparator"),
+                postgres_match.group("quantifier"),
+            )
+            if pair == ("<>", "all"):
+                operator = "not_in"
+            elif pair == ("=", "any"):
+                operator = "in"
+            else:
+                return f"<invalid>:{text}"
+            values = tuple(
+                sorted(set(re.findall(r"'([^']+)'", postgres_match.group("values"))))
+            )
+            return f"{postgres_match.group('column')}:{operator}:{','.join(values)}"
+        return f"<invalid>:{text}"
 
     @classmethod
     def _probe_columns(cls, conn: SqlEngine, table: str) -> set[str]:
@@ -1290,6 +1792,12 @@ class SQLRuntimeStore:
 
         raise NotImplementedError(
             f"{cls.__name__} must enumerate user schema objects before initialization"
+        )
+
+    @classmethod
+    def _probe_user_tables(cls, conn: SqlEngine) -> set[str]:
+        raise NotImplementedError(
+            f"{cls.__name__} must enumerate user tables for the v4 manifest"
         )
 
     @classmethod
@@ -2231,8 +2739,16 @@ class SQLRuntimeStore:
                   execution_generation BIGINT NOT NULL DEFAULT 0,
                   execution_owner_id TEXT,
                   execution_lease_id TEXT,
+                  task_run_id TEXT COLLATE BINARY,
+                  task_run_epoch BIGINT,
+                  task_run_role TEXT,
                   created_at TEXT COLLATE BINARY NOT NULL,
-                  updated_at TEXT NOT NULL
+                  updated_at TEXT NOT NULL,
+                  CHECK (
+                    (task_run_id IS NULL AND task_run_epoch IS NULL AND task_run_role IS NULL)
+                    OR (task_run_id IS NOT NULL AND task_run_epoch IS NOT NULL
+                        AND task_run_epoch > 0 AND task_run_role IS NOT NULL)
+                  )
                 );
                 CREATE TABLE IF NOT EXISTS authority_manifests (
                   manifest_id TEXT PRIMARY KEY,
@@ -2416,106 +2932,6 @@ class SQLRuntimeStore:
                   effect_ledger_seq BIGINT NOT NULL DEFAULT 0
                 );
 
-                CREATE TABLE IF NOT EXISTS human_requests (
-                  request_id TEXT PRIMARY KEY,
-                  pid TEXT NOT NULL,
-                  human TEXT NOT NULL,
-                  payload_json TEXT NOT NULL,
-                  status TEXT NOT NULL,
-                  decision_json TEXT,
-                  blocking INTEGER NOT NULL,
-                  created_at TEXT NOT NULL,
-                  updated_at TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_human_requests_pid_created
-                  ON human_requests(pid, created_at, request_id);
-
-                CREATE INDEX IF NOT EXISTS idx_human_requests_human_status_created
-                  ON human_requests(human, status, created_at, request_id);
-
-                CREATE INDEX IF NOT EXISTS idx_human_requests_status_created
-                  ON human_requests(status, created_at, request_id);
-                CREATE TABLE IF NOT EXISTS llm_calls (
-                  call_id TEXT COLLATE BINARY PRIMARY KEY,
-                  pid TEXT,
-                  image_id TEXT,
-                  purpose TEXT NOT NULL,
-                  status TEXT NOT NULL,
-                  api TEXT,
-                  model TEXT,
-                  request_id TEXT,
-                  response_id TEXT,
-                  messages_json TEXT NOT NULL,
-                  tools_json TEXT NOT NULL,
-                  request_options_json TEXT NOT NULL,
-                  response_content TEXT NOT NULL,
-                  tool_calls_json TEXT NOT NULL,
-                  reasoning_json TEXT,
-                  usage_json TEXT NOT NULL,
-                  raw_response_json TEXT,
-                  observability_json TEXT NOT NULL DEFAULT '{}',
-                  error TEXT,
-                  created_at TEXT COLLATE BINARY NOT NULL,
-                  completed_at TEXT,
-                  payload_retention_tier TEXT NOT NULL DEFAULT 'full' CHECK (
-                    payload_retention_tier IN ('full', 'summary', 'hash_only')
-                  )
-                );
-                CREATE INDEX IF NOT EXISTS idx_llm_calls_pid_created
-                  ON llm_calls(pid, created_at);
-                CREATE INDEX IF NOT EXISTS idx_llm_calls_request_id
-                  ON llm_calls(request_id);
-                CREATE INDEX IF NOT EXISTS idx_llm_calls_response_id
-                  ON llm_calls(response_id);
-                CREATE INDEX IF NOT EXISTS idx_llm_calls_retention_eligible
-                  ON llm_calls(created_at COLLATE BINARY, call_id COLLATE BINARY,
-                               status, completed_at, payload_retention_tier)
-                  WHERE status IN ('ok', 'error') AND completed_at IS NOT NULL
-                    AND payload_retention_tier IN ('full', 'summary');
-                CREATE TABLE IF NOT EXISTS llm_pending_actions (
-                  pid TEXT PRIMARY KEY,
-                  resume_token TEXT,
-                  llm_operation_id TEXT,
-                  tool_operation_id TEXT,
-                  wait_type TEXT NOT NULL,
-                  request_id TEXT,
-                  child_pid TEXT,
-                  response_id TEXT,
-                  tool_call_id TEXT,
-                  tool_name TEXT,
-                  filters_json TEXT NOT NULL,
-                  action_json TEXT NOT NULL,
-                  data_flow_context_json TEXT NOT NULL,
-                  content_preview TEXT NOT NULL,
-                  tool_call_count INTEGER NOT NULL,
-                  status TEXT NOT NULL,
-                  created_at TEXT NOT NULL,
-                  updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS llm_tool_outputs (
-                  pid TEXT NOT NULL,
-                  response_id TEXT NOT NULL,
-                  call_id TEXT NOT NULL,
-                  tool_name TEXT,
-                  output_text TEXT NOT NULL,
-                  created_at TEXT NOT NULL,
-                  updated_at TEXT NOT NULL,
-                  PRIMARY KEY(pid, response_id, call_id)
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_llm_tool_outputs_response
-                  ON llm_tool_outputs(pid, response_id);
-
-                CREATE TABLE IF NOT EXISTS llm_context_generations (
-                  pid TEXT PRIMARY KEY,
-                  generation TEXT NOT NULL,
-                  labels_schema_version INTEGER NOT NULL DEFAULT 1,
-                  labels_json TEXT NOT NULL,
-                  updated_at TEXT NOT NULL
-                );
-
                 CREATE TABLE IF NOT EXISTS process_messages (
                   message_id TEXT PRIMARY KEY,
                   sender TEXT NOT NULL,
@@ -2647,14 +3063,120 @@ class SQLRuntimeStore:
 
                 """
             )
+            self._create_human_llm_schema()
             self._create_process_terminal_cleanup_schema()
             self._create_process_tool_binding_schema()
             self._create_object_task_schema()
+            self._create_task_run_schema()
             self._create_runtime_publication_schema()
             self._create_external_effect_indexes()
             self._create_runtime_publication_indexes()
             self._create_runtime_module_schema()
             self._finish_schema_initialization()
+
+    def _create_human_llm_schema(self) -> None:
+        self._execute_script(
+            """
+            CREATE TABLE IF NOT EXISTS human_requests (
+              request_id TEXT COLLATE BINARY PRIMARY KEY,
+              pid TEXT NOT NULL,
+              human TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              status TEXT NOT NULL,
+              decision_json TEXT,
+              blocking INTEGER NOT NULL,
+              created_at TEXT COLLATE BINARY NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_human_requests_pid_created
+              ON human_requests(pid, created_at, request_id);
+            CREATE INDEX IF NOT EXISTS idx_human_requests_human_status_created
+              ON human_requests(human, status, created_at, request_id);
+            CREATE INDEX IF NOT EXISTS idx_human_requests_status_created
+              ON human_requests(status, created_at, request_id);
+
+            CREATE TABLE IF NOT EXISTS llm_calls (
+              call_id TEXT COLLATE BINARY PRIMARY KEY,
+              pid TEXT,
+              image_id TEXT,
+              purpose TEXT NOT NULL,
+              status TEXT NOT NULL,
+              api TEXT,
+              model TEXT,
+              request_id TEXT,
+              response_id TEXT,
+              messages_json TEXT NOT NULL,
+              tools_json TEXT NOT NULL,
+              request_options_json TEXT NOT NULL,
+              response_content TEXT NOT NULL,
+              tool_calls_json TEXT NOT NULL,
+              reasoning_json TEXT,
+              usage_json TEXT NOT NULL,
+              raw_response_json TEXT,
+              observability_json TEXT NOT NULL DEFAULT '{}',
+              error TEXT,
+              created_at TEXT COLLATE BINARY NOT NULL,
+              completed_at TEXT,
+              payload_retention_tier TEXT NOT NULL DEFAULT 'full' CHECK (
+                payload_retention_tier IN ('full', 'summary', 'hash_only')
+              )
+            );
+            CREATE INDEX IF NOT EXISTS idx_llm_calls_pid_created
+              ON llm_calls(pid, created_at);
+            CREATE INDEX IF NOT EXISTS idx_llm_calls_request_id
+              ON llm_calls(request_id);
+            CREATE INDEX IF NOT EXISTS idx_llm_calls_response_id
+              ON llm_calls(response_id);
+            CREATE INDEX IF NOT EXISTS idx_llm_calls_retention_eligible
+              ON llm_calls(created_at COLLATE BINARY, call_id COLLATE BINARY,
+                           status, completed_at, payload_retention_tier)
+              WHERE status IN ('ok', 'error') AND completed_at IS NOT NULL
+                AND payload_retention_tier IN ('full', 'summary');
+
+            CREATE TABLE IF NOT EXISTS llm_pending_actions (
+              pid TEXT COLLATE BINARY PRIMARY KEY,
+              resume_token TEXT,
+              llm_operation_id TEXT,
+              tool_operation_id TEXT,
+              wait_type TEXT NOT NULL,
+              request_id TEXT,
+              child_pid TEXT,
+              response_id TEXT,
+              tool_call_id TEXT,
+              tool_name TEXT,
+              filters_json TEXT NOT NULL,
+              action_json TEXT NOT NULL,
+              data_flow_context_json TEXT NOT NULL,
+              content_preview TEXT NOT NULL,
+              tool_call_count INTEGER NOT NULL,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS llm_tool_outputs (
+              pid TEXT NOT NULL,
+              response_id TEXT NOT NULL,
+              call_id TEXT NOT NULL,
+              tool_name TEXT,
+              output_text TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(pid, response_id, call_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_llm_tool_outputs_response
+              ON llm_tool_outputs(pid, response_id);
+
+            CREATE TABLE IF NOT EXISTS llm_context_generations (
+              pid TEXT PRIMARY KEY,
+              generation TEXT NOT NULL,
+              labels_schema_version INTEGER NOT NULL DEFAULT 1,
+              labels_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            """
+        )
 
     def _create_process_terminal_cleanup_schema(self) -> None:
         self._execute_script(
@@ -2746,8 +3268,234 @@ class SQLRuntimeStore:
             """
         )
 
+    def _create_task_run_schema(self) -> None:
+        self._execute_script(
+            """
+            CREATE TABLE IF NOT EXISTS task_runs (
+              run_id TEXT COLLATE BINARY PRIMARY KEY,
+              spec_schema_version INTEGER NOT NULL CHECK (spec_schema_version = 1),
+              display_title TEXT NOT NULL,
+              image_id TEXT NOT NULL,
+              launch_options_json TEXT NOT NULL,
+              authority_manifest_id TEXT,
+              status TEXT NOT NULL CHECK (status IN (
+                'queued', 'running', 'waiting_human', 'waiting_process',
+                'waiting_message', 'waiting_tool', 'paused', 'cancelling',
+                'finalizing', 'needs_attention', 'succeeded', 'failed', 'cancelled'
+              )),
+              revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0),
+              runtime_epoch BIGINT NOT NULL DEFAULT 0 CHECK (runtime_epoch >= 0),
+              root_pid TEXT,
+              active_pid TEXT,
+              pause_generation BIGINT NOT NULL DEFAULT 0 CHECK (pause_generation >= 0),
+              cancel_generation BIGINT NOT NULL DEFAULT 0 CHECK (cancel_generation >= 0),
+              binding_hash TEXT,
+              deadline_at TEXT COLLATE BINARY,
+              retention TEXT NOT NULL CHECK (
+                retention IN ('purge_on_terminal', 'permanent')
+              ),
+              blockers_json TEXT NOT NULL DEFAULT '[]',
+              requirement_count BIGINT NOT NULL DEFAULT 0 CHECK (requirement_count >= 0),
+              satisfied_requirement_count BIGINT NOT NULL DEFAULT 0 CHECK (
+                satisfied_requirement_count >= 0
+                AND satisfied_requirement_count <= requirement_count
+              ),
+              step_count BIGINT NOT NULL DEFAULT 0 CHECK (step_count >= 0),
+              completed_step_count BIGINT NOT NULL DEFAULT 0 CHECK (
+                completed_step_count >= 0 AND completed_step_count <= step_count
+              ),
+              result_ref TEXT,
+              created_at TEXT COLLATE BINARY NOT NULL,
+              updated_at TEXT COLLATE BINARY NOT NULL,
+              started_at TEXT,
+              completed_at TEXT,
+              finalized_at TEXT,
+              payloads_purged_at TEXT,
+              CHECK (root_pid IS NOT NULL OR status = 'queued'),
+              CHECK (
+                (status IN ('succeeded', 'failed', 'cancelled')) =
+                (completed_at IS NOT NULL)
+              ),
+              CHECK (
+                payloads_purged_at IS NULL
+                OR status IN ('succeeded', 'failed', 'cancelled')
+              ),
+              CHECK (
+                status NOT IN ('succeeded', 'failed', 'cancelled')
+                OR retention = 'permanent'
+                OR payloads_purged_at IS NOT NULL
+              )
+            );
+
+            CREATE TABLE IF NOT EXISTS task_run_payloads (
+              payload_id TEXT COLLATE BINARY PRIMARY KEY,
+              run_id TEXT COLLATE BINARY NOT NULL,
+              role TEXT NOT NULL,
+              label TEXT NOT NULL,
+              canonical_json TEXT,
+              sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+              size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
+              retention_state TEXT NOT NULL CHECK (
+                retention_state IN ('plaintext', 'hash_only')
+              ),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              purged_at TEXT,
+              CHECK (
+                (retention_state = 'plaintext' AND canonical_json IS NOT NULL
+                  AND purged_at IS NULL)
+                OR (retention_state = 'hash_only' AND canonical_json IS NULL
+                  AND purged_at IS NOT NULL)
+              ),
+              FOREIGN KEY(run_id) REFERENCES task_runs(run_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS task_run_requirements (
+              requirement_id TEXT COLLATE BINARY PRIMARY KEY,
+              run_id TEXT COLLATE BINARY NOT NULL,
+              ordinal BIGINT NOT NULL CHECK (ordinal >= 0),
+              kind TEXT NOT NULL CHECK (kind IN ('initial', 'follow_up')),
+              status TEXT NOT NULL CHECK (
+                status IN ('pending', 'in_progress', 'satisfied', 'blocked', 'waived')
+              ),
+              payload_id TEXT NOT NULL,
+              requirement_sha256 TEXT NOT NULL CHECK (length(requirement_sha256) = 64),
+              label TEXT NOT NULL,
+              created_by TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              started_at TEXT,
+              completed_at TEXT,
+              waived_by TEXT,
+              waiver_reason TEXT,
+              UNIQUE(run_id, ordinal),
+              CHECK ((waived_by IS NULL) = (waiver_reason IS NULL)),
+              CHECK (
+                (status = 'waived' AND waived_by IS NOT NULL)
+                OR (status != 'waived' AND waived_by IS NULL)
+              ),
+              FOREIGN KEY(run_id) REFERENCES task_runs(run_id),
+              FOREIGN KEY(payload_id) REFERENCES task_run_payloads(payload_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS task_run_resume_points (
+              pid TEXT COLLATE BINARY PRIMARY KEY,
+              run_id TEXT COLLATE BINARY NOT NULL,
+              task_run_epoch BIGINT NOT NULL CHECK (task_run_epoch > 0),
+              process_revision BIGINT NOT NULL CHECK (process_revision >= 0),
+              context_generation TEXT COLLATE BINARY NOT NULL,
+              safe_point_seq BIGINT NOT NULL CHECK (safe_point_seq >= 0),
+              binding_hash TEXT NOT NULL,
+              image_binding_hash TEXT NOT NULL,
+              tool_binding_hash TEXT NOT NULL,
+              provider_binding_hash TEXT NOT NULL,
+              transcript_payload_id TEXT NOT NULL,
+              summary_payload_id TEXT,
+              pending_action_payload_id TEXT,
+              last_effect_seq BIGINT NOT NULL DEFAULT 0 CHECK (last_effect_seq >= 0),
+              integrity_sha256 TEXT NOT NULL CHECK (length(integrity_sha256) = 64),
+              complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(run_id) REFERENCES task_runs(run_id),
+              FOREIGN KEY(transcript_payload_id) REFERENCES task_run_payloads(payload_id),
+              FOREIGN KEY(summary_payload_id) REFERENCES task_run_payloads(payload_id),
+              FOREIGN KEY(pending_action_payload_id) REFERENCES task_run_payloads(payload_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS task_run_commands (
+              command_id TEXT COLLATE BINARY PRIMARY KEY,
+              client_request_id TEXT COLLATE BINARY,
+              run_id TEXT COLLATE BINARY NOT NULL,
+              command_kind TEXT NOT NULL,
+              request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+              result_json TEXT NOT NULL,
+              result_revision BIGINT NOT NULL CHECK (result_revision >= 0),
+              created_at TEXT COLLATE BINARY NOT NULL,
+              FOREIGN KEY(run_id) REFERENCES task_runs(run_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS task_run_ledger (
+              seq BIGINT PRIMARY KEY,
+              item_id TEXT COLLATE BINARY NOT NULL UNIQUE,
+              run_id TEXT COLLATE BINARY NOT NULL,
+              kind TEXT NOT NULL CHECK (kind IN (
+                'requirement', 'process', 'llm_turn', 'tool_call', 'human_wait',
+                'message_wait', 'checkpoint', 'effect', 'status_transition'
+              )),
+              status TEXT NOT NULL,
+              label TEXT NOT NULL,
+              requirement_id TEXT,
+              pid TEXT,
+              operation_id TEXT,
+              effect_id TEXT,
+              human_request_id TEXT,
+              llm_call_id TEXT,
+              checkpoint_id TEXT,
+              object_task_id TEXT,
+              payload_id TEXT,
+              metadata_json TEXT NOT NULL,
+              occurred_at TEXT NOT NULL,
+              FOREIGN KEY(run_id) REFERENCES task_runs(run_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS task_run_links (
+              link_id TEXT COLLATE BINARY PRIMARY KEY,
+              run_id TEXT COLLATE BINARY NOT NULL,
+              ledger_seq BIGINT NOT NULL,
+              evidence_type TEXT NOT NULL,
+              evidence_id TEXT COLLATE BINARY NOT NULL,
+              role TEXT NOT NULL,
+              metadata_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE(run_id, evidence_type, evidence_id, role),
+              FOREIGN KEY(run_id) REFERENCES task_runs(run_id),
+              FOREIGN KEY(ledger_seq) REFERENCES task_run_ledger(seq)
+            );
+            """
+        )
+        self._create_task_run_indexes()
+
+    def _create_task_run_indexes(self) -> None:
+        self._execute_script(
+            """
+            CREATE INDEX IF NOT EXISTS idx_task_runs_status_created
+              ON task_runs(status, created_at COLLATE BINARY, run_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_task_runs_recovery
+              ON task_runs(created_at COLLATE BINARY, run_id COLLATE BINARY)
+              WHERE status NOT IN ('succeeded', 'failed', 'cancelled');
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_task_runs_root_pid
+              ON task_runs(root_pid) WHERE root_pid IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_task_run_requirements_run_ordinal
+              ON task_run_requirements(run_id COLLATE BINARY, ordinal, requirement_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_task_run_requirements_pending
+              ON task_run_requirements(run_id COLLATE BINARY, status, ordinal)
+              WHERE status IN ('pending', 'in_progress', 'blocked');
+            CREATE INDEX IF NOT EXISTS idx_task_run_payloads_run_role
+              ON task_run_payloads(run_id COLLATE BINARY, role, payload_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_task_run_payloads_retention
+              ON task_run_payloads(run_id COLLATE BINARY, retention_state, payload_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_task_run_resume_points_recovery
+              ON task_run_resume_points(run_id COLLATE BINARY, complete, pid COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_task_run_commands_run_created
+              ON task_run_commands(run_id COLLATE BINARY, created_at COLLATE BINARY, command_id COLLATE BINARY);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_task_run_commands_client_request
+              ON task_run_commands(client_request_id COLLATE BINARY)
+              WHERE client_request_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_task_run_ledger_run_seq
+              ON task_run_ledger(run_id COLLATE BINARY, seq, item_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_task_run_links_run_seq
+              ON task_run_links(run_id COLLATE BINARY, ledger_seq, link_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_task_run_links_evidence
+              ON task_run_links(evidence_type, evidence_id COLLATE BINARY, run_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_processes_task_run
+              ON processes(task_run_id COLLATE BINARY, created_at COLLATE BINARY, pid COLLATE BINARY)
+              WHERE task_run_id IS NOT NULL;
+            """
+        )
+
     def _finish_schema_initialization(self) -> None:
-        self._initialize_v3_schema()
+        self._initialize_v4_schema()
         self._create_llm_call_indexes()
         self._create_object_task_indexes()
 
@@ -3002,12 +3750,12 @@ class SQLRuntimeStore:
                 f"operation_reconciled={row['operation_reconciled']!r}"
             )
 
-    def _initialize_v3_schema(self) -> None:
-        """Finish a fresh schema-v3 store without migration or backfill paths."""
+    def _initialize_v4_schema(self) -> None:
+        """Finish a fresh schema-v4 store without migration or backfill paths."""
 
-        self._create_v3_data_flow_schema()
-        self._create_v3_operation_schema()
-        self._create_v3_recovery_indexes()
+        self._create_v4_data_flow_schema()
+        self._create_v4_operation_schema()
+        self._create_v4_recovery_indexes()
         now = utc_now()
         self.conn.execute(
             "INSERT OR IGNORE INTO runtime_counters (counter_name, value) VALUES (?, ?)",
@@ -3016,6 +3764,8 @@ class SQLRuntimeStore:
         for counter_name in (
             "jsonrpc_registry_generation",
             "mcp_registry_generation",
+            "task_run_ledger",
+            "task_run_runtime_epoch",
         ):
             self.conn.execute(
                 "INSERT OR IGNORE INTO runtime_counters (counter_name, value) VALUES (?, ?)",
@@ -3031,7 +3781,7 @@ class SQLRuntimeStore:
             (self.SYSTEM_NAMESPACE, None, dumps({"kind": "root"}), "runtime", now, now),
         )
 
-    def _create_v3_recovery_indexes(self) -> None:
+    def _create_v4_recovery_indexes(self) -> None:
         """Create the canonical bounded-startup and reconciliation indexes."""
 
         self._execute_script(
@@ -3693,8 +4443,9 @@ class SQLRuntimeStore:
                     checkpoint_head, status_message, wait_state_json, outcome_json,
                     state_generation, resource_budget_json, resource_usage_json,
                     working_directory, llm_profile_id, revision, execution_generation,
-                    execution_owner_id, execution_lease_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    execution_owner_id, execution_lease_id, task_run_id,
+                    task_run_epoch, task_run_role, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._process_params(process),
             )
@@ -4241,6 +4992,12 @@ class SQLRuntimeStore:
             process.wait_state,
             process.outcome,
         )
+        if isinstance(process.wait_state, StaleExecutionProcessWait) and (
+            persisted is None or process.wait_state != persisted.wait_state
+        ):
+            raise ValidationError(
+                "stale-execution recovery receipts are reserved for Store recovery"
+            )
         if (
             not isinstance(process.state_generation, int)
             or isinstance(process.state_generation, bool)
@@ -4405,6 +5162,11 @@ class SQLRuntimeStore:
             generation=generation,
             owner_id=str(owner_id),
             lease_id=str(lease_id),
+            task_run_epoch=(
+                int(current["task_run_epoch"])
+                if current["task_run_epoch"] is not None
+                else None
+            ),
         )
         takeover_intent = current_process_execution_takeover_intent()
         if takeover_intent is None and execution_token == current_token:
@@ -4992,6 +5754,10 @@ class SQLRuntimeStore:
             wait_state,
             outcome,
         )
+        if isinstance(wait_state, StaleExecutionProcessWait):
+            raise ValidationError(
+                "stale-execution recovery receipts are reserved for Store recovery"
+            )
         with self._lock:
             current = self.get_process(pid)
             if current is None:
@@ -5485,6 +6251,11 @@ class SQLRuntimeStore:
             generation=generation,
             owner_id=owner_id,
             lease_id=lease_id,
+            task_run_epoch=(
+                int(before_row["task_run_epoch"])
+                if before_row.get("task_run_epoch") is not None
+                else None
+            ),
         )
         ambient = current_process_execution_token()
         if ambient is not None and ambient != token:
@@ -7781,6 +8552,1361 @@ class SQLRuntimeStore:
         )
         return [self._row_to_process(row) for row in rows]
 
+    # -- Durable TaskRun v1 -------------------------------------------------
+
+    @property
+    def runtime_epoch(self) -> int | None:
+        return getattr(self, "_task_run_runtime_epoch", None)
+
+    def claim_runtime_epoch(self, instance_id: str) -> int:
+        """Advance the global Runtime incarnation fence under the backend lease."""
+
+        if not isinstance(instance_id, str) or not instance_id or "\x00" in instance_id:
+            raise ValidationError("runtime epoch claim requires a stable instance id")
+        if self._transaction_depth:
+            raise ValidationError("runtime epoch must be claimed outside another transaction")
+        with self.transaction() as cur:
+            changed = cur.execute(
+                "UPDATE runtime_counters SET value = value + 1 "
+                "WHERE counter_name = ?",
+                ("task_run_runtime_epoch",),
+            )
+            if changed.rowcount != 1:
+                raise ValidationError("TaskRun runtime epoch counter is missing")
+            row = cur.execute(
+                "SELECT value FROM runtime_counters WHERE counter_name = ?",
+                ("task_run_runtime_epoch",),
+            ).fetchone()
+            if row is None:
+                raise ValidationError("TaskRun runtime epoch counter is missing")
+            epoch = int(row["value"])
+        self._task_run_runtime_epoch = epoch
+        self._task_run_runtime_instance_id = instance_id
+        return epoch
+
+    def insert_task_run(self, run: TaskRunRecord, *, cursor: Any | None = None) -> None:
+        if not isinstance(run, TaskRunRecord):
+            raise ValidationError("TaskRun insert requires a TaskRunRecord")
+        if cursor is None:
+            with self.transaction() as cur:
+                self.insert_task_run(run, cursor=cur)
+            return
+        cursor.execute(
+            """
+            INSERT INTO task_runs (
+                run_id, spec_schema_version, display_title, image_id,
+                launch_options_json, authority_manifest_id, status, revision,
+                runtime_epoch, root_pid, active_pid, pause_generation,
+                cancel_generation, binding_hash, deadline_at, retention,
+                blockers_json, requirement_count, satisfied_requirement_count,
+                step_count, completed_step_count, result_ref, created_at,
+                updated_at, started_at, completed_at, finalized_at,
+                payloads_purged_at
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            self._task_run_params(run),
+        )
+
+    def get_task_run(self, run_id: str) -> TaskRunRecord | None:
+        rows = self._query("SELECT * FROM task_runs WHERE run_id = ?", (run_id,))
+        return self._row_to_task_run(rows[0]) if rows else None
+
+    def list_task_runs(
+        self,
+        *,
+        statuses: Iterable[TaskRunStatus | str] | None = None,
+        after: TaskRunCursor | None = None,
+        limit: int | None = None,
+    ) -> TaskRunPage:
+        selected_limit = self._task_run_page_limit(
+            limit,
+            default=self.config.task_runs.list_page_size,
+            hard_limit=self.config.task_runs.list_hard_limit,
+            label="TaskRun list",
+        )
+        clauses: list[str] = []
+        params: list[Any] = []
+        if statuses is not None:
+            selected_statuses = tuple(
+                dict.fromkeys(TaskRunStatus(status).value for status in statuses)
+            )
+            if not selected_statuses:
+                return TaskRunPage(records=())
+            clauses.append(
+                f"status IN ({', '.join('?' for _ in selected_statuses)})"
+            )
+            params.extend(selected_statuses)
+        if after is not None:
+            if not isinstance(after, TaskRunCursor):
+                raise ValidationError("TaskRun list cursor has an invalid type")
+            clauses.append("(created_at, run_id) > (?, ?)")
+            params.extend((after.created_at, after.run_id))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(selected_limit + 1)
+        rows = self._query(
+            f"SELECT * FROM task_runs{where} "
+            "ORDER BY created_at COLLATE BINARY, run_id COLLATE BINARY LIMIT ?",
+            params,
+        )
+        records = tuple(self._row_to_task_run(row) for row in rows[:selected_limit])
+        next_cursor = None
+        if len(rows) > selected_limit and records:
+            last = records[-1]
+            next_cursor = TaskRunCursor(last.created_at, last.run_id)
+        return TaskRunPage(records=records, next_cursor=next_cursor)
+
+    def list_recoverable_task_runs(
+        self,
+        *,
+        after: TaskRunCursor | None,
+        limit: int,
+    ) -> TaskRunPage:
+        selected_limit = self._task_run_page_limit(
+            limit,
+            default=self.config.task_runs.recovery_page_size,
+            hard_limit=self.config.task_runs.recovery_page_hard_limit,
+            label="TaskRun recovery",
+        )
+        clauses = ["status NOT IN ('succeeded', 'failed', 'cancelled')"]
+        params: list[Any] = []
+        if after is not None:
+            if not isinstance(after, TaskRunCursor):
+                raise ValidationError("TaskRun recovery cursor has an invalid type")
+            clauses.append("(created_at, run_id) > (?, ?)")
+            params.extend((after.created_at, after.run_id))
+        params.append(selected_limit + 1)
+        rows = self._query(
+            "SELECT * FROM task_runs INDEXED BY idx_task_runs_recovery "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at COLLATE BINARY, run_id COLLATE BINARY LIMIT ?",
+            params,
+        )
+        records = tuple(self._row_to_task_run(row) for row in rows[:selected_limit])
+        next_cursor = None
+        if len(rows) > selected_limit and records:
+            last = records[-1]
+            next_cursor = TaskRunCursor(last.created_at, last.run_id)
+        return TaskRunPage(records=records, next_cursor=next_cursor)
+
+    def update_task_run_cas(
+        self,
+        run_id: str,
+        expected_revision: int,
+        *,
+        updates: Mapping[str, Any],
+        expected_runtime_epoch: int | None = None,
+    ) -> TaskRunRecord:
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValidationError("TaskRun expected revision must be non-negative")
+        if expected_runtime_epoch is not None and (
+            type(expected_runtime_epoch) is not int or expected_runtime_epoch <= 0
+        ):
+            raise ValidationError("TaskRun expected runtime epoch must be positive")
+        allowed = {
+            "status",
+            "root_pid",
+            "active_pid",
+            "pause_generation",
+            "cancel_generation",
+            "binding_hash",
+            "blockers",
+            "requirement_count",
+            "satisfied_requirement_count",
+            "step_count",
+            "completed_step_count",
+            "result_ref",
+            "updated_at",
+            "started_at",
+            "completed_at",
+            "finalized_at",
+            "payloads_purged_at",
+        }
+        unknown = sorted(set(updates) - allowed)
+        if unknown:
+            raise ValidationError(f"immutable or unknown TaskRun fields: {unknown}")
+        selected = dict(updates)
+        selected.setdefault("updated_at", utc_now())
+        encoded: dict[str, Any] = {}
+        for name, value in selected.items():
+            column = "blockers_json" if name == "blockers" else name
+            if name == "status":
+                value = TaskRunStatus(value).value
+            elif name == "blockers":
+                value = canonical_task_run_json(list(value))
+            elif name in {
+                "pause_generation",
+                "cancel_generation",
+                "requirement_count",
+                "satisfied_requirement_count",
+                "step_count",
+                "completed_step_count",
+            } and (type(value) is not int or value < 0):
+                raise ValidationError(f"TaskRun {name} must be non-negative")
+            encoded[column] = value
+        assignments = [f"{column} = ?" for column in encoded]
+        assignments.append("revision = revision + 1")
+        params = [*encoded.values(), run_id, expected_revision]
+        where = "run_id = ? AND revision = ?"
+        if expected_runtime_epoch is not None:
+            where += " AND runtime_epoch = ?"
+            params.append(expected_runtime_epoch)
+        with self.transaction() as cur:
+            changed = cur.execute(
+                f"UPDATE task_runs SET {', '.join(assignments)} WHERE {where}",
+                params,
+            )
+            if changed.rowcount != 1:
+                raise TaskRunRevisionConflict(
+                    f"TaskRun revision or epoch conflict for {run_id}"
+                )
+            row = cur.execute(
+                "SELECT * FROM task_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise TaskRunRevisionConflict(f"TaskRun no longer exists: {run_id}")
+            return self._row_to_task_run(row)
+
+    def claim_task_run_epoch(
+        self,
+        run_id: str,
+        expected_revision: int,
+        runtime_epoch: int | None = None,
+    ) -> TaskRunRecord:
+        selected_epoch = runtime_epoch if runtime_epoch is not None else self.runtime_epoch
+        if type(selected_epoch) is not int or selected_epoch <= 0:
+            raise ValidationError("TaskRun claim requires a claimed Runtime epoch")
+        with self.transaction() as cur:
+            changed = cur.execute(
+                """
+                UPDATE task_runs
+                   SET runtime_epoch = ?, revision = revision + 1, updated_at = ?
+                 WHERE run_id = ? AND revision = ? AND runtime_epoch < ?
+                   AND status NOT IN ('succeeded', 'failed', 'cancelled')
+                """,
+                (
+                    selected_epoch,
+                    utc_now(),
+                    run_id,
+                    expected_revision,
+                    selected_epoch,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise TaskRunRevisionConflict(
+                    f"TaskRun epoch claim conflict for {run_id}"
+                )
+            # Rebind the durable tree in the same commit. A stale Runtime can
+            # no longer claim or settle one of these rows after this point.
+            cur.execute(
+                "UPDATE processes SET task_run_epoch = ? WHERE task_run_id = ?",
+                (selected_epoch, run_id),
+            )
+            row = cur.execute(
+                "SELECT * FROM task_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise TaskRunRevisionConflict(f"TaskRun no longer exists: {run_id}")
+            return self._row_to_task_run(row)
+
+    def claim_terminal_task_run_epoch(
+        self,
+        run_id: str,
+        expected_revision: int,
+        runtime_epoch: int | None = None,
+    ) -> TaskRunRecord:
+        """Fence one terminal Run for an on-demand Host mutation.
+
+        Startup recovery deliberately does not claim terminal Runs.  Explicit
+        terminal-only mutations therefore use this narrower claim, and callers
+        must keep it in the same outer transaction as the mutation and command
+        receipt so a failed operation cannot consume the caller's revision.
+        """
+
+        selected_epoch = runtime_epoch if runtime_epoch is not None else self.runtime_epoch
+        if type(selected_epoch) is not int or selected_epoch <= 0:
+            raise ValidationError(
+                "terminal TaskRun claim requires a claimed Runtime epoch"
+            )
+        if selected_epoch != self.runtime_epoch:
+            raise TaskRunRevisionConflict(
+                f"terminal TaskRun claim used a stale Runtime epoch for {run_id}"
+            )
+        with self.transaction() as cur:
+            changed = cur.execute(
+                """
+                UPDATE task_runs
+                   SET runtime_epoch = ?, revision = revision + 1, updated_at = ?
+                 WHERE run_id = ? AND revision = ? AND runtime_epoch < ?
+                   AND status IN ('succeeded', 'failed', 'cancelled')
+                """,
+                (
+                    selected_epoch,
+                    utc_now(),
+                    run_id,
+                    expected_revision,
+                    selected_epoch,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise TaskRunRevisionConflict(
+                    f"terminal TaskRun epoch claim conflict for {run_id}"
+                )
+            cur.execute(
+                "UPDATE processes SET task_run_epoch = ? WHERE task_run_id = ?",
+                (selected_epoch, run_id),
+            )
+            row = cur.execute(
+                "SELECT * FROM task_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise TaskRunRevisionConflict(f"TaskRun no longer exists: {run_id}")
+            return self._row_to_task_run(row)
+
+    def insert_task_run_requirement(
+        self,
+        requirement: TaskRunRequirement,
+        *,
+        cursor: Any | None = None,
+    ) -> None:
+        if not isinstance(requirement, TaskRunRequirement):
+            raise ValidationError("TaskRun requirement insert requires a model")
+        if cursor is None:
+            with self.transaction() as cur:
+                self.insert_task_run_requirement(requirement, cursor=cur)
+            return
+        cursor.execute(
+            """
+            INSERT INTO task_run_requirements (
+                requirement_id, run_id, ordinal, kind, status, payload_id,
+                requirement_sha256, label, created_by, created_at, updated_at,
+                started_at, completed_at, waived_by, waiver_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                requirement.requirement_id,
+                requirement.run_id,
+                requirement.ordinal,
+                requirement.kind.value,
+                requirement.status.value,
+                requirement.payload_id,
+                requirement.requirement_sha256,
+                requirement.label,
+                requirement.created_by,
+                requirement.created_at,
+                requirement.updated_at,
+                requirement.started_at,
+                requirement.completed_at,
+                requirement.waived_by,
+                requirement.waiver_reason,
+            ),
+        )
+
+    def list_task_run_requirements(
+        self,
+        run_id: str,
+        *,
+        after: tuple[int, str] | None = None,
+        limit: int | None = None,
+    ) -> list[TaskRunRequirement]:
+        """Read requirements by the durable ``(ordinal, id)`` keyset."""
+
+        clauses = ["run_id = ?"]
+        params: list[Any] = [run_id]
+        if after is not None:
+            if (
+                not isinstance(after, tuple)
+                or len(after) != 2
+                or type(after[0]) is not int
+                or after[0] < 0
+                or not isinstance(after[1], str)
+                or not after[1]
+            ):
+                raise ValidationError("TaskRun requirement cursor is invalid")
+            clauses.append("(ordinal, requirement_id) > (?, ?)")
+            params.extend(after)
+        suffix = ""
+        if limit is not None:
+            # Callers fetch one look-ahead row to derive the opaque next cursor.
+            # Runtime recovery and follow-up append integrity checks may need
+            # one bounded read up to the recovery ceiling. Public TaskRun
+            # pagination applies its smaller list_hard_limit before reaching
+            # this Store method.
+            hard_limit = max(
+                self.config.task_runs.list_hard_limit + 1,
+                self.config.task_runs.recovery_page_hard_limit + 1,
+            )
+            selected_limit = self._task_run_page_limit(
+                limit,
+                default=self.config.task_runs.list_page_size,
+                hard_limit=hard_limit,
+                label="TaskRun requirement list",
+            )
+            suffix = " LIMIT ?"
+            params.append(selected_limit)
+        rows = self._query(
+            "SELECT * FROM task_run_requirements "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY ordinal, requirement_id COLLATE BINARY"
+            f"{suffix}",
+            params,
+        )
+        return [self._row_to_task_run_requirement(row) for row in rows]
+
+    def update_task_run_requirement_cas(
+        self,
+        requirement_id: str,
+        *,
+        expected_status: TaskRunRequirementStatus | str,
+        status: TaskRunRequirementStatus | str,
+        updated_at: str,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        waived_by: str | None = None,
+        waiver_reason: str | None = None,
+    ) -> TaskRunRequirement | None:
+        old = TaskRunRequirementStatus(expected_status)
+        new = TaskRunRequirementStatus(status)
+        if new is TaskRunRequirementStatus.WAIVED:
+            if not waived_by or not waiver_reason:
+                raise ValidationError("waiving a TaskRun requirement requires Host evidence")
+        elif waived_by is not None or waiver_reason is not None:
+            raise ValidationError("only waived TaskRun requirements retain waiver evidence")
+        with self.transaction() as cur:
+            changed = cur.execute(
+                """
+                UPDATE task_run_requirements
+                   SET status = ?, updated_at = ?, started_at = ?, completed_at = ?,
+                       waived_by = ?, waiver_reason = ?
+                 WHERE requirement_id = ? AND status = ?
+                """,
+                (
+                    new.value,
+                    updated_at,
+                    started_at,
+                    completed_at,
+                    waived_by,
+                    waiver_reason,
+                    requirement_id,
+                    old.value,
+                ),
+            )
+            if changed.rowcount != 1:
+                return None
+            row = cur.execute(
+                "SELECT * FROM task_run_requirements WHERE requirement_id = ?",
+                (requirement_id,),
+            ).fetchone()
+            return self._row_to_task_run_requirement(row) if row is not None else None
+
+    def insert_task_run_payload(
+        self,
+        payload: TaskRunPayload,
+        *,
+        cursor: Any | None = None,
+    ) -> None:
+        if not isinstance(payload, TaskRunPayload):
+            raise ValidationError("TaskRun payload insert requires a model")
+        if payload.size_bytes > self.config.task_runs.payload_max_bytes:
+            raise ValidationError("TaskRun payload exceeds configured maximum")
+        if (
+            payload.retention_state is TaskRunPayloadRetention.PLAINTEXT
+            and not self.config.task_runs.plaintext_payloads_enabled
+        ):
+            raise ValidationError(
+                "durable TaskRun plaintext payloads are disabled; Host must "
+                "explicitly enable task_runs.plaintext_payloads_enabled"
+            )
+        if cursor is None:
+            with self.transaction() as cur:
+                self.insert_task_run_payload(payload, cursor=cur)
+            return
+        cursor.execute(
+            """
+            INSERT INTO task_run_payloads (
+                payload_id, run_id, role, label, canonical_json, sha256,
+                size_bytes, retention_state, created_at, updated_at, purged_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.payload_id,
+                payload.run_id,
+                payload.role,
+                payload.label,
+                payload.canonical_json,
+                payload.sha256,
+                payload.size_bytes,
+                payload.retention_state.value,
+                payload.created_at,
+                payload.updated_at,
+                payload.purged_at,
+            ),
+        )
+
+    def get_task_run_payload(self, payload_id: str) -> TaskRunPayload | None:
+        rows = self._query(
+            "SELECT * FROM task_run_payloads WHERE payload_id = ?", (payload_id,)
+        )
+        return self._row_to_task_run_payload(rows[0]) if rows else None
+
+    def list_task_run_payloads(self, run_id: str) -> list[TaskRunPayload]:
+        rows = self._query(
+            "SELECT * FROM task_run_payloads WHERE run_id = ? "
+            "ORDER BY created_at, payload_id",
+            (run_id,),
+        )
+        return [self._row_to_task_run_payload(row) for row in rows]
+
+    def purge_task_run_payloads(self, run_id: str, *, purged_at: str) -> int:
+        """Irreversibly reduce Run payloads to hash-only projections."""
+
+        with self.transaction() as cur:
+            changed = cur.execute(
+                """
+                UPDATE task_run_payloads
+                   SET canonical_json = NULL, retention_state = 'hash_only',
+                       purged_at = ?, updated_at = ?
+                 WHERE run_id = ? AND retention_state = 'plaintext'
+                """,
+                (purged_at, purged_at, run_id),
+            )
+            purged_count = int(changed.rowcount)
+            cur.execute("DELETE FROM task_run_resume_points WHERE run_id = ?", (run_id,))
+            return purged_count
+
+    def upsert_task_run_resume_point(self, point: TaskRunResumePoint) -> None:
+        if not isinstance(point, TaskRunResumePoint):
+            raise ValidationError("TaskRun resume point upsert requires a model")
+        with self.transaction() as cur:
+            valid = cur.execute(
+                """
+                SELECT 1
+                  FROM task_runs AS run
+                  JOIN processes AS process ON process.pid = ?
+                 WHERE run.run_id = ? AND run.runtime_epoch = ?
+                   AND process.task_run_id = run.run_id
+                   AND process.task_run_epoch = run.runtime_epoch
+                   AND process.revision = ?
+                   AND EXISTS (
+                     SELECT 1 FROM task_run_payloads AS transcript
+                      WHERE transcript.payload_id = ?
+                        AND transcript.run_id = run.run_id
+                        AND transcript.role = 'transcript'
+                        AND transcript.retention_state = 'plaintext'
+                        AND transcript.canonical_json IS NOT NULL
+                   )
+                   AND (
+                     CAST(? AS TEXT) IS NULL OR EXISTS (
+                       SELECT 1 FROM task_run_payloads AS summary
+                        WHERE summary.payload_id = ?
+                          AND summary.run_id = run.run_id
+                          AND summary.role = 'summary'
+                          AND summary.retention_state = 'plaintext'
+                          AND summary.canonical_json IS NOT NULL
+                     )
+                   )
+                   AND (
+                     CAST(? AS TEXT) IS NULL OR EXISTS (
+                       SELECT 1 FROM task_run_payloads AS pending
+                        WHERE pending.payload_id = ?
+                          AND pending.run_id = run.run_id
+                          AND pending.role = 'pending_action'
+                          AND pending.retention_state = 'plaintext'
+                          AND pending.canonical_json IS NOT NULL
+                     )
+                   )
+                """,
+                (
+                    point.pid,
+                    point.run_id,
+                    point.task_run_epoch,
+                    point.process_revision,
+                    point.transcript_payload_id,
+                    point.summary_payload_id,
+                    point.summary_payload_id,
+                    point.pending_action_payload_id,
+                    point.pending_action_payload_id,
+                ),
+            ).fetchone()
+            if valid is None:
+                raise TaskRunRevisionConflict("TaskRun resume point lost its epoch fence")
+            existing_row = cur.execute(
+                "SELECT * FROM task_run_resume_points WHERE pid = ?",
+                (point.pid,),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._row_to_task_run_resume_point(existing_row)
+                if existing == point:
+                    return
+                if (
+                    existing.run_id != point.run_id
+                    or point.task_run_epoch < existing.task_run_epoch
+                    or point.safe_point_seq <= existing.safe_point_seq
+                ):
+                    raise TaskRunRevisionConflict(
+                        "TaskRun resume point did not advance its safe-point fence"
+                    )
+            changed = cur.execute(
+                """
+                INSERT INTO task_run_resume_points (
+                    pid, run_id, task_run_epoch, process_revision,
+                    context_generation, safe_point_seq, binding_hash,
+                    image_binding_hash, tool_binding_hash, provider_binding_hash,
+                    transcript_payload_id, summary_payload_id,
+                    pending_action_payload_id, last_effect_seq, integrity_sha256,
+                    complete, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(pid) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    task_run_epoch = excluded.task_run_epoch,
+                    process_revision = excluded.process_revision,
+                    context_generation = excluded.context_generation,
+                    safe_point_seq = excluded.safe_point_seq,
+                    binding_hash = excluded.binding_hash,
+                    image_binding_hash = excluded.image_binding_hash,
+                    tool_binding_hash = excluded.tool_binding_hash,
+                    provider_binding_hash = excluded.provider_binding_hash,
+                    transcript_payload_id = excluded.transcript_payload_id,
+                    summary_payload_id = excluded.summary_payload_id,
+                    pending_action_payload_id = excluded.pending_action_payload_id,
+                    last_effect_seq = excluded.last_effect_seq,
+                    integrity_sha256 = excluded.integrity_sha256,
+                    complete = excluded.complete,
+                    updated_at = excluded.updated_at
+                WHERE task_run_resume_points.run_id = excluded.run_id
+                  AND task_run_resume_points.task_run_epoch <= excluded.task_run_epoch
+                  AND task_run_resume_points.safe_point_seq < excluded.safe_point_seq
+                """,
+                self._task_run_resume_point_params(point),
+            )
+            if changed.rowcount != 1:
+                raise TaskRunRevisionConflict(
+                    "TaskRun resume point lost its safe-point fence"
+                )
+
+    def get_task_run_resume_point(
+        self,
+        pid: str,
+        *,
+        complete_only: bool = True,
+    ) -> TaskRunResumePoint | None:
+        clause = " AND complete = 1" if complete_only else ""
+        rows = self._query(
+            f"SELECT * FROM task_run_resume_points WHERE pid = ?{clause}",
+            (pid,),
+        )
+        return self._row_to_task_run_resume_point(rows[0]) if rows else None
+
+    def list_task_run_resume_points(
+        self,
+        run_id: str,
+        *,
+        complete_only: bool = True,
+        limit: int | None = None,
+    ) -> list[TaskRunResumePoint]:
+        clause = " AND complete = 1" if complete_only else ""
+        suffix = ""
+        params: list[Any] = [run_id]
+        if limit is not None:
+            selected_limit = self._task_run_page_limit(
+                limit,
+                default=self.config.task_runs.recovery_page_size,
+                hard_limit=self.config.task_runs.recovery_page_hard_limit + 1,
+                label="TaskRun resume-point list",
+            )
+            suffix = " LIMIT ?"
+            params.append(selected_limit)
+        rows = self._query(
+            "SELECT * FROM task_run_resume_points WHERE run_id = ?"
+            f"{clause} ORDER BY pid{suffix}",
+            params,
+        )
+        return [self._row_to_task_run_resume_point(row) for row in rows]
+
+    def delete_task_run_resume_point(self, pid: str) -> bool:
+        return self._execute(
+            "DELETE FROM task_run_resume_points WHERE pid = ?", (pid,)
+        ).rowcount == 1
+
+    def insert_task_run_command(
+        self,
+        command: TaskRunCommand,
+        *,
+        cursor: Any | None = None,
+        expected_runtime_epoch: int | None = None,
+    ) -> TaskRunCommand:
+        if not isinstance(command, TaskRunCommand):
+            raise ValidationError("TaskRun command insert requires a model")
+        if expected_runtime_epoch is not None and (
+            type(expected_runtime_epoch) is not int
+            or expected_runtime_epoch <= 0
+            or expected_runtime_epoch > 2**63 - 1
+        ):
+            raise ValidationError("TaskRun command runtime epoch is invalid")
+        result_json = canonical_task_run_json(command.result)
+        if len(result_json.encode("utf-8")) > self.config.task_runs.command_result_max_bytes:
+            raise ValidationError("TaskRun command result exceeds configured maximum")
+        if cursor is None:
+            with self.transaction() as cur:
+                return self.insert_task_run_command(
+                    command,
+                    cursor=cur,
+                    expected_runtime_epoch=expected_runtime_epoch,
+                )
+        if expected_runtime_epoch is not None:
+            # A no-op conditional UPDATE is a portable row lock on both
+            # SQLite and PostgreSQL. It serializes this command mutation with
+            # the Runtime epoch increment instead of merely observing an MVCC
+            # snapshot that a concurrent claimant could immediately obsolete.
+            fenced = cursor.execute(
+                "UPDATE runtime_counters SET value = value "
+                "WHERE counter_name = ? AND value = ?",
+                ("task_run_runtime_epoch", expected_runtime_epoch),
+            )
+            if fenced.rowcount != 1:
+                raise TaskRunRevisionConflict("TaskRun runtime epoch is stale")
+        rows = list(
+            cursor.execute(
+                "SELECT * FROM task_run_commands WHERE command_id = ? "
+                "OR (client_request_id IS NOT NULL AND client_request_id = ?)",
+                (command.command_id, command.client_request_id),
+            )
+        )
+        if rows:
+            if len(rows) != 1:
+                raise TaskRunCommandConflict(
+                    "TaskRun command idempotency key was reused with a different request"
+                )
+            existing = self._row_to_task_run_command(rows[0])
+            if (
+                existing.command_id != command.command_id
+                or existing.client_request_id != command.client_request_id
+                or existing.run_id != command.run_id
+                or existing.command_kind != command.command_kind
+                or existing.request_hash != command.request_hash
+            ):
+                raise TaskRunCommandConflict(
+                    "TaskRun command idempotency key was reused with a different request"
+                )
+            return existing
+        if expected_runtime_epoch is None:
+            changed = cursor.execute(
+                """
+                INSERT INTO task_run_commands (
+                    command_id, client_request_id, run_id, command_kind,
+                    request_hash, result_json, result_revision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    command.command_id,
+                    command.client_request_id,
+                    command.run_id,
+                    command.command_kind,
+                    command.request_hash,
+                    result_json,
+                    command.result_revision,
+                    command.created_at,
+                ),
+            )
+        else:
+            # Fence the mutation itself. A preceding read alone would race a
+            # newer Runtime advancing the epoch on PostgreSQL.
+            changed = cursor.execute(
+                """
+                INSERT INTO task_run_commands (
+                    command_id, client_request_id, run_id, command_kind,
+                    request_hash, result_json, result_revision, created_at
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?
+                 WHERE EXISTS (
+                    SELECT 1 FROM runtime_counters
+                     WHERE counter_name = ? AND value = ?
+                 )
+                """,
+                (
+                    command.command_id,
+                    command.client_request_id,
+                    command.run_id,
+                    command.command_kind,
+                    command.request_hash,
+                    result_json,
+                    command.result_revision,
+                    command.created_at,
+                    "task_run_runtime_epoch",
+                    expected_runtime_epoch,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise TaskRunRevisionConflict("TaskRun runtime epoch is stale")
+        return command
+
+    def get_task_run_command(
+        self,
+        run_id: str,
+        command_id: str,
+    ) -> TaskRunCommand | None:
+        rows = self._query(
+            "SELECT * FROM task_run_commands WHERE run_id = ? AND command_id = ?",
+            (run_id, command_id),
+        )
+        return self._row_to_task_run_command(rows[0]) if rows else None
+
+    def list_task_run_commands(
+        self,
+        run_id: str,
+        *,
+        limit: int,
+    ) -> list[TaskRunCommand]:
+        selected_limit = self._task_run_page_limit(
+            limit,
+            default=self.config.task_runs.recovery_page_size,
+            hard_limit=self.config.task_runs.recovery_page_hard_limit + 1,
+            label="TaskRun command list",
+        )
+        rows = self._query(
+            "SELECT * FROM task_run_commands "
+            "WHERE run_id COLLATE BINARY = ? COLLATE BINARY "
+            "ORDER BY created_at COLLATE BINARY, command_id COLLATE BINARY LIMIT ?",
+            (run_id, selected_limit),
+        )
+        return [self._row_to_task_run_command(row) for row in rows]
+
+    def get_task_run_command_by_client_request_id(
+        self,
+        client_request_id: str,
+    ) -> TaskRunCommand | None:
+        rows = self._query(
+            "SELECT * FROM task_run_commands WHERE client_request_id = ?",
+            (client_request_id,),
+        )
+        return self._row_to_task_run_command(rows[0]) if rows else None
+
+    def update_task_run_command_result(
+        self,
+        run_id: str,
+        command_id: str,
+        *,
+        expected_result_revision: int,
+        result: Mapping[str, Any],
+        result_revision: int,
+        expected_runtime_epoch: int | None = None,
+    ) -> TaskRunCommand:
+        if (
+            type(expected_result_revision) is not int
+            or expected_result_revision < 0
+            or expected_result_revision > 2**63 - 1
+            or type(result_revision) is not int
+            or result_revision < expected_result_revision
+            or result_revision > 2**63 - 1
+        ):
+            raise ValidationError("TaskRun command result revision is invalid")
+        if expected_runtime_epoch is not None and (
+            type(expected_runtime_epoch) is not int
+            or expected_runtime_epoch <= 0
+            or expected_runtime_epoch > 2**63 - 1
+        ):
+            raise ValidationError("TaskRun command runtime epoch is invalid")
+        if not isinstance(result, Mapping):
+            raise ValidationError("TaskRun command result must be an object")
+        selected_result = dict(result)
+        result_json = canonical_task_run_json(selected_result)
+        if len(result_json.encode("utf-8")) > self.config.task_runs.command_result_max_bytes:
+            raise ValidationError("TaskRun command result exceeds configured maximum")
+        with self.transaction() as cur:
+            if expected_runtime_epoch is not None:
+                fenced = cur.execute(
+                    "UPDATE runtime_counters SET value = value "
+                    "WHERE counter_name = ? AND value = ?",
+                    ("task_run_runtime_epoch", expected_runtime_epoch),
+                )
+                if fenced.rowcount != 1:
+                    raise TaskRunRevisionConflict("TaskRun runtime epoch is stale")
+            where = "WHERE run_id = ? AND command_id = ? AND result_revision = ?"
+            params: list[Any] = [
+                result_json,
+                result_revision,
+                run_id,
+                command_id,
+                expected_result_revision,
+            ]
+            if expected_runtime_epoch is not None:
+                where += (
+                    " AND EXISTS (SELECT 1 FROM runtime_counters "
+                    "WHERE counter_name = ? AND value = ?)"
+                )
+                params.extend(["task_run_runtime_epoch", expected_runtime_epoch])
+            changed_count = cur.execute(
+                "UPDATE task_run_commands SET result_json = ?, result_revision = ? "
+                + where,
+                params,
+            ).rowcount
+            row = cur.execute(
+                "SELECT * FROM task_run_commands WHERE run_id = ? AND command_id = ?",
+                (run_id, command_id),
+            ).fetchone()
+            if row is None:
+                raise TaskRunRevisionConflict("TaskRun command result target is missing")
+            persisted = self._row_to_task_run_command(row)
+            if changed_count == 1:
+                return persisted
+            if persisted.result_revision == result_revision and persisted.result == selected_result:
+                return persisted
+            raise TaskRunRevisionConflict(
+                "TaskRun command result revision conflict"
+            )
+
+    def append_task_run_ledger_item(
+        self,
+        item: TaskRunLedgerItem,
+        *,
+        cursor: Any | None = None,
+    ) -> TaskRunLedgerItem:
+        if not isinstance(item, TaskRunLedgerItem):
+            raise ValidationError("TaskRun ledger append requires a model")
+        if cursor is None:
+            with self.transaction() as cur:
+                return self.append_task_run_ledger_item(item, cursor=cur)
+        existing_row = cursor.execute(
+            "SELECT * FROM task_run_ledger WHERE item_id = ?", (item.item_id,)
+        ).fetchone()
+        if existing_row is not None:
+            existing = self._row_to_task_run_ledger_item(existing_row)
+            if replace(existing, seq=item.seq) != item:
+                raise ValidationError("TaskRun ledger item identity collision")
+            return existing
+        changed = cursor.execute(
+            "UPDATE runtime_counters SET value = value + 1 WHERE counter_name = ?",
+            ("task_run_ledger",),
+        )
+        if changed.rowcount != 1:
+            raise ValidationError("TaskRun ledger counter is missing")
+        counter = cursor.execute(
+            "SELECT value FROM runtime_counters WHERE counter_name = ?",
+            ("task_run_ledger",),
+        ).fetchone()
+        if counter is None:
+            raise ValidationError("TaskRun ledger counter is missing")
+        persisted = replace(item, seq=int(counter["value"]))
+        cursor.execute(
+            """
+            INSERT INTO task_run_ledger (
+                seq, item_id, run_id, kind, status, label, requirement_id, pid,
+                operation_id, effect_id, human_request_id, llm_call_id,
+                checkpoint_id, object_task_id, payload_id, metadata_json, occurred_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                persisted.seq,
+                persisted.item_id,
+                persisted.run_id,
+                persisted.kind.value,
+                persisted.status,
+                persisted.label,
+                persisted.requirement_id,
+                persisted.pid,
+                persisted.operation_id,
+                persisted.effect_id,
+                persisted.human_request_id,
+                persisted.llm_call_id,
+                persisted.checkpoint_id,
+                persisted.object_task_id,
+                persisted.payload_id,
+                canonical_task_run_json(persisted.metadata),
+                persisted.occurred_at,
+            ),
+        )
+        return persisted
+
+    def get_task_run_ledger_item(
+        self,
+        run_id: str,
+        item_id: str,
+    ) -> TaskRunLedgerItem | None:
+        rows = self._query(
+            "SELECT * FROM task_run_ledger WHERE run_id = ? AND item_id = ?",
+            (run_id, item_id),
+        )
+        return self._row_to_task_run_ledger_item(rows[0]) if rows else None
+
+    def list_task_run_ledger(
+        self,
+        run_id: str,
+        *,
+        after: TaskRunLedgerCursor | None,
+        limit: int,
+    ) -> TaskRunLedgerPage:
+        selected_limit = self._task_run_page_limit(
+            limit,
+            default=self.config.task_runs.ledger_page_size,
+            hard_limit=self.config.task_runs.ledger_page_hard_limit,
+            label="TaskRun ledger",
+        )
+        clauses = ["run_id = ?"]
+        params: list[Any] = [run_id]
+        if after is not None:
+            if not isinstance(after, TaskRunLedgerCursor):
+                raise ValidationError("TaskRun ledger cursor has an invalid type")
+            clauses.append("(seq, item_id) > (?, ?)")
+            params.extend((after.seq, after.item_id))
+        params.append(selected_limit + 1)
+        rows = self._query(
+            "SELECT * FROM task_run_ledger INDEXED BY idx_task_run_ledger_run_seq "
+            f"WHERE {' AND '.join(clauses)} ORDER BY seq, item_id LIMIT ?",
+            params,
+        )
+        records = tuple(
+            self._row_to_task_run_ledger_item(row) for row in rows[:selected_limit]
+        )
+        next_cursor = None
+        if len(rows) > selected_limit and records:
+            last = records[-1]
+            next_cursor = TaskRunLedgerCursor(last.seq, last.item_id)
+        return TaskRunLedgerPage(records=records, next_cursor=next_cursor)
+
+    def insert_task_run_link(
+        self,
+        link: TaskRunLink,
+        *,
+        cursor: Any | None = None,
+    ) -> None:
+        if not isinstance(link, TaskRunLink):
+            raise ValidationError("TaskRun link insert requires a model")
+        if cursor is None:
+            with self.transaction() as cur:
+                self.insert_task_run_link(link, cursor=cur)
+            return
+        identity_rows = list(
+            cursor.execute(
+                "SELECT * FROM task_run_links WHERE link_id = ? OR "
+                "(run_id = ? AND evidence_type = ? AND evidence_id = ? AND role = ?)",
+                (
+                    link.link_id,
+                    link.run_id,
+                    link.evidence_type,
+                    link.evidence_id,
+                    link.role,
+                ),
+            )
+        )
+        if identity_rows:
+            persisted = [self._row_to_task_run_link(row) for row in identity_rows]
+            if len(persisted) != 1 or persisted[0] != link:
+                raise ValidationError("TaskRun link identity collision")
+            return
+        cursor.execute(
+            """
+            INSERT INTO task_run_links (
+                link_id, run_id, ledger_seq, evidence_type, evidence_id,
+                role, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                link.link_id,
+                link.run_id,
+                link.ledger_seq,
+                link.evidence_type,
+                link.evidence_id,
+                link.role,
+                canonical_task_run_json(link.metadata),
+                link.created_at,
+            ),
+        )
+
+    def list_task_run_links(
+        self,
+        run_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[TaskRunLink]:
+        if limit is None:
+            sql = (
+                "SELECT * FROM task_run_links "
+                "WHERE run_id COLLATE BINARY = ? COLLATE BINARY "
+                "ORDER BY ledger_seq, link_id COLLATE BINARY"
+            )
+            params: tuple[Any, ...] = (run_id,)
+        else:
+            selected_limit = self._task_run_page_limit(
+                limit,
+                default=self.config.task_runs.recovery_page_size,
+                hard_limit=self.config.task_runs.recovery_page_hard_limit + 1,
+                label="TaskRun link list",
+            )
+            sql = (
+                "SELECT * FROM task_run_links "
+                "WHERE run_id COLLATE BINARY = ? COLLATE BINARY "
+                "ORDER BY ledger_seq, link_id COLLATE BINARY LIMIT ?"
+            )
+            params = (run_id, selected_limit)
+        rows = self._query(sql, params)
+        return [self._row_to_task_run_link(row) for row in rows]
+
+    def list_processes_for_task_run(self, run_id: str) -> list[AgentProcess]:
+        rows = self._query(
+            "SELECT * FROM processes WHERE task_run_id = ? ORDER BY created_at, pid",
+            (run_id,),
+        )
+        return [self._row_to_process(row) for row in rows]
+
+    def list_task_run_process_ids(self, run_id: str) -> tuple[str, ...]:
+        rows = self._query(
+            "SELECT pid FROM processes WHERE task_run_id = ? ORDER BY pid", (run_id,)
+        )
+        return tuple(str(row["pid"]) for row in rows)
+
+    def list_active_capability_use_reservations_for_pids(
+        self,
+        pids: Iterable[str],
+    ) -> list[dict[str, Any]]:
+        """Return a bounded, payload-free projection of active reservations."""
+
+        selected = tuple(dict.fromkeys(str(pid) for pid in pids if str(pid)))
+        if any(pid != pid.strip() or "\x00" in pid for pid in selected):
+            raise ValidationError("TaskRun capability reservation PID scope is invalid")
+        if len(selected) > self.config.task_runs.recovery_page_hard_limit:
+            raise ValidationError(
+                "TaskRun capability reservation PID scope exceeds its hard cap"
+            )
+        if not selected:
+            return []
+        hard_limit = (
+            self.config.runtime.capability_use_reservation_recovery_page_hard_limit
+        )
+        rows_by_id: dict[str, Any] = {}
+        for offset in range(0, len(selected), 400):
+            batch = selected[offset : offset + 400]
+            rows = self._query(
+                "SELECT reservation.reservation_id, reservation.cap_id, "
+                "reservation.count, reservation.status, "
+                "reservation.created_at, capability.subject AS pid "
+                "FROM capability_use_reservations AS reservation "
+                "JOIN capabilities AS capability "
+                "ON capability.cap_id = reservation.cap_id "
+                "WHERE reservation.status = 'reserved' "
+                f"AND capability.subject IN ({', '.join('?' for _ in batch)}) "
+                "ORDER BY reservation.created_at COLLATE BINARY, "
+                "reservation.reservation_id COLLATE BINARY LIMIT ?",
+                (*batch, hard_limit + 1),
+            )
+            for row in rows:
+                rows_by_id[str(row["reservation_id"])] = row
+        ordered = sorted(
+            rows_by_id.values(),
+            key=lambda row: (str(row["created_at"]), str(row["reservation_id"])),
+        )
+        if len(ordered) > hard_limit:
+            raise ValidationError(
+                "TaskRun active capability reservations exceed the recovery hard cap"
+            )
+        records: list[dict[str, Any]] = []
+        for row in ordered:
+            try:
+                count = _positive_capability_use_count(
+                    row["count"],
+                    label="persisted capability reservation count",
+                )
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
+            records.append(
+                {
+                    "reservation_id": str(row["reservation_id"]),
+                    "cap_id": str(row["cap_id"]),
+                    "pid": str(row["pid"]),
+                    "count": count,
+                    "status": "reserved",
+                    "created_at": str(row["created_at"]),
+                }
+            )
+        return records
+
+    def purge_task_run_messages(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str],
+        *,
+        purged_at: str,
+    ) -> int:
+        """Delete only messages with Host-owned metadata for this Run.
+
+        Discovery, deletion, and the zero-row postcondition share the caller's
+        transaction.  MessageManager applies ``task_run_id`` to every durable
+        inbound message for a Run member, independent of its user channel.
+        """
+
+        del purged_at  # the append-only Run ledger owns purge-time evidence
+        selected = tuple(dict.fromkeys(str(pid) for pid in linked_pids if str(pid)))
+        if any(pid != pid.strip() or "\x00" in pid for pid in selected):
+            raise ValidationError("TaskRun message purge PID scope is invalid")
+        if len(selected) > self.config.task_runs.recovery_page_hard_limit:
+            raise ValidationError("TaskRun message purge PID scope exceeds its hard cap")
+        metadata_fragment = f'"task_run_id": {json.dumps(run_id, ensure_ascii=True)}'
+        metadata_pattern = f"%{metadata_fragment}%"
+
+        def _is_bound(row: Any) -> bool:
+            metadata = loads(row["metadata_json"], {})
+            return (
+                isinstance(metadata, Mapping)
+                and metadata.get("task_run_id") == run_id
+            )
+
+        def _candidates(cur: Any) -> list[Any]:
+            # Process restore deliberately detaches reconstructed rows from a
+            # historical Run.  The Host-owned metadata binding, not the mutable
+            # process row, is therefore the durable ownership proof for message
+            # purge and its zero-residue postcondition.
+            return list(
+                cur.execute(
+                    "SELECT message_id, metadata_json FROM process_messages "
+                    "WHERE metadata_json LIKE ? ORDER BY message_id",
+                    (metadata_pattern,),
+                )
+            )
+
+        with self._join_or_begin_transaction() as cur:
+            run = cur.execute(
+                "SELECT status FROM task_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise ValidationError("TaskRun message purge requires an existing Run")
+            if str(run["status"]) not in {
+                "finalizing",
+                "succeeded",
+                "failed",
+                "cancelled",
+            }:
+                raise ValidationError(
+                    "TaskRun messages may only be purged while finalizing or terminal"
+                )
+            message_ids = [
+                str(row["message_id"])
+                for row in _candidates(cur)
+                if _is_bound(row)
+            ]
+            deleted = 0
+            for offset in range(0, len(message_ids), 400):
+                batch = message_ids[offset : offset + 400]
+                changed = cur.execute(
+                    "DELETE FROM process_messages "
+                    f"WHERE message_id IN ({', '.join('?' for _ in batch)})",
+                    batch,
+                )
+                deleted += int(changed.rowcount)
+            if any(_is_bound(row) for row in _candidates(cur)):
+                raise ValidationError(
+                    "TaskRun message purge did not reach its postcondition"
+                )
+            return deleted
+
+    def purge_task_run_llm_pending_actions(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str],
+        *,
+        purged_at: str,
+        cursor: Any | None = None,
+    ) -> int:
+        """Delete only pending-action rows owned by a finalizing Run.
+
+        The membership, Run state, deletion, and postcondition are checked in
+        one transaction.  When the caller already owns a transaction this
+        method joins it, so terminal payload reduction can remain atomic.
+        """
+
+        del purged_at  # the append-only Run ledger owns purge-time evidence
+        selected = tuple(dict.fromkeys(str(pid) for pid in linked_pids if str(pid)))
+
+        def _purge(cur: Any) -> int:
+            run = cur.execute(
+                "SELECT status FROM task_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise ValidationError("TaskRun pending-action purge requires an existing Run")
+            if str(run["status"]) not in {
+                "finalizing",
+                "succeeded",
+                "failed",
+                "cancelled",
+            }:
+                raise ValidationError(
+                    "TaskRun pending actions may only be purged while finalizing or terminal"
+                )
+
+            owned_rows = list(
+                cur.execute(
+                    "SELECT pid FROM processes WHERE task_run_id = ? ORDER BY pid",
+                    (run_id,),
+                )
+            )
+            owned = tuple(str(row["pid"]) for row in owned_rows)
+            scoped = selected or owned
+            if not set(scoped).issubset(owned):
+                raise ValidationError(
+                    "TaskRun pending-action purge scope contains an unowned PID"
+                )
+            if not scoped:
+                return 0
+
+            deleted = 0
+            for offset in range(0, len(scoped), 400):
+                batch = scoped[offset : offset + 400]
+                placeholders = ", ".join("?" for _ in batch)
+                changed = cur.execute(
+                    f"DELETE FROM llm_pending_actions WHERE pid IN ({placeholders})",
+                    batch,
+                )
+                deleted += int(changed.rowcount)
+                remaining = cur.execute(
+                    "SELECT COUNT(*) AS remaining FROM llm_pending_actions "
+                    f"WHERE pid IN ({placeholders})",
+                    batch,
+                ).fetchone()
+                if remaining is None or int(remaining["remaining"]) != 0:
+                    raise ValidationError(
+                        "TaskRun pending-action purge did not reach its postcondition"
+                    )
+            return deleted
+
+        if cursor is not None:
+            return _purge(cursor)
+        with self._join_or_begin_transaction() as cur:
+            return _purge(cur)
+
+    def list_active_task_run_ids_for_pids(
+        self,
+        pids: Iterable[str],
+    ) -> tuple[str, ...]:
+        selected = tuple(dict.fromkeys(str(pid) for pid in pids if str(pid)))
+        if not selected:
+            return ()
+        found: set[str] = set()
+        for offset in range(0, len(selected), 400):
+            batch = selected[offset : offset + 400]
+            rows = self._query(
+                "SELECT DISTINCT run.run_id FROM processes AS process "
+                "JOIN task_runs AS run ON run.run_id = process.task_run_id "
+                f"WHERE process.pid IN ({', '.join('?' for _ in batch)}) "
+                "AND run.status NOT IN ('succeeded', 'failed', 'cancelled')",
+                batch,
+            )
+            found.update(str(row["run_id"]) for row in rows)
+        return tuple(sorted(found))
+
+    @staticmethod
+    def _task_run_page_limit(
+        limit: int | None,
+        *,
+        default: int,
+        hard_limit: int,
+        label: str,
+    ) -> int:
+        selected = default if limit is None else limit
+        if type(selected) is not int or selected <= 0:
+            raise ValidationError(f"{label} limit must be a positive integer")
+        if selected > hard_limit:
+            raise ValidationError(f"{label} limit exceeds hard cap {hard_limit}")
+        return selected
+
     def insert_authority_manifest(self, manifest: TaskAuthorityManifest) -> None:
         if (
             type(manifest.permitted_effects_policy_schema_version) is not int
@@ -7858,16 +9984,39 @@ class SQLRuntimeStore:
             return None
         return self.get_process(pid)
 
-    def claim_execution(self, pid: str, *, owner_id: str) -> ProcessExecutionToken | None:
+    def claim_execution(
+        self,
+        pid: str,
+        *,
+        owner_id: str,
+        task_run_epoch: int | None = None,
+    ) -> ProcessExecutionToken | None:
         if not owner_id:
             raise ValidationError("execution owner id must be non-empty")
+        if task_run_epoch is not None and (
+            type(task_run_epoch) is not int or task_run_epoch <= 0
+        ):
+            raise ValidationError("execution TaskRun epoch must be positive")
         now = utc_now()
         lease_id = new_id("execution_lease")
+        # Do not bind a nullable value solely through ``? IS NULL`` here.
+        # PostgreSQL cannot infer that placeholder's type, while omitting this
+        # optional predicate is exactly the legacy/no-explicit-epoch behavior.
+        # A supplied epoch remains compared to the BIGINT process column, and
+        # the TaskRun join below always fences a bound process to the current
+        # Run epoch.
+        task_run_epoch_sql = (
+            "" if task_run_epoch is None else "AND task_run_epoch = ?"
+        )
+        task_run_epoch_params: tuple[int, ...] = (
+            () if task_run_epoch is None else (task_run_epoch,)
+        )
         with self.transaction() as cur:
             rows = list(
                 cur.execute(
                     """
-                    SELECT revision, execution_generation, state_generation
+                    SELECT revision, execution_generation, state_generation,
+                           task_run_epoch
                       FROM processes
                      WHERE pid = ? AND status = ?
                     """,
@@ -7878,7 +10027,7 @@ class SQLRuntimeStore:
                 return None
             generation = int(rows[0]["execution_generation"]) + 1
             updated = cur.execute(
-                """
+                f"""
                 UPDATE processes
                    SET status = ?, updated_at = ?, revision = revision + 1,
                        status_message = NULL, wait_state_json = 'null',
@@ -7886,6 +10035,21 @@ class SQLRuntimeStore:
                        execution_generation = ?, execution_owner_id = ?, execution_lease_id = ?
                  WHERE pid = ? AND status = ?
                    AND execution_generation = ?
+                   {task_run_epoch_sql}
+                   AND (
+                     task_run_id IS NULL OR EXISTS (
+                       SELECT 1 FROM task_runs AS task_run
+                        WHERE task_run.run_id = processes.task_run_id
+                          AND task_run.runtime_epoch = processes.task_run_epoch
+                          AND task_run.status IN (
+                            'queued', 'running', 'waiting_human',
+                            'waiting_process', 'waiting_message', 'waiting_tool'
+                          )
+                          AND (
+                            task_run.deadline_at IS NULL OR task_run.deadline_at > ?
+                          )
+                     )
+                   )
                 """,
                 (
                     ProcessStatus.RUNNING.value,
@@ -7896,6 +10060,8 @@ class SQLRuntimeStore:
                     pid,
                     ProcessStatus.RUNNABLE.value,
                     generation - 1,
+                    *task_run_epoch_params,
+                    now,
                 ),
             )
             if updated.rowcount != 1:
@@ -7916,6 +10082,11 @@ class SQLRuntimeStore:
                 generation=generation,
                 owner_id=owner_id,
                 lease_id=lease_id,
+                task_run_epoch=(
+                    int(rows[0]["task_run_epoch"])
+                    if rows[0]["task_run_epoch"] is not None
+                    else None
+                ),
             )
 
     def claim_host_process_exec(
@@ -7926,6 +10097,7 @@ class SQLRuntimeStore:
         expected_revision: int,
         expected_state_generation: int,
         expected_execution_generation: int,
+        task_run_epoch: int | None = None,
     ) -> ProcessExecutionToken | None:
         """Claim a RUNNABLE row for Host exec using its complete concurrency tuple.
 
@@ -7950,10 +10122,20 @@ class SQLRuntimeStore:
                 "process exec concurrency values must be non-negative integers"
             )
         generation = expected_execution_generation + 1
+        if task_run_epoch is not None and (
+            type(task_run_epoch) is not int or task_run_epoch <= 0
+        ):
+            raise ValidationError("process exec TaskRun epoch must be positive")
         lease_id = new_id("execution_lease")
+        task_run_epoch_sql = (
+            "" if task_run_epoch is None else "AND task_run_epoch = ?"
+        )
+        task_run_epoch_params: tuple[int, ...] = (
+            () if task_run_epoch is None else (task_run_epoch,)
+        )
         with self.transaction() as cur:
             updated = cur.execute(
-                """
+                f"""
                 UPDATE processes
                    SET status = ?, updated_at = ?, revision = revision + 1,
                        status_message = NULL, wait_state_json = 'null',
@@ -7963,6 +10145,19 @@ class SQLRuntimeStore:
                    AND state_generation = ? AND execution_generation = ?
                    AND execution_owner_id IS NULL AND execution_lease_id IS NULL
                    AND wait_state_json = 'null'
+                   {task_run_epoch_sql}
+                   AND (
+                     task_run_id IS NULL OR EXISTS (
+                       SELECT 1 FROM task_runs AS task_run
+                        WHERE task_run.run_id = processes.task_run_id
+                          AND task_run.runtime_epoch = processes.task_run_epoch
+                          AND task_run.status IN (
+                            'queued', 'running', 'waiting_human',
+                            'waiting_process', 'waiting_message', 'waiting_tool'
+                          )
+                          AND (task_run.deadline_at IS NULL OR task_run.deadline_at > ?)
+                     )
+                   )
                 """,
                 (
                     ProcessStatus.RUNNING.value,
@@ -7975,6 +10170,8 @@ class SQLRuntimeStore:
                     expected_revision,
                     expected_state_generation,
                     expected_execution_generation,
+                    *task_run_epoch_params,
+                    utc_now(),
                 ),
             )
             if updated.rowcount != 1:
@@ -7986,11 +10183,20 @@ class SQLRuntimeStore:
                 state_generation=expected_state_generation + 1,
                 cursor=cur,
             )
+            claimed_row = cur.execute(
+                "SELECT task_run_epoch FROM processes WHERE pid = ?", (pid,)
+            ).fetchone()
         return ProcessExecutionToken(
             pid=pid,
             generation=generation,
             owner_id=owner_id,
             lease_id=lease_id,
+            task_run_epoch=(
+                int(claimed_row["task_run_epoch"])
+                if claimed_row is not None
+                and claimed_row["task_run_epoch"] is not None
+                else None
+            ),
         )
 
     def claim_worker_process_exec(
@@ -8001,6 +10207,7 @@ class SQLRuntimeStore:
         owner_id: str,
         expected_revision: int,
         expected_state_generation: int,
+        task_run_epoch: int | None = None,
     ) -> ProcessExecutionToken | None:
         """Atomically rotate an exact worker lease into exec-owned admission.
 
@@ -8029,10 +10236,20 @@ class SQLRuntimeStore:
                 "process exec concurrency values must be non-negative integers"
             )
         generation = execution_token.generation + 1
+        if task_run_epoch is not None and (
+            type(task_run_epoch) is not int or task_run_epoch <= 0
+        ):
+            raise ValidationError("process exec TaskRun epoch must be positive")
         lease_id = new_id("execution_lease")
+        task_run_epoch_sql = (
+            "" if task_run_epoch is None else "AND task_run_epoch = ?"
+        )
+        task_run_epoch_params: tuple[int, ...] = (
+            () if task_run_epoch is None else (task_run_epoch,)
+        )
         with self.transaction() as cur:
             updated = cur.execute(
-                """
+                f"""
                 UPDATE processes
                    SET updated_at = ?, revision = revision + 1,
                        status_message = NULL, wait_state_json = 'null',
@@ -8042,6 +10259,19 @@ class SQLRuntimeStore:
                    AND state_generation = ? AND execution_generation = ?
                    AND execution_owner_id = ? AND execution_lease_id = ?
                    AND wait_state_json = 'null'
+                   {task_run_epoch_sql}
+                   AND (
+                     task_run_id IS NULL OR EXISTS (
+                       SELECT 1 FROM task_runs AS task_run
+                        WHERE task_run.run_id = processes.task_run_id
+                          AND task_run.runtime_epoch = processes.task_run_epoch
+                          AND task_run.status IN (
+                            'queued', 'running', 'waiting_human',
+                            'waiting_process', 'waiting_message', 'waiting_tool'
+                          )
+                          AND (task_run.deadline_at IS NULL OR task_run.deadline_at > ?)
+                     )
+                   )
                 """,
                 (
                     utc_now(),
@@ -8055,6 +10285,8 @@ class SQLRuntimeStore:
                     execution_token.generation,
                     execution_token.owner_id,
                     execution_token.lease_id,
+                    *task_run_epoch_params,
+                    utc_now(),
                 ),
             )
             if updated.rowcount != 1:
@@ -8066,11 +10298,20 @@ class SQLRuntimeStore:
                 state_generation=expected_state_generation + 1,
                 cursor=cur,
             )
+            claimed_row = cur.execute(
+                "SELECT task_run_epoch FROM processes WHERE pid = ?", (pid,)
+            ).fetchone()
         return ProcessExecutionToken(
             pid=pid,
             generation=generation,
             owner_id=owner_id,
             lease_id=lease_id,
+            task_run_epoch=(
+                int(claimed_row["task_run_epoch"])
+                if claimed_row is not None
+                and claimed_row["task_run_epoch"] is not None
+                else None
+            ),
         )
 
     def complete_execution(
@@ -8086,6 +10327,10 @@ class SQLRuntimeStore:
 
         selected = ProcessStatus(status)
         validate_process_state_fields(selected.value, wait_state, outcome)
+        if isinstance(wait_state, StaleExecutionProcessWait):
+            raise ValidationError(
+                "stale-execution recovery receipts are reserved for Store recovery"
+            )
         selected_status_message = legacy_status_message(
             wait_state,
             outcome,
@@ -8093,6 +10338,14 @@ class SQLRuntimeStore:
         )
         wait_state_json = dumps(process_wait_state_to_mapping(wait_state))
         outcome_json = dumps(process_outcome_to_mapping(outcome))
+        task_run_epoch_sql = (
+            "AND task_run_epoch IS NULL"
+            if token.task_run_epoch is None
+            else "AND task_run_epoch = ?"
+        )
+        task_run_epoch_params: tuple[int, ...] = (
+            () if token.task_run_epoch is None else (token.task_run_epoch,)
+        )
         generation_increment = 1 if selected in {
             ProcessStatus.EXITED,
             ProcessStatus.FAILED,
@@ -8100,7 +10353,7 @@ class SQLRuntimeStore:
         } else 0
         with self.transaction() as cur:
             updated = cur.execute(
-                """
+                f"""
                 UPDATE processes
                    SET status = ?, status_message = ?, wait_state_json = ?,
                        outcome_json = ?, state_generation = state_generation + 1,
@@ -8109,6 +10362,7 @@ class SQLRuntimeStore:
                        execution_owner_id = NULL, execution_lease_id = NULL
                  WHERE pid = ? AND status = ? AND execution_generation = ?
                    AND execution_owner_id = ? AND execution_lease_id = ?
+                   {task_run_epoch_sql}
                 """,
                 (
                     selected.value,
@@ -8122,6 +10376,7 @@ class SQLRuntimeStore:
                     token.generation,
                     token.owner_id,
                     token.lease_id,
+                    *task_run_epoch_params,
                 ),
             )
             if updated.rowcount != 1:
@@ -8152,15 +10407,24 @@ class SQLRuntimeStore:
     def release_execution(self, token: ProcessExecutionToken) -> bool:
         """Fence and detach an exact execution lease without changing status."""
 
+        task_run_epoch_sql = (
+            "AND task_run_epoch IS NULL"
+            if token.task_run_epoch is None
+            else "AND task_run_epoch = ?"
+        )
+        task_run_epoch_params: tuple[int, ...] = (
+            () if token.task_run_epoch is None else (token.task_run_epoch,)
+        )
         with self.transaction() as cur:
             updated = cur.execute(
-                """
+                f"""
                 UPDATE processes
                    SET updated_at = ?, revision = revision + 1,
                        execution_generation = execution_generation + 1,
                        execution_owner_id = NULL, execution_lease_id = NULL
                  WHERE pid = ? AND execution_generation = ?
                    AND execution_owner_id = ? AND execution_lease_id = ?
+                   {task_run_epoch_sql}
                 """,
                 (
                     utc_now(),
@@ -8168,6 +10432,7 @@ class SQLRuntimeStore:
                     token.generation,
                     token.owner_id,
                     token.lease_id,
+                    *task_run_epoch_params,
                 ),
             )
             if updated.rowcount != 1:
@@ -8462,7 +10727,9 @@ class SQLRuntimeStore:
                 rows = list(
                     cur.execute(
                         f"""
-                        SELECT pid FROM processes
+                        SELECT pid, state_generation, execution_generation,
+                               execution_owner_id, execution_lease_id
+                          FROM processes
                          WHERE status = ?
                            AND (execution_owner_id IS NULL OR execution_owner_id <> ?)
                            {after_clause}
@@ -8475,31 +10742,25 @@ class SQLRuntimeStore:
                 pids = [str(row["pid"]) for row in rows]
                 if not pids:
                     break
-                placeholders = ", ".join("?" for _ in pids)
-                cur.execute(
-                    f"""
-                    UPDATE processes
-                       SET status = ?, status_message = ?, updated_at = ?,
-                           wait_state_json = ?, outcome_json = 'null',
-                           state_generation = state_generation + 1,
-                           revision = revision + 1,
-                           execution_generation = execution_generation + 1,
-                           execution_owner_id = NULL, execution_lease_id = NULL
-                     WHERE pid IN ({placeholders}) AND status = ?
-                    """,
-                    (
-                        ProcessStatus.PAUSED.value,
-                        "stale_execution_recovery",
-                        utc_now(),
-                        dumps(
-                            process_wait_state_to_mapping(
-                                PausedProcessWait(reason_oid=None)
-                            )
-                        ),
-                        *pids,
-                        ProcessStatus.RUNNING.value,
-                    ),
-                )
+                recovered_pids: list[str] = []
+                now = utc_now()
+                recovered_by_owner_sha256 = hashlib.sha256(
+                    owner_id.encode("utf-8")
+                ).hexdigest()
+                for row in rows:
+                    recovered_pid = self._recover_one_stale_execution(
+                        cur,
+                        row,
+                        owner_id=owner_id,
+                        recovered_by_owner_sha256=recovered_by_owner_sha256,
+                        recovered_at=now,
+                    )
+                    if recovered_pid is not None:
+                        recovered_pids.append(recovered_pid)
+                if not recovered_pids:
+                    after_pid = pids[-1]
+                    continue
+                placeholders = ", ".join("?" for _ in recovered_pids)
                 concurrency_rows = list(
                     cur.execute(
                         f"""
@@ -8507,7 +10768,7 @@ class SQLRuntimeStore:
                           FROM processes
                          WHERE pid IN ({placeholders})
                         """,
-                        pids,
+                        recovered_pids,
                     )
                 )
                 for row in concurrency_rows:
@@ -8518,18 +10779,98 @@ class SQLRuntimeStore:
                         state_generation=int(row["state_generation"]),
                         cursor=cur,
                     )
-                for pid in pids:
+                for pid in recovered_pids:
                     on_recovered(pid)
-                recovered_total += len(pids)
+                recovered_total += len(recovered_pids)
                 if len(recovered_sample) < page_size:
                     recovered_sample.extend(
-                        pids[: page_size - len(recovered_sample)]
+                        recovered_pids[: page_size - len(recovered_sample)]
                     )
                 after_pid = pids[-1]
         return StaleExecutionRecoverySummary(
             total_count=recovered_total,
             sample_pids=tuple(recovered_sample),
         )
+
+    @staticmethod
+    def _stale_execution_identity_sha256(value: Any) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def _recover_one_stale_execution(
+        self,
+        cursor: Any,
+        row: Any,
+        *,
+        owner_id: str,
+        recovered_by_owner_sha256: str,
+        recovered_at: str,
+    ) -> str | None:
+        """CAS one selected lease and its hash-only receipt in one statement."""
+
+        pid = str(row["pid"])
+        prior_owner = row["execution_owner_id"]
+        prior_lease = row["execution_lease_id"]
+        prior_state_generation = int(row["state_generation"])
+        prior_execution_generation = int(row["execution_generation"])
+        receipt = StaleExecutionProcessWait(
+            pid=pid,
+            recovered_by_owner_sha256=recovered_by_owner_sha256,
+            prior_owner_sha256=self._stale_execution_identity_sha256(prior_owner),
+            prior_lease_sha256=self._stale_execution_identity_sha256(prior_lease),
+            prior_execution_generation=prior_execution_generation,
+            recovered_execution_generation=prior_execution_generation + 1,
+            recovered_state_generation=prior_state_generation + 1,
+        )
+        owner_clause = (
+            "execution_owner_id IS NULL"
+            if prior_owner is None
+            else "execution_owner_id = ?"
+        )
+        lease_clause = (
+            "execution_lease_id IS NULL"
+            if prior_lease is None
+            else "execution_lease_id = ?"
+        )
+        identity_params = (
+            (() if prior_owner is None else (prior_owner,))
+            + (() if prior_lease is None else (prior_lease,))
+        )
+        updated = cursor.execute(
+            f"""
+            UPDATE processes
+               SET status = ?, status_message = ?, updated_at = ?,
+                   wait_state_json = ?, outcome_json = 'null',
+                   state_generation = state_generation + 1,
+                   revision = revision + 1,
+                   execution_generation = execution_generation + 1,
+                   execution_owner_id = NULL,
+                   execution_lease_id = NULL
+             WHERE pid = ? AND status = ?
+               AND state_generation = ?
+               AND execution_generation = ?
+               AND {owner_clause}
+               AND {lease_clause}
+               AND (
+                 execution_owner_id IS NULL
+                 OR execution_owner_id <> ?
+               )
+            """,
+            (
+                ProcessStatus.PAUSED.value,
+                legacy_status_message(receipt, None),
+                recovered_at,
+                dumps(process_wait_state_to_mapping(receipt)),
+                pid,
+                ProcessStatus.RUNNING.value,
+                prior_state_generation,
+                prior_execution_generation,
+                *identity_params,
+                owner_id,
+            ),
+        )
+        return pid if updated.rowcount == 1 else None
 
     def upsert_resource_reservation(self, reservation: ResourceReservation) -> None:
         self._execute(
@@ -10335,6 +12676,7 @@ class SQLRuntimeStore:
         limit: int | None = None,
         *,
         actor: str | None = None,
+        action: str | None = None,
         target: str | None = None,
         match_any: bool = False,
         include_gui_presentation: bool = True,
@@ -10345,15 +12687,22 @@ class SQLRuntimeStore:
         if not include_gui_presentation:
             clauses.append("gui_snapshot_visible = 1")
         selectors: list[str] = []
+        selector_params: list[Any] = []
         if actor is not None:
-            selectors.append("actor = ?")
-            params.append(actor)
+            selectors.append("actor COLLATE BINARY = ? COLLATE BINARY")
+            selector_params.append(actor)
+        if action is not None:
+            if not isinstance(action, str) or not action:
+                raise ValidationError("audit action filter must be a non-empty string")
+            clauses.append("action COLLATE BINARY = ? COLLATE BINARY")
+            params.append(action)
         if target is not None:
             selectors.append("target = ?")
-            params.append(target)
+            selector_params.append(target)
         if selectors:
             joiner = " OR " if match_any and len(selectors) > 1 else " AND "
             clauses.append(f"({joiner.join(selectors)})")
+            params.extend(selector_params)
         if before_record_id is not None:
             cursor_rows = self._query(
                 "SELECT timestamp, record_id FROM audit_records WHERE record_id = ?",
@@ -11140,6 +13489,576 @@ class SQLRuntimeStore:
             )
             return True
 
+    def settle_external_effect_recovery(
+        self,
+        effect_id: str,
+        *,
+        expected_transaction_state: str,
+        provider_state: str,
+        provider_metadata: dict[str, Any],
+        provider_receipt: dict[str, Any],
+        audit_record: AuditRecord,
+        updated_at: str,
+        run_id: str | None = None,
+        runtime_epoch: int | None = None,
+    ) -> ExternalEffectRecoverySettlement | None:
+        """CAS one provider-verified recovery result and its local evidence.
+
+        Provider verification is intentionally outside the storage boundary.
+        This method owns the second, durable half of the protocol: exact old
+        state and optional TaskRun epoch fencing, reservation convergence, the
+        effect transition, and its audit row all commit together.
+        """
+
+        settled_transaction_state = self._validate_external_effect_recovery_request(
+            effect_id=effect_id,
+            expected_transaction_state=expected_transaction_state,
+            provider_state=provider_state,
+            provider_metadata=provider_metadata,
+            provider_receipt=provider_receipt,
+            audit_record=audit_record,
+            updated_at=updated_at,
+            run_id=run_id,
+            runtime_epoch=runtime_epoch,
+        )
+        with self.transaction() as cur:
+            current = self._load_external_effect_recovery_candidate(
+                cur,
+                effect_id=effect_id,
+                expected_transaction_state=expected_transaction_state,
+                run_id=run_id,
+                runtime_epoch=runtime_epoch,
+            )
+            if current is None:
+                return None
+            capability_reservation_ids = (
+                self._external_effect_recovery_capability_reservation_ids(current)
+            )
+            if provider_state == "not_started":
+                self._require_external_effect_globally_not_started(current)
+            if not self._update_external_effect_recovery_candidate(
+                cur,
+                current=current,
+                expected_transaction_state=expected_transaction_state,
+                provider_state=provider_state,
+                settled_transaction_state=settled_transaction_state,
+                provider_metadata=provider_metadata,
+                provider_receipt=provider_receipt,
+                audit_record_id=audit_record.record_id,
+                updated_at=updated_at,
+            ):
+                return None
+            restored, committed, released = (
+                self._converge_external_effect_recovery_reservations(
+                    cur,
+                    current=current,
+                    capability_reservation_ids=capability_reservation_ids,
+                    provider_state=provider_state,
+                    updated_at=updated_at,
+                )
+            )
+            return self._record_external_effect_recovery_settlement(
+                cur,
+                effect_id=effect_id,
+                previous_transaction_state=expected_transaction_state,
+                provider_state=provider_state,
+                settled_transaction_state=settled_transaction_state,
+                audit_record=audit_record,
+                updated_at=updated_at,
+                restored_capabilities=restored,
+                committed_capabilities=committed,
+                released_resources=released,
+            )
+
+    @staticmethod
+    def _validate_external_effect_recovery_request(
+        *,
+        effect_id: str,
+        expected_transaction_state: str,
+        provider_state: str,
+        provider_metadata: dict[str, Any],
+        provider_receipt: dict[str, Any],
+        audit_record: AuditRecord,
+        updated_at: str,
+        run_id: str | None,
+        runtime_epoch: int | None,
+    ) -> str:
+        if not isinstance(effect_id, str) or not effect_id:
+            raise ValidationError("external effect recovery requires an effect id")
+        if expected_transaction_state not in {
+            "prepared",
+            "authorized",
+            "approved",
+            "dispatched",
+            "unknown",
+        }:
+            raise ValidationError(
+                "external effect recovery expected state is not recoverable"
+            )
+        if provider_state not in {
+            "committed",
+            "failed",
+            "compensated",
+            "not_started",
+        }:
+            raise ValidationError("external effect recovery provider state is invalid")
+        if (
+            expected_transaction_state == "prepared"
+            and provider_state != "not_started"
+        ):
+            raise ValidationError(
+                "prepared external effect recovery requires a certified "
+                "not-started provider conclusion"
+            )
+        if not isinstance(provider_metadata, dict):
+            raise ValidationError("external effect recovery metadata must be an object")
+        if not isinstance(provider_receipt, dict) or not provider_receipt:
+            raise ValidationError(
+                "external effect recovery requires a non-empty provider receipt"
+            )
+        if not isinstance(audit_record, AuditRecord):
+            raise ValidationError("external effect recovery requires an audit record")
+        if (
+            audit_record.action != "external_effect.recovery_settled"
+            or audit_record.target != f"external_effect:{effect_id}"
+        ):
+            raise ValidationError(
+                "external effect recovery audit is not bound to the effect"
+            )
+        if not isinstance(updated_at, str) or not updated_at:
+            raise ValidationError("external effect recovery timestamp must not be empty")
+        SQLRuntimeStore._validate_external_effect_recovery_run_fence(
+            run_id,
+            runtime_epoch,
+        )
+        return "failed" if provider_state == "not_started" else provider_state
+
+    @staticmethod
+    def _validate_external_effect_recovery_run_fence(
+        run_id: str | None,
+        runtime_epoch: int | None,
+    ) -> None:
+        if (run_id is None) != (runtime_epoch is None):
+            raise ValidationError(
+                "external effect recovery TaskRun id and epoch must be supplied together"
+            )
+        if run_id is not None and (not isinstance(run_id, str) or not run_id):
+            raise ValidationError("external effect recovery TaskRun id must not be empty")
+        if runtime_epoch is not None and (
+            type(runtime_epoch) is not int or runtime_epoch <= 0
+        ):
+            raise ValidationError(
+                "external effect recovery TaskRun epoch must be positive"
+            )
+
+    def _load_external_effect_recovery_candidate(
+        self,
+        cur: Any,
+        *,
+        effect_id: str,
+        expected_transaction_state: str,
+        run_id: str | None,
+        runtime_epoch: int | None,
+    ) -> ExternalEffectRecord | None:
+        rows = list(
+            cur.execute(
+                "SELECT * FROM external_effects WHERE effect_id = ?",
+                (effect_id,),
+            )
+        )
+        if not rows:
+            return None
+        current = self._row_to_external_effect(rows[0])
+        if (
+            current.effect_state != "pending"
+            or current.transaction_state != expected_transaction_state
+        ):
+            return None
+        if (
+            external_effect_payload_retention_tier(current)
+            is not PayloadRetentionTier.FULL
+        ):
+            raise ValidationError(
+                "retained external effect payloads cannot be recovered"
+            )
+        if run_id is None:
+            return current
+        membership = list(
+            cur.execute(
+                """
+                SELECT process.pid
+                  FROM processes AS process
+                  JOIN task_runs AS run
+                    ON run.run_id = process.task_run_id
+                   AND run.runtime_epoch = process.task_run_epoch
+                 WHERE process.pid = ?
+                   AND process.task_run_id = ?
+                   AND process.task_run_epoch = ?
+                   AND run.runtime_epoch = ?
+                """,
+                (current.pid, run_id, runtime_epoch, runtime_epoch),
+            )
+        )
+        return current if len(membership) == 1 else None
+
+    @staticmethod
+    def _update_external_effect_recovery_candidate(
+        cur: Any,
+        *,
+        current: ExternalEffectRecord,
+        expected_transaction_state: str,
+        provider_state: str,
+        settled_transaction_state: str,
+        provider_metadata: dict[str, Any],
+        provider_receipt: dict[str, Any],
+        audit_record_id: str,
+        updated_at: str,
+    ) -> bool:
+        changed = cur.execute(
+            """
+            UPDATE external_effects
+               SET record_id = COALESCE(record_id, ?),
+                   effect_state = 'finalized', transaction_state = ?,
+                   provider_metadata_json = ?, provider_receipt_json = ?,
+                   idempotency_key = ?, updated_at = ?
+             WHERE effect_id = ?
+               AND effect_state = 'pending'
+               AND transaction_state = ?
+            """,
+            (
+                audit_record_id,
+                settled_transaction_state,
+                dumps(provider_metadata),
+                dumps(provider_receipt),
+                None if provider_state == "not_started" else current.idempotency_key,
+                updated_at,
+                current.effect_id,
+                expected_transaction_state,
+            ),
+        )
+        return changed.rowcount == 1
+
+    def _converge_external_effect_recovery_reservations(
+        self,
+        cur: Any,
+        *,
+        current: ExternalEffectRecord,
+        capability_reservation_ids: tuple[str, ...],
+        provider_state: str,
+        updated_at: str,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        restored: list[str] = []
+        committed: list[str] = []
+        for reservation_id in capability_reservation_ids:
+            if provider_state == "not_started":
+                self._restore_external_effect_capability_reservation(
+                    cur,
+                    current,
+                    reservation_id=reservation_id,
+                    updated_at=updated_at,
+                )
+                restored.append(reservation_id)
+            else:
+                self._commit_external_effect_capability_reservation(
+                    cur,
+                    current,
+                    reservation_id=reservation_id,
+                    updated_at=updated_at,
+                )
+                committed.append(reservation_id)
+        released = self._release_external_effect_resource_reservations(
+            cur,
+            current,
+            updated_at=updated_at,
+            release=provider_state == "not_started",
+        )
+        return tuple(restored), tuple(committed), released
+
+    def _record_external_effect_recovery_settlement(
+        self,
+        cur: Any,
+        *,
+        effect_id: str,
+        previous_transaction_state: str,
+        provider_state: str,
+        settled_transaction_state: str,
+        audit_record: AuditRecord,
+        updated_at: str,
+        restored_capabilities: tuple[str, ...],
+        committed_capabilities: tuple[str, ...],
+        released_resources: tuple[str, ...],
+    ) -> ExternalEffectRecoverySettlement:
+        transition_seq = self._append_external_effect_transition(
+            cur,
+            effect_id=effect_id,
+            effect_state="finalized",
+            transaction_state=settled_transaction_state,
+            occurred_at=updated_at,
+        )
+        selected_audit = replace(
+            audit_record,
+            decision={
+                **dict(audit_record.decision or {}),
+                "previous_transaction_state": previous_transaction_state,
+                "provider_state": provider_state,
+                "settled_transaction_state": settled_transaction_state,
+                "restored_capability_reservation_ids": list(restored_capabilities),
+                "committed_capability_reservation_ids": list(committed_capabilities),
+                "released_resource_reservation_ids": list(released_resources),
+                "transition_seq": transition_seq,
+            },
+        )
+        self.insert_audit(selected_audit)
+        settled_rows = list(
+            cur.execute(
+                "SELECT * FROM external_effects WHERE effect_id = ?",
+                (effect_id,),
+            )
+        )
+        if len(settled_rows) != 1:
+            raise ValidationError(
+                "external effect recovery row disappeared during settlement"
+            )
+        settled = self._row_to_external_effect(settled_rows[0])
+        return ExternalEffectRecoverySettlement(
+            effect=settled,
+            previous_transaction_state=previous_transaction_state,
+            provider_state=provider_state,
+            transition_seq=transition_seq,
+            audit_record_id=selected_audit.record_id,
+            restored_capability_reservation_ids=restored_capabilities,
+            committed_capability_reservation_ids=committed_capabilities,
+            released_resource_reservation_ids=released_resources,
+        )
+
+    @staticmethod
+    def _external_effect_recovery_capability_reservation_ids(
+        effect: ExternalEffectRecord,
+    ) -> tuple[str, ...]:
+        protected = effect.provider_metadata.get("protected_operation")
+        if protected is None:
+            return ()
+        if not isinstance(protected, Mapping):
+            raise ValidationError(
+                "external effect recovery protected-operation evidence is invalid"
+            )
+        raw = protected.get("reservation_ids")
+        if not isinstance(raw, (list, tuple)) or any(
+            not isinstance(item, str) or not item for item in raw
+        ):
+            raise ValidationError(
+                "external effect recovery capability reservations are invalid"
+            )
+        selected = tuple(raw)
+        if len(selected) != len(set(selected)):
+            raise ValidationError(
+                "external effect recovery capability reservations are duplicated"
+            )
+        return selected
+
+    @staticmethod
+    def _require_external_effect_globally_not_started(
+        effect: ExternalEffectRecord,
+    ) -> None:
+        phases = effect.provider_metadata.get("completed_provider_phases") or []
+        if not isinstance(phases, list) or any(
+            not isinstance(phase, Mapping) for phase in phases
+        ):
+            raise ValidationError(
+                "external effect recovery provider phase evidence is invalid"
+            )
+        if any(
+            bool(phase.get("state_mutation"))
+            or bool(phase.get("information_flow"))
+            or bool(phase.get("commits_authority"))
+            for phase in phases
+        ):
+            raise ValidationError(
+                "phase-local not-started receipt cannot erase an earlier provider effect"
+            )
+
+    @staticmethod
+    def _external_effect_reservation_identity(
+        effect: ExternalEffectRecord,
+    ) -> tuple[str, str]:
+        protected = effect.provider_metadata.get("protected_operation")
+        if not isinstance(protected, Mapping):
+            raise ValidationError(
+                "external effect recovery reservation identity is missing"
+            )
+        actor = protected.get("actor")
+        contract_name = protected.get("contract_name")
+        if not isinstance(actor, str) or not actor or not isinstance(
+            contract_name, str
+        ) or not contract_name:
+            raise ValidationError(
+                "external effect recovery reservation identity is invalid"
+            )
+        return actor, contract_name
+
+    def _restore_external_effect_capability_reservation(
+        self,
+        cur: Any,
+        effect: ExternalEffectRecord,
+        *,
+        reservation_id: str,
+        updated_at: str,
+    ) -> None:
+        actor, contract_name = self._external_effect_reservation_identity(effect)
+        rows = list(
+            cur.execute(
+                "SELECT * FROM capability_use_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            )
+        )
+        if len(rows) != 1:
+            raise ValidationError(
+                "external effect recovery capability reservation is missing"
+            )
+        reservation = rows[0]
+        if (
+            reservation["status"] != "reserved"
+            or reservation["reserved_by"] != actor
+            or reservation["reason"]
+            != f"protected operation reserved authority for {contract_name}"
+        ):
+            raise ValidationError(
+                "external effect recovery capability reservation binding changed"
+            )
+        try:
+            count = _positive_capability_use_count(
+                reservation["count"],
+                label="persisted capability reservation count",
+            )
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        restored = cur.execute(
+            """
+            UPDATE capabilities
+               SET uses_remaining = uses_remaining + ?,
+                   status = CASE WHEN status = ? THEN ? ELSE status END
+             WHERE cap_id = ?
+               AND uses_remaining IS NOT NULL
+               AND status IN (?, ?)
+            """,
+            (
+                count,
+                CapabilityStatus.REVOKED.value,
+                CapabilityStatus.ACTIVE.value,
+                reservation["cap_id"],
+                CapabilityStatus.ACTIVE.value,
+                CapabilityStatus.REVOKED.value,
+            ),
+        )
+        if restored.rowcount != 1:
+            raise ValidationError(
+                "external effect recovery capability could not be restored"
+            )
+        changed = cur.execute(
+            """
+            UPDATE capability_use_reservations
+               SET status = 'restored', updated_at = ?
+             WHERE reservation_id = ? AND status = 'reserved'
+            """,
+            (updated_at, reservation_id),
+        )
+        if changed.rowcount != 1:
+            raise ValidationError(
+                "external effect recovery capability reservation raced"
+            )
+
+    def _commit_external_effect_capability_reservation(
+        self,
+        cur: Any,
+        effect: ExternalEffectRecord,
+        *,
+        reservation_id: str,
+        updated_at: str,
+    ) -> None:
+        actor, contract_name = self._external_effect_reservation_identity(effect)
+        rows = list(
+            cur.execute(
+                "SELECT * FROM capability_use_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            )
+        )
+        if len(rows) != 1:
+            raise ValidationError(
+                "external effect recovery capability reservation is missing"
+            )
+        reservation = rows[0]
+        if (
+            reservation["reserved_by"] != actor
+            or reservation["reason"]
+            != f"protected operation reserved authority for {contract_name}"
+            or reservation["status"] not in {"reserved", "committed"}
+        ):
+            raise ValidationError(
+                "external effect recovery capability reservation binding changed"
+            )
+        if reservation["status"] == "reserved":
+            changed = cur.execute(
+                """
+                UPDATE capability_use_reservations
+                   SET status = 'committed', updated_at = ?
+                 WHERE reservation_id = ? AND status = 'reserved'
+                """,
+                (updated_at, reservation_id),
+            )
+            if changed.rowcount != 1:
+                raise ValidationError(
+                    "external effect recovery capability reservation raced"
+                )
+
+    @staticmethod
+    def _release_external_effect_resource_reservations(
+        cur: Any,
+        effect: ExternalEffectRecord,
+        *,
+        updated_at: str,
+        release: bool,
+    ) -> tuple[str, ...]:
+        rows = list(
+            cur.execute(
+                "SELECT * FROM resource_usage_reservations WHERE reserved_by = ? "
+                "ORDER BY reservation_id",
+                (effect.effect_id,),
+            )
+        )
+        if any(str(row["pid"]) != effect.pid for row in rows):
+            raise ValidationError(
+                "external effect recovery resource reservation binding changed"
+            )
+        if not release:
+            return ()
+        released: list[str] = []
+        for row in rows:
+            if row["status"] != ResourceUsageReservationStatus.ACTIVE.value:
+                raise ValidationError(
+                    "external effect recovery resource reservation is no longer active"
+                )
+            reservation_id = str(row["reservation_id"])
+            changed = cur.execute(
+                """
+                UPDATE resource_usage_reservations
+                   SET status = ?, settled_usage_json = ?, updated_at = ?
+                 WHERE reservation_id = ? AND status = ?
+                """,
+                (
+                    ResourceUsageReservationStatus.RELEASED.value,
+                    dumps(ResourceUsage()),
+                    updated_at,
+                    reservation_id,
+                    ResourceUsageReservationStatus.ACTIVE.value,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise ValidationError(
+                    "external effect recovery resource reservation raced"
+                )
+            released.append(reservation_id)
+        return tuple(released)
+
     def current_effect_ledger_seq(self) -> int:
         rows = self._query(
             "SELECT value FROM runtime_counters WHERE counter_name = ?",
@@ -11148,6 +14067,39 @@ class SQLRuntimeStore:
         if not rows:
             raise ValidationError("external effect ledger counter is missing")
         return int(rows[0]["value"])
+
+    def external_effect_transition_matches(
+        self,
+        transition_seq: int,
+        effect_id: str,
+        *,
+        effect_state: str,
+        transaction_state: str,
+    ) -> bool:
+        if (
+            type(transition_seq) is not int
+            or transition_seq <= 0
+            or transition_seq > 2**63 - 1
+            or not isinstance(effect_id, str)
+            or not effect_id
+            or not isinstance(effect_state, str)
+            or not effect_state
+            or not isinstance(transaction_state, str)
+            or not transaction_state
+        ):
+            raise ValidationError("external effect transition identity is invalid")
+        rows = self._query(
+            "SELECT 1 FROM external_effect_transitions "
+            "WHERE seq = ? AND effect_id = ? AND effect_state = ? "
+            "AND transaction_state = ? LIMIT 1",
+            (
+                transition_seq,
+                effect_id,
+                effect_state,
+                transaction_state,
+            ),
+        )
+        return len(rows) == 1
 
     def list_external_effects_changed_after(
         self,
@@ -11519,6 +14471,205 @@ class SQLRuntimeStore:
             )
             return updated.rowcount == 1
 
+    def list_task_run_external_effects(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str] = (),
+    ) -> list[ExternalEffectRecord]:
+        """List only effects with both Run membership and durable link evidence."""
+
+        with self._join_or_begin_transaction() as cur:
+            pids = self._validated_task_run_pid_scope(run_id, linked_pids)
+            if not pids:
+                return []
+            hard_limit = self.config.task_runs.recovery_page_hard_limit
+            rows_by_id: dict[str, Any] = {}
+            for offset in range(0, len(pids), 400):
+                batch = pids[offset : offset + 400]
+                rows = list(
+                    cur.execute(
+                        "SELECT effect.* FROM external_effects AS effect "
+                        "JOIN processes AS process ON process.pid = effect.pid "
+                        "WHERE process.task_run_id = ? "
+                        f"AND effect.pid IN ({', '.join('?' for _ in batch)}) "
+                        "AND EXISTS ("
+                        "  SELECT 1 FROM task_run_links AS link "
+                        "  WHERE link.run_id = ? "
+                        "    AND link.evidence_type = 'external_effect' "
+                        "    AND link.evidence_id = effect.effect_id"
+                        ") ORDER BY effect.created_at, effect.effect_id LIMIT ?",
+                        (run_id, *batch, run_id, hard_limit + 1),
+                    )
+                )
+                for row in rows:
+                    rows_by_id[str(row["effect_id"])] = row
+                if len(rows_by_id) > hard_limit:
+                    raise ValidationError(
+                        "TaskRun external effects exceed the recovery hard cap"
+                    )
+        rows = sorted(
+            rows_by_id.values(),
+            key=lambda row: (str(row["created_at"]), str(row["effect_id"])),
+        )
+        return [self._row_to_external_effect(row) for row in rows]
+
+    def redact_task_run_external_effect_payload(
+        self,
+        record: ExternalEffectRecord,
+        *,
+        run_id: str,
+        expected_payload_sha256: str,
+        expected_tier: str,
+        expected_effect_state: str,
+        expected_transaction_state: str,
+    ) -> bool:
+        """CAS one canonical Run-linked effect payload reduction."""
+
+        if not isinstance(record, ExternalEffectRecord):
+            return False
+        try:
+            source_tier = PayloadRetentionTier(expected_tier)
+        except (TypeError, ValueError):
+            return False
+        with self._join_or_begin_transaction() as cur:
+            row = self._task_run_external_effect_redaction_source(
+                cur,
+                run_id=run_id,
+                effect_id=record.effect_id,
+            )
+            if row is None:
+                return False
+            current = self._row_to_external_effect(row)
+            try:
+                target_tier = validate_external_effect_payload_retention_update(
+                    current,
+                    record,
+                    expected_payload_sha256=expected_payload_sha256,
+                    expected_tier=source_tier,
+                    expected_effect_state=expected_effect_state,
+                    expected_transaction_state=expected_transaction_state,
+                )
+            except (TypeError, ValueError):
+                return False
+            if not self._task_run_external_effect_identity_matches(current, record):
+                return False
+            return self._redact_task_run_external_effect_payload_cas(
+                cur,
+                current=current,
+                target=record,
+                target_tier=target_tier,
+                run_id=run_id,
+                expected_effect_state=expected_effect_state,
+                expected_transaction_state=expected_transaction_state,
+            )
+
+    @staticmethod
+    def _task_run_external_effect_redaction_source(
+        cursor: Any,
+        *,
+        run_id: str,
+        effect_id: str,
+    ) -> Any | None:
+        return cursor.execute(
+            """
+            SELECT effect.* FROM external_effects AS effect
+            JOIN processes AS process ON process.pid = effect.pid
+            JOIN task_runs AS run ON run.run_id = process.task_run_id
+            WHERE effect.effect_id = ? AND process.task_run_id = ?
+              AND run.status IN (
+                'finalizing', 'succeeded', 'failed', 'cancelled'
+              )
+              AND EXISTS (
+                SELECT 1 FROM task_run_links AS link
+                WHERE link.run_id = run.run_id
+                  AND link.evidence_type = 'external_effect'
+                  AND link.evidence_id = effect.effect_id
+              )
+            """,
+            (effect_id, run_id),
+        ).fetchone()
+
+    @staticmethod
+    def _task_run_external_effect_identity_matches(
+        current: ExternalEffectRecord,
+        target: ExternalEffectRecord,
+    ) -> bool:
+        return replace(
+            target,
+            provider_metadata=current.provider_metadata,
+            provider_receipt=current.provider_receipt,
+            payload_retention_schema_version=(
+                current.payload_retention_schema_version
+            ),
+            payload_retention_tier=current.payload_retention_tier,
+            payload_retention_sha256=current.payload_retention_sha256,
+        ) == current
+
+    @staticmethod
+    def _redact_task_run_external_effect_payload_cas(
+        cursor: Any,
+        *,
+        current: ExternalEffectRecord,
+        target: ExternalEffectRecord,
+        target_tier: PayloadRetentionTier,
+        run_id: str,
+        expected_effect_state: str,
+        expected_transaction_state: str,
+    ) -> bool:
+        changed_count = cursor.execute(
+            """
+            UPDATE external_effects
+               SET provider_metadata_json = ?, provider_receipt_json = ?,
+                   payload_retention_schema_version = ?,
+                   payload_retention_tier = ?, payload_retention_sha256 = ?
+             WHERE effect_id = ? AND pid = ?
+               AND effect_state = ? AND transaction_state = ?
+               AND payload_retention_schema_version = ?
+               AND payload_retention_tier = ?
+               AND (
+                    (payload_retention_sha256 IS NULL AND CAST(? AS TEXT) IS NULL)
+                    OR payload_retention_sha256 = ?
+               )
+               AND provider_metadata_json = ? AND provider_receipt_json = ?
+               AND EXISTS (
+                    SELECT 1 FROM processes AS process
+                    JOIN task_runs AS run
+                      ON run.run_id = process.task_run_id
+                    WHERE process.pid = external_effects.pid
+                      AND process.task_run_id = ?
+                      AND run.status IN (
+                        'finalizing', 'succeeded', 'failed', 'cancelled'
+                      )
+               )
+               AND EXISTS (
+                    SELECT 1 FROM task_run_links AS link
+                    WHERE link.run_id = ?
+                      AND link.evidence_type = 'external_effect'
+                      AND link.evidence_id = external_effects.effect_id
+               )
+            """,
+            (
+                dumps(target.provider_metadata),
+                dumps(target.provider_receipt),
+                target.payload_retention_schema_version,
+                target_tier.value,
+                target.payload_retention_sha256,
+                current.effect_id,
+                current.pid,
+                expected_effect_state,
+                expected_transaction_state,
+                current.payload_retention_schema_version,
+                current.payload_retention_tier,
+                current.payload_retention_sha256,
+                current.payload_retention_sha256,
+                dumps(current.provider_metadata),
+                dumps(current.provider_receipt),
+                run_id,
+                run_id,
+            ),
+        ).rowcount
+        return changed_count == 1
+
     def insert_human_request(self, request: HumanRequest) -> None:
         self._execute(
             "INSERT INTO human_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -11591,6 +14742,345 @@ class SQLRuntimeStore:
         rows = self._query(sql, params)
         return [self._row_to_human_request(row) for row in rows]
 
+    def list_human_requests_for_pids(
+        self,
+        pids: Iterable[str],
+        *,
+        statuses: Iterable[HumanRequestStatus | str] | None = None,
+        limit: int,
+        cursor: str | tuple[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Return a bounded newest-first Human-request keyset page.
+
+        The cursor is opaque on the wire (``h1``); tuple input is retained for
+        repository callers that already decoded it.  PID batches keep every
+        statement below backend bind limits and are merged deterministically.
+        """
+
+        selected_pids = self._validated_task_run_human_pids(pids)
+        selected_limit = self._task_run_page_limit(
+            limit,
+            default=self.config.task_runs.list_page_size,
+            hard_limit=self.config.task_runs.list_hard_limit,
+            label="TaskRun Human request list",
+        )
+        after = self._decode_task_run_human_cursor(cursor)
+        selected_statuses = self._validated_task_run_human_statuses(statuses)
+        if not selected_pids or selected_statuses == ():
+            return {"records": (), "next_cursor": None, "schema_version": 1}
+
+        rows_by_id: dict[str, Any] = {}
+        for offset in range(0, len(selected_pids), 400):
+            batch = selected_pids[offset : offset + 400]
+            for row in self._query_task_run_human_batch(
+                batch,
+                statuses=selected_statuses,
+                after=after,
+                limit=selected_limit + 1,
+            ):
+                rows_by_id[str(row["request_id"])] = row
+        return self._task_run_human_page(rows_by_id.values(), selected_limit)
+
+    def _validated_task_run_human_pids(
+        self,
+        pids: Iterable[str],
+    ) -> tuple[str, ...]:
+        selected = tuple(dict.fromkeys(str(pid) for pid in pids if str(pid)))
+        if any(pid != pid.strip() or "\x00" in pid for pid in selected):
+            raise ValidationError("TaskRun Human request PID scope is invalid")
+        if len(selected) > self.config.task_runs.recovery_page_hard_limit:
+            raise ValidationError("TaskRun Human request PID scope exceeds its hard cap")
+        return selected
+
+    @staticmethod
+    def _validated_task_run_human_statuses(
+        statuses: Iterable[HumanRequestStatus | str] | None,
+    ) -> tuple[str, ...] | None:
+        if statuses is None:
+            return None
+        try:
+            return tuple(
+                dict.fromkeys(HumanRequestStatus(status).value for status in statuses)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("TaskRun Human request status is invalid") from exc
+
+    def _query_task_run_human_batch(
+        self,
+        pids: tuple[str, ...],
+        *,
+        statuses: tuple[str, ...] | None,
+        after: tuple[str, str] | None,
+        limit: int,
+    ) -> list[Any]:
+        clauses = [f"pid IN ({', '.join('?' for _ in pids)})"]
+        params: list[Any] = [*pids]
+        if statuses is not None:
+            clauses.append(f"status IN ({', '.join('?' for _ in statuses)})")
+            params.extend(statuses)
+        if after is not None:
+            clauses.append(
+                "(created_at COLLATE BINARY, request_id COLLATE BINARY) < (?, ?)"
+            )
+            params.extend(after)
+        params.append(limit)
+        return self._query(
+            "SELECT * FROM human_requests "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at COLLATE BINARY DESC, "
+            "request_id COLLATE BINARY DESC LIMIT ?",
+            params,
+        )
+
+    def _task_run_human_page(
+        self,
+        rows: Iterable[Any],
+        limit: int,
+    ) -> dict[str, Any]:
+        ordered = sorted(
+            rows,
+            key=lambda row: (str(row["created_at"]), str(row["request_id"])),
+            reverse=True,
+        )
+        records = tuple(
+            self._row_to_human_request(row) for row in ordered[:limit]
+        )
+        next_cursor = None
+        if len(ordered) > limit and records:
+            last = records[-1]
+            next_cursor = self._encode_task_run_human_cursor(
+                (last.created_at, last.request_id)
+            )
+        return {
+            "records": records,
+            "next_cursor": next_cursor,
+            "schema_version": 1,
+        }
+
+    @staticmethod
+    def _encode_task_run_human_cursor(key: tuple[str, str]) -> str:
+        encoded = json.dumps(
+            {"created_at": key[0], "request_id": key[1]},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return "h1." + base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_task_run_human_cursor(
+        cursor: str | tuple[str, str] | None,
+    ) -> tuple[str, str] | None:
+        if cursor is None or cursor == "":
+            return None
+        if isinstance(cursor, tuple):
+            if (
+                len(cursor) != 2
+                or not isinstance(cursor[0], str)
+                or not isinstance(cursor[1], str)
+                or not cursor[1]
+            ):
+                raise ValidationError("TaskRun Human request cursor is invalid")
+            return cursor
+        if not isinstance(cursor, str) or not cursor.startswith("h1.") or len(cursor) > 1024:
+            raise ValidationError("TaskRun Human request cursor is invalid")
+        try:
+            raw = cursor[3:]
+            raw += "=" * (-len(raw) % 4)
+            decoded = base64.b64decode(raw, altchars=b"-_", validate=True)
+            if len(decoded) > 512:
+                raise ValueError("cursor exceeds decoded bound")
+            payload = json.loads(decoded.decode("utf-8"))
+        except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValidationError("TaskRun Human request cursor is invalid") from exc
+        if not isinstance(payload, dict) or set(payload) != {"created_at", "request_id"}:
+            raise ValidationError("TaskRun Human request cursor is invalid")
+        created_at = payload.get("created_at")
+        request_id = payload.get("request_id")
+        if (
+            not isinstance(created_at, str)
+            or len(created_at) > 128
+            or not isinstance(request_id, str)
+            or not request_id
+            or len(request_id) > 256
+        ):
+            raise ValidationError("TaskRun Human request cursor is invalid")
+        return created_at, request_id
+
+    def list_task_run_human_requests(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str] = (),
+    ) -> list[HumanRequest]:
+        """List Human rows with both Run membership and durable link evidence."""
+
+        with self._join_or_begin_transaction() as cur:
+            pids = self._validated_task_run_pid_scope(run_id, linked_pids)
+            if not pids:
+                return []
+            hard_limit = self.config.task_runs.recovery_page_hard_limit
+            rows_by_id: dict[str, Any] = {}
+            for offset in range(0, len(pids), 400):
+                batch = pids[offset : offset + 400]
+                rows = list(
+                    cur.execute(
+                        "SELECT request.* FROM human_requests AS request "
+                        "JOIN processes AS process ON process.pid = request.pid "
+                        "WHERE process.task_run_id = ? "
+                        f"AND request.pid IN ({', '.join('?' for _ in batch)}) "
+                        "AND EXISTS ("
+                        "  SELECT 1 FROM task_run_links AS link "
+                        "  WHERE link.run_id = ? "
+                        "    AND link.evidence_type = 'human_request' "
+                        "    AND link.evidence_id = request.request_id"
+                        ") ORDER BY request.created_at, request.request_id LIMIT ?",
+                        (run_id, *batch, run_id, hard_limit + 1),
+                    )
+                )
+                for row in rows:
+                    rows_by_id[str(row["request_id"])] = row
+                if len(rows_by_id) > hard_limit:
+                    raise ValidationError(
+                        "TaskRun Human requests exceed the recovery hard cap"
+                    )
+        rows = sorted(
+            rows_by_id.values(),
+            key=lambda row: (str(row["created_at"]), str(row["request_id"])),
+        )
+        return [self._row_to_human_request(row) for row in rows]
+
+    def redact_task_run_human_request_payload(
+        self,
+        record: HumanRequest,
+        *,
+        run_id: str,
+        expected_payload_sha256: str,
+        expected_status: str,
+    ) -> bool:
+        """CAS one canonical Run-linked Human payload reduction."""
+
+        if not isinstance(record, HumanRequest):
+            return False
+        try:
+            source_status = HumanRequestStatus(expected_status)
+        except (TypeError, ValueError):
+            return False
+        from agent_libos.evidence.payload_retention import (
+            validate_terminal_task_run_human_redaction,
+        )
+
+        with self._join_or_begin_transaction() as cur:
+            row = self._task_run_human_redaction_source(
+                cur,
+                run_id=run_id,
+                request_id=record.request_id,
+            )
+            if row is None:
+                return False
+            current = self._row_to_human_request(row)
+            try:
+                validate_terminal_task_run_human_redaction(
+                    current,
+                    record,
+                    expected_payload_sha256=expected_payload_sha256,
+                    expected_status=source_status,
+                )
+            except (TypeError, ValueError):
+                return False
+            if replace(record, payload=current.payload, decision=current.decision) != current:
+                return False
+            return self._redact_task_run_human_request_payload_cas(
+                cur,
+                current=current,
+                target=record,
+                run_id=run_id,
+            )
+
+    @staticmethod
+    def _task_run_human_redaction_source(
+        cursor: Any,
+        *,
+        run_id: str,
+        request_id: str,
+    ) -> Any | None:
+        return cursor.execute(
+            """
+            SELECT request.* FROM human_requests AS request
+            JOIN processes AS process ON process.pid = request.pid
+            JOIN task_runs AS run ON run.run_id = process.task_run_id
+            WHERE request.request_id = ? AND process.task_run_id = ?
+              AND run.status IN (
+                'finalizing', 'succeeded', 'failed', 'cancelled'
+              )
+              AND EXISTS (
+                SELECT 1 FROM task_run_links AS link
+                WHERE link.run_id = run.run_id
+                  AND link.evidence_type = 'human_request'
+                  AND link.evidence_id = request.request_id
+              )
+            """,
+            (request_id, run_id),
+        ).fetchone()
+
+    @staticmethod
+    def _redact_task_run_human_request_payload_cas(
+        cursor: Any,
+        *,
+        current: HumanRequest,
+        target: HumanRequest,
+        run_id: str,
+    ) -> bool:
+        current_decision = (
+            dumps(current.decision) if current.decision is not None else None
+        )
+        target_decision = (
+            dumps(target.decision) if target.decision is not None else None
+        )
+        changed_count = cursor.execute(
+            """
+            UPDATE human_requests
+               SET payload_json = ?, decision_json = ?
+             WHERE request_id = ? AND pid = ? AND human = ? AND status = ?
+               AND blocking = ? AND created_at = ? AND updated_at = ?
+               AND payload_json = ?
+               AND ((decision_json IS NULL AND CAST(? AS TEXT) IS NULL)
+                    OR decision_json = ?)
+               AND EXISTS (
+                    SELECT 1 FROM processes AS process
+                    JOIN task_runs AS run
+                      ON run.run_id = process.task_run_id
+                    WHERE process.pid = human_requests.pid
+                      AND process.task_run_id = ?
+                      AND run.status IN (
+                        'finalizing', 'succeeded', 'failed', 'cancelled'
+                      )
+               )
+               AND EXISTS (
+                    SELECT 1 FROM task_run_links AS link
+                    WHERE link.run_id = ?
+                      AND link.evidence_type = 'human_request'
+                      AND link.evidence_id = human_requests.request_id
+               )
+            """,
+            (
+                dumps(target.payload),
+                target_decision,
+                current.request_id,
+                current.pid,
+                current.human,
+                current.status.value,
+                int(current.blocking),
+                current.created_at,
+                current.updated_at,
+                dumps(current.payload),
+                current_decision,
+                current_decision,
+                run_id,
+                run_id,
+            ),
+        ).rowcount
+        return changed_count == 1
+
     def insert_llm_call(self, record: LLMCallRecord) -> None:
         retention_tier = llm_call_payload_retention_tier(record)
         self._execute(
@@ -11643,6 +15133,244 @@ class SQLRuntimeStore:
     def get_llm_call(self, call_id: str) -> LLMCallRecord | None:
         rows = self._query("SELECT * FROM llm_calls WHERE call_id = ?", (call_id,))
         return self._row_to_llm_call(rows[0]) if rows else None
+
+    def list_task_run_llm_calls(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str] = (),
+    ) -> list[LLMCallRecord]:
+        pids = self._validated_task_run_pid_scope(run_id, linked_pids)
+        if not pids:
+            return []
+        rows: list[Any] = []
+        for offset in range(0, len(pids), 400):
+            batch = pids[offset : offset + 400]
+            rows.extend(
+                self._query(
+                    "SELECT call.* FROM llm_calls AS call "
+                    "JOIN processes AS process ON process.pid = call.pid "
+                    f"WHERE process.task_run_id = ? AND call.pid IN ({', '.join('?' for _ in batch)})",
+                    (run_id, *batch),
+                )
+            )
+        rows.sort(key=lambda row: (str(row["created_at"]), str(row["call_id"])))
+        return [self._row_to_llm_call(row) for row in rows]
+
+    def redact_task_run_llm_call_payload(
+        self,
+        record: LLMCallRecord,
+        *,
+        run_id: str,
+        expected_payload_sha256: str | None,
+        expected_tier: str,
+    ) -> bool:
+        """CAS one canonical reduction after the Run has fenced execution."""
+
+        if not isinstance(record, LLMCallRecord) or expected_payload_sha256 is None:
+            return False
+        try:
+            source_tier = PayloadRetentionTier(expected_tier)
+        except (TypeError, ValueError):
+            return False
+        with self.transaction() as cur:
+            row = cur.execute(
+                """
+                SELECT call.* FROM llm_calls AS call
+                JOIN processes AS process ON process.pid = call.pid
+                JOIN task_runs AS run ON run.run_id = process.task_run_id
+                WHERE call.call_id = ? AND run.run_id = ?
+                  AND run.status IN (
+                    'finalizing', 'succeeded', 'failed', 'cancelled'
+                  )
+                """,
+                (record.call_id, run_id),
+            ).fetchone()
+            if row is None:
+                return False
+            current = self._row_to_llm_call(row)
+            try:
+                target_tier = validate_terminal_task_run_llm_redaction(
+                    current,
+                    record,
+                    expected_payload_sha256=expected_payload_sha256,
+                    expected_tier=source_tier,
+                )
+            except (TypeError, ValueError):
+                return False
+            if llm_call_payload_sha256(current) != expected_payload_sha256:
+                return False
+            changed = cur.execute(
+                """
+                UPDATE llm_calls
+                   SET messages_json = ?, tools_json = ?, response_content = ?,
+                       tool_calls_json = ?, reasoning_json = ?, raw_response_json = ?,
+                       observability_json = ?, error = ?, payload_retention_tier = ?
+                 WHERE call_id = ? AND pid = ? AND status = ?
+                   AND payload_retention_tier = ?
+                   AND messages_json = ? AND tools_json = ?
+                   AND response_content = ? AND tool_calls_json = ?
+                   AND ((reasoning_json IS NULL AND CAST(? AS TEXT) IS NULL)
+                        OR reasoning_json = ?)
+                   AND ((raw_response_json IS NULL AND CAST(? AS TEXT) IS NULL)
+                        OR raw_response_json = ?)
+                   AND observability_json = ?
+                   AND ((error IS NULL AND CAST(? AS TEXT) IS NULL) OR error = ?)
+                """,
+                (
+                    dumps(record.messages),
+                    dumps(record.tools),
+                    record.response_content,
+                    dumps(record.tool_calls),
+                    dumps(record.reasoning) if record.reasoning is not None else None,
+                    dumps(record.raw_response) if record.raw_response is not None else None,
+                    dumps(record.observability),
+                    record.error,
+                    target_tier.value,
+                    current.call_id,
+                    current.pid,
+                    current.status,
+                    source_tier.value,
+                    dumps(current.messages),
+                    dumps(current.tools),
+                    current.response_content,
+                    dumps(current.tool_calls),
+                    dumps(current.reasoning) if current.reasoning is not None else None,
+                    dumps(current.reasoning) if current.reasoning is not None else None,
+                    dumps(current.raw_response) if current.raw_response is not None else None,
+                    dumps(current.raw_response) if current.raw_response is not None else None,
+                    dumps(current.observability),
+                    current.error,
+                    current.error,
+                ),
+            )
+            return changed.rowcount == 1
+
+    def list_task_run_llm_tool_outputs(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str] = (),
+    ) -> list[dict[str, Any]]:
+        pids = self._validated_task_run_pid_scope(run_id, linked_pids)
+        if not pids:
+            return []
+        rows: list[Any] = []
+        for offset in range(0, len(pids), 400):
+            batch = pids[offset : offset + 400]
+            rows.extend(
+                self._query(
+                    "SELECT output.* FROM llm_tool_outputs AS output "
+                    "JOIN processes AS process ON process.pid = output.pid "
+                    f"WHERE process.task_run_id = ? AND output.pid IN ({', '.join('?' for _ in batch)})",
+                    (run_id, *batch),
+                )
+            )
+        rows.sort(
+            key=lambda row: (
+                str(row["created_at"]),
+                str(row["pid"]),
+                str(row["response_id"]),
+                str(row["call_id"]),
+            )
+        )
+        return [dict(row) for row in rows]
+
+    def redact_task_run_llm_tool_output(
+        self,
+        *,
+        run_id: str,
+        pid: str,
+        response_id: str,
+        call_id: str,
+        expected_output_sha256: str,
+        redacted_output: str,
+    ) -> bool:
+        if (
+            not isinstance(expected_output_sha256, str)
+            or len(expected_output_sha256) != 64
+            or not isinstance(redacted_output, str)
+        ):
+            return False
+        with self.transaction() as cur:
+            row = cur.execute(
+                """
+                SELECT output.output_text
+                  FROM llm_tool_outputs AS output
+                  JOIN processes AS process ON process.pid = output.pid
+                  JOIN task_runs AS run ON run.run_id = process.task_run_id
+                 WHERE run.run_id = ? AND output.pid = ?
+                   AND output.response_id = ? AND output.call_id = ?
+                   AND run.status IN (
+                     'finalizing', 'succeeded', 'failed', 'cancelled'
+                   )
+                """,
+                (run_id, pid, response_id, call_id),
+            ).fetchone()
+            if row is None:
+                return False
+            current = str(row["output_text"])
+            canonical_redaction, source_sha256, changed_payload = (
+                redact_terminal_task_run_llm_tool_output(current)
+            )
+            if (
+                not changed_payload
+                or source_sha256 != expected_output_sha256
+                or canonical_redaction != redacted_output
+            ):
+                return False
+            changed = cur.execute(
+                """
+                UPDATE llm_tool_outputs
+                   SET output_text = ?, updated_at = ?
+                 WHERE pid = ? AND response_id = ? AND call_id = ?
+                   AND output_text = ?
+                """,
+                (redacted_output, utc_now(), pid, response_id, call_id, current),
+            )
+            return changed.rowcount == 1
+
+    def _validated_task_run_pid_scope(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str],
+    ) -> tuple[str, ...]:
+        if (
+            not isinstance(run_id, str)
+            or not run_id
+            or run_id != run_id.strip()
+            or "\x00" in run_id
+        ):
+            raise ValidationError("TaskRun payload scope has an invalid Run identity")
+        raw_pids = tuple(linked_pids)
+        if any(
+            not isinstance(pid, str)
+            or not pid
+            or pid != pid.strip()
+            or "\x00" in pid
+            for pid in raw_pids
+        ):
+            raise ValidationError("TaskRun payload scope contains an invalid PID")
+        selected = tuple(dict.fromkeys(raw_pids))
+        hard_limit = self.config.task_runs.recovery_page_hard_limit
+        if len(selected) > hard_limit:
+            raise ValidationError("TaskRun payload scope exceeds the recovery hard cap")
+        run_rows = self._query(
+            "SELECT run_id FROM task_runs WHERE run_id = ?",
+            (run_id,),
+        )
+        if not run_rows:
+            raise ValidationError("TaskRun payload scope requires an existing Run")
+        owned_rows = self._query(
+            "SELECT pid FROM processes WHERE task_run_id = ? ORDER BY pid LIMIT ?",
+            (run_id, hard_limit + 1),
+        )
+        if len(owned_rows) > hard_limit:
+            raise ValidationError("TaskRun process tree exceeds the recovery hard cap")
+        owned = tuple(str(row["pid"]) for row in owned_rows)
+        if selected:
+            if not set(selected).issubset(owned):
+                raise ValidationError("TaskRun payload scope contains an unowned PID")
+            return selected
+        return owned
 
     def scan_llm_call_payloads_for_retention(
         self,
@@ -12083,6 +15811,141 @@ class SQLRuntimeStore:
             rows = self._query("SELECT * FROM llm_pending_actions WHERE status = ? ORDER BY updated_at, pid", (status,))
         return [self._row_to_llm_pending_action(row) for row in rows]
 
+    def list_llm_pending_action_validation_rows(
+        self,
+        *,
+        after_pid: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Return a payload-free validation page for startup routing.
+
+        A corrupt TaskRun-owned pending bundle must be deferred to TaskRun
+        recovery rather than aborting Runtime assembly before it can project
+        ``needs_attention``.  Non-Run corruption remains fatal at the executor
+        boundary.  This seam never returns actions, filters, previews, tokens,
+        or other resumable content.
+        """
+
+        selected_limit = self._task_run_page_limit(
+            limit,
+            default=self.config.task_runs.recovery_page_size,
+            hard_limit=self.config.task_runs.recovery_page_hard_limit,
+            label="pending LLM action validation",
+        )
+        self._validate_pending_action_cursor(after_pid)
+        clause = "WHERE pending.pid > ?" if after_pid is not None else ""
+        params: list[Any] = [after_pid] if after_pid is not None else []
+        params.append(selected_limit + 1)
+        rows = self._query(
+            "SELECT pending.*, process.task_run_id AS task_run_id "
+            "FROM llm_pending_actions AS pending "
+            "LEFT JOIN processes AS process ON process.pid = pending.pid "
+            f"{clause} ORDER BY pending.pid COLLATE BINARY LIMIT ?",
+            params,
+        )
+        records = tuple(
+            self._pending_action_validation_projection(row)
+            for row in rows[:selected_limit]
+        )
+        next_cursor = None
+        if len(rows) > selected_limit and records:
+            next_cursor = records[-1]["pid"]
+        return {
+            "records": records,
+            "next_cursor": next_cursor,
+            "schema_version": 1,
+        }
+
+    @staticmethod
+    def _validate_pending_action_cursor(after_pid: str | None) -> None:
+        if after_pid is not None and (
+            not isinstance(after_pid, str)
+            or not after_pid
+            or after_pid != after_pid.strip()
+            or "\x00" in after_pid
+        ):
+            raise ValidationError("pending LLM action validation cursor is invalid")
+
+    def _pending_action_validation_projection(self, row: Any) -> dict[str, Any]:
+        task_run_id = row["task_run_id"]
+        try:
+            decoded = self._row_to_llm_pending_action(row)
+            self._validate_pending_action_shape(
+                decoded,
+                task_run_id=task_run_id,
+            )
+            valid = True
+            status = str(decoded["status"])
+        except (KeyError, TypeError, ValueError, ValidationError):
+            valid = False
+            status = "invalid"
+        return {
+            "pid": str(row["pid"]),
+            "status": status,
+            "task_run_id": str(task_run_id) if task_run_id is not None else None,
+            "decode_valid": valid,
+            "error_code": None if valid else "invalid_persisted_pending_action",
+        }
+
+    @classmethod
+    def _validate_pending_action_shape(
+        cls,
+        decoded: Mapping[str, Any],
+        *,
+        task_run_id: Any,
+    ) -> None:
+        status = decoded.get("status")
+        wait_type = decoded.get("wait_type")
+        if status not in {"pending", "resuming", "completed"}:
+            raise ValueError("invalid pending status")
+        if wait_type == "context_management":
+            cls._validate_legacy_context_management_marker(
+                decoded,
+                task_run_id=task_run_id,
+            )
+        elif wait_type not in {"llm_release", "human", "child", "message"}:
+            raise ValueError("invalid pending wait type")
+        if not isinstance(decoded.get("resume_token"), str) or not decoded.get(
+            "resume_token"
+        ):
+            raise ValueError("missing pending resume token")
+        if not isinstance(decoded.get("action"), dict) or not isinstance(
+            decoded.get("filters"), dict
+        ):
+            raise ValueError("pending action/filter payload has invalid shape")
+        tool_call_count = decoded.get("tool_call_count")
+        if type(tool_call_count) is not int or tool_call_count < 0:
+            raise ValueError("pending tool call count is invalid")
+        if wait_type in {"llm_release", "human"} and not decoded.get("request_id"):
+            raise ValueError("pending Human request identity is missing")
+        if wait_type == "child" and not decoded.get("child_pid"):
+            raise ValueError("pending child process identity is missing")
+
+    @staticmethod
+    def _validate_legacy_context_management_marker(
+        decoded: Mapping[str, Any],
+        *,
+        task_run_id: Any,
+    ) -> None:
+        """Recognize the narrow 1.0.1 non-Run compaction replay guard."""
+
+        filters = decoded.get("filters")
+        metadata = (
+            filters.get("__agent_libos_pending_metadata__")
+            if isinstance(filters, Mapping)
+            else None
+        )
+        if (
+            task_run_id is not None
+            or decoded.get("status") != "completed"
+            or not isinstance(metadata, Mapping)
+            or metadata.get("kind") != "context_management_auto"
+            or metadata.get("schema_version") != 1
+            or metadata.get("source") != "runtime_context_management"
+            or metadata.get("outcome") not in {"attempted", "compacted"}
+        ):
+            raise ValueError("invalid legacy context-management marker")
+
     def claim_llm_pending_action(self, pid: str, *, resume_token: str) -> dict[str, Any] | None:
         with self._join_or_begin_transaction() as cur:
             updated = cur.execute(
@@ -12231,6 +16094,7 @@ class SQLRuntimeStore:
         statuses: Iterable[ProcessMessageStatus | str] | None = None,
         kind: ProcessMessageKind | str | None = None,
         sender: str | None = None,
+        sender_prefix: str | None = None,
         channel: str | None = None,
         correlation_id: str | None = None,
         reply_to: str | None = None,
@@ -12254,9 +16118,13 @@ class SQLRuntimeStore:
             selected_kind = ProcessMessageKind(kind)
             clauses.append("kind = ?")
             params.append(selected_kind.value)
-        if sender is not None:
-            clauses.append("sender = ?")
-            params.append(sender)
+        sender_clause, sender_params = _process_message_sender_filter(
+            sender,
+            sender_prefix,
+        )
+        if sender_clause is not None:
+            clauses.append(sender_clause)
+            params.extend(sender_params)
         if channel is not None:
             clauses.append("channel = ?")
             params.append(channel)
@@ -13656,7 +17524,7 @@ class SQLRuntimeStore:
             sample_reservation_ids=tuple(recovered_sample),
         )
 
-    def _create_v3_data_flow_schema(self) -> None:
+    def _create_v4_data_flow_schema(self) -> None:
         self._execute_script(
             """
             CREATE TABLE IF NOT EXISTS sink_trust_registry (
@@ -13751,7 +17619,7 @@ class SQLRuntimeStore:
             """
         )
 
-    def _create_v3_operation_schema(self) -> None:
+    def _create_v4_operation_schema(self) -> None:
         self._execute_script(
             """
             CREATE TABLE IF NOT EXISTS operations (
@@ -13987,6 +17855,23 @@ class SQLRuntimeStore:
             process,
             allow_state_transition=False,
         )
+        task_run_fields = (
+            process.task_run_id,
+            process.task_run_epoch,
+            process.task_run_role,
+        )
+        if any(value is not None for value in task_run_fields):
+            if (
+                not isinstance(process.task_run_id, str)
+                or not process.task_run_id
+                or type(process.task_run_epoch) is not int
+                or process.task_run_epoch <= 0
+                or not isinstance(process.task_run_role, str)
+                or not process.task_run_role
+            ):
+                raise ValidationError(
+                    "process TaskRun binding requires run id, positive epoch, and role"
+                )
         return (
             process.pid,
             process.parent_pid,
@@ -14012,8 +17897,66 @@ class SQLRuntimeStore:
             process.execution_generation,
             process.execution_owner_id,
             process.execution_lease_id,
+            process.task_run_id,
+            process.task_run_epoch,
+            process.task_run_role,
             process.created_at,
             process.updated_at,
+        )
+
+    @staticmethod
+    def _task_run_params(run: TaskRunRecord) -> tuple[Any, ...]:
+        return (
+            run.run_id,
+            run.display_title,
+            run.image_id,
+            canonical_task_run_json(run.launch_options),
+            run.authority_manifest_id,
+            run.status.value,
+            run.revision,
+            run.runtime_epoch,
+            run.root_pid,
+            run.active_pid,
+            run.pause_generation,
+            run.cancel_generation,
+            run.binding_hash,
+            run.deadline_at,
+            run.retention.value,
+            canonical_task_run_json(list(run.blockers)),
+            run.requirement_count,
+            run.satisfied_requirement_count,
+            run.step_count,
+            run.completed_step_count,
+            run.result_ref,
+            run.created_at,
+            run.updated_at,
+            run.started_at,
+            run.completed_at,
+            run.finalized_at,
+            run.payloads_purged_at,
+        )
+
+    @staticmethod
+    def _task_run_resume_point_params(point: TaskRunResumePoint) -> tuple[Any, ...]:
+        return (
+            point.pid,
+            point.run_id,
+            point.task_run_epoch,
+            point.process_revision,
+            point.context_generation,
+            point.safe_point_seq,
+            point.binding_hash,
+            point.image_binding_hash,
+            point.tool_binding_hash,
+            point.provider_binding_hash,
+            point.transcript_payload_id,
+            point.summary_payload_id,
+            point.pending_action_payload_id,
+            point.last_effect_seq,
+            point.integrity_sha256,
+            int(point.complete),
+            point.created_at,
+            point.updated_at,
         )
 
     def _object_task_params(self, task: ObjectTask) -> tuple[Any, ...]:
@@ -14137,6 +18080,153 @@ class SQLRuntimeStore:
                 created_at=row["created_at"],
             )
 
+    def _row_to_task_run(self, row: Any) -> TaskRunRecord:
+        with _persisted_model_decode(f"TaskRun {row['run_id']}"):
+            return TaskRunRecord(
+                run_id=str(row["run_id"]),
+                status=TaskRunStatus(str(row["status"])),
+                display_title=str(row["display_title"]),
+                image_id=str(row["image_id"]),
+                launch_options=loads(row["launch_options_json"], {}),
+                authority_manifest_id=row["authority_manifest_id"],
+                deadline_at=row["deadline_at"],
+                retention=TaskRunRetention(str(row["retention"])),
+                revision=int(row["revision"]),
+                runtime_epoch=int(row["runtime_epoch"]),
+                root_pid=row["root_pid"],
+                active_pid=row["active_pid"],
+                pause_generation=int(row["pause_generation"]),
+                cancel_generation=int(row["cancel_generation"]),
+                binding_hash=row["binding_hash"],
+                blockers=tuple(loads(row["blockers_json"], [])),
+                requirement_count=int(row["requirement_count"]),
+                satisfied_requirement_count=int(row["satisfied_requirement_count"]),
+                step_count=int(row["step_count"]),
+                completed_step_count=int(row["completed_step_count"]),
+                result_ref=row["result_ref"],
+                created_at=str(row["created_at"]),
+                updated_at=str(row["updated_at"]),
+                started_at=row["started_at"],
+                completed_at=row["completed_at"],
+                finalized_at=row["finalized_at"],
+                payloads_purged_at=row["payloads_purged_at"],
+            )
+
+    def _row_to_task_run_requirement(self, row: Any) -> TaskRunRequirement:
+        with _persisted_model_decode(
+            f"TaskRun requirement {row['requirement_id']}"
+        ):
+            return TaskRunRequirement(
+                requirement_id=str(row["requirement_id"]),
+                run_id=str(row["run_id"]),
+                ordinal=int(row["ordinal"]),
+                kind=TaskRunRequirementKind(str(row["kind"])),
+                status=TaskRunRequirementStatus(str(row["status"])),
+                payload_id=str(row["payload_id"]),
+                requirement_sha256=str(row["requirement_sha256"]),
+                label=str(row["label"]),
+                created_by=str(row["created_by"]),
+                created_at=str(row["created_at"]),
+                updated_at=str(row["updated_at"]),
+                started_at=row["started_at"],
+                completed_at=row["completed_at"],
+                waived_by=row["waived_by"],
+                waiver_reason=row["waiver_reason"],
+            )
+
+    def _row_to_task_run_payload(self, row: Any) -> TaskRunPayload:
+        with _persisted_model_decode(f"TaskRun payload {row['payload_id']}"):
+            return TaskRunPayload(
+                payload_id=str(row["payload_id"]),
+                run_id=str(row["run_id"]),
+                role=str(row["role"]),
+                label=str(row["label"]),
+                canonical_json=row["canonical_json"],
+                sha256=str(row["sha256"]),
+                size_bytes=int(row["size_bytes"]),
+                retention_state=TaskRunPayloadRetention(
+                    str(row["retention_state"])
+                ),
+                created_at=str(row["created_at"]),
+                updated_at=str(row["updated_at"]),
+                purged_at=row["purged_at"],
+            )
+
+    def _row_to_task_run_resume_point(self, row: Any) -> TaskRunResumePoint:
+        with _persisted_model_decode(f"TaskRun resume point {row['pid']}"):
+            return TaskRunResumePoint(
+                run_id=str(row["run_id"]),
+                pid=str(row["pid"]),
+                task_run_epoch=int(row["task_run_epoch"]),
+                process_revision=int(row["process_revision"]),
+                context_generation=str(row["context_generation"]),
+                safe_point_seq=int(row["safe_point_seq"]),
+                binding_hash=str(row["binding_hash"]),
+                image_binding_hash=str(row["image_binding_hash"]),
+                tool_binding_hash=str(row["tool_binding_hash"]),
+                provider_binding_hash=str(row["provider_binding_hash"]),
+                transcript_payload_id=str(row["transcript_payload_id"]),
+                summary_payload_id=row["summary_payload_id"],
+                pending_action_payload_id=row["pending_action_payload_id"],
+                last_effect_seq=int(row["last_effect_seq"]),
+                integrity_sha256=str(row["integrity_sha256"]),
+                complete=bool(row["complete"]),
+                created_at=str(row["created_at"]),
+                updated_at=str(row["updated_at"]),
+            )
+
+    def _row_to_task_run_command(self, row: Any) -> TaskRunCommand:
+        with _persisted_model_decode(f"TaskRun command {row['command_id']}"):
+            result = bounded_json_loads(
+                row["result_json"],
+                max_bytes=self.config.task_runs.command_result_max_bytes,
+            )
+            return TaskRunCommand(
+                command_id=str(row["command_id"]),
+                client_request_id=row["client_request_id"],
+                run_id=str(row["run_id"]),
+                command_kind=str(row["command_kind"]),
+                request_hash=str(row["request_hash"]),
+                result=result,
+                result_revision=int(row["result_revision"]),
+                created_at=str(row["created_at"]),
+            )
+
+    def _row_to_task_run_ledger_item(self, row: Any) -> TaskRunLedgerItem:
+        with _persisted_model_decode(f"TaskRun ledger item {row['item_id']}"):
+            return TaskRunLedgerItem(
+                item_id=str(row["item_id"]),
+                run_id=str(row["run_id"]),
+                seq=int(row["seq"]),
+                kind=TaskRunLedgerKind(str(row["kind"])),
+                status=str(row["status"]),
+                label=str(row["label"]),
+                occurred_at=str(row["occurred_at"]),
+                requirement_id=row["requirement_id"],
+                pid=row["pid"],
+                operation_id=row["operation_id"],
+                effect_id=row["effect_id"],
+                human_request_id=row["human_request_id"],
+                llm_call_id=row["llm_call_id"],
+                checkpoint_id=row["checkpoint_id"],
+                object_task_id=row["object_task_id"],
+                payload_id=row["payload_id"],
+                metadata=loads(row["metadata_json"], {}),
+            )
+
+    def _row_to_task_run_link(self, row: Any) -> TaskRunLink:
+        with _persisted_model_decode(f"TaskRun link {row['link_id']}"):
+            return TaskRunLink(
+                link_id=str(row["link_id"]),
+                run_id=str(row["run_id"]),
+                ledger_seq=int(row["ledger_seq"]),
+                evidence_type=str(row["evidence_type"]),
+                evidence_id=str(row["evidence_id"]),
+                role=str(row["role"]),
+                metadata=loads(row["metadata_json"], {}),
+                created_at=str(row["created_at"]),
+            )
+
     def _row_to_process(self, row: Any) -> AgentProcess:
         with _persisted_model_decode(f"process {row['pid']}"):
             row_keys = set(row.keys())
@@ -14204,6 +18294,13 @@ class SQLRuntimeStore:
                 execution_generation=int(row["execution_generation"]),
                 execution_owner_id=row["execution_owner_id"],
                 execution_lease_id=row["execution_lease_id"],
+                task_run_id=row["task_run_id"],
+                task_run_epoch=(
+                    int(row["task_run_epoch"])
+                    if row["task_run_epoch"] is not None
+                    else None
+                ),
+                task_run_role=row["task_run_role"],
             )
 
     def _row_to_authority_manifest(self, row: Any) -> TaskAuthorityManifest:

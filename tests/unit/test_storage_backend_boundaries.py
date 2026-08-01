@@ -17,6 +17,7 @@ import agent_libos.storage.sqlite as sqlite_backend
 from agent_libos.models.exceptions import UnsupportedStoreVersion, ValidationError
 from agent_libos.storage.factory import _sqlite_target
 from agent_libos.storage.postgres import _PostgresCursor, _PostgresDialect
+from agent_libos.storage.sql import _V4_REQUIRED_INDEXES
 from agent_libos.storage import (
     PostgresStore,
     SQLRuntimeStore,
@@ -438,7 +439,7 @@ class TestStorageBackendBoundaries:
         assert "pg_catalog.pg_class" in connection.sql
         assert "current_schema()" in connection.sql
 
-    def test_postgres_v3_manifest_rejects_view_relation_before_column_probe(
+    def test_postgres_v4_manifest_rejects_view_relation_before_column_probe(
         self,
     ) -> None:
         class FakeConnection:
@@ -467,7 +468,7 @@ class TestStorageBackendBoundaries:
             UnsupportedStoreVersion,
             match=r"manifest relation types.*jsonrpc_endpoints",
         ):
-            PostgresStore._require_v3_schema_shape(connection)
+            PostgresStore._require_v4_schema_shape(connection)
 
         assert "pg_catalog.pg_class" in connection.sql
         assert "current_schema()" in connection.sql
@@ -591,18 +592,26 @@ class TestStorageBackendBoundaries:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # Identity leases normally share one per-user directory.  xdist workers
+        # legitimately create unrelated entries there, so use a private secure
+        # directory for this exact no-residue assertion instead of weakening it
+        # to ignore newly-created lease files.
+        identity_directory = tmp_path / "identity-leases"
+        identity_directory.mkdir(mode=0o700)
+        monkeypatch.setattr(
+            SQLiteStore,
+            "_secure_database_identity_lease_directory",
+            lambda _store: identity_directory,
+        )
         db_path = tmp_path / "runtime.sqlite"
         seeded = SQLiteStore(db_path)
         lease = seeded._lease_handle
-        identity_directory = lease.identity_path.parent if lease is not None else None
+        assert lease is not None
+        assert lease.identity_path.parent == identity_directory
         seeded.close()
         adjacent_lease = db_path.with_suffix(db_path.suffix + ".runtime.lock")
         adjacent_lease.unlink(missing_ok=True)
-        identity_before = (
-            {path.name for path in identity_directory.iterdir()}
-            if identity_directory is not None
-            else set()
-        )
+        identity_before = {path.name for path in identity_directory.iterdir()}
         original_preflight = SQLiteStore._preflight_existing_store
 
         def remove_after_preflight(store: SQLiteStore, path: Path) -> bool:
@@ -621,8 +630,7 @@ class TestStorageBackendBoundaries:
 
         assert not db_path.exists()
         assert not adjacent_lease.exists()
-        if identity_directory is not None:
-            assert {path.name for path in identity_directory.iterdir()} == identity_before
+        assert {path.name for path in identity_directory.iterdir()} == identity_before
 
     def test_sqlite_actual_connection_lease_survives_connect_path_retarget(
         self,
@@ -2016,7 +2024,7 @@ class TestStorageBackendBoundaries:
             "_write_store_schema_version",
             "_execute_script",
             "_rollback_scope",
-            "_initialize_v3_schema",
+            "_initialize_v4_schema",
             "transaction",
             "abandon_stale_capability_use_reservations",
             "_release_missing_runtime_object_payloads",
@@ -2198,6 +2206,68 @@ class TestStorageBackendBoundaries:
             'SELECT normalized_path FROM file_label_bindings '
             'WHERE normalized_path COLLATE "C" >= %s'
         )
+
+    @pytest.mark.parametrize("unusable_field", ["is_valid", "is_ready", "is_live"])
+    def test_postgres_v4_index_probe_rejects_unusable_catalog_state(
+        self,
+        unusable_field: str,
+    ) -> None:
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.sql = ""
+
+            def execute(
+                self,
+                sql: str,
+                params: object = (),
+            ) -> list[dict[str, object]]:
+                del params
+                self.sql = sql
+                rows: list[dict[str, object]] = []
+                for ordinal, (column, collation) in enumerate(
+                    (("status", None), ("created_at", "C"), ("run_id", "C")),
+                    start=1,
+                ):
+                    row: dict[str, object] = {
+                        "index_name": "idx_task_runs_status_created",
+                        "table_name": "task_runs",
+                        "is_unique": False,
+                        "is_valid": True,
+                        "is_ready": True,
+                        "is_live": True,
+                        "is_partial": False,
+                        "predicate_sql": None,
+                        "key_ordinal": ordinal,
+                        "column_name": column,
+                        "collation_name": collation,
+                        "is_descending": False,
+                        "is_constraint": False,
+                    }
+                    row[unusable_field] = False
+                    rows.append(row)
+                return rows
+
+        connection = FakeConnection()
+        shapes = PostgresStore._probe_index_shapes(connection, {"task_runs"})
+        expected = _V4_REQUIRED_INDEXES["idx_task_runs_status_created"]
+
+        problem = PostgresStore._v4_index_shape_problem(
+            "idx_task_runs_status_created",
+            expected,
+            shapes["idx_task_runs_status_created"],
+        )
+
+        assert problem == {
+            "expected_operability": {"valid": True, "ready": True, "live": True},
+            "actual_operability": {
+                "valid": unusable_field != "is_valid",
+                "ready": unusable_field != "is_ready",
+                "live": unusable_field != "is_live",
+            },
+        }
+        assert "index_row.indisvalid AS is_valid" in connection.sql
+        assert "index_row.indisready AS is_ready" in connection.sql
+        assert "index_row.indislive AS is_live" in connection.sql
 
     def test_postgres_dialect_translates_skill_trust_replace_upsert(self) -> None:
         prepared = _PostgresDialect().prepare(

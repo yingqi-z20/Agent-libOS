@@ -20,7 +20,7 @@ from agent_libos.runtime.checkpoint_reconciliation import (
     CheckpointRestoreReconciler,
 )
 from agent_libos.runtime.operation_manager import OperationManager
-from agent_libos.storage.sql import _V3_REQUIRED_COLUMNS
+from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS
 
 
 def test_publication_scale_profile_and_workflows_are_stable() -> None:
@@ -204,8 +204,8 @@ def test_publication_scale_reviews_only_the_exact_domain_validation_query() -> N
     )
 
 
-def test_publication_startup_v3_manifest_schema_probe_allowlist_is_exact() -> None:
-    manifest_tables = sorted(_V3_REQUIRED_COLUMNS)
+def test_publication_startup_v4_manifest_schema_probe_allowlist_is_exact() -> None:
+    manifest_tables = sorted(_V4_REQUIRED_COLUMNS)
 
     def manifest_probe(tables: list[str]) -> str:
         names = ", ".join(f"'{name}'" for name in tables)
@@ -217,7 +217,7 @@ def test_publication_startup_v3_manifest_schema_probe_allowlist_is_exact() -> No
     exact_probe = manifest_probe(manifest_tables)
     assert (
         publication_runner._publication_statement_shape(exact_probe)
-        == "v3_manifest_schema_probe"
+        == "v4_manifest_schema_probe"
     )
 
     near_or_arbitrary_probes = (
@@ -280,9 +280,11 @@ def test_publication_scale_traces_connect_wrapper_prefix_select(
         nonlocal connection_calls
         connection_calls += 1
         connection = real_connect(*args, **kwargs)
-        # Seed creation uses the first connection.  The measured reopen starts
-        # with the second, read-only preflight connection.
-        if connection_calls == 2:
+        # Seed creation is first. The supported-store preflight now validates
+        # an isolated safety snapshot second; the third connection is the
+        # measured main database and must have tracing installed before this
+        # wrapper can execute a prefix query.
+        if connection_calls == 3:
             connection.execute(
                 "SELECT * FROM runtime_publications LIMIT 1"
             ).fetchone()

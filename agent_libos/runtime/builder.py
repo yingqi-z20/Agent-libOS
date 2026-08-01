@@ -73,6 +73,7 @@ from agent_libos.runtime.scheduler import SimpleScheduler
 from agent_libos.runtime.syscall_router import SyscallRouter
 from agent_libos.runtime.syscalls import BUILTIN_SYSCALL_NAMES, LibOSSyscallSession
 from agent_libos.runtime.snapshots import ProcessExecStateService
+from agent_libos.runtime.task_runs import TaskRunManager
 from agent_libos.sdk import ProtectedOperationSDK
 from agent_libos.skills.manager import SkillManager
 from agent_libos.storage import (
@@ -2635,6 +2636,14 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 ),
             ),
             transitions=host.process_transitions,
+            task_run_fence_checker=(
+                lambda pid, run_id, epoch, action: host.task_runs.require_process_epoch(
+                    pid,
+                    run_id,
+                    epoch,
+                    action,
+                )
+            ),
         )
         host.resources.bind_process_kill_finalizer(
             host.process.finalize_killed_processes
@@ -2802,6 +2811,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             require_recovery_lease=host.lifecycle.require_recovery_lease,
             autostart=False,
         )
+        host.task_runs = TaskRunManager(host, config=host.config)
         host.process.bind_host_managed_runner_checker(
             host.object_tasks.is_runner_pid
         )
@@ -2841,7 +2851,10 @@ class RuntimeBuilder(Generic[RuntimeT]):
             drain_window_s=host.config.scheduler.drain_window_s,
             shutdown_join_timeout_s=host.config.scheduler.shutdown_join_timeout_s,
             resources=host.resources,
-            skip_pid=host.object_tasks.is_runner_pid,
+            skip_pid=lambda pid: (
+                host.object_tasks.is_runner_pid(pid)
+                or host.task_runs.should_skip_pid(pid)
+            ),
             cancel_process=host.process.cancel,
             blocking_work=host.blocking_work,
             owner_id=host.instance_id,
@@ -2902,6 +2915,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 client=llm_client,
                 config=host.config,
                 blocking_work=host.blocking_work,
+                task_runs=host.task_runs,
             )
         host.lifecycle.bind_components(
             scheduler=host.scheduler,
@@ -3088,6 +3102,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             operations=host.operations,
             owner_instance_id=host.instance_id,
             checkpoint_publication_writer=host.uow.checkpoint_restore_publications,
+            task_runs=host.task_runs,
             recovery_required_callback=host.lifecycle.mark_recovery_required,
             require_recovery_lease=host.lifecycle.require_recovery_lease,
             recovery_terminalization_scope=partial(
@@ -3103,16 +3118,15 @@ class RuntimeBuilder(Generic[RuntimeT]):
     @staticmethod
     def _recover_runtime_state(host: Runtime) -> None:
         with host.lifecycle.recovery_lease():
+            # TaskRun plaintext and integrity bindings are validated first and
+            # without dispatch.  Durable recovery effects run only after this
+            # read-only preflight has classified missing/corrupt payloads.
+            host.task_runs.validate_recoverable_payloads()
             recovery_page_size = (
                 host.config.runtime.external_effect_recovery_page_size
             )
             host.recovered_prepared_operations = host.protected_operations.recover_prepared(
                 page_size=recovery_page_size,
-            )
-            host.recovered_capability_use_reservations = (
-                host.uow.authority.abandon_stale_capability_use_reservations(
-                    require_recovery_lease=host.lifecycle.require_recovery_lease,
-                )
             )
             host.reconciled_external_effects = reconcile_pending_external_effects(
                 host.uow.protected_effects,
@@ -3120,6 +3134,15 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 require_recovery_lease=host.lifecycle.require_recovery_lease,
                 page_size=recovery_page_size,
                 provider_overrides={"git": host.git.provider},
+            )
+            # Provider reconciliation may prove an effect was never started
+            # and atomically restore the capability reservations bound in its
+            # metadata.  Stale-reservation abandonment must run afterwards or
+            # it would destroy the state that receipt settlement restores.
+            host.recovered_capability_use_reservations = (
+                host.uow.authority.abandon_stale_capability_use_reservations(
+                    require_recovery_lease=host.lifecycle.require_recovery_lease,
+                )
             )
             host.recovered_resource_usage_reservations = host.resources.recover_usage_reservations()
             host.recovered_exec_publications = host.image_boot.recover_incomplete_publications()
@@ -3152,6 +3175,8 @@ class RuntimeBuilder(Generic[RuntimeT]):
             )
             host.recovered_object_tasks = host.object_tasks.recover()
             host.recovered_terminal_cleanups = host.process.recover_terminal_cleanups()
+            host.recovered_task_runs = host.task_runs.recover_startup()
+            host.recovered_task_run_count = host.task_runs.recovered_total_count
 
     @staticmethod
     def _record_stale_execution_recovery(host: Runtime, pid: str) -> None:

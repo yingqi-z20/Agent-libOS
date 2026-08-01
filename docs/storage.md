@@ -1,6 +1,6 @@
 # Runtime Storage
 
-Agent libOS 1.0.1 stores durable runtime state through a `UnitOfWork` composed of
+Agent libOS 1.1.0 stores durable runtime state through a `UnitOfWork` composed of
 explicit domain boundaries, including `ProcessRepository`,
 `ResourceRepository`, `RuntimePublicationRepository`,
 `SnapshotCheckpointRepository`, `RuntimeModuleRepository`,
@@ -42,7 +42,7 @@ removed.
 
 SQLite is the default local engine. SQLite and PostgreSQL are independent
 connection/dialect/lease adapters over the same typed repository
-implementation and canonical store schema v3. The shared implementation emits a
+implementation and canonical store schema v4. The shared implementation emits a
 small SQLite-shaped SQL subset. The PostgreSQL dialect translates parameter
 placeholders, `COLLATE BINARY`, `INSERT OR IGNORE`, the one reviewed
 `INSERT OR REPLACE` upsert, `INDEXED BY`, the Skill-package description
@@ -78,53 +78,62 @@ transactions on the owning thread use savepoints; another thread cannot join an
 active outer transaction. PostgreSQL database concurrency does not imply that
 this repository has a connection pool or concurrent per-Runtime transactions.
 
-## Strict store schema v3
+## Strict store schema v4
 
-Fresh databases created by Agent libOS 1.0.1 use store schema v3 and create a
+Fresh databases created by Agent libOS 1.1.0 use store schema v4 and create a
 `runtime_schema` table with one marker row; the canonical DDL constrains its
 `singleton` value to `1`. Opening an existing store requires the row selected
-by `singleton = 1` to contain schema version `3`. Product version and store
-schema version are independent identifiers: `1.0.1` is the current product
-release, while `3` remains the persisted schema contract. Both backends apply
+by `singleton = 1` to contain schema version `4`. Product version and store
+schema version are independent identifiers: `1.1.0` is the current product
+release, while `4` is the persisted schema contract. Both backends apply
 the same acceptance rules, with one backend-specific initial probe order:
 
 1. SQLite validates `PRAGMA encoding` before reading the version marker;
    PostgreSQL reads the marker first and validates server encoding with the
    remaining shape probes.
-2. For a version-3 marker, require every manifest table and required column,
-   reject the obsolete `storage_migrations` table, and validate the required
-   keyset text-column collations. A required SQLite relation must have
+2. For a version-4 marker, require the exact manifest table set and exact
+   column-name set for every table, and validate the required keyset
+   text-column collations. The v4 Task Run/recovery index manifest also fixes
+   each required index's table, ordered columns, uniqueness, full/partial
+   shape, partial predicate, ascending direction, and keyset collation. A
+   PostgreSQL required index must additionally be valid, ready, and live. The
+   required Task Run unique constraints are checked, and extra declared indexes
+   on Task Run tables are rejected regardless of index name. A required SQLite relation must have
    `sqlite_master.type = 'table'`, and a required PostgreSQL relation must have
    `pg_class.relkind = 'r'`; a same-column view cannot impersonate a manifest
    table and is rejected before the initializer can mutate the schema.
-3. Reject a wrong marker, a store missing any of that probed surface, or an
-   unversioned target containing a probed user object. SQLite enumerates all
+3. Reject a wrong marker, a store with a missing/extra manifest table or
+   column, a store missing any other probed surface, or an unversioned target
+   containing a probed user object. SQLite enumerates all
    non-`sqlite_%` schema objects; PostgreSQL's freshness probe covers `pg_class`
    relation kinds `r`, `p`, `v`, `m`, `S`, and `f`, not function/type/domain-only
    schemas.
 4. In one transaction, run the idempotent initializer. For an accepted existing
-   version-3 store this can create missing named indexes and insert missing
-   canonical seed rows such as counters and the system namespace. For an empty
-   target it creates the complete schema and then writes the marker.
+   version-4 store this can insert allowed non-manifest seed rows such as the
+   system namespace; required counter seeds are validated during preflight and
+   cannot be repaired here. Its `CREATE INDEX IF NOT EXISTS` statements cannot
+   repair a missing or malformed v4-manifest index because preflight has already
+   rejected that store without writing. For an empty target it creates the
+   complete schema and then writes the marker.
 
 An interrupted bootstrap rolls back both schema and marker, so reopening the
-same empty target retries initialization instead of misclassifying it as a 0.2
-database.
+same empty target retries initialization instead of misclassifying it as an
+unsupported older database.
 
-The DDL emitted for a fresh schema-v3 store is the current release shape,
-including the typed process wait/outcome columns. It replaced draft v3 shapes
-before schema v3 was frozen for the legacy Agent libOS 0.3 product release;
-those development databases were never a supported release format. A version
-marker alone is insufficient: drafts missing a
-required table, required column, or canonical keyset collation are rejected,
-and the runtime does not present that rejection as a migration.
+The DDL emitted for a fresh schema-v4 store is the current release shape,
+including typed process wait/outcome fields and the Durable Task Run ledger,
+payload, resume-point, command, requirement, and link tables. A version marker
+alone is insufficient: stores missing a required table, required column,
+canonical keyset collation, required v4 index/unique shape, or required
+recovery predicate are rejected, and the runtime does not present that
+rejection as a migration.
 
 The open-time compatibility probe is intentionally not a byte-for-byte DDL
-validator. Apart from the checks above, it does not compare column types,
-`NOT NULL`/`CHECK`/foreign-key/primary-key constraints, arbitrary collations,
-extra columns or objects, or the definitions and uniqueness of existing
-indexes. Idempotent initialization does not replace a same-named index with a
-different definition. Operators must create stores through this release's
+validator. It rejects extra tables and columns, but apart from the checks above
+it does not compare column types, `NOT NULL`/`CHECK`/foreign-key/primary-key
+constraints, arbitrary collations outside the keyset manifest, extra non-table
+schema objects, or index/uniqueness definitions outside the explicit v4 Task
+Run/recovery manifest. Operators must create stores through this release's
 backend rather than treating a hand-built schema that passes the compatibility
 probe as canonical.
 
@@ -135,7 +144,7 @@ shape, and their covering indexes use the same collation. Queries inherit the
 validated column collation so SQLite retains composite row-value range seeks.
 SQLite database files and PostgreSQL servers must both use UTF-8 encoding;
 under UTF-8, `BINARY` and `"C"` ordering match Python's Unicode string ordering
-for persisted cursor values. Opening an existing version-3 store fails closed
+for persisted cursor values. Opening an existing version-4 store fails closed
 when its database encoding, any required keyset text column, or any required
 keyset text-column collation is not canonical; those required column
 collations are checked with one set-based catalog probe. A UTF-16 SQLite file
@@ -143,12 +152,132 @@ or locale-inheriting draft PostgreSQL schema is therefore rejected rather than
 silently paginating with a different order or degrading to a sort. This check
 does not validate the collation of text columns outside the keyset manifest.
 
-There are no migrations, backfills, or reconciliation paths from 0.2. A 0.2
-database is archive-only and must be opened with an archived 0.2 release. The
-current runtime raises `UnsupportedStoreVersion` before it initializes tables or
-changes rows. Checkpoints and checkpoint-derived Image artifacts are likewise
-strictly versioned and rejected before operation evidence or process state is
-written.
+There are no migrations, backfills, read-only compatibility modes, or dual
+schema paths from schema v3 to v4. A v3 database is archive-only for this
+release and must be opened with Agent libOS 1.0.1. Agent libOS 1.1.0 raises
+`UnsupportedStoreVersion` during preflight, before initialization, index
+creation, seed insertion, recovery, audit, or any other write. The same
+zero-write rule applies to older/unversioned stores and malformed v4 stores.
+SQLite performs this probe against a private snapshot so rejection leaves the
+original database, WAL/SHM sidecars, and any existing lease bytes and modes
+unchanged.
+Checkpoints and checkpoint-derived Image artifacts remain independently
+versioned and are rejected before operation evidence or process state is
+written when their own format is unsupported.
+
+### Durable Task Run records
+
+Schema v4 adds first-class Task Run state. `task_runs` is the mutable current
+projection and is updated only by revision compare-and-swap under the active
+Runtime epoch. `task_run_requirements`, `task_run_payloads`,
+`task_run_resume_points`, and `task_run_commands` hold the versioned inputs,
+safe local continuation points, and idempotent Host command receipts.
+`task_run_ledger` is append-only; `task_run_links` associates a ledger item
+with existing Operation, external-effect, Human, LLM, checkpoint, ObjectTask,
+or other evidence without copying that evidence into the Run. Process rows
+carry an optional Run identity, epoch, and role so child spawn and fork can
+inherit the supervising Run transactionally.
+
+For a split-phase Host mutation, a `task_run_commands` row fixes the command
+kind and canonical request hash. Every existing-Run mutation includes its
+`expected_revision` in that canonical envelope; changing only the revision
+under an existing command id is a command conflict and writes nothing. Its
+bounded `result_json` and `result_revision` may then advance only by
+compare-and-swap from a provisional
+`settlement_state=pending` summary to the exact completed summary. This update
+is intentionally separate from already committed Run/process state: a crash,
+lost response, or failure to write the final result leaves the pending row as a
+no-redispatch fence rather than evidence that the command never ran. Exact
+replay of `run`, cancel/deadline, resume, or interrupt receipts may settle only
+local generation-fenced state. It does not run another scheduler quantum,
+Provider, Tool, or external effect.
+
+Command-result decoding is strict and bounded. The Store rejects an oversized
+raw UTF-8 `result_json` before parsing, and writes recheck the canonical encoded
+size against `task_runs.command_result_max_bytes`. The version-1 envelope must
+contain the complete canonical public TaskRun summary bound to `run_id` and
+`result_revision`, and the Runtime accepts only the exact key set for the
+command/request-selected variant. Missing/extra keys, pending-only fields on a
+completed receipt, Boolean integers, and values outside signed BIGINT bounds
+fail closed.
+
+Split local-control pending and completed variants retain
+`admission_ledger_seq`, `admission_ledger_item_id`, and
+`admission_evidence_sha256`. Those fields identify the same-transaction
+append-only `STATUS_TRANSITION` item whose Run, command id/kind, request hash,
+from/to status, and canonical semantic evidence must all match before replay,
+including a terminal or superseded early return. Interrupt pending receipts
+also carry the raw admission Runtime epoch and canonical per-PID fences plus
+`interrupt_provenance_sha256`; completion drops the raw epoch/fences but retains
+that digest and the ledger reference. The digest still binds the removed
+pending fields through the immutable admission item.
+
+Authoritative effect-receipt recovery commits the provisional command row and
+the verifier-normalized ExternalEffect settlement in one transaction. If that
+commit survives but completion of the command result does not, replay checks
+the stored Run/effect/cancellation generation/admission epoch together with the
+exact `settlement_transition_seq` and `settlement_audit_record_id`. The former
+must name the append-only finalized effect transition and the latter the
+matching `external_effect.recovery_settled` audit decision sourced from
+`host_verified_receipt`; replay does not depend on purgeable provider metadata
+or receipt bodies and completes locally without calling the verifier again.
+For a recoverable nonterminal Run,
+startup settles already-staged complete provider results before it interprets a
+pending interrupt. Its eligible interrupt command scan is hard bounded; an
+oversized set, duplicate current-generation pending interrupt, or malformed
+interrupt receipt is not truncated into a recovery decision and instead blocks
+the Run in `needs_attention`. Cancellation/deadline state may outrank an older
+interrupt, and a terminal Run is not scanned merely to complete a command row;
+that historical receipt is completed only by exact client replay. See the
+complete [crash-safe command contract](durable_task_runs.md#crash-safe-command-settlement).
+
+Linked recovery also has a bounded command-only repair path for the crash gap
+between its committed deterministic nested rerun and its outer recover receipt.
+The nested request hash includes a versioned parent command id and outer-request
+hash. Exact outer replay may insert the missing receipt only after matching that
+nested command, its immutable source/target summaries, the target's create
+receipt and current Run identity, and exactly one append-only `rerun_of` link.
+It copies the nested result and result revision; it does not create another Run
+or select the source's current revision. A changed request or malformed,
+missing, duplicate, or over-bound evidence rolls back the repair.
+
+The Task Run ledger is durable metadata, not a tamper-proof event log. A
+database administrator can modify it. A Task Run's readable goal, follow-ups,
+resume bundle, and result material are a separate plaintext payload boundary.
+They may be written only when the Host has explicitly enabled Durable Task
+payload persistence. This release does not encrypt those values at rest; SQL
+database files, server administrators, and backups can read payloads retained
+as `plaintext`.
+
+The default Run retention policy is `purge_on_terminal`. Terminalization first
+enters `finalizing` and, in one transaction, replaces Run-owned readable
+payloads and linked LLM/tool-output content with canonical hash-only
+projections, deletes pending LLM continuation rows, and removes resume points.
+It deletes durable messages whose Run binding was derived from their Run-member
+recipient; an ordinary caller cannot suppress, override, or forge that binding.
+It replaces Run-linked Human request prompt, response, and decision bodies with
+hash projections while retaining request id, type, status, timestamps, audit
+linkage, and content digests. Linked terminal external-effect provider metadata
+and provider receipt bodies also move monotonically to canonical hash-only
+envelopes. Effect identity, state, classification, canonical-argument hash,
+original payload digest, receipt digest, and causal links remain; readable
+receipt content does not. The Run does not report `succeeded`, `failed`, or
+`cancelled` if that cleanup cannot commit. `permanent` retention is a Host/admin
+choice made at Run creation and skips automatic Run-terminal cleanup; ordinary
+evidence-retention policy remains independently applicable. A Host/admin may
+later apply the same audited cleanup explicitly to a terminal permanent Run.
+Neither policy makes ordinary Object Memory payloads durable.
+
+The backend's active-store lease still enforces one writable Runtime per
+database/schema. Schema v4 additionally records a monotonic Runtime epoch for
+Task Run execution. Claims, child publication, resume-point publication, and
+terminal settlement reject stale epochs. Every Task Run command insert and
+result update also performs a conditional no-op update of the global
+`task_run_runtime_epoch` counter row, using it as the SQLite/PostgreSQL row lock,
+then requires that same current epoch in the command mutation. This includes
+the linked-recovery missing-parent receipt path, so a superseded manager cannot
+insert or complete a command after a successor Runtime owns the store. This fencing protects cooperating
+Runtime instances; it does not protect against direct database writes.
 
 ## Transaction model
 
@@ -388,8 +517,8 @@ tools table. Candidate receipts bind the exact Object Memory descriptor OID,
 so cleanup and convergence checks use candidate/descriptor primary keys. The
 capability effect and its exact receipt share the publication UnitOfWork, so
 recovery has no metadata-scan fallback for unreceipted capabilities.
-`process_tool_bindings` is part of the complete fresh version-3 release shape,
-not a lazy projection or startup backfill. A draft version-3 database that
+`process_tool_bindings` is part of the complete fresh version-4 release shape,
+not a lazy projection or startup backfill. A draft version-4 database that
 lacks it is rejected by the strict shape probe; supported stores therefore
 retain the projection across reopen without scanning or rewriting processes.
 The projection also stores transactionally derived JIT eligibility. A
@@ -406,13 +535,13 @@ Data-flow evidence stores labels, source references, hashes, Sink/trust
 generation, and decisions—not payload copies. LLM pending actions and context
 generations retain canonical metadata-only `DataFlowContext` values. The
 label/source JSON and pending-action context columns required by those records
-are non-null in the fresh schema-v3 DDL, and row decoders require their canonical
+are non-null in the fresh schema-v4 DDL, and row decoders require their canonical
 object shapes and complete security labels. Malformed persisted values fail
 closed instead of being repaired heuristically; other schema fields may still
 be nullable where their domain permits it.
 
 Process control state is persisted structurally. `wait_state_json` is a tagged
-child/message/human/tool/pause/Host-resume wait, `outcome_json` is a tagged
+child/message/human/tool/pause/Host-resume/stale-execution wait, `outcome_json` is a tagged
 exited/failed/killed outcome, and `state_generation` advances on every semantic
 state transition. Normal runtime orchestration makes those transitions through
 one `ProcessTransitionService`. The only explicit exceptions are typed
@@ -421,8 +550,24 @@ lease or snapshot restore; an exec-epoch commit additionally requires the exact
 non-null admission token recorded by the matching applying `process_exec`
 publication at its final pre-commit phase, then CASes RUNNING status,
 generation, owner, and lease.
-For ordinary waits and outcomes, `status_message` is only a compatibility
-projection for older clients and is never parsed as the control protocol. The
+Startup stale-execution recovery is the other Store-owned semantic boundary.
+Its exact owner/lease/state/execution-generation CAS atomically pauses the row,
+clears the raw execution token, and writes an owner/lease-identity-hash-only
+`StaleExecutionProcessWait`; an owner or generation that changes after the
+recovery SELECT makes that row a CAS loser and it is not paused. Only the PID,
+canonical recovering-Runtime owner-id/prior-owner/prior-lease SHA-256 values,
+and generation receipt are projected. The recovering-owner digest is an
+identity hash rather than a cryptographic signature; this provenance relies on
+the RuntimeStore and database administrator being inside the trusted computing
+base. A later exclusive Runtime may accept the historical recovering-owner hash
+across another reopen, but TaskRun admission/current epochs, per-process
+generation fences, safe-point integrity, and current bindings remain
+authoritative in their existing rows and are not copied into the generic
+process wait. Normal transition and execution-completion APIs reject callers
+that attempt to create this reserved receipt.
+For every current-v4 typed wait and outcome, including stale execution,
+`status_message` is only a compatibility projection for older clients and is
+never parsed as the control protocol. The
 narrow internal exception is checkpoint-fork publication: newly inserted
 non-terminal rows carry the reserved `checkpoint_fork_pending_payload` sentinel
 as a quarantine CAS marker until captured payloads are rehydrated and exact
@@ -461,7 +606,7 @@ specified in [Runtime Events](events.md).
 
 ## Backup and restore runbook
 
-This runbook covers the supported recovery unit: one quiesced schema-v3 SQL
+This runbook covers the supported recovery unit: one quiesced schema-v4 SQL
 store restored into a new target and then opened by the same Agent libOS
 release. It is an operational database backup, not a checkpoint restore and not
 a snapshot of the whole environment.
@@ -484,7 +629,7 @@ Before either backend is backed up:
    not proceed from a recovery-required or incomplete shutdown result.
 4. Record the Agent libOS product version, backend configuration, and the value
    of `runtime_schema.schema_version`. For this release the expected pair is
-   product `1.0.1`, store schema `3`.
+   product `1.1.0`, store schema `4`.
 5. Prepare an owner-only backup directory and run the dump-producing command
    under `umask 077`. Before accepting either backend's archive, verify it is a
    regular, current-user-owned, single-link file with mode `0600`.
@@ -524,7 +669,7 @@ Use this procedure only for a file-backed SQLite target; `local` and
 3. To restore, keep the source database untouched and materialize the verified
    backup at a new, owner-only path. Do not restore over a path held by a live
    Runtime and do not restore old lease/sidecar files. Point a stopped Host at
-   the new path and let `Runtime.open()` perform the complete schema-v3 shape,
+   the new path and let `Runtime.open()` perform the complete schema-v4 shape,
    encoding, collation, and startup-recovery checks. Keep the old target until
    that open and a clean shutdown succeed.
 
@@ -580,19 +725,21 @@ stopped and its advisory-lock session closed:
    ```
 
    Require the restored `current_schema()` to equal the dumped schema and the
-   schema version to equal `3` before opening the Runtime.
+   schema version to equal `4` before opening the Runtime.
 
 3. Point a stopped Host at the restored target. `Runtime.open()` must acquire
-   the new target's advisory lease and pass the schema-v3 table, column,
+   the new target's advisory lease and pass the schema-v4 table, column,
    encoding, and keyset-collation probes before the target is promoted. Keep
    the original database until the restored Runtime also shuts down cleanly.
 
 ### Coverage and online-backup boundary
 
 The SQL backup includes durable process, authority, registry, checkpoint/Image
-artifact, operation, audit, event, and external-effect rows at the database
-snapshot. It also includes any still-full internal root-spawn initial-goal
-recovery envelope, so the backup must be protected as payload-bearing evidence.
+artifact, operation, audit, event, Task Run, and external-effect rows at the
+database snapshot. It also includes any still-full internal root-spawn
+initial-goal recovery envelope and any plaintext Task Run payload or full linked
+Human request/provider receipt captured before terminal purge, so the backup
+must be protected as payload-bearing evidence.
 It does not include other volatile Object payloads that were not explicitly
 serialized into an artifact, process workspaces or arbitrary filesystem/Git
 state, Host configuration and secrets, live provider sessions, or remote side

@@ -11,6 +11,7 @@ import { CapabilityPanel } from "./CapabilityPanel";
 import { CheckpointPanel } from "./CheckpointPanel";
 import { ModulesPanel } from "./ModulesPanel";
 import { ObjectTasksPanel } from "./ObjectTasksPanel";
+import { TaskRunsPanel } from "./TaskRunsPanel";
 import { ProcessOverview } from "./ProcessOverview";
 import { RemoteRegistryPanel } from "./RemoteRegistryPanel";
 import { SkillsPanel } from "./SkillsPanel";
@@ -22,6 +23,7 @@ const tabs = [
   { key: "capabilities", label: "details.capabilities" },
   { key: "toolsSkills", label: "details.toolsSkills" },
   { key: "checkpoints", label: "details.checkpoints" },
+  { key: "taskRuns", label: "details.taskRuns" },
   { key: "tasks", label: "details.tasks" },
   { key: "audit", label: "details.audit" },
   { key: "explain", label: "details.explain" },
@@ -32,7 +34,7 @@ const tabs = [
   { key: "images", label: "details.images" },
   { key: "objectMemory", label: "details.objectMemory" }
 ] as const satisfies ReadonlyArray<{ key: string; label: TranslationKey }>;
-const hostTabs = new Set<TabKey>(["toolsSkills", "jsonRpc", "mcp", "modules", "images"]);
+const hostTabs = new Set<TabKey>(["taskRuns", "toolsSkills", "jsonRpc", "mcp", "modules", "images"]);
 
 type TabKey = (typeof tabs)[number]["key"];
 
@@ -204,7 +206,7 @@ function renderTab(
     confirmAction?(request: ConfirmationRequest): void;
   }
 ) {
-  if (!process && !["jsonRpc", "mcp", "toolsSkills", "images", "modules"].includes(tab)) return <div className="empty">{t("details.selectProcess")}</div>;
+  if (!process && !["taskRuns", "jsonRpc", "mcp", "toolsSkills", "images", "modules"].includes(tab)) return <div className="empty">{t("details.selectProcess")}</div>;
   const adminReady = imageActions.client && imageActions.runAction && imageActions.confirmAction;
   if (tab === "overview" && process) return <ProcessOverview process={process} />;
   if (tab === "rating") return <RatingPanel process={process} onSave={imageActions.onRate} />;
@@ -212,6 +214,7 @@ function renderTab(
   if (tab === "toolsSkills" && process && adminReady) return <SkillsPanel key={`${imageActions.connectionEpoch}:${process.pid}`} process={process} skills={snapshot.skills} tools={snapshot.tools} client={imageActions.client!} confirmAction={imageActions.confirmAction!} />;
   if (tab === "toolsSkills") return <JsonBlock value={{ process_tools: process?.tool_table, loaded_skills: process?.loaded_skills, registry: snapshot.skills, tools: snapshot.tools }} />;
   if (tab === "checkpoints" && process && adminReady) return <CheckpointPanel key={adminPanelKey(process, imageActions.connectionEpoch)} process={process} client={imageActions.client!} runAction={imageActions.runAction!} confirmAction={imageActions.confirmAction!} reloadKey={adminRefreshKey(process, snapshot)} />;
+  if (tab === "taskRuns" && adminReady) return <TaskRunsPanel key={`${imageActions.connectionEpoch}:task-runs`} runs={snapshot.task_runs} client={imageActions.client!} runAction={imageActions.runAction!} confirmAction={imageActions.confirmAction!} />;
   if (tab === "tasks" && process && adminReady) return <ObjectTasksPanel key={`${imageActions.connectionEpoch}:${process.pid}`} process={process} tasks={snapshot.object_tasks} tools={snapshot.tools} client={imageActions.client!} runAction={imageActions.runAction!} confirmAction={imageActions.confirmAction!} />;
   if (tab === "audit" && process && imageActions.client) return <AuditPanel key={`${imageActions.connectionEpoch}:${process.pid}`} process={process} snapshot={snapshot} client={imageActions.client} />;
   if (tab === "audit") return <JsonBlock value={snapshot.audit.filter((item) => item.actor === process?.pid || item.target === `process:${process?.pid}`)} />;

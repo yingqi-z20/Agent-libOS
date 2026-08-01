@@ -1,6 +1,6 @@
 # Runtime Events
 
-Agent libOS 1.0.1 persists a closed catalog of 45 `EventType` values. Events
+Agent libOS 1.1.0 persists a closed catalog of `EventType` values. Events
 are durable observations for operators, the GUI, context materialization, and
 Explain evidence. They are not an authority source, a task queue, or a
 replacement for the process, operation, capability, Human-request, or external-
@@ -13,7 +13,7 @@ Every stored `Event` has these fields:
 | Field | Contract |
 | --- | --- |
 | `event_id` | Opaque primary key. Ordinary `emit()` generates it; `emit_once()` requires the Host producer to supply a stable semantic id. Do not infer time or sequence from the id. |
-| `type` | One of the 45 values in the catalog below. Unknown values are rejected before insertion. |
+| `type` | One of the 46 values in the catalog below. Unknown values are rejected before insertion. |
 | `source` | Producer-selected string identity. It may be a PID, Runtime/component name, capability issuer, Human identity, or resource; it is not a foreign key. |
 | `target` | Producer-selected string identity or `null` for a broadcast observation. It is not a grant or proof of visibility. A target-filtered query returns both exact-target events and `target=null` broadcasts. |
 | `payload` | JSON object owned by the event producer. The catalog lists current discriminators and common keys; failure/recovery variants may add diagnostic fields. Consumers must tolerate additional keys and must not treat an event payload as an authority decision unless the owning domain contract says so. |
@@ -35,11 +35,12 @@ stable discriminator/common fields rather than defining a closed JSON Schema.
 | Event type | Producer and meaning | Source → target | Payload | Non-normal priority |
 | --- | --- | --- | --- | --- |
 | `runtime_shutdown` | Runtime lifecycle records an admitted shutdown attempt reaching its evidence phase | shutdown actor → `runtime` | `reason` | — |
+| `task_run_created` | `TaskRunManager` atomically publishes a new durable Run together with its root process and initial requirement | `runtime.task_runs` → Run id | `schema_version`, `run_id`, `root_pid`, `revision` | — |
 | `process_created` | `ProcessManager` publishes a root or spawned child | `runtime` or parent PID → new PID | root: `pid`, `image`, `goal_oid`, `working_directory`, `llm_profile_id`; child: `parent`, `child`, `image`, `goal_oid`, `working_directory`, `status`, `llm_profile_id` | — |
 | `process_forked` | `ProcessManager` publishes a fork, or `CheckpointManager` publishes a checkpoint fork | parent/source actor → child/fork-root PID | direct fork: `parent`, `child`, `mode`, `working_directory`, `llm_profile_id`; checkpoint fork: `checkpoint_id`, `source_pid`, `fork_root_pid` | — |
 | `process_exec` | `ProcessManager` commits an image replacement | PID → same PID | `old_image`, `new_image`, `preserve_memory`, `preserve_capabilities`, `goal_oid`, `working_directory`, `llm_profile_id` | — |
 | `process_exited` | `ProcessManager` records a terminal outcome; terminal recovery uses `emit_once()` | PID → parent PID or `null` | `pid`, `status`, `result_oid`; recovery/signal finalization may add `reason` | — |
-| `process_message_posted` | `ProcessMessageManager` commits a durable mailbox message | sender identity → recipient PID | `message_id`, `kind`, `channel`, `correlation_id`, `reply_to`, `subject`, `sender`, `data_labels` | `high` for interrupt messages |
+| `process_message_posted` | `ProcessMessageManager` commits a durable mailbox message | sender identity → recipient PID | ordinary message: `message_id`, `kind`, `channel`, `correlation_id`, `reply_to`, `subject`, `sender`, `data_labels`; Task Run-bound message: IDs/labels plus `task_run_id`, `subject_sha256`, `body_sha256`, `payload_sha256`, with no readable content | `high` for interrupt messages |
 | `process_message_notice` | `ProcessMessageManager` publishes a tool-boundary notice | notice source → recipient PID | `phase`, `kind`, `count`, `message_ids`, `channels`, `correlation_ids`, `instruction`; the model projection reduces this to the read-pending control, count, and kind | `high` for interrupt notices |
 | `process_message_acked` | `ProcessMessageManager` commits acknowledgement | recipient PID → same PID | `message_ids`, `count` | — |
 | `process_signal` | Process/Human control or stale-execution recovery records a state-changing signal | actor/component → PID | ordinary: `signal`, `payload`; recovery: `pid`, `reason` | — |

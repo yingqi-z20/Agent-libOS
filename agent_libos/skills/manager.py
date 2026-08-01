@@ -81,6 +81,20 @@ _BUILTIN_PROJECTION_RECEIPT_ACTION = "skill.builtin_projection.receipt"
 _BUILTIN_PROJECTION_RECEIPT_SCHEMA_VERSION = 1
 _BUILTIN_PROJECTION_RECEIPT_FIELD = "builtin_projection_receipt_id"
 _SKILL_PACKAGE_READ_CHUNK_BYTES = 64 * 1024
+_LOADED_SKILL_FIELDS = frozenset(LoadedSkill.__dataclass_fields__)
+_ACTIVATED_SKILL_RESULT_FIELDS = frozenset(
+    {
+        "pid",
+        "skill_id",
+        "name",
+        "version",
+        "tool_names",
+        "tool_ids",
+        "jit_tool_ids",
+        "instructions_hash",
+        "package_sha256",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -1041,6 +1055,167 @@ class SkillManager:
             receipt_recorder=receipt_recorder,
             deferred_jit_finalization=_deferred_jit_finalization,
         )
+
+    def validate_activated_skill_result(
+        self,
+        pid: str,
+        result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Validate a completed activation against its durable process state.
+
+        This is a read-only certification seam for TaskRun safe-point
+        settlement.  It does not make an arbitrary tool-table change trusted:
+        callers must separately prove the complete pre/post table delta.
+        """
+
+        selected = self._validated_activation_result_shape(pid, result)
+        process = self.processes.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        skill_id = selected["skill_id"]
+        loaded = process.loaded_skills.get(skill_id)
+        if not isinstance(loaded, dict):
+            raise ValidationError(
+                f"activated Skill has no durable loaded record: {skill_id}"
+            )
+        self._require_loaded_skill_provenance(loaded)
+        activation_kind = str(loaded.get("activation_kind") or "")
+        allowed_loaded_fields = set(_LOADED_SKILL_FIELDS)
+        if activation_kind == "builtin_projection":
+            allowed_loaded_fields.add(_BUILTIN_PROJECTION_RECEIPT_FIELD)
+            skill, trusted_tool_ids = self._validate_loaded_builtin_projection_record(
+                skill_id,
+                loaded,
+            )
+            if not self.builtin_projection_supported_by_process(
+                process,
+                skill_id,
+                loaded,
+            ):
+                raise ValidationError(
+                    f"activated built-in Skill escapes its Image binding: {skill_id}"
+                )
+            if self._loaded_tool_id_map(loaded, "tool_ids") != trusted_tool_ids:
+                raise ValidationError(
+                    f"activated built-in Skill tool binding changed: {skill_id}"
+                )
+        elif activation_kind == "registered":
+            if self._builtin_catalog.is_builtin_id(skill_id):
+                raise ValidationError(
+                    f"built-in Skill lost projection provenance: {skill_id}"
+                )
+            skill = self._skill_for_loaded_record(skill_id, loaded)
+            self._validate_registered_loaded_tool_sets(skill_id, skill, loaded)
+        else:
+            raise ValidationError(
+                f"activated Skill has an invalid activation kind: {skill_id}"
+            )
+        if set(loaded) != allowed_loaded_fields:
+            raise ValidationError(
+                f"activated Skill loaded record has an invalid shape: {skill_id}"
+            )
+        self._require_activation_result_matches_loaded(
+            selected,
+            loaded,
+            skill=skill,
+        )
+        return {
+            "activation_kind": activation_kind,
+            "skill_id": skill_id,
+            "package_sha256": skill.package_sha256,
+            "instructions_hash": self._hash_text(skill.instructions),
+        }
+
+    def _validated_activation_result_shape(
+        self,
+        pid: str,
+        result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(result, Mapping) or set(result) != _ACTIVATED_SKILL_RESULT_FIELDS:
+            raise ValidationError("TaskRun activate_skill result has an invalid shape")
+        selected = dict(result)
+        if selected.get("pid") != pid:
+            raise ValidationError("TaskRun activate_skill result changed process")
+        for field in (
+            "skill_id",
+            "name",
+            "version",
+            "instructions_hash",
+            "package_sha256",
+        ):
+            if not isinstance(selected.get(field), str) or not selected[field]:
+                raise ValidationError(
+                    f"TaskRun activate_skill result has an invalid {field}"
+                )
+        if not isinstance(selected.get("tool_names"), list) or any(
+            not isinstance(name, str) or not name
+            for name in selected["tool_names"]
+        ):
+            raise ValidationError("TaskRun activate_skill result has invalid tool names")
+        for field in ("tool_ids", "jit_tool_ids"):
+            if not isinstance(selected.get(field), dict) or any(
+                not isinstance(name, str)
+                or not name
+                or not isinstance(tool_id, str)
+                or not tool_id
+                for name, tool_id in selected[field].items()
+            ):
+                raise ValidationError(
+                    f"TaskRun activate_skill result has invalid {field}"
+                )
+        return selected
+
+    def _validate_registered_loaded_tool_sets(
+        self,
+        skill_id: str,
+        skill: SkillPackage,
+        loaded: Mapping[str, Any],
+    ) -> None:
+        tool_ids = self._loaded_tool_id_map(loaded, "tool_ids")
+        jit_tool_ids = self._loaded_tool_id_map(loaded, "jit_tool_ids")
+        expected_jit_names = {tool.name for tool in skill.jit_tools}
+        if set(tool_ids) != set(skill.allowed_tools):
+            raise ValidationError(
+                f"activated Skill static tool provenance changed: {skill_id}"
+            )
+        if set(jit_tool_ids) != expected_jit_names:
+            raise ValidationError(
+                f"activated Skill JIT tool provenance changed: {skill_id}"
+            )
+
+    def _require_activation_result_matches_loaded(
+        self,
+        result: Mapping[str, Any],
+        loaded: Mapping[str, Any],
+        *,
+        skill: SkillPackage,
+    ) -> None:
+        tool_ids = self._loaded_tool_id_map(loaded, "tool_ids")
+        jit_tool_ids = self._loaded_tool_id_map(loaded, "jit_tool_ids")
+        expected = (
+            result.get("skill_id"),
+            result.get("name"),
+            result.get("version"),
+            result.get("package_sha256"),
+            result.get("instructions_hash"),
+            result.get("tool_names"),
+            result.get("tool_ids"),
+            result.get("jit_tool_ids"),
+        )
+        actual = (
+            skill.skill_id,
+            skill.name,
+            skill.version,
+            skill.package_sha256,
+            self._hash_text(skill.instructions),
+            sorted([*tool_ids, *jit_tool_ids]),
+            tool_ids,
+            jit_tool_ids,
+        )
+        if expected != actual:
+            raise ValidationError(
+                f"TaskRun activate_skill result does not match durable state: {skill.skill_id}"
+            )
 
     def _activate_registered_skill(
         self,

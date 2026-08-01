@@ -625,9 +625,10 @@ class TestRuntimeShutdown:
             CAPABILITY_MANAGER_MIXED_PUBLIC_METHODS,
             CAPABILITY_MANAGER_READ_ONLY_PUBLIC_METHODS,
         )
-        assert sum(len(methods) for methods in manager_classes) == 53
+        assert sum(len(methods) for methods in manager_classes) == 54
         assert {
             "inspect_for_presentation",
+            "parent_chain_active",
             "presentation_page",
         } <= CAPABILITY_MANAGER_READ_ONLY_PUBLIC_METHODS
         assert not any(

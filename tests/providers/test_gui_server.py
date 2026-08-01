@@ -49,8 +49,18 @@ from agent_libos.models import (
     ResourceUsage,
     SinkTrustLevel,
     SinkTrustRule,
+    TaskRunLedgerItem,
+    TaskRunLedgerKind,
+    TaskRunLink,
+    TaskRunRetention,
+    TaskRunSpecV1,
+    TaskRunStatus,
     process_outcome_to_mapping,
     process_wait_state_to_mapping,
+)
+from agent_libos.evidence.payload_retention import (
+    PayloadRetentionTier,
+    external_effect_payload_retention_tier,
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, HumanResponseRequired, ProcessWaitRequired, ValidationError
 from agent_libos.utils.ids import utc_now
@@ -289,6 +299,275 @@ def test_gui_rejects_mismatched_config_for_borrowed_runtime(
         assert runtime.llms.profile("runtime-owned").model == "runtime-model"
     finally:
         runtime.shutdown(actor="test", reason="test.cleanup")
+
+
+def test_terminal_purge_keeps_later_gui_presentations_outside_run_links(
+    tmp_path: Path,
+) -> None:
+    """A later Host GUI session must not reopen a purged Run payload scope."""
+
+    database = tmp_path / "post-terminal-gui-presentation.sqlite"
+    config = replace(
+        DEFAULT_CONFIG,
+        task_runs=replace(
+            DEFAULT_CONFIG.task_runs,
+            plaintext_payloads_enabled=True,
+        ),
+    )
+    runtime = Runtime.open(database, config=config)
+    service: GuiRuntimeService | None = None
+    try:
+        created = runtime.task_runs.create(
+            TaskRunSpecV1(
+                goal={"goal": "POST_TERMINAL_GUI_PRESENTATION_GOAL"},
+                display_title="Post-terminal GUI presentation",
+                image_id="base-agent:v0",
+                retention=TaskRunRetention.PURGE_ON_TERMINAL,
+            ),
+            client_request_id="create:post-terminal-gui-presentation",
+        )
+        assert created.root_pid is not None
+        pid = created.root_pid
+        runtime.capability.grant(
+            pid,
+            runtime.config.runtime.default_human_resource,
+            [CapabilityRight.WRITE],
+            issued_by="test",
+        )
+        request_id = runtime.human.query(
+            pid,
+            runtime.config.runtime.default_human,
+            {
+                "type": "question",
+                "question": "POST_TERMINAL_GUI_PRESENTATION_CANARY",
+            },
+            blocking=False,
+        )
+        terminal = runtime.task_runs.cancel(
+            created.run_id,
+            expected_revision=created.revision,
+            command_id="cancel:post-terminal-gui-presentation",
+        )
+        record = runtime.store.get_task_run(created.run_id)
+        assert terminal.status is TaskRunStatus.CANCELLED
+        assert record is not None and record.payloads_purged_at is not None
+
+        def presentation_effects(selected_runtime: Runtime) -> list[Any]:
+            return sorted(
+                (
+                    effect
+                    for effect in selected_runtime.store.list_external_effects(
+                        pid=pid
+                    )
+                    if effect.provider == "human"
+                    and effect.operation == "write"
+                    and effect.provider_metadata.get("context", {}).get("purpose")
+                    == "gui_presentation"
+                    and effect.provider_metadata.get("request_id") == request_id
+                ),
+                key=lambda effect: (effect.created_at, effect.effect_id),
+            )
+
+        def operation_id_for(selected_runtime: Runtime, effect_id: str) -> str:
+            evidence = selected_runtime.uow.evidence.list_operation_evidence(
+                evidence_types=("external_effect",),
+                evidence_id=effect_id,
+                limit=2,
+            )
+            assert len(evidence) == 1 and evidence[0].role == "effect"
+            return evidence[0].operation_id
+
+        service = GuiRuntimeService(
+            runtime=runtime,
+            auto_run=False,
+            token="post-terminal-session-one",
+        )
+        first_effects = presentation_effects(runtime)
+        assert len(first_effects) == 1
+        first_effect = first_effects[0]
+
+        provider_type = type(service._human_presentation_provider)
+        service._human_presentation_provider = provider_type()
+        service.snapshot()
+        exact_effects = presentation_effects(runtime)
+        assert len(exact_effects) == 2
+        legacy_effect = exact_effects[1]
+        first_operation_id = operation_id_for(runtime, first_effect.effect_id)
+        legacy_operation_id = operation_id_for(runtime, legacy_effect.effect_id)
+
+        # Simulate a development build that had already projected the later
+        # GUI observation.  Both links are append-only and must survive repair.
+        legacy_effect_item = runtime.store.append_task_run_ledger_item(
+            TaskRunLedgerItem(
+                item_id=f"legacy-effect-{legacy_effect.effect_id}",
+                run_id=created.run_id,
+                seq=0,
+                kind=TaskRunLedgerKind.EFFECT,
+                status="finalized:committed",
+                label="Legacy post-purge GUI effect projection",
+                occurred_at=utc_now(),
+                pid=pid,
+                effect_id=legacy_effect.effect_id,
+            )
+        )
+        legacy_effect_link = TaskRunLink(
+            link_id=f"legacy-effect-link-{legacy_effect.effect_id}",
+            run_id=created.run_id,
+            ledger_seq=legacy_effect_item.seq,
+            evidence_type="external_effect",
+            evidence_id=legacy_effect.effect_id,
+            role="effect",
+            created_at=legacy_effect_item.occurred_at,
+        )
+        runtime.store.insert_task_run_link(legacy_effect_link)
+        legacy_operation_item = runtime.store.append_task_run_ledger_item(
+            TaskRunLedgerItem(
+                item_id=f"legacy-operation-{legacy_operation_id}",
+                run_id=created.run_id,
+                seq=0,
+                kind=TaskRunLedgerKind.PROCESS,
+                status="succeeded",
+                label="Legacy post-purge GUI operation projection",
+                occurred_at=utc_now(),
+                pid=pid,
+                operation_id=legacy_operation_id,
+            )
+        )
+        legacy_operation_link = TaskRunLink(
+            link_id=f"legacy-operation-link-{legacy_operation_id}",
+            run_id=created.run_id,
+            ledger_seq=legacy_operation_item.seq,
+            evidence_type="operation",
+            evidence_id=legacy_operation_id,
+            role="operation",
+            created_at=legacy_operation_item.occurred_at,
+        )
+        runtime.store.insert_task_run_link(legacy_operation_link)
+
+        class StateChangingGuiProvider(provider_type):
+            @staticmethod
+            def classify_external_effect(
+                operation: str,
+                context: dict[str, Any],
+                result: Any,
+            ) -> ExternalEffectClassification:
+                classification = provider_type.classify_external_effect(
+                    operation,
+                    context,
+                    result,
+                )
+                return replace(classification, state_mutation=True)
+
+        service._human_presentation_provider = StateChangingGuiProvider()
+        service.snapshot()
+        all_presentations = presentation_effects(runtime)
+        assert len(all_presentations) == 3
+        disguised_effect = all_presentations[2]
+        disguised_operation_id = operation_id_for(
+            runtime,
+            disguised_effect.effect_id,
+        )
+        assert disguised_effect.state_mutation is True
+
+        runtime.task_runs.list_ledger(created.run_id, limit=100)
+        links = runtime.store.list_task_run_links(created.run_id)
+        linked = {(link.evidence_type, link.evidence_id) for link in links}
+
+        assert ("external_effect", first_effect.effect_id) not in linked
+        assert ("operation", first_operation_id) not in linked
+        assert ("external_effect", legacy_effect.effect_id) in linked
+        assert ("operation", legacy_operation_id) in linked
+        assert ("external_effect", disguised_effect.effect_id) in linked
+        assert ("operation", disguised_operation_id) in linked
+        assert legacy_effect_link in links
+        assert legacy_operation_link in links
+
+        retained_legacy = runtime.store.get_external_effect(
+            legacy_effect.effect_id
+        )
+        retained_disguised = runtime.store.get_external_effect(
+            disguised_effect.effect_id
+        )
+        retained_first = runtime.store.get_external_effect(first_effect.effect_id)
+        assert retained_legacy is not None
+        assert retained_disguised is not None
+        assert retained_first is not None
+        assert (
+            external_effect_payload_retention_tier(retained_legacy)
+            is PayloadRetentionTier.HASH_ONLY
+        )
+        assert (
+            external_effect_payload_retention_tier(retained_disguised)
+            is PayloadRetentionTier.HASH_ONLY
+        )
+        assert (
+            external_effect_payload_retention_tier(retained_first)
+            is PayloadRetentionTier.FULL
+        )
+        assert retained_first.record_id is not None
+        assert retained_first.event_id is not None
+
+        assert service.shutdown(timeout_s=2.0) is True
+        service = None
+    finally:
+        if service is not None:
+            service.shutdown(timeout_s=2.0)
+        runtime.close()
+
+    reopened = Runtime.open(database, config=config)
+    reopened_service: GuiRuntimeService | None = None
+    try:
+        before_reopen_session = {
+            effect.effect_id for effect in reopened.store.list_external_effects(pid=pid)
+        }
+        reopened_service = GuiRuntimeService(
+            runtime=reopened,
+            auto_run=False,
+            token="post-terminal-session-two",
+        )
+        after_reopen_session = {
+            effect.effect_id for effect in reopened.store.list_external_effects(pid=pid)
+        }
+        new_effect_ids = after_reopen_session - before_reopen_session
+        assert len(new_effect_ids) == 1
+        reopened_effect_id = next(iter(new_effect_ids))
+        reopened_operation_id = operation_id_for(reopened, reopened_effect_id)
+
+        reopened.task_runs.list_ledger(created.run_id, limit=100)
+        reopened_links = reopened.store.list_task_run_links(created.run_id)
+        reopened_linked = {
+            (link.evidence_type, link.evidence_id) for link in reopened_links
+        }
+        assert ("external_effect", first_effect.effect_id) not in reopened_linked
+        assert ("operation", first_operation_id) not in reopened_linked
+        assert ("external_effect", reopened_effect_id) not in reopened_linked
+        assert ("operation", reopened_operation_id) not in reopened_linked
+        assert legacy_effect_link in reopened_links
+        assert legacy_operation_link in reopened_links
+        assert ("external_effect", disguised_effect.effect_id) in reopened_linked
+        assert ("operation", disguised_operation_id) in reopened_linked
+        repaired_legacy = reopened.store.get_external_effect(
+            legacy_effect.effect_id
+        )
+        repaired_disguised = reopened.store.get_external_effect(
+            disguised_effect.effect_id
+        )
+        assert repaired_legacy is not None
+        assert repaired_disguised is not None
+        assert (
+            external_effect_payload_retention_tier(repaired_legacy)
+            is PayloadRetentionTier.HASH_ONLY
+        )
+        assert (
+            external_effect_payload_retention_tier(repaired_disguised)
+            is PayloadRetentionTier.HASH_ONLY
+        )
+        assert reopened_service.shutdown(timeout_s=2.0) is True
+        reopened_service = None
+    finally:
+        if reopened_service is not None:
+            reopened_service.shutdown(timeout_s=2.0)
+        reopened.close()
 
 class TestGuiServer:
 

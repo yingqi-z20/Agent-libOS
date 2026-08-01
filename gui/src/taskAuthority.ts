@@ -2,7 +2,24 @@ export type WorkspaceAccess = "none" | "read" | "edit" | "manage";
 export type CommandAccess = "none" | "reviewed";
 export const DEFAULT_CONTEXT_MAINTENANCE = false;
 
-type CapabilitySpec = {
+/**
+ * Safe, immediately runnable defaults for a standard-user Durable Task Run.
+ * Workspace and Git access remain explicit choices because either one needs a
+ * pre-registered Host authority manifest; the UI must never manufacture that
+ * authority merely to make its first-run path succeed.
+ */
+export const DEFAULT_DURABLE_TASK_LAUNCH = Object.freeze({
+  imageId: "base-agent:v0",
+  llmProfileId: "",
+  workingDirectory: "",
+  workspaceAccess: "none" as WorkspaceAccess,
+  allowGitRequests: false,
+  commandAccess: "none" as CommandAccess,
+  contextMaintenance: DEFAULT_CONTEXT_MAINTENANCE,
+  authorityManifestId: ""
+});
+
+export type GuiCapabilitySpec = {
   resource: string;
   rights: string[];
   delegable: false;
@@ -59,7 +76,7 @@ export function buildGuiTaskAuthorityManifest({
   commandAccess,
   contextMaintenance
 }: GuiTaskAuthorityOptions): Record<string, unknown> {
-  const authorizedCapabilities: CapabilitySpec[] = [
+  const authorizedCapabilities: GuiCapabilitySpec[] = [
     { resource: "human:owner", rights: ["write"], delegable: false }
   ];
   if (commandAccess === "reviewed") {
@@ -106,7 +123,7 @@ export function buildGuiTaskAuthorityManifest({
       }
     );
   }
-  const requestableCapabilities: CapabilitySpec[] = [];
+  const requestableCapabilities: GuiCapabilitySpec[] = [];
   if (workspaceAccess !== "none") {
     requestableCapabilities.push({
       resource: workspaceResourceForDirectory(workingDirectory),
@@ -133,6 +150,36 @@ export function buildGuiTaskAuthorityManifest({
       command_access: commandAccess,
       context_maintenance: contextMaintenance
     }
+  };
+}
+
+export type GuiDurableTaskAuthority = {
+  capabilities: GuiCapabilitySpec[];
+  requiresAuthorityManifest: boolean;
+};
+
+/**
+ * Durable runs persist only direct launch grants. Request/approval policy must
+ * be referenced by an already registered Host authority manifest; it is never
+ * embedded into TaskRun launch_options.
+ */
+export function buildGuiDurableTaskAuthority(
+  options: GuiTaskAuthorityOptions
+): GuiDurableTaskAuthority {
+  const manifest = buildGuiTaskAuthorityManifest(options);
+  const capabilities = manifest.authorized_capabilities;
+  const approvalPolicy = manifest.approval_policy;
+  if (!Array.isArray(capabilities)
+      || !approvalPolicy
+      || typeof approvalPolicy !== "object"
+      || !Array.isArray((approvalPolicy as { requestable_capabilities?: unknown }).requestable_capabilities)) {
+    throw new Error("GUI durable task authority projection is malformed");
+  }
+  return {
+    capabilities: capabilities as GuiCapabilitySpec[],
+    requiresAuthorityManifest: (
+      approvalPolicy as { requestable_capabilities: unknown[] }
+    ).requestable_capabilities.length > 0
   };
 }
 

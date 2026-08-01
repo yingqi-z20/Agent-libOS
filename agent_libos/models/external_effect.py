@@ -205,3 +205,72 @@ class ExternalEffectRecoverySummary:
 
     def __len__(self) -> int:
         return self.total_count
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalEffectRecoverySettlement:
+    """Atomic result of one authoritative external-effect reconciliation.
+
+    ``provider_state`` preserves the provider's exact conclusion.  In
+    particular, ``not_started`` is stored as a finalized ``failed``
+    transaction while the provider conclusion remains explicit in both this
+    result and the effect metadata.  That keeps the existing durable state
+    vocabulary stable while proving that replay is safe.
+    """
+
+    effect: ExternalEffectRecord
+    previous_transaction_state: str
+    provider_state: str
+    transition_seq: int
+    audit_record_id: AuditID
+    restored_capability_reservation_ids: tuple[str, ...] = ()
+    committed_capability_reservation_ids: tuple[str, ...] = ()
+    released_resource_reservation_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.effect.effect_state != "finalized":
+            raise ValueError("external effect recovery settlement must be finalized")
+        if self.previous_transaction_state not in {
+            "prepared",
+            "authorized",
+            "approved",
+            "dispatched",
+            "unknown",
+        }:
+            raise ValueError(
+                "invalid external effect recovery previous transaction state: "
+                f"{self.previous_transaction_state!r}"
+            )
+        if self.provider_state not in {
+            "committed",
+            "failed",
+            "compensated",
+            "not_started",
+        }:
+            raise ValueError(
+                "invalid external effect recovery provider state: "
+                f"{self.provider_state!r}"
+            )
+        if isinstance(self.transition_seq, bool) or not isinstance(
+            self.transition_seq, int
+        ) or self.transition_seq <= 0:
+            raise ValueError(
+                "external effect recovery transition sequence must be positive"
+            )
+        if not isinstance(self.audit_record_id, str) or not self.audit_record_id:
+            raise ValueError(
+                "external effect recovery settlement audit record must not be empty"
+            )
+        reservation_ids = (
+            *self.restored_capability_reservation_ids,
+            *self.committed_capability_reservation_ids,
+            *self.released_resource_reservation_ids,
+        )
+        if any(not isinstance(item, str) or not item for item in reservation_ids):
+            raise ValueError(
+                "external effect recovery reservation IDs must not be empty"
+            )
+        if len(reservation_ids) != len(set(reservation_ids)):
+            raise ValueError(
+                "external effect recovery reservation IDs must not overlap"
+            )

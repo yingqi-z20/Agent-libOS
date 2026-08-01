@@ -11,7 +11,7 @@ from uuid import uuid4
 
 import pytest
 
-from agent_libos.config import AgentLibOSConfig, RuntimeDefaults
+from agent_libos.config import AgentLibOSConfig, RuntimeDefaults, TaskRunDefaults
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import (
     AgentImage,
@@ -23,6 +23,7 @@ from agent_libos.models import (
     JsonRpcEndpointSpec,
     JsonRpcMethodSpec,
     LLMCallRecord,
+    TaskRunSpecV1,
 )
 from agent_libos.models.exceptions import (
     CapabilityDenied,
@@ -34,7 +35,11 @@ from agent_libos.skills.schema import SkillPackage
 from agent_libos.storage import StoreCloseClaimOutcome, open_store
 from agent_libos.storage.factory import open_store_for_migration
 from agent_libos.storage.postgres import PostgresStore
-from agent_libos.storage.sql import STORE_SCHEMA_VERSION
+from agent_libos.storage.sql import (
+    STORE_SCHEMA_VERSION,
+    SQLRuntimeStore,
+    _V4_REQUIRED_INDEXES,
+)
 from agent_libos.utils.ids import utc_now
 
 
@@ -74,7 +79,161 @@ def _dsn_with_search_path(dsn: str, schema: str) -> str:
 
 @pytest.mark.postgres
 class TestPostgresStore:
-    def test_v3_manifest_view_is_rejected_before_initializer(self) -> None:
+    def test_runtime_advisory_lease_rejects_competing_writer_and_reopens(self) -> None:
+        with _postgres_schema_dsn() as dsn:
+            first = PostgresStore(dsn)
+            try:
+                with pytest.raises(ValidationError, match="already open"):
+                    PostgresStore(dsn)
+            finally:
+                first.close()
+
+            reopened = PostgresStore(dsn)
+            reopened.close()
+
+    def test_schema_v3_is_zero_write_rejected_before_initializer(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import psycopg
+
+        with _postgres_schema_dsn() as dsn:
+            PostgresStore(dsn).close()
+            with psycopg.connect(dsn, autocommit=True) as connection:
+                connection.execute(
+                    "UPDATE runtime_schema SET schema_version = 3 "
+                    "WHERE singleton = 1"
+                )
+                before_counters = connection.execute(
+                    "SELECT counter_name, value FROM runtime_counters "
+                    "ORDER BY counter_name"
+                ).fetchall()
+
+            initialized = False
+
+            def forbidden_initialize(_store: SQLRuntimeStore) -> None:
+                nonlocal initialized
+                initialized = True
+                raise AssertionError("v3 rejection must precede the initializer")
+
+            monkeypatch.setattr(SQLRuntimeStore, "initialize", forbidden_initialize)
+            with pytest.raises(
+                UnsupportedStoreVersion,
+                match=r"schema v3.*1\.0\.1.*view or archive",
+            ):
+                PostgresStore(dsn)
+
+            assert initialized is False
+            with psycopg.connect(dsn, autocommit=True) as connection:
+                marker = connection.execute(
+                    "SELECT singleton, schema_version FROM runtime_schema"
+                ).fetchall()
+                after_counters = connection.execute(
+                    "SELECT counter_name, value FROM runtime_counters "
+                    "ORDER BY counter_name"
+                ).fetchall()
+            assert marker == [(1, 3)]
+            assert after_counters == before_counters
+
+    def test_v4_task_run_index_manifest_matches_fresh_store(self) -> None:
+        with _postgres_schema_dsn() as dsn:
+            store = PostgresStore(dsn)
+            try:
+                shapes = PostgresStore._probe_index_shapes(
+                    store.conn,
+                    {spec[0] for spec in _V4_REQUIRED_INDEXES.values()},
+                )
+                for name, (table, columns, unique, partial) in _V4_REQUIRED_INDEXES.items():
+                    shape = shapes[name]
+                    assert shape["table"] == table
+                    assert shape["columns"] == columns
+                    assert shape["unique"] is unique
+                    assert shape["partial"] is partial
+                    assert shape["descending"] == tuple(False for _ in columns)
+                    assert shape["valid"] is True
+                    assert shape["ready"] is True
+                    assert shape["live"] is True
+            finally:
+                store.close()
+
+    def test_v4_extra_partitioned_table_is_rejected_before_initializer(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import psycopg
+
+        with _postgres_schema_dsn() as dsn:
+            PostgresStore(dsn).close()
+            with psycopg.connect(dsn, autocommit=True) as connection:
+                connection.execute(
+                    "CREATE TABLE unexpected_partitioned (id INTEGER) "
+                    "PARTITION BY RANGE (id)"
+                )
+            initialized = False
+
+            def forbidden_initialize(_store: SQLRuntimeStore) -> None:
+                nonlocal initialized
+                initialized = True
+                raise AssertionError("v4 rejection must precede the initializer")
+
+            monkeypatch.setattr(SQLRuntimeStore, "initialize", forbidden_initialize)
+            with pytest.raises(UnsupportedStoreVersion, match="extra"):
+                PostgresStore(dsn)
+
+            assert initialized is False
+            with psycopg.connect(dsn, autocommit=True) as connection:
+                kind = connection.execute(
+                    "SELECT relkind FROM pg_catalog.pg_class "
+                    "WHERE oid = 'unexpected_partitioned'::regclass"
+                ).fetchone()
+            assert kind == ("p",)
+
+    def test_v4_partial_index_predicate_is_rejected_before_initializer(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import psycopg
+
+        with _postgres_schema_dsn() as dsn:
+            PostgresStore(dsn).close()
+            with psycopg.connect(dsn, autocommit=True) as connection:
+                connection.execute("DROP INDEX idx_task_runs_recovery")
+                connection.execute(
+                    'CREATE INDEX idx_task_runs_recovery '
+                    'ON task_runs(created_at COLLATE "C", run_id COLLATE "C") '
+                    "WHERE status = 'queued'"
+                )
+            initialized = False
+
+            def forbidden_initialize(_store: SQLRuntimeStore) -> None:
+                nonlocal initialized
+                initialized = True
+                raise AssertionError("invalid v4 must be rejected before initializer")
+
+            monkeypatch.setattr(SQLRuntimeStore, "initialize", forbidden_initialize)
+            with pytest.raises(
+                UnsupportedStoreVersion,
+                match=r"schema v4 index manifest",
+            ):
+                PostgresStore(dsn)
+            assert initialized is False
+
+            with psycopg.connect(dsn, autocommit=True) as connection:
+                predicate = connection.execute(
+                    """
+                    SELECT pg_catalog.pg_get_expr(index_row.indpred, index_row.indrelid)
+                      FROM pg_catalog.pg_index AS index_row
+                      JOIN pg_catalog.pg_class AS relation
+                        ON relation.oid = index_row.indexrelid
+                      JOIN pg_catalog.pg_namespace AS namespace
+                        ON namespace.oid = relation.relnamespace
+                     WHERE namespace.nspname = current_schema()
+                       AND relation.relname = 'idx_task_runs_recovery'
+                    """
+                ).fetchone()
+            assert predicate is not None and "queued" in predicate[0]
+
+    def test_v4_manifest_view_is_rejected_before_initializer(self) -> None:
         import psycopg
 
         with _postgres_schema_dsn() as dsn:
@@ -694,5 +853,65 @@ class TestPostgresStore:
                 assert runtime.process.get(forked["fork_root_pid"]) is not None
                 assert any(record.action == "checkpoint.restore" for record in runtime.audit.trace())
                 assert runtime.events.list()
+            finally:
+                runtime.close()
+
+    def test_postgres_task_run_execution_claims_are_epoch_fenced(self) -> None:
+        with _postgres_schema_dsn() as dsn:
+            config = AgentLibOSConfig(
+                runtime=RuntimeDefaults(store_backend="postgres", store_dsn=dsn),
+                task_runs=TaskRunDefaults(plaintext_payloads_enabled=True),
+            )
+            runtime = Runtime.open(dsn, config=config)
+            try:
+                run = runtime.task_runs.create(
+                    TaskRunSpecV1(
+                        goal="exercise PostgreSQL nullable epoch predicates",
+                        display_title="PostgreSQL epoch fencing",
+                        image_id="base-agent:v0",
+                    ),
+                    client_request_id="postgres-epoch-fencing",
+                )
+                assert run.root_pid is not None
+                epoch = runtime.task_runs.runtime_epoch
+
+                assert (
+                    runtime.store.claim_execution(
+                        run.root_pid,
+                        owner_id="stale.scheduler",
+                        task_run_epoch=epoch + 1,
+                    )
+                    is None
+                )
+
+                worker = runtime.store.claim_execution(
+                    run.root_pid,
+                    owner_id="current.scheduler",
+                    task_run_epoch=epoch,
+                )
+                assert worker is not None
+                process = runtime.process.get(run.root_pid)
+                exec_token = runtime.store.claim_worker_process_exec(
+                    run.root_pid,
+                    execution_token=worker,
+                    owner_id="current.exec",
+                    expected_revision=process.revision,
+                    expected_state_generation=process.state_generation,
+                    task_run_epoch=epoch,
+                )
+                assert exec_token is not None
+                assert runtime.store.complete_execution(exec_token)
+
+                process = runtime.process.get(run.root_pid)
+                host_token = runtime.store.claim_host_process_exec(
+                    run.root_pid,
+                    owner_id="host.exec",
+                    expected_revision=process.revision,
+                    expected_state_generation=process.state_generation,
+                    expected_execution_generation=process.execution_generation,
+                    task_run_epoch=epoch,
+                )
+                assert host_token is not None
+                assert runtime.store.release_execution(host_token)
             finally:
                 runtime.close()

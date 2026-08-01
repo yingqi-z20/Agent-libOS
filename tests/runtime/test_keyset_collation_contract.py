@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sqlite3
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
@@ -12,7 +14,7 @@ import pytest
 from agent_libos.models import RuntimePublicationCursor
 from agent_libos.models.exceptions import UnsupportedStoreVersion
 from agent_libos.storage.postgres import PostgresStore
-from agent_libos.storage.sql import _V3_KEYSET_TEXT_COLUMNS
+from agent_libos.storage.sql import _V4_KEYSET_TEXT_COLUMNS
 from agent_libos.storage.sqlite import SQLiteStore
 
 
@@ -84,7 +86,7 @@ def test_keyset_schema_probe_is_single_query_and_all_columns_are_canonical(
         expected_name = "BINARY" if backend == "sqlite" else "C"
         expected_columns = {
             (table, column)
-            for table, columns in _V3_KEYSET_TEXT_COLUMNS.items()
+            for table, columns in _V4_KEYSET_TEXT_COLUMNS.items()
             for column in columns
         }
         assert counted.execute_calls == 1
@@ -145,6 +147,51 @@ def test_postgres_keyset_probe_rejects_non_utf8_in_its_single_catalog_query() ->
     with pytest.raises(UnsupportedStoreVersion, match="requires UTF8"):
         PostgresStore._probe_text_column_collations(connection)
     assert connection.execute_calls == 1
+
+
+@pytest.mark.parametrize(
+    "spoofed_declaration",
+    [
+        "created_at TEXT /* COLLATE BINARY */ COLLATE NOCASE NOT NULL",
+        "created_at TEXT -- COLLATE BINARY\n COLLATE NOCASE NOT NULL",
+        "created_at TEXT DEFAULT 'COLLATE BINARY' COLLATE NOCASE NOT NULL",
+    ],
+    ids=("block-comment", "line-comment", "string-literal"),
+)
+def test_sqlite_keyset_probe_rejects_collation_spoofed_by_non_code_sql(
+    tmp_path: Path,
+    spoofed_declaration: str,
+) -> None:
+    db_path = tmp_path / "collation-comment-spoof.sqlite"
+    SQLiteStore(db_path).close()
+
+    connection = sqlite3.connect(db_path)
+    try:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'runtime_publications'"
+        ).fetchone()
+        assert row is not None
+        original = str(row[0])
+        canonical = "created_at TEXT COLLATE BINARY NOT NULL"
+        assert original.count(canonical) == 1
+        spoofed = original.replace(canonical, spoofed_declaration, 1)
+        schema_version = int(
+            connection.execute("PRAGMA schema_version").fetchone()[0]
+        )
+        connection.execute("PRAGMA writable_schema = ON")
+        connection.execute(
+            "UPDATE sqlite_master SET sql = ? "
+            "WHERE type = 'table' AND name = 'runtime_publications'",
+            (spoofed,),
+        )
+        connection.execute(f"PRAGMA schema_version = {schema_version + 1}")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(UnsupportedStoreVersion, match="keyset collation"):
+        SQLiteStore(db_path)
 
 
 def _insert_publications(

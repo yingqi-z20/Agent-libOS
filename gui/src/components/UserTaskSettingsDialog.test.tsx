@@ -22,7 +22,7 @@ afterEach(async () => {
 });
 
 describe("UserTaskSettingsDialog", () => {
-  it("renders all eight launch settings and applies the complete draft atomically", async () => {
+  it("renders all nine launch settings and applies the complete draft atomically", async () => {
     const onApply = vi.fn();
     const onClose = vi.fn();
     const container = await renderDialog({ onApply, onClose });
@@ -33,6 +33,7 @@ describe("UserTaskSettingsDialog", () => {
     expect(field(container, "Quanta")).not.toBeNull();
     expect(field(container, "Initial working directory")).not.toBeNull();
     expect(field(container, "Workspace permission requests")).not.toBeNull();
+    expect(field(container, "Durable authority template ID")).not.toBeNull();
     expect(field(container, "Allow requests for local Git operations")).not.toBeNull();
     expect(field(container, "Command execution")).not.toBeNull();
     expect(field(container, "Enable persistent context enrichment and bounded maintenance")).not.toBeNull();
@@ -56,7 +57,8 @@ describe("UserTaskSettingsDialog", () => {
       workspaceAccess: "manage",
       allowGitRequests: false,
       commandAccess: "reviewed",
-      contextMaintenance: true
+      contextMaintenance: true,
+      authorityManifestId: "authm_test"
     });
     expect(onClose).toHaveBeenCalledTimes(1);
   });
@@ -113,6 +115,18 @@ describe("UserTaskSettingsDialog", () => {
     expect(save.disabled).toBe(true);
     await click(save);
     expect(onApply).not.toHaveBeenCalled();
+  });
+
+  it("requires a referenced Host authority template for request policies", async () => {
+    const onApply = vi.fn();
+    const container = await renderDialog({ onApply });
+    const manifest = inputFor(container, "Durable authority template ID");
+
+    await setInput(manifest, "");
+
+    expect(manifest.getAttribute("aria-invalid")).toBe("true");
+    expect(container.textContent).toContain("unsupported without a pre-registered authority template ID");
+    expect(button(container, "Save settings").disabled).toBe(true);
   });
 
   it("keeps one dialog and preserves the draft while managing profiles", async () => {
@@ -265,7 +279,8 @@ const initialSettings: TaskLaunchSettings = {
   workspaceAccess: "edit",
   allowGitRequests: true,
   commandAccess: "none",
-  contextMaintenance: false
+  contextMaintenance: false,
+  authorityManifestId: "authm_test"
 };
 
 const images: ImageSummary[] = [

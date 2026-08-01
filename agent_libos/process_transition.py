@@ -15,6 +15,7 @@ from agent_libos.models.process_state import (
     MessageProcessWait,
     ProcessOutcome,
     ProcessWaitState,
+    StaleExecutionProcessWait,
     ToolProcessWait,
     validate_process_state_fields,
 )
@@ -167,6 +168,10 @@ class ProcessTransitionService:
             )
         selected_status = ProcessStatus(status)
         validate_process_state(selected_status, wait_state, outcome)
+        if isinstance(wait_state, StaleExecutionProcessWait):
+            raise ValidationError(
+                "stale-execution recovery receipts are reserved for Store recovery"
+            )
         if isinstance(wait_state, _CONDITION_WAIT_TYPES):
             current = self.store.get_process(pid)
             if current is not None:

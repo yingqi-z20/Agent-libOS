@@ -19,7 +19,7 @@ from agent_libos.models import ExternalEffectRecoveryQuery
 from agent_libos.runtime import RuntimeBuilder
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import sqlite as sqlite_storage
-from agent_libos.storage.sql import _V3_REQUIRED_COLUMNS
+from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS
 from agent_libos.storage.sqlite import SQLiteStore
 from agent_libos.utils.serde import dumps
 
@@ -127,10 +127,10 @@ _EXTERNAL_EFFECT_SCHEMA_INDEXES = frozenset(
         "idx_external_effects_pid_idempotency",
     }
 )
-_SQLITE_V3_MANIFEST_TABLES = tuple(sorted(_V3_REQUIRED_COLUMNS))
-_SQLITE_V3_MANIFEST_SCHEMA_PROBE_SHAPE = (
+_SQLITE_V4_MANIFEST_TABLES = tuple(sorted(_V4_REQUIRED_COLUMNS))
+_SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE = (
     "SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN ("
-    + ", ".join("?" for _ in _SQLITE_V3_MANIFEST_TABLES)
+    + ", ".join("?" for _ in _SQLITE_V4_MANIFEST_TABLES)
     + ")"
 )
 _GLOBAL_PATCH_SCOPE_LOCK = threading.RLock()
@@ -859,13 +859,13 @@ def _handler_statement_kind(sql: str) -> str | None:
 def _startup_statement_kind(sql: str) -> str | None:
     normalized = " ".join(str(sql).upper().split()).rstrip(";")
     normalized_literals = _SQL_TEXT_LITERAL_RE.sub("?", normalized)
-    if normalized_literals == _SQLITE_V3_MANIFEST_SCHEMA_PROBE_SHAPE:
+    if normalized_literals == _SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE:
         manifest_tables = tuple(
             literal[1:-1].replace("''", "'")
             for literal in _SQL_TEXT_LITERAL_RE.findall(str(sql))
         )
-        if manifest_tables == _SQLITE_V3_MANIFEST_TABLES:
-            return "v3_manifest_schema_probe"
+        if manifest_tables == _SQLITE_V4_MANIFEST_TABLES:
+            return "v4_manifest_schema_probe"
     if re.fullmatch(
         r"SELECT NAME, SQL FROM SQLITE_MASTER WHERE TYPE = \?"
         r" AND NAME IN \(\?(?:, \?)*\)",
@@ -950,11 +950,13 @@ def _strip_sql_comments(sql: str) -> str:
 
 
 def _assert_startup_statement_contract(actual: Counter[str]) -> None:
+    # Existing-store validation runs against an isolated safety snapshot. This
+    # ledger covers only the subsequently opened measured main connection.
     expected = Counter(
         {
-            "schema_probe": 2,
-            "keyset_collation_schema_probe": 2,
-            "v3_manifest_schema_probe": 2,
+            "schema_probe": 1,
+            "keyset_collation_schema_probe": 1,
+            "v4_manifest_schema_probe": 1,
             "schema_table": 1,
         }
     )
@@ -1069,8 +1071,8 @@ def _require_external_effect_index_contract(
 
 
 def _assert_structural_contract(result: RecoveryScaleResult) -> None:
-    if result.startup_schema_probe_calls != 2:
-        raise AssertionError("external-effect preflight/main schema probes changed")
+    if result.startup_schema_probe_calls != 1:
+        raise AssertionError("external-effect measured-main schema probe changed")
     if result.startup_ddl_calls != 8:
         raise AssertionError("external-effect initialization DDL ledger changed")
     if result.recovered_records != result.pending_records:

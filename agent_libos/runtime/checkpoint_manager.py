@@ -42,6 +42,7 @@ from agent_libos.models import (
     PausedProcessWait,
     ResourceBudget,
     ResourceUsage,
+    StaleExecutionProcessWait,
     ToolHandle,
     ToolProcessWait,
     legacy_status_message,
@@ -72,6 +73,7 @@ from agent_libos.runtime.snapshots import (
     SnapshotRemapper,
     SnapshotRows,
 )
+from agent_libos.runtime.task_run_reference import is_task_run_reference_payload
 from agent_libos.storage import StoreAssemblyReadiness, UnitOfWork
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads, to_jsonable
@@ -105,6 +107,9 @@ class CheckpointManager:
     or external provider side effects. Provider-decided external effect records
     are reported during diff/restore, while restore edits only the scoped
     process subtree state that can be reconstructed from the checkpoint payload.
+    Durable TaskRun ledgers and payloads are never snapshot rows: restore rejects
+    active intersections, and restore/fork detach reconstructed process rows from
+    any historical TaskRun execution identity.
     """
 
     PROCESS_RESOURCE_PREFIX = "checkpoint:process:"
@@ -126,6 +131,11 @@ class CheckpointManager:
         ProcessStatus.WAITING_HUMAN.value,
     }
     FORK_COMMITTED_RECEIPT_ATTRIBUTE = "checkpoint_fork_receipt"
+    TASK_RUN_PROCESS_FIELDS = (
+        "task_run_id",
+        "task_run_epoch",
+        "task_run_role",
+    )
 
     def __init__(
         self,
@@ -152,6 +162,7 @@ class CheckpointManager:
         ],
         transitions: ProcessTransitionService | None = None,
         config: AgentLibOSConfig | None = None,
+        task_runs: Any | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self._unit_of_work = unit_of_work
@@ -182,6 +193,13 @@ class CheckpointManager:
         self._snapshot_rows = unit_of_work.snapshots
         self._modules: Any | None = None
         self._image_registry: Any | None = None
+        if task_runs is not None:
+            active_runs_for_pids = getattr(task_runs, "active_runs_for_pids", None)
+            if not callable(active_runs_for_pids):
+                raise ValidationError(
+                    "checkpoint TaskRun provider must implement active_runs_for_pids"
+                )
+        self._task_runs = task_runs
         self.snapshots = SnapshotCoordinator(unit_of_work)
         self._restore_single_flight_lock = threading.Lock()
         self._preflight_artifact: ContextVar[
@@ -231,6 +249,26 @@ class CheckpointManager:
 
     def bind_image_registry(self, image_registry: Any) -> None:
         self._image_registry = image_registry
+
+    def bind_task_runs(self, task_runs: Any) -> None:
+        """Bind the durable TaskRun query boundary used by restore guards.
+
+        TaskRun orchestration is assembled after checkpoint services.  Keep the
+        dependency narrow and late-bound so checkpoints can reject a restore
+        that intersects any non-terminal run without learning TaskRun mutation
+        or payload APIs.
+        """
+
+        if task_runs is None:
+            raise ValidationError("checkpoint TaskRun provider must not be null")
+        if self._task_runs is not None and self._task_runs is not task_runs:
+            raise ValidationError("checkpoint TaskRun provider is already bound")
+        active_runs_for_pids = getattr(task_runs, "active_runs_for_pids", None)
+        if not callable(active_runs_for_pids):
+            raise ValidationError(
+                "checkpoint TaskRun provider must implement active_runs_for_pids"
+            )
+        self._task_runs = task_runs
 
     def process_resource(self, pid: str) -> str:
         return f"{self.PROCESS_RESOURCE_PREFIX}{pid}"
@@ -818,6 +856,7 @@ class CheckpointManager:
         self._validate_snapshot_flow_rows(snapshot)
         current_pids = self._subtree_pids(checkpoint.pid)
         snapshot_pids = list(typed.subtree_pids)
+        self._reject_active_task_runs_for_restore(snapshot_pids, current_pids)
         self._reject_active_object_tasks_for_restore(snapshot, current_pids)
         self._validate_snapshot_restore_assets(snapshot)
         stale_tool_ids = self._stale_ephemeral_tool_ids_for_restore(
@@ -2188,6 +2227,60 @@ class CheckpointManager:
                 + ", ".join(sorted(blocked))
             )
 
+    def _reject_active_task_runs_for_restore(
+        self,
+        snapshot_pids: Iterable[str],
+        current_pids: Iterable[str],
+    ) -> None:
+        """Reject rollback of any process identity owned by an active TaskRun.
+
+        TaskRun ledgers and external-effect history are deliberately outside
+        checkpoint snapshots.  Restoring only their process projection would
+        split the durable execution history, so the safe behavior is to refuse
+        the restore before its publication row is created.
+        """
+
+        task_runs = self._task_runs
+        if task_runs is None:
+            # Legacy runtimes have no TaskRun subsystem and therefore cannot
+            # have active TaskRun ownership to reconcile.
+            return
+        scoped_pids = tuple(
+            sorted(
+                {
+                    str(pid)
+                    for pid in (*tuple(current_pids), *tuple(snapshot_pids))
+                    if str(pid)
+                }
+            )
+        )
+        if not scoped_pids:
+            return
+        intersections = task_runs.active_runs_for_pids(scoped_pids)
+        run_ids = sorted(
+            {
+                self._task_run_summary_id(item)
+                for item in intersections
+            }
+        )
+        if run_ids:
+            raise ValidationError(
+                "checkpoint restore refused while scoped Durable TaskRuns are active: "
+                + ", ".join(run_ids)
+            )
+
+    @staticmethod
+    def _task_run_summary_id(summary: Any) -> str:
+        if isinstance(summary, Mapping):
+            run_id = summary.get("run_id")
+        else:
+            run_id = getattr(summary, "run_id", None)
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValidationError(
+                "checkpoint TaskRun provider returned a summary without a canonical run_id"
+            )
+        return run_id
+
     def _restore_scoped_rows(
         self,
         snapshot: dict[str, Any],
@@ -2195,6 +2288,7 @@ class CheckpointManager:
         checkpoint: Checkpoint,
     ) -> tuple[list[str], list[str], list[str], list[Any]]:
         typed_snapshot = SnapshotCodec.decode_mapping(snapshot)
+        self._require_no_task_run_private_replay_rows(typed_snapshot)
         rows = typed_snapshot.rows
         snapshot_object_oids = self._snapshot_owned_object_oids(snapshot)
         current_object_oids = set(self._current_scoped_object_oids(current_pids))
@@ -2267,7 +2361,12 @@ class CheckpointManager:
         """Fence snapshot rows with monotonic process concurrency epochs."""
         del cur  # retained for private fault-injection compatibility
         rows = SnapshotRows(
-            processes=tuple(dict(row) for row in process_rows),
+            processes=tuple(
+                self._prepare_restored_process_state_row(
+                    self._without_task_run_binding(row)
+                )
+                for row in process_rows
+            ),
             capabilities=tuple(dict(row) for row in capability_rows),
         )
         return list(
@@ -2276,6 +2375,36 @@ class CheckpointManager:
                 restored_capability_rows=capability_rows,
             )
         )
+
+    @staticmethod
+    def _prepare_restored_process_state_row(
+        row: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Drop Store takeover receipts at the restore concurrency boundary.
+
+        A stale-execution wait proves one exact owner/lease/generation
+        takeover.  Checkpoint restore reserves new process concurrency epochs,
+        so carrying that receipt into the replacement row would make it appear
+        authoritative for an execution identity it never certified.  Preserve
+        the inert paused posture while discarding both the typed receipt and
+        its legacy compatibility projection.
+        """
+
+        selected = dict(row)
+        wait_state = process_wait_state_from_json(selected.get("wait_state_json"))
+        if not isinstance(wait_state, StaleExecutionProcessWait):
+            return selected
+        paused = PausedProcessWait()
+        outcome = process_outcome_from_json(selected.get("outcome_json"))
+        selected["wait_state_json"] = dumps(
+            process_wait_state_to_mapping(paused)
+        )
+        selected["status_message"] = legacy_status_message(
+            paused,
+            outcome,
+            None,
+        )
+        return selected
 
     def _validate_snapshot_flow_rows(self, snapshot: dict[str, Any]) -> None:
         rows = snapshot.get("rows", {})
@@ -2295,6 +2424,17 @@ class CheckpointManager:
                 raise ValidationError(
                     "0.3 checkpoint process message has no canonical label metadata"
                 )
+
+    @staticmethod
+    def _require_no_task_run_private_replay_rows(
+        snapshot: ProcessSnapshot,
+    ) -> None:
+        """Reject an artifact that embeds TaskRun-owned replay plaintext."""
+
+        if snapshot.rows.without_task_run_private_replay_rows() is not snapshot.rows:
+            raise ValidationError(
+                "checkpoint snapshot contains Durable TaskRun private replay rows"
+            )
 
     @staticmethod
     def _canonical_snapshot_data_flow_context(value: Any) -> dict[str, Any] | None:
@@ -2495,6 +2635,9 @@ class CheckpointManager:
         return failure
 
     def _remap_snapshot(self, snapshot: dict[str, Any], *, parent_pid: str | None, root_pid: str) -> dict[str, Any]:
+        self._require_no_task_run_private_replay_rows(
+            SnapshotCodec.decode_mapping(snapshot)
+        )
         rows = deepcopy(snapshot["rows"])
         identities, non_clonable_object_oids, source_capability_rows = (
             self._prepare_fork_identities(snapshot, rows)
@@ -2656,6 +2799,11 @@ class CheckpointManager:
         )
         non_clonable: set[str] = set()
         for oid in candidate_oids:
+            if is_task_run_reference_payload(
+                snapshot.get("object_payloads", {}).get(oid)
+            ):
+                non_clonable.add(oid)
+                continue
             object_type = snapshot_types.get(oid)
             if object_type is None:
                 current = self._objects.get_object(oid)
@@ -3185,6 +3333,7 @@ class CheckpointManager:
         typed, validated = self.snapshots.canonicalize(
             stored_snapshot.to_mapping()
         )
+        self._require_no_task_run_private_replay_rows(typed)
         return checkpoint, validated, typed
 
     def _checkpoint_summary(self, checkpoint: Checkpoint) -> dict[str, Any]:
@@ -3301,6 +3450,10 @@ class CheckpointManager:
             raise ProcessError(
                 f"cannot attach checkpoint fork to terminal process: "
                 f"{parent_pid} status={parent.status.value}"
+            )
+        if getattr(parent, "task_run_id", None) is not None:
+            raise ValidationError(
+                "checkpoint fork cannot attach to a Durable TaskRun process"
             )
         if not require_capability or actor == parent_pid:
             return
@@ -4276,6 +4429,10 @@ class CheckpointManager:
         """Remap nested typed process identities without consulting legacy text."""
 
         wait_state = process_wait_state_from_json(row.get("wait_state_json"))
+        stale_execution_receipt = isinstance(
+            wait_state,
+            StaleExecutionProcessWait,
+        )
         outcome = process_outcome_from_json(row.get("outcome_json"))
         removed_state_reference = False
         if (
@@ -4303,7 +4460,11 @@ class CheckpointManager:
         )
         outcome = remap_process_outcome(outcome, objects=identities.objects)
         status = row.get("status")
-        status_fallback = None if removed_state_reference else row.get("status_message")
+        status_fallback = (
+            None
+            if removed_state_reference or stale_execution_receipt
+            else row.get("status_message")
+        )
         if status in self.FORK_TRANSIENT_STATUSES:
             status = ProcessStatus.RUNNABLE.value
             wait_state = None
@@ -4357,6 +4518,7 @@ class CheckpointManager:
         item["state_generation"] = 0
         item["execution_owner_id"] = None
         item["execution_lease_id"] = None
+        item = self._without_task_run_binding(item)
         item.update(
             self._remap_process_state_fields(
                 row,
@@ -4408,6 +4570,16 @@ class CheckpointManager:
         now = utc_now()
         item["created_at"] = now
         item["updated_at"] = now
+        return item
+
+    @classmethod
+    def _without_task_run_binding(cls, row: Mapping[str, Any]) -> dict[str, Any]:
+        """Return a process row detached from its source durable execution."""
+
+        item = dict(row)
+        for field_name in cls.TASK_RUN_PROCESS_FIELDS:
+            if field_name in item:
+                item[field_name] = None
         return item
 
     def _remap_namespace_row(

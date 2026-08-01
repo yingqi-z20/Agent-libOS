@@ -459,6 +459,18 @@ def test_workflow_order_requires_baseline_and_fresh_finalization_evidence() -> N
     }
 
 
+def test_workflow_order_does_not_treat_completion_review_as_terminal_exit() -> None:
+    evidence = _ordered_workflow_evidence()
+    exit_receipt = evidence[-1]
+    exit_receipt["status"] = "completion_review_required"
+    exit_receipt["terminal_committed"] = False
+
+    assert _workflow_order_checks(evidence) == {
+        "baseline_reproduced_before_edit": True,
+        "finalization_evidence_fresh": False,
+    }
+
+
 @pytest.mark.skipif(
     os.name == "nt",
     reason="Windows Host oracle fails closed without SubprocessLimits",
@@ -959,6 +971,13 @@ def _workflow_evidence_for_names(names: list[str]) -> list[dict[str, Any]]:
             "tool_id": f"tool:{name}",
             "result_oid": f"result:{index}",
         }
+        if name == "process_exit":
+            receipt.update(
+                {
+                    "status": "exited",
+                    "terminal_committed": True,
+                }
+            )
         if name == "run_shell_command":
             baseline = shell_index == 0
             receipt.update(

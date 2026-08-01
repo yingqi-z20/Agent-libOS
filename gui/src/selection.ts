@@ -1,4 +1,36 @@
-import type { RuntimeProcess, RuntimeSnapshot } from "./api/types";
+import type { RuntimeProcess, RuntimeSnapshot, TaskRunSummary } from "./api/types";
+import { upsertTaskRunSummary } from "./api/types";
+
+export function reconcileSelectedRunId(
+  snapshot: RuntimeSnapshot,
+  current: string | null,
+  { preserveExisting = true }: { preserveExisting?: boolean } = {}
+): string | null {
+  if (preserveExisting && current && snapshot.task_runs.some((run) => run.run_id === current)) {
+    return current;
+  }
+  const attention = snapshot.task_runs.find((run) => run.status === "needs_attention" || run.status === "waiting_human");
+  const active = snapshot.task_runs.find((run) => !["succeeded", "failed", "cancelled"].includes(run.status));
+  return attention?.run_id ?? active?.run_id ?? snapshot.task_runs[0]?.run_id ?? null;
+}
+
+export function upsertRuntimeTaskRun(
+  snapshot: RuntimeSnapshot,
+  run: TaskRunSummary
+): RuntimeSnapshot {
+  return { ...snapshot, task_runs: upsertTaskRunSummary(snapshot.task_runs, run) };
+}
+
+/** Preserve locally observed higher TaskRun revisions when a full snapshot is stale. */
+export function mergeRuntimeTaskRuns(
+  snapshot: RuntimeSnapshot,
+  current: RuntimeSnapshot
+): RuntimeSnapshot {
+  return current.task_runs.reduce(
+    (merged, run) => upsertRuntimeTaskRun(merged, run),
+    snapshot
+  );
+}
 
 export function reconcileSelectedPid(
   snapshot: RuntimeSnapshot,

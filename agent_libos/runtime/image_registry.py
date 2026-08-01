@@ -47,6 +47,7 @@ from agent_libos.ports import (
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
 from agent_libos.runtime.image_artifact import ImageArtifactLoader
+from agent_libos.runtime.task_run_reference import is_task_run_reference_payload
 from agent_libos.skills.schema import JitToolSpec
 from agent_libos.storage import ExtensionRepository, StoreAssemblyReadiness
 from agent_libos.tools.observability import ensure_json_size
@@ -2314,17 +2315,7 @@ class ImageRegistryPrimitive:
             raise ValidationError("required_modules[].source_sha256 must be a 64-character hex sha256")
 
     def _build_commit_artifact(self, snapshot: dict[str, Any], *, checkpoint_id: str) -> dict[str, Any]:
-        source_pid = str(snapshot["pid"])
-        process_rows = [row for row in snapshot.get("rows", {}).get("processes", []) if row["pid"] == source_pid]
-        if not process_rows:
-            raise ValidationError(f"checkpoint root process row is missing: {source_pid}")
-        process_row = dict(process_rows[0])
-        # Resource constraints are launch-time policy, not image state. A
-        # checkpoint-committed image may replay reconstructable memory/tool
-        # context, but it must not carry the source process budget or usage into
-        # a newly started process.
-        process_row.pop("resource_budget_json", None)
-        process_row.pop("resource_usage_json", None)
+        source_pid, process_row = self._checkpoint_commit_source_process(snapshot)
         object_oids = self._root_object_oids(snapshot, process_row, source_pid)
         object_rows = [row for row in snapshot.get("rows", {}).get("objects", []) if row["oid"] in object_oids]
         namespace_names = self._root_namespace_names(snapshot, object_rows, source_pid)
@@ -2342,27 +2333,19 @@ class ImageRegistryPrimitive:
             object_oids=object_oids,
             namespace_names=namespace_names,
         )
-        object_payloads: dict[str, Any] = {}
-        for oid in object_oids:
-            payload = deepcopy(snapshot.get("object_payloads", {}).get(oid))
-            payload_bytes = len(dumps(payload).encode("utf-8"))
-            if payload_bytes > self.config.image_commit.payload_capture_limit_bytes:
-                raise ValidationError(
-                    f"object payload {oid} exceeds image_commit.payload_capture_limit_bytes="
-                    f"{self.config.image_commit.payload_capture_limit_bytes}"
-                )
-            object_payloads[oid] = payload
+        object_payloads = self._checkpoint_commit_object_payloads(snapshot, object_oids)
         visible_tool_ids = set(tool_table.values())
-        jit_sources = {
-            tool_id: source
-            for tool_id, source in snapshot.get("jit_sources", {}).items()
-            if tool_id in visible_tool_ids
-        }
-        if len(jit_sources) > self.config.image_commit.max_committed_jit_sources:
-            raise ValidationError(
-                "committed JIT sources exceed "
-                f"max_committed_jit_sources={self.config.image_commit.max_committed_jit_sources}"
-            )
+        jit_sources = self._checkpoint_commit_jit_sources(snapshot, visible_tool_ids)
+        artifact_rows = self._checkpoint_commit_rows(
+            snapshot,
+            source_pid=source_pid,
+            object_oids=object_oids,
+            object_rows=object_rows,
+            namespace_names=namespace_names,
+            internal_capabilities=internal_capabilities,
+            visible_tool_ids=visible_tool_ids,
+        )
+        modules = list(snapshot.get("modules", []))
         return {
             "artifact_version": self.config.image_commit.artifact_version,
             "kind": "checkpoint_commit",
@@ -2370,27 +2353,7 @@ class ImageRegistryPrimitive:
             "source_pid": source_pid,
             "source_image_id": source_image_id,
             "source_process": process_row,
-            "rows": {
-                "object_namespaces": [
-                    row for row in snapshot.get("rows", {}).get("object_namespaces", [])
-                    if row["namespace"] in namespace_names
-                ],
-                "objects": object_rows,
-                "object_links": [
-                    row for row in snapshot.get("rows", {}).get("object_links", [])
-                    if row["src_oid"] in object_oids and row["dst_oid"] in object_oids
-                ],
-                "capabilities": internal_capabilities,
-                "skills": snapshot.get("rows", {}).get("skills", []),
-                "tools": [
-                    row for row in snapshot.get("rows", {}).get("tools", [])
-                    if row["tool_id"] in visible_tool_ids
-                ],
-                "tool_candidates": [
-                    row for row in snapshot.get("rows", {}).get("tool_candidates", [])
-                    if row["pid"] == source_pid
-                ],
-            },
+            "rows": artifact_rows,
             "object_oids": sorted(object_oids),
             "namespaces": sorted(namespace_names),
             "object_payloads": object_payloads,
@@ -2401,7 +2364,7 @@ class ImageRegistryPrimitive:
             "default_skills": list(source_image.default_skills) if source_image is not None else [],
             "static_default_tools": static_tool_names,
             "required_capabilities": required_capabilities,
-            "modules": list(snapshot.get("modules", [])),
+            "modules": modules,
             "counts": {
                 "objects": len(object_rows),
                 "namespaces": len(namespace_names),
@@ -2409,8 +2372,156 @@ class ImageRegistryPrimitive:
                 "required_capabilities": len(required_capabilities),
                 "tools": len(tool_table),
                 "jit_sources": len(jit_sources),
-                "modules": len(snapshot.get("modules", [])),
+                "modules": len(modules),
             },
+        }
+
+    def _checkpoint_commit_source_process(
+        self,
+        snapshot: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        source_pid = str(snapshot["pid"])
+        process_rows = [
+            row
+            for row in snapshot.get("rows", {}).get("processes", [])
+            if row["pid"] == source_pid
+        ]
+        if not process_rows:
+            raise ValidationError(
+                f"checkpoint root process row is missing: {source_pid}"
+            )
+        process_row = dict(process_rows[0])
+        self._strip_live_execution_state_from_commit_process(process_row)
+        task_run_reference_oids = self._task_run_reference_oids(snapshot)
+        self._strip_task_run_references_from_commit_process(
+            process_row,
+            task_run_reference_oids,
+        )
+        return source_pid, process_row
+
+    @staticmethod
+    def _strip_live_execution_state_from_commit_process(
+        process_row: dict[str, Any],
+    ) -> None:
+        # Resource constraints are launch-time policy, not image state. A
+        # checkpoint-committed image may replay reconstructable memory/tool
+        # context, but it must not carry the source process budget or usage into
+        # a newly started process. Durable TaskRun ownership is likewise a live
+        # execution identity backed by an append-only ledger, not reusable image
+        # state. The TaskRun payload and ledger tables are outside the checkpoint
+        # artifact; remove the process-side references as well.
+        for field_name in (
+            "resource_budget_json",
+            "resource_usage_json",
+            "task_run_id",
+            "task_run_epoch",
+            "task_run_role",
+        ):
+            process_row.pop(field_name, None)
+
+    @staticmethod
+    def _task_run_reference_oids(snapshot: dict[str, Any]) -> set[str]:
+        return {
+            str(oid)
+            for oid, payload in snapshot.get("object_payloads", {}).items()
+            if is_task_run_reference_payload(payload)
+        }
+
+    @staticmethod
+    def _strip_task_run_references_from_commit_process(
+        process_row: dict[str, Any],
+        task_run_reference_oids: set[str],
+    ) -> None:
+        source_goal_oid = process_row.get("goal_oid")
+        if (
+            source_goal_oid is not None
+            and str(source_goal_oid) in task_run_reference_oids
+        ):
+            process_row["goal_oid"] = None
+        memory_view = loads(process_row.get("memory_view_json"), {})
+        if not isinstance(memory_view, dict):
+            return
+        roots = memory_view.get("roots")
+        if not isinstance(roots, list):
+            return
+        memory_view["roots"] = [
+            root
+            for root in roots
+            if not isinstance(root, dict)
+            or str(root.get("oid")) not in task_run_reference_oids
+        ]
+        process_row["memory_view_json"] = dumps(memory_view)
+
+    def _checkpoint_commit_object_payloads(
+        self,
+        snapshot: dict[str, Any],
+        object_oids: set[str],
+    ) -> dict[str, Any]:
+        object_payloads: dict[str, Any] = {}
+        for oid in object_oids:
+            payload = deepcopy(snapshot.get("object_payloads", {}).get(oid))
+            payload_bytes = len(dumps(payload).encode("utf-8"))
+            if payload_bytes > self.config.image_commit.payload_capture_limit_bytes:
+                raise ValidationError(
+                    f"object payload {oid} exceeds image_commit.payload_capture_limit_bytes="
+                    f"{self.config.image_commit.payload_capture_limit_bytes}"
+                )
+            object_payloads[oid] = payload
+        return object_payloads
+
+    def _checkpoint_commit_jit_sources(
+        self,
+        snapshot: dict[str, Any],
+        visible_tool_ids: set[str],
+    ) -> dict[str, str]:
+        jit_sources = {
+            tool_id: source
+            for tool_id, source in snapshot.get("jit_sources", {}).items()
+            if tool_id in visible_tool_ids
+        }
+        if len(jit_sources) > self.config.image_commit.max_committed_jit_sources:
+            raise ValidationError(
+                "committed JIT sources exceed "
+                f"max_committed_jit_sources={self.config.image_commit.max_committed_jit_sources}"
+            )
+        return jit_sources
+
+    @staticmethod
+    def _checkpoint_commit_rows(
+        snapshot: dict[str, Any],
+        *,
+        source_pid: str,
+        object_oids: set[str],
+        object_rows: list[dict[str, Any]],
+        namespace_names: set[str],
+        internal_capabilities: list[dict[str, Any]],
+        visible_tool_ids: set[str],
+    ) -> dict[str, Any]:
+        rows = snapshot.get("rows", {})
+        return {
+            "object_namespaces": [
+                row
+                for row in rows.get("object_namespaces", [])
+                if row["namespace"] in namespace_names
+            ],
+            "objects": object_rows,
+            "object_links": [
+                row
+                for row in rows.get("object_links", [])
+                if row["src_oid"] in object_oids and row["dst_oid"] in object_oids
+            ],
+            "capabilities": internal_capabilities,
+            "skills": rows.get("skills", []),
+            "tools": [
+                row
+                for row in rows.get("tools", [])
+                if row["tool_id"] in visible_tool_ids
+            ],
+            "tool_candidates": [
+                row
+                for row in rows.get("tool_candidates", [])
+                if row["pid"] == source_pid
+            ],
         }
 
     def _root_object_oids(self, snapshot: dict[str, Any], process_row: dict[str, Any], source_pid: str) -> set[str]:
@@ -2425,7 +2536,14 @@ class ImageRegistryPrimitive:
             if row.get("owner_kind") == ObjectOwnerKind.PROCESS.value and row.get("owner_id") == source_pid:
                 oids.add(str(row["oid"]))
         available = set(snapshot.get("object_payloads", {}).keys())
-        return {oid for oid in oids if oid in available}
+        return {
+            oid
+            for oid in oids
+            if oid in available
+            and not is_task_run_reference_payload(
+                snapshot.get("object_payloads", {}).get(oid)
+            )
+        }
 
     def _root_namespace_names(self, snapshot: dict[str, Any], object_rows: list[dict[str, Any]], source_pid: str) -> set[str]:
         process_namespace = f"{self.config.memory.process_namespace_prefix}:{source_pid}"

@@ -31,6 +31,7 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import (
     CapabilityDenied,
     HumanApprovalRequired,
+    HumanResponseRequired,
     NotFound,
     ProcessError,
     ProcessMessageWaitRequired,
@@ -640,6 +641,16 @@ class LibOSSyscallSession:
                 decision={"wait_state_preserved": preserve_wait},
             )
             raise
+        except (
+            HumanApprovalRequired,
+            ProcessWaitRequired,
+            ProcessMessageWaitRequired,
+        ):
+            # Durable Task Runs surface typed waits to the action executor so
+            # it can persist a replay-safe pending action.  The process wait
+            # row is already the authoritative scheduler boundary and must not
+            # be woken by the generic exceptional-syscall cleanup below.
+            raise
         except BaseException:
             self._cleanup_interrupted_wait(normalized)
             raise
@@ -712,13 +723,23 @@ class LibOSSyscallSession:
                 return result
             except HumanApprovalRequired as exc:
                 self._remember_wait_state()
+                if self._is_durable_task_run_process():
+                    raise
                 await self._resolve_human_request(exc.request_id)
             except ProcessWaitRequired as exc:
                 self._remember_wait_state()
+                if self._is_durable_task_run_process():
+                    raise
                 await self._wait_for_child_terminal(exc.child_pid)
             except ProcessMessageWaitRequired as exc:
                 self._remember_wait_state()
+                if self._is_durable_task_run_process():
+                    raise
                 await self._wait_for_process_message(exc.recipient_pid, exc.filters)
+
+    def _is_durable_task_run_process(self) -> bool:
+        process = self._processes.get_process(self.pid)
+        return process is not None and process.task_run_id is not None
 
     def _require_non_terminal_process(self) -> None:
         process = self._processes.get_process(self.pid)
@@ -762,6 +783,13 @@ class LibOSSyscallSession:
                 return
             if request.status != HumanRequestStatus.PENDING:
                 raise CapabilityDenied(f"human request was not approved: {request_id} status={request.status.value}")
+            if self._is_durable_task_run_process():
+                raise HumanResponseRequired(
+                    request_id=request_id,
+                    message=(
+                        f"{self.pid} is waiting for human answer to {request_id}"
+                    ),
+                )
             processed = await self.runtime.human.aprocess_next_terminal(
                 human=request.human,
                 auto_approve=self._human_run_context.auto_approve,

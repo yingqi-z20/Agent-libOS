@@ -97,6 +97,7 @@ CAPABILITY_MANAGER_READ_ONLY_PUBLIC_METHODS = frozenset(
         "list_subject",
         "matching_capabilities",
         "object_access",
+        "parent_chain_active",
         "parse_resource_pattern",
         "presentation_page",
         "permission_policy",
@@ -630,6 +631,11 @@ class CapabilityManager:
         """Public expiry predicate for authority transition planners."""
 
         return self._is_expired(capability)
+
+    def parent_chain_active(self, capability: Capability) -> bool:
+        """Return whether every delegated ancestor remains active and valid."""
+
+        return self._parent_chain_active(capability)
 
     def resources_overlap(self, left: str, right: str) -> bool:
         """Return whether two canonical resource patterns may select one target."""

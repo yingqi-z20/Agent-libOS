@@ -544,6 +544,21 @@ links, and original payload digests, and it refuses rows still needed for
 runtime continuation or recovery. This at-rest lifecycle is distinct from
 write-time `llm.persist_full_io` and from Sink clearance.
 
+Durable Task Run payloads form another explicit at-rest boundary. Their rows
+retain a label and content hash, but `task_runs.plaintext_payloads_enabled`
+controls whether the Host may persist readable goal/follow-up/resume content;
+it is not Sink authority or encryption. The default `purge_on_terminal` policy
+reduces Run-owned plaintext, linked LLM/tool-output bodies, and linked terminal
+Human request payload/decision bodies to hash-only projections, and deletes
+pending continuation actions and messages automatically bound from a Run-member
+recipient, before terminalization. A caller cannot suppress or forge that
+recipient-derived Run binding. Human request identity, type, status,
+timestamps, hashes, and audit linkage remain without readable
+prompt/answer/decision content.
+`permanent` is Host/admin-only and skips that Run-terminal cleanup; independent
+evidence retention may still apply. A Run's ledger must never copy resolved
+credentials or provider secret values from their environment-backed boundary.
+
 ## Guarantee boundary
 
 The guarantee covers payloads that cross runtime-mediated Sinks. Marking a

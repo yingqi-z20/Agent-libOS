@@ -17,6 +17,90 @@ operation may contain several ordered provider phases, but uses one durable
 effect id, one deduplicated reservation set, and one explicit operation/evidence
 chain. Waiting/resume behavior remains part of the enclosing logical operation.
 
+## Durable Task Run supervision
+
+A [`TaskRun`](durable_task_runs.md) is a Host-supervised durable envelope around
+one root `AgentProcess` and its descendant process tree. It adds a versioned
+goal, requirements, a current status projection, an append-only ledger, safe
+resume points, idempotent commands, retention policy, and one monotonic Runtime
+epoch. It is not another scheduler and is not a declarative workflow graph:
+ordinary process transitions, ToolBroker calls, Human requests, messages,
+Capabilities, Task Authority, data-flow decisions, resource accounting, and
+protected external effects remain authoritative.
+
+Process spawn and fork under a Run inherit its id, epoch, and process role in
+the same transaction as child publication. A stale epoch cannot claim or
+publish Run-owned execution after a successor Runtime takes the active-store
+lease. `run_until_blocked` advances bounded scheduler quanta and then projects
+the process tree into a Run status such as `waiting_human`, `waiting_process`,
+`waiting_message`, `waiting_tool`, `paused`, or `needs_attention`.
+
+A safe resume point is written only after a complete model action and all
+paired tool results have committed. It binds the local context generation,
+Image/tool and provider identities, authority, transcript/payload hashes, and
+Runtime epoch. Startup does not re-run work merely because its Run was
+`running` when the Host stopped. It first validates Run payloads, reconciles
+prepared/provider effects, reservations, and publications, fences stale
+operation/execution claims, and then reconciles ObjectTask and
+terminal-process-cleanup facts. It automatically continues only from a valid
+local resume point with no later unsettled effect,
+an authoritatively certified non-dispatch, or an already durable provider
+success awaiting local settlement.
+
+Task Run command receipts fence Host retries separately from resume points.
+Split-phase `run`/`resume`/cancel/deadline, interrupting follow-up, and
+authoritative effect-receipt commands persist a request-bound provisional
+result before their response can be mistaken for permission to start again;
+local convergence CASes that receipt to its final revision-bound result. Every
+split local-control pending and completed receipt retains its exact
+`admission_ledger_seq`, `admission_ledger_item_id`, and
+`admission_evidence_sha256` reference to the same-transaction append-only status
+transition. Replay validates that ledger row and its Run, command, request,
+from/to status, and semantic generation/revision evidence even on terminal or
+superseded early-return paths. Interrupt completion retains its
+`interrupt_provenance_sha256` while removing the raw admission epoch/fence list.
+After
+a crash or lost response, an exact pending-command replay performs only local
+settlement and projection: it does not consume another scheduler quantum or
+redispatch an LLM, tool, provider operation, or external effect. Once verified
+effect settlement has committed, that replay instead validates the exact
+append-only effect transition plus `host_verified_receipt` audit and does not
+invoke the receipt verifier again; this evidence survives provider-body purge.
+All command inserts and result updates, including a linked-recovery gap repair,
+hold the global Runtime-epoch counter-row fence, so a superseded Runtime writes
+nothing. Startup locally completes only a well-formed pending interrupt
+for a recoverable nonterminal Run and the current pause/cancel generation. It
+first settles any already-staged complete provider result and validates durable
+waits, then applies ordinary binding, authority, effect, and ObjectTask gates.
+Queued execution stays queued; only an integrity- and generation-matched
+typed `StaleExecutionProcessWait` receipt is resumed, never an independent Host
+pause. Its `stale_execution_recovery` `status_message` is compatibility display
+text and is not a control input; ordinary resume blockers and finalization still
+run afterwards. Cancellation
+or an expired deadline outranks an older interrupt. If the Run becomes terminal
+before command-result CAS, startup leaves that receipt for exact local client
+replay. Ambiguous, corrupt, or over-bound recovery evidence fails closed into
+`needs_attention`. The detailed receipt state machine is specified in
+[Durable Task Runs](durable_task_runs.md#crash-safe-command-settlement).
+Linked-Run recovery has a separate local gap protocol: if its deterministic
+nested rerun and target creation committed before the outer recover receipt,
+only the exact outer request may validate the parent request-hash binding,
+source/target receipts, target row, and unique Run link and then copy that
+immutable result into the missing outer receipt. Startup does not create or
+repeat the linked Run, and incomplete evidence writes nothing.
+
+Missing payloads, binding drift, non-replayable pending actions, abandoned
+ObjectTasks, and dispatched/unknown effects produce `needs_attention` and
+prevent downstream dispatch. Pause, cancel, and deadline handling are
+forward-only persisted intents. An unresolved effect is never converted into
+a false retry or `cancelled` state. A Run succeeds only after every descendant,
+required requirement, effect, reservation, and retention cleanup has settled.
+Default Run cleanup also removes readable content from linked terminal Human
+request payloads/decisions while retaining their identities, types, statuses,
+timestamps, hashes, and audit linkage.
+The exact model and Host interfaces are documented in
+[Durable Task Runs](durable_task_runs.md).
+
 ## Process Lifecycle
 
 The current lifecycle includes:
@@ -96,7 +180,7 @@ operations perform the same validation at their atomic boundary.
 | matching typed wait | `runnable`, same-domain wait, or `paused` | child/message condition owner, Human decision owner, or syscall-owned cleanup | Child/message and syscall cleanup use an exact `ProcessStateToken`; Human uses the exact observed revision/status/generation and acts only on its own request-id wait | Updated process generation plus the owning domain's documented evidence; there is no standalone generic wake event |
 | `waiting_human` | `paused` | `HumanObjectManager` | Rejected release/general request, or an unknown provider outcome; the latter and executor finalization of a rejected exact conditional LLM release require the Host-only wait kind | Typed ordinary-pause or Host-resume state and Human response/diagnostic evidence |
 | `paused` or compatibility `suspended` | `runnable` | trusted Host resume | Signal is applicable; a Host-resume marker may be cleared only by the Host path | `PROCESS_SIGNAL` and audit with the state transition |
-| eligible nonterminal without a condition-owned wait | `paused` | trusted Host/Human control or startup stale-execution recovery | Exact observed state; a live execution lease requires a scoped takeover | Typed pause state and signal/recovery audit/event |
+| eligible nonterminal without a condition-owned wait | `paused` | trusted Host/Human control or startup stale-execution recovery | Exact observed state; a live execution lease requires a scoped takeover | Typed ordinary pause or hash-only Store recovery receipt, plus signal/recovery audit/event |
 | eligible nonterminal | `killed` | trusted signal, resource enforcement, or ObjectTask cancellation | Exact observed state; a live execution lease requires a scoped takeover | Typed killed outcome and terminal-cleanup intent; signal/resource evidence identifies the cause |
 | eligible nonterminal | `exited` or `failed` | process exit, workflow/ObjectTask owner, scheduler failure, or recovery | Exact revision/generation and a matching typed outcome | Terminal row and cleanup intent; ordinary process exit emits `PROCESS_EXITED`, while specialized failures retain their own audit/event contract |
 | captured process state | reconciled restored state | `CheckpointManager` | Recovery/publication lease, exact plan anchor, scoped quiescence, and restore CAS | Checkpoint-restore publication, `ROLLBACK`, audit, operation evidence, and fresh revision/execution/state-generation fences |
@@ -1094,8 +1178,12 @@ only when the primitive/provider implements one explicitly.
 ## Human Queue
 
 Human interaction is modeled as typed runtime objects rather than untracked
-terminal strings. Request and answer payloads may be retained in their dedicated
-Human records; effect and audit metadata remain content-free as described below.
+terminal strings. Request and answer payloads may be retained in their
+dedicated Human records; effect and audit metadata remain content-free as
+described below. For a Human record linked to a Durable Task Run, the Run's
+default terminal cleanup or later explicit Host purge replaces readable
+request/answer/decision content with hashes while retaining identity, type,
+status, timestamps, and audit linkage.
 
 - `ask_human` creates a blocking question.
 - `request_permission` requires human write authority, creates a blocking scoped

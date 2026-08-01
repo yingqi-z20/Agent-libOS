@@ -12,6 +12,9 @@ from typing import Any, Callable, Iterable, Mapping
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.evidence.message_projection import (
+    task_run_message_evidence_projection,
+)
 from agent_libos.models import (
     AuthorityRisk,
     CapabilityEffect,
@@ -1065,14 +1068,17 @@ class HumanObjectManager:
                 actor=f"human:{selected_human}",
                 action="human.message",
                 target=f"process:{recipient_pid}",
-                decision={
-                    "message_id": message.message_id,
-                    "kind": message.kind.value,
-                    "channel": message.channel,
-                    "correlation_id": message.correlation_id,
-                    "reply_to": message.reply_to,
-                    "subject": message.subject,
-                },
+                decision=(
+                    task_run_message_evidence_projection(message)
+                    or {
+                        "message_id": message.message_id,
+                        "kind": message.kind.value,
+                        "channel": message.channel,
+                        "correlation_id": message.correlation_id,
+                        "reply_to": message.reply_to,
+                        "subject": message.subject,
+                    }
+                ),
             )
         return message
 

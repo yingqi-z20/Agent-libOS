@@ -12,6 +12,7 @@ from agent_libos.evidence.payload_retention import (
     PayloadRetentionPage,
     PayloadRetentionStore,
     PayloadRetentionTier,
+    TaskRunExternalEffectRedactionStore,
 )
 from agent_libos.evidence.initial_goal_recovery import (
     redact_initial_goal_recovery_receipt_projection,
@@ -79,6 +80,19 @@ from agent_libos.models import (
     RuntimePublicationState,
     ToolCandidate,
     ToolSpec,
+    TaskRunCommand,
+    TaskRunCursor,
+    TaskRunLedgerCursor,
+    TaskRunLedgerItem,
+    TaskRunLedgerPage,
+    TaskRunLink,
+    TaskRunPage,
+    TaskRunPayload,
+    TaskRunRecord,
+    TaskRunRequirement,
+    TaskRunRequirementStatus,
+    TaskRunResumePoint,
+    TaskRunStatus,
     parse_runtime_publication_kind,
     validate_runtime_publication_record,
 )
@@ -96,6 +110,7 @@ from agent_libos.storage.contracts import (
     RuntimePublicationBackendProtocol,
     SnapshotCheckpointBackendProtocol,
     ToolArtifactRepositoryProtocol,
+    TaskRunBackendProtocol,
     TransactionBackendProtocol,
     UnitOfWorkBackendProtocol,
 )
@@ -324,6 +339,62 @@ class _RepositoryFacade:
         return self.__store.transaction(include_object_payloads=include_object_payloads)
 
 
+class TaskRunRepository(_RepositoryFacade):
+    """Narrow facade for schema-v4 durable TaskRun persistence."""
+
+    _METHODS = frozenset(
+        {
+            "runtime_epoch",
+            "claim_runtime_epoch",
+            "insert_task_run",
+            "get_task_run",
+            "list_task_runs",
+            "list_recoverable_task_runs",
+            "update_task_run_cas",
+            "claim_task_run_epoch",
+            "claim_terminal_task_run_epoch",
+            "insert_task_run_requirement",
+            "list_task_run_requirements",
+            "update_task_run_requirement_cas",
+            "insert_task_run_payload",
+            "get_task_run_payload",
+            "list_task_run_payloads",
+            "purge_task_run_payloads",
+            "upsert_task_run_resume_point",
+            "get_task_run_resume_point",
+            "list_task_run_resume_points",
+            "delete_task_run_resume_point",
+            "insert_task_run_command",
+            "get_task_run_command",
+            "get_task_run_command_by_client_request_id",
+            "update_task_run_command_result",
+            "append_task_run_ledger_item",
+            "get_task_run_ledger_item",
+            "list_task_run_ledger",
+            "insert_task_run_link",
+            "list_task_run_links",
+            "list_processes_for_task_run",
+            "list_task_run_process_ids",
+            "list_active_capability_use_reservations_for_pids",
+            "list_human_requests_for_pids",
+            "list_task_run_human_requests",
+            "redact_task_run_human_request_payload",
+            "purge_task_run_messages",
+            "purge_task_run_llm_pending_actions",
+            "list_task_run_external_effects",
+            "redact_task_run_external_effect_payload",
+            "list_active_task_run_ids_for_pids",
+            "list_task_run_llm_calls",
+            "redact_task_run_llm_call_payload",
+            "list_task_run_llm_tool_outputs",
+            "redact_task_run_llm_tool_output",
+        }
+    )
+
+    def __init__(self, backend: TaskRunBackendProtocol) -> None:
+        super().__init__(backend)
+
+
 class ProcessRepository(_RepositoryFacade):
     """Process lifecycle, messaging, human, and LLM persistence."""
 
@@ -332,6 +403,7 @@ class ProcessRepository(_RepositoryFacade):
             "insert_human_request",
             "update_human_request",
             "list_human_requests",
+            "list_human_requests_for_pids",
             "insert_llm_call",
             "list_llm_calls",
             "get_llm_call",
@@ -346,6 +418,7 @@ class ProcessRepository(_RepositoryFacade):
             "upsert_llm_pending_action",
             "get_llm_pending_action",
             "list_llm_pending_actions",
+            "list_llm_pending_action_validation_rows",
             "claim_llm_pending_action",
             "complete_llm_pending_action",
             "insert_process_message",
@@ -2627,7 +2700,7 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
                     pids,
                 ),
             }
-        )
+        ).without_task_run_private_replay_rows()
         return rows, cast(
             dict[str, Any],
             self._snapshot_backend.snapshot_object_payloads(selected_object_oids),
@@ -3899,6 +3972,9 @@ class EvidenceRepository(_RepositoryFacade):
             "insert_external_effect",
             "finalize_external_effect",
             "transition_external_effect",
+            "settle_external_effect_recovery",
+            "list_task_run_external_effects",
+            "redact_task_run_external_effect_payload",
             "abandon_external_effect_intent",
             "list_external_effects",
             "query_external_effect_recovery",
@@ -3910,6 +3986,10 @@ class EvidenceRepository(_RepositoryFacade):
         super().__init__(store)
         self._operation_backend = store
         self._publication_backend = cast(RuntimePublicationBackendProtocol, store)
+        self._task_run_external_effect_backend = cast(
+            TaskRunExternalEffectRedactionStore,
+            store,
+        )
 
     def list_events(
         self,
@@ -4033,6 +4113,21 @@ class EvidenceRepository(_RepositoryFacade):
     def current_effect_ledger_seq(self) -> int:
         return self._operation_backend.current_effect_ledger_seq()
 
+    def external_effect_transition_matches(
+        self,
+        transition_seq: int,
+        effect_id: str,
+        *,
+        effect_state: str,
+        transaction_state: str,
+    ) -> bool:
+        return self._operation_backend.external_effect_transition_matches(
+            transition_seq,
+            effect_id,
+            effect_state=effect_state,
+            transaction_state=transaction_state,
+        )
+
     def list_external_effects_changed_after(
         self,
         effect_ledger_seq: int,
@@ -4042,6 +4137,37 @@ class EvidenceRepository(_RepositoryFacade):
         return self._operation_backend.list_external_effects_changed_after(
             effect_ledger_seq,
             pids=pids,
+        )
+
+    def list_task_run_external_effects(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str] = (),
+    ) -> list[ExternalEffectRecord]:
+        return self._task_run_external_effect_backend.list_task_run_external_effects(
+            run_id,
+            linked_pids,
+        )
+
+    def redact_task_run_external_effect_payload(
+        self,
+        record: ExternalEffectRecord,
+        *,
+        run_id: str,
+        expected_payload_sha256: str,
+        expected_tier: str,
+        expected_effect_state: str,
+        expected_transaction_state: str,
+    ) -> bool:
+        return (
+            self._task_run_external_effect_backend.redact_task_run_external_effect_payload(
+                record,
+                run_id=run_id,
+                expected_payload_sha256=expected_payload_sha256,
+                expected_tier=expected_tier,
+                expected_effect_state=expected_effect_state,
+                expected_transaction_state=expected_transaction_state,
+            )
         )
 
     def list_operation_ids_by_runtime_publication_id(
@@ -4397,6 +4523,12 @@ class ProtectedEffectRepository:
     def transition_external_effect(self, *args: Any, **kwargs: Any) -> Any:
         return self.__unit_of_work.evidence.transition_external_effect(*args, **kwargs)
 
+    def settle_external_effect_recovery(self, *args: Any, **kwargs: Any) -> Any:
+        return self.__unit_of_work.evidence.settle_external_effect_recovery(
+            *args,
+            **kwargs,
+        )
+
     def abandon_external_effect_intent(self, *args: Any, **kwargs: Any) -> Any:
         return self.__unit_of_work.evidence.abandon_external_effect_intent(*args, **kwargs)
 
@@ -4417,6 +4549,7 @@ class ProtectedEffectRepository:
 
 
 _MIGRATED_BACKEND_PROTOCOLS: tuple[tuple[str, type[Any]], ...] = (
+    ("task-run", TaskRunBackendProtocol),
     ("authority-recovery", AuthorityRecoveryBackendProtocol),
     ("object-query", ObjectQueryBackendProtocol),
     ("object-recovery", ObjectRecoveryBackendProtocol),
@@ -4545,6 +4678,7 @@ class UnitOfWork:
             details = "; ".join(errors)
             raise TypeError(f"UnitOfWork backend contract violation: {details}")
         self.__store = store
+        self.task_runs = TaskRunRepository(cast(TaskRunBackendProtocol, store))
         self.processes = ProcessRepository(store)
         self.objects = ObjectRepository(store)
         self.authority = AuthorityRepository(store)

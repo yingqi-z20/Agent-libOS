@@ -1,11 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://agent-libos.local/schemas/gui-api/v1.json",
-  "title": "Agent libOS local GUI API contract subset v1",
-  "description": "Machine-readable same-build schema registry for the snapshot's top-level structure, JSON error envelopes, and explicit-confirmation mutation payloads. The document root deliberately rejects instances: validators must select one of the named $defs entry points with a JSON Pointer fragment. Snapshot collection item semantics outside process identity/state remain renderer/server implementation details. This is not a complete public REST/OpenAPI specification.",
-  "x-agent-libos-schema-version": 1,
+  "$id": "https://agent-libos.local/schemas/gui-api/v2.json",
+  "title": "Agent libOS local GUI API contract subset v2",
+  "description": "Machine-readable same-build schema registry for the snapshot's top-level structure, process identity/state, redacted Durable Task Run summaries/details, JSON error envelopes, and explicit-confirmation mutation payloads. The document root deliberately rejects instances: validators must select one of the named $defs entry points with a JSON Pointer fragment. Snapshot collection item semantics outside process and Task Run state remain renderer/server implementation details. This is not a complete public REST/OpenAPI specification.",
+  "x-agent-libos-schema-version": 2,
   "x-agent-libos-contract-scope": {
     "snapshot": "GET /api/snapshot",
+    "task_run_summary": "GET /api/snapshot and task_run.updated SSE payloads",
+    "task_run_detail": "GET /api/task-runs/{run_id}",
     "error_envelope": "JSON errors from /api routes",
     "confirmed_operations": {
       "workflow.run": { "route": "POST /api/workflows/run", "request_def": "workflowRunPayload", "conditional": "Only workflow requests classified as high-risk require confirmed=true." },
@@ -25,13 +27,15 @@
       "jsonrpc.register": { "route": "POST /api/jsonrpc/register", "request_def": "registryManifestPayload" },
       "jsonrpc.call": { "route": "POST /api/jsonrpc/{endpoint_id}/call", "request_def": "jsonRpcCallPayload" },
       "mcp.register": { "route": "POST /api/mcp/register", "request_def": "registryManifestPayload" },
-      "mcp.call": { "route": "POST /api/mcp/{server_id}/call", "request_def": "mcpCallPayload" }
+      "mcp.call": { "route": "POST /api/mcp/{server_id}/call", "request_def": "mcpCallPayload" },
+      "task_run.cancel": { "route": "POST /api/task-runs/{run_id}/cancel", "request_def": "taskRunCancelPayload" },
+      "task_run.recover": { "route": "POST /api/task-runs/{run_id}/recover", "request_def": "taskRunRecoverPayload" }
     }
   },
   "x-agent-libos-definition-usage": {
     "root_validation": "The registry root is not an instance schema and always rejects. Select a definition explicitly.",
     "local_ref_example": "./gui_api_schema.json#/$defs/processExecPayload",
-    "canonical_ref_example": "https://agent-libos.local/schemas/gui-api/v1.json#/$defs/processExecPayload"
+    "canonical_ref_example": "https://agent-libos.local/schemas/gui-api/v2.json#/$defs/processExecPayload"
   },
   "not": {},
   "$defs": {
@@ -95,12 +99,129 @@
       },
       "additionalProperties": true
     },
+    "processWaitState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["schema_version", "kind", "child_pid"],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "kind": { "const": "child" },
+            "child_pid": { "$ref": "#/$defs/nonEmptyString" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["schema_version", "kind", "filters"],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "kind": { "const": "message" },
+            "filters": { "type": "object" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["schema_version", "kind", "request_ids"],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "kind": { "const": "human" },
+            "request_ids": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/nonEmptyString" }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["schema_version", "kind", "operation_id"],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "kind": { "const": "tool" },
+            "operation_id": { "$ref": "#/$defs/nonEmptyString" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["schema_version", "kind", "reason_oid"],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "kind": { "const": "paused" },
+            "reason_oid": {
+              "oneOf": [
+                { "$ref": "#/$defs/nonEmptyString" },
+                { "type": "null" }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["schema_version", "kind", "reason_oid"],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "kind": { "const": "host_resume" },
+            "reason_oid": { "$ref": "#/$defs/nonEmptyString" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Diagnostic stale-execution takeover projection; not independent TaskRun resume authority.",
+          "required": [
+            "schema_version",
+            "kind",
+            "pid",
+            "recovered_by_owner_sha256",
+            "prior_owner_sha256",
+            "prior_lease_sha256",
+            "prior_execution_generation",
+            "recovered_execution_generation",
+            "recovered_state_generation"
+          ],
+          "properties": {
+            "schema_version": { "const": 1 },
+            "kind": { "const": "stale_execution" },
+            "pid": { "$ref": "#/$defs/nonEmptyString" },
+            "recovered_by_owner_sha256": { "$ref": "#/$defs/sha256" },
+            "prior_owner_sha256": {
+              "oneOf": [
+                { "$ref": "#/$defs/sha256" },
+                { "type": "null" }
+              ]
+            },
+            "prior_lease_sha256": {
+              "oneOf": [
+                { "$ref": "#/$defs/sha256" },
+                { "type": "null" }
+              ]
+            },
+            "prior_execution_generation": { "type": "integer", "minimum": 0 },
+            "recovered_execution_generation": { "type": "integer", "minimum": 1 },
+            "recovered_state_generation": { "type": "integer", "minimum": 1 }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "processSummary": {
       "type": "object",
       "required": ["pid", "status"],
       "properties": {
         "pid": { "$ref": "#/$defs/nonEmptyString" },
         "status": { "$ref": "#/$defs/nonEmptyString" },
+        "wait_state": {
+          "oneOf": [
+            { "$ref": "#/$defs/processWaitState" },
+            { "type": "null" }
+          ]
+        },
         "messages": { "type": "array" },
         "terminal": { "type": "boolean" },
         "unread_message_count": { "type": "integer", "minimum": 0 },
@@ -108,9 +229,169 @@
       },
       "additionalProperties": true
     },
+    "taskRunBlocker": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "unknown_effect",
+            "effect_unknown",
+            "payload_missing",
+            "payload_corrupt",
+            "binding_drift",
+            "pending_action_unreplayable",
+            "active_object_task",
+            "requirements_unsatisfied",
+            "cleanup_failed",
+            "authority_revoked",
+            "deadline_reached",
+            "effect_unsettled",
+            "reservation_unsettled",
+            "publication_unsettled",
+            "manual_recovery_required"
+          ]
+        },
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "evidence_ref": { "type": "string" },
+        "process_id": { "type": "string" },
+        "effect_id": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "taskRunSummary": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "run_id",
+        "revision",
+        "status",
+        "display_title",
+        "root_pid",
+        "active_pid",
+        "allowed_actions",
+        "blockers",
+        "retention",
+        "payloads_purged"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "run_id": { "$ref": "#/$defs/nonEmptyString" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "status": {
+          "enum": [
+            "queued",
+            "running",
+            "waiting_human",
+            "waiting_process",
+            "waiting_message",
+            "waiting_tool",
+            "paused",
+            "cancelling",
+            "finalizing",
+            "needs_attention",
+            "succeeded",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "display_title": { "$ref": "#/$defs/nonEmptyString" },
+        "root_pid": { "type": ["string", "null"] },
+        "active_pid": { "type": ["string", "null"] },
+        "allowed_actions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["run", "wait", "pause", "resume", "cancel", "follow_up", "recover", "rerun"] }
+        },
+        "blockers": { "type": "array", "items": { "$ref": "#/$defs/taskRunBlocker" } },
+        "retention": { "enum": ["purge_on_terminal", "permanent"] },
+        "payloads_purged": { "type": "boolean" },
+        "requirement_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "step_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "step_count": { "type": "integer", "minimum": 0 },
+        "completed_step_count": { "type": "integer", "minimum": 0 },
+        "result_ref": { "type": ["string", "null"] },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" },
+        "started_at": { "type": ["string", "null"] },
+        "completed_at": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "taskRunRequirement": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "requirement_id",
+        "run_id",
+        "ordinal",
+        "kind",
+        "status",
+        "requirement_sha256",
+        "label",
+        "created_by",
+        "created_at",
+        "updated_at",
+        "started_at",
+        "completed_at",
+        "waived_by",
+        "content_available",
+        "content_retention",
+        "content_sha256"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "requirement_id": { "$ref": "#/$defs/nonEmptyString" },
+        "run_id": { "$ref": "#/$defs/nonEmptyString" },
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "kind": { "enum": ["initial", "follow_up"] },
+        "status": { "enum": ["pending", "in_progress", "satisfied", "blocked", "waived"] },
+        "requirement_sha256": { "$ref": "#/$defs/sha256" },
+        "label": { "type": "string" },
+        "created_by": { "$ref": "#/$defs/nonEmptyString" },
+        "created_at": { "type": "string" },
+        "updated_at": { "type": "string" },
+        "started_at": { "type": ["string", "null"] },
+        "completed_at": { "type": ["string", "null"] },
+        "waived_by": { "type": ["string", "null"] },
+        "content_available": { "type": "boolean" },
+        "content_retention": { "enum": ["plaintext", "hash_only"] },
+        "content_sha256": { "$ref": "#/$defs/sha256" },
+        "content_text": { "type": "string" },
+        "content_truncated": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "content_retention": { "const": "hash_only" } }, "required": ["content_retention"] },
+          "then": { "properties": { "content_available": { "const": false } }, "not": { "required": ["content_text"] } }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "taskRunDetailResponse": {
+      "type": "object",
+      "required": ["summary", "requirements", "recovery_options"],
+      "properties": {
+        "summary": { "$ref": "#/$defs/taskRunSummary" },
+        "requirements": {
+          "type": "object",
+          "required": ["items", "next_cursor", "has_more"],
+          "properties": {
+            "items": { "type": "array", "items": { "$ref": "#/$defs/taskRunRequirement" } },
+            "next_cursor": { "type": ["string", "null"] },
+            "has_more": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "recovery_options": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } }
+      },
+      "additionalProperties": false
+    },
     "snapshotResponse": {
       "type": "object",
       "required": [
+        "schema_version",
         "db",
         "scheduler",
         "processes",
@@ -119,6 +400,7 @@
         "audit",
         "llm_calls",
         "object_tasks",
+        "task_runs",
         "tools",
         "images",
         "skills",
@@ -128,6 +410,7 @@
         "llm_profiles"
       ],
       "properties": {
+        "schema_version": { "const": 2 },
         "db": { "type": "string" },
         "scheduler": { "$ref": "#/$defs/schedulerStatus" },
         "processes": { "type": "array", "items": { "$ref": "#/$defs/processSummary" } },
@@ -136,6 +419,7 @@
         "audit": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },
         "llm_calls": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },
         "object_tasks": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },
+        "task_runs": { "type": "array", "items": { "$ref": "#/$defs/taskRunSummary" } },
         "tools": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },
         "images": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },
         "skills": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },
@@ -157,12 +441,15 @@
           "required": ["message"],
           "properties": {
             "type": { "type": "string" },
+            "code": { "type": "string" },
             "message": { "type": "string" },
             "confirmation_required": { "type": "boolean" },
             "action": { "type": "string" },
             "preview": { "type": "object", "additionalProperties": true },
             "retryable": { "type": "boolean" },
-            "status": { "type": "string" }
+            "status": { "type": "string" },
+            "command_admitted": { "type": "boolean" },
+            "current_summary": { "$ref": "#/$defs/taskRunSummary" }
           },
           "additionalProperties": true
         }
@@ -410,6 +697,42 @@
             "pid": { "$ref": "#/$defs/nonEmptyString" },
             "tool_id": { "$ref": "#/$defs/nonEmptyString" },
             "arguments": {
+              "oneOf": [
+                { "$ref": "#/$defs/jsonObject" },
+                { "type": "null" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "taskRunCommandMutation": {
+      "type": "object",
+      "required": ["expected_revision", "command_id"],
+      "properties": {
+        "expected_revision": { "type": "integer", "minimum": 0 },
+        "command_id": { "$ref": "#/$defs/nonEmptyString" }
+      },
+      "additionalProperties": true
+    },
+    "taskRunCancelPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        { "$ref": "#/$defs/noActor" },
+        { "$ref": "#/$defs/taskRunCommandMutation" },
+        { "properties": { "reason": { "type": "string" } } }
+      ]
+    },
+    "taskRunRecoverPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/confirmedMutation" },
+        { "$ref": "#/$defs/noActor" },
+        { "$ref": "#/$defs/taskRunCommandMutation" },
+        {
+          "required": ["option_id"],
+          "properties": {
+            "option_id": { "$ref": "#/$defs/nonEmptyString" },
+            "receipt": {
               "oneOf": [
                 { "$ref": "#/$defs/jsonObject" },
                 { "type": "null" }

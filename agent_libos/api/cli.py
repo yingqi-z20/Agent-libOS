@@ -6,6 +6,7 @@ import json
 import math
 import sys
 import threading
+import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -42,11 +43,29 @@ from agent_libos.models.exceptions import ValidationError as LibOSValidationErro
 from agent_libos.modules import ModuleLoader
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import display_store_target
-from agent_libos.utils.serde import to_jsonable
+from agent_libos.utils.serde import bounded_json_loads, to_jsonable
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _WORKFLOW_HELP = "Run an Image-bound workflow tool directly without an LLM turn"
 _WORKFLOW_RUN_HELP = "Spawn a workflow process and call one tool from its complete process table"
+_TASK_RUN_STATUSES = frozenset(
+    {
+        "queued",
+        "running",
+        "waiting_human",
+        "waiting_process",
+        "waiting_message",
+        "waiting_tool",
+        "paused",
+        "cancelling",
+        "finalizing",
+        "needs_attention",
+        "succeeded",
+        "failed",
+        "cancelled",
+    }
+)
+_TASK_RUN_RETENTIONS = ("purge_on_terminal", "permanent")
 
 DEMO_PATCH_PREVIEW_PATH = "agent_outputs/demo_patch_preview.txt"
 DEMO_PATCH_PREVIEW_CONTENT = "change add() expected value\n"
@@ -62,7 +81,7 @@ _COMPACT_COMMANDS = frozenset(
     }
 )
 _PRIMARY_COMMANDS = frozenset(
-    {"init", "demo", "explain", "workflow", "object-task"}
+    {"init", "demo", "explain", "workflow", "object-task", "task-run"}
 )
 _PROCESS_COMMANDS = frozenset(
     {"spawn", "cd", "exec", "exit", "llm-once", "run", "message", "interrupt"}
@@ -259,6 +278,11 @@ def _parse_cli_args(
         help="Start, get, list, cancel, wait for, or watch Object tasks",
     )
     _add_object_task_parser_args(object_task_parser)
+    task_run_parser = sub.add_parser(
+        "task-run",
+        help="Create, supervise, recover, or rerun a durable TaskRun",
+    )
+    _add_task_run_parser_args(task_run_parser)
     spawn_parser = sub.add_parser("spawn", help="Spawn a process")
     spawn_parser.add_argument("--image")
     spawn_parser.add_argument("--goal", required=True)
@@ -377,6 +401,9 @@ def _run_primary_cli_command(
         return
     if args.command == "object-task":
         _print_json(_run_object_task_command(runtime, args))
+        return
+    if args.command == "task-run":
+        _print_json(_run_task_run_command(runtime, args))
         return
     raise AssertionError(f"unsupported primary command: {args.command}")
 
@@ -657,6 +684,479 @@ def _run_workflow_command(runtime: Runtime, args: argparse.Namespace) -> Any:
             "--authority-manifest-json",
         ),
     )
+
+
+def _add_task_run_parser_args(parser: argparse.ArgumentParser) -> None:
+    sub = parser.add_subparsers(dest="task_run_command", required=True)
+
+    start = sub.add_parser(
+        "start",
+        help="Create a queued durable TaskRun; use --run to consume scheduler quanta now",
+    )
+    goal = start.add_mutually_exclusive_group(required=True)
+    goal.add_argument("--goal", help="Task goal as text.")
+    goal.add_argument("--goal-json", help="Task goal as strict JSON.")
+    start.add_argument(
+        "--title",
+        "--display-title",
+        dest="title",
+        required=True,
+        help="Persistent display title for the run.",
+    )
+    start.add_argument(
+        "--image",
+        "--image-id",
+        dest="image",
+        help="AgentImage id; omitted uses the Runtime's configured default image.",
+    )
+    start.add_argument(
+        "--launch-json",
+        "--launch-options-json",
+        dest="launch_json",
+        default="{}",
+        help="Host-authored launch options as a strict JSON object.",
+    )
+    start.add_argument(
+        "--authority-manifest-id",
+        "--authority-ref",
+        dest="authority_manifest_id",
+        help="Reference to an existing Host-authored authority manifest.",
+    )
+    start.add_argument(
+        "--deadline-at",
+        help="Optional absolute wall-clock deadline timestamp.",
+    )
+    start.add_argument(
+        "--retention",
+        choices=_TASK_RUN_RETENTIONS,
+        default="purge_on_terminal",
+        help="Durable payload retention policy; permanent is Host/admin only.",
+    )
+    start.add_argument(
+        "--client-request-id",
+        help="Stable client request id for create idempotency; omitted generates one.",
+    )
+    start.add_argument(
+        "--run",
+        action="store_true",
+        help="After creation, run until the run blocks, finishes, or exhausts --max-quanta.",
+    )
+    start.add_argument(
+        "--run-command-id",
+        help="Stable command id for the separate --run mutation.",
+    )
+    start.add_argument(
+        "--max-quanta",
+        type=int,
+        help="Optional scheduler quantum budget used only with --run.",
+    )
+
+    get = sub.add_parser("get", help="Get the current durable TaskRun summary")
+    get.add_argument("run_id")
+
+    list_parser = sub.add_parser("list", help="List durable TaskRuns as a keyset-paginated page")
+    list_parser.add_argument(
+        "--status",
+        dest="statuses",
+        action="append",
+        default=[],
+        help="Filter status, comma-separated or repeated.",
+    )
+    list_parser.add_argument("--cursor", help="Opaque keyset cursor from the preceding page.")
+    list_parser.add_argument(
+        "--limit",
+        type=_task_run_page_limit,
+        default=100,
+        help="Page size from 1 through 500.",
+    )
+
+    wait = sub.add_parser(
+        "wait",
+        help="Observe a TaskRun until its revision changes, it blocks, or it is terminal",
+    )
+    wait.add_argument("run_id")
+    wait.add_argument("--timeout", type=float, help="Optional finite wait timeout in seconds.")
+
+    recovery_options = sub.add_parser(
+        "recovery-options",
+        help="List the server-derived recovery options currently allowed for a TaskRun",
+    )
+    recovery_options.add_argument("run_id")
+
+    pause = sub.add_parser("pause", help="Durably pause a TaskRun before new dispatch")
+    pause.add_argument("run_id")
+    _add_task_run_command_args(pause)
+
+    resume = sub.add_parser("resume", help="Resume a paused TaskRun")
+    resume.add_argument("run_id")
+    _add_task_run_command_args(resume)
+
+    cancel = sub.add_parser("cancel", help="Cancel a TaskRun with explicit confirmation")
+    cancel.add_argument("run_id")
+    cancel.add_argument("--reason")
+    cancel.add_argument(
+        "--confirm",
+        action="store_true",
+        required=True,
+        help="Confirm durable cancellation and descendant termination.",
+    )
+    _add_task_run_command_args(cancel)
+
+    follow_up = sub.add_parser(
+        "follow-up",
+        help="Append a durable requirement and notify the current root Agent",
+    )
+    follow_up.add_argument("run_id")
+    follow_up.add_argument(
+        "content",
+        nargs="?",
+        help="Follow-up requirement text; alternatively use --content or --content-json.",
+    )
+    follow_up.add_argument("--content", dest="content_option", help="Follow-up requirement text.")
+    follow_up.add_argument("--content-json", help="Follow-up requirement as strict JSON.")
+    follow_up.add_argument(
+        "--interrupt",
+        action="store_true",
+        help="Also interrupt the active root process after durably recording the requirement.",
+    )
+    follow_up.add_argument(
+        "--optional",
+        action="store_false",
+        dest="required",
+        default=True,
+        help="Record the follow-up without making it a required success condition.",
+    )
+    _add_task_run_command_args(follow_up)
+
+    recover = sub.add_parser(
+        "recover",
+        help="Apply a server-provided recovery option with explicit confirmation",
+    )
+    recover.add_argument("run_id")
+    recover.add_argument(
+        "option",
+        nargs="?",
+        help="Exact recovery option returned by the server; alternatively use --option.",
+    )
+    recover.add_argument("--option", dest="option_flag", help="Exact server-provided recovery option.")
+    recover.add_argument(
+        "--receipt-json",
+        "--evidence-json",
+        dest="receipt_json",
+        help="Optional authoritative receipt as a strict JSON object.",
+    )
+    recover.add_argument(
+        "--confirm",
+        action="store_true",
+        required=True,
+        help="Confirm the selected evidence-backed recovery action.",
+    )
+    _add_task_run_command_args(recover)
+
+    rerun = sub.add_parser("rerun", help="Create a new TaskRun linked to a terminal source run")
+    rerun.add_argument("run_id")
+    rerun.add_argument("--client-request-id", help="Stable create id for the linked rerun.")
+    rerun.add_argument(
+        "--spec-overrides-json",
+        help="Optional complete or partial canonical TaskRun spec overrides.",
+    )
+    _add_task_run_command_args(rerun)
+
+
+def _add_task_run_command_args(
+    parser: argparse.ArgumentParser,
+    *,
+    expected_revision: bool = True,
+) -> None:
+    if expected_revision:
+        parser.add_argument(
+            "--expected-revision",
+            type=_task_run_revision_arg,
+            required=True,
+            help="Revision last observed by this client; stale revisions are rejected.",
+        )
+    parser.add_argument(
+        "--command-id",
+        help="Stable idempotency id; omitted generates one for this invocation.",
+    )
+
+
+def _task_run_revision_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("revision must be a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("revision must be a non-negative integer")
+    return parsed
+
+
+def _task_run_page_limit(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("task-run list limit must be an integer from 1 through 500") from exc
+    if not 1 <= parsed <= 500:
+        raise argparse.ArgumentTypeError("task-run list limit must be an integer from 1 through 500")
+    return parsed
+
+
+def _run_task_run_command(runtime: Runtime, args: argparse.Namespace) -> Any:
+    manager = runtime.task_runs
+    command = args.task_run_command
+    if command == "start":
+        return _run_task_run_start_command(runtime, args)
+    if command in {"get", "list", "wait", "recovery-options"}:
+        return _run_task_run_read_command(manager, args)
+
+    mutation = {
+        "expected_revision": args.expected_revision,
+        "command_id": _task_run_command_id(args.command_id),
+    }
+    if command == "pause":
+        return to_jsonable(manager.pause(args.run_id, **mutation))
+    if command == "resume":
+        return to_jsonable(manager.resume(args.run_id, **mutation))
+    if command == "cancel":
+        return to_jsonable(
+            manager.cancel(
+                args.run_id,
+                **mutation,
+                reason=args.reason or "",
+            )
+        )
+    if command == "follow-up":
+        return to_jsonable(
+            manager.follow_up(
+                args.run_id,
+                **mutation,
+                body=_task_run_follow_up_content(runtime, args),
+                kind="interrupt" if args.interrupt else "normal",
+                required=args.required,
+            )
+        )
+    if command == "recover":
+        return to_jsonable(
+            manager.recover(
+                args.run_id,
+                **mutation,
+                option_id=_task_run_recovery_option(args),
+                receipt=(
+                    _task_run_json_mapping(runtime, args.receipt_json, "--receipt-json")
+                    if args.receipt_json is not None
+                    else None
+                ),
+            )
+        )
+    if command == "rerun":
+        return to_jsonable(
+            manager.rerun(
+                args.run_id,
+                **mutation,
+                client_request_id=(
+                    _task_run_client_request_id(args.client_request_id)
+                    if args.client_request_id is not None
+                    else None
+                ),
+                spec_overrides=(
+                    _task_run_json_mapping(
+                        runtime,
+                        args.spec_overrides_json,
+                        "--spec-overrides-json",
+                    )
+                    if args.spec_overrides_json is not None
+                    else None
+                ),
+            )
+        )
+    raise SystemExit(f"unknown task-run command: {command}")
+
+
+def _run_task_run_start_command(runtime: Runtime, args: argparse.Namespace) -> Any:
+    if args.run_command_id is not None and not args.run:
+        raise LibOSValidationError("--run-command-id requires --run")
+    if args.max_quanta is not None and not args.run:
+        raise LibOSValidationError("--max-quanta requires --run")
+    if args.max_quanta is not None and args.max_quanta <= 0:
+        raise LibOSValidationError("TaskRun max_quanta must be a positive integer")
+
+    manager = runtime.task_runs
+    created = manager.create(
+        _task_run_spec_from_args(runtime, args),
+        client_request_id=_task_run_client_request_id(args.client_request_id),
+        auto_run=False,
+    )
+    if not args.run:
+        return to_jsonable(created)
+    return to_jsonable(
+        manager.run_until_blocked(
+            _task_run_summary_field(created, "run_id", str),
+            expected_revision=_task_run_summary_field(created, "revision", int),
+            command_id=_task_run_command_id(args.run_command_id),
+            max_quanta=args.max_quanta,
+        )
+    )
+
+
+def _run_task_run_read_command(manager: Any, args: argparse.Namespace) -> Any:
+    command = args.task_run_command
+    if command == "get":
+        return to_jsonable(manager.get(args.run_id))
+    if command == "list":
+        return to_jsonable(
+            manager.list(
+                statuses=_task_run_status_filters(args.statuses),
+                cursor=args.cursor,
+                limit=args.limit,
+            )
+        )
+    if command == "wait":
+        return to_jsonable(
+            manager.wait(
+                args.run_id,
+                timeout=_finite_timeout_or_none(args.timeout, "--timeout"),
+            )
+        )
+    if command == "recovery-options":
+        return to_jsonable(manager.recovery_options(args.run_id))
+    raise SystemExit(f"unknown task-run read command: {command}")
+
+
+def _task_run_spec_from_args(runtime: Runtime, args: argparse.Namespace) -> Any:
+    # Keep the import local so the ordinary CLI remains importable in runtimes
+    # that reject the v4 schema before TaskRun services are assembled.
+    from agent_libos.models import TaskRunSpecV1
+
+    goal = (
+        args.goal
+        if args.goal is not None
+        else _task_run_json_value(runtime, args.goal_json, "--goal-json")
+    )
+    values = {
+        "schema_version": 1,
+        "goal": goal,
+        "display_title": args.title,
+        "image_id": args.image,
+        "launch_options": _task_run_json_mapping(runtime, args.launch_json, "--launch-json"),
+        "authority_manifest_id": args.authority_manifest_id,
+        "deadline_at": args.deadline_at,
+        "retention": args.retention,
+    }
+    try:
+        from_mapping = getattr(TaskRunSpecV1, "from_mapping", None)
+        if callable(from_mapping):
+            return from_mapping(values)
+        return TaskRunSpecV1(**values)
+    except (TypeError, ValueError) as exc:
+        raise LibOSValidationError(str(exc)) from exc
+
+
+def _task_run_json_value(runtime: Runtime, value: str, label: str) -> Any:
+    max_bytes = runtime.config.task_runs.payload_max_bytes
+    try:
+        return bounded_json_loads(
+            value,
+            max_bytes=max_bytes,
+        )
+    except ValueError as exc:
+        raise LibOSValidationError(f"{label} must be valid bounded JSON: {exc}") from exc
+
+
+def _task_run_json_mapping(runtime: Runtime, value: str, label: str) -> dict[str, Any]:
+    decoded = _task_run_json_value(runtime, value, label)
+    if not isinstance(decoded, dict):
+        raise LibOSValidationError(f"{label} must be a JSON object")
+    return decoded
+
+
+def _task_run_command_id(value: str | None) -> str:
+    if value is None:
+        return str(uuid.uuid4())
+    selected = value.strip()
+    if not selected:
+        raise LibOSValidationError("--command-id must be a non-empty string")
+    return selected
+
+
+def _task_run_client_request_id(value: str | None) -> str:
+    if value is None:
+        return str(uuid.uuid4())
+    selected = value.strip()
+    if not selected:
+        raise LibOSValidationError("--client-request-id must be a non-empty string")
+    return selected
+
+
+def _optional_nonempty_cli_value(value: str | None, label: str) -> str | None:
+    if value is None:
+        return None
+    selected = value.strip()
+    if not selected:
+        raise LibOSValidationError(f"{label} must be a non-empty string")
+    return selected
+
+
+def _task_run_summary_field(summary: Any, field: str, expected_type: type[Any]) -> Any:
+    projected = to_jsonable(summary)
+    if not isinstance(projected, dict) or field not in projected:
+        raise LibOSValidationError(f"TaskRun create returned no {field}")
+    value = projected[field]
+    if expected_type is int:
+        valid = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    else:
+        valid = isinstance(value, expected_type) and bool(str(value).strip())
+    if not valid:
+        raise LibOSValidationError(f"TaskRun create returned an invalid {field}")
+    return value
+
+
+def _task_run_status_filters(values: list[str]) -> tuple[str, ...] | None:
+    selected = _parse_csv_values(values)
+    invalid = sorted(set(selected) - _TASK_RUN_STATUSES)
+    if invalid:
+        raise LibOSValidationError(
+            "invalid TaskRun status filter(s): " + ", ".join(invalid)
+        )
+    return tuple(selected) or None
+
+
+def _task_run_follow_up_content(runtime: Runtime, args: argparse.Namespace) -> str:
+    supplied = [
+        args.content is not None,
+        args.content_option is not None,
+        args.content_json is not None,
+    ]
+    if sum(supplied) != 1:
+        raise LibOSValidationError(
+            "follow-up requires exactly one of positional content, --content, or --content-json"
+        )
+    if args.content_json is not None:
+        decoded = _task_run_json_value(runtime, args.content_json, "--content-json")
+        return json.dumps(
+            decoded,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    selected = args.content if args.content is not None else args.content_option
+    assert selected is not None
+    if not selected.strip():
+        raise LibOSValidationError("follow-up content must be non-empty text")
+    return selected
+
+
+def _task_run_recovery_option(args: argparse.Namespace) -> str:
+    if (args.option is None) == (args.option_flag is None):
+        raise LibOSValidationError(
+            "recover requires exactly one of positional option or --option"
+        )
+    value = args.option if args.option is not None else args.option_flag
+    assert value is not None
+    selected = value.strip()
+    if not selected:
+        raise LibOSValidationError("recovery option must be a non-empty string")
+    return selected
 
 
 def _add_object_task_parser_args(parser: argparse.ArgumentParser) -> None:

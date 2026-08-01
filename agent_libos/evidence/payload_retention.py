@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -10,9 +11,10 @@ from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 
 from agent_libos.models.audit import AuditRecord
 from agent_libos.models.external_effect import ExternalEffectRecord
+from agent_libos.models.human import HumanRequest, HumanRequestStatus
 from agent_libos.models.llm import LLMCallRecord
 from agent_libos.ports.audit import AuditPort
-from agent_libos.utils.serde import dumps, to_jsonable
+from agent_libos.utils.serde import bounded_json_loads, dumps, to_jsonable
 
 if TYPE_CHECKING:
     from agent_libos.config.defaults import RuntimeDefaults
@@ -39,6 +41,13 @@ _IMAGE_ONLY_REQUEST_PURPOSE_PREFIX = "image_only_request:"
 _IMAGE_ONLY_REQUEST_SCHEMA_VERSION = 1
 _IMAGE_ONLY_TRANSCRIPT_KEY = "image_only_transcript"
 _IMAGE_ONLY_TRANSCRIPT_SCHEMA_VERSION = 2
+_TASK_RUN_TOOL_OUTPUT_REDACTION_KEY = (
+    "$agent_libos_task_run_tool_output_redaction"
+)
+_TASK_RUN_TOOL_OUTPUT_REDACTION_SCHEMA_VERSION = 1
+_TASK_RUN_HUMAN_REDACTION_KEY = "$agent_libos_task_run_human_redaction"
+_TASK_RUN_HUMAN_REDACTION_SCHEMA_VERSION = 1
+_TASK_RUN_HUMAN_TYPE_PATTERN = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 
 
 def _validate_retention_age(name: str, value: int | None) -> None:
@@ -268,6 +277,94 @@ class PayloadRetentionStore(Protocol):
     ) -> bool:
         ...
 
+
+class TaskRunLLMRedactionStore(Protocol):
+    """Narrow, caller-transactional store boundary for terminal Run purge."""
+
+    def list_task_run_llm_calls(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str] = (),
+    ) -> list[LLMCallRecord]:
+        ...
+
+    def redact_task_run_llm_call_payload(
+        self,
+        record: LLMCallRecord,
+        *,
+        run_id: str,
+        expected_payload_sha256: str,
+        expected_tier: str,
+    ) -> bool:
+        ...
+
+    def list_task_run_llm_tool_outputs(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str] = (),
+    ) -> list[dict[str, Any]]:
+        ...
+
+    def redact_task_run_llm_tool_output(
+        self,
+        *,
+        run_id: str,
+        pid: str,
+        response_id: str,
+        call_id: str,
+        expected_output_sha256: str,
+        redacted_output: str,
+    ) -> bool:
+        ...
+
+
+class TaskRunExternalEffectRedactionStore(Protocol):
+    """Run-linked external-effect boundary for caller-transactional purge.
+
+    Implementations must enforce both the durable ``task_run_links`` evidence
+    relationship and Process ``task_run_id`` membership on the read and on
+    every CAS.  The caller owns the transaction spanning all returned rows.
+    """
+
+    def list_task_run_external_effects(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str] = (),
+    ) -> list[ExternalEffectRecord]:
+        ...
+
+    def redact_task_run_external_effect_payload(
+        self,
+        record: ExternalEffectRecord,
+        *,
+        run_id: str,
+        expected_payload_sha256: str,
+        expected_tier: str,
+        expected_effect_state: str,
+        expected_transaction_state: str,
+    ) -> bool:
+        ...
+
+
+class TaskRunHumanRedactionStore(Protocol):
+    """Run-linked Human I/O boundary for caller-transactional purge."""
+
+    def list_task_run_human_requests(
+        self,
+        run_id: str,
+        linked_pids: Iterable[str] = (),
+    ) -> list[HumanRequest]:
+        ...
+
+    def redact_task_run_human_request_payload(
+        self,
+        request: HumanRequest,
+        *,
+        run_id: str,
+        expected_payload_sha256: str,
+        expected_status: str,
+    ) -> bool:
+        ...
 
 class PayloadRetentionAdmission(Protocol):
     """Lifecycle gate used when maintenance is exposed by a live Runtime."""
@@ -661,6 +758,597 @@ def retain_llm_call_payload(
         observability=retained_observability,
         error=retained_fields["error"],
     )
+
+
+def redact_terminal_task_run_llm_call(record: LLMCallRecord) -> LLMCallRecord:
+    """Return a canonical hash-only copy for a fenced, terminal TaskRun.
+
+    Unlike scheduled retention, terminal Run purge intentionally permits a
+    direct ``full`` -> ``hash_only`` transition and may redact the latest
+    Provider/image transcript head.  The caller must first fence/finalize the
+    owning Run; the store boundary rechecks exact Run membership. Identity,
+    usage, Provider receipts, timing and other non-payload evidence remain
+    unchanged.
+    """
+
+    if not isinstance(record, LLMCallRecord):
+        raise ValueError("TaskRun LLM redaction target has an invalid type")
+    if not _llm_call_is_terminal(record):
+        raise ValueError("nonterminal TaskRun LLM calls cannot be redacted")
+    current = llm_call_payload_retention_tier(record)
+    if current is PayloadRetentionTier.HASH_ONLY:
+        # Validate existing provenance before treating the row as complete.
+        llm_call_payload_sha256(record)
+        return record
+
+    source_fields = _llm_payload_sources(record, current=current)
+    trust_retention_envelopes = _has_retention_marker(record.observability)
+    retained_fields: dict[str, Any] = {}
+    for field_name in _LLM_PAYLOAD_FIELDS:
+        value = source_fields[field_name]
+        if value is None and field_name in {"reasoning", "raw_response", "error"}:
+            retained_fields[field_name] = None
+            continue
+        envelope = content_free_payload_envelope(
+            value,
+            PayloadRetentionTier.HASH_ONLY,
+            source_tier=current,
+            trust_retention_envelopes=trust_retention_envelopes,
+        )
+        retained_fields[field_name] = (
+            dumps(envelope)
+            if field_name in {"response_content", "error"}
+            else envelope
+        )
+    payload_sha256 = _field_digest(
+        retained_fields,
+        source_tier=PayloadRetentionTier.HASH_ONLY,
+    )
+    retained_observability = {
+        _RETENTION_KEY: {
+            "schema_version": _RETENTION_SCHEMA_VERSION,
+            "tier": PayloadRetentionTier.HASH_ONLY.value,
+            "payload_sha256": payload_sha256,
+            "source_observability_sha256": _source_observability_sha256(record),
+        }
+    }
+    redacted = replace(
+        record,
+        messages=retained_fields["messages"],
+        tools=retained_fields["tools"],
+        response_content=retained_fields["response_content"],
+        tool_calls=retained_fields["tool_calls"],
+        reasoning=retained_fields["reasoning"],
+        raw_response=retained_fields["raw_response"],
+        observability=retained_observability,
+        error=retained_fields["error"],
+    )
+    if llm_call_payload_sha256(redacted) != llm_call_payload_sha256(record):
+        raise RuntimeError("TaskRun LLM redaction changed payload provenance")
+    return redacted
+
+
+def validate_terminal_task_run_llm_redaction(
+    current: LLMCallRecord,
+    target: LLMCallRecord,
+    *,
+    expected_payload_sha256: str,
+    expected_tier: PayloadRetentionTier,
+) -> PayloadRetentionTier:
+    """Validate the exceptional direct-to-hash terminal Run transition."""
+
+    if not isinstance(current, LLMCallRecord) or not isinstance(
+        target, LLMCallRecord
+    ):
+        raise ValueError("TaskRun LLM redaction records have invalid types")
+    if not isinstance(expected_tier, PayloadRetentionTier):
+        raise ValueError("TaskRun LLM redaction expected tier is invalid")
+    if not _llm_call_is_terminal(current):
+        raise ValueError("nonterminal TaskRun LLM calls cannot be redacted")
+    current_tier = llm_call_payload_retention_tier(current)
+    if current_tier is not expected_tier:
+        raise ValueError("TaskRun LLM redaction source tier changed")
+    if current_tier is PayloadRetentionTier.HASH_ONLY:
+        raise ValueError("TaskRun LLM call is already hash-only")
+    if (
+        not _valid_sha256(expected_payload_sha256)
+        or llm_call_payload_sha256(current) != expected_payload_sha256
+    ):
+        raise ValueError("TaskRun LLM redaction source digest changed")
+    canonical = redact_terminal_task_run_llm_call(current)
+    if _llm_payload_write_projection(target) != _llm_payload_write_projection(
+        canonical
+    ):
+        raise ValueError("TaskRun LLM redaction target is not canonical")
+    if llm_call_payload_retention_tier(target) is not PayloadRetentionTier.HASH_ONLY:
+        raise ValueError("TaskRun LLM redaction target is not hash-only")
+    if llm_call_payload_sha256(target) != expected_payload_sha256:
+        raise ValueError("TaskRun LLM redaction target changed payload provenance")
+    return PayloadRetentionTier.HASH_ONLY
+
+
+def redact_task_run_llm_calls(
+    store: TaskRunLLMRedactionStore,
+    run_id: str,
+    linked_pids: Iterable[str],
+) -> int:
+    """Redact every linked LLM row without owning or committing a transaction.
+
+    A CAS conflict raises so a TaskRun cannot leave ``finalizing`` with only a
+    partial purge. The caller owns the surrounding transaction/savepoint and
+    the store owns the authoritative Run/PID membership check.
+    """
+
+    selected_pids = _validated_task_run_redaction_pids(run_id, linked_pids)
+    return _redact_task_run_llm_call_rows(
+        store,
+        run_id,
+        selected_pids,
+    ) + _redact_task_run_llm_tool_output_rows(store, run_id, selected_pids)
+
+
+def _validated_task_run_redaction_pids(
+    run_id: str,
+    linked_pids: Iterable[str],
+) -> tuple[str, ...]:
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("TaskRun redaction run_id must not be empty")
+    if isinstance(linked_pids, (str, bytes, bytearray)):
+        raise ValueError("TaskRun redaction linked_pids must be an iterable of ids")
+    raw_pids = tuple(linked_pids)
+    if any(not isinstance(pid, str) or not pid for pid in raw_pids):
+        raise ValueError("TaskRun redaction linked_pids are invalid")
+    return tuple(sorted(set(raw_pids)))
+
+
+def _redact_task_run_llm_call_rows(
+    store: TaskRunLLMRedactionStore,
+    run_id: str,
+    selected_pids: tuple[str, ...],
+) -> int:
+    records = store.list_task_run_llm_calls(run_id, selected_pids)
+    if not isinstance(records, list):
+        raise RuntimeError("TaskRun LLM redaction backend returned an invalid page")
+    seen_call_ids: set[str] = set()
+    updated = 0
+    for record in records:
+        _validate_task_run_llm_call_row(record, selected_pids, seen_call_ids)
+        current_tier = llm_call_payload_retention_tier(record)
+        current_sha256 = llm_call_payload_sha256(record)
+        target = redact_terminal_task_run_llm_call(record)
+        if target is record:
+            continue
+        if not store.redact_task_run_llm_call_payload(
+            target,
+            run_id=run_id,
+            expected_payload_sha256=current_sha256,
+            expected_tier=current_tier.value,
+        ):
+            raise RuntimeError(
+                f"TaskRun LLM redaction conflicted for call: {record.call_id}"
+            )
+        updated += 1
+    return updated
+
+
+def _validate_task_run_llm_call_row(
+    record: Any,
+    selected_pids: tuple[str, ...],
+    seen_call_ids: set[str],
+) -> None:
+    if not isinstance(record, LLMCallRecord):
+        raise RuntimeError("TaskRun LLM redaction backend returned an invalid row")
+    if record.call_id in seen_call_ids:
+        raise RuntimeError("TaskRun LLM redaction backend returned duplicate rows")
+    seen_call_ids.add(record.call_id)
+    if record.pid is None or (
+        selected_pids and str(record.pid) not in selected_pids
+    ):
+        raise RuntimeError("TaskRun LLM redaction backend returned an unlinked row")
+
+
+def _redact_task_run_llm_tool_output_rows(
+    store: TaskRunLLMRedactionStore,
+    run_id: str,
+    selected_pids: tuple[str, ...],
+) -> int:
+    output_rows = store.list_task_run_llm_tool_outputs(run_id, selected_pids)
+    if not isinstance(output_rows, list):
+        raise RuntimeError(
+            "TaskRun LLM tool-output redaction backend returned an invalid page"
+        )
+    seen_output_ids: set[tuple[str, str, str]] = set()
+    updated = 0
+    for row in output_rows:
+        pid, response_id, call_id, output_text = (
+            _validated_task_run_llm_tool_output_row(
+                row,
+                selected_pids,
+                seen_output_ids,
+            )
+        )
+        redacted_output, expected_sha256, changed = (
+            redact_terminal_task_run_llm_tool_output(output_text)
+        )
+        if not changed:
+            continue
+        if not store.redact_task_run_llm_tool_output(
+            run_id=run_id,
+            pid=pid,
+            response_id=response_id,
+            call_id=call_id,
+            expected_output_sha256=expected_sha256,
+            redacted_output=redacted_output,
+        ):
+            raise RuntimeError(
+                "TaskRun LLM tool-output redaction conflicted for "
+                f"pid={pid} response_id={response_id} call_id={call_id}"
+            )
+        updated += 1
+    return updated
+
+
+def _validated_task_run_llm_tool_output_row(
+    row: Any,
+    selected_pids: tuple[str, ...],
+    seen_output_ids: set[tuple[str, str, str]],
+) -> tuple[str, str, str, str]:
+    if not isinstance(row, dict):
+        raise RuntimeError(
+            "TaskRun LLM tool-output redaction backend returned an invalid row"
+        )
+    pid = row.get("pid")
+    response_id = row.get("response_id")
+    call_id = row.get("call_id")
+    output_text = row.get("output_text")
+    if any(
+        not isinstance(value, str) or not value
+        for value in (pid, response_id, call_id)
+    ) or not isinstance(output_text, str):
+        raise RuntimeError("TaskRun LLM tool-output redaction row is malformed")
+    if selected_pids and pid not in selected_pids:
+        raise RuntimeError(
+            "TaskRun LLM tool-output redaction backend returned an unlinked row"
+        )
+    output_id = (pid, response_id, call_id)
+    if output_id in seen_output_ids:
+        raise RuntimeError(
+            "TaskRun LLM tool-output redaction backend returned duplicate rows"
+        )
+    seen_output_ids.add(output_id)
+    return pid, response_id, call_id, output_text
+
+
+def redact_terminal_task_run_llm_tool_output(
+    output_text: str,
+) -> tuple[str, str, bool]:
+    """Return ``(redacted_text, source_sha256, changed)`` for a Tool output."""
+
+    if not isinstance(output_text, str):
+        raise ValueError("TaskRun LLM tool output must be text")
+    try:
+        decoded = bounded_json_loads(output_text, max_bytes=1_048_576)
+    except ValueError:
+        decoded = None
+    if isinstance(decoded, dict) and set(decoded) == {
+        _TASK_RUN_TOOL_OUTPUT_REDACTION_KEY
+    }:
+        marker = decoded[_TASK_RUN_TOOL_OUTPUT_REDACTION_KEY]
+        if (
+            isinstance(marker, dict)
+            and set(marker) == {"schema_version", "sha256", "bytes"}
+            and marker.get("schema_version")
+            == _TASK_RUN_TOOL_OUTPUT_REDACTION_SCHEMA_VERSION
+            and _valid_sha256(marker.get("sha256"))
+            and isinstance(marker.get("bytes"), int)
+            and not isinstance(marker.get("bytes"), bool)
+            and marker["bytes"] >= 0
+            and dumps(decoded) == output_text
+        ):
+            return output_text, str(marker["sha256"]), False
+    encoded = output_text.encode("utf-8")
+    source_sha256 = hashlib.sha256(encoded).hexdigest()
+    redacted = dumps(
+        {
+            _TASK_RUN_TOOL_OUTPUT_REDACTION_KEY: {
+                "schema_version": _TASK_RUN_TOOL_OUTPUT_REDACTION_SCHEMA_VERSION,
+                "sha256": source_sha256,
+                "bytes": len(encoded),
+            }
+        }
+    )
+    return redacted, source_sha256, True
+
+
+def human_request_payload_sha256(request: HumanRequest) -> str:
+    """Hash the original Human prompt and answer without retaining either."""
+
+    if not isinstance(request, HumanRequest):
+        raise ValueError("TaskRun Human redaction target has an invalid type")
+    if not isinstance(request.payload, dict):
+        raise ValueError("TaskRun Human request payload must be an object")
+    if request.decision is not None and not isinstance(request.decision, dict):
+        raise ValueError("TaskRun Human request decision must be an object or null")
+    payload_sha256 = _task_run_human_field_sha256(request.payload, "payload")
+    decision_sha256 = _task_run_human_field_sha256(
+        request.decision,
+        "decision",
+    )
+    return hashlib.sha256(
+        dumps(
+            {
+                "payload_sha256": payload_sha256,
+                "decision_sha256": decision_sha256,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def redact_terminal_task_run_human_request(
+    request: HumanRequest,
+) -> HumanRequest:
+    """Return a content-free Human request while preserving lifecycle evidence."""
+
+    source_sha256 = human_request_payload_sha256(request)
+    payload, payload_changed = _redacted_task_run_human_field(
+        request.payload,
+        field="payload",
+        request_type=_task_run_human_request_type(request.payload),
+    )
+    decision: dict[str, Any] | None = request.decision
+    decision_changed = False
+    if decision is not None:
+        decision, decision_changed = _redacted_task_run_human_field(
+            decision,
+            field="decision",
+        )
+    if not payload_changed and not decision_changed:
+        return request
+    target = replace(request, payload=payload, decision=decision)
+    if human_request_payload_sha256(target) != source_sha256:
+        raise RuntimeError("TaskRun Human redaction changed payload provenance")
+    return target
+
+
+def validate_terminal_task_run_human_redaction(
+    current: HumanRequest,
+    target: HumanRequest,
+    *,
+    expected_payload_sha256: str,
+    expected_status: HumanRequestStatus,
+) -> None:
+    """Validate one exact Human prompt/answer reduction for a terminal Run."""
+
+    if not isinstance(current, HumanRequest) or not isinstance(target, HumanRequest):
+        raise ValueError("TaskRun Human redaction records have invalid types")
+    if not isinstance(expected_status, HumanRequestStatus):
+        raise ValueError("TaskRun Human redaction expected status is invalid")
+    if current.status is not expected_status:
+        raise ValueError("TaskRun Human request status changed")
+    if (
+        not _valid_sha256(expected_payload_sha256)
+        or human_request_payload_sha256(current) != expected_payload_sha256
+    ):
+        raise ValueError("TaskRun Human request payload digest changed")
+    canonical = redact_terminal_task_run_human_request(current)
+    if canonical is current:
+        raise ValueError("TaskRun Human request is already hash-only")
+    if target != canonical:
+        raise ValueError("TaskRun Human redaction target is not canonical")
+    if replace(target, payload=current.payload, decision=current.decision) != current:
+        raise ValueError("TaskRun Human redaction changed lifecycle evidence")
+    if human_request_payload_sha256(target) != expected_payload_sha256:
+        raise ValueError("TaskRun Human redaction changed payload provenance")
+
+
+def redact_task_run_human_requests(
+    store: TaskRunHumanRedactionStore,
+    run_id: str,
+    linked_pids: Iterable[str],
+) -> int:
+    """Redact every Run-linked Human prompt/answer in the caller transaction."""
+
+    selected_pids = _validated_task_run_redaction_pids(run_id, linked_pids)
+    records = store.list_task_run_human_requests(run_id, selected_pids)
+    if not isinstance(records, list):
+        raise RuntimeError("TaskRun Human redaction backend returned an invalid page")
+    seen_request_ids: set[str] = set()
+    updated = 0
+    for request in records:
+        _validate_task_run_human_request_row(
+            request,
+            selected_pids,
+            seen_request_ids,
+        )
+        expected_sha256 = human_request_payload_sha256(request)
+        target = redact_terminal_task_run_human_request(request)
+        if target is request:
+            continue
+        if not store.redact_task_run_human_request_payload(
+            target,
+            run_id=run_id,
+            expected_payload_sha256=expected_sha256,
+            expected_status=request.status.value,
+        ):
+            raise RuntimeError(
+                "TaskRun Human redaction conflicted for request: "
+                f"{request.request_id}"
+            )
+        updated += 1
+    return updated
+
+
+def _validate_task_run_human_request_row(
+    request: Any,
+    selected_pids: tuple[str, ...],
+    seen_request_ids: set[str],
+) -> None:
+    if not isinstance(request, HumanRequest):
+        raise RuntimeError("TaskRun Human redaction backend returned an invalid row")
+    request_id = str(request.request_id)
+    if not request_id or request_id in seen_request_ids:
+        raise RuntimeError(
+            "TaskRun Human redaction backend returned a duplicate or invalid row"
+        )
+    seen_request_ids.add(request_id)
+    if selected_pids and str(request.pid) not in selected_pids:
+        raise RuntimeError("TaskRun Human redaction backend returned an unlinked row")
+
+
+def _task_run_human_request_type(payload: Mapping[str, Any]) -> str:
+    selected = payload.get("type")
+    if isinstance(selected, str) and _TASK_RUN_HUMAN_TYPE_PATTERN.fullmatch(selected):
+        return selected
+    marker = _task_run_human_redaction_marker(payload, field="payload")
+    if marker is not None:
+        return str(marker["request_type"])
+    return "unknown"
+
+
+def _task_run_human_field_sha256(value: Any, field: str) -> str:
+    marker = _task_run_human_redaction_marker(value, field=field)
+    if marker is not None:
+        return str(marker["sha256"])
+    return hashlib.sha256(dumps(value).encode("utf-8")).hexdigest()
+
+
+def _redacted_task_run_human_field(
+    value: dict[str, Any],
+    *,
+    field: str,
+    request_type: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    if _task_run_human_redaction_marker(value, field=field) is not None:
+        return value, False
+    encoded = dumps(value).encode("utf-8")
+    marker: dict[str, Any] = {
+        "schema_version": _TASK_RUN_HUMAN_REDACTION_SCHEMA_VERSION,
+        "field": field,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "bytes": len(encoded),
+    }
+    if field == "payload":
+        marker["request_type"] = request_type or "unknown"
+    return {_TASK_RUN_HUMAN_REDACTION_KEY: marker}, True
+
+
+def _task_run_human_redaction_marker(
+    value: Any,
+    *,
+    field: str,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != {_TASK_RUN_HUMAN_REDACTION_KEY}:
+        return None
+    marker = value[_TASK_RUN_HUMAN_REDACTION_KEY]
+    expected = {"schema_version", "field", "sha256", "bytes"}
+    if field == "payload":
+        expected.add("request_type")
+    if not isinstance(marker, dict) or set(marker) != expected:
+        return None
+    if (
+        marker.get("schema_version") != _TASK_RUN_HUMAN_REDACTION_SCHEMA_VERSION
+        or marker.get("field") != field
+        or not _valid_sha256(marker.get("sha256"))
+        or not isinstance(marker.get("bytes"), int)
+        or isinstance(marker.get("bytes"), bool)
+        or marker["bytes"] < 0
+    ):
+        return None
+    if field == "payload" and (
+        not isinstance(marker.get("request_type"), str)
+        or not _TASK_RUN_HUMAN_TYPE_PATTERN.fullmatch(marker["request_type"])
+    ):
+        return None
+    if dumps(value) != dumps({_TASK_RUN_HUMAN_REDACTION_KEY: marker}):
+        return None
+    return marker
+
+
+def redact_task_run_external_effects(
+    store: TaskRunExternalEffectRedactionStore,
+    run_id: str,
+    linked_pids: Iterable[str],
+) -> int:
+    """Reduce every terminal, linked Run effect to canonical hash-only form.
+
+    A full payload deliberately takes the ordinary two monotonic CAS steps,
+    ``full`` -> ``summary`` -> ``hash_only``.  This function never owns a
+    transaction: the TaskRun finalizer must wrap the entire purge so any
+    conflict rolls back every prior reduction and keeps the Run finalizing.
+    The return value counts effect rows changed, not individual CAS writes.
+    """
+
+    selected_pids = _validated_task_run_redaction_pids(run_id, linked_pids)
+    records = store.list_task_run_external_effects(run_id, selected_pids)
+    validated = _validated_task_run_external_effect_rows(
+        records,
+        selected_pids,
+    )
+    updated = 0
+    for record in validated:
+        current = record
+        changed = False
+        while (
+            external_effect_payload_retention_tier(current)
+            is not PayloadRetentionTier.HASH_ONLY
+        ):
+            current_tier = external_effect_payload_retention_tier(current)
+            target_tier = (
+                PayloadRetentionTier.SUMMARY
+                if current_tier is PayloadRetentionTier.FULL
+                else PayloadRetentionTier.HASH_ONLY
+            )
+            source_sha256 = external_effect_payload_sha256(current)
+            target = retain_external_effect_payload(current, target_tier)
+            if not store.redact_task_run_external_effect_payload(
+                target,
+                run_id=run_id,
+                expected_payload_sha256=source_sha256,
+                expected_tier=current_tier.value,
+                expected_effect_state=current.effect_state,
+                expected_transaction_state=current.transaction_state,
+            ):
+                raise RuntimeError(
+                    "TaskRun external-effect redaction conflicted for effect: "
+                    f"{current.effect_id}"
+                )
+            current = target
+            changed = True
+        updated += int(changed)
+    return updated
+
+
+def _validated_task_run_external_effect_rows(
+    records: Any,
+    selected_pids: tuple[str, ...],
+) -> tuple[ExternalEffectRecord, ...]:
+    if not isinstance(records, list):
+        raise RuntimeError(
+            "TaskRun external-effect redaction backend returned an invalid page"
+        )
+    validated: list[ExternalEffectRecord] = []
+    seen_effect_ids: set[str] = set()
+    for record in records:
+        if not isinstance(record, ExternalEffectRecord):
+            raise RuntimeError(
+                "TaskRun external-effect redaction backend returned an invalid row"
+            )
+        if record.effect_id in seen_effect_ids:
+            raise RuntimeError(
+                "TaskRun external-effect redaction backend returned duplicate rows"
+            )
+        seen_effect_ids.add(record.effect_id)
+        if selected_pids and str(record.pid) not in selected_pids:
+            raise RuntimeError(
+                "TaskRun external-effect redaction backend returned an unlinked row"
+            )
+        if not external_effect_payload_is_terminal(record):
+            raise ValueError(
+                "nonterminal TaskRun external effects cannot be redacted"
+            )
+        external_effect_payload_sha256(record)
+        validated.append(record)
+    return tuple(validated)
 
 
 def content_free_llm_call_fields(

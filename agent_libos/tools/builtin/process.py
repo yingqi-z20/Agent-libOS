@@ -12,7 +12,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.prompt import recover_initial_goal_context
 from agent_libos.memory.data_labels import flow_context_parts, flow_context_value
-from agent_libos.models.exceptions import NotFound, ProcessTerminalCleanupRequired
+from agent_libos.models.exceptions import (
+    NotFound,
+    ProcessTerminalCleanupRequired,
+    TaskRunCompletionContractError,
+)
 from agent_libos.skills.builtin_catalog import get_builtin_skill_catalog
 from agent_libos.models import (
     AgentProcess,
@@ -79,7 +83,7 @@ class CompletionAcceptanceCheck(BaseModel):
     )
     source_refs: list[str] = Field(
         min_length=1,
-        description="Goal oid or acknowledged human message ids that state this requirement.",
+        description="Exact completion_source_refs from the cumulative review that state this requirement.",
     )
     status: Literal["completed", "blocked", "cancelled"]
     evidence_tool_calls: list[str] = Field(
@@ -539,6 +543,28 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
         runtime: Any,
         image: Any,
     ) -> ProcessExitOutput:
+        try:
+            return self._run_cumulative_exit_locked(args, ctx, runtime, image)
+        except TaskRunCompletionContractError as exc:
+            # Completion-contract validation runs under the same Store lock that
+            # linearizes Human follow-ups with terminal exit. Persisting the Run
+            # blocker also notifies TaskRun waiters, whose condition is acquired
+            # before Store transactions in control mutations. Let the Store
+            # critical section unwind before taking that condition so the two
+            # paths cannot deadlock each other.
+            runtime.task_runs.persist_completion_contract_error(exc)
+            raise ToolExecutionError(
+                str(exc),
+                code=ToolErrorCode.VALIDATION_ERROR,
+            ) from exc
+
+    def _run_cumulative_exit_locked(
+        self,
+        args: ProcessExitArgs,
+        ctx: ToolContext,
+        runtime: Any,
+        image: Any,
+    ) -> ProcessExitOutput:
         # Human message posting and process exit use this same Runtime store
         # lock. Keep review, freshness validation, and terminal commit inside
         # one critical section so a follow-up cannot land between them.
@@ -716,6 +742,7 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
             code=ToolErrorCode.VALIDATION_ERROR,
         )
     goal_oid = process.goal_oid
+    task_run_contract = runtime.task_runs.completion_contract_for_pid(pid)
     (
         goal_payload,
         goal_version,
@@ -726,6 +753,7 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
         runtime,
         pid,
         goal_oid,
+        task_run_contract=task_run_contract,
     )
     human_messages, acknowledged, unread = _completion_review_human_messages(runtime, pid)
     goal_sha256 = _canonical_sha256(goal_payload)
@@ -735,6 +763,23 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
     contract_identity = {
         "goal_oid": goal_oid,
         "goal_version": goal_version,
+        "task_run": (
+            {
+                "run_id": task_run_contract["run_id"],
+                "requirements": [
+                    {
+                        "requirement_id": item["requirement_id"],
+                        "requirement_sha256": item["requirement_sha256"],
+                        "status": item["status"],
+                        "created_at": item["created_at"],
+                        "started_at": item["started_at"],
+                    }
+                    for item in task_run_contract["requirements"]
+                ],
+            }
+            if task_run_contract is not None
+            else None
+        ),
         "human_messages": [
             {
                 "message_id": message.message_id,
@@ -742,9 +787,41 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
             }
             for message in human_messages
         ],
+        "acknowledged_human_messages_sha256": acknowledged_messages_sha256,
     }
     acknowledged_message_ids = [message.message_id for message in acknowledged]
-    observed_tools = _successful_tool_calls(runtime, pid)
+    successful_tool_receipts = _successful_tool_receipts(runtime, pid)
+    task_run_requirements = (
+        [
+            {
+                "requirement_id": item["requirement_id"],
+                "ordinal": item["ordinal"],
+                "kind": item["kind"],
+                "status": item["status"],
+                "requirement_sha256": item["requirement_sha256"],
+                "eligible_evidence_tool_calls": list(
+                    item["eligible_evidence_tool_calls"]
+                ),
+                "eligible_evidence_receipts": [
+                    dict(receipt)
+                    for receipt in item["eligible_evidence_receipts"]
+                ],
+            }
+            for item in task_run_contract["requirements"]
+        ]
+        if task_run_contract is not None
+        else []
+    )
+    outstanding_task_run_refs = [
+        item["requirement_id"]
+        for item in task_run_requirements
+        if item["status"] not in {"satisfied", "waived"}
+    ]
+    completion_source_refs = [
+        *(outstanding_task_run_refs or ([goal_oid] if task_run_contract is None else [])),
+        *acknowledged_message_ids,
+    ]
+    observed_tools = _successful_tool_calls_from_receipts(successful_tool_receipts)
     goal_evidence: dict[str, Any] = {
         "oid": goal_oid,
         "version": goal_version,
@@ -761,6 +838,15 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
         "schema_version": 2,
         "review_token": f"exitrev_{_canonical_sha256(contract_identity)}",
         "goal": goal_evidence,
+        "task_run": (
+            {
+                "run_id": task_run_contract["run_id"],
+                "requirements": task_run_requirements,
+            }
+            if task_run_contract is not None
+            else None
+        ),
+        "completion_source_refs": completion_source_refs,
         "acknowledged_human_message_count": len(acknowledged),
         "acknowledged_human_message_ids": acknowledged_message_ids,
         "acknowledged_human_messages_sha256": acknowledged_messages_sha256,
@@ -785,7 +871,7 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
             "acceptance_checks": [
                 {
                     "requirement": "one explicit cumulative requirement; do not bundle unrelated deliverables",
-                    "source_refs": ["goal oid or acknowledged human message id"],
+                    "source_refs": completion_source_refs,
                     "status": "completed | blocked | cancelled",
                     "evidence_tool_calls": ["successful tool names that prove this status"],
                     "evidence_summary": "concise concrete evidence or blocker/cancellation reason",
@@ -809,8 +895,14 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
                 "activate its Skill and call the tool before retrying."
             ),
             (
-                "Cover the goal oid and every acknowledged_human_message_id as "
-                "source_refs, and cite only successful tool calls actually observed."
+                "Cover every completion_source_ref as a source_ref, and cite only "
+                "successful tool calls actually observed."
+            ),
+            (
+                "For a Durable TaskRun, each acceptance check may cover at most "
+                "one outstanding requirement_id. A completed check may cite only "
+                "that requirement's eligible_evidence_tool_calls; use a separate "
+                "check for every other outstanding requirement."
             ),
             (
                 "Treat process_exit as terminal control flow, not as a deliverable, "
@@ -920,12 +1012,12 @@ def _completion_review_human_messages(
     runtime: Any,
     pid: str,
 ) -> tuple[list[Any], list[Any], list[Any]]:
-    human_messages = [
-        message
-        for message in runtime.store.list_process_messages(pid)
-        if message.sender.startswith("human:")
-    ]
     message_limit = runtime.config.tools.message_read_hard_limit
+    human_messages = runtime.store.list_process_messages(
+        pid,
+        sender_prefix="human:",
+        limit=message_limit + 1,
+    )
     if len(human_messages) > message_limit:
         raise ToolExecutionError(
             "Cumulative exit review cannot safely represent every human message; "
@@ -977,7 +1069,40 @@ def _completion_goal_payload(
     runtime: Any,
     pid: str,
     goal_oid: str,
+    *,
+    task_run_contract: Any | None = None,
 ) -> tuple[Any, int, str, dict[str, Any], bool]:
+    if task_run_contract is not None:
+        persisted = runtime.uow.objects.get_persisted_object_state(goal_oid)
+        version = persisted.version if persisted is not None else 0
+        searchable_contract = {
+            "goal": task_run_contract["goal_text"],
+            "requirements": [
+                {
+                    "requirement_id": item["requirement_id"],
+                    "kind": item["kind"],
+                    "status": item["status"],
+                    "content_text": item["content_text"],
+                }
+                for item in task_run_contract["requirements"]
+                if item["status"] not in {"satisfied", "waived"}
+            ],
+        }
+        return (
+            searchable_contract,
+            version,
+            "task_run_payload",
+            {
+                "kind": "task_run_payload",
+                "run_id": task_run_contract["run_id"],
+                "payload_sha256": task_run_contract["goal_payload_sha256"],
+                "instruction": (
+                    "Use the authoritative Durable TaskRun contract already "
+                    "present in local prompt context."
+                ),
+            },
+            False,
+        )
     try:
         goal_handle = runtime.memory.handle_for_oid(
             pid,
@@ -1151,29 +1276,119 @@ def _completion_evidence_errors(
             "explicit goal requirements still need successful tool calls: "
             + ", ".join(required_unobserved_tools)
         )
-    expected_sources = {
-        str(review["goal"]["oid"]),
-        *[
-            str(message_id)
-            for message_id in review["acknowledged_human_message_ids"]
-        ],
-    }
-    covered_sources: set[str] = set()
-    for index, check in enumerate(evidence_model.acceptance_checks):
-        check_errors, covered = _acceptance_check_errors(
-            check,
-            index=index,
-            expected_sources=expected_sources,
-            observed_tools=observed_tools,
-        )
-        errors.extend(check_errors)
-        covered_sources.update(covered)
+    raw_completion_sources = review.get("completion_source_refs")
+    if not isinstance(raw_completion_sources, list) or not all(
+        isinstance(source, str) and source for source in raw_completion_sources
+    ):
+        errors.append("completion review source references are invalid")
+        return errors
+    expected_sources = set(raw_completion_sources)
+    task_run_requirements, projection_errors = _completion_task_run_requirements(
+        review
+    )
+    errors.extend(projection_errors)
+    if projection_errors:
+        return errors
+    check_errors, covered_sources = _completion_acceptance_check_errors(
+        evidence_model,
+        expected_sources=expected_sources,
+        observed_tools=observed_tools,
+        task_run_requirements=task_run_requirements,
+    )
+    errors.extend(check_errors)
     missing_sources = expected_sources - covered_sources
     if missing_sources:
         errors.append("acceptance checks do not cover every expected_source_ref")
     if set(evidence_model.final_verification) - observed_tools:
         errors.append("completion_evidence.final_verification cites unobserved tools")
     return errors
+
+
+def _completion_task_run_requirements(
+    review: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    raw_task_run = review.get("task_run")
+    if raw_task_run is None:
+        return {}, []
+    raw_requirements = (
+        raw_task_run.get("requirements")
+        if isinstance(raw_task_run, dict)
+        else None
+    )
+    if not isinstance(raw_requirements, list):
+        return {}, ["TaskRun completion requirement projection is invalid"]
+    selected: dict[str, dict[str, Any]] = {}
+    for item in raw_requirements:
+        error = _task_run_requirement_projection_error(item, selected)
+        if error is not None:
+            return {}, [error]
+        assert isinstance(item, dict)
+        if item.get("status") not in {"satisfied", "waived"}:
+            selected[str(item["requirement_id"])] = item
+    return selected, []
+
+
+def _task_run_requirement_projection_error(
+    item: Any,
+    selected: dict[str, dict[str, Any]],
+) -> str | None:
+    if not isinstance(item, dict):
+        return "TaskRun completion requirement projection is invalid"
+    requirement_id = item.get("requirement_id")
+    if (
+        not isinstance(requirement_id, str)
+        or not requirement_id
+        or requirement_id in selected
+    ):
+        return "TaskRun completion requirement projection is invalid"
+    eligible = item.get("eligible_evidence_tool_calls")
+    receipts = item.get("eligible_evidence_receipts")
+    if not isinstance(eligible, list) or not all(
+        isinstance(tool, str) and tool for tool in eligible
+    ):
+        return "TaskRun completion evidence eligibility is invalid"
+    if not isinstance(receipts, list):
+        return "TaskRun completion evidence receipt projection is invalid"
+    receipt_ids: set[str] = set()
+    receipt_tools: set[str] = set()
+    for receipt in receipts:
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != {"receipt_id", "tool"}
+            or not isinstance(receipt.get("receipt_id"), str)
+            or not receipt["receipt_id"]
+            or receipt["receipt_id"] in receipt_ids
+            or not isinstance(receipt.get("tool"), str)
+            or not receipt["tool"]
+        ):
+            return "TaskRun completion evidence receipt projection is invalid"
+        receipt_ids.add(receipt["receipt_id"])
+        receipt_tools.add(receipt["tool"])
+    if set(eligible) != receipt_tools:
+        return "TaskRun completion evidence eligibility is invalid"
+    return None
+
+
+def _completion_acceptance_check_errors(
+    evidence: ProcessCompletionEvidence,
+    *,
+    expected_sources: set[str],
+    observed_tools: set[str],
+    task_run_requirements: dict[str, dict[str, Any]],
+) -> tuple[list[str], set[str]]:
+    errors: list[str] = []
+    covered_sources: set[str] = set()
+    for index, check in enumerate(evidence.acceptance_checks):
+        check_errors, covered = _acceptance_check_errors(
+            check,
+            index=index,
+            expected_sources=expected_sources,
+            observed_tools=observed_tools,
+            task_run_requirements=task_run_requirements,
+        )
+        errors.extend(check_errors)
+        covered_sources.update(covered)
+    return errors, covered_sources
 
 
 def _completion_identity_errors(
@@ -1201,35 +1416,90 @@ def _acceptance_check_errors(
     index: int,
     expected_sources: set[str],
     observed_tools: set[str],
+    task_run_requirements: dict[str, dict[str, Any]],
 ) -> tuple[list[str], set[str]]:
     errors: list[str] = []
     label = f"acceptance_checks[{index}]"
     source_refs = set(check.source_refs)
     if source_refs - expected_sources:
         errors.append(f"{label}.source_refs contains unknown references")
+    task_run_refs = source_refs & set(task_run_requirements)
+    if len(task_run_refs) > 1:
+        errors.append(
+            f"{label}.source_refs must cover at most one TaskRun requirement"
+        )
     if check.status == "completed" and not check.evidence_tool_calls:
         errors.append(
             f"{label}.evidence_tool_calls must cite evidence for completed work"
         )
     elif set(check.evidence_tool_calls) - observed_tools:
         errors.append(f"{label}.evidence_tool_calls cites unobserved tools")
+    if check.status == "completed" and len(task_run_refs) == 1:
+        requirement_id = next(iter(task_run_refs))
+        eligible = set(
+            task_run_requirements[requirement_id]["eligible_evidence_tool_calls"]
+        )
+        if set(check.evidence_tool_calls) - eligible:
+            errors.append(
+                f"{label}.evidence_tool_calls predates its TaskRun requirement"
+            )
     return errors, source_refs & expected_sources
 
 
-def _successful_tool_calls(runtime: Any, pid: str) -> list[str]:
-    names: list[str] = []
-    for record in runtime.audit.trace(actor=pid):
-        if record.action != "tool.call" or record.decision.get("ok") is not True:
+def _successful_tool_receipts(runtime: Any, pid: str) -> list[dict[str, str]]:
+    receipts: list[dict[str, str]] = []
+    hard_limit = runtime.config.runtime.operation_recovery_page_hard_limit
+    records = runtime.store.list_audit(
+        limit=hard_limit + 1,
+        actor=pid,
+        action="tool.call",
+    )
+    if len(records) > hard_limit:
+        raise ToolExecutionError(
+            "Cumulative exit review cannot safely represent every successful "
+            "tool receipt; start a successor process with a consolidated goal.",
+            code=ToolErrorCode.VALIDATION_ERROR,
+            details={"review_tool_receipt_limit": hard_limit},
+        )
+    for record in records:
+        decision = record.decision
+        if (
+            not isinstance(decision, dict)
+            or decision.get("ok") is not True
+        ):
             continue
-        name = record.decision.get("tool")
+        name = decision.get("tool")
         # A prior nonterminal review is not evidence that any deliverable was
         # completed. Excluding it also keeps an unchanged review stable across
         # retries.
         if name == "process_exit":
             continue
-        if isinstance(name, str) and name and name not in names:
+        if isinstance(name, str) and name:
+            receipts.append(
+                {
+                    "receipt_id": str(record.record_id),
+                    "tool": name,
+                    "completed_at": str(record.timestamp),
+                }
+            )
+    return receipts
+
+
+def _successful_tool_calls_from_receipts(
+    receipts: Iterable[dict[str, str]],
+) -> list[str]:
+    names: list[str] = []
+    for receipt in receipts:
+        name = receipt["tool"]
+        if name not in names:
             names.append(name)
     return names
+
+
+def _successful_tool_calls(runtime: Any, pid: str) -> list[str]:
+    return _successful_tool_calls_from_receipts(
+        _successful_tool_receipts(runtime, pid)
+    )
 
 
 def _explicit_unobserved_tool_hints(

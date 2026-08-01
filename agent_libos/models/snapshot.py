@@ -7,7 +7,7 @@ typed snapshots without importing concrete runtime orchestration modules.
 """
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import re
 from typing import Any, ClassVar, Mapping
 
@@ -138,6 +138,27 @@ def _validate_process_rows(rows: tuple[dict[str, Any], ...]) -> None:
             ):
                 raise ValidationError(
                     "snapshot process state_generation must be a non-negative integer"
+                )
+            task_run_id = row["task_run_id"]
+            task_run_epoch = row["task_run_epoch"]
+            task_run_role = row["task_run_role"]
+            if task_run_id is None:
+                if task_run_epoch is not None or task_run_role is not None:
+                    raise ValidationError(
+                        "snapshot process TaskRun binding must be entirely null"
+                    )
+            elif (
+                type(task_run_id) is not str
+                or not task_run_id.strip()
+                or task_run_id != task_run_id.strip()
+                or type(task_run_epoch) is not int
+                or task_run_epoch <= 0
+                or type(task_run_role) is not str
+                or not task_run_role.strip()
+                or task_run_role != task_run_role.strip()
+            ):
+                raise ValidationError(
+                    "snapshot process TaskRun binding is not canonical"
                 )
         except (KeyError, TypeError, ValueError, ValidationError) as exc:
             raise ValidationError(
@@ -477,7 +498,8 @@ class SnapshotRows:
                 "resource_usage_json", "working_directory", "llm_profile_id",
                 "wait_state_json", "outcome_json", "state_generation",
                 "revision", "execution_generation", "execution_owner_id",
-                "execution_lease_id",
+                "execution_lease_id", "task_run_id", "task_run_epoch",
+                "task_run_role",
                 "created_at", "updated_at",
             }
         ),
@@ -603,6 +625,65 @@ class SnapshotRows:
             ]
             for name in self.TABLES
         }
+
+    def without_task_run_private_replay_rows(self) -> "SnapshotRows":
+        """Drop process-local plaintext that belongs to a Durable TaskRun.
+
+        TaskRun resume payloads and ledgers are deliberately outside checkpoint
+        state.  Process messages and legacy pending-action rows are just as
+        replay-sensitive: retaining them in a checkpoint would let restore or
+        fork resurrect content after the Run's terminal purge.  Process rows
+        keep their binding solely so restore/fork guards can recognize the
+        historical ownership before detaching the reconstructed process.
+        """
+
+        bound_pids = {
+            str(row["pid"])
+            for row in self.processes
+            if row.get("task_run_id") is not None
+        }
+
+        def task_run_message(row: Mapping[str, Any]) -> bool:
+            if (
+                str(row.get("recipient_pid") or "") in bound_pids
+                or str(row.get("sender") or "") in bound_pids
+            ):
+                return True
+            raw_metadata = row.get("metadata_json")
+            try:
+                metadata = (
+                    loads(raw_metadata)
+                    if isinstance(raw_metadata, str)
+                    else raw_metadata
+                )
+            except (TypeError, ValueError):
+                # Canonical snapshot validation will reject malformed metadata;
+                # do not reinterpret it here as a TaskRun binding.
+                return False
+            return (
+                isinstance(metadata, Mapping)
+                and isinstance(metadata.get("task_run_id"), str)
+                and bool(str(metadata["task_run_id"]).strip())
+            )
+
+        messages = tuple(
+            row for row in self.process_messages if not task_run_message(row)
+        )
+        pending_actions = tuple(
+            row
+            for row in self.llm_pending_actions
+            if str(row.get("pid") or "") not in bound_pids
+        )
+        if (
+            messages == self.process_messages
+            and pending_actions == self.llm_pending_actions
+        ):
+            return self
+        return replace(
+            self,
+            process_messages=messages,
+            llm_pending_actions=pending_actions,
+        )
 
 
 @dataclass(frozen=True)

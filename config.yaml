@@ -1,6 +1,12 @@
 runtime:
   local_store_target: .agent_libos.sqlite
 
+task_runs:
+  enabled: true
+  # Durable Run creation requires an explicit Host decision to persist
+  # bounded goal/resume material as plaintext in RuntimeStore.
+  plaintext_payloads_enabled: false
+
 git:
   enabled: true
   executable: git

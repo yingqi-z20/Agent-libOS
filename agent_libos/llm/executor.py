@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, TYPE_CHECKING
 
@@ -26,6 +27,7 @@ from agent_libos.utils.public_errors import (
 from agent_libos.utils.serde import dumps, to_jsonable
 from agent_libos.llm.client import (
     LLMClient,
+    LLMCompletion,
     LLMError,
     LLMTransientError,
     llm_error_internal_observation,
@@ -53,11 +55,22 @@ from agent_libos.llm.prompt import (
 from agent_libos.llm.records import observable_llm_call_fields
 from agent_libos.llm.usage import canonicalize_llm_usage
 from agent_libos.llm.tool_protocol import tool_call_to_action
+from agent_libos.llm.task_runs import (
+    TaskRunDispatchDeferred,
+    TaskRunLLMHook,
+    completed_outcome_manifest,
+    normalize_task_run_prompt_context,
+    normalize_validated_action_manifest,
+    task_run_contract_message,
+    validated_action_manifest,
+)
 from agent_libos.llm.pending import (
     LLMPendingActionService,
+    PENDING_TASK_RUN_TRANSCRIPT_KEY,
     pending_data_flow_metadata,
     pending_metadata,
     pending_resume_token,
+    pending_task_run_transcript_call_id,
 )
 from agent_libos.llm.actions import LLMActionService, auto_wait_message_action
 from agent_libos.llm.provider_service import LLMProviderService
@@ -121,6 +134,7 @@ _HOST_AUTO_WAIT_METADATA = {
 }
 
 _FULL_SNAPSHOT_RESPONSE_CHAIN_DISABLED_REASON = "full_snapshot_executor_replay"
+_TASK_RUN_REQUIREMENT_BINDING_KEY = "task_run_requirement_binding_v1"
 _IMAGE_ONLY_FROZEN_ANCHOR_KEY = "image_only_request_anchor"
 _IMAGE_ONLY_FROZEN_ANCHOR_SCHEMA_VERSION = 1
 _IMAGE_ONLY_REQUEST_KEY = "image_only_request"
@@ -227,6 +241,7 @@ class LLMProcessExecutor:
         client: LLMClient | None = None,
         config: AgentLibOSConfig | None = None,
         blocking_work: Any | None = None,
+        task_runs: TaskRunLLMHook | None = None,
     ) -> None:
         self.config = config or DEFAULT_CONFIG
         self._processes = unit_of_work.processes
@@ -252,6 +267,7 @@ class LLMProcessExecutor:
         self._protected_operations = protected_operations
         self._authority_manifests = authority_manifests
         self._capabilities = capabilities
+        self._task_runs = task_runs
         if client is not None:
             self._llms.set_test_client(self.config.llm.default_profile_id, client)
         self.pending = LLMPendingActionService(
@@ -352,6 +368,273 @@ class LLMProcessExecutor:
                 DataFlowContext(labels=DataLabels.from_object_metadata(metadata)),
             )
         )
+
+    def _task_run_prompt_context(self, pid: str) -> dict[str, Any] | None:
+        if self._task_runs is None:
+            return None
+        selected = self._task_runs.prompt_context_for_pid(pid)
+        if selected is None:
+            return None
+        try:
+            return normalize_task_run_prompt_context(selected)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("durable TaskRun prompt context is invalid") from exc
+
+    def _task_run_requirement_binding(
+        self,
+        pid: str,
+        context: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Freeze the Host-authored requirement set sent in this request.
+
+        The binding is deliberately kept out of model-visible prompt text.  It
+        travels in the local LLM-call options so a release approval/reopen keeps
+        the exact requirement set that preceded the Provider call.
+        """
+
+        if self._task_runs is None or context is None:
+            return None
+        selected = self._task_runs.requirement_binding_for_prompt(
+            pid,
+            context_generation=str(context["context_generation"]),
+        )
+        if selected is None:
+            return None
+        try:
+            detached = json.loads(dumps(dict(selected)))
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "durable TaskRun requirement binding is invalid"
+            ) from exc
+        if not isinstance(detached, dict):
+            raise ValidationError("durable TaskRun requirement binding is invalid")
+        return detached
+
+    def _pending_task_run_validated_action(
+        self,
+        pid: str,
+    ) -> dict[str, Any] | None:
+        if self._task_runs is None:
+            return None
+        getter = getattr(
+            self._task_runs,
+            "pending_validated_action_for_pid",
+            None,
+        )
+        # Legacy/non-Durable hook implementations have no recovery bundle.
+        # The real TaskRun manager implements this method; absence must never
+        # make an ordinary AgentProcess call the Provider fail.
+        if not callable(getter):
+            return None
+        selected = getter(pid)
+        if selected is None:
+            return None
+        try:
+            return normalize_validated_action_manifest(selected)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "durable TaskRun pending action manifest is invalid"
+            ) from exc
+
+    def _pending_task_run_action_boundary(
+        self,
+        pid: str,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Convert a persisted control fence into a skipped quantum marker."""
+
+        try:
+            return self._pending_task_run_validated_action(pid), False
+        except TaskRunDispatchDeferred:
+            return None, True
+
+    def _task_run_expected_tool_id(
+        self,
+        pid: str,
+        action: Mapping[str, Any],
+    ) -> str | None:
+        if self._task_runs is None:
+            return None
+        getter = getattr(
+            self._task_runs,
+            "expected_tool_id_for_pending_action",
+            None,
+        )
+        if not callable(getter):
+            return None
+        selected = getter(pid, action)
+        if selected is not None and (
+            not isinstance(selected, str) or not selected
+        ):
+            raise ValidationError("durable TaskRun exact tool identity is invalid")
+        return selected
+
+    def _task_run_request_binding_hash(self, pid: str) -> str | None:
+        if self._task_runs is None:
+            return None
+        getter = getattr(self._task_runs, "request_binding_hash_for_pid", None)
+        if not callable(getter):
+            return None
+        selected = getter(pid)
+        if selected is None:
+            return None
+        if (
+            not isinstance(selected, str)
+            or len(selected) != 64
+            or any(character not in "0123456789abcdef" for character in selected)
+        ):
+            raise ValidationError("durable TaskRun request binding hash is invalid")
+        return selected
+
+    def _task_run_settlement_binding_hash(self, pid: str) -> str | None:
+        if self._task_runs is None:
+            return None
+        getter = getattr(
+            self._task_runs,
+            "settlement_binding_hash_for_pid",
+            None,
+        )
+        if not callable(getter):
+            return self._task_run_request_binding_hash(pid)
+        selected = getter(pid)
+        if selected is None:
+            return None
+        if (
+            not isinstance(selected, str)
+            or len(selected) != 64
+            or any(character not in "0123456789abcdef" for character in selected)
+        ):
+            raise ValidationError("durable TaskRun settlement binding hash is invalid")
+        return selected
+
+    def _task_run_dispatch_scope(self, pid: str, kind: str):
+        if self._task_runs is None:
+            return nullcontext()
+        getter = getattr(self._task_runs, "dispatch_scope_for_pid", None)
+        if not callable(getter):
+            return nullcontext()
+        return getter(pid, kind)
+
+    def _defer_unstarted_task_run_action(self, pid: str) -> None:
+        if self._task_runs is None:
+            return
+        defer = getattr(self._task_runs, "defer_unstarted_action_for_pid", None)
+        if callable(defer):
+            defer(pid)
+
+    def _mark_task_run_request_scope_drift(self, pid: str) -> None:
+        if self._task_runs is None:
+            return
+        marker = getattr(self._task_runs, "mark_request_scope_drift_for_pid", None)
+        if callable(marker):
+            marker(pid)
+
+    async def _dispatch_pending_task_run_validated_action(
+        self,
+        pid: str,
+        manifest: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Dispatch one integrity-checked local bundle without another LLM call."""
+
+        actions = [dict(action) for action in manifest["actions"]]
+        parallel_tool_calls = bool(manifest["parallel_tool_calls"])
+        host_auto_wait = bool(manifest["host_auto_wait"])
+        if host_auto_wait:
+            if len(actions) != 1:
+                raise ValidationError(
+                    "durable TaskRun host auto-wait action count changed"
+                )
+            self.actions.validate_host_auto_wait(pid, actions[0])
+        else:
+            for action in actions:
+                self._validate_dispatchable_action(pid, action)
+        if parallel_tool_calls and len(actions) > 1:
+            self._preflight_parallel_tool_batch(pid, actions)
+
+        call_id = str(manifest["call_id"])
+        tool_call_count = int(manifest["tool_call_count"])
+        tool_calls: list[dict[str, Any]] = []
+        if tool_call_count:
+            selected_actions = actions if parallel_tool_calls else [actions[-1]]
+            padding = max(0, tool_call_count - len(selected_actions))
+            tool_calls.extend({} for _ in range(padding))
+            for index, action in enumerate(selected_actions, start=padding):
+                digest = hashlib.sha256(
+                    f"{call_id}:{index}".encode("utf-8")
+                ).hexdigest()[:24]
+                tool_calls.append(
+                    {
+                        "id": f"taskrun_call_{digest}",
+                        "name": str(action.get("action") or ""),
+                        "arguments": "{}",
+                    }
+                )
+        completion = LLMCompletion(
+            content="",
+            tool_calls=tool_calls,
+            api="local_task_run_resume",
+            response_id=call_id,
+            request_id=None,
+            usage={},
+        )
+        labels = DataLabels.from_dict(dict(manifest["data_labels"]))
+        flow_token = self._data_flow.push(DataFlowContext(labels=labels))
+        try:
+            self._audit.record(
+                actor=pid,
+                action="llm.task_run_validated_action_recovered",
+                target=f"llm_call:{call_id}",
+                decision={
+                    "call_id": call_id,
+                    "action_count": len(actions),
+                    "parallel_tool_calls": parallel_tool_calls,
+                    "provider_called": False,
+                },
+            )
+            return await self._dispatch_completed_llm_action(
+                pid=pid,
+                completion=completion,
+                actions=actions,
+                parallel_tool_calls=parallel_tool_calls,
+                host_auto_wait=host_auto_wait,
+                call_id=call_id,
+            )
+        finally:
+            self._data_flow.reset(flow_token)
+
+    @staticmethod
+    def _include_task_run_labels(
+        flow_context: DataFlowContext,
+        task_context: Mapping[str, Any],
+    ) -> DataFlowContext:
+        try:
+            labels = DataLabels.from_dict(dict(task_context["data_labels"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValidationError("durable TaskRun data labels are invalid") from exc
+        return DataFlowContext.aggregate(
+            (flow_context, DataFlowContext(labels=labels))
+        )
+
+    @staticmethod
+    def _task_run_messages(
+        *,
+        system_message: Mapping[str, Any],
+        task_context: Mapping[str, Any],
+        current_user_message: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = [
+            dict(system_message),
+            {
+                "role": "user",
+                "content": task_run_contract_message(task_context),
+            },
+            *[
+                dict(message)
+                for message in task_context["transcript_messages"]
+            ],
+        ]
+        if current_user_message is not None:
+            messages.append(dict(current_user_message))
+        return messages
 
     def _image_only_transcript_anchor(
         self,
@@ -1062,33 +1345,19 @@ class LLMProcessExecutor:
         DataFlowContext,
         str | None,
         dict[str, str] | None,
+        dict[str, Any] | None,
     ]:
+        task_context = self._task_run_prompt_context(pid)
+        requirement_binding = self._task_run_requirement_binding(pid, task_context)
         if image.prompt_mode == PROMPT_MODE_IMAGE_ONLY:
-            if not self.config.llm.persist_full_io:
-                raise _ImageOnlyFullIORequired(
-                    "image_only requires llm.persist_full_io=true for durable transcript replay"
-                )
-            anchor = self._image_only_transcript_anchor(image, process)
-            messages, flow_context, input_refs = self._image_only_messages_and_flow(
+            return self._assemble_image_only_llm_request(
                 pid=pid,
                 image=image,
                 process=process,
                 context=context,
-                anchor=anchor,
+                task_context=task_context,
+                requirement_binding=requirement_binding,
             )
-            self._audit.record(
-                actor=pid,
-                action="llm.request",
-                target=f"image:{image.image_id}",
-                input_refs=input_refs,
-                decision={
-                    "messages": len(messages),
-                    "policy": image.context_policy,
-                    "prompt_mode": PROMPT_MODE_IMAGE_ONLY,
-                    "event_projection": {"model_visible": False},
-                },
-            )
-            return messages, flow_context, None, anchor
         # The live goal is already part of the authoritative materialized
         # context in the ordinary case.  Replaying the retained copy as well
         # duplicates a potentially large, volatile block on every later
@@ -1101,14 +1370,15 @@ class LLMProcessExecutor:
         )
         original_goal_context = (
             None
-            if goal_is_materialized
+            if goal_is_materialized or task_context is not None
             else self._retained_original_goal_context(
                 process=process,
                 image=image,
             )
         )
         if (
-            process.goal_oid is not None
+            task_context is None
+            and process.goal_oid is not None
             and not goal_is_materialized
             and original_goal_context is None
             # An explicit MemoryView may deliberately omit the goal while the
@@ -1131,6 +1401,11 @@ class LLMProcessExecutor:
             flow_context = self._include_retained_goal_labels(
                 flow_context,
                 process.goal_oid,
+            )
+        if task_context is not None:
+            flow_context = self._include_task_run_labels(
+                flow_context,
+                task_context,
             )
         event_projection = project_prompt_events(
             events,
@@ -1157,6 +1432,12 @@ class LLMProcessExecutor:
             available_skills=available_skills,
             original_goal_context=original_goal_context,
         )
+        if task_context is not None:
+            messages = self._task_run_messages(
+                system_message=messages[0],
+                task_context=task_context,
+                current_user_message=messages[1],
+            )
         input_refs = list(context.object_refs)
         if (
             original_goal_context is not None
@@ -1173,6 +1454,17 @@ class LLMProcessExecutor:
                 "messages": len(messages),
                 "policy": image.context_policy,
                 "event_projection": event_projection.summary,
+                "task_run": (
+                    {
+                        "run_id": task_context["run_id"],
+                        "context_generation": task_context["context_generation"],
+                        "transcript_message_count": len(
+                            task_context["transcript_messages"]
+                        ),
+                    }
+                    if task_context is not None
+                    else None
+                ),
             },
         )
         return (
@@ -1180,7 +1472,75 @@ class LLMProcessExecutor:
             flow_context,
             event_projection.represented_through_event_id,
             None,
+            requirement_binding,
         )
+
+    def _assemble_image_only_llm_request(
+        self,
+        *,
+        pid: str,
+        image: Any,
+        process: Any,
+        context: MaterializedContext,
+        task_context: Mapping[str, Any] | None,
+        requirement_binding: dict[str, Any] | None,
+    ) -> tuple[
+        list[dict[str, Any]],
+        DataFlowContext,
+        None,
+        dict[str, str],
+        dict[str, Any] | None,
+    ]:
+        if not self.config.llm.persist_full_io:
+            raise _ImageOnlyFullIORequired(
+                "image_only requires llm.persist_full_io=true for durable transcript replay"
+            )
+        anchor = self._image_only_transcript_anchor(image, process)
+        task_run_projection: dict[str, Any] | None = None
+        if task_context is None:
+            messages, flow_context, input_refs = self._image_only_messages_and_flow(
+                pid=pid,
+                image=image,
+                process=process,
+                context=context,
+                anchor=anchor,
+            )
+        else:
+            messages = self._task_run_messages(
+                system_message={
+                    "role": "system",
+                    "content": build_system_prompt(image),
+                },
+                task_context=task_context,
+            )
+            flow_context = self._include_task_run_labels(
+                self._data_flow.context_from_materialization(pid, context),
+                task_context,
+            )
+            input_refs = list(context.object_refs)
+            task_run_projection = {
+                "run_id": task_context["run_id"],
+                "context_generation": task_context["context_generation"],
+                "transcript_message_count": len(
+                    task_context["transcript_messages"]
+                ),
+            }
+        decision: dict[str, Any] = {
+            "messages": len(messages),
+            "policy": image.context_policy,
+            "prompt_mode": PROMPT_MODE_IMAGE_ONLY,
+            "event_projection": {"model_visible": False},
+        }
+        if task_run_projection is not None:
+            decision["task_run"] = task_run_projection
+        self._audit.record(
+            actor=pid,
+            action="llm.request",
+            target=f"image:{image.image_id}",
+            input_refs=input_refs,
+            decision=decision,
+        )
+        return messages, flow_context, None, anchor, requirement_binding
 
     def run_once(self, pid: str) -> dict[str, Any]:
         try:
@@ -1248,6 +1608,20 @@ class LLMProcessExecutor:
                 "pending_action_resuming": True,
                 "wait_type": durable_pending.get("wait_type"),
             }
+        pending_task_run_action, task_run_deferred = (
+            self._pending_task_run_action_boundary(pid)
+        )
+        if task_run_deferred:
+            return {
+                "ok": False,
+                "skipped": True,
+                "task_run_control_deferred": True,
+            }
+        if pending_task_run_action is not None:
+            return await self._dispatch_pending_task_run_validated_action(
+                pid,
+                pending_task_run_action,
+            )
         image = self._images.get(process.image_id)
         if image is None:
             error = f"agent image not found for process {pid}: {process.image_id}"
@@ -1318,6 +1692,7 @@ class LLMProcessExecutor:
                 flow_context,
                 represented_through_event_id,
                 image_only_anchor,
+                task_run_requirement_binding,
             ) = (
                 self._assemble_llm_request(
                     pid=pid,
@@ -1339,24 +1714,22 @@ class LLMProcessExecutor:
         flow_token = self._data_flow.push(flow_context)
         try:
             openai_tools = self._tools.openai_tool_schemas(pid)
-            response_scope_fingerprint = self._responses_state_scope_fingerprint(
-                pid=pid,
-                process=prompt_process,
-                context=context,
-                tools=openai_tools,
-                available_skills=available_skills,
+            response_scope_fingerprint = (
+                self._current_responses_state_scope_fingerprint(pid)
             )
             (
                 completion,
                 actions,
                 parallel_tool_calls,
                 host_auto_wait,
-            ) = await self._complete_valid_action(
+                call_id,
+            ) = await self._complete_valid_action_with_control_boundary(
                 pid,
                 messages,
                 openai_tools,
                 response_scope_fingerprint=response_scope_fingerprint,
                 image_only_anchor=image_only_anchor,
+                task_run_requirement_binding=task_run_requirement_binding,
             )
             # Cursor advancement is an acknowledgement that the projected
             # batch reached a successfully recorded provider completion.  A
@@ -1370,6 +1743,7 @@ class LLMProcessExecutor:
                 actions=actions,
                 parallel_tool_calls=parallel_tool_calls,
                 host_auto_wait=host_auto_wait,
+                call_id=call_id,
             )
         except _ContextManagementHandled as handled:
             return handled.result
@@ -1968,15 +2342,54 @@ class LLMProcessExecutor:
         parallel_tool_calls: bool,
         host_auto_wait: bool = False,
         resumed_after_human: bool = False,
+        call_id: str,
     ) -> dict[str, Any]:
-        if host_auto_wait and len(actions) != 1:
-            raise ValueError("host-generated auto-wait must contain exactly one action")
         if parallel_tool_calls and len(actions) > 1:
             return await self._dispatch_action_batch(
                 pid=pid,
                 completion=completion,
                 actions=actions,
+                call_id=call_id,
             )
+        try:
+            with self._task_run_dispatch_scope(pid, "tool"):
+                return await self._dispatch_completed_llm_action_admitted(
+                    pid=pid,
+                    completion=completion,
+                    actions=actions,
+                    parallel_tool_calls=parallel_tool_calls,
+                    host_auto_wait=host_auto_wait,
+                    resumed_after_human=resumed_after_human,
+                    call_id=call_id,
+                )
+        except TaskRunDispatchDeferred:
+            # ``pending_validated_action_for_pid`` may already have changed a
+            # purely local action from validated to dispatching.  The exact
+            # tool admission did not occur, so durably rewind that claim and
+            # leave it available for an ordinary pause/resume.  Interrupt
+            # control may supersede it after the run scope drains.
+            self._defer_unstarted_task_run_action(pid)
+            return {
+                "ok": False,
+                "skipped": True,
+                "task_run_control_deferred": True,
+            }
+
+    async def _dispatch_completed_llm_action_admitted(
+        self,
+        *,
+        pid: str,
+        completion: Any,
+        actions: list[dict[str, Any]],
+        parallel_tool_calls: bool,
+        host_auto_wait: bool = False,
+        resumed_after_human: bool = False,
+        call_id: str,
+    ) -> dict[str, Any]:
+        if host_auto_wait and len(actions) != 1:
+            raise ValueError("host-generated auto-wait must contain exactly one action")
+        if parallel_tool_calls and len(actions) > 1:
+            raise RuntimeError("parallel TaskRun actions require per-tool admission")
         action = actions[-1]
         tool_call_context = self._selected_completion_tool_call_context(completion)
         content_preview = self._completion_content_preview(completion.content)
@@ -2002,6 +2415,7 @@ class LLMProcessExecutor:
                 content_preview=content_preview,
                 tool_call_count=tool_call_count,
                 pending_metadata=host_pending_metadata,
+                task_run_call_id=call_id,
                 **tool_call_context,
             )
         except ProcessWaitRequired as exc:
@@ -2013,6 +2427,7 @@ class LLMProcessExecutor:
                 content_preview=content_preview,
                 tool_call_count=tool_call_count,
                 pending_metadata=host_pending_metadata,
+                task_run_call_id=call_id,
                 **tool_call_context,
             )
         except ProcessMessageWaitRequired as exc:
@@ -2024,6 +2439,7 @@ class LLMProcessExecutor:
                 content_preview=content_preview,
                 tool_call_count=tool_call_count,
                 pending_metadata=host_pending_metadata,
+                task_run_call_id=call_id,
                 **tool_call_context,
             )
         self._persist_response_tool_output(
@@ -2031,7 +2447,7 @@ class LLMProcessExecutor:
             result=result,
             **tool_call_context,
         )
-        return self._completed_action_result(
+        completed = self._completed_action_result(
             pid=pid,
             action=action,
             result=result,
@@ -2042,6 +2458,14 @@ class LLMProcessExecutor:
                 "host_empty_tool_calls_auto_wait" if host_auto_wait else None
             ),
         )
+        self._record_task_run_completed_transcript(
+            pid=pid,
+            call_id=call_id,
+            state="completed",
+            paired_outputs_persisted=True,
+            result=completed,
+        )
+        return completed
 
     async def _dispatch_action_batch(
         self,
@@ -2049,110 +2473,90 @@ class LLMProcessExecutor:
         pid: str,
         completion: Any,
         actions: list[dict[str, Any]],
+        call_id: str,
     ) -> dict[str, Any]:
         completed_actions: list[dict[str, Any]] = []
         completed_results: list[dict[str, Any]] = []
-        content_preview = self._completion_content_preview(getattr(completion, "content", ""))
+        content_preview = self._completion_content_preview(
+            getattr(completion, "content", "")
+        )
         tool_call_count = len(getattr(completion, "tool_calls", []) or [])
         stop_reason = "completed"
         stopped_action: dict[str, Any] | None = None
         stopped_result: dict[str, Any] | None = None
 
         for action_index, action in enumerate(actions):
-            tool_call_context = self._completion_tool_call_context(completion, index=action_index)
+            tool_call_context = self._completion_tool_call_context(
+                completion,
+                index=action_index,
+            )
             try:
-                result = await self.adispatch(
-                    pid,
-                    action,
-                    context_metadata=self._tool_context_identity_metadata(
-                        tool_call_context
-                    ),
-                )
-            except HumanApprovalRequired as exc:
-                stop_reason = "waiting_human"
+                with self._task_run_dispatch_scope(pid, "tool"):
+                    result = await self.adispatch(
+                        pid,
+                        action,
+                        context_metadata=self._tool_context_identity_metadata(
+                            tool_call_context
+                        ),
+                    )
+                    if result.get("interrupted_by_message"):
+                        stop_reason = "interrupted_by_message"
+                        stopped_action = action
+                        stopped_result = result
+                        self._persist_response_tool_output(
+                            pid=pid,
+                            result=result,
+                            **tool_call_context,
+                        )
+                        self._persist_unexecuted_parallel_tool_outputs(
+                            pid=pid,
+                            completion=completion,
+                            start_index=action_index + 1,
+                            reason=stop_reason,
+                        )
+                        break
+                    self._persist_response_tool_output(
+                        pid=pid,
+                        result=result,
+                        **tool_call_context,
+                    )
+                    completed_actions.append(action)
+                    completed_results.append(result)
+            except TaskRunDispatchDeferred:
+                if action_index == 0:
+                    self._defer_unstarted_task_run_action(pid)
+                    return {
+                        "ok": False,
+                        "skipped": True,
+                        "task_run_control_deferred": True,
+                    }
+                stop_reason = "task_run_control_deferred"
                 self._persist_unexecuted_parallel_tool_outputs(
                     pid=pid,
                     completion=completion,
-                    start_index=action_index + 1,
+                    start_index=action_index,
                     reason=stop_reason,
                 )
-                payload = self._wait_for_human_action(
+                break
+            except (
+                HumanApprovalRequired,
+                ProcessWaitRequired,
+                ProcessMessageWaitRequired,
+            ) as exc:
+                return self._complete_parallel_action_wait(
                     pid=pid,
+                    completion=completion,
+                    actions=actions,
+                    action_index=action_index,
                     action=action,
-                    request_id=exc.request_id,
-                    message=str(exc),
-                    content_preview=content_preview,
-                    tool_call_count=tool_call_count,
-                    **tool_call_context,
-                )
-                self._record_action_batch(
-                    pid=pid,
-                    actions=actions,
+                    wait=exc,
                     completed_actions=completed_actions,
                     completed_results=completed_results,
                     content_preview=content_preview,
                     tool_call_count=tool_call_count,
-                    stop_reason=stop_reason,
-                    pending_action=action,
+                    call_id=call_id,
+                    tool_call_context=tool_call_context,
                 )
-                return self._with_parallel_batch_progress(payload, completed_actions, completed_results)
-            except ProcessWaitRequired as exc:
-                stop_reason = "waiting_child"
-                self._persist_unexecuted_parallel_tool_outputs(
-                    pid=pid,
-                    completion=completion,
-                    start_index=action_index + 1,
-                    reason=stop_reason,
-                )
-                pending_action = exc.resume_action or action
-                payload = self._wait_for_child_action(
-                    pid=pid,
-                    action=pending_action,
-                    child_pid=exc.child_pid,
-                    message=str(exc),
-                    content_preview=content_preview,
-                    tool_call_count=tool_call_count,
-                    **tool_call_context,
-                )
-                self._record_action_batch(
-                    pid=pid,
-                    actions=actions,
-                    completed_actions=completed_actions,
-                    completed_results=completed_results,
-                    content_preview=content_preview,
-                    tool_call_count=tool_call_count,
-                    stop_reason=stop_reason,
-                    pending_action=pending_action,
-                )
-                return self._with_parallel_batch_progress(payload, completed_actions, completed_results)
-            except ProcessMessageWaitRequired as exc:
-                stop_reason = "waiting_message"
-                self._persist_unexecuted_parallel_tool_outputs(
-                    pid=pid,
-                    completion=completion,
-                    start_index=action_index + 1,
-                    reason=stop_reason,
-                )
-                payload = self._wait_for_message_action(
-                    pid=pid,
-                    action=action,
-                    filters=exc.filters,
-                    message=str(exc),
-                    content_preview=content_preview,
-                    tool_call_count=tool_call_count,
-                    **tool_call_context,
-                )
-                self._record_action_batch(
-                    pid=pid,
-                    actions=actions,
-                    completed_actions=completed_actions,
-                    completed_results=completed_results,
-                    content_preview=content_preview,
-                    tool_call_count=tool_call_count,
-                    stop_reason=stop_reason,
-                    pending_action=action,
-                )
-                return self._with_parallel_batch_progress(payload, completed_actions, completed_results)
             except ResourceLimitExceeded:
                 self._persist_unexecuted_parallel_tool_outputs(
                     pid=pid,
@@ -2171,25 +2575,8 @@ class LLMProcessExecutor:
                 )
                 raise
 
-            if result.get("interrupted_by_message"):
-                stop_reason = "interrupted_by_message"
-                stopped_action = action
-                stopped_result = result
-                self._persist_response_tool_output(
-                    pid=pid,
-                    result=result,
-                    **tool_call_context,
-                )
-                self._persist_unexecuted_parallel_tool_outputs(
-                    pid=pid,
-                    completion=completion,
-                    start_index=action_index + 1,
-                    reason=stop_reason,
-                )
+            if stop_reason == "interrupted_by_message":
                 break
-            self._persist_response_tool_output(pid=pid, result=result, **tool_call_context)
-            completed_actions.append(action)
-            completed_results.append(result)
             if not result.get("ok"):
                 stop_reason = "tool_failed"
                 break
@@ -2207,6 +2594,123 @@ class LLMProcessExecutor:
                 stop_reason = "process_terminal"
                 break
 
+        return self._settle_parallel_action_batch(
+            pid=pid,
+            completion=completion,
+            actions=actions,
+            completed_actions=completed_actions,
+            completed_results=completed_results,
+            content_preview=content_preview,
+            tool_call_count=tool_call_count,
+            stop_reason=stop_reason,
+            stopped_action=stopped_action,
+            stopped_result=stopped_result,
+            call_id=call_id,
+        )
+
+    def _complete_parallel_action_wait(
+        self,
+        *,
+        pid: str,
+        completion: Any,
+        actions: list[dict[str, Any]],
+        action_index: int,
+        action: dict[str, Any],
+        wait: HumanApprovalRequired
+        | ProcessWaitRequired
+        | ProcessMessageWaitRequired,
+        completed_actions: list[dict[str, Any]],
+        completed_results: list[dict[str, Any]],
+        content_preview: str,
+        tool_call_count: int,
+        call_id: str,
+        tool_call_context: dict[str, str | None],
+    ) -> dict[str, Any]:
+        if isinstance(wait, HumanApprovalRequired):
+            stop_reason = "waiting_human"
+        elif isinstance(wait, ProcessWaitRequired):
+            stop_reason = "waiting_child"
+        else:
+            stop_reason = "waiting_message"
+        self._persist_unexecuted_parallel_tool_outputs(
+            pid=pid,
+            completion=completion,
+            start_index=action_index + 1,
+            reason=stop_reason,
+        )
+        wait_result = self._parallel_batch_wait_result(
+            completed_actions,
+            completed_results,
+        )
+        pending_action = action
+        if isinstance(wait, HumanApprovalRequired):
+            payload = self._wait_for_human_action(
+                pid=pid,
+                action=action,
+                request_id=wait.request_id,
+                message=str(wait),
+                content_preview=content_preview,
+                tool_call_count=tool_call_count,
+                task_run_call_id=call_id,
+                task_run_wait_result=wait_result,
+                **tool_call_context,
+            )
+        elif isinstance(wait, ProcessWaitRequired):
+            pending_action = wait.resume_action or action
+            payload = self._wait_for_child_action(
+                pid=pid,
+                action=pending_action,
+                child_pid=wait.child_pid,
+                message=str(wait),
+                content_preview=content_preview,
+                tool_call_count=tool_call_count,
+                task_run_call_id=call_id,
+                task_run_wait_result=wait_result,
+                **tool_call_context,
+            )
+        else:
+            payload = self._wait_for_message_action(
+                pid=pid,
+                action=action,
+                filters=wait.filters,
+                message=str(wait),
+                content_preview=content_preview,
+                tool_call_count=tool_call_count,
+                task_run_call_id=call_id,
+                task_run_wait_result=wait_result,
+                **tool_call_context,
+            )
+        self._record_action_batch(
+            pid=pid,
+            actions=actions,
+            completed_actions=completed_actions,
+            completed_results=completed_results,
+            content_preview=content_preview,
+            tool_call_count=tool_call_count,
+            stop_reason=stop_reason,
+            pending_action=pending_action,
+        )
+        return self._with_parallel_batch_progress(
+            payload,
+            completed_actions,
+            completed_results,
+        )
+
+    def _settle_parallel_action_batch(
+        self,
+        *,
+        pid: str,
+        completion: Any,
+        actions: list[dict[str, Any]],
+        completed_actions: list[dict[str, Any]],
+        completed_results: list[dict[str, Any]],
+        content_preview: str,
+        tool_call_count: int,
+        stop_reason: str,
+        stopped_action: dict[str, Any] | None,
+        stopped_result: dict[str, Any] | None,
+        call_id: str,
+    ) -> dict[str, Any]:
         if stop_reason != "completed" and stop_reason != "interrupted_by_message":
             self._persist_unexecuted_parallel_tool_outputs(
                 pid=pid,
@@ -2235,13 +2739,21 @@ class LLMProcessExecutor:
             "executed_count": len(completed_actions),
             "stop_reason": stop_reason,
         }
-        return self._complete_action_batch_payload(
+        completed = self._complete_action_batch_payload(
             payload=payload,
             completed_actions=completed_actions,
             completed_results=completed_results,
             stopped_action=stopped_action,
             stopped_result=stopped_result,
         )
+        self._record_task_run_completed_transcript(
+            pid=pid,
+            call_id=call_id,
+            state="completed",
+            paired_outputs_persisted=True,
+            result=completed,
+        )
+        return completed
 
     @staticmethod
     def _complete_action_batch_payload(
@@ -2312,6 +2824,18 @@ class LLMProcessExecutor:
         payload["executed_count"] = len(completed_actions)
         return payload
 
+    @staticmethod
+    def _parallel_batch_wait_result(
+        completed_actions: list[dict[str, Any]],
+        completed_results: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "parallel_tool_calls": True,
+            "completed_actions": list(completed_actions),
+            "completed_results": list(completed_results),
+            "executed_count": len(completed_actions),
+        }
+
     def _process_is_terminal(self, pid: str) -> bool:
         return self._process.get(pid).status in {
             ProcessStatus.EXITED,
@@ -2331,7 +2855,13 @@ class LLMProcessExecutor:
         tool_call_id: str | None = None,
         tool_name: str | None = None,
         pending_metadata: dict[str, Any] | None = None,
+        task_run_call_id: str | None = None,
+        task_run_wait_result: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        selected_pending_metadata = self._pending_metadata_with_task_run_transcript(
+            pending_metadata,
+            task_run_call_id,
+        )
         resume_token = self._persist_pending_action(
             pid,
             wait_type="human",
@@ -2342,7 +2872,7 @@ class LLMProcessExecutor:
             response_id=response_id,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
-            pending_metadata=pending_metadata,
+            pending_metadata=selected_pending_metadata,
         )
         operation_context = self.pending.get(pid) or {}
         self.pending.remember(pid, "human", {
@@ -2356,7 +2886,7 @@ class LLMProcessExecutor:
             "response_id": response_id,
             "tool_call_id": tool_call_id,
             "tool_name": tool_name,
-            "pending_metadata": dict(pending_metadata or {}),
+            "pending_metadata": selected_pending_metadata,
         })
         self._audit.record(
             actor=pid,
@@ -2369,7 +2899,16 @@ class LLMProcessExecutor:
                 "tool_call_count": tool_call_count,
             },
         )
-        return {"ok": False, "waiting_human": True, "request_id": request_id}
+        payload = {"ok": False, "waiting_human": True, "request_id": request_id}
+        self._record_task_run_completed_transcript(
+            pid=pid,
+            call_id=task_run_call_id,
+            state="waiting",
+            paired_outputs_persisted=True,
+            result=task_run_wait_result,
+            durable_wait={"wait_type": "human", "request_id": request_id},
+        )
+        return payload
 
     def _wait_for_llm_release(
         self,
@@ -2522,7 +3061,13 @@ class LLMProcessExecutor:
         tool_call_id: str | None = None,
         tool_name: str | None = None,
         pending_metadata: dict[str, Any] | None = None,
+        task_run_call_id: str | None = None,
+        task_run_wait_result: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        selected_pending_metadata = self._pending_metadata_with_task_run_transcript(
+            pending_metadata,
+            task_run_call_id,
+        )
         resume_token = self._persist_pending_action(
             pid,
             wait_type="child",
@@ -2533,7 +3078,7 @@ class LLMProcessExecutor:
             response_id=response_id,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
-            pending_metadata=pending_metadata,
+            pending_metadata=selected_pending_metadata,
         )
         operation_context = self.pending.get(pid) or {}
         self.pending.remember(pid, "child", {
@@ -2547,7 +3092,7 @@ class LLMProcessExecutor:
             "response_id": response_id,
             "tool_call_id": tool_call_id,
             "tool_name": tool_name,
-            "pending_metadata": dict(pending_metadata or {}),
+            "pending_metadata": selected_pending_metadata,
         })
         self._audit.record(
             actor=pid,
@@ -2560,7 +3105,16 @@ class LLMProcessExecutor:
                 "tool_call_count": tool_call_count,
             },
         )
-        return {"ok": False, "waiting_event": True, "child_pid": child_pid}
+        payload = {"ok": False, "waiting_event": True, "child_pid": child_pid}
+        self._record_task_run_completed_transcript(
+            pid=pid,
+            call_id=task_run_call_id,
+            state="waiting",
+            paired_outputs_persisted=True,
+            result=task_run_wait_result,
+            durable_wait={"wait_type": "process", "child_pid": child_pid},
+        )
+        return payload
 
     def _wait_for_message_action(
         self,
@@ -2574,7 +3128,13 @@ class LLMProcessExecutor:
         tool_call_id: str | None = None,
         tool_name: str | None = None,
         pending_metadata: dict[str, Any] | None = None,
+        task_run_call_id: str | None = None,
+        task_run_wait_result: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        selected_pending_metadata = self._pending_metadata_with_task_run_transcript(
+            pending_metadata,
+            task_run_call_id,
+        )
         resume_token = self._persist_pending_action(
             pid,
             wait_type="message",
@@ -2585,7 +3145,7 @@ class LLMProcessExecutor:
             response_id=response_id,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
-            pending_metadata=pending_metadata,
+            pending_metadata=selected_pending_metadata,
         )
         operation_context = self.pending.get(pid) or {}
         self.pending.remember(pid, "message", {
@@ -2599,7 +3159,7 @@ class LLMProcessExecutor:
             "response_id": response_id,
             "tool_call_id": tool_call_id,
             "tool_name": tool_name,
-            "pending_metadata": dict(pending_metadata or {}),
+            "pending_metadata": selected_pending_metadata,
         })
         self._audit.record(
             actor=pid,
@@ -2612,7 +3172,16 @@ class LLMProcessExecutor:
                 "tool_call_count": tool_call_count,
             },
         )
-        return {"ok": False, "waiting_message": True, "filters": filters}
+        payload = {"ok": False, "waiting_message": True, "filters": filters}
+        self._record_task_run_completed_transcript(
+            pid=pid,
+            call_id=task_run_call_id,
+            state="waiting",
+            paired_outputs_persisted=True,
+            result=task_run_wait_result,
+            durable_wait={"wait_type": "message", "filters": dict(filters)},
+        )
+        return payload
 
     async def _resume_pending_human_action(self, pid: str) -> dict[str, Any]:
         pending = self.pending.require_memory(pid, "human")
@@ -2628,6 +3197,7 @@ class LLMProcessExecutor:
             return self._pending_action_resuming_result(pid)
         pending = claimed
         action = dict(pending["action"])
+        task_run_call_id = self._pending_task_run_call_id(pending)
         context_management_metadata = self._context_management_pending_metadata(pending)
         self.pending.forget_generation(pid, "human", resume_token)
         if request.status == HumanRequestStatus.APPROVED or (
@@ -2660,6 +3230,7 @@ class LLMProcessExecutor:
                     content_preview=str(pending.get("content_preview", "")),
                     tool_call_count=int(pending.get("tool_call_count", 0)),
                     pending_metadata=context_management_metadata or None,
+                    task_run_call_id=task_run_call_id,
                     **self._pending_tool_call_context(pending),
                 )
             except ProcessMessageWaitRequired as exc:
@@ -2671,6 +3242,7 @@ class LLMProcessExecutor:
                     content_preview=str(pending.get("content_preview", "")),
                     tool_call_count=int(pending.get("tool_call_count", 0)),
                     pending_metadata=context_management_metadata or None,
+                    task_run_call_id=task_run_call_id,
                     **self._pending_tool_call_context(pending),
                 )
             except ProcessWaitRequired as exc:
@@ -2682,6 +3254,7 @@ class LLMProcessExecutor:
                     content_preview=str(pending.get("content_preview", "")),
                     tool_call_count=int(pending.get("tool_call_count", 0)),
                     pending_metadata=context_management_metadata or None,
+                    task_run_call_id=task_run_call_id,
                     **self._pending_tool_call_context(pending),
                 )
             except Exception as exc:
@@ -2702,7 +3275,7 @@ class LLMProcessExecutor:
                     result=result,
                     metadata=context_management_metadata,
                 )
-            return self._completed_action_result(
+            completed = self._completed_action_result(
                 pid=pid,
                 action=action,
                 result=result,
@@ -2710,6 +3283,14 @@ class LLMProcessExecutor:
                 tool_call_count=int(pending.get("tool_call_count", 0)),
                 resumed_after_human=True,
             )
+            self._record_task_run_completed_transcript(
+                pid=pid,
+                call_id=task_run_call_id,
+                state="completed",
+                paired_outputs_persisted=True,
+                result=completed,
+            )
+            return completed
 
         error = f"human rejected approval request {request_id}"
         # A rejected per-use approval is surfaced as a failed action result, not
@@ -2728,7 +3309,7 @@ class LLMProcessExecutor:
                 result=result,
                 metadata=context_management_metadata,
             )
-        return self._completed_action_result(
+        completed = self._completed_action_result(
             pid=pid,
             action=action,
             result=result,
@@ -2736,6 +3317,14 @@ class LLMProcessExecutor:
             tool_call_count=int(pending.get("tool_call_count", 0)),
             resumed_after_human=True,
         )
+        self._record_task_run_completed_transcript(
+            pid=pid,
+            call_id=task_run_call_id,
+            state="completed",
+            paired_outputs_persisted=True,
+            result=completed,
+        )
+        return completed
 
     async def _resume_pending_llm_release_action(self, pid: str) -> dict[str, Any]:
         pending = self.pending.require_memory(pid, "llm_release")
@@ -2875,9 +3464,15 @@ class LLMProcessExecutor:
         self,
         pid: str,
         claimed: dict[str, Any],
-        completed_action: tuple[Any, list[dict[str, Any]], bool, bool],
+        completed_action: tuple[Any, list[dict[str, Any]], bool, bool, str],
     ) -> dict[str, Any]:
-        completion, actions, parallel_tool_calls, host_auto_wait = completed_action
+        (
+            completion,
+            actions,
+            parallel_tool_calls,
+            host_auto_wait,
+            call_id,
+        ) = completed_action
         self._clear_pending_action(pid, self._pending_resume_token(claimed))
         return await self._dispatch_completed_llm_action(
             pid=pid,
@@ -2886,6 +3481,7 @@ class LLMProcessExecutor:
             parallel_tool_calls=parallel_tool_calls,
             host_auto_wait=host_auto_wait,
             resumed_after_human=True,
+            call_id=call_id,
         )
 
     def _action_name(self, action: dict[str, Any]) -> str:
@@ -3010,6 +3606,22 @@ class LLMProcessExecutor:
     @staticmethod
     def _pending_resume_token(pending: dict[str, Any]) -> str:
         return pending_resume_token(pending)
+
+    @staticmethod
+    def _pending_metadata_with_task_run_transcript(
+        metadata: Mapping[str, Any] | None,
+        call_id: str | None,
+    ) -> dict[str, Any]:
+        selected = dict(metadata or {})
+        if call_id is not None:
+            if not isinstance(call_id, str) or not call_id:
+                raise RuntimeError("TaskRun pending transcript call id is invalid")
+            selected[PENDING_TASK_RUN_TRANSCRIPT_KEY] = call_id
+        return selected
+
+    @staticmethod
+    def _pending_task_run_call_id(pending: dict[str, Any]) -> str | None:
+        return pending_task_run_transcript_call_id(pending)
 
     @staticmethod
     def _pending_tool_call_context(pending: dict[str, Any]) -> dict[str, str | None]:
@@ -3435,6 +4047,7 @@ class LLMProcessExecutor:
             return self._pending_action_resuming_result(pid)
         pending = claimed
         action = dict(pending["action"])
+        task_run_call_id = self._pending_task_run_call_id(pending)
         context_management_metadata = self._context_management_pending_metadata(
             pending
         )
@@ -3464,6 +4077,7 @@ class LLMProcessExecutor:
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
                 pending_metadata=context_management_metadata or None,
+                task_run_call_id=task_run_call_id,
                 **self._pending_tool_call_context(pending),
             )
         except HumanApprovalRequired as exc:
@@ -3475,6 +4089,7 @@ class LLMProcessExecutor:
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
                 pending_metadata=context_management_metadata or None,
+                task_run_call_id=task_run_call_id,
                 **self._pending_tool_call_context(pending),
             )
         except ProcessMessageWaitRequired as exc:
@@ -3486,6 +4101,7 @@ class LLMProcessExecutor:
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
                 pending_metadata=context_management_metadata or None,
+                task_run_call_id=task_run_call_id,
                 **self._pending_tool_call_context(pending),
             )
         except Exception as exc:
@@ -3506,7 +4122,7 @@ class LLMProcessExecutor:
                 result=result,
                 metadata=context_management_metadata,
             )
-        return self._completed_action_result(
+        completed = self._completed_action_result(
             pid=pid,
             action=action,
             result=result,
@@ -3514,6 +4130,14 @@ class LLMProcessExecutor:
             tool_call_count=int(pending.get("tool_call_count", 0)),
             resumed_after_human=False,
         )
+        self._record_task_run_completed_transcript(
+            pid=pid,
+            call_id=task_run_call_id,
+            state="completed",
+            paired_outputs_persisted=True,
+            result=completed,
+        )
+        return completed
 
     async def _resume_pending_message_action(self, pid: str) -> dict[str, Any]:
         pending = self.pending.require_memory(pid, "message")
@@ -3536,6 +4160,7 @@ class LLMProcessExecutor:
             return self._pending_action_resuming_result(pid)
         pending = claimed
         action = dict(pending["action"])
+        task_run_call_id = self._pending_task_run_call_id(pending)
         context_management_metadata = self._context_management_pending_metadata(
             pending
         )
@@ -3568,6 +4193,7 @@ class LLMProcessExecutor:
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
                 pending_metadata=pending_action_metadata or None,
+                task_run_call_id=task_run_call_id,
                 **self._pending_tool_call_context(pending),
             )
         except ProcessWaitRequired as exc:
@@ -3579,6 +4205,7 @@ class LLMProcessExecutor:
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
                 pending_metadata=pending_action_metadata or None,
+                task_run_call_id=task_run_call_id,
                 **self._pending_tool_call_context(pending),
             )
         except HumanApprovalRequired as exc:
@@ -3590,6 +4217,7 @@ class LLMProcessExecutor:
                 content_preview=str(pending.get("content_preview", "")),
                 tool_call_count=int(pending.get("tool_call_count", 0)),
                 pending_metadata=pending_action_metadata or None,
+                task_run_call_id=task_run_call_id,
                 **self._pending_tool_call_context(pending),
             )
         except Exception as exc:
@@ -3622,6 +4250,13 @@ class LLMProcessExecutor:
                 if host_auto_wait_metadata
                 else None
             ),
+        )
+        self._record_task_run_completed_transcript(
+            pid=pid,
+            call_id=task_run_call_id,
+            state="completed",
+            paired_outputs_persisted=True,
+            result=completed,
         )
         return completed
 
@@ -3691,8 +4326,9 @@ class LLMProcessExecutor:
         max_attempts: int | None = None,
         response_scope_fingerprint: str | None = None,
         image_only_anchor: Mapping[str, str] | None = None,
+        task_run_requirement_binding: Mapping[str, Any] | None = None,
         _prepared_request: dict[str, Any] | None = None,
-    ) -> tuple[Any, list[dict[str, Any]], bool, bool]:
+    ) -> tuple[Any, list[dict[str, Any]], bool, bool, str]:
         attempt_messages = list(
             (_prepared_request or {}).get("attempt_messages") or messages
         )
@@ -3708,6 +4344,7 @@ class LLMProcessExecutor:
                     auto_wait_on_empty_tool_calls,
                     fallback_json_actions,
                     profile_id,
+                    call_id,
                 ) = await self._complete_action_recorded(
                     pid=pid,
                     messages=attempt_messages,
@@ -3716,6 +4353,7 @@ class LLMProcessExecutor:
                     max_attempts=selected_max_attempts,
                     response_scope_fingerprint=response_scope_fingerprint,
                     image_only_anchor=image_only_anchor,
+                    task_run_requirement_binding=task_run_requirement_binding,
                     _prepared_request=prepared_request,
                 )
             except _LLMReleaseApprovalRequired as exc:
@@ -3766,7 +4404,21 @@ class LLMProcessExecutor:
                     pid=pid,
                     completion=completion,
                 )
-                return completion, actions, parallel_tool_calls, auto_wait_used
+                self._publish_and_claim_task_run_validated_action(
+                    pid=pid,
+                    call_id=call_id,
+                    actions=actions,
+                    parallel_tool_calls=parallel_tool_calls,
+                    host_auto_wait=auto_wait_used,
+                    tool_call_count=len(completion.tool_calls),
+                )
+                return (
+                    completion,
+                    actions,
+                    parallel_tool_calls,
+                    auto_wait_used,
+                    call_id,
+                )
             except ValueError as exc:
                 last_error = exc
                 self._audit.record(
@@ -3808,8 +4460,241 @@ class LLMProcessExecutor:
         assert last_error is not None
         raise last_error
 
+    async def _complete_valid_action_with_control_boundary(
+        self,
+        pid: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        response_scope_fingerprint: str | None,
+        image_only_anchor: Mapping[str, str] | None,
+        task_run_requirement_binding: Mapping[str, Any] | None,
+    ) -> tuple[Any, list[dict[str, Any]], bool, bool, str]:
+        """Map a persisted control fence onto the existing handled boundary."""
+
+        try:
+            return await self._complete_valid_action(
+                pid,
+                messages,
+                tools,
+                response_scope_fingerprint=response_scope_fingerprint,
+                image_only_anchor=image_only_anchor,
+                task_run_requirement_binding=task_run_requirement_binding,
+            )
+        except TaskRunDispatchDeferred as exc:
+            raise _ContextManagementHandled(
+                {
+                    "ok": False,
+                    "skipped": True,
+                    "task_run_control_deferred": True,
+                }
+            ) from exc
+
     def _preflight_parallel_tool_batch(self, pid: str, actions: list[dict[str, Any]]) -> None:
         self.actions.preflight_parallel(pid, actions)
+
+    def _record_task_run_validated_transcript(
+        self,
+        *,
+        pid: str,
+        call_id: str,
+        actions: list[dict[str, Any]],
+        parallel_tool_calls: bool,
+        host_auto_wait: bool,
+        tool_call_count: int,
+    ) -> dict[str, Any] | None:
+        """Publish a local-only resume point after complete action validation."""
+
+        if self._task_runs is None:
+            return None
+        record = self._processes.get_llm_call(call_id)
+        if record is None or record.status != "ok" or not record.completed_at:
+            raise RuntimeError(
+                "validated TaskRun transcript is missing from the local LLM ledger"
+            )
+        try:
+            manifest = validated_action_manifest(
+                actions,
+                call_id=call_id,
+                parallel_tool_calls=parallel_tool_calls,
+                host_auto_wait=host_auto_wait,
+                tool_call_count=tool_call_count,
+                data_labels=self._data_flow.current_context().labels.to_dict(),
+            )
+            self._task_runs.record_validated_transcript(
+                pid=pid,
+                call_id=call_id,
+                action_manifest=manifest,
+                context_generation=self._processes.get_llm_context_generation(pid),
+            )
+        except Exception as exc:
+            # A resume-point persistence conflict is a Runtime failure, not a
+            # malformed model action.  In particular, never enter action repair
+            # and issue another Provider call after the validated completion.
+            raise RuntimeError(
+                "failed to persist validated TaskRun LLM transcript"
+            ) from exc
+        return manifest
+
+    def _publish_and_claim_task_run_validated_action(
+        self,
+        *,
+        pid: str,
+        call_id: str,
+        actions: list[dict[str, Any]],
+        parallel_tool_calls: bool,
+        host_auto_wait: bool,
+        tool_call_count: int,
+    ) -> None:
+        expected = self._record_task_run_validated_transcript(
+            pid=pid,
+            call_id=call_id,
+            actions=actions,
+            parallel_tool_calls=parallel_tool_calls,
+            host_auto_wait=host_auto_wait,
+            tool_call_count=tool_call_count,
+        )
+        process = self._processes.get_process(pid)
+        is_durable_run = (
+            process is not None
+            and getattr(process, "task_run_id", None) is not None
+        )
+        if expected is None or not is_durable_run:
+            return
+        claimed = self._pending_task_run_validated_action(pid)
+        if claimed is None or dumps(claimed) != dumps(expected):
+            raise RuntimeError(
+                "durable TaskRun action claim changed its validated manifest"
+            )
+
+    def _record_task_run_completed_transcript(
+        self,
+        *,
+        pid: str,
+        call_id: str | None,
+        state: str,
+        paired_outputs_persisted: bool,
+        result: Mapping[str, Any] | None = None,
+        durable_wait: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Publish a safe point only after a local result or wait is durable."""
+
+        if self._task_runs is None or call_id is None:
+            return
+        record = self._processes.get_llm_call(call_id)
+        if record is None or record.status != "ok" or not record.completed_at:
+            raise RuntimeError(
+                "completed TaskRun transcript is missing from the local LLM ledger"
+            )
+        try:
+            data_labels = self._task_run_outcome_data_labels(pid, result)
+            outcome_manifest = completed_outcome_manifest(
+                state=state,
+                paired_outputs_persisted=paired_outputs_persisted,
+                data_labels=data_labels,
+                result=result,
+                durable_wait=durable_wait,
+            )
+            stage_completed = getattr(
+                self._task_runs,
+                "stage_completed_transcript",
+                None,
+            )
+            if callable(stage_completed):
+                stage_completed(
+                    pid=pid,
+                    call_id=call_id,
+                    outcome_manifest=outcome_manifest,
+                    context_generation=(
+                        self._processes.get_llm_context_generation(pid)
+                    ),
+                )
+            elif self._task_runs.prompt_context_for_pid(pid) is not None:
+                raise RuntimeError(
+                    "durable TaskRun completed-outcome staging is unavailable"
+                )
+            self._task_runs.record_completed_transcript(
+                pid=pid,
+                call_id=call_id,
+                outcome_manifest=outcome_manifest,
+                context_generation=self._processes.get_llm_context_generation(pid),
+            )
+        except Exception as exc:
+            # Never continue the process after losing the local safe-point
+            # commit. The Provider completion must not be replayed merely to
+            # make the TaskRun projection look complete.
+            raise RuntimeError(
+                "failed to persist completed TaskRun LLM transcript"
+            ) from exc
+
+    def _task_run_outcome_data_labels(
+        self,
+        pid: str,
+        result: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Bind copied result/wait content to every locally known label."""
+
+        contexts = [self._data_flow.current_context()]
+        pending = self.pending.get(pid)
+        if pending is not None:
+            raw_context = pending.get("data_flow_context")
+            if not isinstance(raw_context, dict):
+                raise RuntimeError(
+                    "durable pending TaskRun action lacks data-flow labels"
+                )
+            try:
+                contexts.append(DataFlowContext.from_dict(raw_context))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "durable pending TaskRun action has invalid data-flow labels"
+                ) from exc
+        result_oids = self._task_run_result_oids(result)
+        for result_oid in result_oids:
+            # Settlement is a trusted Runtime projection, not a new process
+            # read.  A one-shot object capability may already have been
+            # consumed by the Tool (or the process may have exited), so using
+            # the public data-flow read path here would incorrectly deny the
+            # transcript commit after the effect completed.  Read only the
+            # persisted metadata and fail closed if the referenced result is
+            # no longer labelable.
+            metadata = self._objects.get_persisted_object_metadata(result_oid)
+            if metadata is None:
+                raise RuntimeError(
+                    "TaskRun result Object metadata is unavailable for labeling"
+                )
+            contexts.append(
+                DataFlowContext(
+                    labels=DataLabels.from_object_metadata(metadata),
+                )
+            )
+        return DataFlowContext.aggregate(contexts).labels.to_dict()
+
+    @staticmethod
+    def _task_run_result_oids(
+        result: Mapping[str, Any] | None,
+    ) -> tuple[str, ...]:
+        if result is None:
+            return ()
+        stack: list[Any] = [result]
+        selected: set[str] = set()
+        visited = 0
+        while stack:
+            current = stack.pop()
+            visited += 1
+            if visited > 4_096:
+                raise RuntimeError("TaskRun result projection is too deeply nested")
+            if isinstance(current, Mapping):
+                result_oid = current.get("result_oid")
+                if isinstance(result_oid, str) and result_oid:
+                    selected.add(result_oid)
+                    if len(selected) > 256:
+                        raise RuntimeError(
+                            "TaskRun result projection contains too many Object ids"
+                        )
+                stack.extend(current.values())
+            elif isinstance(current, (list, tuple)):
+                stack.extend(current)
+        return tuple(sorted(selected))
 
     def _validate_dispatchable_action(self, pid: str, action: dict[str, Any]) -> None:
         self.actions.validate(pid, action)
@@ -3917,10 +4802,11 @@ class LLMProcessExecutor:
         max_attempts: int,
         response_scope_fingerprint: str | None = None,
         image_only_anchor: Mapping[str, str] | None = None,
+        task_run_requirement_binding: Mapping[str, Any] | None = None,
         _force_stateless: bool = False,
         _chain_scope_retry: int = 0,
         _prepared_request: dict[str, Any] | None = None,
-    ) -> tuple[Any, bool, bool, bool, str]:
+    ) -> tuple[Any, bool, bool, bool, str, str]:
         state = self._initialize_llm_call_state(
             pid=pid,
             messages=messages,
@@ -3929,48 +4815,64 @@ class LLMProcessExecutor:
             max_attempts=max_attempts,
             prepared_request=_prepared_request,
             image_only_anchor=image_only_anchor,
+            task_run_requirement_binding=task_run_requirement_binding,
         )
-        try:
-            if _prepared_request is None:
-                await self._prepare_fresh_llm_request(
-                    state,
-                    response_scope_fingerprint=response_scope_fingerprint,
-                    force_stateless=_force_stateless,
+        # Admission is serialized with persisted pause/interrupt generation.
+        # Once admitted, the scope stays active through local LLM-call
+        # persistence so a concurrent controller can drain it without taking
+        # over the process execution lease.
+        with self._task_run_dispatch_scope(pid, "provider"):
+            try:
+                if _prepared_request is None:
+                    await self._prepare_fresh_llm_request(
+                        state,
+                        response_scope_fingerprint=response_scope_fingerprint,
+                        force_stateless=_force_stateless,
+                    )
+                else:
+                    self._prepare_resumed_llm_request(state, _prepared_request)
+                self._assert_task_run_request_scope_current(
+                    state.pid,
+                    response_scope_fingerprint,
                 )
-            else:
-                self._prepare_resumed_llm_request(state, _prepared_request)
-            completion = await self._invoke_prepared_llm_request(state)
-        except _ContextManagementHandled:
-            # No Provider request was attempted, so do not charge or persist a
-            # synthetic failed LLM call for host-side maintenance/waiting.
-            raise
-        except HumanApprovalRequired as exc:
-            if not state.prepared:
+                completion = await self._invoke_prepared_llm_request(state)
+                self._assert_task_run_request_scope_current(
+                    state.pid,
+                    response_scope_fingerprint,
+                    settlement=True,
+                )
+            except _ContextManagementHandled:
+                # No Provider request was attempted, so do not charge or persist a
+                # synthetic failed LLM call for host-side maintenance/waiting.
                 raise
-            prepared = self._build_llm_release_request(
-                state,
-                previous=_prepared_request,
-                response_scope_fingerprint=response_scope_fingerprint,
-            )
-            raise _LLMReleaseApprovalRequired(exc, prepared) from exc
-        except _LLMProviderChainScopeChanged:
-            if _chain_scope_retry >= 1:
+            except HumanApprovalRequired as exc:
+                if not state.prepared:
+                    raise
+                prepared = self._build_llm_release_request(
+                    state,
+                    previous=_prepared_request,
+                    response_scope_fingerprint=response_scope_fingerprint,
+                )
+                raise _LLMReleaseApprovalRequired(exc, prepared) from exc
+            except _LLMProviderChainScopeChanged:
+                if _chain_scope_retry >= 1:
+                    raise
+                return await self._complete_action_recorded(
+                    pid=pid,
+                    messages=messages,
+                    tools=state.tools,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    response_scope_fingerprint=response_scope_fingerprint,
+                    image_only_anchor=image_only_anchor,
+                    task_run_requirement_binding=task_run_requirement_binding,
+                    _force_stateless=True,
+                    _chain_scope_retry=_chain_scope_retry + 1,
+                )
+            except Exception as exc:
+                self._record_llm_call_error(state, exc)
                 raise
-            return await self._complete_action_recorded(
-                pid=pid,
-                messages=messages,
-                tools=state.tools,
-                attempt=attempt,
-                max_attempts=max_attempts,
-                response_scope_fingerprint=response_scope_fingerprint,
-                image_only_anchor=image_only_anchor,
-                _force_stateless=True,
-                _chain_scope_retry=_chain_scope_retry + 1,
-            )
-        except Exception as exc:
-            self._record_llm_call_error(state, exc)
-            raise
-        return self._record_llm_call_success(state, completion)
+            return self._record_llm_call_success(state, completion)
 
     def _initialize_llm_call_state(
         self,
@@ -3982,6 +4884,7 @@ class LLMProcessExecutor:
         max_attempts: int,
         prepared_request: dict[str, Any] | None,
         image_only_anchor: Mapping[str, str] | None,
+        task_run_requirement_binding: Mapping[str, Any] | None,
     ) -> _LLMCallState:
         process = self._process.get(pid)
         if prepared_request is None:
@@ -4001,6 +4904,10 @@ class LLMProcessExecutor:
                     **frozen_anchor,
                     "purpose": self._image_only_request_purpose(frozen_anchor),
                 }
+            if task_run_requirement_binding is not None:
+                request_options[_TASK_RUN_REQUIREMENT_BINDING_KEY] = json.loads(
+                    dumps(dict(task_run_requirement_binding))
+                )
             return _LLMCallState(
                 pid=pid,
                 process=process,
@@ -5345,6 +6252,7 @@ class LLMProcessExecutor:
             state.auto_wait_on_empty_tool_calls,
             state.fallback_json_actions,
             str(state.request_options["llm_profile_id"]),
+            state.call_id,
         )
 
     def _supersede_image_only_request_anchor(
@@ -6028,9 +6936,9 @@ class LLMProcessExecutor:
         *,
         pid: str,
         process: Any,
-        context: Any,
         tools: list[dict[str, Any]],
         available_skills: list[dict[str, Any]] | None = None,
+        task_run_settlement: bool = False,
     ) -> str:
         context_scope = self._context_scope_for_previous_response(pid)
         material = {
@@ -6041,8 +6949,58 @@ class LLMProcessExecutor:
             "context_scope": context_scope,
             "tools": to_jsonable(tools),
             "available_skills": to_jsonable(available_skills or []),
+            "task_run_binding_sha256": (
+                self._task_run_settlement_binding_hash(pid)
+                if task_run_settlement
+                else self._task_run_request_binding_hash(pid)
+            ),
         }
         return hashlib.sha256(dumps(material).encode("utf-8")).hexdigest()
+
+    def _current_responses_state_scope_fingerprint(
+        self,
+        pid: str,
+        *,
+        settlement: bool = False,
+    ) -> str:
+        process = self._processes.get_process(pid)
+        if process is None:
+            raise ValidationError(f"LLM request process does not exist: {pid}")
+        prompt_process = replace(
+            process,
+            tool_table=self._tools.model_tool_table(pid),
+            loaded_skills=self._tools.model_loaded_skills(pid),
+        )
+        return self._responses_state_scope_fingerprint(
+            pid=pid,
+            process=prompt_process,
+            tools=self._tools.openai_tool_schemas(pid),
+            available_skills=[],
+            task_run_settlement=settlement,
+        )
+
+    def _assert_task_run_request_scope_current(
+        self,
+        pid: str,
+        expected_scope_fingerprint: str | None,
+        *,
+        settlement: bool = False,
+    ) -> None:
+        process = self._processes.get_process(pid)
+        if process is None or getattr(process, "task_run_id", None) is None:
+            return
+        current = self._current_responses_state_scope_fingerprint(
+            pid,
+            settlement=settlement,
+        )
+        if (
+            not isinstance(expected_scope_fingerprint, str)
+            or not hmac.compare_digest(current, expected_scope_fingerprint)
+        ):
+            self._mark_task_run_request_scope_drift(pid)
+            raise ValidationError(
+                "durable TaskRun LLM request binding changed before action commit"
+            )
 
     def _context_scope_for_previous_response(self, pid: str) -> dict[str, Any]:
         return {
@@ -6095,6 +7053,7 @@ class LLMProcessExecutor:
             pid,
             action,
             context_metadata=context_metadata,
+            expected_tool_id=self._task_run_expected_tool_id(pid, action),
         )
 
     async def adispatch(
@@ -6108,6 +7067,7 @@ class LLMProcessExecutor:
             pid,
             action,
             context_metadata=context_metadata,
+            expected_tool_id=self._task_run_expected_tool_id(pid, action),
         )
 
     async def _adispatch_selected_action(
@@ -6131,6 +7091,7 @@ class LLMProcessExecutor:
                 **(context_metadata or {}),
                 "llm_action_source": "host_empty_tool_calls_auto_wait",
             },
+            expected_tool_id=self._task_run_expected_tool_id(pid, action),
         )
 
     def _notify_interrupt_messages(self, pid: str) -> dict[str, Any] | None:
@@ -6147,7 +7108,19 @@ class LLMProcessExecutor:
         pid: str,
         tool_name: str,
         tool_args: dict[str, Any],
+        context_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
+        if self._is_exact_resuming_ask_human(
+            pid,
+            tool_name,
+            tool_args,
+            context_metadata,
+        ):
+            # The Human provider has already presented this exact question and
+            # durably recorded its answer.  Returning that answer settles the
+            # admitted wait; it is not a new model-selected dispatch.  Keep the
+            # interrupt unread so the next quantum must still handle it.
+            return None
         if tool_name in {"read_process_messages", "receive_process_messages"}:
             return None
         if tool_name == "discover_skills":
@@ -6187,6 +7160,41 @@ class LLMProcessExecutor:
             "interrupted_by_message": True,
             "message_notice": notice,
         }
+
+    def _is_exact_resuming_ask_human(
+        self,
+        pid: str,
+        tool_name: str,
+        tool_args: Mapping[str, Any],
+        context_metadata: Mapping[str, Any] | None,
+    ) -> bool:
+        """Prove that dispatch only returns one already-recorded Human answer."""
+
+        if tool_name != "ask_human" or not isinstance(context_metadata, Mapping):
+            return False
+        request_id = context_metadata.get("human_resume_request_id")
+        if not isinstance(request_id, str) or not request_id:
+            return False
+        pending = self.pending.get(pid)
+        if not isinstance(pending, Mapping):
+            return False
+        expected_action = {"action": tool_name, **dict(tool_args)}
+        if not (
+            pending.get("pid") == pid
+            and pending.get("wait_type") == "human"
+            and pending.get("status") == "resuming"
+            and pending.get("request_id") == request_id
+            and pending.get("action") == expected_action
+        ):
+            return False
+        try:
+            request = self._human.get(request_id)
+        except Exception:
+            return False
+        return bool(
+            request.pid == pid
+            and request.status is HumanRequestStatus.APPROVED
+        )
 
     def _notify_normal_messages(self, pid: str) -> dict[str, Any] | None:
         return self._messages.notice(
@@ -6296,7 +7304,8 @@ class LLMProcessExecutor:
         self.pending.hydrate(pending)
 
     def _load_pending_actions(self) -> None:
-        for pending in self.pending.list(status="resuming"):
+        pending_by_status = self._validated_pending_actions_for_startup()
+        for pending in pending_by_status["resuming"]:
             pid = str(pending["pid"])
             process = self._processes.get_process(pid)
             if process is not None and process.status not in {
@@ -6319,7 +7328,7 @@ class LLMProcessExecutor:
                     "replayed": False,
                 },
             )
-        for pending in self.pending.list(status="pending"):
+        for pending in pending_by_status["pending"]:
             action = dict(pending.get("action") or {})
             if (
                 pending.get("wait_type") == "llm_release"
@@ -6359,6 +7368,173 @@ class LLMProcessExecutor:
                 self._fail_interrupted_pending_resume(pid, claimed, error)
                 continue
             self._hydrate_pending_action(pending)
+
+    def _validated_pending_actions_for_startup(
+        self,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Decode startup rows individually so corrupt Runs can fail in place.
+
+        TaskRun recovery owns projection of a corrupt Run-local resume bundle to
+        ``needs_attention``.  Ordinary process resume state has no such
+        isolation boundary, so corruption there remains fatal.  In either
+        case this routing pass never exposes the corrupt payload to the audit
+        log or hydrates it into executor memory.
+        """
+
+        selected: dict[str, list[dict[str, Any]]] = {
+            "pending": [],
+            "resuming": [],
+        }
+        cursor: str | None = None
+        while True:
+            records, next_cursor = self._pending_action_validation_page(cursor)
+            last_pid = cursor
+            for record in records:
+                identity = self._pending_action_validation_identity(
+                    record,
+                    after_pid=last_pid,
+                )
+                pid, status, task_run_id, decode_valid, error_code = identity
+                last_pid = pid
+                routed = self._route_pending_action_validation_identity(
+                    pid=pid,
+                    status=status,
+                    task_run_id=task_run_id,
+                    decode_valid=decode_valid,
+                    error_code=error_code,
+                )
+                if routed is not None:
+                    selected[status].append(routed)
+
+            if next_cursor is None:
+                break
+            if not records or next_cursor != last_pid or next_cursor == cursor:
+                raise ValidationError(
+                    "persisted pending LLM action validation projection is invalid"
+                )
+            cursor = next_cursor
+        return selected
+
+    def _pending_action_validation_page(
+        self,
+        cursor: str | None,
+    ) -> tuple[list[Any] | tuple[Any, ...], str | None]:
+        page = self._processes.list_llm_pending_action_validation_rows(
+            after_pid=cursor,
+            limit=self.config.task_runs.recovery_page_size,
+        )
+        expected_keys = {"records", "next_cursor", "schema_version"}
+        if not isinstance(page, Mapping) or set(page) != expected_keys:
+            self._invalid_pending_action_validation_projection()
+        if type(page["schema_version"]) is not int or page["schema_version"] != 1:
+            self._invalid_pending_action_validation_projection()
+        records = page["records"]
+        next_cursor = page["next_cursor"]
+        if not isinstance(records, (list, tuple)):
+            self._invalid_pending_action_validation_projection()
+        if next_cursor is not None and (
+            not isinstance(next_cursor, str) or not next_cursor
+        ):
+            self._invalid_pending_action_validation_projection()
+        return records, next_cursor
+
+    def _pending_action_validation_identity(
+        self,
+        record: Any,
+        *,
+        after_pid: str | None,
+    ) -> tuple[str, str, str | None, bool, str | None]:
+        expected_keys = {
+            "pid",
+            "status",
+            "task_run_id",
+            "decode_valid",
+            "error_code",
+        }
+        if not isinstance(record, Mapping) or set(record) != expected_keys:
+            self._invalid_pending_action_validation_projection()
+        pid = record["pid"]
+        status = record["status"]
+        task_run_id = record["task_run_id"]
+        decode_valid = record["decode_valid"]
+        error_code = record["error_code"]
+        valid_identity = (
+            isinstance(pid, str)
+            and bool(pid)
+            and (after_pid is None or pid > after_pid)
+            and isinstance(status, str)
+            and (
+                task_run_id is None
+                or (isinstance(task_run_id, str) and bool(task_run_id))
+            )
+            and type(decode_valid) is bool
+            and (
+                error_code is None
+                or (isinstance(error_code, str) and bool(error_code))
+            )
+        )
+        if not valid_identity:
+            self._invalid_pending_action_validation_projection()
+        return pid, status, task_run_id, decode_valid, error_code
+
+    def _route_pending_action_validation_identity(
+        self,
+        *,
+        pid: str,
+        status: str,
+        task_run_id: str | None,
+        decode_valid: bool,
+        error_code: str | None,
+    ) -> dict[str, Any] | None:
+        if not decode_valid:
+            return self._defer_corrupt_task_run_pending_action(
+                pid=pid,
+                status=status,
+                task_run_id=task_run_id,
+                error_code=error_code,
+            )
+        if status not in {"pending", "resuming", "completed"} or error_code is not None:
+            self._invalid_pending_action_validation_projection()
+        if status == "completed":
+            return None
+        pending = self.pending.get(pid)
+        if (
+            pending is None
+            or pending.get("pid") != pid
+            or pending.get("status") != status
+        ):
+            raise ValidationError("invalid persisted pending LLM action")
+        return pending
+
+    def _defer_corrupt_task_run_pending_action(
+        self,
+        *,
+        pid: str,
+        status: str,
+        task_run_id: str | None,
+        error_code: str | None,
+    ) -> None:
+        if status != "invalid" or error_code is None:
+            self._invalid_pending_action_validation_projection()
+        if task_run_id is None:
+            raise ValidationError("invalid persisted pending LLM action")
+        self._audit.record(
+            actor="llm.executor",
+            action="llm.pending_action_corrupt_deferred_to_task_run",
+            target=f"process:{pid}",
+            decision={
+                "task_run_id": task_run_id,
+                "error_code": error_code,
+                "hydrated": False,
+            },
+        )
+        return None
+
+    @staticmethod
+    def _invalid_pending_action_validation_projection() -> None:
+        raise ValidationError(
+            "persisted pending LLM action validation projection is invalid"
+        )
 
     def _restore_pending_compaction_child_goal(self, pending: dict[str, Any]) -> None:
         try:

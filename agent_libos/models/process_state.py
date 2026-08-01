@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 import json
 import math
+import re
 from typing import Any, ClassVar, Mapping, TypeAlias
 
 from agent_libos.models.exceptions import ValidationError
@@ -22,6 +23,36 @@ def _optional_string(value: Any, field_name: str) -> str | None:
     if value is None:
         return None
     return _non_empty_string(value, field_name)
+
+
+def _nonnegative_integer(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValidationError(
+            f"process state {field_name} must be a non-negative integer"
+        )
+    return value
+
+
+def _positive_integer(value: Any, field_name: str) -> int:
+    selected = _nonnegative_integer(value, field_name)
+    if selected == 0:
+        raise ValidationError(f"process state {field_name} must be positive")
+    return selected
+
+
+def _sha256(value: Any, field_name: str) -> str:
+    selected = _non_empty_string(value, field_name)
+    if re.fullmatch(r"[0-9a-f]{64}", selected) is None:
+        raise ValidationError(
+            f"process state {field_name} must be a canonical SHA-256"
+        )
+    return selected
+
+
+def _optional_sha256(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _sha256(value, field_name)
 
 
 def _canonical_mapping(
@@ -223,6 +254,71 @@ class HostResumeProcessWait:
         object.__setattr__(self, "reason_oid", _non_empty_string(self.reason_oid, "reason_oid"))
 
 
+@dataclass(frozen=True, slots=True)
+class StaleExecutionProcessWait:
+    """Store-only receipt for one fenced stale-execution takeover.
+
+    Execution owner and lease identities are retained only as canonical hashes:
+    the compatibility/API projection must never expose a former worker token.
+    TaskRun safe-point and binding evidence deliberately remain in their
+    authoritative tables instead of being copied into this receipt.
+    """
+
+    kind: ClassVar[str] = "stale_execution"
+    pid: str
+    recovered_by_owner_sha256: str
+    prior_owner_sha256: str | None
+    prior_lease_sha256: str | None
+    prior_execution_generation: int
+    recovered_execution_generation: int
+    recovered_state_generation: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pid", _non_empty_string(self.pid, "pid"))
+        object.__setattr__(
+            self,
+            "recovered_by_owner_sha256",
+            _sha256(
+                self.recovered_by_owner_sha256,
+                "recovered_by_owner_sha256",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "prior_owner_sha256",
+            _optional_sha256(self.prior_owner_sha256, "prior_owner_sha256"),
+        )
+        object.__setattr__(
+            self,
+            "prior_lease_sha256",
+            _optional_sha256(self.prior_lease_sha256, "prior_lease_sha256"),
+        )
+        object.__setattr__(
+            self,
+            "prior_execution_generation",
+            _nonnegative_integer(
+                self.prior_execution_generation,
+                "prior_execution_generation",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "recovered_execution_generation",
+            _positive_integer(
+                self.recovered_execution_generation,
+                "recovered_execution_generation",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "recovered_state_generation",
+            _positive_integer(
+                self.recovered_state_generation,
+                "recovered_state_generation",
+            ),
+        )
+
+
 ProcessWaitState: TypeAlias = (
     ChildProcessWait
     | MessageProcessWait
@@ -230,6 +326,7 @@ ProcessWaitState: TypeAlias = (
     | ToolProcessWait
     | PausedProcessWait
     | HostResumeProcessWait
+    | StaleExecutionProcessWait
 )
 
 
@@ -287,7 +384,10 @@ def validate_process_state_fields(
         if not isinstance(wait_state, ToolProcessWait):
             raise ValidationError("waiting_tool requires a tool process wait state")
     elif selected_status == "paused":
-        if not isinstance(wait_state, (PausedProcessWait, HostResumeProcessWait)):
+        if not isinstance(
+            wait_state,
+            (PausedProcessWait, HostResumeProcessWait, StaleExecutionProcessWait),
+        ):
             raise ValidationError("paused requires a paused process wait state")
     elif wait_state is not None:
         raise ValidationError(f"{selected_status} processes cannot carry a wait state")
@@ -320,6 +420,16 @@ def process_wait_state_to_mapping(value: ProcessWaitState | None) -> dict[str, A
         fields = {"operation_id": value.operation_id}
     elif isinstance(value, (PausedProcessWait, HostResumeProcessWait)):
         fields = {"reason_oid": value.reason_oid}
+    elif isinstance(value, StaleExecutionProcessWait):
+        fields = {
+            "pid": value.pid,
+            "recovered_by_owner_sha256": value.recovered_by_owner_sha256,
+            "prior_owner_sha256": value.prior_owner_sha256,
+            "prior_lease_sha256": value.prior_lease_sha256,
+            "prior_execution_generation": value.prior_execution_generation,
+            "recovered_execution_generation": value.recovered_execution_generation,
+            "recovered_state_generation": value.recovered_state_generation,
+        }
     else:  # pragma: no cover - a defensive boundary for dynamically supplied values
         raise ValidationError(f"unsupported process wait state: {type(value).__name__}")
     return {
@@ -359,6 +469,33 @@ def process_wait_state_from_mapping(value: Mapping[str, Any] | None) -> ProcessW
     if kind == HostResumeProcessWait.kind:
         selected = _canonical_mapping(value, kind=kind, fields=frozenset({"reason_oid"}))
         return HostResumeProcessWait(reason_oid=selected["reason_oid"])
+    if kind == StaleExecutionProcessWait.kind:
+        selected = _canonical_mapping(
+            value,
+            kind=kind,
+            fields=frozenset(
+                {
+                    "pid",
+                    "recovered_by_owner_sha256",
+                    "prior_owner_sha256",
+                    "prior_lease_sha256",
+                    "prior_execution_generation",
+                    "recovered_execution_generation",
+                    "recovered_state_generation",
+                }
+            ),
+        )
+        return StaleExecutionProcessWait(
+            pid=selected["pid"],
+            recovered_by_owner_sha256=selected["recovered_by_owner_sha256"],
+            prior_owner_sha256=selected["prior_owner_sha256"],
+            prior_lease_sha256=selected["prior_lease_sha256"],
+            prior_execution_generation=selected["prior_execution_generation"],
+            recovered_execution_generation=selected[
+                "recovered_execution_generation"
+            ],
+            recovered_state_generation=selected["recovered_state_generation"],
+        )
     raise ValidationError(f"unsupported process wait state kind: {kind!r}")
 
 
@@ -460,6 +597,8 @@ def legacy_status_message(
         return prefix + ",".join(wait_state.request_ids)
     if isinstance(wait_state, HostResumeProcessWait):
         return f"host_resume_required:{wait_state.reason_oid}"
+    if isinstance(wait_state, StaleExecutionProcessWait):
+        return "stale_execution_recovery"
     if isinstance(wait_state, PausedProcessWait) and wait_state.reason_oid is not None:
         return f"result_oid:{wait_state.reason_oid}"
     if isinstance(outcome, (ExitedProcessOutcome, FailedProcessOutcome)) and outcome.result_oid is not None:
@@ -604,6 +743,11 @@ def remap_process_wait_state(
     if isinstance(value, (PausedProcessWait, HostResumeProcessWait)):
         reason_oid = objects.get(value.reason_oid, value.reason_oid) if value.reason_oid is not None else None
         return type(value)(reason_oid=reason_oid)  # type: ignore[call-arg]
+    if isinstance(value, StaleExecutionProcessWait):
+        # A fork/restore cannot transfer an execution takeover receipt to a
+        # different concurrency identity. Preserve the safe paused posture but
+        # intentionally discard the non-transferable recovery provenance.
+        return PausedProcessWait(reason_oid=None)
     return value
 
 

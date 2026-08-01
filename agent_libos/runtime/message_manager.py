@@ -3,6 +3,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Iterable
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.evidence.message_projection import (
+    task_run_message_evidence_projection,
+)
 from agent_libos.memory.data_labels import labels_for_explain, metadata_from_labels
 from agent_libos.models import (
     DataFlowContext,
@@ -84,6 +87,10 @@ class ProcessMessageManager:
         body_text = str(body or "")
         payload_dict = dict(payload or {})
         message_metadata = self._message_metadata(sender, metadata, source_oids=source_oids)
+        message_metadata = self._bind_recipient_task_run_metadata(
+            recipient,
+            message_metadata,
+        )
         labels = metadata_from_labels(message_metadata)
         if labels is not None:
             self.authority_policy.assert_data_flow_labels(
@@ -116,6 +123,7 @@ class ProcessMessageManager:
             created_at=now,
             updated_at=now,
         )
+        task_run_evidence = task_run_message_evidence_projection(message)
         # Recheck terminal state while holding the same transaction that
         # inserts the message and wakes a matching waiter.  This linearizes
         # post against process exit and makes evidence failures retry-safe.
@@ -130,31 +138,39 @@ class ProcessMessageManager:
                 EventType.PROCESS_MESSAGE_POSTED,
                 source=sender,
                 target=recipient_pid,
-                payload={
-                    "message_id": message.message_id,
-                    "kind": message.kind.value,
-                    "channel": message.channel,
-                    "correlation_id": message.correlation_id,
-                    "reply_to": message.reply_to,
-                    "subject": message.subject,
-                    "sender": sender,
-                    "data_labels": message.metadata.get("data_labels"),
-                },
+                payload=(
+                    task_run_evidence
+                    if task_run_evidence is not None
+                    else {
+                        "message_id": message.message_id,
+                        "kind": message.kind.value,
+                        "channel": message.channel,
+                        "correlation_id": message.correlation_id,
+                        "reply_to": message.reply_to,
+                        "subject": message.subject,
+                        "sender": sender,
+                        "data_labels": message.metadata.get("data_labels"),
+                    }
+                ),
                 priority=EventPriority.HIGH if message.kind == ProcessMessageKind.INTERRUPT else EventPriority.NORMAL,
             )
             self.audit.record(
                 actor=sender,
                 action="process.message.post",
                 target=f"process:{recipient_pid}",
-                decision={
-                    "message_id": message.message_id,
-                    "kind": message.kind.value,
-                    "channel": message.channel,
-                    "correlation_id": message.correlation_id,
-                    "reply_to": message.reply_to,
-                    "subject": message.subject,
-                    "data_labels": message.metadata.get("data_labels"),
-                },
+                decision=(
+                    task_run_evidence
+                    if task_run_evidence is not None
+                    else {
+                        "message_id": message.message_id,
+                        "kind": message.kind.value,
+                        "channel": message.channel,
+                        "correlation_id": message.correlation_id,
+                        "reply_to": message.reply_to,
+                        "subject": message.subject,
+                        "data_labels": message.metadata.get("data_labels"),
+                    }
+                ),
             )
             self._wake_if_waiting_for_message(message)
         if self._object_tasks is not None:
@@ -781,6 +797,38 @@ class ProcessMessageManager:
                 trust_level="user_asserted" if sender.startswith("human:") else "unknown",
             )
         selected["data_labels"] = labels_for_explain(labels)
+        return selected
+
+    @staticmethod
+    def _bind_recipient_task_run_metadata(
+        recipient: Any,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Bind inbound durable content to its supervising Run.
+
+        ``task_run_id`` is Host-owned retention metadata.  Callers may repeat
+        the recipient's binding (the TaskRun follow-up path does this inside
+        its atomic transaction), but they cannot forge a binding for an
+        ordinary process or redirect a message into another Run's purge
+        scope.
+        """
+
+        selected = dict(metadata)
+        run_id = getattr(recipient, "task_run_id", None)
+        supplied = selected.get("task_run_id")
+        if run_id is None:
+            if supplied is not None:
+                raise ValidationError(
+                    "process message task_run_id is reserved for a Run-bound recipient"
+                )
+            return selected
+        if not isinstance(run_id, str) or not run_id:
+            raise ValidationError("recipient has an invalid TaskRun binding")
+        if supplied is not None and supplied != run_id:
+            raise ValidationError(
+                "process message task_run_id does not match the recipient Run"
+            )
+        selected["task_run_id"] = run_id
         return selected
 
     def _normalize_limit(self, limit: int | None) -> int:

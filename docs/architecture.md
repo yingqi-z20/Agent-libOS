@@ -423,6 +423,12 @@ The assembled graph includes:
   `ProcessTransitionService`, with token-based owners failing closed on stale
   wake tokens. Direct Host workflows and Host-managed ObjectTask runners can
   also advance a process without making it scheduler work.
+- `TaskRunManager` supervises one root process tree through a versioned goal,
+  requirements, idempotent Host commands, an append-only linked ledger, and
+  integrity-bound local resume points. It asks the existing scheduler and
+  managers to advance work rather than interpreting a workflow DAG. Store
+  leases plus the Run's monotonic Runtime epoch fence stale claims and commits;
+  unsafe external-effect or ObjectTask recovery blocks in `needs_attention`.
 - `ObjectTaskManager` coordinates execution while dedicated state and
   notification services own durable transitions and wake/message publication.
 - `CheckpointManager` coordinates restore/fork transactions over typed snapshot
@@ -441,7 +447,7 @@ The assembled graph includes:
 The default substrate is `LocalResourceProviderSubstrate`, rooted at the current
 workspace unless another substrate is injected.
 
-The durable event envelope, current 45-value event catalog, ordering model, and
+The durable event envelope, current 46-value event catalog, ordering model, and
 transaction/causality limits are documented in [Runtime Events](events.md).
 
 The internal core module registers the built-in tool set and default images

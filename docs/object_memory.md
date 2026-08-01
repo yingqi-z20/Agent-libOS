@@ -350,6 +350,14 @@ the live `result_oid`, and preserves the previous status and oid in wait
 metadata. Checkpoint/image reconstruction is different because those formats
 explicitly capture the payloads they promise to restore.
 
+Durable Task Runs do not change this ObjectTask contract. A Run may supervise a
+process that starts an ObjectTask, and the Run ledger links to that task's
+evidence, but its arguments and live worker remain runtime-local. On reopen the
+ObjectTask is still reconciled to `abandoned`; the supervising Run moves to
+`needs_attention` and blocks downstream dispatch rather than replaying the
+tool. Task Run payload persistence is a separate, explicit plaintext opt-in and
+does not make an ObjectTask owner or any other ordinary Object payload durable.
+
 The `abandoned` and `result_unavailable_after_reopen` transitions each begin a
 new terminal notification phase. Delivery still revalidates the original owner
 and result source lineage. Because runtime-only source payloads may already be

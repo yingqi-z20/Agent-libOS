@@ -20,14 +20,23 @@ surface. They are grouped below by purpose.
 | --- | --- |
 | Runtime and authority | `Runtime`, `Capability`, `CapabilityRight`, `Rights`, `TaskAuthorityManifest` |
 | Process and image state | `AgentImage`, `AgentProcess`, `ProcessResult`, `ProcessSignal`, `ProcessStatus`, `ForkMode` |
-| Process outcomes and waits | `ProcessOutcome`, `ExitedProcessOutcome`, `FailedProcessOutcome`, `KilledProcessOutcome`, `ProcessWaitState`, `HostResumeProcessWait`, `HumanProcessWait`, `MessageProcessWait`, `PausedProcessWait`, `ToolProcessWait`, `ChildProcessWait` |
+| Process outcomes and waits | `ProcessOutcome`, `ExitedProcessOutcome`, `FailedProcessOutcome`, `KilledProcessOutcome`, `ProcessWaitState`, `HostResumeProcessWait`, `HumanProcessWait`, `MessageProcessWait`, `PausedProcessWait`, `StaleExecutionProcessWait`, `ToolProcessWait`, `ChildProcessWait` |
 | Object Memory | `AgentObject`, `MaterializedContext`, `MemoryView`, `ObjectHandle`, `ObjectMetadata`, `ObjectNamespace`, `ObjectQuery`, `ObjectRight`, `ObjectType`, `RelationType`, `ViewMode` |
 | Object tasks | `ObjectTask`, `ObjectTaskNotification`, `ObjectTaskNotificationStatus`, `ObjectTaskOwnerWatch`, `ObjectTaskStatus` |
+| Durable Task Runs | `TaskRunSpecV1`, `TaskRunStatus`, `TaskRunAction`, `TaskRunRetention`, `TaskRunSummary`, `TaskRunLedgerItem` |
 | Operations and evidence | `ContextMaterializationManifest`, `OperationEvidenceLink`, `OperationEvidenceRole`, `OperationKind`, `OperationOutcome`, `OperationRecord`, `OperationState` |
 | Human, events, tools, and workflows | `HumanRequest`, `Event`, `EventType`, `ToolCallResult`, `ToolCandidate`, `ToolHandle`, `ToolSpec`, `ValidationResult`, `WorkflowRunResult` |
 
 `Rights` is an alias for `CapabilityRight`. `agent_libos.__version__` exposes
 the installed package version but is not included in wildcard imports.
+
+`StaleExecutionProcessWait` is exported so Hosts can type-check and serialize a
+persisted process projection. It is nevertheless a Store-only recovery receipt:
+application code must not construct or submit one as an ordinary transition,
+and process transition/execution-completion APIs reject attempts to persist it.
+Its identity hashes and generations are diagnostic; TaskRun epoch, safe-point
+integrity, and current binding evidence stay in their authoritative records and
+must not be inferred from this public value.
 
 The wider `agent_libos.models` package contains subsystem and persistence
 models used by the implementation. Their presence there does not add them to
@@ -221,7 +230,7 @@ enforce their own authority.
 | `config`, `workspace_root`, `instance_id` | Effective frozen configuration and Runtime identity; authority-rule conditions are defensively copied and recursively frozen |
 | `process`, `launch`, `process_transitions`, `scheduler` | Process lifecycle, launch, status transitions, and scheduling |
 | `capability`, `authority_manifests` | Capability and Task Authority control planes |
-| `memory`, `object_tasks` | Object Memory and Object-bound background tasks |
+| `memory`, `object_tasks`, `task_runs` | Object Memory, Object-bound background tasks, and Durable Task Run supervision |
 | `tools`, `syscalls` | ToolBroker and the JIT syscall router |
 | `messages`, `human` | Durable process messaging and Human requests |
 | `resources`, `ratings` | Hierarchical resource accounting and agent ratings |
@@ -273,6 +282,24 @@ For subsystem-specific signatures and security semantics, see
 [Object Memory](object_memory.md), [Data Flow](data_flow.md),
 [Checkpoints](checkpoints.md), [Skills](skills.md), [Git](git.md), and
 [Tools and JIT](tools_and_jit.md).
+
+`Runtime.task_runs` is a Host-only control plane for one root AgentProcess tree.
+It provides `create`, `get`, `list`, `run_until_blocked`, `wait`, `pause`,
+`resume`, `cancel`, `follow_up`, `recover`, `rerun`, and the Host/admin-only
+`purge_payloads` operation for a terminal permanent-retention Run. It also
+provides paged `list_requirements`, `list_ledger`, and `list_human_requests`
+reads plus server-derived `recovery_options`. Mutations require a monotonic
+expected Run revision and stable command id. Rerun creates a linked new Run
+rather than rewinding history; whenever default terminal cleanup or an explicit
+Host purge has removed the source goal, `spec_overrides` must supply a
+replacement `goal`. Only a still-retained `permanent` Run may reuse its goal.
+Creation instead uses a stable client request id and has no pre-existing
+revision. `TaskRunSummary.payloads_purged` is the server-derived, content-free
+signal callers should use when deciding whether rerun needs that replacement. Do
+not expose this manager to model code;
+every process action still goes through the normal Tool/Skill and primitive
+authority boundaries. See [Durable Task Runs](durable_task_runs.md) for payload
+opt-in, retention, recovery, and external-effect semantics.
 
 ## JSON-RPC and MCP Host APIs
 
@@ -412,7 +439,7 @@ cannot silently abandon an owned store or partially assembled component graph.
 
 ## Compatibility boundary
 
-- Agent libOS 1.0.1 is experimental. The top-level `agent_libos.__all__` names
+- Agent libOS 1.1.0 is experimental. The top-level `agent_libos.__all__` names
   and the Runtime entrypoints documented here are the intended application
   import surface for this release. Pin the package version when depending on
   exact signatures or dataclass fields.

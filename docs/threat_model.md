@@ -40,6 +40,8 @@ The runtime is intended to protect:
   JSON-RPC, MCP, Git, and database credentials;
 - Object Memory and prompt context, process messages, Human answers, provider
   inputs and outputs, and their tenant/principal labels;
+- Durable Task Run goals, follow-ups, resume payloads, requirements, command
+  receipts, and the integrity of their generation/epoch fences;
 - external systems reachable through LLM, Human, JSON-RPC, MCP, Git, Shell,
   PTY, filesystem, and other provider-backed operations;
 - process authority: capabilities, finite-use reservations, Task Authority
@@ -233,10 +235,57 @@ OS-account, ACL, namespace, container, or VM isolation.
   phase, or after an ambiguous provider start, uncertainty remains durable and
   startup does not blindly replay an unknown effect. This is not a distributed
   transaction with the provider.
+- A split-phase Task Run mutation commits a request- and generation-bound
+  provisional command receipt before a lost response can be interpreted as a
+  fresh dispatch. Its strict version-1 result has an exact variant schema,
+  complete revision-bound public summary, raw pre-decode byte cap, and signed
+  BIGINT bounds. Local-control pending and completed variants reference a
+  same-transaction append-only status-transition ledger item and canonical
+  evidence digest binding the Run, command identity/request hash, from/to state,
+  and semantic revision/generation fence. Terminal or superseded early returns
+  validate that evidence before returning. Exact replay settles only durable local state and never
+  repeats scheduler, LLM, Tool, Provider, or external-effect work. A committed
+  verified effect receipt is not verified again merely because completion of
+  the public command result was lost; replay instead requires its exact
+  append-only finalized-effect transition and matching
+  `host_verified_receipt` audit, which remain after provider-body purge. All
+  command inserts/result updates, including linked-gap repair, are fenced by a
+  global Runtime-epoch counter-row lock. Startup first settles a staged complete
+  provider result, then auto-settles only a well-formed current-generation
+  pending interrupt for a recoverable nonterminal Run. It cannot start queued
+  work or resume an unrelated Host pause; ordinary effect, resume-point, and
+  finalization gates still apply. Corrupt, duplicate, or over-bound command
+  recovery evidence produces `needs_attention` instead of truncated or guessed
+  execution. Terminal command-result loss requires exact local client replay.
+- Interrupt recovery recognizes only the Store-reserved typed
+  `StaleExecutionProcessWait`, never the `stale_execution_recovery`
+  `status_message`. Its prior owner/lease and recovering Runtime owner-id are
+  projected only as canonical SHA-256 identity hashes; the recovering-owner
+  hash is not a cryptographic signature and relies on RuntimeStore/database
+  administrator integrity inside the TCB. A historical recovering-owner hash
+  may survive another reopen, but it grants nothing by itself: the current
+  Run/process epoch, the interrupt admission Runtime epoch and exact per-PID
+  state/execution-generation fence, an identity- and integrity-bound complete
+  safe point, no live owner/lease, and the current Image/tool/provider binding
+  must all agree. Prior raw owner/lease tokens do not enter the stale wait,
+  TaskRun ledger, summary, or error projection. Checkpoint restore and fork
+  replace the non-transferable receipt with an ordinary pause and clear its
+  compatibility message before publishing a new concurrency identity.
+- A linked recovery whose nested rerun committed before its outer receipt does
+  not use startup or current source state to guess whether to create again. An
+  exact outer retry can copy the immutable target result only after validating
+  a request-hash-bound nested command, source/target receipts, target Run, and
+  unique causal link. Missing, changed, duplicate, or malformed evidence fails
+  closed without a second Run.
 - Checkpoint restore/fork revalidates current authority and reconstructs only
   scoped runtime state; it does not silently claim to roll back external state.
 - Audit and effect history obey append/CAS/transition rules through Runtime APIs
   and remain causally linked to operations within the RuntimeStore boundary.
+- A cooperating stale Runtime cannot publish Task Run claims, child processes,
+  resume points, or terminal settlement after the active-store lease and
+  monotonic Runtime epoch have advanced. Unknown or dispatched external
+  effects block automatic Run continuation rather than being treated as safe
+  retries.
 
 ### Explicit non-goals
 
@@ -258,6 +307,8 @@ Agent libOS does not claim to:
   provider state through a checkpoint or checkpoint-derived image;
 - support mutually untrusted writable Runtimes on one store, or isolate hostile
   processes sharing the same OS user; or
+- provide a distributed workflow service, multi-host Run failover, hard LLM
+  provider-spend caps, or automatic recovery of runtime-local ObjectTasks; or
 - turn deterministic tests and benchmarks into a formal proof or a claim that
   every supported OS/provider environment has been release-validated.
 
@@ -357,6 +408,26 @@ or backup reader can therefore see that material. Operators that do not need
 lossless training/debugging records should disable full-I/O persistence and
 apply the separately documented payload-retention policy; neither setting is
 at-rest encryption.
+
+Durable Task payload persistence is independently disabled by default because
+useful restart recovery requires readable goals, follow-ups, transcripts, and
+resume bundles. Enabling it is an explicit Host decision to store that material
+as plaintext. The default `purge_on_terminal` policy reduces retained content
+only during safe terminal settlement, including linked LLM/tool-output bodies
+and linked terminal external-effect provider metadata/receipt bodies. It also
+hash-reduces Run-linked Human prompt/response/decision bodies, then deletes
+pending continuations and durable messages automatically bound from a
+Run-member recipient. Ordinary callers cannot suppress, override, or forge the
+message binding. Human request id, type, status, timestamps, audit linkage, and
+content digests remain without readable Human content. Effect identity, state,
+classification, content digests, and causal links likewise remain, but readable
+provider receipt content does not. Nonterminal effects are never reduced. This
+is not secure erasure and backups may retain earlier copies.
+`permanent` retention is Host/admin-only and deliberately skips automatic
+Run-terminal cleanup, while independent evidence retention may still apply; a
+Host/admin may explicitly apply the same audited cleanup to a terminal
+permanent Run later. A task/model cannot choose either the global
+payload-persistence setting or upgrade itself to permanent retention.
 
 RuntimeStore transactions, recovery fences, active-runtime leases, bounded
 reconciliation, and exact operation/publication links address partial commits,

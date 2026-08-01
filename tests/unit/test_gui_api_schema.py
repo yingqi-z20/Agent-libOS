@@ -36,6 +36,7 @@ _ROUTE_BASES = {
     "_dispatch_images": ("api", "images"),
     "_dispatch_jsonrpc": ("api", "jsonrpc"),
     "_dispatch_mcp": ("api", "mcp"),
+    "_dispatch_task_runs": ("api", "task-runs"),
 }
 _ROUTE_PLACEHOLDERS = {
     "_dispatch_checkpoints": {0: "{checkpoint_id}"},
@@ -43,6 +44,7 @@ _ROUTE_PLACEHOLDERS = {
     "_dispatch_capabilities": {0: "{capability_id}"},
     "_dispatch_jsonrpc": {0: "{endpoint_id}"},
     "_dispatch_mcp": {0: "{server_id}"},
+    "_dispatch_task_runs": {0: "{run_id}"},
 }
 
 
@@ -170,7 +172,7 @@ def _relative_route(test: ast.expr, function: str, action: str) -> tuple[str, ..
 def test_gui_api_schema_is_valid_draft_2020_12() -> None:
     schema = _schema()
     Draft202012Validator.check_schema(schema)
-    assert schema["x-agent-libos-schema-version"] == 1
+    assert schema["x-agent-libos-schema-version"] == 2
     assert list(Draft202012Validator(schema).iter_errors({"confirmed": True}))
     usage = schema["x-agent-libos-definition-usage"]
     assert usage["local_ref_example"].endswith("#/$defs/processExecPayload")
@@ -191,6 +193,7 @@ def test_gui_api_schema_tracks_every_explicit_confirmation_operation() -> None:
 
 def test_gui_api_schema_validates_snapshot_and_error_envelopes() -> None:
     snapshot = {
+        "schema_version": 2,
         "db": "local",
         "scheduler": {"auto_run": True, "running": False, "paused": False},
         "processes": [{"pid": "pid_1", "status": "waiting"}],
@@ -199,6 +202,21 @@ def test_gui_api_schema_validates_snapshot_and_error_envelopes() -> None:
         "audit": [],
         "llm_calls": [],
         "object_tasks": [],
+        "task_runs": [
+            {
+                "schema_version": 1,
+                "run_id": "run_1",
+                "revision": 2,
+                "status": "paused",
+                "display_title": "Durable task",
+                "root_pid": "pid_1",
+                "active_pid": "pid_1",
+                "allowed_actions": ["resume", "cancel"],
+                "blockers": [],
+                "retention": "purge_on_terminal",
+                "payloads_purged": False,
+            }
+        ],
         "tools": [],
         "images": [],
         "skills": [],
@@ -209,6 +227,45 @@ def test_gui_api_schema_validates_snapshot_and_error_envelopes() -> None:
     }
     snapshot_validator = _validator_for("snapshotResponse")
     snapshot_validator.validate(snapshot)
+    private_summary = {
+        **snapshot["task_runs"][0],
+        "goal": "must not cross summary boundary",
+    }
+    assert list(_validator_for("taskRunSummary").iter_errors(private_summary))
+    missing_purge_state = dict(snapshot["task_runs"][0])
+    missing_purge_state.pop("payloads_purged")
+    assert list(_validator_for("taskRunSummary").iter_errors(missing_purge_state))
+    _validator_for("taskRunDetailResponse").validate(
+        {
+            "summary": snapshot["task_runs"][0],
+            "requirements": {
+                "items": [
+                    {
+                        "schema_version": 1,
+                        "requirement_id": "req_1",
+                        "run_id": "run_1",
+                        "ordinal": 0,
+                        "kind": "initial",
+                        "status": "pending",
+                        "requirement_sha256": "a" * 64,
+                        "label": "Initial requirement",
+                        "created_by": "host",
+                        "created_at": "2030-01-01T00:00:00Z",
+                        "updated_at": "2030-01-01T00:00:00Z",
+                        "started_at": None,
+                        "completed_at": None,
+                        "waived_by": None,
+                        "content_available": False,
+                        "content_retention": "hash_only",
+                        "content_sha256": "a" * 64,
+                    }
+                ],
+                "next_cursor": None,
+                "has_more": False,
+            },
+            "recovery_options": [],
+        }
+    )
     invalid_snapshot = {**snapshot, "events": [42]}
     assert list(snapshot_validator.iter_errors(invalid_snapshot))
     _validator_for("errorEnvelope").validate(
@@ -222,6 +279,81 @@ def test_gui_api_schema_validates_snapshot_and_error_envelopes() -> None:
             },
         }
     )
+    _validator_for("errorEnvelope").validate(
+        {
+            "ok": False,
+            "error": {
+                "type": "TaskRunRevisionConflict",
+                "code": "task_run_revision_conflict",
+                "message": "stale TaskRun revision",
+                "command_admitted": False,
+                "current_summary": snapshot["task_runs"][0],
+            },
+        }
+    )
+
+
+def test_gui_api_schema_bounds_stale_execution_wait_to_diagnostic_hashes() -> None:
+    validator = _validator_for("processWaitState")
+    receipt = {
+        "schema_version": 1,
+        "kind": "stale_execution",
+        "pid": "pid_1",
+        "recovered_by_owner_sha256": "a" * 64,
+        "prior_owner_sha256": "b" * 64,
+        "prior_lease_sha256": "c" * 64,
+        "prior_execution_generation": 4,
+        "recovered_execution_generation": 5,
+        "recovered_state_generation": 9,
+    }
+    validator.validate(receipt)
+    validator.validate(
+        {
+            **receipt,
+            "prior_owner_sha256": None,
+            "prior_lease_sha256": None,
+        }
+    )
+
+    for field in (
+        "execution_owner_id",
+        "execution_lease_id",
+        "prior_execution_owner_id",
+        "prior_execution_lease_id",
+        "runtime_epoch",
+        "binding_hash",
+        "safe_point",
+    ):
+        assert list(validator.iter_errors({**receipt, field: "raw-or-extra"}))
+
+    for field in (
+        "recovered_by_owner_sha256",
+        "prior_owner_sha256",
+        "prior_lease_sha256",
+    ):
+        assert list(validator.iter_errors({**receipt, field: "A" * 64}))
+        assert list(validator.iter_errors({**receipt, field: "a" * 63}))
+
+    for missing in receipt:
+        invalid = dict(receipt)
+        invalid.pop(missing)
+        assert list(validator.iter_errors(invalid))
+
+    for field in (
+        "prior_execution_generation",
+        "recovered_execution_generation",
+        "recovered_state_generation",
+    ):
+        assert list(validator.iter_errors({**receipt, field: -1}))
+
+    schema = _schema()
+    stale_branch = next(
+        branch
+        for branch in schema["$defs"]["processWaitState"]["oneOf"]
+        if branch.get("properties", {}).get("kind", {}).get("const")
+        == "stale_execution"
+    )
+    assert "not independent TaskRun resume authority" in stale_branch["description"]
 
 
 def test_gui_api_schema_requires_confirmation_and_workspace_relative_skill_path() -> None:
@@ -350,6 +482,29 @@ def test_gui_api_schema_requires_confirmation_and_workspace_relative_skill_path(
             "confirmed": True,
             "source": "selected-package",
             "files": {"IMAGE.yaml": "schema_version: 1"},
+        }
+    )
+    task_run_cancel = _validator_for("taskRunCancelPayload")
+    task_run_cancel.validate(
+        {
+            "confirmed": True,
+            "expected_revision": 3,
+            "command_id": "cancel-1",
+            "reason": "operator request",
+        }
+    )
+    assert list(
+        task_run_cancel.iter_errors(
+            {"expected_revision": 3, "command_id": "cancel-1"}
+        )
+    )
+    _validator_for("taskRunRecoverPayload").validate(
+        {
+            "confirmed": True,
+            "expected_revision": 4,
+            "command_id": "recover-1",
+            "option_id": "register_receipt",
+            "receipt": {"receipt_id": "r-1"},
         }
     )
     assert list(

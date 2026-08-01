@@ -31,6 +31,7 @@ from agent_libos.models import (
     ResourceUsageReservationRecoverySummary,
     StaleExecutionRecoverySummary,
     StaleOperationRecoverySummary,
+    TaskRunSummary,
     WorkflowRunResult,
 )
 from agent_libos.models.exceptions import (
@@ -92,6 +93,7 @@ if TYPE_CHECKING:
     from agent_libos.runtime.scheduler import SimpleScheduler
     from agent_libos.runtime.snapshots import ProcessExecStateService
     from agent_libos.runtime.syscall_router import SyscallRouter
+    from agent_libos.runtime.task_runs import TaskRunManager
     from agent_libos.sdk import ProtectedOperationSDK
     from agent_libos.skills.manager import SkillManager
     from agent_libos.storage import UnitOfWork
@@ -161,6 +163,7 @@ class Runtime:
     mcp: McpPrimitive
     tools: ToolBroker
     object_tasks: ObjectTaskManager
+    task_runs: TaskRunManager
     scheduler: SimpleScheduler
     checkpoint: CheckpointManager
     skills: SkillManager
@@ -185,6 +188,8 @@ class Runtime:
     recovered_stale_operations: StaleOperationRecoverySummary
     recovered_stale_executions: StaleExecutionRecoverySummary
     recovered_terminal_cleanups: dict[str, Any]
+    recovered_task_runs: tuple[TaskRunSummary, ...]
+    recovered_task_run_count: int
     reconciled_external_effects: ExternalEffectRecoverySummary
     payload_retention: PayloadRetentionMaintenance
     explainable_boundary_names: frozenset[str]

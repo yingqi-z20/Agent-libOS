@@ -249,6 +249,7 @@ function process(): RuntimeProcess {
 
 function snapshot(): RuntimeSnapshot {
   return {
+    schema_version: 2,
     db: "local",
     scheduler: {
       auto_run: true,
@@ -268,6 +269,7 @@ function snapshot(): RuntimeSnapshot {
     audit: [],
     llm_calls: [],
     object_tasks: [],
+    task_runs: [],
     tools: [],
     llm_profiles: [],
     images: [],
