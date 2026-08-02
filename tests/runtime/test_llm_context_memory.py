@@ -2689,7 +2689,20 @@ class TestLLMContextMemory:
                 assert call.tool_calls[0]['name'] == 'process_exit'
                 assert call.tool_calls[0]['arguments'] == json.dumps({'payload': {'done': True}})
                 assert call.raw_response['id'] == 'raw_resp'
-                assert call.reasoning == {'summary': 'selected process_exit'}
+                assert call.reasoning['kind'] == 'provider_trace'
+                assert call.reasoning['coverage'] == 'custom_client_incomplete'
+                assert call.reasoning['selected_attempt'] == 1
+                assert call.reasoning['attempts'][0]['reasoning']['blocks'][0]['text'] == 'selected process_exit'
+                assert call.request_options['provider_trace_summary'] == {
+                    'schema_version': 1,
+                    'coverage': 'custom_client_incomplete',
+                    'attempt_count': 1,
+                    'recorded_attempt_count': 1,
+                    'selected_attempt': 1,
+                    'status_counts': {'ok': 1, 'error': 0},
+                    'limited': False,
+                    'omitted_attempts': 0,
+                }
                 assert call.observability['response_content']['sha256']
                 serialized = json.dumps(call.__dict__, sort_keys=True)
                 assert 'persist full llm calls by default' in serialized
@@ -2707,6 +2720,35 @@ class TestLLMContextMemory:
                 assert persisted[0].observability['messages']['bytes'] > 0
             finally:
                 reopened.close()
+
+    def test_llm_client_subclass_is_not_trusted_as_complete_attempt_observer(self) -> None:
+        class CustomLLMClient(LLMClient):
+            pass
+
+        client = CustomLLMClient(model='custom', api_key='key', api_mode='chat')
+        completion = LLMCompletion(
+            content='done',
+            tool_calls=[],
+            reasoning={'summary': 'adapter-visible'},
+            provider_trace={
+                'kind': 'provider_trace',
+                'schema_version': 1,
+                'coverage': 'complete',
+                'selected_attempt': None,
+                'limited': False,
+                'omitted_attempts': 0,
+                'attempts': [],
+            },
+        )
+
+        trace = LLMProcessExecutor._provider_trace_for_completion(
+            SimpleNamespace(client=client),
+            completion,
+        )
+
+        assert trace['coverage'] == 'custom_client_incomplete'
+        assert trace['selected_attempt'] == 1
+        assert trace['attempts'][0]['api'] == 'custom'
 
     def test_llm_call_records_can_opt_out_of_full_io_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2855,6 +2897,12 @@ class TestLLMContextMemory:
 
                 calls = runtime.store.list_llm_calls(pid)
                 assert [call.response_id for call in calls] == ['resp_first', 'resp_second']
+                assert all(call.reasoning['coverage'] == 'complete' for call in calls)
+                assert all(call.reasoning['selected_attempt'] == 1 for call in calls)
+                assert all(
+                    call.request_options['provider_trace_summary']['attempt_count'] == 1
+                    for call in calls
+                )
                 assert all(
                     call.request_options[
                         'openai_responses_previous_response_id_configured'

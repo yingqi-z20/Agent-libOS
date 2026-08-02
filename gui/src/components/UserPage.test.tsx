@@ -274,7 +274,7 @@ function runtimeProcess(): RuntimeProcess {
 
 function emptySnapshot(): RuntimeSnapshot {
   return {
-    schema_version: 2,
+    schema_version: 3,
     db: "local",
     scheduler: {
       auto_run: true,

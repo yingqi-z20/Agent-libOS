@@ -27,6 +27,34 @@ def _validator_for(definition: str) -> Draft202012Validator:
     )
 
 
+def _llm_call_summary() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "call_id": "llmcall_1",
+        "pid": "pid_1",
+        "image_id": "base-agent:v0",
+        "purpose": "action_selection",
+        "status": "ok",
+        "api": "responses",
+        "model": "provider-model",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "total_tokens": 12,
+        },
+        "error": None,
+        "created_at": "2030-01-01T00:00:00Z",
+        "completed_at": "2030-01-01T00:00:01Z",
+        "request_id": "req_1",
+        "response_id": "resp_1",
+        "attempt_count": 2,
+        "coverage": "complete",
+        "selected_attempt": 2,
+        "reasoning_availability": "returned",
+        "payload_retention_tier": "full",
+    }
+
+
 _ROUTE_BASES = {
     "_dispatch_workflows": ("api", "workflows"),
     "_dispatch_process": ("api", "processes", "{pid}"),
@@ -62,10 +90,7 @@ def _confirmed_contracts_from_server() -> dict[str, str]:
         if node.func.attr != "_require_confirmed" or not node.args:
             continue
         actions = _confirmed_actions(node.args[0])
-        function = _ancestor(node, parents, ast.FunctionDef)
-        route_guard = _route_guard(node, parents)
-        assert isinstance(function, ast.FunctionDef)
-        assert route_guard is not None
+        function, route_guard = _confirmed_route_context(node, tree, parents)
         for action in actions:
             relative = _relative_route(route_guard.test, function.name, action)
             route = "/".join((*_ROUTE_BASES[function.name], *relative))
@@ -110,6 +135,49 @@ def _route_guard(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> ast.If | Non
             return current
         current = parents.get(current)
     return None
+
+
+def _confirmed_route_context(
+    confirmation: ast.Call,
+    tree: ast.Module,
+    parents: dict[ast.AST, ast.AST],
+) -> tuple[ast.FunctionDef, ast.If]:
+    """Resolve a confirmation directly or through one routed action helper.
+
+    Extracted route bodies keep confirmation behavior close to the action while
+    the dispatcher retains the HTTP contract.  Require exactly one guarded
+    dispatcher callsite so an unguarded or ambiguously reused helper still
+    fails this contract check instead of silently losing coverage.
+    """
+
+    function = _ancestor(confirmation, parents, ast.FunctionDef)
+    assert isinstance(function, ast.FunctionDef)
+    direct_guard = _route_guard(confirmation, parents)
+    if direct_guard is not None:
+        assert function.name in _ROUTE_BASES
+        return function, direct_guard
+
+    routed_callsites: list[tuple[ast.FunctionDef, ast.If]] = []
+    for candidate in ast.walk(tree):
+        if not isinstance(candidate, ast.Call):
+            continue
+        if not isinstance(candidate.func, ast.Attribute):
+            continue
+        if candidate.func.attr != function.name:
+            continue
+        caller = _ancestor(candidate, parents, ast.FunctionDef)
+        route_guard = _route_guard(candidate, parents)
+        if (
+            isinstance(caller, ast.FunctionDef)
+            and caller.name in _ROUTE_BASES
+            and route_guard is not None
+        ):
+            routed_callsites.append((caller, route_guard))
+    assert len(routed_callsites) == 1, (
+        f"confirmation helper {function.name} must have exactly one guarded "
+        f"dispatcher callsite, found {len(routed_callsites)}"
+    )
+    return routed_callsites[0]
 
 
 def _relative_route(test: ast.expr, function: str, action: str) -> tuple[str, ...]:
@@ -193,14 +261,14 @@ def test_gui_api_schema_tracks_every_explicit_confirmation_operation() -> None:
 
 def test_gui_api_schema_validates_snapshot_and_error_envelopes() -> None:
     snapshot = {
-        "schema_version": 2,
+        "schema_version": 3,
         "db": "local",
         "scheduler": {"auto_run": True, "running": False, "paused": False},
         "processes": [{"pid": "pid_1", "status": "waiting"}],
         "human_requests": [],
         "events": [],
         "audit": [],
-        "llm_calls": [],
+        "llm_calls": [_llm_call_summary()],
         "object_tasks": [],
         "task_runs": [
             {
@@ -290,6 +358,43 @@ def test_gui_api_schema_validates_snapshot_and_error_envelopes() -> None:
                 "current_summary": snapshot["task_runs"][0],
             },
         }
+    )
+
+
+def test_gui_api_schema_llm_call_summary_is_strict_and_content_free() -> None:
+    validator = _validator_for("llmCallSummary")
+    summary = _llm_call_summary()
+    validator.validate(summary)
+
+    for content_field, content in {
+        "messages": [{"role": "user", "content": "private prompt"}],
+        "tools": [{"name": "private_tool"}],
+        "request_options": {"authorization": "private"},
+        "reasoning": {"summary": "private reasoning"},
+        "response_content": "private output",
+        "output": "private output",
+        "tool_calls": [{"name": "private_tool", "arguments": {"secret": True}}],
+        "tool_arguments": {"secret": True},
+        "raw_response": {"opaque": "private provider response"},
+    }.items():
+        assert list(
+            validator.iter_errors({**summary, content_field: content})
+        ), content_field
+
+    for required_field in summary:
+        invalid = dict(summary)
+        invalid.pop(required_field)
+        assert list(validator.iter_errors(invalid)), required_field
+
+    assert list(
+        validator.iter_errors(
+            {**summary, "usage": {"prompt_tokens": "private prompt"}}
+        )
+    )
+    assert list(
+        validator.iter_errors(
+            {**summary, "usage": {"private_provider_field": 1}}
+        )
     )
 
 

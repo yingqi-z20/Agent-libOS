@@ -1,5 +1,5 @@
-import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LLMProfileInput, LLMProfileSummary, McpCallResult, McpDiscoveryResult, McpServerSummary, McpToolListResult, ModuleSummary, ObjectTask, OperationListResponse, RuntimeSnapshot, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunSpecV1, TaskRunSummary } from "./types";
-import { assertMcpCallResult, assertMcpDiscoveryResult, assertMcpServerSummary, assertMcpToolListResult, assertRuntimeSnapshot, assertSchedulerStatus, assertTaskRunDetail, assertTaskRunSummary } from "./types";
+import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LlmCallDetail, LlmCallPage, LlmTraceContentChunk, LlmTraceContentField, LLMProfileInput, LLMProfileSummary, McpCallResult, McpDiscoveryResult, McpServerSummary, McpToolListResult, ModuleSummary, ObjectTask, OperationListResponse, RuntimeSnapshot, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunSpecV1, TaskRunSummary } from "./types";
+import { assertLlmCallDetail, assertLlmCallPage, assertLlmTraceContentChunk, assertMcpCallResult, assertMcpDiscoveryResult, assertMcpServerSummary, assertMcpToolListResult, assertRuntimeSnapshot, assertSchedulerStatus, assertTaskRunDetail, assertTaskRunSummary } from "./types";
 import type { OptionalQuanta } from "../quanta";
 
 type JsonBody = Record<string, unknown>;
@@ -218,6 +218,59 @@ export class LibOSClient {
       undefined,
       options
     );
+  }
+
+  async listProcessLlmCalls(pid: string, limit = 50, cursor?: string, options: RequestOptions = {}): Promise<LlmCallPage> {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (cursor) query.set("cursor", cursor);
+    const value = await this.request<unknown>(
+      "GET",
+      `/api/processes/${encodeURIComponent(pid)}/llm-calls?${query.toString()}`,
+      undefined,
+      options
+    );
+    assertLlmCallPage(value);
+    if (value.items.some((item) => item.pid !== pid)) {
+      throw new Error("GUI LLM call page contains a call from another process.");
+    }
+    return value;
+  }
+
+  async getProcessLlmCall(pid: string, callId: string, options: RequestOptions = {}): Promise<LlmCallDetail> {
+    const value = await this.request<unknown>(
+      "GET",
+      `/api/processes/${encodeURIComponent(pid)}/llm-calls/${encodeURIComponent(callId)}`,
+      undefined,
+      options
+    );
+    assertLlmCallDetail(value);
+    if (value.call.pid !== pid || value.call.call_id !== callId) {
+      throw new Error("GUI LLM call detail identity does not match the request.");
+    }
+    return value;
+  }
+
+  async getProcessLlmCallContent(
+    pid: string,
+    callId: string,
+    field: LlmTraceContentField,
+    options: RequestOptions & { attemptSequence?: number; cursor?: string; limit?: number } = {}
+  ): Promise<LlmTraceContentChunk> {
+    const query = new URLSearchParams({ field, limit: String(options.limit ?? 32_768) });
+    if (options.attemptSequence !== undefined) query.set("attempt_sequence", String(options.attemptSequence));
+    if (options.cursor) query.set("cursor", options.cursor);
+    const value = await this.request<unknown>(
+      "GET",
+      `/api/processes/${encodeURIComponent(pid)}/llm-calls/${encodeURIComponent(callId)}/content?${query.toString()}`,
+      undefined,
+      options
+    );
+    assertLlmTraceContentChunk(value);
+    if (value.pid !== pid || value.call_id !== callId || value.field !== field
+        || value.attempt_sequence !== (options.attemptSequence ?? null)) {
+      throw new Error("GUI LLM trace content identity does not match the request.");
+    }
+    return value;
   }
 
   async images(): Promise<ImageSummary[]> {

@@ -16,6 +16,7 @@ import { ProcessOverview } from "./ProcessOverview";
 import { RemoteRegistryPanel } from "./RemoteRegistryPanel";
 import { SkillsPanel } from "./SkillsPanel";
 import { RequestEpoch } from "../requestEpoch";
+import { ProviderTracePanel, type LlmTraceFocus } from "./ProviderTracePanel";
 
 const tabs = [
   { key: "overview", label: "details.overview" },
@@ -51,6 +52,7 @@ export function DetailTabs({
   onExplainOperation,
   onResolveOperation,
   explainLookup,
+  llmTraceFocus = null,
   connectionEpoch = 0,
   client,
   runAction,
@@ -69,6 +71,7 @@ export function DetailTabs({
   onExplainOperation(operationId: string, cursor?: string, signal?: AbortSignal): Promise<ExplainOperationResponse>;
   onResolveOperation(kind: string, id: string, signal?: AbortSignal): Promise<ExplainOperationResponse>;
   explainLookup: { kind: string; id: string; nonce: number } | null;
+  llmTraceFocus?: LlmTraceFocus | null;
   connectionEpoch?: number;
   client?: LibOSClient | null;
   runAction?: RunGuiAction;
@@ -90,6 +93,9 @@ export function DetailTabs({
   useEffect(() => {
     if (explainLookup) setTab("explain");
   }, [explainLookup?.nonce]);
+  useEffect(() => {
+    if (llmTraceFocus) setTab("llmCalls");
+  }, [llmTraceFocus?.nonce]);
   useEffect(() => {
     const previousPid = previousProcessPidRef.current;
     const nextPid = process?.pid ?? null;
@@ -165,6 +171,7 @@ export function DetailTabs({
           onExplainOperation,
           onResolveOperation,
           explainLookup,
+          llmTraceFocus,
           connectionEpoch,
           client: client ?? null,
           runAction,
@@ -200,6 +207,7 @@ function renderTab(
     onExplainOperation(operationId: string, cursor?: string, signal?: AbortSignal): Promise<ExplainOperationResponse>;
     onResolveOperation(kind: string, id: string, signal?: AbortSignal): Promise<ExplainOperationResponse>;
     explainLookup: { kind: string; id: string; nonce: number } | null;
+    llmTraceFocus: LlmTraceFocus | null;
     connectionEpoch: number;
     client: LibOSClient | null;
     runAction?: RunGuiAction;
@@ -232,7 +240,19 @@ function renderTab(
       />
     );
   }
-  if (tab === "llmCalls") return <JsonBlock value={snapshot.llm_calls.filter((item) => item.pid === process?.pid)} />;
+  if (tab === "llmCalls" && process && imageActions.client) {
+    return (
+      <ProviderTracePanel
+        key={providerTracePanelKey(process.pid, imageActions.connectionEpoch)}
+        pid={process.pid}
+        client={imageActions.client}
+        snapshotCalls={snapshot.llm_calls}
+        focus={imageActions.llmTraceFocus}
+        connectionKey={String(imageActions.connectionEpoch)}
+      />
+    );
+  }
+  if (tab === "llmCalls") return <div className="empty">{t("app.clientUnavailable")}</div>;
   if (tab === "jsonRpc" && imageActions.client && imageActions.confirmAction) return <RemoteRegistryPanel key={`${imageActions.connectionEpoch}:jsonrpc:${process?.pid ?? "host"}`} kind="jsonrpc" process={process} entries={snapshot.jsonrpc_endpoints} client={imageActions.client} confirmAction={imageActions.confirmAction} />;
   if (tab === "jsonRpc") return <JsonBlock value={snapshot.jsonrpc_endpoints} />;
   if (tab === "mcp" && imageActions.client && imageActions.confirmAction) return <RemoteRegistryPanel key={`${imageActions.connectionEpoch}:mcp:${process?.pid ?? "host"}`} kind="mcp" process={process} entries={snapshot.mcp_servers} client={imageActions.client} confirmAction={imageActions.confirmAction} />;
@@ -259,6 +279,10 @@ function renderTab(
 
 export function adminPanelKey(process: RuntimeProcess, connectionEpoch = 0): string {
   return `${connectionEpoch}:${process.pid}`;
+}
+
+export function providerTracePanelKey(pid: string, connectionEpoch = 0): string {
+  return `${connectionEpoch}:${pid}`;
 }
 
 export function adminRefreshKey(process: RuntimeProcess, snapshot: RuntimeSnapshot): string {

@@ -147,7 +147,7 @@ describe("deriveUserConversation", () => {
 
 function snapshot(): RuntimeSnapshot {
   return {
-    schema_version: 2,
+    schema_version: 3,
     db: "local",
     scheduler: {
       auto_run: true,
@@ -282,6 +282,7 @@ function snapshot(): RuntimeSnapshot {
     ],
     llm_calls: [
       {
+        schema_version: 1,
         call_id: "llm_1",
         pid: "pid_1",
         image_id: "coding-agent:v0",
@@ -289,14 +290,17 @@ function snapshot(): RuntimeSnapshot {
         status: "ok",
         api: "chat",
         model: "mock",
-        request_options: { llm_profile_id: "default" },
-        response_content: "raw model output",
-        tool_calls: [],
         usage: { total_tokens: 12 },
-        reasoning: null,
         error: null,
         created_at: "2026-06-19T01:00:01.000Z",
-        completed_at: "2026-06-19T01:00:02.000Z"
+        completed_at: "2026-06-19T01:00:02.000Z",
+        request_id: null,
+        response_id: null,
+        attempt_count: 1,
+        coverage: "legacy_final_only",
+        selected_attempt: 1,
+        reasoning_availability: "not_returned",
+        payload_retention_tier: "full"
       }
     ],
     tools: [],

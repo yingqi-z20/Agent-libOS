@@ -35,7 +35,8 @@ export function Timeline({
   llmCalls,
   events,
   audit,
-  onExplainEvidence
+  onExplainEvidence,
+  onOpenLlmTrace
 }: {
   pid: string | null;
   messages: ProcessMessage[];
@@ -44,6 +45,7 @@ export function Timeline({
   events: RuntimeEvent[];
   audit: AuditRecord[];
   onExplainEvidence?(kind: string, id: string): void;
+  onOpenLlmTrace?(callId: string): void;
 }) {
   const { formatTime, t } = useI18n();
   const [filter, setFilter] = useState<TimelineFilter>("activity");
@@ -159,6 +161,15 @@ export function Timeline({
                     {t("timeline.explain")}
                   </button>
                 ) : null}
+                {entry.kind === "llm" && onOpenLlmTrace ? (
+                  <button
+                    type="button"
+                    className="timelineExplain timelineTrace"
+                    onClick={() => onOpenLlmTrace(entry.item.call_id)}
+                  >
+                    {t("timeline.trace")}
+                  </button>
+                ) : null}
                 <div className="timelineJsonOperation" role="group" aria-live="off">
                   <CollapsibleJson value={entry.item} />
                 </div>
@@ -201,7 +212,7 @@ export function timelineItemRevision(entry: TimelineItem): string {
   if (entry.kind === "message") return `${key}:${entry.item.status}:${contentRevision(entry.item.subject)}:${contentRevision(entry.item.body)}`;
   if (entry.kind === "human") return `${key}:${entry.item.status}:${entry.item.updated_at}`;
   if (entry.kind === "llm") {
-    return `${key}:${entry.item.status}:${entry.item.completed_at ?? ""}:${contentRevision(entry.item.response_content)}:${entry.item.error ?? ""}`;
+    return `${key}:${entry.item.status}:${entry.item.completed_at ?? ""}:${entry.item.attempt_count}:${entry.item.reasoning_availability}:${entry.item.payload_retention_tier}`;
   }
   return key;
 }
@@ -285,7 +296,7 @@ function summary(entry: TimelineItem, t: (key: TranslationKey) => string) {
   if (entry.kind === "message") return entry.item.subject || entry.item.body || t("timeline.emptyMessage");
   if (entry.kind === "human" && isHumanOutput(entry.item)) return String(entry.item.payload.message ?? t("timeline.emptyOutput"));
   if (entry.kind === "human") return String(entry.item.payload?.question ?? entry.item.payload?.type ?? t("timeline.humanInteraction"));
-  if (entry.kind === "llm") return entry.item.error ?? entry.item.response_content ?? entry.item.purpose;
+  if (entry.kind === "llm") return entry.item.error ?? entry.item.purpose;
   if (entry.kind === "audit") return entry.item.target ?? t("timeline.auditRecord");
   return entry.item.target ?? entry.item.source;
 }

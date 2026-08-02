@@ -326,8 +326,41 @@ describe("LibOSClient", () => {
     );
   });
 
+  it("uses process-bound cursor routes for LLM trace list, detail, and content", async () => {
+    const call = llmCallSummaryFixture("pid/1", "call/1");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [call], next_cursor: "next/list", has_more: true }))
+      .mockResolvedValueOnce(jsonResponse(llmCallDetailFixture(call)))
+      .mockResolvedValueOnce(jsonResponse({
+        schema_version: 1,
+        pid: "pid/1",
+        call_id: "call/1",
+        field: "attempt_reasoning",
+        attempt_sequence: 1,
+        content: "reasoning",
+        next_cursor: null,
+        has_more: false,
+        content_hash: "a".repeat(64),
+        retention_tier: "full"
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.listProcessLlmCalls("pid/1", 25, "before/1");
+    await client.getProcessLlmCall("pid/1", "call/1");
+    await client.getProcessLlmCallContent("pid/1", "call/1", "attempt_reasoning", {
+      attemptSequence: 1,
+      cursor: "signed/0",
+      limit: 32_768
+    });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "http://127.0.0.1:1/api/processes/pid%2F1/llm-calls?limit=25&cursor=before%2F1", expect.objectContaining({ method: "GET" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "http://127.0.0.1:1/api/processes/pid%2F1/llm-calls/call%2F1", expect.objectContaining({ method: "GET" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "http://127.0.0.1:1/api/processes/pid%2F1/llm-calls/call%2F1/content?field=attempt_reasoning&limit=32768&attempt_sequence=1&cursor=signed%2F0", expect.objectContaining({ method: "GET" }));
+  });
+
   it("rejects malformed snapshots and retains structured API error context", async () => {
-    const malformedFetch = mockFetch({ schema_version: 2, db: "local", scheduler: {}, processes: [] });
+    const malformedFetch = mockFetch({ schema_version: 3, db: "local", scheduler: {}, processes: [] });
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
     await expect(client.snapshot()).rejects.toThrow(/scheduler/);
     expect(malformedFetch).toHaveBeenCalledTimes(1);
@@ -745,5 +778,65 @@ function taskRunSummary() {
     blockers: [],
     retention: "purge_on_terminal",
     payloads_purged: false
+  };
+}
+
+function llmCallSummaryFixture(pid = "pid_1", callId = "call_1") {
+  return {
+    schema_version: 1,
+    call_id: callId,
+    pid,
+    image_id: "coding-agent:v0",
+    purpose: "agent_loop",
+    status: "ok",
+    api: "responses",
+    model: "test-model",
+    usage: {},
+    error: null,
+    created_at: "2030-01-01T00:00:00Z",
+    completed_at: "2030-01-01T00:00:01Z",
+    request_id: "req_1",
+    response_id: "resp_1",
+    attempt_count: 1,
+    coverage: "complete",
+    selected_attempt: 1,
+    reasoning_availability: "returned",
+    payload_retention_tier: "full"
+  };
+}
+
+function llmCallDetailFixture(call: ReturnType<typeof llmCallSummaryFixture>) {
+  return {
+    schema_version: 1,
+    call,
+    attempts: [{
+      sequence: 1,
+      kind: "initial",
+      api: "responses",
+      status: "ok",
+      model: "test-model",
+      request_id: "req_1",
+      response_id: "resp_1",
+      reasoning_availability: "returned",
+      reasoning_blocks: [],
+      output_availability: "returned",
+      tool_names: [],
+      tool_call_count: 0,
+      usage: {},
+      started_at: "2030-01-01T00:00:00Z",
+      completed_at: "2030-01-01T00:00:01Z",
+      duration_ms: 1000,
+      error: null
+    }],
+    content: [{
+      field: "attempt_reasoning",
+      attempt_sequence: 1,
+      availability: "available",
+      content_type: "text",
+      size_bytes: 9,
+      size_chars: 9,
+      content_hash: "a".repeat(64),
+      cursor: "signed/0"
+    }]
   };
 }

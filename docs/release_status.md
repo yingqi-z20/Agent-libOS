@@ -1,6 +1,6 @@
-# Agent libOS 1.3.2 Status
+# Agent libOS 1.3.3 Status
 
-Agent libOS 1.3.2 is a release candidate for the core Python runtime scope
+Agent libOS 1.3.3 is a release candidate for the core Python runtime scope
 defined in `docs/support_matrix.md`. Release-ready status for any source tree is
 conditional on that exact tree passing the checked-in CI workflow; local
 deterministic results do not substitute for its Python-version, PostgreSQL, and
@@ -26,7 +26,7 @@ checkout or candidate artifact.
   one root AgentProcess tree. They persist requirements, idempotent command
   receipts, append-only ledger links, and locally integrity-bound resume points;
   they do not introduce a generic workflow DSL or distributed scheduler.
-- RuntimeStore schema v4 is the only store format accepted by 1.3.2. A schema
+- RuntimeStore schema v4 is the only store format accepted by 1.3.3. A schema
   v3 store is rejected before initialization or any write and remains
   archive-only under 1.0.1; this release has no migration, read-only bridge, or
   dual-schema mode.
@@ -50,6 +50,11 @@ checkout or candidate artifact.
   the aggregate maximum before model-selected tools run. No UI or documentation
   may present this logical-call boundary as an exact physical-request,
   Provider-billing, currency, or monetary-spend cap.
+- The built-in OpenAI-compatible client records a bounded terminal Provider
+  attempt trace for each logical call, including explicit transport retries and
+  protocol fallbacks. The loopback GUI exposes summary-only snapshot/SSE state
+  and selected-process, on-demand retained content; custom-client traces are
+  explicitly incomplete and no view is described as hidden chain of thought.
 
 - `Runtime.git` is a typed system-Git provider pinned to the workspace root.
   It validates repository/config/executable identity, uses state-token CAS and
@@ -226,7 +231,7 @@ checkout or candidate artifact.
 - The Durable Task Run gate requires fresh schema-v4 SQLite/PostgreSQL shape,
   v3 zero-write refusal, revision/command conflicts, stale Runtime-epoch
   fencing, plaintext opt-in and terminal purge, unknown-effect/ObjectTask
-  blocking, checkpoint intersection refusal, and GUI schema-v2 behavior. Its
+  blocking, checkpoint intersection refusal, and GUI snapshot schema-v3 behavior. Its
   crash harness exercises `os._exit` and `SIGKILL` durability barriers through
   a real action/tool/protected-provider path against an independently fsynced,
   idempotency-keyed provider ledger. A second reopen must leave the complete
@@ -307,7 +312,7 @@ checkout or candidate artifact.
   The profile must validate exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The `release-artifacts` CI job is configured to build one canonical 1.3.2
+- The `release-artifacts` CI job is configured to build one canonical 1.3.3
   wheel/source pair, reject extra or non-regular output, and record an exact
   checksum manifest.
   Python 3.11 through 3.14 smoke jobs download and verify that same pair, install
@@ -327,7 +332,7 @@ endpoint to read a policy and CSV, compute a report, emit `human_output`, and
 exit. No provenance-bearing report for that run is checked in with the source
 revision, model/profile identity, redacted configuration, environment, and raw
 test outcome needed to reproduce or compare it. It is therefore an unarchived
-observation, not Agent libOS 1.3.2 release evidence, and supports no call-count,
+observation, not Agent libOS 1.3.3 release evidence, and supports no call-count,
 token-count, approval-count, latency, or serial-versus-parallel claim. Promote a
 future rerun only after using a documented opt-in real-model gate and preserving
 its reproducible report outside this status summary.
@@ -364,7 +369,7 @@ its reproducible report outside this status summary.
   non-bare workspace repository and system Git 2.26 or newer; unavailable Git
   fails individual calls without preventing Runtime startup. Host-configured
   remotes are the only first-class Git network exception. There is no Git CLI,
-  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.3.2.
+  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.3.3.
 
 ## Remaining environment gates and non-blocking debt
 

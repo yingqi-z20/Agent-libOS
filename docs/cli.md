@@ -246,7 +246,7 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint --actor-pid <actor_pid> i
 
 ## Persistent Runtime Basics
 
-Agent libOS 1.3.2 opens only store schema v4. A schema-v3 database from 1.0.1
+Agent libOS 1.3.3 opens only store schema v4. A schema-v3 database from 1.0.1
 is rejected before `init`, recovery, audit, or any other write; use 1.0.1 to
 inspect/archive it. There is no v3 migration or read-only compatibility mode.
 

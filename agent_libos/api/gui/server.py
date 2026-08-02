@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import math
 import secrets
@@ -22,6 +24,10 @@ from pydantic import ValidationError as PydanticValidationError
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, load_config_file, load_config_from_project_root
+from agent_libos.evidence.payload_retention import (
+    PayloadRetentionTier,
+    llm_call_payload_retention_tier,
+)
 from agent_libos.llm.user_profiles import (
     UserLLMProfileStore,
     default_user_llm_profiles_path,
@@ -29,12 +35,14 @@ from agent_libos.llm.user_profiles import (
     serialize_user_llm_profile,
     summarize_llm_profile,
 )
+from agent_libos.llm.usage import canonicalize_llm_usage
 from agent_libos.models import (
     CapabilityRight,
     CapabilitySpec,
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
+    LLMCallRecord,
     ObjectRight,
     ProcessMessageKind,
     ProcessSignal,
@@ -62,6 +70,86 @@ _GUI_DEFAULTS = DEFAULT_CONFIG.gui
 _GUI_PRODUCTION_RENDERER_ORIGIN = "agent-libos://app"
 _TERMINAL = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 _TASK_RUN_PAGE_MAX_ITEMS = 500
+_GUI_LLM_CONTENT_DEFAULT_BYTES = 32 * 1024
+_GUI_LLM_CONTENT_MAX_BYTES = 64 * 1024
+_GUI_LLM_CONTENT_TOTAL_BYTES = 4 * 1024 * 1024
+_GUI_LLM_CURSOR_MAX_CHARS = 4_096
+_GUI_LLM_TRACE_MAX_ATTEMPTS = 256
+_GUI_LLM_TRACE_MAX_BLOCKS = 4_096
+_GUI_LLM_REASONING_MAX_DEPTH = 32
+_GUI_LLM_REASONING_MAX_NODES = 4_096
+_GUI_LLM_REASONING_TEXT_MAX_CHARS = 262_144
+_GUI_LLM_REASONING_TEXT_MAX_BYTES = 1_048_576
+_GUI_LLM_REASONING_AGGREGATE_BYTES = 2 * 1_048_576
+_GUI_LLM_CONTENT_FIELDS = frozenset(
+    {
+        "messages",
+        "tools",
+        "request_options",
+        "raw_response",
+        "response_content",
+        "attempt_reasoning",
+        "attempt_output",
+        "attempt_tool_calls",
+    }
+)
+_GUI_LLM_ATTEMPT_FIELDS = frozenset(
+    {"attempt_reasoning", "attempt_output", "attempt_tool_calls"}
+)
+_GUI_LLM_REASONING_AVAILABILITY = frozenset(
+    {"returned", "not_returned", "not_persisted", "purged", "limited"}
+)
+_GUI_LLM_REDACTED_KEY_MARKERS = (
+    "api_key",
+    "authorization",
+    "bearer",
+    "blob",
+    "ciphertext",
+    "credential",
+    "encrypted",
+    "opaque",
+    "password",
+    "secret",
+    "signed",
+    "signature",
+)
+_GUI_LLM_REDACTED_TOKEN_KEYS = frozenset(
+    {
+        "access_token",
+        "accesstoken",
+        "apikey",
+        "api_token",
+        "apitoken",
+        "auth_token",
+        "authtoken",
+        "id_token",
+        "idtoken",
+        "refresh_token",
+        "refreshtoken",
+        "session_token",
+        "sessiontoken",
+        "token",
+    }
+)
+_GUI_LLM_REDACTED_COOKIE_KEYS = frozenset(
+    {
+        "cookie",
+        "cookies",
+        "set_cookie",
+        "setcookie",
+    }
+)
+_GUI_LLM_LEGACY_REASONING_KEYS = frozenset(
+    {
+        "content",
+        "reasoning",
+        "reasoning_content",
+        "summary",
+        "summary_text",
+        "thinking",
+        "thinking_content",
+    }
+)
 _CONFIG_DEFAULT = object()
 _SUMMARY_UNSET = object()
 _GUI_BOOL_FIELDS = {
@@ -405,6 +493,1149 @@ class GuiServerError(Exception):
         super().__init__(message)
         self.status = status
         self.details = details or {}
+
+
+@dataclass(frozen=True, slots=True)
+class _GuiLlmContent:
+    availability: str
+    content_type: str
+    text: str | None
+
+    @property
+    def content_hash(self) -> str | None:
+        if self.text is None:
+            return None
+        return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+
+    @property
+    def size_bytes(self) -> int | None:
+        return None if self.text is None else len(self.text.encode("utf-8"))
+
+    @property
+    def size_chars(self) -> int | None:
+        return None if self.text is None else len(self.text)
+
+
+def _gui_llm_cursor_encode(
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    secret: str,
+) -> str:
+    encoded = json.dumps(
+        {"kind": kind, "schema_version": 1, **payload},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        kind.encode("ascii") + b"\0" + encoded,
+        hashlib.sha256,
+    ).digest()
+    return ".".join(
+        (
+            kind,
+            base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("="),
+            base64.urlsafe_b64encode(signature).decode("ascii").rstrip("="),
+        )
+    )
+
+
+def _gui_llm_cursor_decode(
+    cursor: str,
+    *,
+    kind: str,
+    secret: str,
+) -> dict[str, Any]:
+    if not isinstance(cursor, str) or not cursor or len(cursor) > _GUI_LLM_CURSOR_MAX_CHARS:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid LLM trace cursor",
+            details={"code": "invalid_cursor"},
+        )
+    parts = cursor.split(".")
+    if len(parts) != 3 or parts[0] != kind:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid LLM trace cursor",
+            details={"code": "invalid_cursor"},
+        )
+    try:
+        encoded = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+        signature = base64.urlsafe_b64decode(parts[2] + "=" * (-len(parts[2]) % 4))
+        expected = hmac.new(
+            secret.encode("utf-8"),
+            kind.encode("ascii") + b"\0" + encoded,
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("signature mismatch")
+        value = bounded_json_loads(encoded, max_bytes=_GUI_LLM_CURSOR_MAX_CHARS)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid LLM trace cursor",
+            details={"code": "invalid_cursor"},
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("kind") != kind
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+    ):
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid LLM trace cursor",
+            details={"code": "invalid_cursor"},
+        )
+    return value
+
+
+def _gui_llm_retention_availability(tier: PayloadRetentionTier) -> str:
+    if tier is PayloadRetentionTier.SUMMARY:
+        return "not_persisted"
+    if tier is PayloadRetentionTier.HASH_ONLY:
+        return "purged"
+    return "not_returned"
+
+
+def _gui_llm_optional_text(value: Any, *, limit: int = 1_024) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return value[:limit]
+
+
+def _gui_llm_nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _gui_llm_nonnegative_number(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    selected = float(value)
+    if not math.isfinite(selected) or selected < 0:
+        return None
+    return value
+
+
+def _gui_llm_usage(value: Any, *, api: str | None) -> dict[str, int]:
+    usage, _invalid = canonicalize_llm_usage(value, api=api)
+    return usage
+
+
+def _gui_llm_attempt_error(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        error_type = _gui_llm_optional_text(value.get("error_type"), limit=128)
+        message_bytes = _gui_llm_nonnegative_int(value.get("message_bytes"))
+        message_sha256 = _gui_llm_optional_text(value.get("message_sha256"), limit=64)
+        status_code = value.get("status_code")
+        if type(status_code) is not int or not 100 <= status_code <= 599:
+            status_code = None
+        if message_sha256 is not None and (
+            len(message_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in message_sha256)
+        ):
+            message_sha256 = None
+        return {
+            "error_type": error_type,
+            "message_bytes": message_bytes,
+            "message_sha256": message_sha256,
+            "status_code": status_code,
+        }
+    text = str(value)
+    encoded = text.encode("utf-8", errors="replace")
+    return {
+        "error_type": "legacy_error",
+        "message_bytes": len(encoded),
+        "message_sha256": hashlib.sha256(encoded).hexdigest(),
+        "status_code": None,
+    }
+
+
+def _gui_llm_valid_digest(value: Any) -> str | None:
+    digest = _gui_llm_optional_text(value, limit=64)
+    if digest is None or len(digest) != 64:
+        return None
+    if any(character not in "0123456789abcdef" for character in digest):
+        return None
+    return digest
+
+
+def _gui_llm_reasoning_block_projection(
+    raw_block: Any,
+) -> tuple[dict[str, Any], str | None] | None:
+    if not isinstance(raw_block, dict):
+        return None
+    raw_type = raw_block.get("type")
+    block_type = "reasoning_text" if raw_type == "text" else raw_type
+    if block_type not in {
+        "summary_text",
+        "reasoning_text",
+        "opaque",
+        "omitted",
+    }:
+        return None
+    source = _gui_llm_optional_text(raw_block.get("source"), limit=128)
+    reason = raw_block.get("reason")
+    if reason not in {
+        "bounds",
+        "aggregate_limit",
+        "structure_limit",
+        "node_limit",
+        "non_finite_number",
+    }:
+        reason = None
+    chars = _gui_llm_nonnegative_int(raw_block.get("chars"))
+    byte_count = _gui_llm_nonnegative_int(raw_block.get("bytes"))
+    digest = _gui_llm_valid_digest(raw_block.get("sha256"))
+    readable = None
+    text_value = raw_block.get("text")
+    if block_type in {"summary_text", "reasoning_text"} and isinstance(
+        text_value,
+        str,
+    ):
+        encoded = text_value.encode("utf-8")
+        readable = text_value
+        chars = len(text_value)
+        byte_count = len(encoded)
+        digest = hashlib.sha256(encoded).hexdigest()
+    return (
+        {
+            "type": block_type,
+            "source": source,
+            "reason": reason,
+            "chars": chars,
+            "bytes": byte_count,
+            "sha256": digest,
+        },
+        readable,
+    )
+
+
+def _gui_llm_reasoning_projection(
+    value: Any,
+    *,
+    tier: PayloadRetentionTier,
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    if tier is not PayloadRetentionTier.FULL:
+        return _gui_llm_retention_availability(tier), [], None
+    if not isinstance(value, dict):
+        if value is None:
+            return "not_returned", [], None
+        serialized = _gui_llm_json_text(value)
+        return (
+            "returned" if serialized is not None else "limited",
+            [],
+            serialized,
+        )
+    availability = value.get("availability")
+    if availability not in _GUI_LLM_REASONING_AVAILABILITY:
+        availability = "not_returned"
+    blocks = value.get("blocks")
+    if not isinstance(blocks, list):
+        blocks = []
+    metadata: list[dict[str, Any]] = []
+    readable: list[str] = []
+    for raw_block in blocks[:_GUI_LLM_TRACE_MAX_BLOCKS]:
+        projected = _gui_llm_reasoning_block_projection(raw_block)
+        if projected is None:
+            continue
+        block, text_value = projected
+        metadata.append(block)
+        if text_value is not None:
+            readable.append(text_value)
+    if len(blocks) > _GUI_LLM_TRACE_MAX_BLOCKS:
+        availability = "limited"
+    text = "\n\n".join(readable) if readable else None
+    if availability == "returned" and text is None:
+        availability = "not_returned"
+    if availability == "limited" and text is None:
+        text = ""
+    return str(availability), metadata, text
+
+
+def _gui_llm_json_text(value: Any) -> str | None:
+    try:
+        return json.dumps(
+            to_jsonable(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        )
+    except (OverflowError, RecursionError, TypeError, ValueError):
+        return None
+
+
+def _gui_llm_is_sensitive_key(value: Any) -> bool:
+    selected = str(value).strip().lower().replace("-", "_")
+    compact = selected.replace("_", "")
+    if any(marker in selected for marker in _GUI_LLM_REDACTED_KEY_MARKERS):
+        return True
+    if (
+        selected in _GUI_LLM_REDACTED_TOKEN_KEYS
+        or compact in _GUI_LLM_REDACTED_TOKEN_KEYS
+        or selected in _GUI_LLM_REDACTED_COOKIE_KEYS
+        or compact in _GUI_LLM_REDACTED_COOKIE_KEYS
+    ):
+        return True
+    return selected.endswith(("_token", "_cookie", "_cookies"))
+
+
+def _gui_llm_opaque_block(value: Any, *, source: str) -> dict[str, Any]:
+    if isinstance(value, bytes):
+        encoded = value
+    elif isinstance(value, bytearray):
+        encoded = bytes(value)
+    elif isinstance(value, str):
+        encoded = value.encode("utf-8", errors="replace")
+    else:
+        serialized = _gui_llm_json_text(value)
+        encoded = (serialized or type(value).__name__).encode(
+            "utf-8",
+            errors="replace",
+        )
+    return {
+        "type": "opaque",
+        "source": source[:128],
+        "bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _gui_llm_legacy_reasoning_view(value: Any) -> dict[str, Any]:
+    """Project legacy reasoning without exposing opaque Provider material."""
+
+    blocks: list[dict[str, Any]] = []
+    nodes = 0
+    text_bytes = 0
+    limited = False
+
+    def omit(current: Any, *, source: str, reason: str) -> None:
+        nonlocal limited
+        digest = _gui_llm_opaque_block(current, source=source)
+        blocks.append(
+            {
+                "type": "omitted",
+                "source": source[:128],
+                "reason": reason,
+                "bytes": digest["bytes"],
+                "sha256": digest["sha256"],
+            }
+        )
+        limited = True
+
+    def add_text(current: str, *, source: str, block_type: str) -> None:
+        nonlocal text_bytes, limited
+        encoded = current.encode("utf-8", errors="replace")
+        digest = hashlib.sha256(encoded).hexdigest()
+        if (
+            len(current) > _GUI_LLM_REASONING_TEXT_MAX_CHARS
+            or len(encoded) > _GUI_LLM_REASONING_TEXT_MAX_BYTES
+        ):
+            blocks.append(
+                {
+                    "type": "omitted",
+                    "source": source[:128],
+                    "reason": "bounds",
+                    "chars": len(current),
+                    "bytes": len(encoded),
+                    "sha256": digest,
+                }
+            )
+            limited = True
+            return
+        if text_bytes + len(encoded) > _GUI_LLM_REASONING_AGGREGATE_BYTES:
+            blocks.append(
+                {
+                    "type": "omitted",
+                    "source": source[:128],
+                    "reason": "aggregate_limit",
+                    "chars": len(current),
+                    "bytes": len(encoded),
+                    "sha256": digest,
+                }
+            )
+            limited = True
+            return
+        text_bytes += len(encoded)
+        blocks.append(
+            {
+                "type": block_type,
+                "source": source[:128],
+                "text": current,
+            }
+        )
+
+    def visit_sequence(
+        current: list[Any] | tuple[Any, ...],
+        *,
+        source: str,
+        depth: int,
+        readable: bool,
+    ) -> None:
+        nonlocal nodes
+        for child in current:
+            if nodes >= _GUI_LLM_REASONING_MAX_NODES:
+                omit(child, source=source, reason="bounds")
+                break
+            nodes += 1
+            visit(
+                child,
+                source=source,
+                depth=depth + 1,
+                readable=readable,
+                count_node=False,
+            )
+
+    def visit_mapping(
+        current: dict[Any, Any],
+        *,
+        source: str,
+        depth: int,
+    ) -> None:
+        nonlocal nodes
+        marker = str(current.get("type") or "").lower()
+        if marker and _gui_llm_is_sensitive_key(marker):
+            blocks.append(_gui_llm_opaque_block(current, source=source))
+            return
+
+        for raw_key, child in current.items():
+            key = str(raw_key).strip().lower().replace("-", "_")
+            if nodes >= _GUI_LLM_REASONING_MAX_NODES:
+                omit(current, source=source, reason="bounds")
+                return
+            nodes += 1
+            if _gui_llm_is_sensitive_key(key):
+                blocks.append(
+                    _gui_llm_opaque_block(
+                        child,
+                        source=f"{source}.{key}",
+                    )
+                )
+
+        if marker in {"summary_text", "reasoning_text"} and isinstance(
+            current.get("text"),
+            str,
+        ):
+            add_text(
+                current["text"],
+                source=f"{source}.text",
+                block_type=marker,
+            )
+            return
+
+        for raw_key, child in current.items():
+            key = str(raw_key).strip().lower().replace("-", "_")
+            if key not in _GUI_LLM_LEGACY_REASONING_KEYS:
+                continue
+            visit(
+                child,
+                source=f"{source}.{key}",
+                depth=depth + 1,
+                readable=True,
+                count_node=False,
+            )
+
+    def visit(
+        current: Any,
+        *,
+        source: str,
+        depth: int,
+        readable: bool,
+        count_node: bool = True,
+    ) -> None:
+        nonlocal nodes, limited
+        if current is None or current == "":
+            return
+        if count_node:
+            nodes += 1
+        if depth > _GUI_LLM_REASONING_MAX_DEPTH or nodes > _GUI_LLM_REASONING_MAX_NODES:
+            omit(current, source=source, reason="bounds")
+            return
+        if isinstance(current, str):
+            if readable:
+                add_text(
+                    current,
+                    source=source,
+                    block_type=(
+                        "summary_text" if "summary" in source else "reasoning_text"
+                    ),
+                )
+            return
+        if isinstance(current, (bytes, bytearray)):
+            blocks.append(_gui_llm_opaque_block(current, source=source))
+            return
+        if isinstance(current, (list, tuple)):
+            visit_sequence(
+                current,
+                source=source,
+                depth=depth,
+                readable=readable,
+            )
+            return
+        if isinstance(current, dict):
+            visit_mapping(current, source=source, depth=depth)
+            return
+        try:
+            jsonable = to_jsonable(current)
+        except BaseException:
+            return
+        if jsonable is not current:
+            visit(
+                jsonable,
+                source=source,
+                depth=depth + 1,
+                readable=readable,
+            )
+
+    visit(value, source="reasoning", depth=0, readable=True)
+    readable_blocks = any(
+        block.get("type") in {"summary_text", "reasoning_text"}
+        for block in blocks
+    )
+    return {
+        "availability": (
+            "limited" if limited else "returned" if readable_blocks else "not_returned"
+        ),
+        "blocks": blocks,
+    }
+
+
+def _gui_llm_redacted_projection(value: Any) -> Any:
+    """Remove credential and opaque blob values from explicit raw reveals."""
+
+    nodes = 0
+
+    def redacted(item: Any) -> dict[str, Any]:
+        encoded = _gui_llm_json_text(item)
+        payload = (encoded or "").encode("utf-8")
+        return {
+            "kind": "redacted",
+            "bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+
+    def project(current: Any, depth: int) -> Any:
+        nonlocal nodes
+        nodes += 1
+        if nodes > 4_096 or depth > 32:
+            return {"kind": "omitted", "reason": "bounds"}
+        if isinstance(current, dict):
+            projected: dict[str, Any] = {}
+            sensitive_named_value = any(
+                str(key).strip().lower().replace("-", "_")
+                in {"name", "key", "header", "header_name", "headername"}
+                and isinstance(item, str)
+                and _gui_llm_is_sensitive_key(item)
+                for key, item in current.items()
+            )
+            for key, item in list(current.items())[:4_096]:
+                selected_key = str(key)
+                normalized_key = selected_key.strip().lower().replace("-", "_")
+                if _gui_llm_is_sensitive_key(selected_key) or (
+                    sensitive_named_value
+                    and normalized_key
+                    not in {"name", "key", "header", "header_name", "headername"}
+                ):
+                    projected[selected_key] = redacted(item)
+                else:
+                    projected[selected_key] = project(item, depth + 1)
+            if len(current) > len(projected):
+                projected["_omitted"] = {
+                    "kind": "omitted",
+                    "reason": "bounds",
+                }
+            return projected
+        if isinstance(current, list):
+            if (
+                len(current) >= 2
+                and isinstance(current[0], str)
+                and _gui_llm_is_sensitive_key(current[0])
+            ):
+                return [current[0][:256], *(redacted(item) for item in current[1:])]
+            projected_list = [project(item, depth + 1) for item in current[:4_096]]
+            if len(current) > len(projected_list):
+                projected_list.append({"kind": "omitted", "reason": "bounds"})
+            return projected_list
+        return to_jsonable(current)
+
+    return project(value, 0)
+
+
+def _gui_llm_safe_trace_summary(record: LLMCallRecord) -> dict[str, Any] | None:
+    options = record.request_options
+    if not isinstance(options, dict):
+        return None
+    summary = options.get("provider_trace_summary")
+    if (
+        not isinstance(summary, dict)
+        or type(summary.get("schema_version")) is not int
+        or summary["schema_version"] != 1
+    ):
+        return None
+    coverage = summary.get("coverage")
+    if coverage not in {"complete", "custom_client_incomplete", "legacy_final_only"}:
+        return None
+    attempt_count = _gui_llm_nonnegative_int(summary.get("attempt_count"))
+    recorded_attempt_count = _gui_llm_nonnegative_int(
+        summary.get("recorded_attempt_count")
+    )
+    selected_attempt = summary.get("selected_attempt")
+    if (
+        isinstance(selected_attempt, bool)
+        or not isinstance(selected_attempt, int)
+        or selected_attempt <= 0
+    ):
+        selected_attempt = None
+    if attempt_count is None or attempt_count > _GUI_LLM_TRACE_MAX_ATTEMPTS:
+        attempt_count = min(
+            _GUI_LLM_TRACE_MAX_ATTEMPTS,
+            recorded_attempt_count or 0,
+        )
+    if selected_attempt is not None and selected_attempt > attempt_count:
+        selected_attempt = None
+    return {
+        "coverage": coverage,
+        "attempt_count": attempt_count,
+        "recorded_attempt_count": min(
+            _GUI_LLM_TRACE_MAX_ATTEMPTS,
+            recorded_attempt_count or 0,
+        ),
+        "selected_attempt": selected_attempt,
+        "limited": bool(summary.get("limited")),
+    }
+
+
+def _gui_llm_is_provider_trace(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("kind") == "provider_trace"
+        and type(value.get("schema_version")) is int
+        and value["schema_version"] == 1
+        and value.get("coverage")
+        in {"complete", "custom_client_incomplete", "legacy_final_only"}
+        and isinstance(value.get("attempts"), list)
+    )
+
+
+def _gui_llm_tool_names(value: Any) -> tuple[list[str], int]:
+    if not isinstance(value, list):
+        return [], 0
+    names: list[str] = []
+    for item in value[:4_096]:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str):
+            function = item.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+        if isinstance(name, str) and name and name not in names:
+            names.append(name[:256])
+    return names, min(len(value), 4_096)
+
+
+def _gui_llm_is_legacy_responses_config(value: Any, *, api: str | None) -> bool:
+    """Recognize the pre-trace Responses reasoning configuration object."""
+
+    if api != "responses" or not isinstance(value, dict):
+        return False
+    marker = str(value.get("type") or "").strip().lower()
+    if marker in {"reasoning", "summary_text", "reasoning_text"}:
+        return False
+    normalized_keys = {
+        str(key).strip().lower().replace("-", "_") for key in value
+    }
+    if normalized_keys.intersection(
+        {"content", "reasoning", "reasoning_content", "thinking", "thinking_content"}
+    ):
+        return False
+    config_keys = {"effort", "generate_summary", "summary"}
+    return bool(normalized_keys) and (
+        normalized_keys.issubset(config_keys)
+        or bool(normalized_keys.intersection({"effort", "generate_summary"}))
+    )
+
+
+def _gui_llm_normalize_trace_attempt(
+    raw: Any,
+    *,
+    fallback_sequence: int,
+    record: LLMCallRecord,
+    tier: PayloadRetentionTier,
+) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    sequence = raw.get("sequence")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+        sequence = fallback_sequence
+    reasoning_availability, reasoning_blocks, reasoning_text = (
+        _gui_llm_reasoning_projection(raw.get("reasoning"), tier=tier)
+    )
+    output = raw.get("output") if isinstance(raw.get("output"), str) else ""
+    if tier is not PayloadRetentionTier.FULL:
+        output_availability = _gui_llm_retention_availability(tier)
+        output_text = None
+        attempt_tool_calls: Any = None
+    else:
+        output_availability = "returned" if output else "not_returned"
+        if isinstance(raw.get("output_limited"), dict):
+            output_availability = "limited"
+        output_text = output if output or output_availability == "limited" else None
+        attempt_tool_calls = raw.get("tool_calls")
+        if not isinstance(attempt_tool_calls, list):
+            attempt_tool_calls = []
+    tool_names, tool_call_count = _gui_llm_tool_names(attempt_tool_calls)
+    api = _gui_llm_optional_text(raw.get("api"), limit=64) or record.api
+    status = raw.get("status") if raw.get("status") in {"ok", "error"} else "error"
+    kind = _gui_llm_optional_text(raw.get("kind"), limit=64) or "initial"
+    return {
+        "sequence": int(sequence),
+        "kind": kind,
+        "api": api,
+        "status": status,
+        "model": _gui_llm_optional_text(raw.get("model"), limit=512) or record.model,
+        "request_id": _gui_llm_optional_text(raw.get("request_id"), limit=1_024),
+        "response_id": _gui_llm_optional_text(raw.get("response_id"), limit=1_024),
+        "reasoning_availability": reasoning_availability,
+        "reasoning_blocks": reasoning_blocks,
+        "output_availability": output_availability,
+        "tool_names": tool_names,
+        "tool_call_count": tool_call_count,
+        "usage": _gui_llm_usage(raw.get("usage"), api=api),
+        "started_at": _gui_llm_optional_text(raw.get("started_at"), limit=128),
+        "completed_at": _gui_llm_optional_text(raw.get("completed_at"), limit=128),
+        "duration_ms": _gui_llm_nonnegative_number(raw.get("duration_ms")),
+        "error": _gui_llm_attempt_error(raw.get("error")),
+        "_reasoning_text": reasoning_text,
+        "_output_text": output_text,
+        "_tool_calls": attempt_tool_calls,
+    }
+
+
+def _gui_llm_legacy_attempt(
+    record: LLMCallRecord,
+    *,
+    tier: PayloadRetentionTier,
+) -> dict[str, Any]:
+    if tier is PayloadRetentionTier.FULL:
+        legacy_reasoning = (
+            None
+            if _gui_llm_is_legacy_responses_config(
+                record.reasoning,
+                api=record.api,
+            )
+            else record.reasoning
+        )
+        reasoning_availability, reasoning_blocks, reasoning_text = (
+            _gui_llm_reasoning_projection(
+                _gui_llm_legacy_reasoning_view(legacy_reasoning),
+                tier=tier,
+            )
+        )
+        output_text = record.response_content if record.response_content else None
+        output_availability = "returned" if output_text is not None else "not_returned"
+        tool_calls: Any = record.tool_calls if isinstance(record.tool_calls, list) else []
+    else:
+        reasoning_text = None
+        reasoning_availability = _gui_llm_retention_availability(tier)
+        reasoning_blocks = []
+        output_text = None
+        output_availability = _gui_llm_retention_availability(tier)
+        tool_calls = None
+    tool_names, tool_call_count = _gui_llm_tool_names(tool_calls)
+    return {
+        "sequence": 1,
+        "kind": "legacy_final",
+        "api": record.api,
+        "status": record.status,
+        "model": record.model,
+        "request_id": record.request_id,
+        "response_id": record.response_id,
+        "reasoning_availability": reasoning_availability,
+        "reasoning_blocks": reasoning_blocks,
+        "output_availability": output_availability,
+        "tool_names": tool_names,
+        "tool_call_count": tool_call_count,
+        "usage": _gui_llm_usage(record.usage, api=record.api),
+        "started_at": record.created_at or None,
+        "completed_at": record.completed_at,
+        "duration_ms": None,
+        "error": _gui_llm_attempt_error(record.error),
+        "_reasoning_text": reasoning_text,
+        "_output_text": output_text,
+        "_tool_calls": tool_calls,
+    }
+
+
+def _gui_llm_normalized_trace_attempts(
+    reasoning: dict[str, Any],
+    *,
+    record: LLMCallRecord,
+    tier: PayloadRetentionTier,
+) -> tuple[int, list[dict[str, Any]]]:
+    raw_attempts = reasoning.get("attempts")
+    if not isinstance(raw_attempts, list):
+        raw_attempts = []
+    attempts: list[dict[str, Any]] = []
+    used_sequences: set[int] = set()
+    for index, raw_attempt in enumerate(raw_attempts[:_GUI_LLM_TRACE_MAX_ATTEMPTS]):
+        attempt = _gui_llm_normalize_trace_attempt(
+            raw_attempt,
+            fallback_sequence=index + 1,
+            record=record,
+            tier=tier,
+        )
+        if attempt is None:
+            continue
+        sequence = int(attempt["sequence"])
+        if sequence in used_sequences or (
+            attempts and sequence <= attempts[-1]["sequence"]
+        ):
+            sequence = attempts[-1]["sequence"] + 1 if attempts else 1
+            attempt["sequence"] = sequence
+        used_sequences.add(sequence)
+        attempts.append(attempt)
+    return len(raw_attempts), attempts
+
+
+def _gui_llm_current_trace_projection(
+    record: LLMCallRecord,
+    reasoning: dict[str, Any],
+    *,
+    tier: PayloadRetentionTier,
+    safe_summary: dict[str, Any] | None,
+) -> dict[str, Any]:
+    raw_attempt_count, attempts = _gui_llm_normalized_trace_attempts(
+        reasoning,
+        record=record,
+        tier=tier,
+    )
+    coverage = reasoning.get("coverage")
+    if coverage not in {"complete", "custom_client_incomplete", "legacy_final_only"}:
+        coverage = "complete"
+    omitted = _gui_llm_nonnegative_int(reasoning.get("omitted_attempts")) or 0
+    summary_attempt_count = (safe_summary or {}).get("attempt_count", 0)
+    attempt_count = min(
+        _GUI_LLM_TRACE_MAX_ATTEMPTS,
+        max(len(attempts) + omitted, summary_attempt_count),
+    )
+    selected_attempt = reasoning.get("selected_attempt")
+    if (
+        isinstance(selected_attempt, bool)
+        or not isinstance(selected_attempt, int)
+        or selected_attempt <= 0
+        or selected_attempt > attempt_count
+    ):
+        selected_attempt = None
+    return {
+        "tier": tier,
+        "coverage": coverage,
+        "attempt_count": attempt_count,
+        "selected_attempt": selected_attempt,
+        "limited": bool(reasoning.get("limited"))
+        or raw_attempt_count > len(attempts),
+        "attempts": attempts,
+    }
+
+
+def _gui_llm_trace_projection(record: LLMCallRecord) -> dict[str, Any]:
+    tier = llm_call_payload_retention_tier(record)
+    safe_summary = _gui_llm_safe_trace_summary(record)
+    reasoning = record.reasoning
+    invalid_provider_trace = (
+        isinstance(reasoning, dict)
+        and reasoning.get("kind") == "provider_trace"
+        and not _gui_llm_is_provider_trace(reasoning)
+    )
+    if tier is PayloadRetentionTier.FULL and invalid_provider_trace:
+        return {
+            "tier": tier,
+            "coverage": "legacy_final_only",
+            "attempt_count": 0,
+            "selected_attempt": None,
+            "limited": True,
+            "attempts": [],
+        }
+    if tier is PayloadRetentionTier.FULL and _gui_llm_is_provider_trace(reasoning):
+        return _gui_llm_current_trace_projection(
+            record,
+            reasoning,
+            tier=tier,
+            safe_summary=safe_summary,
+        )
+    if tier is not PayloadRetentionTier.FULL and safe_summary is not None:
+        return {
+            "tier": tier,
+            "coverage": safe_summary["coverage"],
+            "attempt_count": safe_summary["attempt_count"],
+            "selected_attempt": safe_summary["selected_attempt"],
+            "limited": bool(safe_summary["limited"]),
+            "attempts": [],
+        }
+    legacy = _gui_llm_legacy_attempt(record, tier=tier)
+    return {
+        "tier": tier,
+        "coverage": "legacy_final_only",
+        "attempt_count": 1,
+        "selected_attempt": 1,
+        "limited": False,
+        "attempts": [legacy] if tier is PayloadRetentionTier.FULL else [],
+    }
+
+
+def _gui_llm_call_summary(
+    record: LLMCallRecord,
+    *,
+    trace: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    selected_trace = trace or _gui_llm_trace_projection(record)
+    tier = selected_trace["tier"]
+    selected_attempt = selected_trace["selected_attempt"]
+    availability = _gui_llm_retention_availability(tier)
+    if tier is PayloadRetentionTier.FULL:
+        attempts = selected_trace["attempts"]
+        selected = next(
+            (
+                attempt
+                for attempt in attempts
+                if attempt["sequence"] == selected_attempt
+            ),
+            attempts[-1] if attempts else None,
+        )
+        availability = (
+            selected["reasoning_availability"]
+            if selected is not None
+            else "not_returned"
+        )
+        if selected_trace["limited"] and availability == "returned":
+            availability = "limited"
+    return {
+        "schema_version": 1,
+        "call_id": record.call_id,
+        "pid": record.pid,
+        "image_id": record.image_id,
+        "purpose": record.purpose,
+        "status": record.status or "unknown",
+        "api": record.api,
+        "model": record.model,
+        "usage": _gui_llm_usage(record.usage, api=record.api),
+        "error": record.error if tier is PayloadRetentionTier.FULL else None,
+        "created_at": record.created_at,
+        "completed_at": record.completed_at,
+        "request_id": record.request_id,
+        "response_id": record.response_id,
+        "attempt_count": int(selected_trace["attempt_count"]),
+        "coverage": selected_trace["coverage"],
+        "selected_attempt": selected_attempt,
+        "reasoning_availability": availability,
+        "payload_retention_tier": tier.value,
+    }
+
+
+def _gui_llm_public_attempt(attempt: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in attempt.items()
+        if not key.startswith("_")
+    }
+
+
+def _gui_llm_bound_content(content: _GuiLlmContent) -> _GuiLlmContent:
+    if content.text is None:
+        if content.availability == "limited":
+            return _GuiLlmContent(
+                availability="limited",
+                content_type=content.content_type,
+                text="",
+            )
+        return content
+    encoded = content.text.encode("utf-8")
+    if len(encoded) <= _GUI_LLM_CONTENT_TOTAL_BYTES:
+        return content
+    selected = encoded[:_GUI_LLM_CONTENT_TOTAL_BYTES].decode("utf-8", errors="ignore")
+    return _GuiLlmContent(
+        availability="limited",
+        content_type=content.content_type,
+        text=selected,
+    )
+
+
+def _gui_llm_call_content(
+    record: LLMCallRecord,
+    trace: dict[str, Any],
+    *,
+    field: str,
+    attempt_sequence: int | None,
+) -> _GuiLlmContent:
+    tier: PayloadRetentionTier = trace["tier"]
+    if field in _GUI_LLM_ATTEMPT_FIELDS:
+        attempt = next(
+            (
+                item
+                for item in trace["attempts"]
+                if item["sequence"] == attempt_sequence
+            ),
+            None,
+        )
+        if attempt is None:
+            return _GuiLlmContent(
+                availability=_gui_llm_retention_availability(tier),
+                content_type="json" if field == "attempt_tool_calls" else "text",
+                text=None,
+            )
+        if field == "attempt_reasoning":
+            return _gui_llm_bound_content(
+                _GuiLlmContent(
+                    availability=(
+                        "available"
+                        if attempt["reasoning_availability"] == "returned"
+                        else attempt["reasoning_availability"]
+                    ),
+                    content_type="text",
+                    text=attempt["_reasoning_text"],
+                )
+            )
+        if field == "attempt_output":
+            return _gui_llm_bound_content(
+                _GuiLlmContent(
+                    availability=(
+                        "available"
+                        if attempt["output_availability"] == "returned"
+                        else attempt["output_availability"]
+                    ),
+                    content_type="text",
+                    text=attempt["_output_text"],
+                )
+            )
+        serialized = (
+            _gui_llm_json_text(attempt["_tool_calls"])
+            if attempt["_tool_calls"] is not None
+            else None
+        )
+        return _gui_llm_bound_content(
+            _GuiLlmContent(
+                availability=(
+                    "available"
+                    if serialized is not None
+                    else _gui_llm_retention_availability(tier)
+                ),
+                content_type="json",
+                text=serialized,
+            )
+        )
+
+    if field == "request_options":
+        value = _gui_llm_redacted_projection(record.request_options)
+        serialized = _gui_llm_json_text(value)
+        return _gui_llm_bound_content(
+            _GuiLlmContent(
+                availability="available" if serialized is not None else "limited",
+                content_type="json",
+                text=serialized,
+            )
+        )
+    if tier is not PayloadRetentionTier.FULL:
+        return _GuiLlmContent(
+            availability=_gui_llm_retention_availability(tier),
+            content_type="text" if field == "response_content" else "json",
+            text=None,
+        )
+    if field == "response_content":
+        return _gui_llm_bound_content(
+            _GuiLlmContent(
+                availability="available",
+                content_type="text",
+                text=record.response_content,
+            )
+        )
+    value = {
+        "messages": record.messages,
+        "tools": record.tools,
+        "raw_response": (
+            _gui_llm_redacted_projection(record.raw_response)
+            if record.raw_response is not None
+            else None
+        ),
+    }[field]
+    if value is None:
+        return _GuiLlmContent(
+            availability="not_returned",
+            content_type="json",
+            text=None,
+        )
+    serialized = _gui_llm_json_text(value)
+    return _gui_llm_bound_content(
+        _GuiLlmContent(
+            availability="available" if serialized is not None else "limited",
+            content_type="json",
+            text=serialized,
+        )
+    )
+
+
+def _gui_llm_content_cursor(
+    record: LLMCallRecord,
+    *,
+    field: str,
+    attempt_sequence: int | None,
+    tier: PayloadRetentionTier,
+    content_hash: str,
+    offset: int,
+    secret: str,
+) -> str:
+    return _gui_llm_cursor_encode(
+        "llmc1",
+        {
+            "pid": record.pid,
+            "call_id": record.call_id,
+            "field": field,
+            "attempt_sequence": attempt_sequence,
+            "retention_tier": tier.value,
+            "content_hash": content_hash,
+            "offset": offset,
+        },
+        secret=secret,
+    )
+
+
+def _gui_llm_content_descriptor(
+    record: LLMCallRecord,
+    *,
+    field: str,
+    attempt_sequence: int | None,
+    content: _GuiLlmContent,
+    tier: PayloadRetentionTier,
+    secret: str,
+) -> dict[str, Any]:
+    content_hash = content.content_hash
+    return {
+        "field": field,
+        "attempt_sequence": attempt_sequence,
+        "availability": content.availability,
+        "content_type": content.content_type,
+        "size_bytes": content.size_bytes,
+        "size_chars": content.size_chars,
+        "content_hash": content_hash,
+        "cursor": (
+            _gui_llm_content_cursor(
+                record,
+                field=field,
+                attempt_sequence=attempt_sequence,
+                tier=tier,
+                content_hash=content_hash,
+                offset=0,
+                secret=secret,
+            )
+            if content_hash is not None
+            else None
+        ),
+    }
 
 
 @dataclass
@@ -772,11 +2003,13 @@ class GuiRuntimeService:
         self._db_target = db
         if runtime is None:
             self.db = display_store_target(db, config=selected_config)
-            self.runtime = Runtime.open(db, config=selected_config)
+            selected_runtime = Runtime.open(db, config=selected_config)
         else:
             display_target = db if db is not None else runtime.store.path
             self.db = display_store_target(display_target, config=selected_config)
-            self.runtime = runtime
+            selected_runtime = runtime
+        self.runtime = selected_runtime
+        self._processes = selected_runtime.uow.processes
         self.audit = self.runtime.audit
         self.owns_runtime = runtime is None
         try:
@@ -1009,6 +2242,265 @@ class GuiRuntimeService:
             return
         self.broadcaster.publish("task_run.updated", payload)
 
+    def llm_call_page(
+        self,
+        pid: str,
+        *,
+        limit: int,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        self._require_process_record(pid)
+        before: tuple[str, str] | None = None
+        if cursor is not None:
+            payload = _gui_llm_cursor_decode(
+                cursor,
+                kind="llml1",
+                secret=self.token,
+            )
+            if payload.get("pid") != pid:
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "LLM call cursor does not match the requested process",
+                    details={"code": "invalid_cursor"},
+                )
+            created_at = payload.get("created_at")
+            call_id = payload.get("call_id")
+            if (
+                not isinstance(created_at, str)
+                or not created_at
+                or not isinstance(call_id, str)
+                or not call_id
+            ):
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "invalid LLM call cursor",
+                    details={"code": "invalid_cursor"},
+                )
+            before = (created_at, call_id)
+        page = self._processes.query_llm_calls(
+            pid,
+            before=before,
+            limit=limit,
+        )
+        records = page.get("records")
+        if not isinstance(records, (list, tuple)):
+            raise TypeError("LLM call repository returned an invalid page")
+        raw_next_cursor = page.get("next_cursor")
+        next_cursor = None
+        if raw_next_cursor is not None:
+            if (
+                not isinstance(raw_next_cursor, tuple)
+                or len(raw_next_cursor) != 2
+                or any(
+                    not isinstance(item, str) or not item
+                    for item in raw_next_cursor
+                )
+            ):
+                raise TypeError("LLM call repository returned an invalid cursor")
+            next_cursor = _gui_llm_cursor_encode(
+                "llml1",
+                {
+                    "pid": pid,
+                    "created_at": raw_next_cursor[0],
+                    "call_id": raw_next_cursor[1],
+                },
+                secret=self.token,
+            )
+        return {
+            "schema_version": 1,
+            "items": [_gui_llm_call_summary(record) for record in records],
+            "next_cursor": next_cursor,
+            "has_more": next_cursor is not None,
+        }
+
+    def scoped_llm_call(self, pid: str, call_id: str) -> LLMCallRecord:
+        self._require_process_record(pid)
+        record = self._processes.get_llm_call(call_id)
+        if record is None or record.pid != pid:
+            raise GuiServerError(
+                HTTPStatus.NOT_FOUND,
+                "LLM call not found",
+                details={"code": "llm_call_not_found"},
+            )
+        return record
+
+    def _require_process_record(self, pid: str) -> Any:
+        process = self._processes.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        return process
+
+    def llm_call_detail(self, pid: str, call_id: str) -> dict[str, Any]:
+        record = self.scoped_llm_call(pid, call_id)
+        trace = _gui_llm_trace_projection(record)
+        descriptors: list[dict[str, Any]] = []
+        for field in (
+            "messages",
+            "tools",
+            "request_options",
+            "raw_response",
+            "response_content",
+        ):
+            content = _gui_llm_call_content(
+                record,
+                trace,
+                field=field,
+                attempt_sequence=None,
+            )
+            descriptors.append(
+                _gui_llm_content_descriptor(
+                    record,
+                    field=field,
+                    attempt_sequence=None,
+                    content=content,
+                    tier=trace["tier"],
+                    secret=self.token,
+                )
+            )
+        for attempt in trace["attempts"]:
+            for field in (
+                "attempt_reasoning",
+                "attempt_output",
+                "attempt_tool_calls",
+            ):
+                content = _gui_llm_call_content(
+                    record,
+                    trace,
+                    field=field,
+                    attempt_sequence=attempt["sequence"],
+                )
+                descriptors.append(
+                    _gui_llm_content_descriptor(
+                        record,
+                        field=field,
+                        attempt_sequence=attempt["sequence"],
+                        content=content,
+                        tier=trace["tier"],
+                        secret=self.token,
+                    )
+                )
+        return {
+            "schema_version": 1,
+            "call": _gui_llm_call_summary(record, trace=trace),
+            "attempts": [
+                _gui_llm_public_attempt(attempt)
+                for attempt in trace["attempts"]
+            ],
+            "content": descriptors,
+        }
+
+    def llm_call_content(
+        self,
+        pid: str,
+        call_id: str,
+        *,
+        field: str,
+        attempt_sequence: int | None,
+        cursor: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        record = self.scoped_llm_call(pid, call_id)
+        trace = _gui_llm_trace_projection(record)
+        content = _gui_llm_call_content(
+            record,
+            trace,
+            field=field,
+            attempt_sequence=attempt_sequence,
+        )
+        content_hash = content.content_hash
+        offset = 0
+        if cursor is not None:
+            payload = _gui_llm_cursor_decode(
+                cursor,
+                kind="llmc1",
+                secret=self.token,
+            )
+            expected_identity = {
+                "pid": pid,
+                "call_id": call_id,
+            }
+            if any(payload.get(key) != value for key, value in expected_identity.items()):
+                raise GuiServerError(
+                    HTTPStatus.NOT_FOUND,
+                    "LLM call not found",
+                    details={"code": "llm_call_not_found"},
+                )
+            if (
+                payload.get("field") != field
+                or payload.get("attempt_sequence") != attempt_sequence
+            ):
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "LLM trace cursor does not match the requested content field",
+                    details={"code": "invalid_cursor"},
+                )
+            if (
+                payload.get("retention_tier") != trace["tier"].value
+                or payload.get("content_hash") != content_hash
+            ):
+                raise GuiServerError(
+                    HTTPStatus.CONFLICT,
+                    "LLM trace content changed",
+                    details={"code": "content_changed"},
+                )
+            raw_offset = payload.get("offset")
+            if (
+                isinstance(raw_offset, bool)
+                or not isinstance(raw_offset, int)
+                or raw_offset < 0
+            ):
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "invalid LLM trace cursor",
+                    details={"code": "invalid_cursor"},
+                )
+            offset = raw_offset
+        if content.text is None or content_hash is None:
+            raise GuiServerError(
+                HTTPStatus.NOT_FOUND,
+                "LLM trace content is unavailable",
+                details={
+                    "code": "content_unavailable",
+                    "availability": content.availability,
+                },
+            )
+        if offset > len(content.text):
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid LLM trace cursor",
+                details={"code": "invalid_cursor"},
+            )
+        chunk, next_offset = _gui_llm_utf8_chunk(
+            content.text,
+            offset=offset,
+            max_bytes=limit,
+        )
+        next_cursor = (
+            _gui_llm_content_cursor(
+                record,
+                field=field,
+                attempt_sequence=attempt_sequence,
+                tier=trace["tier"],
+                content_hash=content_hash,
+                offset=next_offset,
+                secret=self.token,
+            )
+            if next_offset is not None
+            else None
+        )
+        return {
+            "schema_version": 1,
+            "pid": pid,
+            "call_id": call_id,
+            "field": field,
+            "attempt_sequence": attempt_sequence,
+            "content": chunk,
+            "next_cursor": next_cursor,
+            "has_more": next_cursor is not None,
+            "content_hash": content_hash,
+            "retention_tier": trace["tier"].value,
+        }
+
     def health(self) -> dict[str, Any]:
         process_count: int | None = None
         runtime_busy = not self.runtime_lock.acquire(blocking=False)
@@ -1089,7 +2581,7 @@ class GuiRuntimeService:
             static = self._static_snapshot()
             source_truncated.update(self._static_snapshot_truncated)
             snapshot = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "db": self.db,
                 "scheduler": self.scheduler.status(),
                 "processes": processes,
@@ -1097,7 +2589,12 @@ class GuiRuntimeService:
                 "human_requests": human_requests,
                 "events": to_jsonable(self._snapshot_events()),
                 "audit": to_jsonable(self._snapshot_audit()),
-                "llm_calls": to_jsonable(self.runtime.store.list_llm_calls(limit=self.runtime.config.gui.snapshot_llm_call_limit)),
+                "llm_calls": [
+                    _gui_llm_call_summary(call)
+                    for call in self.runtime.store.list_llm_calls(
+                        limit=self.runtime.config.gui.snapshot_llm_call_limit
+                    )
+                ],
                 "object_tasks": to_jsonable(self.runtime.object_tasks.list(limit=self.runtime.config.gui.snapshot_object_task_limit)),
                 **static,
             }
@@ -2234,166 +3731,367 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             return to_jsonable(task)
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown object-tasks endpoint")
 
-    def _dispatch_process(self, method: str, pid: str, route: list[str], query: dict[str, list[str]]) -> Any:
+    def _dispatch_process(
+        self,
+        method: str,
+        pid: str,
+        route: list[str],
+        query: dict[str, list[str]],
+    ) -> Any:
         service = self.server.service
         if method == "GET" and not route:
             return service._process_summary(pid, include_messages=True)
-        if method == "GET" and route == ["messages"]:
-            return to_jsonable(service.runtime.messages.list(pid, include_acked=True, limit=_query_int(query, "limit")))
-        if method == "GET" and route == ["human-requests"]:
-            return service.human_request_views(pid=pid)
-        if method == "GET" and route == ["llm-calls"]:
+        if method == "GET" and len(route) == 1 and route[0] == "messages":
+            return self._get_process_messages(pid, query)
+        if method == "GET" and len(route) == 1 and route[0] == "human-requests":
+            return self._get_process_human_requests(pid, query)
+        if method == "GET" and len(route) == 1 and route[0] == "llm-calls":
+            return self._dispatch_process_llm_get(pid, tuple(route), query)
+        if method == "GET" and len(route) == 2 and route[0] == "llm-calls":
+            return self._dispatch_process_llm_get(pid, tuple(route), query)
+        if (
+            method == "GET"
+            and len(route) == 3
+            and route[0] == "llm-calls"
+            and route[2] == "content"
+        ):
+            return self._dispatch_process_llm_get(pid, tuple(route), query)
+        if method == "GET" and len(route) == 1 and route[0] == "rating":
+            return self._get_process_rating(pid, query)
+        if method == "GET" and route == ["audit"]:
+            return self._get_process_audit(pid, query)
+        if method == "GET" and route == ["events"]:
+            return self._get_process_events(pid, query)
+        if method == "GET" and route == ["capabilities"]:
+            return self._get_process_capabilities(pid, query)
+        if method == "GET" and route == ["checkpoints"]:
+            return self._get_process_checkpoints(pid, query)
+        if method == "POST" and route == ["rating"]:
+            return self._post_process_rating(pid)
+        if method == "POST" and route == ["run"]:
+            return self._post_process_run(pid)
+        if method == "POST" and route == ["step"]:
+            return self._post_process_step(pid)
+        if method == "POST" and route == ["pause"]:
+            return self._post_process_pause(pid)
+        if method == "POST" and route == ["resume"]:
+            return self._post_process_resume(pid)
+        if method == "POST" and route == ["signal"]:
+            return self._post_process_signal(pid)
+        if method == "POST" and route == ["message"]:
+            return self._post_process_message(pid)
+        if method == "POST" and route == ["interrupt"]:
+            return self._post_process_interrupt(pid)
+        if method == "POST" and route == ["cd"]:
+            return self._post_process_cd(pid)
+        if method == "POST" and route == ["exec"]:
+            return self._post_process_exec(pid)
+        if method == "POST" and route == ["exit"]:
+            return self._post_process_exit(pid)
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown process endpoint")
+
+    def _dispatch_process_llm_get(
+        self,
+        pid: str,
+        route: tuple[str, ...],
+        query: dict[str, list[str]],
+    ) -> Any:
+        service = self.server.service
+        if route == ("llm-calls",):
             limit = _bounded_query_limit(
                 query,
                 "limit",
                 default=service.runtime.config.gui.snapshot_process_llm_call_limit,
-                maximum=service.runtime.config.gui.snapshot_process_llm_call_limit,
+                maximum=min(
+                    service.runtime.config.gui.snapshot_collection_max_items,
+                    service.runtime.config.llm.call_record_hard_limit,
+                ),
             )
-            return to_jsonable(service.runtime.store.list_llm_calls(pid=pid, limit=limit))
-        if method == "GET" and route == ["rating"]:
-            return to_jsonable(service.runtime.ratings.get(pid))
-        if method == "POST" and route == ["rating"]:
-            body = self._read_body()
-            rating = service.runtime.ratings.upsert(
+            return service.llm_call_page(
                 pid,
-                score=body.get("score"),
-                comment=body.get("comment", ""),
+                limit=limit,
+                cursor=_query_str(query, "cursor"),
             )
-            service.publish_runtime_changes("rating.upsert")
-            return to_jsonable(rating)
-        if method == "GET" and route == ["audit"]:
-            limit = _bounded_query_limit(
-                query,
-                "limit",
-                default=service.runtime.config.gui.snapshot_audit_limit,
-                maximum=service.runtime.config.gui.snapshot_audit_limit,
-            )
-            return to_jsonable(
-                service.runtime.audit.trace(
-                    limit=limit,
-                    actor=pid,
-                    target=f"process:{pid}",
-                    match_any=True,
-                    before_record_id=_query_str(query, "before"),
-                )
-            )
-        if method == "GET" and route == ["events"]:
-            limit = _bounded_query_limit(
-                query,
-                "limit",
-                default=service.runtime.config.gui.snapshot_event_limit,
-                maximum=service.runtime.config.gui.snapshot_event_limit,
-            )
-            return to_jsonable(
-                service.runtime.events.list(
-                    target=pid,
-                    limit=limit,
-                    before_event_id=_query_str(query, "before"),
-                )
-            )
-        if method == "GET" and route == ["capabilities"]:
-            return to_jsonable(service.runtime.capability.list_subject(pid, include_inactive=True))
-        if method == "GET" and route == ["checkpoints"]:
-            return service.runtime.checkpoint.list(pid=pid, actor=None, require_capability=False)
-        if method == "POST" and route == ["run"]:
-            body = self._read_body()
-            return service.scheduler.start(
-                pid=pid,
-                max_quanta=_positive_int_or_none(body.get("max_quanta"), "max_quanta"),
-                reason=f"run:{pid}",
-            )
-        if method == "POST" and route == ["step"]:
-            return service.scheduler.run_step(pid)
-        if method == "POST" and route == ["pause"]:
-            body = self._read_body()
-            service.runtime.process.pause(pid, str(body.get("reason") or "paused from GUI"))
-            service.publish_runtime_changes("process.pause")
-            return service._process_summary(pid, include_messages=True)
-        if method == "POST" and route == ["resume"]:
-            body = self._read_body(optional=True)
-            service.runtime.process.resume(pid)
-            service.publish_runtime_changes("process.resume")
-            if _json_bool(body, "auto_run", False):
-                service.scheduler.maybe_start(reason=f"resume:{pid}")
-            return service._process_summary(pid, include_messages=True)
-        if method == "POST" and route == ["signal"]:
-            body = self._read_body()
-            try:
-                signal = ProcessSignal(str(body.get("signal") or ProcessSignal.INTERRUPT.value))
-            except ValueError as exc:
-                raise GuiServerError(HTTPStatus.BAD_REQUEST, f"unknown process signal: {body.get('signal')}") from exc
-            if signal in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}:
-                self._require_confirmed("process.signal", body, {"pid": pid, "signal": signal.value})
-            service.runtime.process.signal(pid, signal, payload=body.get("payload"))
-            service.publish_runtime_changes("process.signal")
-            return service._process_summary(pid, include_messages=True)
-        if method == "POST" and route in (["message"], ["interrupt"]):
-            body = self._read_body()
-            max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
-            kind = ProcessMessageKind.INTERRUPT if route == ["interrupt"] else ProcessMessageKind.NORMAL
-            message = service.runtime.human.send_process_message(
+        if len(route) == 2:
+            return service.llm_call_detail(pid, route[1])
+        if len(route) == 3 and route[2] == "content":
+            field, attempt_sequence, content_limit = _gui_llm_content_request(query)
+            return service.llm_call_content(
                 pid,
-                str(body.get("body") or body.get("message") or ""),
-                kind=kind,
-                human=str(body.get("human") or service.runtime.config.runtime.default_human),
-                channel=str(body.get("channel") or "human"),
-                correlation_id=body.get("correlation_id"),
-                reply_to=body.get("reply_to"),
-                subject=body.get("subject"),
-                payload=body.get("payload") if isinstance(body.get("payload"), dict) else {},
+                route[1],
+                field=field,
+                attempt_sequence=attempt_sequence,
+                cursor=_query_str(query, "cursor"),
+                limit=content_limit,
             )
-            service.publish_runtime_changes(f"process.{kind.value}_message")
-            if _json_bool(body, "auto_run", True):
-                service.scheduler.maybe_start(
-                    max_quanta=max_quanta,
-                    reason=f"message:{pid}",
-                )
-            return {"message": to_jsonable(message), "process": service._process_summary(pid, include_messages=True), "scheduler": service.scheduler.status()}
-        if method == "POST" and route == ["cd"]:
-            body = self._read_body()
-            process = service.runtime.set_process_working_directory(pid, _required_body_string(body, "path"))
-            service.publish_runtime_changes("process.cd")
-            return service._process_summary(pid, include_messages=True, process=process)
-        if method == "POST" and route == ["exec"]:
-            body = self._read_body()
-            max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
-            llm_profile_id = service.require_llm_profile_id(body.get("llm_profile"))
-            image = _required_body_string(body, "image")
-            goal = _nullable_body_goal(body)
-            raw_args = _body_object_field_or_default(
-                body,
-                "args",
-                error_message="process exec args must be a JSON object",
-            )
-            self._require_confirmed(
-                "process.exec",
-                body,
-                {"pid": pid, "image": body.get("image"), "goal": body.get("goal"), "llm_profile": llm_profile_id},
-            )
-            process = service.runtime.exec_process(
-                pid,
-                image,
-                args=raw_args,
-                goal=goal,
-                preserve_memory=_json_bool(body, "preserve_memory", True),
-                preserve_capabilities=_json_bool(body, "preserve_capabilities", False),
-                llm_profile_id=llm_profile_id,
-            )
-            service.publish_runtime_changes("process.exec")
-            if _json_bool(body, "auto_run", True):
-                service.scheduler.maybe_start(
-                    max_quanta=max_quanta,
-                    reason=f"exec:{pid}",
-                )
-            return service._process_summary_with_scheduler(pid, process)
-        if method == "POST" and route == ["exit"]:
-            body = self._read_body()
-            message = _nullable_body_string(body, "message")
-            self._require_confirmed("process.exit", body, {"pid": pid, "failed": body.get("failed", False)})
-            service.runtime.process.exit(pid, failed=_json_bool(body, "failed", False), message=message)
-            service.publish_runtime_changes("process.exit")
-            return service._process_summary(pid, include_messages=True)
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown process endpoint")
+
+    def _get_process_messages(
+        self,
+        pid: str,
+        query: dict[str, list[str]],
+    ) -> Any:
+        return to_jsonable(
+            self.server.service.runtime.messages.list(
+                pid,
+                include_acked=True,
+                limit=_query_int(query, "limit"),
+            )
+        )
+
+    def _get_process_human_requests(
+        self,
+        pid: str,
+        _query: dict[str, list[str]],
+    ) -> Any:
+        return self.server.service.human_request_views(pid=pid)
+
+    def _get_process_rating(
+        self,
+        pid: str,
+        _query: dict[str, list[str]],
+    ) -> Any:
+        return to_jsonable(self.server.service.runtime.ratings.get(pid))
+
+    def _get_process_audit(
+        self,
+        pid: str,
+        query: dict[str, list[str]],
+    ) -> Any:
+        service = self.server.service
+        limit = _bounded_query_limit(
+            query,
+            "limit",
+            default=service.runtime.config.gui.snapshot_audit_limit,
+            maximum=service.runtime.config.gui.snapshot_audit_limit,
+        )
+        return to_jsonable(
+            service.runtime.audit.trace(
+                limit=limit,
+                actor=pid,
+                target=f"process:{pid}",
+                match_any=True,
+                before_record_id=_query_str(query, "before"),
+            )
+        )
+
+    def _get_process_events(
+        self,
+        pid: str,
+        query: dict[str, list[str]],
+    ) -> Any:
+        service = self.server.service
+        limit = _bounded_query_limit(
+            query,
+            "limit",
+            default=service.runtime.config.gui.snapshot_event_limit,
+            maximum=service.runtime.config.gui.snapshot_event_limit,
+        )
+        return to_jsonable(
+            service.runtime.events.list(
+                target=pid,
+                limit=limit,
+                before_event_id=_query_str(query, "before"),
+            )
+        )
+
+    def _get_process_capabilities(
+        self,
+        pid: str,
+        _query: dict[str, list[str]],
+    ) -> Any:
+        return to_jsonable(
+            self.server.service.runtime.capability.list_subject(
+                pid,
+                include_inactive=True,
+            )
+        )
+
+    def _get_process_checkpoints(
+        self,
+        pid: str,
+        _query: dict[str, list[str]],
+    ) -> Any:
+        return self.server.service.runtime.checkpoint.list(
+            pid=pid,
+            actor=None,
+            require_capability=False,
+        )
+
+    def _post_process_rating(self, pid: str) -> Any:
+        service = self.server.service
+        body = self._read_body()
+        rating = service.runtime.ratings.upsert(
+            pid,
+            score=body.get("score"),
+            comment=body.get("comment", ""),
+        )
+        service.publish_runtime_changes("rating.upsert")
+        return to_jsonable(rating)
+
+    def _post_process_run(self, pid: str) -> Any:
+        body = self._read_body()
+        return self.server.service.scheduler.start(
+            pid=pid,
+            max_quanta=_positive_int_or_none(
+                body.get("max_quanta"),
+                "max_quanta",
+            ),
+            reason=f"run:{pid}",
+        )
+
+    def _post_process_step(self, pid: str) -> Any:
+        return self.server.service.scheduler.run_step(pid)
+
+    def _post_process_pause(self, pid: str) -> Any:
+        service = self.server.service
+        body = self._read_body()
+        service.runtime.process.pause(
+            pid,
+            str(body.get("reason") or "paused from GUI"),
+        )
+        service.publish_runtime_changes("process.pause")
+        return service._process_summary(pid, include_messages=True)
+
+    def _post_process_resume(self, pid: str) -> Any:
+        service = self.server.service
+        body = self._read_body(optional=True)
+        service.runtime.process.resume(pid)
+        service.publish_runtime_changes("process.resume")
+        if _json_bool(body, "auto_run", False):
+            service.scheduler.maybe_start(reason=f"resume:{pid}")
+        return service._process_summary(pid, include_messages=True)
+
+    def _post_process_signal(self, pid: str) -> Any:
+        service = self.server.service
+        body = self._read_body()
+        try:
+            signal = ProcessSignal(
+                str(body.get("signal") or ProcessSignal.INTERRUPT.value)
+            )
+        except ValueError as exc:
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                f"unknown process signal: {body.get('signal')}",
+            ) from exc
+        if signal in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}:
+            self._require_confirmed(
+                "process.signal",
+                body,
+                {"pid": pid, "signal": signal.value},
+            )
+        service.runtime.process.signal(pid, signal, payload=body.get("payload"))
+        service.publish_runtime_changes("process.signal")
+        return service._process_summary(pid, include_messages=True)
+
+    def _post_process_message(self, pid: str) -> Any:
+        return self._send_process_message(pid, kind=ProcessMessageKind.NORMAL)
+
+    def _post_process_interrupt(self, pid: str) -> Any:
+        return self._send_process_message(pid, kind=ProcessMessageKind.INTERRUPT)
+
+    def _send_process_message(self, pid: str, *, kind: ProcessMessageKind) -> Any:
+        service = self.server.service
+        body = self._read_body()
+        max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
+        message = service.runtime.human.send_process_message(
+            pid,
+            str(body.get("body") or body.get("message") or ""),
+            kind=kind,
+            human=str(
+                body.get("human") or service.runtime.config.runtime.default_human
+            ),
+            channel=str(body.get("channel") or "human"),
+            correlation_id=body.get("correlation_id"),
+            reply_to=body.get("reply_to"),
+            subject=body.get("subject"),
+            payload=(
+                body.get("payload")
+                if isinstance(body.get("payload"), dict)
+                else {}
+            ),
+        )
+        service.publish_runtime_changes(f"process.{kind.value}_message")
+        if _json_bool(body, "auto_run", True):
+            service.scheduler.maybe_start(
+                max_quanta=max_quanta,
+                reason=f"message:{pid}",
+            )
+        return {
+            "message": to_jsonable(message),
+            "process": service._process_summary(pid, include_messages=True),
+            "scheduler": service.scheduler.status(),
+        }
+
+    def _post_process_cd(self, pid: str) -> Any:
+        service = self.server.service
+        body = self._read_body()
+        process = service.runtime.set_process_working_directory(
+            pid,
+            _required_body_string(body, "path"),
+        )
+        service.publish_runtime_changes("process.cd")
+        return service._process_summary(pid, include_messages=True, process=process)
+
+    def _post_process_exec(self, pid: str) -> Any:
+        service = self.server.service
+        body = self._read_body()
+        max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
+        llm_profile_id = service.require_llm_profile_id(body.get("llm_profile"))
+        image = _required_body_string(body, "image")
+        goal = _nullable_body_goal(body)
+        raw_args = _body_object_field_or_default(
+            body,
+            "args",
+            error_message="process exec args must be a JSON object",
+        )
+        self._require_confirmed(
+            "process.exec",
+            body,
+            {
+                "pid": pid,
+                "image": body.get("image"),
+                "goal": body.get("goal"),
+                "llm_profile": llm_profile_id,
+            },
+        )
+        process = service.runtime.exec_process(
+            pid,
+            image,
+            args=raw_args,
+            goal=goal,
+            preserve_memory=_json_bool(body, "preserve_memory", True),
+            preserve_capabilities=_json_bool(
+                body,
+                "preserve_capabilities",
+                False,
+            ),
+            llm_profile_id=llm_profile_id,
+        )
+        service.publish_runtime_changes("process.exec")
+        if _json_bool(body, "auto_run", True):
+            service.scheduler.maybe_start(
+                max_quanta=max_quanta,
+                reason=f"exec:{pid}",
+            )
+        return service._process_summary_with_scheduler(pid, process)
+
+    def _post_process_exit(self, pid: str) -> Any:
+        service = self.server.service
+        body = self._read_body()
+        message = _nullable_body_string(body, "message")
+        self._require_confirmed(
+            "process.exit",
+            body,
+            {"pid": pid, "failed": body.get("failed", False)},
+        )
+        service.runtime.process.exit(
+            pid,
+            failed=_json_bool(body, "failed", False),
+            message=message,
+        )
+        service.publish_runtime_changes("process.exit")
+        return service._process_summary(pid, include_messages=True)
 
     def _dispatch_human(self, method: str, route: list[str]) -> Any:
         service = self.server.service
@@ -2912,7 +4610,6 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         cursor = _int_or_none(parse_qs(parsed.query).get("cursor", ["0"])[0]) or 0
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self._send_common_headers()
         self.end_headers()
@@ -3045,6 +4742,9 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _send_common_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         origin = _allowed_cors_origin(self.headers.get("Origin"))
         if origin is not None:
             self.send_header("Access-Control-Allow-Origin", origin)
@@ -3250,6 +4950,27 @@ def _query_int(query: dict[str, list[str]], key: str) -> int | None:
     return _int_or_none(values[0]) if values else None
 
 
+def _gui_llm_utf8_chunk(
+    text: str,
+    *,
+    offset: int,
+    max_bytes: int,
+) -> tuple[str, int | None]:
+    if max_bytes < 4:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "LLM trace content limit must be at least 4 bytes",
+        )
+    if offset >= len(text):
+        return "", None
+    candidate = text[offset : offset + max_bytes]
+    encoded = candidate.encode("utf-8")
+    if len(encoded) > max_bytes:
+        candidate = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    next_offset = offset + len(candidate)
+    return candidate, next_offset if next_offset < len(text) else None
+
+
 def _bounded_query_limit(
     query: dict[str, list[str]],
     key: str,
@@ -3270,6 +4991,39 @@ def _bounded_query_limit(
 def _query_str(query: dict[str, list[str]], key: str) -> str | None:
     values = query.get(key)
     return values[0] if values else None
+
+
+def _gui_llm_content_request(
+    query: dict[str, list[str]],
+) -> tuple[str, int | None, int]:
+    field = _query_str(query, "field")
+    if field not in _GUI_LLM_CONTENT_FIELDS:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "unknown LLM trace content field",
+            details={"code": "invalid_content_field"},
+        )
+    attempt_sequence = _query_int(query, "attempt_sequence")
+    if field in _GUI_LLM_ATTEMPT_FIELDS:
+        if attempt_sequence is None or attempt_sequence <= 0:
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "attempt_sequence is required for attempt content",
+                details={"code": "invalid_attempt_sequence"},
+            )
+    elif attempt_sequence is not None:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "attempt_sequence is only valid for attempt content",
+            details={"code": "invalid_attempt_sequence"},
+        )
+    content_limit = _bounded_query_limit(
+        query,
+        "limit",
+        default=_GUI_LLM_CONTENT_DEFAULT_BYTES,
+        maximum=_GUI_LLM_CONTENT_MAX_BYTES,
+    )
+    return field, attempt_sequence, content_limit
 
 
 def _task_run_query_statuses(

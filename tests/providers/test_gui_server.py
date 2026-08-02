@@ -39,6 +39,7 @@ from agent_libos.models import (
     ExternalEffectRollbackStatus,
     HumanRequest,
     HumanRequestStatus,
+    LLMCallRecord,
     ObjectMetadata,
     ObjectPatch,
     ObjectType,
@@ -65,6 +66,8 @@ from agent_libos.models import (
 from agent_libos.evidence.payload_retention import (
     PayloadRetentionTier,
     external_effect_payload_retention_tier,
+    llm_call_payload_sha256,
+    retain_llm_call_payload,
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, HumanResponseRequired, ProcessWaitRequired, ValidationError
 from agent_libos.utils.ids import utc_now
@@ -573,6 +576,101 @@ def test_terminal_purge_keeps_later_gui_presentations_outside_run_links(
             reopened_service.shutdown(timeout_s=2.0)
         reopened.close()
 
+def _gui_provider_trace_record(
+    pid: str,
+    call_id: str,
+    *,
+    created_at: str = "2026-08-03T00:00:00+00:00",
+    reasoning_text: str = "Provider reasoning",
+) -> LLMCallRecord:
+    trace = {
+        "kind": "provider_trace",
+        "schema_version": 1,
+        "coverage": "complete",
+        "selected_attempt": 1,
+        "limited": False,
+        "omitted_attempts": 0,
+        "attempts": [
+            {
+                "sequence": 1,
+                "kind": "initial",
+                "api": "responses",
+                "status": "ok",
+                "reasoning": {
+                    "availability": "returned",
+                    "blocks": [
+                        {
+                            "type": "reasoning_text",
+                            "source": "output.reasoning",
+                            "text": reasoning_text,
+                        }
+                    ],
+                },
+                "output": "final answer",
+                "tool_calls": [
+                    {
+                        "id": "tool-call-1",
+                        "name": "read_text_file",
+                        "arguments": '{"path":"PRIVATE_TOOL_ARGUMENT"}',
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 7,
+                    "total_tokens": 19,
+                    "ignored_provider_metric": "PRIVATE_USAGE_VALUE",
+                },
+                "model": "trace-model",
+                "request_id": "request-1",
+                "response_id": "response-1",
+                "started_at": created_at,
+                "completed_at": created_at,
+                "duration_ms": 4,
+                "error": None,
+            }
+        ],
+    }
+    return LLMCallRecord(
+        call_id=call_id,
+        pid=pid,
+        image_id="base-agent:v0",
+        purpose="agent_action",
+        status="ok",
+        api="responses",
+        model="trace-model",
+        request_id="request-1",
+        response_id="response-1",
+        messages=[{"role": "user", "content": "PRIVATE_PROMPT"}],
+        tools=[{"name": "read_text_file", "description": "PRIVATE_TOOL_SCHEMA"}],
+        request_options={
+            "provider_trace_summary": {
+                "schema_version": 1,
+                "coverage": "complete",
+                "attempt_count": 1,
+                "recorded_attempt_count": 1,
+                "selected_attempt": 1,
+                "status_counts": {"ok": 1, "error": 0},
+                "limited": False,
+                "omitted_attempts": 0,
+            },
+            "authorization": "PRIVATE_AUTHORIZATION",
+        },
+        response_content="final answer",
+        tool_calls=[{"name": "read_text_file", "arguments": {"path": "PRIVATE_TOOL_ARGUMENT"}}],
+        reasoning=trace,
+        usage={"input_tokens": 12, "output_tokens": 7, "total_tokens": 19},
+        raw_response={
+            "id": "response-1",
+            "encrypted_content": "PRIVATE_ENCRYPTED_BLOB",
+            "output_text": "final answer",
+        },
+        observability={},
+        error=None,
+        created_at=created_at,
+        completed_at=created_at,
+    )
+
+
 class TestGuiServer:
 
     def setup_method(self) -> None:
@@ -774,6 +872,442 @@ class TestGuiServer:
         assert 'images' in snapshot
         assert any((profile['profile_id'] == 'gui-spawn' for profile in snapshot['llm_profiles']))
         assert any((image['image_id'] == 'base-agent:v0' for image in snapshot['images']))
+
+    def test_llm_trace_api_keeps_snapshots_content_free_and_chunks_on_demand(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image="base-agent:v0", goal="trace API")
+        reasoning_text = "推理轨迹" * 12_000
+        record = _gui_provider_trace_record(
+            pid,
+            "llm-call-trace-api",
+            reasoning_text=reasoning_text,
+        )
+        record = replace(
+            record,
+            raw_response={
+                **(record.raw_response or {}),
+                "headers": [
+                    ["Authorization", "Bearer PRIVATE_HEADER_AUTHORIZATION"],
+                    [
+                        "Authorization",
+                        "Bearer PRIVATE_HEADER_TRIPLE_AUTHORIZATION",
+                        "PRIVATE_HEADER_TRIPLE_METADATA",
+                    ],
+                    ["x-api-key", "PRIVATE_HEADER_API_KEY"],
+                    ["content-type", "application/json"],
+                    {
+                        "name": "Authorization",
+                        "value": "Bearer PRIVATE_HEADER_OBJECT_AUTHORIZATION",
+                    },
+                    {
+                        "key": "set-cookie",
+                        "data": ["PRIVATE_HEADER_OBJECT_COOKIE"],
+                    },
+                ],
+            },
+        )
+        runtime.store.insert_llm_call(record)
+        self.server.service.publish_runtime_changes("test.llm_trace")
+        replayed = dumps(
+            [
+                {"event": event.event, "data": event.data}
+                for event in self.server.service.broadcaster.replay_after(0)
+                if event.event in {"snapshot", "llm_call.appended"}
+            ]
+        )
+        assert reasoning_text not in replayed
+        assert "PRIVATE_PROMPT" not in replayed
+        assert "PRIVATE_TOOL_ARGUMENT" not in replayed
+
+        snapshot_status, snapshot = self.request("GET", "/api/snapshot")
+        page_status, page = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls?limit=50",
+        )
+        detail_status, detail = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls/{record.call_id}",
+        )
+
+        assert snapshot_status == page_status == detail_status == 200
+        assert snapshot["schema_version"] == 3
+        assert page == {
+            "schema_version": 1,
+            "items": [page["items"][0]],
+            "next_cursor": None,
+            "has_more": False,
+        }
+        summary = page["items"][0]
+        assert summary["attempt_count"] == 1
+        assert summary["coverage"] == "complete"
+        assert summary["reasoning_availability"] == "returned"
+        assert summary["payload_retention_tier"] == "full"
+        assert detail["call"] == summary
+        assert detail["attempts"][0]["tool_names"] == ["read_text_file"]
+        assert detail["attempts"][0]["reasoning_blocks"][0]["type"] == "reasoning_text"
+
+        outward = dumps({"snapshot": snapshot, "page": page, "detail": detail})
+        for private in (
+            "PRIVATE_PROMPT",
+            "PRIVATE_TOOL_SCHEMA",
+            "PRIVATE_TOOL_ARGUMENT",
+            "PRIVATE_AUTHORIZATION",
+            "PRIVATE_ENCRYPTED_BLOB",
+            reasoning_text,
+        ):
+            assert private not in outward
+
+        descriptor = next(
+            item
+            for item in detail["content"]
+            if item["field"] == "attempt_reasoning"
+        )
+        assert descriptor["availability"] == "available"
+        assert descriptor["cursor"]
+        assembled = ""
+        cursor = descriptor["cursor"]
+        while cursor is not None:
+            status, chunk = self.request(
+                "GET",
+                f"/api/processes/{pid}/llm-calls/{record.call_id}/content"
+                f"?field=attempt_reasoning&attempt_sequence=1&limit=32768&cursor={cursor}",
+            )
+            assert status == 200
+            assembled += chunk["content"]
+            cursor = chunk["next_cursor"]
+        assert assembled == reasoning_text
+
+        raw_descriptor = next(
+            item for item in detail["content"] if item["field"] == "raw_response"
+        )
+        status, raw_chunk = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls/{record.call_id}/content"
+            f"?field=raw_response&cursor={raw_descriptor['cursor']}",
+        )
+        assert status == 200
+        assert "PRIVATE_ENCRYPTED_BLOB" not in raw_chunk["content"]
+        assert "PRIVATE_HEADER_AUTHORIZATION" not in raw_chunk["content"]
+        assert "PRIVATE_HEADER_TRIPLE_AUTHORIZATION" not in raw_chunk["content"]
+        assert "PRIVATE_HEADER_TRIPLE_METADATA" not in raw_chunk["content"]
+        assert "PRIVATE_HEADER_API_KEY" not in raw_chunk["content"]
+        assert "PRIVATE_HEADER_OBJECT_AUTHORIZATION" not in raw_chunk["content"]
+        assert "PRIVATE_HEADER_OBJECT_COOKIE" not in raw_chunk["content"]
+        assert '"kind": "redacted"' in raw_chunk["content"]
+        assert '"content-type"' in raw_chunk["content"]
+        assert '"application/json"' in raw_chunk["content"]
+
+        status, headers, _payload = self.request_raw(
+            "GET",
+            f"/api/processes/{pid}/llm-calls/{record.call_id}",
+        )
+        assert status == 200
+        assert headers["cache-control"] == "no-store"
+        assert headers["x-content-type-options"] == "nosniff"
+        assert headers["referrer-policy"] == "no-referrer"
+
+    @pytest.mark.parametrize(
+        ("provider_status", "expected_status"),
+        [
+            (429, 429),
+            (True, None),
+            ("429", None),
+            (99, None),
+            (600, None),
+        ],
+    )
+    def test_llm_trace_attempt_error_only_exposes_valid_http_status_codes(
+        self,
+        provider_status: Any,
+        expected_status: int | None,
+    ) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image="base-agent:v0", goal="trace error")
+        record = _gui_provider_trace_record(
+            pid,
+            f"llm-call-status-{str(provider_status).lower()}",
+        )
+        assert isinstance(record.reasoning, dict)
+        attempt = record.reasoning["attempts"][0]
+        attempt["status"] = "error"
+        attempt["error"] = {
+            "error_type": "ProviderStatusError",
+            "message_bytes": 17,
+            "message_sha256": "a" * 64,
+            "status_code": provider_status,
+        }
+        runtime.store.insert_llm_call(record)
+
+        status, detail = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls/{record.call_id}",
+        )
+        assert status == 200
+        assert detail["attempts"][0]["error"] == {
+            "error_type": "ProviderStatusError",
+            "message_bytes": 17,
+            "message_sha256": "a" * 64,
+            "status_code": expected_status,
+        }
+
+    def test_legacy_llm_reasoning_only_reveals_explicit_readable_blocks(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image="base-agent:v0", goal="legacy trace")
+        record = replace(
+            _gui_provider_trace_record(pid, "llm-call-legacy-reasoning"),
+            request_options={},
+            reasoning={
+                "type": "reasoning",
+                "summary": [
+                    {
+                        "type": "summary_text",
+                        "text": "LEGACY_READABLE_SUMMARY",
+                    }
+                ],
+                "content": [
+                    {
+                        "type": "reasoning_text",
+                        "text": "LEGACY_READABLE_REASONING",
+                    }
+                ],
+                "encrypted_content": "LEGACY_ENCRYPTED_SECRET",
+                "signature": "LEGACY_SIGNATURE_SECRET",
+                "opaque_blob": {"text": "LEGACY_OPAQUE_SECRET"},
+                "unrelated": {"text": "LEGACY_UNRELATED_SECRET"},
+            },
+            raw_response={
+                "apiKey": "RAW_API_KEY_SECRET",
+                "access_token": "RAW_ACCESS_TOKEN_SECRET",
+                "refreshToken": "RAW_REFRESH_TOKEN_SECRET",
+                "id_token": "RAW_ID_TOKEN_SECRET",
+                "session_token": "RAW_SESSION_TOKEN_SECRET",
+                "Cookie": "RAW_COOKIE_SECRET",
+                "Set-Cookie": "RAW_SET_COOKIE_SECRET",
+                "input_tokens": 17,
+            },
+        )
+        runtime.store.insert_llm_call(record)
+
+        page_status, page = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls?limit=50",
+        )
+        detail_status, detail = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls/{record.call_id}",
+        )
+        assert page_status == detail_status == 200
+        assert page["items"][0]["coverage"] == "legacy_final_only"
+        assert detail["attempts"][0]["reasoning_availability"] == "returned"
+        block_types = {
+            block["type"]
+            for block in detail["attempts"][0]["reasoning_blocks"]
+        }
+        assert {"summary_text", "reasoning_text", "opaque"} <= block_types
+
+        outward = dumps({"page": page, "detail": detail})
+        for private in (
+            "LEGACY_READABLE_SUMMARY",
+            "LEGACY_READABLE_REASONING",
+            "LEGACY_ENCRYPTED_SECRET",
+            "LEGACY_SIGNATURE_SECRET",
+            "LEGACY_OPAQUE_SECRET",
+            "LEGACY_UNRELATED_SECRET",
+        ):
+            assert private not in outward
+
+        reasoning_descriptor = next(
+            item
+            for item in detail["content"]
+            if item["field"] == "attempt_reasoning"
+        )
+        status, reasoning = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls/{record.call_id}/content"
+            "?field=attempt_reasoning&attempt_sequence=1"
+            f"&cursor={reasoning_descriptor['cursor']}",
+        )
+        assert status == 200
+        assert set(reasoning["content"].split("\n\n")) == {
+            "LEGACY_READABLE_SUMMARY",
+            "LEGACY_READABLE_REASONING",
+        }
+        for private in (
+            "LEGACY_ENCRYPTED_SECRET",
+            "LEGACY_SIGNATURE_SECRET",
+            "LEGACY_OPAQUE_SECRET",
+            "LEGACY_UNRELATED_SECRET",
+        ):
+            assert private not in reasoning["content"]
+
+        raw_descriptor = next(
+            item for item in detail["content"] if item["field"] == "raw_response"
+        )
+        status, raw = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls/{record.call_id}/content"
+            f"?field=raw_response&cursor={raw_descriptor['cursor']}",
+        )
+        assert status == 200
+        for private in (
+            "RAW_API_KEY_SECRET",
+            "RAW_ACCESS_TOKEN_SECRET",
+            "RAW_REFRESH_TOKEN_SECRET",
+            "RAW_ID_TOKEN_SECRET",
+            "RAW_SESSION_TOKEN_SECRET",
+            "RAW_COOKIE_SECRET",
+            "RAW_SET_COOKIE_SECRET",
+        ):
+            assert private not in raw["content"]
+        assert raw["content"].count('"kind": "redacted"') == 7
+        assert '"input_tokens": 17' in raw["content"]
+
+    def test_legacy_responses_reasoning_configuration_is_not_provider_content(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image="base-agent:v0", goal="legacy config")
+        record = replace(
+            _gui_provider_trace_record(pid, "llm-call-legacy-config"),
+            request_options={},
+            reasoning={"effort": "high", "summary": "auto"},
+        )
+        runtime.store.insert_llm_call(record)
+
+        status, detail = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls/{record.call_id}",
+        )
+        assert status == 200
+        assert detail["call"]["coverage"] == "legacy_final_only"
+        assert detail["call"]["reasoning_availability"] == "not_returned"
+        assert detail["attempts"][0]["reasoning_availability"] == "not_returned"
+        assert detail["attempts"][0]["reasoning_blocks"] == []
+        descriptor = next(
+            item
+            for item in detail["content"]
+            if item["field"] == "attempt_reasoning"
+        )
+        assert descriptor["availability"] == "not_returned"
+        assert descriptor["cursor"] is None
+        assert "auto" not in dumps(detail)
+
+    def test_llm_trace_list_uses_stable_keyset_and_rejects_cross_process_reads(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image="base-agent:v0", goal="trace pagination")
+        other_pid = runtime.process.spawn(image="base-agent:v0", goal="other trace")
+        for call_id in ("llm-call-a", "llm-call-b", "llm-call-c"):
+            runtime.store.insert_llm_call(_gui_provider_trace_record(pid, call_id))
+        runtime.store.insert_llm_call(
+            _gui_provider_trace_record(other_pid, "llm-call-other")
+        )
+
+        status, first = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls?limit=2",
+        )
+        assert status == 200
+        assert [item["call_id"] for item in first["items"]] == [
+            "llm-call-c",
+            "llm-call-b",
+        ]
+        assert first["has_more"] is True
+
+        runtime.store.insert_llm_call(
+            _gui_provider_trace_record(
+                pid,
+                "llm-call-newer",
+                created_at="2026-08-03T01:00:00+00:00",
+            )
+        )
+        status, second = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls?limit=2&cursor={first['next_cursor']}",
+        )
+        assert status == 200
+        assert [item["call_id"] for item in second["items"]] == ["llm-call-a"]
+        assert second["has_more"] is False
+
+        status, _cross = self.request(
+            "GET",
+            f"/api/processes/{other_pid}/llm-calls/llm-call-a",
+        )
+        assert status == 404
+        status, detail = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls/llm-call-a",
+        )
+        assert status == 200
+        messages_cursor = next(
+            item for item in detail["content"] if item["field"] == "messages"
+        )["cursor"]
+        for scoped_pid, scoped_call in (
+            (pid, "llm-call-b"),
+            (other_pid, "llm-call-other"),
+        ):
+            status, wrong_scope = self.request(
+                "GET",
+                f"/api/processes/{scoped_pid}/llm-calls/{scoped_call}/content"
+                f"?field=messages&cursor={messages_cursor}",
+            )
+            assert status == 404
+            assert wrong_scope["error"]["code"] == "llm_call_not_found"
+        tampered = first["next_cursor"][:-1] + (
+            "A" if first["next_cursor"][-1] != "A" else "B"
+        )
+        status, invalid = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls?limit=2&cursor={tampered}",
+        )
+        assert status == 400
+        assert invalid["error"]["code"] == "invalid_cursor"
+
+    def test_llm_trace_content_cursor_detects_retention_change(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image="base-agent:v0", goal="trace retention")
+        record = _gui_provider_trace_record(pid, "llm-call-retention")
+        runtime.store.insert_llm_call(record)
+        status, detail = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls/{record.call_id}",
+        )
+        assert status == 200
+        descriptor = next(
+            item for item in detail["content"] if item["field"] == "response_content"
+        )
+        assert descriptor["cursor"]
+
+        expected_sha256 = llm_call_payload_sha256(record)
+        retained = retain_llm_call_payload(
+            record,
+            PayloadRetentionTier.SUMMARY,
+            provider_chain_head=False,
+        )
+        assert runtime.store.update_llm_call_payload_retention(
+            retained,
+            expected_payload_sha256=expected_sha256,
+            expected_tier=PayloadRetentionTier.FULL,
+        )
+
+        status, changed = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls/{record.call_id}/content"
+            f"?field=response_content&cursor={descriptor['cursor']}",
+        )
+        assert status == 409
+        assert changed["error"]["code"] == "content_changed"
+
+        status, refreshed = self.request(
+            "GET",
+            f"/api/processes/{pid}/llm-calls/{record.call_id}",
+        )
+        assert status == 200
+        assert refreshed["call"]["payload_retention_tier"] == "summary"
+        assert refreshed["call"]["reasoning_availability"] == "not_persisted"
+        assert refreshed["attempts"] == []
+        response_descriptor = next(
+            item for item in refreshed["content"] if item["field"] == "response_content"
+        )
+        assert response_descriptor["availability"] == "not_persisted"
+        assert response_descriptor["cursor"] is None
 
     def test_process_handlers_preserve_typed_wait_and_outcome_discriminators(
         self,
@@ -3087,6 +3621,9 @@ class TestGuiServer:
         request = urllib.request.Request(f'http://{self.host}:{self.port}/api/events/stream?cursor=0', headers={'Authorization': 'Bearer test-token'})
         with urllib.request.urlopen(request, timeout=10) as response:
             assert response.status == 200
+            assert response.headers['Cache-Control'] == 'no-store'
+            assert response.headers['X-Content-Type-Options'] == 'nosniff'
+            assert response.headers['Referrer-Policy'] == 'no-referrer'
             frame_lines: list[str] = []
             while len(frame_lines) < 3:
                 line = response.readline().decode('utf-8').strip()
@@ -4233,8 +4770,8 @@ class TestGuiServer:
         )
         assert failed_audit["correlation_id"] == correlation_id
         assert failed_audit["decision"]["error_details"] == step["result"]["error_details"]
-        assert calls[0]["error"] == step["result"]["error"]
-        assert calls[0]["observability"]["failure"]["public_error"] == step["result"]["error_details"]
+        assert calls["items"][0]["error"] == step["result"]["error"]
+        assert "observability" not in calls["items"][0]
 
         process = runtime.process.get(pid)
         assert process.outcome is not None

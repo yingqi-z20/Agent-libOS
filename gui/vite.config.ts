@@ -21,6 +21,6 @@ export default defineConfig({
     }
   },
   test: {
-    exclude: [...configDefaults.exclude, "dist/**", "dist-electron/**"]
+    exclude: [...configDefaults.exclude, "dist/**", "dist-electron/**", "e2e/**"]
   }
 });

@@ -93,6 +93,7 @@ export function App() {
   const [lastUpdatedAt, setLastUpdatedAt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [explainLookup, setExplainLookup] = useState<{ pid: string; kind: string; id: string; nonce: number } | null>(null);
+  const [llmTraceFocus, setLlmTraceFocus] = useState<{ pid: string; callId: string; nonce: number } | null>(null);
   const [connectionEpoch, setConnectionEpoch] = useState(0);
   const [streamEpoch, setStreamEpoch] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
@@ -334,6 +335,7 @@ export function App() {
   const cwd = selectedPid ? cwdDrafts[selectedPid] ?? "" : "";
   const execGoal = selectedPid ? execGoalDrafts[selectedPid] ?? "" : "";
   const selectedExplainLookup = explainLookup?.pid === selectedPid ? explainLookup : null;
+  const selectedLlmTraceFocus = llmTraceFocus?.pid === selectedPid ? llmTraceFocus : null;
 
   function setMessage(value: string) {
     if (!messageDraftKey) return;
@@ -1158,6 +1160,19 @@ export function App() {
     }, 0);
   }
 
+  function openOperatorLlmTrace(callId: string) {
+    if (!selectedProcess) return;
+    setLlmTraceFocus({ pid: selectedProcess.pid, callId, nonce: Date.now() });
+    globalThis.setTimeout(() => {
+      const panel = document.querySelector<HTMLElement>(".rightPane .providerTracePanel");
+      panel?.focus({ preventScroll: true });
+      panel?.scrollIntoView({
+        block: "start",
+        behavior: globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"
+      });
+    }, 0);
+  }
+
   const notices = (
     <AppNotices
       key="runtime-notices"
@@ -1180,6 +1195,7 @@ export function App() {
         <UserPage
           notices={notices}
           connection={connection}
+          client={client}
           snapshot={snapshot}
           selectedPid={selectedPid}
           selectedProcess={selectedProcess}
@@ -1392,6 +1408,7 @@ export function App() {
                 events={snapshot?.events ?? []}
                 audit={snapshot?.audit ?? []}
                 onExplainEvidence={explainOperatorEvidence}
+                onOpenLlmTrace={openOperatorLlmTrace}
               />
 
               <div className="composer">
@@ -1510,6 +1527,7 @@ export function App() {
                   return client.resolveOperation(kind, id, { signal, timeoutMs: 15_000 });
                 }}
                 explainLookup={selectedExplainLookup}
+                llmTraceFocus={selectedLlmTraceFocus}
                 connectionEpoch={connectionEpoch}
                 client={client}
                 runAction={safe}

@@ -2,10 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://agent-libos.local/schemas/gui-api/v2.json",
   "title": "Agent libOS local GUI API contract subset v2",
-  "description": "Machine-readable same-build schema registry for the snapshot's top-level structure, process identity/state, redacted Durable Task Run summaries/details, JSON error envelopes, and explicit-confirmation mutation payloads. The document root deliberately rejects instances: validators must select one of the named $defs entry points with a JSON Pointer fragment. Snapshot collection item semantics outside process and Task Run state remain renderer/server implementation details. This is not a complete public REST/OpenAPI specification.",
+  "description": "Machine-readable same-build schema registry for the snapshot's top-level structure, process identity/state, content-free LLM call summaries, redacted Durable Task Run summaries/details, JSON error envelopes, and explicit-confirmation mutation payloads. The document root deliberately rejects instances: validators must select one of the named $defs entry points with a JSON Pointer fragment. Snapshot collection item semantics outside process, LLM call, and Task Run state remain renderer/server implementation details. This is not a complete public REST/OpenAPI specification.",
   "x-agent-libos-schema-version": 2,
   "x-agent-libos-contract-scope": {
     "snapshot": "GET /api/snapshot",
+    "llm_call_summary": "GET /api/snapshot and llm_call.appended SSE payloads",
     "task_run_summary": "GET /api/snapshot and task_run.updated SSE payloads",
     "task_run_detail": "GET /api/task-runs/{run_id}",
     "error_envelope": "JSON errors from /api routes",
@@ -229,6 +230,85 @@
       },
       "additionalProperties": true
     },
+    "llmCallSummary": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "call_id",
+        "pid",
+        "image_id",
+        "purpose",
+        "status",
+        "api",
+        "model",
+        "usage",
+        "error",
+        "created_at",
+        "completed_at",
+        "request_id",
+        "response_id",
+        "attempt_count",
+        "coverage",
+        "selected_attempt",
+        "reasoning_availability",
+        "payload_retention_tier"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "call_id": { "$ref": "#/$defs/nonEmptyString" },
+        "pid": { "type": ["string", "null"] },
+        "image_id": { "type": ["string", "null"] },
+        "purpose": { "type": "string" },
+        "status": { "$ref": "#/$defs/nonEmptyString" },
+        "api": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "usage": {
+          "type": "object",
+          "propertyNames": {
+            "enum": [
+              "prompt_tokens",
+              "completion_tokens",
+              "total_tokens",
+              "input_tokens",
+              "output_tokens",
+              "cache_read_tokens",
+              "cache_write_tokens"
+            ]
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "error": { "type": ["string", "null"] },
+        "created_at": { "$ref": "#/$defs/nonEmptyString" },
+        "completed_at": { "type": ["string", "null"] },
+        "request_id": { "type": ["string", "null"] },
+        "response_id": { "type": ["string", "null"] },
+        "attempt_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 256
+        },
+        "coverage": {
+          "enum": ["complete", "custom_client_incomplete", "legacy_final_only"]
+        },
+        "selected_attempt": {
+          "oneOf": [
+            { "type": "integer", "minimum": 1, "maximum": 256 },
+            { "type": "null" }
+          ]
+        },
+        "reasoning_availability": {
+          "enum": ["returned", "not_returned", "not_persisted", "purged", "limited"]
+        },
+        "payload_retention_tier": {
+          "enum": ["full", "summary", "hash_only"]
+        }
+      },
+      "additionalProperties": false
+    },
     "taskRunBlocker": {
       "type": "object",
       "required": ["kind"],
@@ -410,14 +490,14 @@
         "llm_profiles"
       ],
       "properties": {
-        "schema_version": { "const": 2 },
+        "schema_version": { "const": 3 },
         "db": { "type": "string" },
         "scheduler": { "$ref": "#/$defs/schedulerStatus" },
         "processes": { "type": "array", "items": { "$ref": "#/$defs/processSummary" } },
         "human_requests": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },
         "events": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },
         "audit": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },
-        "llm_calls": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },
+        "llm_calls": { "type": "array", "items": { "$ref": "#/$defs/llmCallSummary" } },
         "object_tasks": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },
         "task_runs": { "type": "array", "items": { "$ref": "#/$defs/taskRunSummary" } },
         "tools": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },

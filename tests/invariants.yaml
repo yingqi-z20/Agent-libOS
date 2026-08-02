@@ -3324,6 +3324,33 @@
       "benchmark_attack_classes": []
     },
     {
+      "id": "llm-provider-attempt-traces-are-bounded-redacted-and-logically-accounted",
+      "title": "Provider attempts are explicitly bounded and redacted while every physical retry remains inside one logical LLM reservation.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/unit/test_llm_client.py::TestLLMClient::test_responses_trace_uses_output_reasoning_not_top_level_configuration",
+        "tests/unit/test_llm_client.py::TestLLMClient::test_explicit_transport_retry_records_each_wire_attempt",
+        "tests/unit/test_llm_client.py::TestLLMClient::test_raw_response_projection_hashes_opaque_fields_and_caps_aggregate",
+        "tests/unit/test_llm_client.py::TestLLMClient::test_provider_trace_cap_matches_durable_serializer",
+        "tests/runtime/test_llm_usage_reservations.py::test_llm_reservation_is_active_before_provider_and_settles_exactly",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_call_records_persist_full_io_by_default"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "gui-llm-reasoning-content-is-on-demand-retention-aware-and-inert",
+      "title": "GUI LLM summaries remain content-free while process-scoped detail reads are bounded, retention-aware, and safe for inert rendering.",
+      "lane": "providers",
+      "node_ids": [
+        "tests/providers/test_gui_server.py::TestGuiServer::test_llm_trace_api_keeps_snapshots_content_free_and_chunks_on_demand",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_llm_trace_list_uses_stable_keyset_and_rejects_cross_process_reads",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_llm_trace_content_cursor_detects_retention_change",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_legacy_llm_reasoning_only_reveals_explicit_readable_blocks",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_legacy_responses_reasoning_configuration_is_not_provider_content"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "subprocess-resource-profiles-are-enforced",
       "title": "Subprocess resource profiles are enforced and audited by supporting providers, while unsupported Shell or PTY backends reject budgeted dispatch before spawn.",
       "lane": "providers",

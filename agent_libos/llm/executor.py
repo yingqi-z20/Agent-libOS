@@ -51,6 +51,13 @@ from agent_libos.llm.prompt import (
     recover_initial_goal_context,
 )
 from agent_libos.llm.records import observable_llm_call_fields
+from agent_libos.llm.provider_trace import (
+    custom_provider_trace,
+    is_provider_trace,
+    project_provider_raw_response,
+    provider_trace_from_error,
+    provider_trace_summary,
+)
 from agent_libos.llm.usage import canonicalize_llm_usage
 from agent_libos.llm.tool_protocol import tool_call_to_action
 from agent_libos.llm.task_runs import (
@@ -212,6 +219,7 @@ class _LLMCallState:
     resource_envelope_sha256: str = ""
     completion_usage: dict[str, int] = field(default_factory=dict)
     invalid_completion_usage_fields: set[str] = field(default_factory=set)
+    provider_trace: dict[str, Any] | None = None
     provider_dispatched: bool = False
     budget_admission_denial_audited: bool = False
     egress_payload: dict[str, Any] = field(default_factory=dict)
@@ -5987,6 +5995,11 @@ class LLMProcessExecutor:
                 ),
                 dispatch_bound_request,
             )
+            state.provider_trace = self._provider_trace_for_completion(
+                state,
+                completion,
+            )
+            self._record_provider_trace_summary(state)
             resource, violation = self._llm_completion_resource_settlement(
                 state,
                 completion,
@@ -6006,6 +6019,26 @@ class LLMProcessExecutor:
             if violation is not None:
                 raise ResourceLimitExceeded(violation)
             return result
+
+    @staticmethod
+    def _provider_trace_for_completion(
+        state: _LLMCallState,
+        completion: Any,
+    ) -> dict[str, Any]:
+        if type(state.client) is LLMClient:
+            trace = getattr(completion, "provider_trace", None)
+            if is_provider_trace(trace):
+                return trace
+        return custom_provider_trace(completion)
+
+    @staticmethod
+    def _record_provider_trace_summary(state: _LLMCallState) -> None:
+        if state.provider_trace is None:
+            state.request_options.pop("provider_trace_summary", None)
+            return
+        state.request_options["provider_trace_summary"] = provider_trace_summary(
+            state.provider_trace
+        )
 
     def _assert_llm_call_scope(self, state: _LLMCallState) -> None:
         assert state.resolved is not None and state.sink is not None
@@ -6138,6 +6171,12 @@ class LLMProcessExecutor:
         state: _LLMCallState,
         error: Exception,
     ) -> None:
+        if state.provider_trace is None:
+            if type(state.client) is LLMClient:
+                state.provider_trace = provider_trace_from_error(error)
+            if state.provider_trace is None:
+                state.provider_trace = custom_provider_trace(error=error)
+        self._record_provider_trace_summary(state)
         preserve_domain_text = self._preserve_llm_domain_error_text(error)
         public_error: dict[str, str] | None = None
         internal_error: dict[str, Any] | None = None
@@ -6150,7 +6189,7 @@ class LLMProcessExecutor:
             tools=state.tools,
             response_content="",
             tool_calls=[],
-            reasoning=None,
+            reasoning=state.provider_trace,
             raw_response=None,
             error=selected_error,
             config=self.config,
@@ -6190,6 +6229,7 @@ class LLMProcessExecutor:
                 response_content=observable["response_content"],
                 tool_calls=observable["tool_calls"],
                 reasoning=observable["reasoning"],
+                usage=dict(state.completion_usage),
                 raw_response=observable["raw_response"],
                 observability=observability,
                 error=observable["error"],
@@ -6237,8 +6277,10 @@ class LLMProcessExecutor:
             tools=state.tools,
             response_content=str(getattr(completion, "content", "")),
             tool_calls=list(getattr(completion, "tool_calls", []) or []),
-            reasoning=getattr(completion, "reasoning", None),
-            raw_response=getattr(completion, "raw", None),
+            reasoning=state.provider_trace,
+            raw_response=project_provider_raw_response(
+                getattr(completion, "raw", None)
+            ),
             config=self.config,
         )
         success_record = LLMCallRecord(

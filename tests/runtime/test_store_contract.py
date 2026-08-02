@@ -4648,6 +4648,94 @@ def test_llm_call_limit_selects_latest_window_then_returns_chronologically(
         ]
 
 
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
+def test_query_llm_calls_uses_stable_pid_scoped_keyset_pages(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        records = [
+            ("call-tie-b", "pid-a", "2026-01-01T00:00:03+00:00"),
+            ("call-other-pid", "pid-b", "2026-01-01T00:00:06+00:00"),
+            ("call-oldest", "pid-a", "2026-01-01T00:00:01+00:00"),
+            ("call-new", "pid-a", "2026-01-01T00:00:04+00:00"),
+            ("call-tie-a", "pid-a", "2026-01-01T00:00:03+00:00"),
+            ("call-old", "pid-a", "2026-01-01T00:00:02+00:00"),
+            ("call-tie-c", "pid-a", "2026-01-01T00:00:03+00:00"),
+        ]
+        for call_id, pid, created_at in records:
+            runtime.store.insert_llm_call(
+                LLMCallRecord(
+                    call_id=call_id,
+                    pid=pid,
+                    image_id=None,
+                    purpose="keyset-page",
+                    status="ok",
+                    created_at=created_at,
+                )
+            )
+
+        first = runtime.store.query_llm_calls("pid-a", before=None, limit=2)
+        assert first["schema_version"] == 1
+        assert [record.call_id for record in first["records"]] == [
+            "call-new",
+            "call-tie-c",
+        ]
+        assert first["next_cursor"] == (
+            "2026-01-01T00:00:03+00:00",
+            "call-tie-c",
+        )
+
+        # A newly inserted leading row must not leak into continuation pages.
+        runtime.store.insert_llm_call(
+            LLMCallRecord(
+                call_id="call-later",
+                pid="pid-a",
+                image_id=None,
+                purpose="keyset-page",
+                status="ok",
+                created_at="2026-01-01T00:00:05+00:00",
+            )
+        )
+
+        second = runtime.store.query_llm_calls(
+            "pid-a",
+            before=first["next_cursor"],
+            limit=2,
+        )
+        assert [record.call_id for record in second["records"]] == [
+            "call-tie-b",
+            "call-tie-a",
+        ]
+        assert second["next_cursor"] == (
+            "2026-01-01T00:00:03+00:00",
+            "call-tie-a",
+        )
+
+        third = runtime.store.query_llm_calls(
+            "pid-a",
+            before=second["next_cursor"],
+            limit=2,
+        )
+        assert [record.call_id for record in third["records"]] == [
+            "call-old",
+            "call-oldest",
+        ]
+        assert third["next_cursor"] is None
+
+        fresh = runtime.store.query_llm_calls("pid-a", before=None, limit=1)
+        assert [record.call_id for record in fresh["records"]] == ["call-later"]
+        assert fresh["next_cursor"] == (
+            "2026-01-01T00:00:05+00:00",
+            "call-later",
+        )
+        assert all(
+            record.pid == "pid-a"
+            for page in (first, second, third, fresh)
+            for record in page["records"]
+        )
+
+
 @pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)
 def test_llm_cache_usage_counters_survive_backend_reopen(
     kind: str,

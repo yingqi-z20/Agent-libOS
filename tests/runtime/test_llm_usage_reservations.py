@@ -5,13 +5,15 @@ import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.llm.client import LLMCompletion
+import agent_libos.llm.client as llm_client_module
+from agent_libos.llm.client import LLMClient, LLMCompletion
 from agent_libos.models import (
     ProcessStatus,
     ResourceBudget,
@@ -238,6 +240,128 @@ def test_llm_reservation_is_active_before_provider_and_settles_exactly() -> None
         assert process.resource_usage.llm_completion_tokens == 2
         assert process.resource_usage.llm_total_tokens == 7
         reservations = runtime.uow.resources.list_resource_usage_reservations(pid=pid)
+        assert len(reservations) == 1
+        assert reservations[0].status is ResourceUsageReservationStatus.SETTLED
+        assert reservations[0].settled_usage == ResourceUsage(
+            llm_calls=1,
+            llm_prompt_tokens=5,
+            llm_completion_tokens=2,
+            llm_total_tokens=7,
+        )
+    finally:
+        runtime.close()
+
+
+def test_builtin_transport_retry_is_one_logical_child_llm_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RateLimited(Exception):
+        status_code = 429
+        response = SimpleNamespace(headers={"retry-after": "0"})
+
+    class SequencedChatCompletions:
+        def __init__(self) -> None:
+            self.items: list[Any] = [
+                RateLimited("private rate-limit body"),
+                SimpleNamespace(
+                    id="chat_retry",
+                    _request_id="req_retry",
+                    model="gpt-test",
+                    usage=SimpleNamespace(
+                        prompt_tokens=5,
+                        completion_tokens=2,
+                        total_tokens=7,
+                    ),
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason="tool_calls",
+                            message=SimpleNamespace(
+                                content="",
+                                tool_calls=[
+                                    SimpleNamespace(
+                                        id="tool_exit",
+                                        function=SimpleNamespace(
+                                            name="process_exit",
+                                            arguments=json.dumps(
+                                                {"payload": {"done": True}}
+                                            ),
+                                        ),
+                                    )
+                                ],
+                            ),
+                        )
+                    ],
+                ),
+            ]
+            self.payloads: list[dict[str, Any]] = []
+
+        async def create(self, **payload: Any) -> Any:
+            self.payloads.append(payload)
+            item = self.items.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+    config = _hard_budget_config()
+    completions = SequencedChatCompletions()
+    client = LLMClient(
+        model="gpt-test",
+        api_key="key",
+        api_mode="chat",
+        max_retries=1,
+        defaults=config.llm,
+    )
+    assert type(client) is LLMClient
+    client._async_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions)
+    )
+    monkeypatch.setattr(llm_client_module, "_is_openai_sdk_error", lambda _exc: True)
+    runtime = Runtime.open("local", config=config)
+    try:
+        runtime.llm.client = client
+        parent = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="parent logical budget",
+            resource_budget=ResourceBudget(
+                max_child_processes=1,
+                max_llm_calls=2,
+                max_llm_total_tokens=2 * _MAX_TOTAL_TOKENS,
+            ),
+        )
+        child = runtime.process.spawn_child(
+            parent,
+            goal="child physical retry",
+            resource_budget=ResourceBudget(
+                max_child_processes=0,
+                max_llm_calls=1,
+                max_llm_total_tokens=_MAX_TOTAL_TOKENS,
+            ),
+        )
+
+        result = runtime.run_process_once(child)
+
+        assert result["ok"]
+        assert len(completions.payloads) == 2
+        child_usage = runtime.process.get(child).resource_usage
+        parent_usage = runtime.process.get(parent).resource_usage
+        assert child_usage.llm_calls == parent_usage.llm_calls == 1
+        assert child_usage.llm_prompt_tokens == parent_usage.llm_prompt_tokens == 5
+        assert child_usage.llm_completion_tokens == parent_usage.llm_completion_tokens == 2
+        assert child_usage.llm_total_tokens == parent_usage.llm_total_tokens == 7
+
+        calls = runtime.store.list_llm_calls(pid=child)
+        assert len(calls) == 1
+        assert runtime.store.list_llm_calls(pid=parent) == []
+        trace = calls[0].reasoning
+        assert trace["coverage"] == "complete"
+        assert trace["selected_attempt"] == 2
+        assert [
+            (attempt["kind"], attempt["status"])
+            for attempt in trace["attempts"]
+        ] == [("initial", "error"), ("transport_retry", "ok")]
+        assert calls[0].request_options["provider_trace_summary"]["attempt_count"] == 2
+
+        reservations = runtime.uow.resources.list_resource_usage_reservations(pid=child)
         assert len(reservations) == 1
         assert reservations[0].status is ResourceUsageReservationStatus.SETTLED
         assert reservations[0].settled_usage == ResourceUsage(

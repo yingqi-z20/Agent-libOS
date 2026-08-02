@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import email.utils
+import hashlib
 import inspect
 import json
 import os
+import random
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -19,6 +24,12 @@ from agent_libos.utils.openai_schema import (
 )
 from agent_libos.models.exceptions import LibOSError
 from agent_libos.ports.blocking_work import run_blocking_once
+from agent_libos.llm.provider_trace import (
+    ProviderAttemptKind,
+    ProviderTraceBuilder,
+    attach_provider_trace,
+    project_provider_raw_response,
+)
 from agent_libos.utils.public_errors import (
     internal_error_observation,
     internal_exception_observation,
@@ -29,6 +40,12 @@ from agent_libos.utils.serde import to_jsonable
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 _API_MODES = {"auto", "responses", "chat"}
+_ACTIVE_PROVIDER_TRACE: contextvars.ContextVar[ProviderTraceBuilder | None] = (
+    contextvars.ContextVar("agent_libos_provider_trace", default=None)
+)
+_ACTIVE_PROVIDER_ATTEMPT_KIND: contextvars.ContextVar[ProviderAttemptKind] = (
+    contextvars.ContextVar("agent_libos_provider_attempt_kind", default="initial")
+)
 
 # These are inbound trust-boundary limits, not generation preferences. They
 # cap provider-authored material before it is joined or copied into durable
@@ -75,6 +92,8 @@ class LLMCompletion:
     # into durable call records by downstream consumers.
     provider_request_options: dict[str, Any] = field(default_factory=dict)
     compatibility_removed_options: list[str] = field(default_factory=list)
+    provider_trace: dict[str, Any] | None = None
+    _provider_attempt_sequence: int | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -82,6 +101,7 @@ class _ProviderCallResult:
     response: Any
     request: dict[str, Any]
     compatibility_removed_options: tuple[str, ...] = ()
+    attempt_sequence: int | None = None
 
 
 @dataclass
@@ -316,21 +336,42 @@ class LLMClient:
         json_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
     ) -> LLMCompletion:
-        selected_messages = self._messages_with_json_instruction(messages) if json_mode and json_schema is None else messages
-        completion = await self._complete_without_tools(
-            messages=selected_messages,
-            temperature=self._temperature(temperature),
-            max_tokens=self._max_tokens(max_tokens),
-            json_mode=json_mode,
-            json_schema=json_schema,
-            schema_name=schema_name,
-        )
-        if not completion.content:
-            raise llm_provider_failure_error(
-                "empty content",
-                diagnostic_type="ProviderEmptyResponse",
+        trace = ProviderTraceBuilder()
+        trace_token = _ACTIVE_PROVIDER_TRACE.set(trace)
+        kind_token = _ACTIVE_PROVIDER_ATTEMPT_KIND.set("initial")
+        try:
+            selected_messages = (
+                self._messages_with_json_instruction(messages)
+                if json_mode and json_schema is None
+                else messages
             )
-        return completion
+            completion = await self._complete_without_tools(
+                messages=selected_messages,
+                temperature=self._temperature(temperature),
+                max_tokens=self._max_tokens(max_tokens),
+                json_mode=json_mode,
+                json_schema=json_schema,
+                schema_name=schema_name,
+            )
+            if not completion.content:
+                error = llm_provider_failure_error(
+                    "empty content",
+                    diagnostic_type="ProviderEmptyResponse",
+                )
+                _reject_active_provider_sequence(
+                    completion._provider_attempt_sequence,
+                    error,
+                )
+                raise error
+            trace.mark_selected(completion._provider_attempt_sequence)
+            completion.provider_trace = trace.to_dict()
+            return completion
+        except BaseException as exc:
+            attach_provider_trace(exc, trace.to_dict())
+            raise
+        finally:
+            _ACTIVE_PROVIDER_ATTEMPT_KIND.reset(kind_token)
+            _ACTIVE_PROVIDER_TRACE.reset(trace_token)
 
     def complete_action(
         self,
@@ -361,6 +402,37 @@ class LLMClient:
         previous_response_id: str | None = None,
         parallel_tool_calls: bool | None = None,
     ) -> LLMCompletion:
+        trace = ProviderTraceBuilder()
+        trace_token = _ACTIVE_PROVIDER_TRACE.set(trace)
+        kind_token = _ACTIVE_PROVIDER_ATTEMPT_KIND.set("initial")
+        try:
+            completion = await self._acomplete_action_untraced(
+                messages=messages,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                previous_response_id=previous_response_id,
+                parallel_tool_calls=parallel_tool_calls,
+            )
+            trace.mark_selected(completion._provider_attempt_sequence)
+            completion.provider_trace = trace.to_dict()
+            return completion
+        except BaseException as exc:
+            attach_provider_trace(exc, trace.to_dict())
+            raise
+        finally:
+            _ACTIVE_PROVIDER_ATTEMPT_KIND.reset(kind_token)
+            _ACTIVE_PROVIDER_TRACE.reset(trace_token)
+
+    async def _acomplete_action_untraced(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        previous_response_id: str | None = None,
+        parallel_tool_calls: bool | None = None,
+    ) -> LLMCompletion:
         selected_temperature = self._temperature(temperature)
         selected_max_tokens = self._max_tokens(max_tokens)
         selected_parallel_tool_calls = self._parallel_tool_calls(parallel_tool_calls)
@@ -381,13 +453,22 @@ class LLMClient:
                 elif self.fallback_json_actions and self._is_tool_protocol_rejection(
                     exc.__cause__ or exc
                 ):
-                    return await self._complete_json_action_fallback(
-                        messages,
-                        selected_temperature,
-                        selected_max_tokens,
-                    )
+                    with _provider_attempt_kind("json_action_fallback"):
+                        return await self._complete_json_action_fallback(
+                            messages,
+                            selected_temperature,
+                            selected_max_tokens,
+                        )
                 else:
                     raise
+            with _provider_attempt_kind("responses_to_chat"):
+                return await self._chat_complete_action(
+                    messages,
+                    tools,
+                    selected_temperature,
+                    selected_max_tokens,
+                    parallel_tool_calls=selected_parallel_tool_calls,
+                )
         return await self._chat_complete_action(
             messages,
             tools,
@@ -411,6 +492,15 @@ class LLMClient:
             except LLMError as exc:
                 if self.api_mode != "auto" or not self._should_fallback_to_chat(exc.__cause__ or exc):
                     raise
+            with _provider_attempt_kind("responses_to_chat"):
+                return await self._chat_complete(
+                    messages,
+                    temperature,
+                    max_tokens,
+                    json_mode,
+                    json_schema,
+                    schema_name,
+                )
         return await self._chat_complete(messages, temperature, max_tokens, json_mode, json_schema, schema_name)
 
     async def _responses_complete(
@@ -428,7 +518,11 @@ class LLMClient:
         elif json_mode:
             payload["text"] = self._text_config(json_mode=True)
         provider_call = await self._create_response(payload)
-        return self._completion_from_response(provider_call)
+        try:
+            return self._completion_from_response(provider_call)
+        except Exception as exc:
+            _reject_active_provider_attempt(provider_call, exc)
+            raise
 
     async def _responses_complete_action(
         self,
@@ -454,7 +548,11 @@ class LLMClient:
             }
         )
         provider_call = await self._create_response(payload)
-        return self._completion_from_response(provider_call)
+        try:
+            return self._completion_from_response(provider_call)
+        except Exception as exc:
+            _reject_active_provider_attempt(provider_call, exc)
+            raise
 
     async def _chat_complete(
         self,
@@ -471,22 +569,37 @@ class LLMClient:
         elif json_mode:
             payload["response_format"] = {"type": "json_object"}
         provider_call = await self._create_chat_completion(payload)
-        result = self._completion_from_chat(provider_call)
+        try:
+            result = self._completion_from_chat(provider_call)
+        except Exception as exc:
+            _reject_active_provider_attempt(provider_call, exc)
+            raise
         if self._needs_non_thinking_retry(result):
+            _reject_active_provider_attempt(
+                provider_call,
+                RuntimeError("Provider completion required non-thinking retry"),
+            )
             previous_removed = provider_call.compatibility_removed_options
             retry_payload = self._with_enable_thinking(provider_call.request, enabled=False)
-            retry_call = await self._create_chat_completion(retry_payload)
-            result = self._completion_from_chat(
-                retry_call,
-                additional_removed=previous_removed,
-            )
+            with _provider_attempt_kind("non_thinking_retry"):
+                retry_call = await self._create_chat_completion(retry_payload)
+            try:
+                result = self._completion_from_chat(
+                    retry_call,
+                    additional_removed=previous_removed,
+                )
+            except Exception as exc:
+                _reject_active_provider_attempt(retry_call, exc)
+                raise
             provider_call = retry_call
         if not result.content:
             finish_reason = _first_choice_attr(provider_call.response, "finish_reason")
-            raise llm_provider_failure_error(
+            error = llm_provider_failure_error(
                 finish_reason,
                 diagnostic_type="ProviderEmptyResponse",
             )
+            _reject_active_provider_attempt(provider_call, error)
+            raise error
         return result
 
     async def _chat_complete_action(
@@ -506,28 +619,44 @@ class LLMClient:
             if self.fallback_json_actions and self._is_tool_protocol_rejection(
                 exc.__cause__ or exc
             ):
-                return await self._complete_json_action_fallback(
-                    messages,
-                    temperature,
-                    max_tokens,
-                )
+                with _provider_attempt_kind("json_action_fallback"):
+                    return await self._complete_json_action_fallback(
+                        messages,
+                        temperature,
+                        max_tokens,
+                    )
             raise
-        result = self._completion_from_chat(provider_call)
+        try:
+            result = self._completion_from_chat(provider_call)
+        except Exception as exc:
+            _reject_active_provider_attempt(provider_call, exc)
+            raise
         if self._needs_non_thinking_retry(result):
-            retry_call = await self._create_chat_completion(
-                self._with_enable_thinking(provider_call.request, enabled=False)
+            _reject_active_provider_attempt(
+                provider_call,
+                RuntimeError("Provider completion required non-thinking retry"),
             )
-            result = self._completion_from_chat(
-                retry_call,
-                additional_removed=provider_call.compatibility_removed_options,
-            )
+            with _provider_attempt_kind("non_thinking_retry"):
+                retry_call = await self._create_chat_completion(
+                    self._with_enable_thinking(provider_call.request, enabled=False)
+                )
+            try:
+                result = self._completion_from_chat(
+                    retry_call,
+                    additional_removed=provider_call.compatibility_removed_options,
+                )
+            except Exception as exc:
+                _reject_active_provider_attempt(retry_call, exc)
+                raise
             provider_call = retry_call
         finish_reason = _first_choice_attr(provider_call.response, "finish_reason")
         if finish_reason in {"length", "content_filter"}:
-            raise llm_provider_failure_error(
+            error = llm_provider_failure_error(
                 finish_reason,
                 diagnostic_type="ProviderFinishReason",
             )
+            _reject_active_provider_attempt(provider_call, error)
+            raise error
         return result
 
     async def _complete_json_action_fallback(
@@ -545,10 +674,12 @@ class LLMClient:
             schema_name="response",
         )
         if not result.content:
-            raise llm_provider_failure_error(
+            error = llm_provider_failure_error(
                 "empty JSON action fallback content",
                 diagnostic_type="ProviderEmptyResponse",
             )
+            _reject_active_provider_sequence(result._provider_attempt_sequence, error)
+            raise error
         result.fallback_json_action_used = True
         return result
 
@@ -600,6 +731,18 @@ class LLMClient:
             client.admin_api_key = None
         if hasattr(client, "webhook_secret"):
             client.webhook_secret = None
+        if getattr(client, "max_retries", None) != 0:
+            raise LLMError("the OpenAI SDK client must disable hidden retries")
+        transport = getattr(client, "_client", None)
+        if transport is None or not hasattr(transport, "follow_redirects"):
+            raise LLMError(
+                "the installed OpenAI SDK cannot safely disable redirects"
+            )
+        transport.follow_redirects = False
+        if transport.follow_redirects is not False:
+            raise LLMError(
+                "the installed OpenAI SDK cannot safely disable redirects"
+            )
         return client
 
     @asynccontextmanager
@@ -633,8 +776,10 @@ class LLMClient:
 
         kwargs: dict[str, Any] = {
             "timeout": self.timeout,
-            # Let the SDK own transient network/rate-limit retry behavior.
-            "max_retries": self.max_retries,
+            # Runtime policy records every wire attempt, so SDK-owned hidden
+            # retries must remain disabled. ``self.max_retries`` is consumed by
+            # the explicit loop around each create call instead.
+            "max_retries": 0,
         }
         if api_key:
             kwargs["api_key"] = api_key
@@ -741,13 +886,26 @@ class LLMClient:
         request = dict(payload)
         last_error: Exception | None = None
         removed_options: set[str] = set()
-        for _attempt in range(self.defaults.compatibility_retry_attempts):
+        base_kind = _ACTIVE_PROVIDER_ATTEMPT_KIND.get()
+        for compatibility_attempt in range(
+            self.defaults.compatibility_retry_attempts
+        ):
             try:
-                response = await create(**request)
+                response, sequence = await self._call_with_transport_retries(
+                    create,
+                    request,
+                    api=api,
+                    kind=(
+                        base_kind
+                        if compatibility_attempt == 0
+                        else "compatibility_retry"
+                    ),
+                )
                 return _ProviderCallResult(
                     response=response,
                     request=dict(request),
                     compatibility_removed_options=tuple(sorted(removed_options)),
+                    attempt_sequence=sequence,
                 )
             except Exception as exc:
                 if not _is_openai_sdk_error(exc):
@@ -762,6 +920,43 @@ class LLMClient:
                 request = retry
         assert last_error is not None
         raise _openai_sdk_request_error(last_error) from last_error
+
+    async def _call_with_transport_retries(
+        self,
+        create: Any,
+        request: dict[str, Any],
+        *,
+        api: str,
+        kind: ProviderAttemptKind,
+    ) -> tuple[Any, int | None]:
+        max_retries = max(0, int(self.max_retries or 0))
+        for retry_index in range(max_retries + 1):
+            trace = _ACTIVE_PROVIDER_TRACE.get()
+            sequence = (
+                trace.start_attempt(
+                    api="responses" if api == "responses" else "chat",
+                    kind=kind if retry_index == 0 else "transport_retry",
+                )
+                if trace is not None
+                else None
+            )
+            try:
+                response = await create(**request)
+            except Exception as exc:
+                if trace is not None and sequence is not None:
+                    trace.finish_error(sequence, exc)
+                if (
+                    not _is_openai_sdk_error(exc)
+                    or not _should_retry_openai_sdk_error(exc)
+                    or retry_index >= max_retries
+                ):
+                    raise
+                await asyncio.sleep(_openai_retry_delay(exc, retry_index))
+                continue
+            if trace is not None and sequence is not None:
+                trace.finish_response(sequence, response)
+            return response, sequence
+        raise AssertionError("unreachable Provider retry loop")
 
     def _compatibility_retry_payload(self, payload: dict[str, Any], exc: Exception, api: str) -> dict[str, Any] | None:
         message = str(exc).lower()
@@ -882,7 +1077,7 @@ class LLMClient:
                     "arguments": arguments,
                 }
             )
-        return LLMCompletion(
+        completion = LLMCompletion(
             content=self._response_text(response, output=output),
             tool_calls=tool_calls,
             raw=response,
@@ -891,7 +1086,7 @@ class LLMClient:
             request_id=getattr(response, "_request_id", None),
             model=str(getattr(response, "model", "")) or None,
             usage=_usage_from_response(response),
-            reasoning=_reasoning_from_response(response),
+            reasoning=_reasoning_from_response(response, output=output),
             provider_request_options=_provider_request_option_observation(
                 provider_call.request
             ),
@@ -900,7 +1095,10 @@ class LLMClient:
                     provider_call.compatibility_removed_options
                 )
             ),
+            _provider_attempt_sequence=provider_call.attempt_sequence,
         )
+        _enrich_active_provider_trace(completion)
+        return completion
 
     def _completion_from_chat(
         self,
@@ -962,7 +1160,7 @@ class LLMClient:
                 diagnostic_type="ProviderFinishReason",
             )
 
-        return LLMCompletion(
+        result = LLMCompletion(
             content=content,
             tool_calls=tool_calls,
             raw=completion,
@@ -980,7 +1178,10 @@ class LLMClient:
                     provider_call.compatibility_removed_options
                 )
             ),
+            _provider_attempt_sequence=provider_call.attempt_sequence,
         )
+        _enrich_active_provider_trace(result)
+        return result
 
     def _use_responses_api(self) -> bool:
         if self.api_mode == "responses":
@@ -1264,6 +1465,57 @@ def _llm_defaults(config: AgentLibOSConfig | LLMDefaults | None) -> LLMDefaults:
     if isinstance(config, LLMDefaults):
         return config
     return config.llm
+
+
+@contextmanager
+def _provider_attempt_kind(kind: ProviderAttemptKind) -> Any:
+    token = _ACTIVE_PROVIDER_ATTEMPT_KIND.set(kind)
+    try:
+        yield
+    finally:
+        _ACTIVE_PROVIDER_ATTEMPT_KIND.reset(token)
+
+
+def _enrich_active_provider_trace(completion: LLMCompletion) -> None:
+    trace = _ACTIVE_PROVIDER_TRACE.get()
+    sequence = completion._provider_attempt_sequence
+    if trace is None or sequence is None:
+        return
+    try:
+        trace.enrich_response(
+            sequence,
+            reasoning=completion.reasoning,
+            output=completion.content,
+            tool_calls=completion.tool_calls,
+            usage=completion.usage,
+            model=completion.model,
+            request_id=completion.request_id,
+            response_id=completion.response_id,
+        )
+    except Exception:
+        # Trace construction is diagnostic and must never turn a valid Provider
+        # completion into a second logical call or a failed tool selection.
+        trace.limited = True
+
+
+def _reject_active_provider_attempt(
+    provider_call: _ProviderCallResult,
+    error: BaseException,
+) -> None:
+    _reject_active_provider_sequence(provider_call.attempt_sequence, error)
+
+
+def _reject_active_provider_sequence(
+    sequence: int | None,
+    error: BaseException,
+) -> None:
+    trace = _ACTIVE_PROVIDER_TRACE.get()
+    if trace is None or sequence is None:
+        return
+    try:
+        trace.reject_response(sequence, error)
+    except Exception:
+        trace.limited = True
 
 
 def _messages_to_responses_parts(
@@ -1572,7 +1824,23 @@ def _openai_sdk_request_error(exc: Exception) -> LLMError:
 def _is_transient_openai_sdk_error(exc: Exception) -> bool:
     """Mirror the SDK's documented retryable transport/status classes."""
 
+    return _should_retry_openai_sdk_error(exc)
+
+
+def _should_retry_openai_sdk_error(exc: Exception) -> bool:
     status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and 300 <= status_code <= 399:
+        # Redirects are disabled at the transport and remain terminal even if a
+        # compatible endpoint tries to override retry policy with a header.
+        return False
+    retry_directive = _openai_error_header(exc, "x-should-retry")
+    if retry_directive is not None:
+        normalized = retry_directive.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+
     if isinstance(status_code, int) and (
         status_code in {408, 409, 429} or 500 <= status_code <= 599
     ):
@@ -1583,6 +1851,57 @@ def _is_transient_openai_sdk_error(exc: Exception) -> bool:
         "InternalServerError",
         "RateLimitError",
     }
+
+
+def _openai_retry_delay(exc: Exception, retry_index: int) -> float:
+    retry_after_ms = _openai_error_header(exc, "retry-after-ms")
+    if retry_after_ms is not None:
+        try:
+            selected_ms = float(retry_after_ms)
+        except (TypeError, ValueError):
+            selected_ms = -1.0
+        selected_seconds = selected_ms / 1000.0
+        if 0.0 <= selected_seconds <= 60.0:
+            return selected_seconds
+
+    retry_after = _openai_error_header(exc, "retry-after")
+    if retry_after is not None:
+        try:
+            selected_seconds = float(retry_after)
+        except (TypeError, ValueError):
+            selected_seconds = _retry_after_date_seconds(retry_after)
+        if 0.0 <= selected_seconds <= 60.0:
+            return selected_seconds
+
+    exponential = min(8.0, 0.5 * (2 ** max(0, retry_index)))
+    jittered = exponential * (0.75 + (0.5 * random.random()))
+    return min(8.0, max(0.5, jittered))
+
+
+def _retry_after_date_seconds(value: str) -> float:
+    try:
+        parsed = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return -1.0
+    if parsed is None:
+        return -1.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (parsed - datetime.now(timezone.utc)).total_seconds()
+
+
+def _openai_error_header(exc: Exception, name: str) -> str | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        headers = getattr(exc, "headers", None)
+    if headers is None:
+        return None
+    try:
+        value = headers.get(name)
+    except (AttributeError, TypeError):
+        return None
+    return str(value) if value is not None else None
 
 
 
@@ -1696,29 +2015,81 @@ def _usage_from_response(response: Any) -> dict[str, Any]:
     return jsonable if isinstance(jsonable, dict) else {"raw": jsonable}
 
 
-def _reasoning_from_response(response: Any) -> Any | None:
-    direct = _get_attr_or_key(response, "reasoning")
-    if direct is not None:
-        return to_jsonable(direct)
+def _reasoning_from_response(
+    response: Any,
+    *,
+    output: list[Any] | None = None,
+) -> Any | None:
+    # ``Response.reasoning`` is the request/configuration object in current
+    # OpenAI SDKs. The actual Provider-authored reasoning is emitted as ordered
+    # output items and must not be shadowed by that top-level setting.
     reasoning_items: list[Any] = []
-    for item in _get_attr_or_key(response, "output") or []:
+    selected_output = output
+    if selected_output is None:
+        selected_output = _bounded_provider_items(
+            _get_attr_or_key(response, "output"),
+            limit=LLM_RESPONSE_OUTPUT_MAX_ITEMS,
+            label="response.output",
+        )
+    for item in selected_output:
         if _get_attr_or_key(item, "type") == "reasoning":
-            reasoning_items.append(to_jsonable(item))
+            projected = project_provider_raw_response(item)
+            if isinstance(projected, dict):
+                if projected.get("type") == "omitted":
+                    reasoning_items.append(projected)
+                    continue
+                selected_keys = {
+                    "type",
+                    "summary",
+                    "content",
+                    "encrypted_content",
+                    "signature",
+                }
+                selected = {
+                    key: value
+                    for key, value in projected.items()
+                    if key in selected_keys
+                    or (
+                        isinstance(value, dict)
+                        and value.get("type") == "opaque"
+                    )
+                }
+                reasoning_items.append(selected)
+                if projected.get("_provider_projection_limited") is True:
+                    omitted = projected.get("_omitted")
+                    if isinstance(omitted, dict) and omitted.get("type") == "omitted":
+                        reasoning_items.append(omitted)
+                    else:
+                        reasoning_items.append(
+                            {
+                                "type": "omitted",
+                                "reason": "structure_limit",
+                                "bytes": 0,
+                                "sha256": hashlib.sha256(b"").hexdigest(),
+                                "digest_scope": "bounded_summary",
+                            }
+                        )
     return reasoning_items or None
 
 
 def _reasoning_from_chat_message(message: Any) -> Any | None:
-    for key in ("reasoning", "reasoning_content", "thinking", "thinking_content"):
+    allowed = ("reasoning", "reasoning_content", "thinking", "thinking_content")
+    selected: dict[str, Any] = {}
+    for key in allowed:
         value = _get_attr_or_key(message, key)
         if _has_value(value):
-            return to_jsonable(value)
+            selected[key] = project_provider_raw_response(value)
     additional = _get_attr_or_key(message, "additional_kwargs")
     if isinstance(additional, dict):
-        for key in ("reasoning", "reasoning_content", "thinking", "thinking_content"):
+        for key in allowed:
+            if key in selected:
+                continue
             value = additional.get(key)
             if _has_value(value):
-                return to_jsonable(value)
-    return None
+                selected[key] = project_provider_raw_response(value)
+    if not selected:
+        return None
+    return {key: selected[key] for key in allowed if key in selected}
 
 
 def _has_value(value: Any) -> bool:

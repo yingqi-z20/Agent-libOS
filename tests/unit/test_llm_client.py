@@ -7,6 +7,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any
+from pydantic import BaseModel, ConfigDict
 from agent_libos.config import AgentLibOSConfig, LLMDefaults
 import agent_libos.llm.client as llm_client_module
 from agent_libos.llm.client import (
@@ -18,9 +19,549 @@ from agent_libos.llm.client import (
     LLM_RESPONSE_TOOL_CALL_MAX_COUNT,
     llm_error_internal_observation,
 )
+from agent_libos.llm.provider_trace import (
+    PROVIDER_TRACE_MAX_BYTES,
+    ProviderTraceBuilder,
+    ProviderTraceAttemptLimitExceeded,
+    custom_provider_trace,
+    project_provider_raw_response,
+    provider_reasoning_view,
+    provider_trace_from_error,
+)
+from agent_libos.utils.serde import dumps
 from agent_libos.utils.public_errors import public_error_envelope
 
 class TestLLMClient:
+
+    def test_responses_trace_uses_output_reasoning_not_top_level_configuration(self) -> None:
+        class ReasoningItem(BaseModel):
+            model_config = ConfigDict(extra="allow")
+
+            type: str
+            summary: list[dict[str, str]]
+            content: list[dict[str, str]]
+            encrypted_content: str | None = None
+
+        secret = "OPAQUE_REASONING_SECRET"
+        response = SimpleNamespace(
+            id="resp_reasoning",
+            model="gpt-test",
+            status="completed",
+            reasoning={"effort": "high", "summary": "configuration-only"},
+            output_text="done",
+            output=[
+                ReasoningItem(
+                    type="reasoning",
+                    summary=[{"text": "first summary"}],
+                    content=[{"text": "then detail"}],
+                    encrypted_content=secret,
+                    opaque_blob=secret,
+                )
+            ],
+        )
+        fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        client = LLMClient(model="gpt-test", api_key="key", api_mode="responses")
+        client._async_client = fake
+
+        completion = asyncio.run(
+            client.acomplete_with_metadata(
+                messages=[{"role": "user", "content": "answer"}],
+                json_mode=False,
+            )
+        )
+
+        assert completion.provider_trace is not None
+        attempt = completion.provider_trace["attempts"][0]
+        assert attempt["reasoning"]["blocks"][:2] == [
+            {"type": "summary_text", "text": "first summary", "source": "summary"},
+            {"type": "reasoning_text", "text": "then detail", "source": "content"},
+        ]
+        serialized = json.dumps(completion.provider_trace, sort_keys=True)
+        assert "configuration-only" not in serialized
+        assert secret not in serialized
+        assert [block["type"] for block in attempt["reasoning"]["blocks"][2:]] == [
+            "opaque",
+            "opaque",
+        ]
+
+    def test_responses_reasoning_projection_limit_retains_hash_descriptor(self) -> None:
+        response = SimpleNamespace(
+            id="resp_reasoning_limit",
+            model="gpt-test",
+            status="completed",
+            output_text="done",
+            output=[
+                {
+                    "type": "reasoning",
+                    "content": ["x" * 262_144 for _ in range(16)],
+                }
+            ],
+        )
+        fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        client = LLMClient(model="gpt-test", api_key="key", api_mode="responses")
+        client._async_client = fake
+
+        completion = asyncio.run(
+            client.acomplete_with_metadata(
+                messages=[{"role": "user", "content": "answer"}],
+                json_mode=False,
+            )
+        )
+
+        assert completion.provider_trace is not None
+        reasoning = completion.provider_trace["attempts"][0]["reasoning"]
+        assert reasoning["availability"] == "limited"
+        omitted = next(
+            block for block in reasoning["blocks"] if block["type"] == "omitted"
+        )
+        assert omitted["reason"] in {"aggregate_limit", "bounds"}
+        assert omitted["bytes"] > 0
+        assert len(omitted["sha256"]) == 64
+
+    def test_responses_absent_opaque_reasoning_fields_do_not_claim_content(self) -> None:
+        response = SimpleNamespace(
+            id="resp_reasoning_optional_none",
+            model="gpt-test",
+            status="completed",
+            output_text="done",
+            output=[
+                SimpleNamespace(
+                    type="reasoning",
+                    summary=None,
+                    content=None,
+                    encrypted_content=None,
+                    signature=None,
+                )
+            ],
+        )
+        fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        client = LLMClient(model="gpt-test", api_key="key", api_mode="responses")
+        client._async_client = fake
+
+        completion = asyncio.run(
+            client.acomplete_with_metadata(
+                messages=[{"role": "user", "content": "answer"}],
+                json_mode=False,
+            )
+        )
+
+        assert completion.provider_trace is not None
+        reasoning = completion.provider_trace["attempts"][0]["reasoning"]
+        assert reasoning == {"availability": "not_returned", "blocks": []}
+
+    def test_explicit_transport_retry_records_each_wire_attempt(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class RateLimited(Exception):
+            status_code = 429
+            response = SimpleNamespace(headers={"retry-after": "0"})
+
+        completion = SimpleNamespace(
+            id="chat_retry",
+            model="gpt-test",
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content="ok", tool_calls=[]),
+                )
+            ],
+        )
+        fake = FakeAsyncOpenAI(
+            chat=FakeChat(FakeChatCompletions([RateLimited("private"), completion]))
+        )
+        client = LLMClient(
+            model="gpt-test",
+            api_key="key",
+            api_mode="chat",
+            max_retries=2,
+        )
+        client._async_client = fake
+        monkeypatch.setattr(llm_client_module, "_is_openai_sdk_error", lambda _exc: True)
+
+        result = asyncio.run(
+            client.acomplete_with_metadata(
+                messages=[{"role": "user", "content": "answer"}],
+                json_mode=False,
+            )
+        )
+
+        assert result.provider_trace is not None
+        assert result.provider_trace["selected_attempt"] == 2
+        assert [attempt["kind"] for attempt in result.provider_trace["attempts"]] == [
+            "initial",
+            "transport_retry",
+        ]
+        assert [attempt["status"] for attempt in result.provider_trace["attempts"]] == [
+            "error",
+            "ok",
+        ]
+        assert result.provider_trace["attempts"][0]["error"]["status_code"] == 429
+        assert len(fake.chat.completions.payloads) == 2
+
+    def test_compatibility_retry_is_distinct_from_transport_retry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class ProviderError(Exception):
+            def __init__(self, message: str, status_code: int) -> None:
+                super().__init__(message)
+                self.status_code = status_code
+                self.response = SimpleNamespace(headers={"retry-after": "0"})
+
+        completion = SimpleNamespace(
+            id="chat_compat",
+            model="gpt-test",
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content="ok", tool_calls=[]),
+                )
+            ],
+        )
+        fake = FakeAsyncOpenAI(
+            chat=FakeChat(
+                FakeChatCompletions(
+                    [
+                        ProviderError("rate limited", 429),
+                        ProviderError("unknown parameter temperature", 400),
+                        completion,
+                    ]
+                )
+            )
+        )
+        client = LLMClient(
+            model="gpt-test",
+            api_key="key",
+            api_mode="chat",
+            max_retries=1,
+        )
+        client._async_client = fake
+        monkeypatch.setattr(llm_client_module, "_is_openai_sdk_error", lambda _exc: True)
+
+        result = asyncio.run(
+            client.acomplete_with_metadata(
+                messages=[{"role": "user", "content": "answer"}],
+                json_mode=False,
+            )
+        )
+
+        assert result.provider_trace is not None
+        assert [attempt["kind"] for attempt in result.provider_trace["attempts"]] == [
+            "initial",
+            "transport_retry",
+            "compatibility_retry",
+        ]
+        assert "temperature" not in fake.chat.completions.payloads[2]
+
+    def test_non_thinking_retry_rejects_first_attempt_and_selects_second(self) -> None:
+        first = SimpleNamespace(
+            id="chat_empty",
+            model="compat-model",
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content="", tool_calls=[]),
+                )
+            ],
+        )
+        second = SimpleNamespace(
+            id="chat_final",
+            model="compat-model",
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content="ok", tool_calls=[]),
+                )
+            ],
+        )
+        fake = FakeAsyncOpenAI(
+            chat=FakeChat(FakeChatCompletions([first, second]))
+        )
+        client = LLMClient(
+            base_url="https://example.com/v1",
+            model="compat-model",
+            api_key="key",
+            api_mode="chat",
+            allow_custom_base_url=True,
+        )
+        client._async_client = fake
+
+        result = asyncio.run(
+            client.acomplete_with_metadata(
+                messages=[{"role": "user", "content": "answer"}],
+                json_mode=False,
+            )
+        )
+
+        assert result.provider_trace is not None
+        assert result.provider_trace["selected_attempt"] == 2
+        assert [attempt["kind"] for attempt in result.provider_trace["attempts"]] == [
+            "initial",
+            "non_thinking_retry",
+        ]
+        assert [attempt["status"] for attempt in result.provider_trace["attempts"]] == [
+            "error",
+            "ok",
+        ]
+
+    def test_terminal_provider_error_carries_bounded_trace(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class BadRequest(Exception):
+            status_code = 400
+            response = SimpleNamespace(headers={"x-should-retry": "false"})
+
+        secret = "PRIVATE_PROVIDER_ERROR"
+        fake = FakeAsyncOpenAI(
+            chat=FakeChat(FakeChatCompletions(BadRequest(secret)))
+        )
+        client = LLMClient(
+            model="gpt-test",
+            api_key="key",
+            api_mode="chat",
+            max_retries=3,
+        )
+        client._async_client = fake
+        monkeypatch.setattr(llm_client_module, "_is_openai_sdk_error", lambda _exc: True)
+
+        with pytest.raises(LLMError) as raised:
+            asyncio.run(
+                client.acomplete_with_metadata(
+                    messages=[{"role": "user", "content": "answer"}],
+                    json_mode=False,
+                )
+            )
+
+        trace = provider_trace_from_error(raised.value)
+        assert trace is not None
+        assert len(trace["attempts"]) == 1
+        assert trace["attempts"][0]["status"] == "error"
+        assert secret not in json.dumps(trace, sort_keys=True)
+        assert len(fake.chat.completions.payloads) == 1
+
+    def test_redirect_is_terminal_even_when_provider_requests_retry(self) -> None:
+        error = SimpleNamespace(
+            status_code=302,
+            response=SimpleNamespace(headers={"x-should-retry": "true"}),
+        )
+
+        assert llm_client_module._should_retry_openai_sdk_error(error) is False
+
+    @pytest.mark.parametrize(
+        ("status_code", "headers", "expected"),
+        [
+            (408, {}, True),
+            (409, {}, True),
+            (429, {}, True),
+            (500, {}, True),
+            (599, {}, True),
+            (400, {}, False),
+            (400, {"x-should-retry": "true"}, True),
+            (503, {"x-should-retry": "false"}, False),
+        ],
+    )
+    def test_explicit_retry_status_and_header_matrix(
+        self,
+        status_code: int,
+        headers: dict[str, str],
+        expected: bool,
+    ) -> None:
+        error = SimpleNamespace(
+            status_code=status_code,
+            response=SimpleNamespace(headers=headers),
+        )
+
+        assert llm_client_module._should_retry_openai_sdk_error(error) is expected
+
+    @pytest.mark.parametrize("error_type", ["APIConnectionError", "APITimeoutError"])
+    def test_explicit_retry_transport_error_matrix(self, error_type: str) -> None:
+        error = type(error_type, (Exception,), {})("private transport failure")
+
+        assert llm_client_module._should_retry_openai_sdk_error(error) is True
+
+    @pytest.mark.parametrize(
+        ("headers", "retry_index", "expected"),
+        [
+            ({"retry-after-ms": "1500"}, 0, 1.5),
+            ({"retry-after": "60"}, 0, 60.0),
+            ({"retry-after": "61"}, 2, 2.0),
+            ({"retry-after": "invalid"}, 2, 2.0),
+        ],
+    )
+    def test_retry_after_bounds_and_exponential_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        headers: dict[str, str],
+        retry_index: int,
+        expected: float,
+    ) -> None:
+        monkeypatch.setattr(llm_client_module.random, "random", lambda: 0.5)
+        error = SimpleNamespace(response=SimpleNamespace(headers=headers))
+
+        assert llm_client_module._openai_retry_delay(error, retry_index) == expected
+
+    def test_custom_provider_error_does_not_claim_an_unobservable_wire_attempt(self) -> None:
+        trace = custom_provider_trace(error=RuntimeError("private adapter error"))
+
+        assert trace["coverage"] == "custom_client_incomplete"
+        assert trace["selected_attempt"] is None
+        assert trace["attempts"] == []
+
+    def test_raw_response_projection_hashes_opaque_fields_and_caps_aggregate(self) -> None:
+        secret = "ENCRYPTED_PROVIDER_SECRET"
+        projected = project_provider_raw_response(
+            {
+                "encrypted_content": secret,
+                "signature": secret,
+                "opaque_data": secret,
+                "opaque_wrapper": {"type": "opaque", "data": secret},
+                ("a" * 256) + "_encrypted_content": secret,
+                "parts": ["x" * 200_000 for _ in range(30)],
+            }
+        )
+        serialized = dumps(projected).encode()
+        assert len(serialized) <= PROVIDER_TRACE_MAX_BYTES
+        assert secret.encode() not in serialized
+        assert projected["encrypted_content"]["sha256"]
+        assert projected["opaque_data"]["type"] == "opaque"
+        assert projected["opaque_wrapper"]["type"] == "opaque"
+        assert projected["a" * 256]["type"] == "opaque"
+
+        credential_secret = "RAW_PROVIDER_CREDENTIAL_SECRET"
+        credential_projection = project_provider_raw_response(
+            {
+                "Authorization": f"Bearer {credential_secret}",
+                "headers": [
+                    ["x-api-key", credential_secret],
+                    ["Authorization", credential_secret, credential_secret],
+                    ["content-type", "application/json"],
+                    {"name": "Authorization", "value": credential_secret},
+                    {"key": "set-cookie", "data": [credential_secret]},
+                    {"name": "content-type", "value": "application/json"},
+                ],
+            }
+        )
+        credential_wire = dumps(credential_projection)
+        assert credential_secret not in credential_wire
+        assert credential_projection["Authorization"]["type"] == "opaque"
+        assert credential_projection["headers"][0][0] == "x-api-key"
+        assert credential_projection["headers"][0][1]["type"] == "opaque"
+        assert credential_projection["headers"][1][1]["type"] == "opaque"
+        assert credential_projection["headers"][1][2]["type"] == "opaque"
+        assert credential_projection["headers"][2] == [
+            "content-type",
+            "application/json",
+        ]
+        assert credential_projection["headers"][3]["value"]["type"] == "opaque"
+        assert credential_projection["headers"][4]["data"]["type"] == "opaque"
+        assert credential_projection["headers"][5] == {
+            "name": "content-type",
+            "value": "application/json",
+        }
+
+        opaque_reasoning = provider_reasoning_view({"opaque": secret})
+        assert opaque_reasoning["availability"] == "returned"
+        assert opaque_reasoning["blocks"][0]["type"] == "opaque"
+        assert secret not in dumps(opaque_reasoning)
+
+        nested: dict[str, Any] = {"text": "leaf"}
+        for _ in range(40):
+            nested = {"content": nested}
+        reasoning = provider_reasoning_view(nested)
+        assert reasoning["availability"] == "limited"
+        omitted = next(
+            block for block in reasoning["blocks"] if block["type"] == "omitted"
+        )
+        assert omitted["bytes"] > 0
+        assert len(omitted["sha256"]) == 64
+
+        many_blocks = provider_reasoning_view(["x"] * 10_000)
+        assert many_blocks["availability"] == "limited"
+        assert len(many_blocks["blocks"]) <= 4_096
+        assert many_blocks["blocks"][-1]["type"] == "omitted"
+
+        huge_integer = 10**5_000
+        projected_integer = project_provider_raw_response({"value": huge_integer})
+        assert projected_integer["value"]["reason"] == "integer_out_of_range"
+        assert projected_integer["value"]["sha256"]
+
+        builder = ProviderTraceBuilder()
+        sequence = builder.start_attempt(api="chat", kind="initial")
+        builder.finish_response(
+            sequence,
+            SimpleNamespace(usage={"total_tokens": huge_integer}),
+        )
+        huge_integer_trace = builder.to_dict()
+        usage = huge_integer_trace["attempts"][0]["usage"]
+        assert usage["total_tokens"] is None
+        assert usage["_provider_projection_invalid_fields"] == ["total_tokens"]
+
+        class WideSdkModel:
+            def __init__(self) -> None:
+                self.__dict__.update({f"field_{index}": index for index in range(10_000)})
+
+            def model_dump(self) -> dict[str, Any]:
+                raise AssertionError("unbounded recursive model_dump must not be called")
+
+        projected_model = project_provider_raw_response(WideSdkModel())
+        assert projected_model["_provider_projection_limited"] is True
+        assert projected_model["_omitted"]["items"] > 0
+        assert len(projected_model) <= 4_097
+
+    def test_attempt_limit_stops_the_257th_dispatch_before_provider(self) -> None:
+        builder = ProviderTraceBuilder()
+        for _ in range(256):
+            builder.start_attempt(api="chat", kind="initial")
+        dispatched = 0
+
+        async def create(**_payload: Any) -> Any:
+            nonlocal dispatched
+            dispatched += 1
+            return SimpleNamespace()
+
+        async def run() -> None:
+            token = llm_client_module._ACTIVE_PROVIDER_TRACE.set(builder)
+            try:
+                client = LLMClient(
+                    model="gpt-test",
+                    api_key="key",
+                    api_mode="chat",
+                    max_retries=0,
+                )
+                await client._call_with_transport_retries(
+                    create,
+                    {"model": "gpt-test"},
+                    api="chat",
+                    kind="initial",
+                )
+            finally:
+                llm_client_module._ACTIVE_PROVIDER_TRACE.reset(token)
+
+        with pytest.raises(ProviderTraceAttemptLimitExceeded):
+            asyncio.run(run())
+        assert dispatched == 0
+
+    def test_provider_trace_cap_matches_durable_serializer(self) -> None:
+        builder = ProviderTraceBuilder()
+        response = SimpleNamespace(id="response", model="model", usage={})
+        for _ in range(256):
+            sequence = builder.start_attempt(api="chat", kind="initial")
+            builder.finish_response(sequence, response)
+            builder.enrich_response(
+                sequence,
+                reasoning=None,
+                output="x" * 16_100,
+                tool_calls=[],
+                usage={},
+            )
+        builder.mark_selected(256)
+
+        trace = builder.to_dict()
+
+        assert len(dumps(trace).encode()) <= PROVIDER_TRACE_MAX_BYTES
+        assert trace["selected_attempt"] == 256
 
     def test_sdk_timeout_is_classified_as_transient_after_sdk_retries(
         self,
@@ -146,6 +687,7 @@ class TestLLMClient:
             model="gpt-test",
             status="incomplete",
             incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+            usage=SimpleNamespace(input_tokens=9, output_tokens=2, total_tokens=11),
             output_text="",
             output=[
                 SimpleNamespace(
@@ -180,6 +722,16 @@ class TestLLMClient:
             )
         assert "incomplete" not in str(raised.value)
         assert str(raised.value).startswith("llm_error: LLMError (correlation_id=")
+        trace = provider_trace_from_error(raised.value)
+        assert trace is not None
+        assert trace["selected_attempt"] is None
+        assert trace["attempts"][0]["status"] == "error"
+        assert trace["attempts"][0]["output"] == ""
+        assert trace["attempts"][0]["usage"] == {
+            "input_tokens": 9,
+            "output_tokens": 2,
+            "total_tokens": 11,
+        }
 
     def test_responses_provider_error_object_is_text_free(self) -> None:
         secret = "PROVIDER_RESPONSE_ERROR_SECRET"
@@ -920,7 +1472,62 @@ class TestLLMClient:
         assert completion.api == 'chat'
         assert completion.tool_calls[0]['name'] == 'process_exit'
         assert completion.usage['total_tokens'] == 9
-        assert completion.reasoning == 'select process_exit'
+        assert completion.reasoning == {
+            'reasoning_content': 'select process_exit',
+        }
+        assert completion.provider_trace is not None
+        assert completion.provider_trace['attempts'][0]['reasoning']['blocks'] == [
+            {
+                'type': 'reasoning_text',
+                'text': 'select process_exit',
+                'source': 'reasoning_content',
+            }
+        ]
+
+    def test_chat_trace_collects_all_allowlisted_reasoning_fields_only(self) -> None:
+        message = SimpleNamespace(
+            content="ok",
+            reasoning="reasoning text",
+            thinking_content="thinking text",
+            chain_of_thought="must not be retained",
+            additional_kwargs={
+                "reasoning": "duplicate must not replace direct field",
+                "reasoning_content": "summary text",
+                "hidden_cot": "must not be retained",
+            },
+            tool_calls=[],
+        )
+        completion = SimpleNamespace(
+            id="chat_reasoning_fields",
+            model="gpt-test",
+            choices=[SimpleNamespace(finish_reason="stop", message=message)],
+        )
+        fake = FakeAsyncOpenAI(chat=FakeChat(FakeChatCompletions(completion)))
+        client = LLMClient(model="gpt-test", api_key="key", api_mode="chat")
+        client._async_client = fake
+
+        result = asyncio.run(
+            client.acomplete_with_metadata(
+                messages=[{"role": "user", "content": "answer"}],
+                json_mode=False,
+            )
+        )
+
+        assert result.reasoning == {
+            "reasoning": "reasoning text",
+            "reasoning_content": "summary text",
+            "thinking_content": "thinking text",
+        }
+        assert result.provider_trace is not None
+        blocks = result.provider_trace["attempts"][0]["reasoning"]["blocks"]
+        assert [(block["source"], block["text"]) for block in blocks] == [
+            ("reasoning", "reasoning text"),
+            ("reasoning_content", "summary text"),
+            ("thinking_content", "thinking text"),
+        ]
+        serialized = json.dumps(result.provider_trace, sort_keys=True)
+        assert "must not be retained" not in serialized
+        assert "duplicate must not replace" not in serialized
 
     def test_chat_action_rejects_truncated_tool_call(self) -> None:
         truncated = SimpleNamespace(
@@ -1108,6 +1715,10 @@ class TestLLMClient:
             assert async_sdk.admin_api_key is None
             assert sync_sdk.webhook_secret is None
             assert async_sdk.webhook_secret is None
+            assert sync_sdk.max_retries == 0
+            assert async_sdk.max_retries == 0
+            assert sync_sdk._client.follow_redirects is False
+            assert async_sdk._client.follow_redirects is False
         finally:
             client.close()
             asyncio.run(async_sdk.close())
@@ -1123,6 +1734,8 @@ class TestLLMClient:
             assert 'X-Ambient-Secret' not in sdk.default_headers
             assert sdk.admin_api_key is None
             assert sdk.webhook_secret is None
+            assert sdk.max_retries == 0
+            assert sdk._client.follow_redirects is False
         finally:
             client.close()
 
@@ -1132,6 +1745,8 @@ class TestLLMClient:
             _custom_headers={'X-Captured-Before-Environment-Change': 'do-not-send'},
             admin_api_key='ambient-admin-key',
             webhook_secret='ambient-webhook-secret',
+            max_retries=0,
+            _client=SimpleNamespace(follow_redirects=True),
         )
 
         normalized = LLMClient._normalize_openai_sdk_client(sdk)
@@ -1140,6 +1755,18 @@ class TestLLMClient:
         assert sdk._custom_headers == {}
         assert sdk.admin_api_key is None
         assert sdk.webhook_secret is None
+        assert sdk._client.follow_redirects is False
+
+    @pytest.mark.parametrize(
+        "sdk",
+        [
+            SimpleNamespace(_custom_headers={}),
+            SimpleNamespace(_custom_headers={}, max_retries=0),
+        ],
+    )
+    def test_sdk_retry_and_redirect_controls_fail_closed(self, sdk: Any) -> None:
+        with pytest.raises(LLMError):
+            LLMClient._normalize_openai_sdk_client(sdk)
 
     def test_from_env_and_requests_use_configured_llm_defaults(self, monkeypatch) -> None:
         config = AgentLibOSConfig(
@@ -1335,6 +1962,66 @@ class TestLLMClient:
         assert "tools" in fake.chat.completions.payloads[0]
         assert "tools" not in fake.chat.completions.payloads[1]
         assert "tool_choice" not in fake.chat.completions.payloads[1]
+        assert completion.provider_trace is not None
+        assert completion.provider_trace["selected_attempt"] == 2
+        assert [
+            attempt["kind"] for attempt in completion.provider_trace["attempts"]
+        ] == ["initial", "json_action_fallback"]
+        assert [
+            attempt["status"] for attempt in completion.provider_trace["attempts"]
+        ] == ["error", "ok"]
+
+    def test_auto_mode_records_responses_to_chat_fallback_trace(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class EndpointNotFound(Exception):
+            status_code = 404
+            response = SimpleNamespace(headers={})
+
+        class FailingResponses:
+            def __init__(self) -> None:
+                self.payloads: list[dict[str, Any]] = []
+
+            async def create(self, **payload: Any) -> Any:
+                self.payloads.append(payload)
+                raise EndpointNotFound("Responses endpoint not found")
+
+        chat_completion = SimpleNamespace(
+            id="chat_fallback",
+            model="gpt-test",
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content="ok", tool_calls=[]),
+                )
+            ],
+        )
+        responses = FailingResponses()
+        chat = FakeChat(FakeChatCompletions(chat_completion))
+        fake = FakeAsyncOpenAI(responses=responses, chat=chat)
+        client = LLMClient(model="gpt-test", api_key="key", api_mode="auto")
+        client._async_client = fake
+        monkeypatch.setattr(llm_client_module, "_is_openai_sdk_error", lambda _exc: True)
+
+        completion = asyncio.run(
+            client.acomplete_with_metadata(
+                messages=[{"role": "user", "content": "answer"}],
+                json_mode=False,
+            )
+        )
+
+        assert len(responses.payloads) == 1
+        assert len(chat.completions.payloads) == 1
+        assert completion.provider_trace is not None
+        assert completion.provider_trace["selected_attempt"] == 2
+        assert [
+            (attempt["api"], attempt["kind"], attempt["status"])
+            for attempt in completion.provider_trace["attempts"]
+        ] == [
+            ("responses", "initial", "error"),
+            ("chat", "responses_to_chat", "ok"),
+        ]
 
     def test_close_releases_cached_sync_and_async_clients(self) -> None:
         client = LLMClient(model='gpt-test', api_key='key')

@@ -3530,7 +3530,7 @@ async def _mcp_sdk_v2_client(
     del sdk_mode
     client_info = mcp_types.Implementation(
         name=("mcp" if server.schema_version == 1 else "agent-libos"),
-        version=("0.1.0" if server.schema_version == 1 else "1.3.2"),
+        version=("0.1.0" if server.schema_version == 1 else "1.3.3"),
     )
     negotiation_started = time.monotonic()
     session: Any = None

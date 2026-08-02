@@ -70,6 +70,12 @@ has a stricter boundary: it is normalized to a text-free public error before
 any durable or model-facing sink, regardless of retention tier or
 `llm.persist_full_io`.
 
+A `ProviderTraceV1` is one possible value of the reasoning field, so reduction
+applies to the whole trace—including every attempt's readable reasoning,
+output, and tool arguments—in one transition. A content-free attempt-count,
+coverage, status, and limit summary may remain in request options; it is not a
+source from which the removed content can be reconstructed.
+
 The entire `observability` mapping is also replaced; retention does not preserve
 selected observability keys or field previews. Its replacement contains only
 the retention schema version, tier, aggregate retained-payload hash, and a

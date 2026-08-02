@@ -179,7 +179,7 @@ function runRevisionText(container: HTMLElement): string {
 
 function runtimeSnapshot(revision: number): RuntimeSnapshot {
   return {
-    schema_version: 2,
+    schema_version: 3,
     db: "test.sqlite",
     scheduler: {
       auto_run: false,

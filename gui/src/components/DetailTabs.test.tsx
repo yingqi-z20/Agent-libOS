@@ -9,6 +9,7 @@ import {
   explainPanelKey,
   explainRefreshKey,
   mergeAuditRecords,
+  providerTracePanelKey,
   tabIndexForKey
 } from "./DetailTabs";
 
@@ -112,6 +113,9 @@ describe("DetailTabs", () => {
 
     expect(adminPanelKey(selected, 1)).toBe("1:pid_1");
     expect(adminPanelKey(selected, 2)).not.toBe(adminPanelKey(selected, 1));
+    expect(providerTracePanelKey("pid_1", 1)).toBe("1:pid_1");
+    expect(providerTracePanelKey("pid_2", 1)).not.toBe(providerTracePanelKey("pid_1", 1));
+    expect(providerTracePanelKey("pid_1", 2)).not.toBe(providerTracePanelKey("pid_1", 1));
   });
 
   it("refreshes admin data for current-process evidence", () => {
@@ -249,7 +253,7 @@ function process(): RuntimeProcess {
 
 function snapshot(): RuntimeSnapshot {
   return {
-    schema_version: 2,
+    schema_version: 3,
     db: "local",
     scheduler: {
       auto_run: true,

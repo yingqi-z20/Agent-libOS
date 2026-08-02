@@ -566,6 +566,13 @@ credentials or provider secret values from their environment-backed boundary.
 
 ## Guarantee boundary
 
+Provider trace policy is Host-local presentation and does not participate in
+Sink or cached-client identity. Recording or displaying an attempt does not
+authorize a request, change its labels, or add a second budget charge. Returned
+reasoning/output is ordinary untrusted Provider ingress and cannot become a
+policy, approval, recovery, or tool-dispatch instruction merely because the GUI
+renders it.
+
 The guarantee covers payloads that cross runtime-mediated Sinks. Marking a
 Shell, PTY, or MCP stdio executable trusted means the Host deliberately trusts
 that program to receive the data; it does not give Agent libOS kernel-level

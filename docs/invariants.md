@@ -318,7 +318,7 @@ longer defines.
   pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
   typed boundaries compute the next state generation, preventing a direct-write
   rewind from reviving a stale token.
-- `v4-persisted-state-is-strict-and-versioned`: a 1.3.2 store accepts only the
+- `v4-persisted-state-is-strict-and-versioned`: a 1.3.3 store accepts only the
   frozen version-4 physical schema (including Durable Task Run and typed process
   state) and canonical security carriers. Schema-v3, older, incomplete, or
   malformed state is rejected before mutation; no compatibility path is
@@ -864,6 +864,15 @@ longer defines.
 - `llm-token-usage-is-charged-before-tool-dispatch`: provider-reported LLM token
   usage is validated against the reserved envelope and settled exactly or
   conservatively before any model-selected tool call is dispatched.
+- `llm-provider-attempt-traces-are-bounded-redacted-and-logically-accounted`:
+  built-in-client attempts are explicit, bounded, and stripped of credentials,
+  opaque Provider blobs, and raw failure bodies; all attempts remain inside one
+  logical-call reservation and intermediate diagnostic usage is not charged
+  again.
+- `gui-llm-reasoning-content-is-on-demand-retention-aware-and-inert`: GUI
+  snapshot/SSE projections contain no LLM body content; authenticated
+  process-bound detail reads honor retention and content-version cursors, and
+  Provider text is rendered without Markdown, HTML, links, or action authority.
 - `subprocess-resource-profiles-are-enforced`: shell and Deno subprocess wall,
   CPU, and RSS limits are enforced by supporting providers and audited on
   exceedance. POSIX PTY supervision runs independently from output reads,

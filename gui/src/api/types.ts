@@ -603,7 +603,22 @@ export type RuntimeEvent = {
   created_at: string;
 };
 
-export type LlmCall = {
+export type LlmTraceCoverage = "complete" | "custom_client_incomplete" | "legacy_final_only";
+export type LlmReasoningAvailability = "returned" | "not_returned" | "not_persisted" | "purged" | "limited";
+export type LlmPayloadRetentionTier = "full" | "summary" | "hash_only";
+export type LlmUsageField =
+  | "prompt_tokens"
+  | "completion_tokens"
+  | "total_tokens"
+  | "input_tokens"
+  | "output_tokens"
+  | "cache_read_tokens"
+  | "cache_write_tokens";
+export type LlmUsage = Partial<Record<LlmUsageField, number>>;
+
+/** Content-free projection used by snapshots, SSE, and paginated call lists. */
+export type LlmCallSummary = {
+  schema_version: 1;
   call_id: string;
   pid: string | null;
   image_id: string | null;
@@ -611,14 +626,106 @@ export type LlmCall = {
   status: string;
   api: string | null;
   model: string | null;
-  request_options: Record<string, unknown>;
-  response_content: string;
-  tool_calls: unknown[];
-  usage: Record<string, unknown>;
-  reasoning: unknown;
+  usage: LlmUsage;
   error: string | null;
   created_at: string;
   completed_at: string | null;
+  request_id: string | null;
+  response_id: string | null;
+  attempt_count: number;
+  coverage: LlmTraceCoverage;
+  selected_attempt: number | null;
+  reasoning_availability: LlmReasoningAvailability;
+  payload_retention_tier: LlmPayloadRetentionTier;
+};
+
+/** Kept as a source-compatible name for timeline consumers. */
+export type LlmCall = LlmCallSummary;
+
+export type LlmProviderAttempt = {
+  sequence: number;
+  kind: string;
+  api: string | null;
+  status: string;
+  model: string | null;
+  request_id: string | null;
+  response_id: string | null;
+  reasoning_availability: LlmReasoningAvailability;
+  reasoning_blocks: LlmReasoningBlock[];
+  output_availability: LlmReasoningAvailability;
+  tool_names: string[];
+  tool_call_count: number;
+  usage: LlmUsage;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_ms: number | null;
+  error: LlmAttemptError | null;
+};
+
+export type LlmReasoningBlock = {
+  type: "summary_text" | "reasoning_text" | "opaque" | "omitted";
+  source: string | null;
+  reason: "bounds" | "aggregate_limit" | "structure_limit" | "node_limit" | "non_finite_number" | null;
+  chars: number | null;
+  bytes: number | null;
+  sha256: string | null;
+};
+
+export type LlmAttemptError = {
+  error_type: string | null;
+  status_code: number | null;
+  message_bytes: number | null;
+  message_sha256: string | null;
+};
+
+export type LlmTraceContentField =
+  | "messages"
+  | "tools"
+  | "request_options"
+  | "raw_response"
+  | "response_content"
+  | "attempt_reasoning"
+  | "attempt_output"
+  | "attempt_tool_calls";
+
+export type LlmTraceContentAvailability = "available" | "not_returned" | "not_persisted" | "purged" | "limited";
+
+export type LlmTraceContentDescriptor = {
+  field: LlmTraceContentField;
+  attempt_sequence: number | null;
+  availability: LlmTraceContentAvailability;
+  content_type: "text" | "json";
+  size_bytes: number | null;
+  size_chars: number | null;
+  content_hash: string | null;
+  cursor: string | null;
+};
+
+export type LlmCallPage = {
+  schema_version: 1;
+  items: LlmCallSummary[];
+  next_cursor: string | null;
+  has_more: boolean;
+};
+
+export type LlmCallDetail = {
+  schema_version: 1;
+  call: LlmCallSummary;
+  attempts: LlmProviderAttempt[];
+  content: LlmTraceContentDescriptor[];
+};
+
+export type LlmTraceContentChunk = {
+  schema_version: 1;
+  pid: string;
+  call_id: string;
+  field: LlmTraceContentField;
+  attempt_sequence: number | null;
+  content: string;
+  next_cursor: string | null;
+  has_more: boolean;
+  content_hash: string | null;
+  retention_tier: LlmPayloadRetentionTier;
 };
 
 export type ToolSummary = {
@@ -745,14 +852,14 @@ export type ImageMutationResult = {
 };
 
 export type RuntimeSnapshot = {
-  schema_version: 2;
+  schema_version: 3;
   db: string;
   scheduler: SchedulerStatus;
   processes: RuntimeProcess[];
   human_requests: HumanRequest[];
   events: RuntimeEvent[];
   audit: AuditRecord[];
-  llm_calls: LlmCall[];
+  llm_calls: LlmCallSummary[];
   object_tasks: ObjectTask[];
   task_runs: TaskRunSummary[];
   tools: ToolSummary[];
@@ -870,10 +977,190 @@ const snapshotCollections = [
   "modules"
 ] as const;
 
+const llmTraceCoverages = ["complete", "custom_client_incomplete", "legacy_final_only"] as const;
+const llmReasoningAvailabilities = ["returned", "not_returned", "not_persisted", "purged", "limited"] as const;
+const llmContentAvailabilities = ["available", "not_returned", "not_persisted", "purged", "limited"] as const;
+const llmPayloadRetentionTiers = ["full", "summary", "hash_only"] as const;
+const llmUsageFields = new Set<LlmUsageField>([
+  "prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens",
+  "cache_read_tokens", "cache_write_tokens"
+]);
+const llmTraceContentFields = [
+  "messages",
+  "tools",
+  "request_options",
+  "raw_response",
+  "response_content",
+  "attempt_reasoning",
+  "attempt_output",
+  "attempt_tool_calls"
+] as const satisfies readonly LlmTraceContentField[];
+const llmCallSummaryKeys = new Set([
+  "schema_version", "call_id", "pid", "image_id", "purpose", "status", "api", "model", "usage", "error",
+  "created_at", "completed_at", "request_id", "response_id", "attempt_count", "coverage", "selected_attempt",
+  "reasoning_availability", "payload_retention_tier"
+]);
+const llmAttemptKeys = new Set([
+  "sequence", "kind", "api", "status", "model", "request_id", "response_id", "reasoning_availability",
+  "reasoning_blocks", "output_availability", "tool_names", "tool_call_count", "usage", "started_at",
+  "completed_at", "duration_ms", "error"
+]);
+const llmReasoningBlockKeys = new Set(["type", "source", "reason", "chars", "bytes", "sha256"]);
+const llmAttemptErrorKeys = new Set(["error_type", "status_code", "message_bytes", "message_sha256"]);
+const llmContentDescriptorKeys = new Set([
+  "field", "attempt_sequence", "availability", "content_type", "size_bytes", "size_chars", "content_hash", "cursor"
+]);
+const llmCallPageKeys = new Set(["schema_version", "items", "next_cursor", "has_more"]);
+const llmCallDetailKeys = new Set(["schema_version", "call", "attempts", "content"]);
+const llmContentChunkKeys = new Set([
+  "schema_version", "pid", "call_id", "field", "attempt_sequence", "content", "next_cursor", "has_more",
+  "content_hash", "retention_tier"
+]);
+
+export function assertLlmCallSummary(value: unknown): asserts value is LlmCallSummary {
+  if (!isRecord(value) || !hasOnlyKeys(value, llmCallSummaryKeys)
+      || value.schema_version !== 1
+      || !isNonEmptyString(value.call_id)
+      || !isOptionalNullableString(value.pid)
+      || !isOptionalNullableString(value.image_id)
+      || typeof value.purpose !== "string"
+      || !isNonEmptyString(value.status)
+      || !isOptionalNullableString(value.api)
+      || !isOptionalNullableString(value.model)
+      || !isCanonicalLlmUsage(value.usage)
+      || !isOptionalNullableString(value.error)
+      || !isNonEmptyString(value.created_at)
+      || !isOptionalNullableString(value.completed_at)
+      || !isOptionalNullableString(value.request_id)
+      || !isOptionalNullableString(value.response_id)
+      || !isNonNegativeSafeInteger(value.attempt_count)
+      || !(llmTraceCoverages as readonly unknown[]).includes(value.coverage)
+      || !(value.selected_attempt === null || (Number.isSafeInteger(value.selected_attempt) && Number(value.selected_attempt) > 0))
+      || !(llmReasoningAvailabilities as readonly unknown[]).includes(value.reasoning_availability)
+      || !(llmPayloadRetentionTiers as readonly unknown[]).includes(value.payload_retention_tier)) {
+    throw new Error("GUI LLM call summary is malformed.");
+  }
+  if (value.selected_attempt !== null && Number(value.selected_attempt) > Number(value.attempt_count)) {
+    throw new Error("GUI LLM call summary selects an unknown attempt.");
+  }
+}
+
+export function assertLlmCallPage(value: unknown): asserts value is LlmCallPage {
+  if (!isRecord(value) || !hasOnlyKeys(value, llmCallPageKeys) || value.schema_version !== 1
+      || !Array.isArray(value.items) || !isOptionalNullableString(value.next_cursor) || typeof value.has_more !== "boolean") {
+    throw new Error("GUI LLM call page is malformed.");
+  }
+  for (const item of value.items) assertLlmCallSummary(item);
+  if (value.has_more !== Boolean(value.next_cursor)) throw new Error("GUI LLM call page cursor is inconsistent.");
+}
+
+export function assertLlmCallDetail(value: unknown): asserts value is LlmCallDetail {
+  if (!isRecord(value) || !hasOnlyKeys(value, llmCallDetailKeys) || value.schema_version !== 1
+      || !Array.isArray(value.attempts) || !Array.isArray(value.content)) {
+    throw new Error("GUI LLM call detail is malformed.");
+  }
+  assertLlmCallSummary(value.call);
+  let previousSequence = 0;
+  for (const attempt of value.attempts) {
+    assertLlmProviderAttempt(attempt);
+    if (attempt.sequence <= previousSequence) throw new Error("GUI LLM attempts are not strictly ordered.");
+    previousSequence = attempt.sequence;
+  }
+  for (const descriptor of value.content) assertLlmContentDescriptor(descriptor);
+}
+
+export function assertLlmTraceContentChunk(value: unknown): asserts value is LlmTraceContentChunk {
+  if (!isRecord(value) || !hasOnlyKeys(value, llmContentChunkKeys) || value.schema_version !== 1
+      || !isNonEmptyString(value.pid) || !isNonEmptyString(value.call_id)
+      || !(llmTraceContentFields as readonly unknown[]).includes(value.field)
+      || !(value.attempt_sequence === null || (Number.isSafeInteger(value.attempt_sequence) && Number(value.attempt_sequence) > 0))
+      || typeof value.content !== "string" || !isOptionalNullableString(value.next_cursor)
+      || typeof value.has_more !== "boolean" || !isOptionalContentHash(value.content_hash)
+      || !(llmPayloadRetentionTiers as readonly unknown[]).includes(value.retention_tier)) {
+    throw new Error("GUI LLM trace content chunk is malformed.");
+  }
+  if (value.has_more !== Boolean(value.next_cursor)) throw new Error("GUI LLM trace content cursor is inconsistent.");
+}
+
+function assertLlmProviderAttempt(value: unknown): asserts value is LlmProviderAttempt {
+  if (!isRecord(value) || !hasOnlyKeys(value, llmAttemptKeys)
+      || !Number.isSafeInteger(value.sequence) || Number(value.sequence) <= 0
+      || !isNonEmptyString(value.kind) || !isOptionalNullableString(value.api) || !isNonEmptyString(value.status)
+      || !isOptionalNullableString(value.model) || !isOptionalNullableString(value.request_id)
+      || !isOptionalNullableString(value.response_id)
+      || !(llmReasoningAvailabilities as readonly unknown[]).includes(value.reasoning_availability)
+      || !Array.isArray(value.reasoning_blocks)
+      || !(llmReasoningAvailabilities as readonly unknown[]).includes(value.output_availability)
+      || !isUniqueStringArray(value.tool_names) || !isNonNegativeSafeInteger(value.tool_call_count)
+      || !isCanonicalLlmUsage(value.usage)
+      || !isOptionalNullableString(value.started_at) || !isOptionalNullableString(value.completed_at)
+      || !(value.duration_ms === null || isNonNegativeFiniteNumber(value.duration_ms))
+      || !(value.error === null || isLlmAttemptError(value.error))) {
+    throw new Error("GUI LLM provider attempt is malformed.");
+  }
+  for (const block of value.reasoning_blocks) {
+    if (!isRecord(block) || !hasOnlyKeys(block, llmReasoningBlockKeys)
+        || !["summary_text", "reasoning_text", "opaque", "omitted"].includes(String(block.type))
+        || !isOptionalNullableString(block.source)
+        || !(block.reason === null || ["bounds", "aggregate_limit", "structure_limit", "node_limit", "non_finite_number"].includes(String(block.reason)))
+        || !(block.chars === null || isNonNegativeSafeInteger(block.chars))
+        || !(block.bytes === null || isNonNegativeSafeInteger(block.bytes))
+        || !isOptionalContentHash(block.sha256)) {
+      throw new Error("GUI LLM reasoning block metadata is malformed.");
+    }
+  }
+}
+
+function assertLlmContentDescriptor(value: unknown): asserts value is LlmTraceContentDescriptor {
+  if (!isRecord(value) || !hasOnlyKeys(value, llmContentDescriptorKeys)
+      || !(llmTraceContentFields as readonly unknown[]).includes(value.field)
+      || !(value.attempt_sequence === null || (Number.isSafeInteger(value.attempt_sequence) && Number(value.attempt_sequence) > 0))
+      || !(llmContentAvailabilities as readonly unknown[]).includes(value.availability)
+      || !(value.content_type === "text" || value.content_type === "json")
+      || !(value.size_bytes === null || isNonNegativeSafeInteger(value.size_bytes))
+      || !(value.size_chars === null || isNonNegativeSafeInteger(value.size_chars))
+      || !isOptionalContentHash(value.content_hash) || !isOptionalNullableString(value.cursor)) {
+    throw new Error("GUI LLM trace content descriptor is malformed.");
+  }
+  const readable = value.availability === "available" || value.availability === "limited";
+  if (readable !== (typeof value.cursor === "string" && Boolean(value.cursor))) {
+    throw new Error("GUI LLM trace content descriptor cursor is inconsistent.");
+  }
+}
+
+function isLlmAttemptError(value: unknown): value is LlmAttemptError {
+  return isRecord(value) && hasOnlyKeys(value, llmAttemptErrorKeys)
+    && isOptionalNullableString(value.error_type)
+    && (value.status_code === null || (Number.isSafeInteger(value.status_code) && Number(value.status_code) >= 100 && Number(value.status_code) <= 599))
+    && (value.message_bytes === null || isNonNegativeSafeInteger(value.message_bytes))
+    && isOptionalContentHash(value.message_sha256);
+}
+
+function isCanonicalLlmUsage(value: unknown): value is LlmUsage {
+  return isRecord(value)
+    && Object.entries(value).every(([key, counter]) =>
+      llmUsageFields.has(key as LlmUsageField)
+      && Number.isSafeInteger(counter)
+      && Number(counter) >= 0
+    );
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
+  return Object.keys(value).every((key) => allowed.has(key)) && Object.keys(value).length === allowed.size;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && Boolean(value);
+}
+
+function isOptionalContentHash(value: unknown): value is string | null {
+  return value === null || (typeof value === "string" && /^[a-f0-9]{64}$/.test(value));
+}
+
 /** Fail closed on a malformed same-build response before React consumes it. */
 export function assertRuntimeSnapshot(value: unknown): asserts value is RuntimeSnapshot {
   if (!isRecord(value)) throw new Error("GUI snapshot must be a JSON object.");
-  if (value.schema_version !== 2) throw new Error("GUI snapshot schema_version must be 2.");
+  if (value.schema_version !== 3) throw new Error("GUI snapshot schema_version must be 3.");
   if (typeof value.db !== "string") throw new Error("GUI snapshot is missing db.");
   try {
     assertSchedulerStatus(value.scheduler);
@@ -894,6 +1181,7 @@ export function assertRuntimeSnapshot(value: unknown): asserts value is RuntimeS
     }
   }
   for (const run of value.task_runs as unknown[]) assertTaskRunSummary(run);
+  for (const call of value.llm_calls as unknown[]) assertLlmCallSummary(call);
   for (const server of value.mcp_servers as unknown[]) assertMcpServerSummary(server);
 }
 

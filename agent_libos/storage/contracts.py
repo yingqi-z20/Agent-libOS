@@ -24,6 +24,7 @@ from agent_libos.models import (
     HumanRequest,
     HumanRequestStatus,
     JITRehydrationArtifact,
+    LLMCallRecord,
     ObjectHandle,
     ObjectNamespace,
     ObjectNamespaceCursor,
@@ -1286,6 +1287,14 @@ class ProcessBackendProtocol(
         statuses: Iterable[HumanRequestStatus | str] | None = None,
         limit: int,
         cursor: str | tuple[str, str] | None = None,
+    ) -> Mapping[str, Any]: ...
+
+    def query_llm_calls(
+        self,
+        pid: str,
+        *,
+        before: tuple[str, str] | None,
+        limit: int,
     ) -> Mapping[str, Any]: ...
 
     def list_llm_pending_action_validation_rows(

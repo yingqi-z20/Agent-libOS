@@ -1448,7 +1448,7 @@ class SQLRuntimeStore:
                 if version == 3:
                     raise UnsupportedStoreVersion(
                         "Agent libOS store schema v3 is not writable or readable by "
-                        "1.3.2; expected 4. Use Agent libOS 1.0.1 to view or "
+                        "1.3.3; expected 4. Use Agent libOS 1.0.1 to view or "
                         "archive this store. No migration was attempted."
                     )
                 raise UnsupportedStoreVersion(
@@ -1461,7 +1461,7 @@ class SQLRuntimeStore:
         if cls._probe_user_schema_objects(conn):
             raise UnsupportedStoreVersion(
                 "unversioned Agent libOS store detected; pre-v4 stores are "
-                "archive-only and cannot be opened by 1.3.2; use Agent libOS "
+                "archive-only and cannot be opened by 1.3.3; use Agent libOS "
                 "1.0.1 to view or archive a v3 store"
             )
         return True
@@ -15134,6 +15134,52 @@ class SQLRuntimeStore:
         params.append(selected_limit)
         sql += ") AS latest_llm_calls ORDER BY created_at ASC, call_id ASC"
         return [self._row_to_llm_call(row) for row in self._query(sql, params)]
+
+    def query_llm_calls(
+        self,
+        pid: str,
+        *,
+        before: tuple[str, str] | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Return one bounded, newest-first process LLM-call keyset page."""
+
+        if not isinstance(pid, str) or not pid or pid != pid.strip() or "\x00" in pid:
+            raise ValidationError("LLM call PID scope is invalid")
+        selected_limit = self._llm_call_limit(limit)
+        if before is not None and (
+            not isinstance(before, tuple)
+            or len(before) != 2
+            or any(not isinstance(item, str) or not item for item in before)
+        ):
+            raise ValidationError("LLM call cursor is invalid")
+        clauses = ["pid COLLATE BINARY = ? COLLATE BINARY"]
+        params: list[Any] = [pid]
+        if before is not None:
+            clauses.append(
+                "(created_at COLLATE BINARY, call_id COLLATE BINARY) < (?, ?)"
+            )
+            params.extend(before)
+        params.append(selected_limit + 1)
+        rows = self._query(
+            "SELECT * FROM llm_calls "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at COLLATE BINARY DESC, "
+            "call_id COLLATE BINARY DESC LIMIT ?",
+            params,
+        )
+        records = tuple(
+            self._row_to_llm_call(row) for row in rows[:selected_limit]
+        )
+        next_cursor = None
+        if len(rows) > selected_limit and records:
+            last = records[-1]
+            next_cursor = (last.created_at, last.call_id)
+        return {
+            "schema_version": 1,
+            "records": records,
+            "next_cursor": next_cursor,
+        }
 
     def get_llm_call(self, call_id: str) -> LLMCallRecord | None:
         rows = self._query("SELECT * FROM llm_calls WHERE call_id = ?", (call_id,))

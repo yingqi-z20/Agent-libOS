@@ -99,6 +99,8 @@ pnpm-debug.log*
 /gui/.smoke-log.jsonl
 /gui/.smoke-user-data/
 /gui/release/
+/gui/playwright-report/
+/gui/.playwright-results/
 
 # Editors and operating-system metadata
 /.idea/

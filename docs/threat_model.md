@@ -408,6 +408,14 @@ layer, retain data, or become unavailable. Provider receipts and reconciliation
 are only as trustworthy as the selected provider/service; returned content is
 ingress, not a new policy source.
 
+Provider-returned reasoning may itself contain HTML, misleading links, Unicode
+direction controls, secrets copied from prompts, or instructions aimed at the
+operator. The GUI fetches this material only on demand for an authenticated
+selected process and renders it as inert isolated text, never Markdown or raw
+HTML. Snapshot/SSE frames contain summaries only. Retention and full-I/O opt-out
+can make content unavailable; the GUI must not reconstruct it from raw response
+fields, previews, hashes, or legacy metadata.
+
 ### Persistence, recovery, and management surfaces
 
 The CLI and GUI can issue capabilities, approve requests, register code and

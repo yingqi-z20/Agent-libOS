@@ -235,7 +235,7 @@ describe("Timeline", () => {
     await act(() => root.unmount());
   });
 
-  it("continues following when an existing timeline item changes to equal-length content without changing id", async () => {
+  it("continues following when an existing LLM summary changes without changing id", async () => {
     const container = document.createElement("div");
     const root = createRoot(container);
     const call = llmCall("llm_1", "pid_1", "2026-06-19T01:00:05.000Z");
@@ -269,7 +269,7 @@ describe("Timeline", () => {
     Object.defineProperty(timeline, "scrollHeight", { configurable: true, value: 1400 });
     await renderTimeline([{
       ...call,
-      response_content: "line\none"
+      payload_retention_tier: "summary"
     }]);
 
     expect(timeline.scrollTop).toBe(1400);
@@ -310,6 +310,7 @@ function humanRequest(requestId: string, pid: string, createdAt: string): HumanR
 
 function llmCall(callId: string, pid: string, createdAt: string): LlmCall {
   return {
+    schema_version: 1,
     call_id: callId,
     pid,
     image_id: "coding-agent:v0",
@@ -317,14 +318,17 @@ function llmCall(callId: string, pid: string, createdAt: string): LlmCall {
     status: "ok",
     api: "responses",
     model: "test-model",
-    request_options: {},
-    response_content: "response",
-    tool_calls: [],
     usage: {},
-    reasoning: null,
     error: null,
     created_at: createdAt,
-    completed_at: createdAt
+    completed_at: createdAt,
+    request_id: null,
+    response_id: null,
+    attempt_count: 1,
+    coverage: "complete",
+    selected_attempt: 1,
+    reasoning_availability: "not_returned",
+    payload_retention_tier: "full"
   };
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { allowedTaskRunActions, assertMcpDiscoveryResult, assertRuntimeSnapshot, assertTaskRunDetail, runtimeSnapshotFromSseData, taskRunSummaryFromSseData, upsertTaskRunSummary } from "./types";
+import { allowedTaskRunActions, assertLlmCallDetail, assertLlmCallPage, assertLlmTraceContentChunk, assertMcpDiscoveryResult, assertRuntimeSnapshot, assertTaskRunDetail, runtimeSnapshotFromSseData, taskRunSummaryFromSseData, upsertTaskRunSummary } from "./types";
 
 describe("assertRuntimeSnapshot", () => {
   it("accepts the minimum same-build snapshot shape", () => {
@@ -12,8 +12,8 @@ describe("assertRuntimeSnapshot", () => {
     expect(() => assertRuntimeSnapshot({ ...snapshot(), events: {} })).toThrow(/events/);
   });
 
-  it("requires schema v2 and validates durable run controls", () => {
-    expect(() => assertRuntimeSnapshot({ ...snapshot(), schema_version: 1 })).toThrow(/schema_version/);
+  it("requires schema v3 and validates durable run controls", () => {
+    expect(() => assertRuntimeSnapshot({ ...snapshot(), schema_version: 2 })).toThrow(/schema_version/);
     expect(() => assertRuntimeSnapshot({ ...snapshot(), task_runs: [{ ...run(), allowed_actions: ["retry"] }] })).toThrow(/allowed_actions/);
     expect(() => assertRuntimeSnapshot({ ...snapshot(), task_runs: [{ ...run(), allowed_actions: ["purge_payloads"] }] })).toThrow(/allowed_actions/);
   });
@@ -56,7 +56,7 @@ describe("assertRuntimeSnapshot", () => {
 
   it("validates streamed snapshots before exposing them to React", () => {
     expect(runtimeSnapshotFromSseData({ snapshot: snapshot() })).toMatchObject({ db: "local" });
-    expect(() => runtimeSnapshotFromSseData({ snapshot: { schema_version: 2, db: "local" } })).toThrow(/scheduler/);
+    expect(() => runtimeSnapshotFromSseData({ snapshot: { schema_version: 3, db: "local" } })).toThrow(/scheduler/);
     expect(() => runtimeSnapshotFromSseData({})).toThrow(/payload/);
   });
 
@@ -98,6 +98,62 @@ describe("MCP v2 API projection", () => {
       ...result,
       receipts: [{ ...result.receipts[0], phase: "subscriptions/listen" }]
     })).toThrow(/receipt/);
+  });
+});
+
+describe("LLM Provider trace API projection", () => {
+  it("accepts the content-free list and bounded detail contract", () => {
+    const detail = llmDetail();
+    expect(() => assertLlmCallPage({ schema_version: 1, items: [detail.call], next_cursor: null, has_more: false })).not.toThrow();
+    expect(() => assertLlmCallDetail(detail)).not.toThrow();
+    expect(() => assertLlmTraceContentChunk({
+      schema_version: 1,
+      pid: "pid_1",
+      call_id: "call_1",
+      field: "attempt_reasoning",
+      attempt_sequence: 1,
+      content: "inert text",
+      next_cursor: null,
+      has_more: false,
+      content_hash: "a".repeat(64),
+      retention_tier: "full"
+    })).not.toThrow();
+  });
+
+  it("rejects private summary fields, invalid availability, and unsigned readable content", () => {
+    const detail = llmDetail();
+    expect(() => assertLlmCallPage({
+      schema_version: 1,
+      items: [{ ...detail.call, response_content: "must stay on demand" }],
+      next_cursor: null,
+      has_more: false
+    })).toThrow(/summary/);
+    expect(() => assertLlmCallDetail({
+      ...detail,
+      call: { ...detail.call, reasoning_availability: "available" }
+    })).toThrow(/summary/);
+    expect(() => assertLlmCallDetail({
+      ...detail,
+      content: [{ ...detail.content[0], cursor: null }]
+    })).toThrow(/cursor/);
+    for (const usage of [
+      { total_tokens: "10" },
+      { total_tokens: -1 },
+      { total_tokens: true },
+      { provider_private_usage: 10 },
+      { total_tokens: { nested: 10 } }
+    ]) {
+      expect(() => assertLlmCallPage({
+        schema_version: 1,
+        items: [{ ...detail.call, usage }],
+        next_cursor: null,
+        has_more: false
+      })).toThrow(/summary/);
+      expect(() => assertLlmCallDetail({
+        ...detail,
+        attempts: [{ ...detail.attempts[0], usage }]
+      })).toThrow(/attempt/);
+    }
   });
 });
 
@@ -158,7 +214,7 @@ describe("task run recovery option projection", () => {
 
 function snapshot(): Record<string, unknown> {
   return {
-    schema_version: 2,
+    schema_version: 3,
     db: "local",
     scheduler: { auto_run: true, running: false, paused: false },
     processes: [],
@@ -205,6 +261,63 @@ function mcpServer() {
     max_request_bytes: 65_536,
     max_response_bytes: 1_048_576,
     metadata: {}
+  };
+}
+
+function llmDetail() {
+  const call = {
+    schema_version: 1,
+    call_id: "call_1",
+    pid: "pid_1",
+    image_id: "coding-agent:v0",
+    purpose: "agent_loop",
+    status: "ok",
+    api: "responses",
+    model: "test-model",
+    usage: { total_tokens: 10 },
+    error: null,
+    created_at: "2030-01-01T00:00:00Z",
+    completed_at: "2030-01-01T00:00:01Z",
+    request_id: "req_1",
+    response_id: "resp_1",
+    attempt_count: 1,
+    coverage: "complete",
+    selected_attempt: 1,
+    reasoning_availability: "returned",
+    payload_retention_tier: "full"
+  };
+  return {
+    schema_version: 1,
+    call,
+    attempts: [{
+      sequence: 1,
+      kind: "initial",
+      api: "responses",
+      status: "ok",
+      model: "test-model",
+      request_id: "req_1",
+      response_id: "resp_1",
+      reasoning_availability: "returned",
+      reasoning_blocks: [{ type: "summary_text", source: "responses.output", reason: null, chars: 5, bytes: 5, sha256: "a".repeat(64) }],
+      output_availability: "returned",
+      tool_names: [],
+      tool_call_count: 0,
+      usage: { total_tokens: 10 },
+      started_at: "2030-01-01T00:00:00Z",
+      completed_at: "2030-01-01T00:00:01Z",
+      duration_ms: 1000,
+      error: null
+    }],
+    content: [{
+      field: "attempt_reasoning",
+      attempt_sequence: 1,
+      availability: "available",
+      content_type: "text",
+      size_bytes: 5,
+      size_chars: 5,
+      content_hash: "a".repeat(64),
+      cursor: "signed-offset-zero"
+    }]
   };
 }
 

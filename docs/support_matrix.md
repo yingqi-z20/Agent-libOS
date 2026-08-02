@@ -35,9 +35,10 @@ Legend:
 
 | Surface | Per-change CI | Environment gate |
 | --- | --- | --- |
-| React/Vitest | Ubuntu, Node 24 LTS with the npm version supplied by that toolchain, source tests | The package declares Node `^24.15.0 || >=26.0.0` and npm `>=11`; Node 26 Current satisfies the engine contract but is not a separate per-change CI job. Browser accessibility and operator usability studies are not automated |
+| React/Vitest | Ubuntu, Node 24 LTS with the npm version supplied by that toolchain, source tests | The package declares Node `^24.15.0 || >=26.0.0` and npm `>=11`; Node 26 Current satisfies the engine contract but is not a separate per-change CI job |
+| Chromium GUI end-to-end | Ubuntu, version-matched Playwright Chromium, desktop/mobile Provider-trace journeys, real GUI HTTP/SSE authentication, loopback fake Provider retries/fallbacks, bounded pagination/content reads, retention races, keyboard operation, and feature-scoped axe checks | Other browser engines, native desktop accessibility APIs, and operator usability studies remain environment gates |
 | Web and Electron TypeScript | Typecheck and production build on Ubuntu | Native Electron packaging/signing/notarization are not configured release jobs |
-| Python GUI HTTP/SSE server | Providers lane exercises auth, route validation, bounded event windows, shutdown, CORS, schema-v2 snapshots, Durable Task Run pagination/mutations, stable 409 conflicts, confirmation gates, and redacted monotonic SSE summaries | Native desktop process lifecycle remains platform-specific |
+| Python GUI HTTP/SSE server | Providers lane exercises auth, route validation, bounded event windows, shutdown, CORS, schema-v3 snapshots, Durable Task Run pagination/mutations, stable 409 conflicts, confirmation gates, and redacted monotonic SSE summaries | Native desktop process lifecycle remains platform-specific |
 | Headless Electron main-process smoke | Not in the default GUI lane | Run `AGENT_LIBOS_GUI_SMOKE=1 npm --prefix gui run electron:dev` |
 | Production-build custom-protocol BrowserWindow smoke | Not in CI | On a desktop/GPU runner use `AGENT_LIBOS_GUI_SMOKE=1 AGENT_LIBOS_GUI_SMOKE_WINDOW=1 npm --prefix gui run electron:dev`; this does not package, sign, or notarize an Electron application |
 | Local GUI API compatibility | Server and renderer tests cover the matching checkout | The unversioned `/api` surface is an internal same-build contract, not a stable third-party REST API |

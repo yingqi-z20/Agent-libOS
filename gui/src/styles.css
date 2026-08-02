@@ -3805,6 +3805,398 @@ button.promptChip:hover:not(:disabled) {
   }
 }
 
+/* Provider-returned reasoning is an inert, on-demand diagnostic surface. */
+.providerTracePanel {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+}
+
+.providerTraceHeader,
+.userReasoningDrawerHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.providerTraceHeader > span:last-child {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  flex: 1;
+}
+
+.providerTraceHeader small,
+.traceDetailHeader small {
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.traceTitleIcon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  color: var(--color-accent-fg);
+  background: var(--accent-soft);
+  border-radius: 10px;
+}
+
+.providerTraceWarning {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 0;
+  padding: 9px 10px;
+  color: var(--color-warning-fg);
+  background: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.providerTraceWarning svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+.providerTraceLayout {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+}
+
+.providerTracePanel.user .providerTraceLayout {
+  grid-template-columns: minmax(160px, 210px) minmax(0, 1fr);
+  align-items: start;
+}
+
+.providerTraceCalls {
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  gap: 7px;
+}
+
+.providerTraceCalls > button:not(.traceLoadMore) {
+  display: grid;
+  width: 100%;
+  height: auto;
+  min-height: 62px;
+  justify-content: stretch;
+  gap: 4px;
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.providerTraceCalls > button.active {
+  color: var(--color-accent-strong);
+  background: var(--accent-subtle);
+  border-color: var(--color-accent-border);
+  box-shadow: 0 0 0 2px var(--color-focus);
+}
+
+.providerTraceCalls > button > span:first-child,
+.traceDetailHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 8px;
+}
+
+.providerTraceCalls strong,
+.providerTraceCalls small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.providerTraceCalls time,
+.traceCallMeta {
+  color: var(--color-text-tertiary);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.traceCallMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+
+.traceLoadMore {
+  width: 100%;
+}
+
+.providerTraceDetail,
+.traceDetailBody {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+}
+
+.traceDetailHeader > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.traceFacts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin: 0;
+}
+
+.traceFacts > div {
+  min-width: 0;
+  padding: 8px;
+  background: var(--color-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.traceFacts dt {
+  color: var(--color-text-tertiary);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+
+.traceFacts dd {
+  min-width: 0;
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.traceAttempts {
+  display: grid;
+  gap: 8px;
+}
+
+.traceAttempts > h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.traceAttempt,
+.traceLowLevel,
+.traceBlockMetadata {
+  min-width: 0;
+  overflow: hidden;
+  background: var(--color-panel);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.traceAttempt > summary,
+.traceLowLevel > summary,
+.traceBlockMetadata > summary {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+  gap: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.traceAttempt > summary::-webkit-details-marker,
+.traceLowLevel > summary::-webkit-details-marker,
+.traceBlockMetadata > summary::-webkit-details-marker {
+  display: none;
+}
+
+.traceAttempt > summary > svg,
+.traceLowLevel > summary > svg {
+  flex: none;
+  transition: transform 120ms ease;
+}
+
+.traceAttempt[open] > summary > svg,
+.traceLowLevel[open] > summary > svg {
+  transform: rotate(90deg);
+}
+
+.traceAttempt > summary > span:nth-child(2) {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+  flex: 1;
+}
+
+.traceAttempt > summary small {
+  color: var(--color-text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+.traceAttemptStatus {
+  flex: none;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+}
+
+.traceAttemptBody,
+.traceLowLevel[open] > :not(summary),
+.traceBlockMetadata[open] > :not(summary) {
+  margin: 0;
+  padding: 10px;
+  border-top: 1px solid var(--color-border);
+}
+
+.traceAttemptBody {
+  display: grid;
+  gap: 10px;
+}
+
+.traceToolNames {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.traceToolNames bdi {
+  padding: 2px 6px;
+  background: var(--accent-subtle);
+  border-radius: 999px;
+}
+
+.traceContentGrid {
+  display: grid;
+  gap: 8px;
+}
+
+.traceContent {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+  padding: 9px;
+  background: var(--color-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.traceContent > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.traceContent > header small,
+.traceUnavailable {
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+}
+
+.traceUnavailable {
+  margin: 0;
+}
+
+.traceContent > button {
+  justify-self: start;
+  min-height: 32px;
+  height: auto;
+}
+
+.traceInertText,
+.traceInertJson {
+  max-width: 100%;
+  margin: 0;
+  overflow: auto;
+  color: var(--color-code-fg);
+  background: var(--color-code-bg);
+  border-radius: 7px;
+  padding: 9px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  unicode-bidi: plaintext;
+}
+
+.traceInertJson {
+  max-height: 180px;
+}
+
+.reasoningToggle.active {
+  color: var(--color-accent-strong);
+  background: var(--accent-soft);
+  border-color: var(--color-accent-border);
+}
+
+.userReasoningDrawer {
+  position: fixed;
+  z-index: 80;
+  top: var(--app-header-height, 64px);
+  right: 0;
+  bottom: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(720px, calc(100vw - 28px));
+  padding: 0;
+  overflow: hidden;
+  background: var(--color-panel);
+  border-left: 1px solid var(--color-border);
+  box-shadow: -18px 0 48px rgb(49 24 67 / 18%);
+}
+
+.userReasoningDrawerHeader {
+  min-height: 62px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.userReasoningDrawerHeader h2 {
+  margin: 2px 0 0;
+  font-size: 17px;
+}
+
+.userReasoningDrawer > .providerTracePanel {
+  min-height: 0;
+  padding: 14px;
+  overflow: auto;
+}
+
+@media (max-width: 720px) {
+  .userReasoningDrawer {
+    top: 0;
+    width: 100vw;
+    max-width: none;
+    border-left: 0;
+  }
+
+  .providerTracePanel.user .providerTraceLayout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .providerTracePanel.user .providerTraceCalls {
+    max-height: 190px;
+    overflow: auto;
+  }
+
+  .traceFacts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (forced-colors: active) {
+  .providerTraceCalls > button.active,
+  .reasoningToggle.active {
+    outline: 2px solid Highlight;
+  }
+}
+
 /* Operator workspace ---------------------------------------------------- */
 
 .appShell {

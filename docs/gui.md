@@ -214,6 +214,18 @@ npm --prefix gui run build
 uv run python scripts/test_matrix.py --lane gui
 ```
 
+The browser end-to-end suite also needs the version-matched Chromium binary:
+
+```bash
+npm --prefix gui exec -- playwright install chromium
+npm --prefix gui run test:e2e
+```
+
+The E2E runner creates a temporary SQLite store, starts the real loopback GUI
+HTTP/SSE service and Vite bridge with an ephemeral bearer token, and blocks
+renderer requests to non-loopback hosts. Provider content is deterministic test
+data; real Provider credentials are not part of this suite.
+
 `npm --prefix gui run build` removes `dist-electron` before compiling. Vitest
 excludes both renderer and Electron build output, and the production Electron
 TypeScript configuration excludes `*.test.ts`; generated JavaScript therefore
@@ -456,12 +468,15 @@ quantum as its batching boundary. Once a provider/tool quantum has been
 admitted it is allowed to finish even when it takes longer than the core
 scheduler drain window; that exception is local to GUI batching, while ordinary
 bounded Runtime calls retain their cancellation boundary. Real LLM calls are
-still persisted in `llm_calls`, so the GUI can
-show token usage, errors, full stored LLM inputs and outputs, and bounded
-prompt/output observability metadata. This default supports self-evolution
+still persisted in `llm_calls`, so the GUI can show token usage, errors, and a
+bounded Provider trace. Snapshot and SSE projections carry only content-free
+call summaries. The selected process's full-retention input, output,
+Provider-returned reasoning, tool actions, and sanitized raw response are
+fetched through authenticated, size-bounded detail/content routes only when
+the corresponding panel is opened. This default supports self-evolution
 training and fine-tuning pipelines under the deployment's user agreement. If
 the host runtime is configured with `llm.persist_full_io=False`, the same
-`llm_calls` API returns content-free hashes, counts, and structural envelopes
+detail API returns unavailable states, content-free hashes, counts, and structural envelopes
 for sensitive prompt, tool, reasoning, and provider payload fields. Processes
 using `image_only` cannot run under that setting because their lossless durable
 transcript is unavailable; they fail before provider dispatch.
@@ -646,9 +661,10 @@ deliberately covers the snapshot's required top-level collections, the minimal
 process/scheduler shape consumed during bootstrap, redacted Task Run
 summary/detail state, the JSON error envelope, and payloads for every operation
 that the server gates with explicit confirmation.
-`GET /api/snapshot` emits `schema_version: 2`; this same-build renderer rejects
-the older v1 snapshot shape instead of treating missing Task Run state as an
-empty collection.
+`GET /api/snapshot` emits `schema_version: 3`; this same-build renderer rejects
+older snapshot shapes instead of treating summary-only LLM state or Task Run
+state as an empty collection. Version 3 replaces full LLM rows in snapshot/SSE
+with strict `LlmCallSummary` projections.
 Other snapshot collection item schemas and renderer routes remain same-build
 implementation details. It is JSON Schema, not a complete OpenAPI document.
 
@@ -712,7 +728,7 @@ Important endpoints:
   Collection, ledger, and Human pages accept opaque `cursor` values and return
   `next_cursor`; clients must not parse or synthesize them. The embedded
   requirements page also returns `next_cursor`. Requirement changes are linked
-  ledger items, and 1.3.2 has no independent Task Run requirements or wait HTTP
+  ledger items, and 1.3.3 has no independent Task Run requirements or wait HTTP
   route.
 - `POST /api/task-runs/{run_id}/run|pause|resume|cancel|follow-ups|recover|rerun`.
   Every existing-Run mutation carries a command id and expected revision.
@@ -757,8 +773,13 @@ Important endpoints:
 - `GET /api/processes/{pid}`
 - `POST /api/processes/{pid}/run|step|pause|resume|signal|message|interrupt|cd|exec|exit`
 - `GET /api/processes/{pid}/messages|human-requests|llm-calls|audit|events|capabilities|checkpoints`.
-  The LLM-call route's `limit` defaults to and cannot exceed
-  `gui.snapshot_process_llm_call_limit`.
+  The LLM-call route returns a newest-first keyset page of content-free
+  summaries and an opaque cursor. `GET
+  /api/processes/{pid}/llm-calls/{call_id}` returns bounded attempt metadata and
+  content descriptors; its `/content` child route accepts only the documented
+  field allowlist and returns at most 64 KiB per chunk. Content cursors bind the
+  process, call, field, attempt, retention tier, and content hash; retention or
+  content changes invalidate them with `409 content_changed`.
   The events route accepts `limit=<n>` (default and maximum
   `gui.snapshot_event_limit`) and `before=<event_id>` for older pages. It selects
   the bounded newest/cursor window in storage and returns that page in

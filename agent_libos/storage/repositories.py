@@ -393,6 +393,7 @@ class ProcessRepository(_RepositoryFacade):
             "list_human_requests_for_pids",
             "insert_llm_call",
             "list_llm_calls",
+            "query_llm_calls",
             "get_llm_call",
             "get_latest_llm_call",
             "get_latest_successful_llm_call",

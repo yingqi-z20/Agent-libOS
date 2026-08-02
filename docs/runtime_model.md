@@ -512,6 +512,19 @@ correlation id. Set `persist_full_io` to `false` when full local I/O evidence is
 not acceptable, while accounting for image modes that require durable
 transcript material.
 
+The built-in OpenAI-compatible client materializes a versioned, bounded
+Provider trace in the existing LLM-call reasoning field. Each entry represents
+one network attempt made by Agent libOS and records only sanitized metadata,
+Provider-returned readable reasoning/output, tool actions, diagnostic usage,
+and timing. SDK-hidden retries and redirects are disabled; Agent libOS performs
+its configured retries explicitly inside the same protected logical call.
+Custom clients remain usable but are marked `custom_client_incomplete` because
+their internal network attempts are not observable. Attempt diagnostics do not
+create extra resource reservations or change the one-logical-call budget.
+Trace persistence is terminal-call evidence, not a crash-safe per-attempt
+journal; cancellation or process loss may therefore leave only the protected
+effect and budget evidence.
+
 The low-level OpenAI client sends an explicitly supplied
 `previous_response_id` only for an official, stored Responses request whose
 tool history is representable. That client does not receive or enforce Runtime

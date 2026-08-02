@@ -192,7 +192,7 @@ def test_data_flow_docs_do_not_promise_decisions_for_pre_flow_denials() -> None:
 def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() -> None:
     documentation = _words(_read("docs/storage.md"))
 
-    assert "Agent libOS 1.3.2 stores durable runtime state" in documentation
+    assert "Agent libOS 1.3.3 stores durable runtime state" in documentation
     assert "## Strict store schema v4" in documentation
     assert "Product version and store schema version are independent" in documentation
     assert "There are no migrations, backfills, read-only compatibility modes, or dual schema paths from schema v3 to v4" in documentation

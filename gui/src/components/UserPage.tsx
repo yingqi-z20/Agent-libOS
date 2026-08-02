@@ -50,6 +50,7 @@ import { ImageSelect } from "./ImageSelect";
 import { LanguageSwitch } from "./LanguageSwitch";
 import { RatingPanel } from "./RatingPanel";
 import { UserTaskSettingsDialog, type TaskLaunchSettings } from "./UserTaskSettingsDialog";
+import { ProviderTracePanel, type ProviderTraceClient } from "./ProviderTracePanel";
 
 const MarkdownMessage = lazy(async () => {
   const module = await import("./MarkdownMessage");
@@ -129,6 +130,7 @@ const workspaceAccessTranslationKeys: Record<TaskLaunchSettings["workspaceAccess
 type UserPageProps = {
   notices?: ReactNode;
   connection: GuiConnection | null;
+  client?: ProviderTraceClient | null;
   snapshot: RuntimeSnapshot | null;
   selectedPid: string | null;
   selectedProcess: RuntimeProcess | null;
@@ -178,6 +180,7 @@ type UserPageProps = {
 export function UserPage({
   notices,
   connection,
+  client = null,
   snapshot,
   selectedPid,
   selectedProcess,
@@ -231,6 +234,7 @@ export function UserPage({
   const [taskSettingsOpen, setTaskSettingsOpen] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const [showReasoning, setShowReasoning] = useState(false);
   const sidebarQuantaErrorId = useId();
   const newTaskStatusId = useId();
   const conversation = useMemo(() => deriveUserConversation(snapshot, selectedPid), [snapshot, selectedPid]);
@@ -263,6 +267,9 @@ export function UserPage({
   const goalInputRef = useRef<HTMLTextAreaElement>(null);
   const taskSettingsButtonRef = useRef<HTMLButtonElement>(null);
   const workspaceRef = useRef<HTMLElement>(null);
+  const reasoningToggleRef = useRef<HTMLButtonElement>(null);
+  const reasoningDrawerRef = useRef<HTMLElement>(null);
+  const previousRetentionRef = useRef<{ scope: string; tiers: Map<string, string> } | null>(null);
   const followConversationRef = useRef(true);
   const processRunning = selectedRun?.status === "running" || selectedProcess?.status === "running";
   const canRun = selectedRun
@@ -291,6 +298,18 @@ export function UserPage({
     ? selectedRunDetail.requirements.items
     : [];
   const taskSettingsWorkspaceLabel = t(workspaceAccessTranslationKeys[taskSettings.workspaceAccess]);
+  const retentionScope = `${connection?.db ?? ""}:${selectedPid ?? ""}`;
+  const visibleLlmCalls = useMemo(
+    () => (snapshot?.llm_calls ?? []).filter((call) => call.pid === selectedPid),
+    [selectedPid, snapshot?.llm_calls]
+  );
+  const reasoningRetentionFingerprint = useMemo(
+    () => visibleLlmCalls
+      .map((call) => `${call.call_id}:${call.payload_retention_tier}:${call.reasoning_availability}`)
+      .sort()
+      .join("|"),
+    [visibleLlmCalls]
+  );
 
   function closeTaskSettings() {
     setTaskSettingsOpen(false);
@@ -304,6 +323,35 @@ export function UserPage({
   useEffect(() => {
     if (!showTaskComposer) setTaskSettingsOpen(false);
   }, [showTaskComposer]);
+
+  useEffect(() => {
+    setShowReasoning(false);
+  }, [connection?.db, selectedPid, selectedRun?.payloads_purged, selectedRun?.retention]);
+
+  useEffect(() => {
+    const tiers = new Map(visibleLlmCalls.map((call) => [call.call_id, call.payload_retention_tier]));
+    const previous = previousRetentionRef.current;
+    if (previous?.scope === retentionScope) {
+      const downgraded = Array.from(previous.tiers).some(([callId, tier]) => tiers.has(callId) && tiers.get(callId) !== tier);
+      if (downgraded) setShowReasoning(false);
+    }
+    previousRetentionRef.current = { scope: retentionScope, tiers };
+  }, [retentionScope, visibleLlmCalls]);
+
+  useEffect(() => {
+    if (!showReasoning) return;
+    const drawer = reasoningDrawerRef.current;
+    const restoreBackground = drawer ? inertModalSiblings(drawer) : () => undefined;
+    drawer?.querySelector<HTMLButtonElement>("[data-testid='close-reasoning-drawer']")?.focus();
+    const removeKeyboardBoundary = drawer
+      ? installModalKeyboardBoundary(drawer, () => setShowReasoning(false))
+      : () => undefined;
+    return () => {
+      removeKeyboardBoundary();
+      restoreBackground();
+      globalThis.queueMicrotask(() => reasoningToggleRef.current?.focus());
+    };
+  }, [showReasoning]);
 
   useEffect(() => {
     const container = conversationRef.current;
@@ -729,6 +777,19 @@ export function UserPage({
                   {selectedStatusDetail ? <span className="conversationStatusDetail">{selectedStatusDetail}</span> : null}
                 </div>
                 <div className="conversationHeaderMeta">
+                  <button
+                    ref={reasoningToggleRef}
+                    type="button"
+                    className={`reasoningToggle ${showReasoning ? "active" : ""}`}
+                    data-testid="user-reasoning-toggle"
+                    aria-pressed={showReasoning}
+                    aria-expanded={showReasoning}
+                    aria-controls="user-reasoning-drawer"
+                    disabled={!client || !selectedPid}
+                    onClick={() => setShowReasoning((current) => !current)}
+                  >
+                    <Bot size={14} aria-hidden="true" />{t("user.showReasoning")}
+                  </button>
                   {selectedProcess?.interrupt_count ? <span className="interruptBanner"><AlertTriangle size={15} />{t("operator.interruptPending")}</span> : null}
                   <span className={`statusPill ${statusTone}`}><span className="statusDot" />{selectedStatusLabel}</span>
                 </div>
@@ -825,11 +886,92 @@ export function UserPage({
           )}
         </section>
       </div>
+      {showReasoning && client && selectedPid ? (
+        <aside
+          ref={reasoningDrawerRef}
+          id="user-reasoning-drawer"
+          className="userReasoningDrawer"
+          data-testid="user-reasoning-drawer"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="user-reasoning-drawer-title"
+        >
+          <header className="userReasoningDrawerHeader">
+            <div><span className="eyebrow">{t("trace.title")}</span><h2 id="user-reasoning-drawer-title">{t("user.reasoningDrawer")}</h2></div>
+            <button
+              type="button"
+              className="iconOnly"
+              data-testid="close-reasoning-drawer"
+              aria-label={t("user.closeReasoning")}
+              title={t("user.closeReasoning")}
+              onClick={() => setShowReasoning(false)}
+            ><X size={17} aria-hidden="true" /></button>
+          </header>
+          <ProviderTracePanel
+            key={`${connection?.db ?? ""}:${selectedPid}:${selectedRun?.payloads_purged ?? false}:${reasoningRetentionFingerprint}`}
+            pid={selectedPid}
+            client={client}
+            snapshotCalls={visibleLlmCalls}
+            mode="user"
+            connectionKey={`${connection?.db ?? ""}:${selectedRun?.payloads_purged ?? false}`}
+          />
+        </aside>
+      ) : null}
     </main>
   );
 }
 
 export type ProcessStatusTone = "running" | "waiting" | "completed" | "terminal" | "paused" | "idle";
+
+export function inertModalSiblings(modal: HTMLElement): () => void {
+  const parent = modal.parentElement;
+  if (!parent) return () => undefined;
+  const siblings = Array.from(parent.children).filter((element): element is HTMLElement => (
+    element instanceof HTMLElement && element !== modal
+  ));
+  const previous = siblings.map((element) => ({
+    element,
+    inert: element.hasAttribute("inert"),
+    ariaHidden: element.getAttribute("aria-hidden")
+  }));
+  for (const element of siblings) {
+    element.setAttribute("inert", "");
+    element.setAttribute("aria-hidden", "true");
+  }
+  return () => {
+    for (const item of previous) {
+      if (!item.inert) item.element.removeAttribute("inert");
+      if (item.ariaHidden === null) item.element.removeAttribute("aria-hidden");
+      else item.element.setAttribute("aria-hidden", item.ariaHidden);
+    }
+  };
+}
+
+export function installModalKeyboardBoundary(modal: HTMLElement, onEscape: () => void): () => void {
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      onEscape();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = Array.from(modal.querySelectorAll<HTMLElement>(
+      "button:not([disabled]), summary, [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"
+    ));
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  document.addEventListener("keydown", onKeyDown);
+  return () => document.removeEventListener("keydown", onKeyDown);
+}
 
 export function processStatusLabel(
   status: string,

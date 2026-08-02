@@ -285,6 +285,18 @@ gate.
 
 ## Failure semantics
 
+### LLM Provider attempt visibility
+
+The built-in OpenAI-compatible LLM client disables SDK-internal retries and
+automatic redirects so every request it dispatches can be represented in the
+terminal logical-call trace. Connection/timeout and configured retryable HTTP
+failures, compatibility retries, Responses-to-Chat fallback, JSON-action
+fallback, and non-thinking retry remain inside one Runtime logical call.
+Readable reasoning is Provider-supplied untrusted ingress; opaque/encrypted
+fields, signatures, headers, URLs, credentials, and raw failure bodies are not
+trace content. Injected custom clients have no attempt-observation contract and
+are reported as incomplete rather than assigned invented attempts.
+
 `ProviderEffectNotStarted` is a certificate about the current provider callable
 and phase, not about the whole composite operation. An effectful provider may
 raise it only when it can certify that the current phase attempted no external

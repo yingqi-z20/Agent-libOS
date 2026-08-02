@@ -203,7 +203,7 @@ async function renderWithSuspense(node: ReactNode): Promise<string> {
 
 function userPageSnapshot(): RuntimeSnapshot {
   return {
-    schema_version: 2,
+    schema_version: 3,
     db: "local",
     scheduler: {
       auto_run: true,

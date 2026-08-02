@@ -57,6 +57,13 @@ Agent personality / application
      - future container, WASM, or service providers
 ```
 
+The built-in LLM provider boundary records a bounded terminal attempt trace
+inside the logical LLM call. This is an observability projection, not another
+provider/effect layer: retries and fallbacks remain within one protected
+operation and one resource reservation. The GUI receives content-free call
+summaries in snapshot/SSE and reads retained trace content on demand through
+the authenticated loopback server.
+
 The Skills and tools layer exists for LLM ergonomics and self-evolution. It
 presents stable action names, schemas, summaries, workflow instructions, and
 process-local JIT candidates. It does not own external authority.
