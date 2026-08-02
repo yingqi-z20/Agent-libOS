@@ -43,7 +43,10 @@ The implementation currently includes:
   Deno syscalls. Discrete counts/bytes/tokens are integers; runtime and
   subprocess wall/CPU seconds are continuous values. A charge publishes the
   full process-to-ancestor accounting chain, reservations, event, and audit as
-  one transaction.
+  one transaction. Every logical LLM call durably reserves one call and its
+  configured token envelope before Provider dispatch; known usage settles
+  exactly, certified non-start releases, and ambiguous outcomes charge the
+  aggregate maximum before model-selected tools run.
 - Thread-backed process scheduling through `Runtime.run_until_idle()` and the
   async host wrapper `Runtime.arun_until_idle()`, so blocked quanta do not
   monopolize scheduler progress.
@@ -305,9 +308,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.3.0-py3-none-any.whl dist/agent_libos-1.3.0.tar.gz
+  dist/agent_libos-1.3.2-py3-none-any.whl dist/agent_libos-1.3.2.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.3.0-py3-none-any.whl
+  dist/agent_libos-1.3.2-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 uv export --frozen --no-dev --no-emit-project --output-file runtime-requirements.txt
 uv export --frozen --only-group release --no-emit-project --output-file release-build-requirements.txt
@@ -321,7 +324,7 @@ uv venv /tmp/agent-libos-wheel-check
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
   --require-hashes -r runtime-requirements.txt
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
-  --no-deps dist/agent_libos-1.3.0-py3-none-any.whl
+  --no-deps dist/agent_libos-1.3.2-py3-none-any.whl
 uv pip check --python /tmp/agent-libos-wheel-check/bin/python
 /tmp/agent-libos-wheel-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-wheel-check/bin/agent-libos --help
@@ -334,7 +337,7 @@ uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
   --require-hashes -r release-build-requirements.txt
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
-  --no-deps --no-build-isolation dist/agent_libos-1.3.0.tar.gz
+  --no-deps --no-build-isolation dist/agent_libos-1.3.2.tar.gz
 uv pip check --python /tmp/agent-libos-sdist-check/bin/python
 /tmp/agent-libos-sdist-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-sdist-check/bin/agent-libos --help
@@ -509,10 +512,10 @@ uv sync --frozen --extra postgres
 uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" init
 ```
 
-Agent libOS 1.3.0 creates and opens only RuntimeStore schema v4. It rejects a
+Agent libOS 1.3.2 creates and opens only RuntimeStore schema v4. It rejects a
 schema-v3 store before initialization or any write; use Agent libOS 1.0.1 only
 to view or archive that store. There is no v3 migration, read-only bridge, or
-dual-schema mode in 1.3.0.
+dual-schema mode in 1.3.2.
 
 Both backends implement the same runtime store contract. Process metadata,
 capabilities, audit/events, messages, human requests, LLM call records,

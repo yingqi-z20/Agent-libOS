@@ -94,23 +94,33 @@ drift from the identity being authorized. The returned provider content is
 treated as unclassified `normal/untrusted` input and cannot lower the request
 context.
 
-The LLM protected-operation contract uses `ResourcePolicy.NONE`; LLM call and
-token accounting is performed separately by the executor. It preflights the
-call count before dispatch, then charges that count when the executor attempt
-completes or fails; provider-reported token usage is charged only after a
-completion. There is no durable call-count or maximum-token reservation before
-dispatch, so these budgets are not hard provider-spend caps. An abrupt host
-failure between dispatch and post-attempt charging can leave provider call or
-token usage uncharged. Missing or invalid billable usage fails the completed
-action closed when a token budget is configured, and an over-budget completion
-is retained without dispatching its model-selected tools.
+The LLM protected-operation contract uses `ResourcePolicy.REQUIRED`. After the
+exact request is assembled, the executor admits it against the profile's local
+input and total-token ceilings, then atomically persists the prepared external
+effect and a maximum usage reservation before dispatch. The reservation holds
+one logical LLM call plus prompt, completion, and aggregate token envelopes
+against the process and every ancestor. Valid provider usage settles exactly;
+a certified not-started result releases the reservation; exceptions,
+cancellation, and crash-ambiguous outcomes charge one call and the aggregate
+maximum without inventing a prompt/completion split. Settlement completes
+before the LLM call row or any model-selected tool dispatch.
 
-Durable Task Runs use that same accounting contract. A Run may persist a local
-resume point after a complete LLM action and all paired tool results, but it does not
-reserve provider calls, tokens, or money before dispatch. Its configured budget
-therefore remains a local post-attempt enforcement control, not a hard
-provider-spend cap. Product surfaces must not relabel it as a guaranteed cost
-limit.
+`max_llm_calls` counts executor-level logical calls. OpenAI SDK retries,
+compatibility retries, and API/tool-protocol fallbacks inside one such call may
+still perform multiple physical requests. The reservation is therefore a hard
+Runtime admission/accounting boundary, not an exact physical-request,
+provider-billing, currency, or monetary-spend cap. Missing or invalid billable
+usage fails closed and charges the aggregate maximum when a cumulative token
+budget is configured. An arithmetic mismatch between reported components and
+total, or any per-call envelope overrun, fails closed regardless of that
+cumulative limit. An unlimited process retains the compatibility behavior of
+settling one call and zero tokens when usage is wholly absent.
+
+Durable Task Runs use that same accounting contract. Human/data-flow waits hold
+no LLM reservation; a resumed exact request is admitted against current Host
+ceilings and receives a new durable reservation immediately before dispatch.
+A Run's logical-call/token budget must not be presented as an exact physical
+request, provider bill, currency, or monetary cost limit.
 
 Task Run recovery also does not weaken protected-operation classification. A
 provider-certified non-dispatch may be continued, and a complete durable

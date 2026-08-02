@@ -185,9 +185,10 @@ and unregister from changing the registry.
 | PTY input/control | `pty:session:<session-id>` | aliases the immutable content-bound spawn trust identity |
 | Internal process handoff | `process:<pid>` | identity-domain propagation, not external trust |
 
-`context_window_tokens` is a local LLM scheduling bound, not a Provider/Sink
-identity component. Changing only that value therefore does not invalidate an
-otherwise identical trusted LLM Sink rule.
+`context_window_tokens`, `max_input_tokens_per_call`, and
+`max_total_tokens_per_call` are local LLM scheduling/admission bounds, not
+Provider/Sink identity components. Changing only those values therefore does
+not invalidate an otherwise identical trusted LLM Sink rule.
 
 Each live PTY session keeps a monotonic data-flow high-water of labels and
 Object source references, seeded by the spawn request. A successful write or

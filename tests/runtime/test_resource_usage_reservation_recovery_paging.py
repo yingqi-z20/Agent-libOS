@@ -331,6 +331,60 @@ def test_recovery_charge_rolls_back_if_settlement_fails_after_charge(
 
 
 @pytest.mark.parametrize("backend", STORE_BACKENDS)
+def test_llm_unknown_recovery_charges_aggregate_without_inventing_components(
+    backend: str,
+) -> None:
+    with _resource_store(backend, page_size=2, hard_limit=2) as store:
+        unit = UnitOfWork(store)
+        pid = f"pid-llm-maximum-{backend}"
+        unit.processes.insert_process(
+            _process(
+                pid,
+                max_external_write_bytes=10,
+                max_llm_calls=1,
+                max_llm_total_tokens=100,
+            )
+        )
+        effect_id = f"effect-llm-maximum-{backend}"
+        reservation_id = f"reservation-llm-maximum-{backend}"
+        unit.evidence.insert_external_effect(
+            _dispatched_effect(effect_id, pid=pid)
+        )
+        _insert_reservation(
+            unit,
+            reservation_id,
+            pid=pid,
+            reserved_by=effect_id,
+            reason="llm.request",
+            usage=ResourceUsage(
+                llm_calls=1,
+                llm_prompt_tokens=80,
+                llm_completion_tokens=20,
+                llm_total_tokens=100,
+            ),
+        )
+        manager = _resource_manager(unit, store.config)
+
+        assert manager.recover_usage_reservations().total_count == 1
+        reservation = unit.resources.get_resource_usage_reservation(
+            reservation_id
+        )
+        assert reservation is not None
+        assert reservation.status is ResourceUsageReservationStatus.CHARGED_MAXIMUM
+        assert reservation.settled_usage == ResourceUsage(
+            llm_calls=1,
+            llm_total_tokens=100,
+        )
+        process = unit.processes.get_process(pid)
+        assert process is not None
+        assert process.resource_usage.llm_calls == 1
+        assert process.resource_usage.llm_prompt_tokens == 0
+        assert process.resource_usage.llm_completion_tokens == 0
+        assert process.resource_usage.llm_total_tokens == 100
+        assert manager.recover_usage_reservations().total_count == 0
+
+
+@pytest.mark.parametrize("backend", STORE_BACKENDS)
 @pytest.mark.parametrize(
     "failure_type",
     [RuntimeError, KeyboardInterrupt],
@@ -713,6 +767,7 @@ def _insert_reservation(
     pid: str = "pid-reservation",
     reserved_by: str | None = None,
     usage: ResourceUsage | None = None,
+    reason: str = "test",
     created_at: str = "2026-01-01T00:00:00Z",
 ) -> None:
     unit.resources.insert_resource_usage_reservation(
@@ -720,12 +775,18 @@ def _insert_reservation(
         pid=pid,
         usage=usage or ResourceUsage(external_write_bytes=1),
         reserved_by=reserved_by or f"missing-effect-{reservation_id}",
-        reason="test",
+        reason=reason,
         created_at=created_at,
     )
 
 
-def _process(pid: str, *, max_external_write_bytes: int) -> AgentProcess:
+def _process(
+    pid: str,
+    *,
+    max_external_write_bytes: int,
+    max_llm_calls: int | None = None,
+    max_llm_total_tokens: int | None = None,
+) -> AgentProcess:
     created_at = "2026-01-01T00:00:00Z"
     return AgentProcess(
         pid=pid,
@@ -741,6 +802,8 @@ def _process(pid: str, *, max_external_write_bytes: int) -> AgentProcess:
         checkpoint_head=None,
         resource_budget=ResourceBudget(
             max_external_write_bytes=max_external_write_bytes,
+            max_llm_calls=max_llm_calls,
+            max_llm_total_tokens=max_llm_total_tokens,
         ),
         resource_usage=ResourceUsage(),
         created_at=created_at,

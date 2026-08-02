@@ -39,6 +39,7 @@ from agent_libos.models import (
     ProcessStatus,
     ResourceBudget,
     ResourceUsage,
+    ResourceUsageReservationStatus,
     SinkTrustLevel,
     SinkTrustRule,
     ViewMode,
@@ -1853,6 +1854,10 @@ class TestLLMContextMemory:
                 assert durable['action']['prepared_request_sha256']
                 assert 'request_messages' not in durable['action']
                 assert 'egress_payload' not in durable['action']
+                assert runtime.process.get(pid).resource_usage.llm_calls == 0
+                assert runtime.uow.resources.list_resource_usage_reservations(
+                    pid=pid
+                ) == []
 
                 runtime.human.drain_terminal_queue(auto_approve=True)
                 resumed = runtime.run_next_process_once()
@@ -1861,6 +1866,15 @@ class TestLLMContextMemory:
                 assert resumed['resumed_after_human']
                 assert len(client.user_prompts) == 1
                 assert sentinel in client.user_prompts[0]
+                assert runtime.process.get(pid).resource_usage.llm_calls == 1
+                reservations = (
+                    runtime.uow.resources.list_resource_usage_reservations(pid=pid)
+                )
+                assert len(reservations) == 1
+                assert (
+                    reservations[0].status
+                    is ResourceUsageReservationStatus.SETTLED
+                )
                 completed = runtime.store.get_llm_pending_action(pid)
                 assert completed is not None and completed['status'] == 'completed'
                 assert sentinel not in json.dumps(completed['action'], sort_keys=True)
@@ -2626,6 +2640,17 @@ class TestLLMContextMemory:
             assert preview['arguments_redacted']
             assert preview['arguments_sha256']
             assert preview['arguments_bytes'] > 0
+            process = runtime.process.get(pid)
+            assert process.resource_usage.llm_calls == 2
+            assert process.resource_usage.llm_total_tokens == 0
+            reservations = runtime.uow.resources.list_resource_usage_reservations(
+                pid=pid
+            )
+            assert len(reservations) == 2
+            assert all(
+                reservation.status is ResourceUsageReservationStatus.SETTLED
+                for reservation in reservations
+            )
         finally:
             runtime.close()
 

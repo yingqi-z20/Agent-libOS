@@ -52,8 +52,14 @@ _USER_PROFILE_FIELDS = (
     "fallback_json_actions",
     "temperature",
     "max_tokens",
+    "max_input_tokens_per_call",
+    "max_total_tokens_per_call",
     "context_window_tokens",
     "allow_custom_base_url",
+)
+_CORE_ONLY_PROFILE_FIELDS = (
+    "max_input_tokens_per_call",
+    "max_total_tokens_per_call",
 )
 
 
@@ -110,12 +116,21 @@ class UserLLMProfileStore:
 
     def upsert(self, profile_id: str, payload: Mapping[str, Any]) -> LLMProfile:
         selected_id = normalize_user_llm_profile_id(profile_id)
+        profiles = self.load()
+        selected_payload = dict(payload)
+        existing = profiles.get(selected_id)
+        if existing is not None:
+            # The bundled GUI intentionally has no controls for these core-only
+            # limits. Preserve an existing override when an older/editor payload
+            # omits it; an explicit null still clears the override.
+            for field_name in _CORE_ONLY_PROFILE_FIELDS:
+                if field_name not in selected_payload:
+                    selected_payload[field_name] = getattr(existing, field_name)
         profile = validate_user_llm_profile_payload(
             selected_id,
-            payload,
+            selected_payload,
             config=self.config,
         )
-        profiles = self.load()
         profiles[selected_id] = profile
         self.save(profiles)
         return profile
@@ -193,6 +208,14 @@ def validate_user_llm_profile_payload(
     raw["timeout_s"] = _optional_positive_float(raw.get("timeout_s"), "timeout_s")
     raw["max_retries"] = _optional_nonnegative_int(raw.get("max_retries"), "max_retries")
     raw["max_tokens"] = _optional_positive_int(raw.get("max_tokens"), "max_tokens")
+    raw["max_input_tokens_per_call"] = _optional_positive_int(
+        raw.get("max_input_tokens_per_call"),
+        "max_input_tokens_per_call",
+    )
+    raw["max_total_tokens_per_call"] = _optional_positive_int(
+        raw.get("max_total_tokens_per_call"),
+        "max_total_tokens_per_call",
+    )
     raw["context_window_tokens"] = _optional_positive_int(
         raw.get("context_window_tokens"),
         "context_window_tokens",
@@ -214,9 +237,26 @@ def validate_user_llm_profile_payload(
         raw["context_window_tokens"]
         or selected_config.llm.context_window_tokens
     )
+    effective_max_input_tokens = (
+        raw["max_input_tokens_per_call"]
+        or selected_config.llm.max_input_tokens_per_call
+    )
+    effective_max_total_tokens = (
+        raw["max_total_tokens_per_call"]
+        or selected_config.llm.max_total_tokens_per_call
+    )
     if effective_max_tokens >= effective_context_window:
         raise ValidationError(
             "LLM profile max_tokens must be less than context_window_tokens"
+        )
+    if effective_max_input_tokens > effective_max_total_tokens:
+        raise ValidationError(
+            "LLM profile max_input_tokens_per_call must not exceed "
+            "max_total_tokens_per_call"
+        )
+    if effective_max_tokens > effective_max_total_tokens:
+        raise ValidationError(
+            "LLM profile max_tokens must not exceed max_total_tokens_per_call"
         )
     try:
         return LLMProfile(**cleaned)
@@ -272,6 +312,8 @@ def summarize_llm_profile(
         "fallback_json_actions": profile.fallback_json_actions,
         "temperature": profile.temperature,
         "max_tokens": profile.max_tokens,
+        "max_input_tokens_per_call": profile.max_input_tokens_per_call,
+        "max_total_tokens_per_call": profile.max_total_tokens_per_call,
         "context_window_tokens": profile.context_window_tokens,
         "allow_custom_base_url": profile.allow_custom_base_url,
         "source": source,

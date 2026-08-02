@@ -1141,19 +1141,25 @@ atomically apply the corresponding resource-limit termination; it does not
 discard ambiguous provider consumption to make the budget appear valid. This is
 an operation-specific SDK policy, not a guarantee for every provider call.
 
-The LLM protected operation declares `ResourcePolicy.NONE`; its executor does
-separate resource accounting rather than SDK reservation/settlement. It
-preflights and later charges one LLM call, and charges token usage after provider
-completion using provider-reported usage. There is no durable call-count or
-maximum-token reservation before dispatch, so the corresponding limits are not
-hard caps on provider work already admitted: an abrupt host failure after
-dispatch but before post-attempt charging can leave the provider's call or token
-usage uncharged. If a
-token budget exists and the provider does not return billable usage, returns
-booleans/strings/negative values, or reports a total smaller than its
-prompt-plus-completion components, the completed LLM action fails closed. When
-an LLM completion pushes usage over budget, the call record is retained but
-model-selected tools are not dispatched.
+The LLM protected operation declares `ResourcePolicy.REQUIRED`. Once context
+management has produced the exact request, the executor checks the configured
+per-call input and aggregate ceilings, then atomically prepares the external
+effect and reserves one logical call plus the maximum prompt, completion, and
+total-token envelope. Active reservations reduce remaining budget throughout
+the process ancestry, so sibling calls cannot oversell a parent. Valid provider
+usage settles exactly before the call record and any selected tool; a certified
+not-started result releases; exceptions, cancellation, or ambiguous recovery
+charge one call and the aggregate maximum with unknown token components left at
+zero. Prepared effects release on startup, while dispatched or later effects
+settle maximally and idempotently.
+
+If a cumulative token budget exists and billable usage is absent, malformed,
+or negative, the completed action maximum-settles and fails closed. An
+arithmetic mismatch between reported components and total, or usage outside
+any per-call envelope, does the same regardless of the cumulative limit. With
+no cumulative token limit, wholly absent usage keeps the compatibility
+settlement of one call and zero tokens. These guarantees cover Runtime logical
+calls, not SDK retry attempts, exact provider billing, or monetary spend.
 Context materialization has both a per-call cap
 (`max_context_materialization_tokens`) and a separate cumulative budget
 (`max_context_materialization_total_tokens`). The cumulative context token

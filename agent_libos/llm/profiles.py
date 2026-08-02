@@ -50,6 +50,8 @@ class ResolvedLLMProfile:
     identity_sha256: str
     temperature: float
     max_tokens: int
+    max_input_tokens_per_call: int
+    max_total_tokens_per_call: int
     context_window_tokens: int
     parallel_tool_calls: bool
     auto_wait_on_empty_tool_calls: bool
@@ -191,6 +193,16 @@ class LLMProfileRegistry:
                 identity_sha256=snapshot.identity_sha256,
                 temperature=self.config.llm.temperature if profile.temperature is None else profile.temperature,
                 max_tokens=self.config.llm.max_tokens if profile.max_tokens is None else profile.max_tokens,
+                max_input_tokens_per_call=(
+                    self.config.llm.max_input_tokens_per_call
+                    if profile.max_input_tokens_per_call is None
+                    else profile.max_input_tokens_per_call
+                ),
+                max_total_tokens_per_call=(
+                    self.config.llm.max_total_tokens_per_call
+                    if profile.max_total_tokens_per_call is None
+                    else profile.max_total_tokens_per_call
+                ),
                 context_window_tokens=(
                     self.config.llm.context_window_tokens
                     if profile.context_window_tokens is None
@@ -269,10 +281,15 @@ class LLMProfileRegistry:
             profile.prompt_cache_retention,
             label=f"LLM profile {profile_id} prompt_cache_retention",
         )
-        # Model-window sizing controls only local request scheduling. It does
-        # not identify the external Provider/Sink and must not invalidate
-        # existing trust rules when hosts adopt this field.
-        identity_profile.pop("context_window_tokens", None)
+        # Model-window sizing and per-call budget envelopes control only local
+        # scheduling/admission. They do not identify the external Provider/Sink
+        # and must not invalidate existing trust rules when hosts change them.
+        for local_policy_field in (
+            "context_window_tokens",
+            "max_input_tokens_per_call",
+            "max_total_tokens_per_call",
+        ):
+            identity_profile.pop(local_policy_field, None)
         identity = {
             "schema_version": 1,
             "profile_id": profile_id,
@@ -574,15 +591,46 @@ class LLMProfileRegistry:
             raise ValidationError(f"unsupported LLM profile kind for {profile_id}: {profile.kind}")
         if not profile.api_key_env.strip():
             raise ValidationError(f"LLM profile api_key_env must be non-empty: {profile_id}")
+        for field_name in (
+            "max_tokens",
+            "max_input_tokens_per_call",
+            "max_total_tokens_per_call",
+            "context_window_tokens",
+        ):
+            value = getattr(profile, field_name)
+            if value is not None and value <= 0:
+                raise ValidationError(
+                    f"LLM profile {field_name} must be positive: {profile_id}"
+                )
         max_tokens = self.config.llm.max_tokens if profile.max_tokens is None else profile.max_tokens
         context_window = (
             self.config.llm.context_window_tokens
             if profile.context_window_tokens is None
             else profile.context_window_tokens
         )
+        max_input_tokens = (
+            self.config.llm.max_input_tokens_per_call
+            if profile.max_input_tokens_per_call is None
+            else profile.max_input_tokens_per_call
+        )
+        max_total_tokens = (
+            self.config.llm.max_total_tokens_per_call
+            if profile.max_total_tokens_per_call is None
+            else profile.max_total_tokens_per_call
+        )
         if max_tokens >= context_window:
             raise ValidationError(
                 f"LLM profile max_tokens must be less than context_window_tokens: {profile_id}"
+            )
+        if max_input_tokens > max_total_tokens:
+            raise ValidationError(
+                "LLM profile max_input_tokens_per_call must not exceed "
+                f"max_total_tokens_per_call: {profile_id}"
+            )
+        if max_tokens > max_total_tokens:
+            raise ValidationError(
+                "LLM profile max_tokens must not exceed "
+                f"max_total_tokens_per_call: {profile_id}"
             )
 
     def _normalize_profile_id(self, profile_id: str | None) -> str:

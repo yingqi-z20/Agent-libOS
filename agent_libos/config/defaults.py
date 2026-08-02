@@ -513,6 +513,8 @@ class LLMProfile:
     fallback_json_actions: bool | None = None
     temperature: StrictFloat | None = None
     max_tokens: StrictInt | None = None
+    max_input_tokens_per_call: StrictInt | None = None
+    max_total_tokens_per_call: StrictInt | None = None
     context_window_tokens: int | None = None
     allow_custom_base_url: bool = False
 
@@ -523,6 +525,8 @@ class LLMDefaults:
     profiles: dict[str, LLMProfile] = field(default_factory=lambda: {"default": LLMProfile()})
     temperature: StrictFloat = 0.2
     max_tokens: StrictInt = 16_384
+    max_input_tokens_per_call: StrictInt = 114_688
+    max_total_tokens_per_call: StrictInt = 131_072
     context_window_tokens: int = 131_072
     timeout_s: float = 60.0
     max_retries: int = 2
@@ -1691,6 +1695,14 @@ def _validate_llm_config(llm: LLMDefaults) -> None:
         _nonnegative_optional(f"{prefix}.temperature", profile.temperature)
         _positive_optional(f"{prefix}.max_tokens", profile.max_tokens)
         _positive_optional(
+            f"{prefix}.max_input_tokens_per_call",
+            profile.max_input_tokens_per_call,
+        )
+        _positive_optional(
+            f"{prefix}.max_total_tokens_per_call",
+            profile.max_total_tokens_per_call,
+        )
+        _positive_optional(
             f"{prefix}.context_window_tokens",
             profile.context_window_tokens,
         )
@@ -1702,19 +1714,50 @@ def _validate_llm_config(llm: LLMDefaults) -> None:
             if profile.context_window_tokens is None
             else profile.context_window_tokens
         )
+        effective_max_input_tokens = (
+            llm.max_input_tokens_per_call
+            if profile.max_input_tokens_per_call is None
+            else profile.max_input_tokens_per_call
+        )
+        effective_max_total_tokens = (
+            llm.max_total_tokens_per_call
+            if profile.max_total_tokens_per_call is None
+            else profile.max_total_tokens_per_call
+        )
         if effective_max_tokens >= effective_context_window:
             raise ValueError(
                 f"{prefix} effective max_tokens must be less than "
                 "effective context_window_tokens"
+            )
+        if effective_max_input_tokens > effective_max_total_tokens:
+            raise ValueError(
+                f"{prefix} effective max_input_tokens_per_call must not exceed "
+                "effective max_total_tokens_per_call"
+            )
+        if effective_max_tokens > effective_max_total_tokens:
+            raise ValueError(
+                f"{prefix} effective max_tokens must not exceed "
+                "effective max_total_tokens_per_call"
             )
     _optional_non_empty("llm.safety_identifier", llm.safety_identifier)
     _optional_max_chars("llm.safety_identifier", llm.safety_identifier, 64)
     _optional_non_empty("llm.prompt_cache_key", llm.prompt_cache_key)
     _nonnegative("llm.temperature", llm.temperature)
     _positive("llm.max_tokens", llm.max_tokens)
+    _positive("llm.max_input_tokens_per_call", llm.max_input_tokens_per_call)
+    _positive("llm.max_total_tokens_per_call", llm.max_total_tokens_per_call)
     _positive("llm.context_window_tokens", llm.context_window_tokens)
     if llm.max_tokens >= llm.context_window_tokens:
         raise ValueError("llm.max_tokens must be less than llm.context_window_tokens")
+    if llm.max_input_tokens_per_call > llm.max_total_tokens_per_call:
+        raise ValueError(
+            "llm.max_input_tokens_per_call must not exceed "
+            "llm.max_total_tokens_per_call"
+        )
+    if llm.max_tokens > llm.max_total_tokens_per_call:
+        raise ValueError(
+            "llm.max_tokens must not exceed llm.max_total_tokens_per_call"
+        )
     _positive("llm.timeout_s", llm.timeout_s)
     _nonnegative("llm.max_retries", llm.max_retries)
     _positive("llm.compatibility_retry_attempts", llm.compatibility_retry_attempts)

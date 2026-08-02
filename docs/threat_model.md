@@ -325,8 +325,9 @@ Agent libOS does not claim to:
   provider state through a checkpoint or checkpoint-derived image;
 - support mutually untrusted writable Runtimes on one store, or isolate hostile
   processes sharing the same OS user; or
-- provide a distributed workflow service, multi-host Run failover, hard LLM
-  provider-spend caps, or automatic recovery of runtime-local ObjectTasks; or
+- provide a distributed workflow service, multi-host Run failover, exact LLM
+  physical-request/provider-billing/monetary-spend caps, or automatic recovery
+  of runtime-local ObjectTasks; or
 - turn deterministic tests and benchmarks into a formal proof or a claim that
   every supported OS/provider environment has been release-validated.
 

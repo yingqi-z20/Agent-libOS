@@ -8,6 +8,7 @@ from agent_libos.llm.client import (
     LLMTransientError,
     llm_provider_failure_error,
 )
+from agent_libos.substrate import ProviderEffectNotStarted
 from agent_libos.ports.blocking_work import run_blocking_once
 
 
@@ -43,6 +44,10 @@ class LLMProviderService:
                 previous_response_id=previous_response_id,
                 parallel_tool_calls=parallel_tool_calls,
             )
+        except ProviderEffectNotStarted:
+            # Preserve the Host/Provider certificate so the protected
+            # operation can release its pre-dispatch usage reservation.
+            raise
         except Exception as exc:
             wrapped = llm_provider_failure_error(
                 exc,

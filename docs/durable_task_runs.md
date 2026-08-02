@@ -1,6 +1,6 @@
 # Durable Task Runs
 
-Durable Task Runs, introduced in Agent libOS 1.1.0, remain the 1.3.0
+Durable Task Runs, introduced in Agent libOS 1.1.0, remain the 1.3.2
 Host-supervised unit for long-running
 agent work. One `TaskRun` owns one root `AgentProcess` and the child-process
 tree created from that root. The Run adds a durable goal, requirement ledger,
@@ -489,7 +489,7 @@ paged listing, optionally quantum-bounded execution, passive waiting,
 pause/resume, cancellation,
 follow-ups, evidence-constrained recovery, whole-Run rerun operations, and an
 audited `purge_payloads` operation for a terminal `permanent` Run. The explicit
-purge is a Python Host/admin surface in 1.3.0; it is not offered to ordinary
+purge is a Python Host/admin surface in 1.3.2; it is not offered to ordinary
 CLI or GUI users.
 Rerun creates a new Run id and links it to the prior Run; it never rewinds the
 old ledger. After either `purge_on_terminal` cleanup or an explicit Host purge
@@ -506,7 +506,7 @@ its stable client request id instead of an expected revision.
 ## CLI
 
 The `task-run` command group mirrors the ordinary Host controls (the
-Host/admin-only explicit payload purge remains Python-only in 1.3.0):
+Host/admin-only explicit payload purge remains Python-only in 1.3.2):
 
 ```text
 task-run start
@@ -549,7 +549,7 @@ The private local API provides `/api/task-runs` collection/detail routes,
 paged ledger and Human-request reads, and run, pause, resume, cancel, follow-up,
 recover, and rerun mutations. Collection, ledger, and Human pages accept an
 opaque `cursor` and return `next_cursor`; clients must not parse it. There is no
-separate Task Run requirements or wait HTTP route in 1.3.0: the detail response
+separate Task Run requirements or wait HTTP route in 1.3.2: the detail response
 embeds a bounded requirements page selected with `requirements_limit` and
 `requirements_cursor`, requirement changes are also ledger items, and waiting
 is ordinary state observation. Cancel/recover require the same explicit
@@ -597,10 +597,13 @@ same-build contract, not a separately supported public REST service.
 - Capabilities, Task Authority, Human approval, data-flow labels, ToolBroker,
   provider policy, and protected-operation evidence continue to apply to every
   action. Task Run ownership grants none of them.
-- LLM call count is preflighted and usage is charged after attempts complete,
-  as in ordinary scheduler execution. There is no durable pre-dispatch token or
-  cost reservation, so configured LLM budgets are not hard provider-spend
-  limits and must not be presented as such.
+- Every logical LLM call atomically prepares its external effect and maximum
+  call/token reservation before Provider dispatch, as in ordinary scheduler
+  execution. Human/data-flow waits hold no reservation; resume re-admits the
+  exact request under current Host ceilings. Known usage settles exactly,
+  certified non-start releases, and ambiguous outcomes charge the aggregate
+  maximum before any model-selected tool runs. This is not an exact physical
+  request, Provider billing, currency, or monetary-spend cap.
 
 See [Runtime Model](runtime_model.md), [Storage](storage.md),
 [Object Memory](object_memory.md), [Checkpoints](checkpoints.md),

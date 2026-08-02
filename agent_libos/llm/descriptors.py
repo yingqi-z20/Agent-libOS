@@ -8,7 +8,7 @@ PROTECTED_OPERATION_DESCRIPTORS = (
         "primitive.llm.complete",
         "llm",
         "complete",
-        resource_policy=ResourcePolicy.NONE,
+        resource_policy=ResourcePolicy.REQUIRED,
         authority_mode=AuthorityMode.RUNTIME_INTERNAL,
         state_mutation=True,
         information_flow=True,

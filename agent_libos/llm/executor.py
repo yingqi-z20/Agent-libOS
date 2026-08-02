@@ -41,6 +41,7 @@ from agent_libos.llm.context_management import (
     assess_context_pressure,
     context_management_policy,
     context_pressure_prompt,
+    estimate_request_input_tokens,
     provider_usage_lower_bound,
 )
 from agent_libos.llm.event_projection import project_prompt_events
@@ -110,6 +111,7 @@ from agent_libos.sdk import (
     ProtectedOperationEvidence,
     ProtectedOperationInvocation,
     ProviderPhase,
+    ResourceSettlement,
 )
 from agent_libos.substrate import ProviderEffectNotStarted
 
@@ -203,6 +205,15 @@ class _LLMCallState:
     fallback_json_actions: bool = False
     temperature: float = 0.0
     max_tokens: int = 0
+    max_input_tokens_per_call: int = 0
+    max_total_tokens_per_call: int = 0
+    estimated_input_tokens: int = 0
+    resource_envelope: ResourceUsage | None = None
+    resource_envelope_sha256: str = ""
+    completion_usage: dict[str, int] = field(default_factory=dict)
+    invalid_completion_usage_fields: set[str] = field(default_factory=set)
+    provider_dispatched: bool = False
+    budget_admission_denial_audited: bool = False
     egress_payload: dict[str, Any] = field(default_factory=dict)
     canonical_args: dict[str, Any] = field(default_factory=dict)
     resumed_release: bool = False
@@ -4867,7 +4878,22 @@ class LLMProcessExecutor:
                     _chain_scope_retry=_chain_scope_retry + 1,
                 )
             except Exception as exc:
-                self._record_llm_call_error(state, exc)
+                # Host-side admission failures occur before the protected
+                # provider phase and are already represented by resource/audit
+                # evidence. Do not turn them into synthetic Provider calls.
+                if (
+                    isinstance(exc, ResourceLimitExceeded)
+                    and not state.provider_dispatched
+                ):
+                    self._deny_llm_budget_admission(
+                        state,
+                        reason="resource_envelope_unavailable",
+                    )
+                if state.provider_dispatched or not isinstance(
+                    exc,
+                    ResourceLimitExceeded,
+                ):
+                    self._record_llm_call_error(state, exc)
                 raise
             return self._record_llm_call_success(state, completion)
 
@@ -5011,24 +5037,25 @@ class LLMProcessExecutor:
             "previous_response_id": state.previous_response_id,
             "parallel_tool_calls": state.parallel_tool_calls,
         }
-        # Context pressure is evaluated only after the complete request has
-        # been assembled, but before either LLM resource preflight or external
-        # data-flow clearance. Prompt-mode notices therefore participate in
-        # the exact egress payload that is checked and persisted.
+        # Context pressure and the hard per-call envelope are evaluated only
+        # after the complete request has been assembled. Prompt-mode notices
+        # therefore participate in the exact payload admitted for dispatch.
+        self._prepare_llm_budget_envelope(state)
         self._data_flow.precheck_egress_clearance(
             pid=state.pid,
             sink=precheck_sink,
             context=state.flow_context,
             payload=state.egress_payload,
         )
-        self._preflight_llm_call(state.pid)
         state.canonical_args = {
+            "call_id": state.call_id,
             "profile_id": resolved.profile_id,
             "sink_identity_sha256": state.sink.identity_sha256,
             "payload_sha256": hashlib.sha256(
                 dumps(to_jsonable(state.egress_payload)).encode("utf-8")
             ).hexdigest(),
             "attempt": state.attempt,
+            "resource_envelope_sha256": state.resource_envelope_sha256,
         }
 
     def _set_llm_provider_scope(self, state: _LLMCallState) -> None:
@@ -5783,7 +5810,6 @@ class LLMProcessExecutor:
         state: _LLMCallState,
         prepared_request: dict[str, Any],
     ) -> None:
-        self._preflight_llm_call(state.pid)
         resolved = self._llms.resolve(state.profile_id)
         state.resolved = resolved
         state.client = resolved.client
@@ -5833,6 +5859,15 @@ class LLMProcessExecutor:
             prepared_request.get("canonical_args") or {}
         )
         self._rebind_resumed_image_only_generation(state)
+        self._prepare_llm_budget_envelope(state)
+        state.canonical_args.update(
+            {
+                "call_id": state.call_id,
+                "profile_id": resolved.profile_id,
+                "attempt": state.attempt,
+                "resource_envelope_sha256": state.resource_envelope_sha256,
+            }
+        )
 
     def _rebind_resumed_image_only_generation(self, state: _LLMCallState) -> None:
         image = self._images.get(state.process.image_id)
@@ -5892,6 +5927,8 @@ class LLMProcessExecutor:
 
     async def _invoke_prepared_llm_request(self, state: _LLMCallState) -> Any:
         assert state.resolved is not None and state.sink is not None
+        if state.resource_envelope is None:
+            raise RuntimeError("LLM resource envelope was not prepared")
         invocation = ProtectedOperationInvocation(
             pid=state.pid,
             actor=state.pid,
@@ -5899,6 +5936,7 @@ class LLMProcessExecutor:
             canonical_args=state.canonical_args,
             observation={
                 **state.canonical_args,
+                **self._llm_resource_context(state),
                 "message_count": len(state.request_messages),
                 "tool_count": len(state.tools),
                 "source_count": len(state.flow_context.source_refs),
@@ -5912,6 +5950,9 @@ class LLMProcessExecutor:
             data_flow_payload=state.egress_payload,
             data_flow_operation="llm.complete",
             data_flow_allow_recovered_source_snapshots=state.resumed_release,
+            reservation_usage=state.resource_envelope,
+            resource_source="llm.request",
+            resource_context=self._llm_resource_context(state),
             prepare=lambda: self._assert_llm_call_scope(state),
             failure_evidence=lambda error, phase: self._llm_failure_evidence(
                 state,
@@ -5927,6 +5968,7 @@ class LLMProcessExecutor:
 
             async def dispatch_bound_request() -> Any:
                 self._assert_llm_call_scope(state)
+                state.provider_dispatched = True
                 return await self._complete_action(
                     state.client,
                     state.request_messages,
@@ -5945,7 +5987,11 @@ class LLMProcessExecutor:
                 ),
                 dispatch_bound_request,
             )
-            return protected.complete(
+            resource, violation = self._llm_completion_resource_settlement(
+                state,
+                completion,
+            )
+            result = protected.complete(
                 completion,
                 self._llm_success_evidence(state, completion),
                 classification_override=ExternalEffectClassification(
@@ -5955,7 +6001,11 @@ class LLMProcessExecutor:
                     information_flow=True,
                     metadata={"outcome": "provider_completed"},
                 ),
+                resource=resource,
             )
+            if violation is not None:
+                raise ResourceLimitExceeded(violation)
+            return result
 
     def _assert_llm_call_scope(self, state: _LLMCallState) -> None:
         assert state.resolved is not None and state.sink is not None
@@ -6088,11 +6138,6 @@ class LLMProcessExecutor:
         state: _LLMCallState,
         error: Exception,
     ) -> None:
-        self._charge_llm_attempt(
-            state.pid,
-            source="llm.error",
-            context={"error_type": type(error).__name__},
-        )
         preserve_domain_text = self._preserve_llm_domain_error_text(error)
         public_error: dict[str, str] | None = None
         internal_error: dict[str, Any] | None = None
@@ -6163,9 +6208,10 @@ class LLMProcessExecutor:
         self,
         state: _LLMCallState,
         completion: Any,
-    ) -> tuple[Any, bool, bool, bool, str]:
+    ) -> tuple[Any, bool, bool, bool, str, str]:
         self._prepare_image_only_transcript_record(state, completion)
-        usage, invalid_usage_fields = self._canonical_llm_usage(completion)
+        usage = dict(state.completion_usage)
+        invalid_usage_fields = set(state.invalid_completion_usage_fields)
         self._record_effective_provider_request_options(state, completion)
         if invalid_usage_fields:
             state.request_options["invalid_usage_fields"] = sorted(
@@ -6173,11 +6219,6 @@ class LLMProcessExecutor:
             )
         state.request_options["fallback_json_action_used"] = (
             self._fallback_json_action_was_used(state, completion)
-        )
-        self._charge_llm_attempt(
-            state.pid,
-            source="llm.completion",
-            context={"usage": usage},
         )
         if getattr(completion, "api", None) == "responses":
             manifest = self._response_tool_call_manifest(completion)
@@ -6238,11 +6279,6 @@ class LLMProcessExecutor:
                 "invocation",
                 metadata={"call_id": state.call_id},
             )
-        self._charge_llm_completion(
-            state.pid,
-            usage,
-            invalid_usage_fields=invalid_usage_fields,
-        )
         return (
             completion,
             state.parallel_tool_calls,
@@ -6555,29 +6591,104 @@ class LLMProcessExecutor:
             return False
         return True
 
-    def _preflight_llm_call(self, pid: str) -> None:
-        resources = self._resources
-        if resources is None:
+    def _prepare_llm_budget_envelope(self, state: _LLMCallState) -> None:
+        resolved = state.resolved
+        if resolved is None:
+            raise RuntimeError("LLM profile must be resolved before budget admission")
+
+        state.max_input_tokens_per_call = int(
+            resolved.max_input_tokens_per_call
+        )
+        state.max_total_tokens_per_call = int(
+            resolved.max_total_tokens_per_call
+        )
+        state.estimated_input_tokens = estimate_request_input_tokens(
+            state.request_messages,
+            state.tools,
+        )
+        reserved_total_tokens = min(
+            state.max_total_tokens_per_call,
+            state.max_input_tokens_per_call + state.max_tokens,
+        )
+        state.resource_envelope = ResourceUsage(
+            llm_calls=1,
+            llm_prompt_tokens=state.max_input_tokens_per_call,
+            llm_completion_tokens=state.max_tokens,
+            llm_total_tokens=reserved_total_tokens,
+        )
+        envelope = {
+            "llm_calls": 1,
+            "llm_prompt_tokens": state.max_input_tokens_per_call,
+            "llm_completion_tokens": state.max_tokens,
+            "llm_total_tokens": reserved_total_tokens,
+        }
+        state.resource_envelope_sha256 = hashlib.sha256(
+            dumps(envelope).encode("utf-8")
+        ).hexdigest()
+        state.request_options["llm_budget"] = {
+            "schema_version": 1,
+            "estimated_input_tokens": state.estimated_input_tokens,
+            "max_input_tokens_per_call": state.max_input_tokens_per_call,
+            "max_output_tokens_per_call": state.max_tokens,
+            "max_total_tokens_per_call": state.max_total_tokens_per_call,
+            "reserved_total_tokens": reserved_total_tokens,
+            "resource_envelope_sha256": state.resource_envelope_sha256,
+        }
+
+        if state.estimated_input_tokens > state.max_input_tokens_per_call:
+            self._deny_llm_budget_admission(
+                state,
+                reason="estimated_input_exceeds_per_call_limit",
+            )
+            raise ResourceLimitExceeded(
+                "LLM estimated input tokens exceed max_input_tokens_per_call: "
+                f"{state.estimated_input_tokens} > "
+                f"{state.max_input_tokens_per_call}"
+            )
+        projected_tokens = state.estimated_input_tokens + state.max_tokens
+        if projected_tokens > state.max_total_tokens_per_call:
+            self._deny_llm_budget_admission(
+                state,
+                reason="estimated_total_exceeds_per_call_limit",
+            )
+            raise ResourceLimitExceeded(
+                "LLM estimated input plus max output tokens exceed "
+                "max_total_tokens_per_call: "
+                f"{projected_tokens} > {state.max_total_tokens_per_call}"
+            )
+
+    def _deny_llm_budget_admission(
+        self,
+        state: _LLMCallState,
+        *,
+        reason: str,
+    ) -> None:
+        if state.budget_admission_denial_audited:
             return
-        resources.preflight(
-            pid,
-            ResourceUsage(llm_calls=1),
-            source="llm.request",
-            context={"purpose": "action_selection"},
+        state.budget_admission_denial_audited = True
+        self._audit.record(
+            actor=state.pid,
+            action="llm.budget_admission_denied",
+            target=f"llm:{state.profile_id}",
+            decision={
+                **self._llm_resource_context(state),
+                "reason": reason,
+            },
         )
 
-    def _charge_llm_attempt(self, pid: str, *, source: str, context: dict[str, Any] | None = None) -> None:
-        resources = self._resources
-        if resources is None:
-            return
-        resources.charge(
-            pid,
-            ResourceUsage(llm_calls=1),
-            source=source,
-            context=context or {},
-            allow_overage=True,
-            kill_on_exceed=True,
-        )
+    @staticmethod
+    def _llm_resource_context(state: _LLMCallState) -> dict[str, Any]:
+        return {
+            "purpose": "action_selection",
+            "call_id": state.call_id,
+            "profile_id": state.profile_id,
+            "attempt": state.attempt,
+            "estimated_input_tokens": state.estimated_input_tokens,
+            "max_input_tokens_per_call": state.max_input_tokens_per_call,
+            "max_output_tokens_per_call": state.max_tokens,
+            "max_total_tokens_per_call": state.max_total_tokens_per_call,
+            "resource_envelope_sha256": state.resource_envelope_sha256,
+        }
 
     @staticmethod
     def _canonical_llm_usage(completion: Any) -> tuple[dict[str, int], set[str]]:
@@ -6586,105 +6697,215 @@ class LLMProcessExecutor:
             api=getattr(completion, "api", None),
         )
 
-    def _charge_llm_completion(
+    def _llm_completion_resource_settlement(
         self,
-        pid: str,
-        usage: Mapping[str, int],
-        *,
-        invalid_usage_fields: set[str] | None = None,
-    ) -> None:
-        resources = self._resources
-        if resources is None:
-            return
-        canonical_usage = dict(usage)
-        invalid_fields = invalid_usage_fields or set()
-        has_token_limit = resources.has_limit(pid, "max_llm_total_tokens")
-        token_keys = {"prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"}
-        if has_token_limit and not any(
-            key in canonical_usage or key in invalid_fields for key in token_keys
-        ):
-            resources.charge(
-                pid,
-                ResourceUsage(),
-                source="llm.completion",
-                context={"usage_missing": True},
-                allow_overage=False,
-                kill_on_exceed=False,
+        state: _LLMCallState,
+        completion: Any,
+    ) -> tuple[ResourceSettlement, str | None]:
+        if state.resource_envelope is None:
+            raise RuntimeError("LLM resource envelope was not prepared")
+        canonical_usage, invalid_fields = self._canonical_llm_usage(completion)
+        state.completion_usage = dict(canonical_usage)
+        state.invalid_completion_usage_fields = set(invalid_fields)
+        token_keys = {
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+        }
+        invalid_token_fields = sorted(invalid_fields & token_keys)
+        context: dict[str, Any] = {
+            **self._llm_resource_context(state),
+            "usage": canonical_usage,
+        }
+        has_cumulative_token_limit = bool(
+            self._resources is not None
+            and self._resources.has_limit(state.pid, "max_llm_total_tokens")
+        )
+        if invalid_token_fields and has_cumulative_token_limit:
+            context["invalid_usage_fields"] = invalid_token_fields
+            return self._llm_maximum_resource_settlement(
+                context,
+                "LLM provider returned invalid token usage fields: "
+                + ", ".join(invalid_token_fields),
             )
-            raise ResourceLimitExceeded("LLM token budget is configured, but provider response did not include token usage")
-        if has_token_limit:
-            prompt_value = self._budget_usage_int(
-                canonical_usage,
-                "prompt_tokens",
-                "input_tokens",
-                invalid_fields=invalid_fields,
+        material_invalid_fields = self._material_invalid_llm_usage_fields(
+            canonical_usage,
+            invalid_fields,
+        )
+        if material_invalid_fields:
+            context["invalid_usage_fields"] = material_invalid_fields
+            return self._llm_maximum_resource_settlement(
+                context,
+                "LLM provider returned invalid token usage fields without "
+                "a valid compatible counter: "
+                + ", ".join(material_invalid_fields),
             )
-            completion_value = self._budget_usage_int(
-                canonical_usage,
-                "completion_tokens",
-                "output_tokens",
-                invalid_fields=invalid_fields,
-            )
-            total_value = self._budget_usage_int(
-                canonical_usage,
-                "total_tokens",
-                invalid_fields=invalid_fields,
-            )
-            prompt_tokens = prompt_value or 0
-            completion_tokens = completion_value or 0
-            component_total = prompt_tokens + completion_tokens
-            total_tokens = component_total if total_value is None else total_value
-            if total_value is not None and total_value < component_total:
-                raise ResourceLimitExceeded(
-                    "LLM token budget is configured, but provider total_tokens is smaller than prompt/completion usage"
+
+        has_reported_usage = any(key in canonical_usage for key in token_keys)
+        if not has_reported_usage:
+            if has_cumulative_token_limit:
+                context["usage_missing"] = True
+                return self._llm_maximum_resource_settlement(
+                    context,
+                    "LLM token budget is configured, but provider response "
+                    "did not include token usage",
                 )
-        else:
-            prompt_tokens = self._usage_int(
-                canonical_usage, "prompt_tokens", "input_tokens"
+            return (
+                ResourceSettlement(
+                    usage=ResourceUsage(llm_calls=1),
+                    source="llm.completion",
+                    context={**context, "usage_missing": True},
+                ),
+                None,
             )
-            completion_tokens = self._usage_int(
-                canonical_usage, "completion_tokens", "output_tokens"
+
+        (
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            inconsistent_component_total,
+        ) = self._normalized_llm_token_usage(canonical_usage)
+        if inconsistent_component_total is not None:
+            context["component_total_tokens"] = inconsistent_component_total
+            return self._llm_maximum_resource_settlement(
+                context,
+                "LLM provider total_tokens does not equal prompt/completion usage",
             )
-            total_tokens = self._usage_int(canonical_usage, "total_tokens")
-            if total_tokens == 0 and (prompt_tokens or completion_tokens):
-                total_tokens = prompt_tokens + completion_tokens
-        resources.charge(
-            pid,
-            ResourceUsage(
-                llm_prompt_tokens=prompt_tokens,
-                llm_completion_tokens=completion_tokens,
-                llm_total_tokens=total_tokens,
+
+        actual = ResourceUsage(
+            llm_calls=1,
+            llm_prompt_tokens=prompt_tokens,
+            llm_completion_tokens=completion_tokens,
+            llm_total_tokens=total_tokens,
+        )
+        exceeded = [
+            (
+                "prompt_tokens",
+                actual.llm_prompt_tokens,
+                state.resource_envelope.llm_prompt_tokens,
             ),
-            source="llm.completion",
-            context={"usage": canonical_usage},
-            allow_overage=True,
-            kill_on_exceed=True,
+            (
+                "completion_tokens",
+                actual.llm_completion_tokens,
+                state.resource_envelope.llm_completion_tokens,
+            ),
+            (
+                "total_tokens",
+                actual.llm_total_tokens,
+                state.resource_envelope.llm_total_tokens,
+            ),
+        ]
+        exceeded = [item for item in exceeded if item[1] > item[2]]
+        if exceeded:
+            context["exceeded_usage"] = {
+                name: {"actual": actual_value, "reserved": reserved_value}
+                for name, actual_value, reserved_value in exceeded
+            }
+            return self._llm_maximum_resource_settlement(
+                context,
+                "LLM provider usage exceeded the reserved per-call token envelope: "
+                + ", ".join(
+                    f"{name}={actual_value}>{reserved_value}"
+                    for name, actual_value, reserved_value in exceeded
+                ),
+            )
+        return (
+            ResourceSettlement(
+                usage=actual,
+                source="llm.completion",
+                context=context,
+            ),
+            None,
         )
 
-    def _usage_int(self, usage: Mapping[str, int], *keys: str) -> int:
-        for key in keys:
-            value = usage.get(key)
-            if value is None:
-                continue
-            return value
-        return 0
+    @staticmethod
+    def _llm_maximum_resource_settlement(
+        context: Mapping[str, Any],
+        violation: str,
+    ) -> tuple[ResourceSettlement, str]:
+        return (
+            ResourceSettlement(
+                usage=ResourceUsage(),
+                source="llm.completion",
+                context={**dict(context), "settlement": "fail_closed_maximum"},
+                charge_reserved_maximum=True,
+            ),
+            violation,
+        )
 
-    def _budget_usage_int(
-        self,
+    @classmethod
+    def _normalized_llm_token_usage(
+        cls,
+        usage: Mapping[str, int],
+    ) -> tuple[int, int, int, int | None]:
+        prompt_tokens = int(
+            cls._first_usage_counter(
+                usage,
+                "prompt_tokens",
+                "input_tokens",
+            )
+            or 0
+        )
+        completion_tokens = int(
+            cls._first_usage_counter(
+                usage,
+                "completion_tokens",
+                "output_tokens",
+            )
+            or 0
+        )
+        reported_total = cls._first_usage_counter(
+            usage,
+            "total_tokens",
+            default=None,
+        )
+        component_total = prompt_tokens + completion_tokens
+        total_tokens = component_total if reported_total is None else reported_total
+        has_both_components = any(
+            key in usage for key in ("prompt_tokens", "input_tokens")
+        ) and any(
+            key in usage for key in ("completion_tokens", "output_tokens")
+        )
+        inconsistent = bool(
+            reported_total is not None
+            and has_both_components
+            and reported_total != component_total
+        )
+        return (
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            component_total if inconsistent else None,
+        )
+
+    @staticmethod
+    def _material_invalid_llm_usage_fields(
+        usage: Mapping[str, int],
+        invalid_fields: set[str],
+    ) -> list[str]:
+        material: set[str] = set()
+        for aliases in (
+            {"prompt_tokens", "input_tokens"},
+            {"completion_tokens", "output_tokens"},
+            {"total_tokens"},
+        ):
+            invalid_aliases = invalid_fields & aliases
+            if invalid_aliases and not usage.keys() & aliases:
+                material.update(invalid_aliases)
+        return sorted(material)
+
+    @staticmethod
+    def _first_usage_counter(
         usage: Mapping[str, int],
         *keys: str,
-        invalid_fields: set[str],
+        default: int | None = 0,
     ) -> int | None:
         for key in keys:
-            if key in invalid_fields:
-                raise ResourceLimitExceeded(
-                    "LLM token budget is configured, but provider returned "
-                    f"invalid {key}"
-                )
-            if key not in usage:
-                continue
-            return usage[key]
-        return None
+            if key in usage:
+                return usage[key]
+        return default
 
     def _data_flow_provider_chain_fingerprint(
         self,

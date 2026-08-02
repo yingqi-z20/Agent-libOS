@@ -418,12 +418,14 @@ libOS/llm-profiles.json` on Windows, `~/Library/Application Support/Agent
 libOS/llm-profiles.json` on macOS, and the `agent-libos/llm-profiles.json`
 file under `${XDG_CONFIG_HOME:-~/.config}` on Linux. The file stores model
 routing fields such as profile id, model, base URL, API mode, tuning options,
-optional `context_window_tokens`, prompt-cache/Responses-continuation policy
+optional `context_window_tokens`, `max_input_tokens_per_call`, and
+`max_total_tokens_per_call`, prompt-cache/Responses-continuation policy
 settings, and the
 `api_key_env`/`safety_identifier_env` names. It never stores either environment
-variable's value. The bundled editor exposes every field returned by the GUI
-profile summary, including reasoning effort, verbosity, cache retention, and
-explicit Responses continuation policy. The current full-snapshot AgentProcess
+variable's value. The Python profile API validates, preserves, and returns the
+core-only per-call budget fields, but this release adds no bundled GUI controls
+for them. The editor continues to expose routing, reasoning effort, verbosity,
+cache retention, and explicit Responses continuation policy. The current full-snapshot AgentProcess
 executor records that policy but does not send `previous_response_id`; enabling
 provider storage can still increase provider-side retention. Profile deletion
 requires an inline second confirmation. Numeric fields reject fractional
@@ -710,7 +712,7 @@ Important endpoints:
   Collection, ledger, and Human pages accept opaque `cursor` values and return
   `next_cursor`; clients must not parse or synthesize them. The embedded
   requirements page also returns `next_cursor`. Requirement changes are linked
-  ledger items, and 1.3.0 has no independent Task Run requirements or wait HTTP
+  ledger items, and 1.3.2 has no independent Task Run requirements or wait HTTP
   route.
 - `POST /api/task-runs/{run_id}/run|pause|resume|cancel|follow-ups|recover|rerun`.
   Every existing-Run mutation carries a command id and expected revision.

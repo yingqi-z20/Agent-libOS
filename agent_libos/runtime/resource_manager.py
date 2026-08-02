@@ -42,6 +42,13 @@ from agent_libos.utils.public_errors import (
 
 _TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 _USAGE_FIELD_NAMES = {field.name for field in fields(ResourceUsage)}
+_LLM_USAGE_RESERVATION_SOURCE = "llm.request"
+_LLM_USAGE_FIELDS = {
+    "llm_calls",
+    "llm_prompt_tokens",
+    "llm_completion_tokens",
+    "llm_total_tokens",
+}
 
 # Most counters are cumulative. Peak RSS is different: one large subprocess
 # should not make future small subprocesses impossible, but it must still be
@@ -219,7 +226,7 @@ class ResourceManager:
                 selected = ResourceUsage()
                 status = "released"
             elif charge_maximum:
-                selected = maximum
+                selected = self._maximum_charge_usage(reservation)
                 status = "charged_maximum"
             else:
                 selected = self._coerce_usage(actual_usage or ResourceUsage())
@@ -274,6 +281,30 @@ class ResourceManager:
                     )
         self._run_resource_limit_finalizations(post_commit_finalizations)
         return selected
+
+    @staticmethod
+    def _maximum_charge_usage(
+        reservation: ResourceUsageReservation,
+    ) -> ResourceUsage:
+        """Return the conservative durable charge for an unknown outcome.
+
+        LLM prompt/completion counters are an observed breakdown, not separate
+        budget ceilings.  When the Provider outcome is unknown, charge the
+        logical call and aggregate token ceiling without inventing a split.
+        Other resource reservations retain their existing full-vector maximum.
+        """
+
+        llm_only = all(
+            field.name in _LLM_USAGE_FIELDS
+            or getattr(reservation.usage, field.name) == 0
+            for field in fields(ResourceUsage)
+        )
+        if reservation.reason == _LLM_USAGE_RESERVATION_SOURCE and llm_only:
+            return ResourceUsage(
+                llm_calls=reservation.usage.llm_calls,
+                llm_total_tokens=reservation.usage.llm_total_tokens,
+            )
+        return reservation.usage
 
     def recover_usage_reservations(
         self,
@@ -1107,20 +1138,80 @@ class ResourceManager:
         owner_pid: str,
         budget_field: str,
     ) -> _ResourceNumber:
+        """Return active usage not already covered by child budget reservations."""
+
         usage_fields = _BUDGET_USAGE_MAP[budget_field]
         total = self._budget_zero(budget_field)
+        usage_by_child: dict[str, _ResourceNumber] = {}
         for reservation in self._iter_active_usage_reservations():
             try:
-                chain_pids = {
-                    process.pid for process in self._process_chain(reservation.pid)
-                }
+                chain = self._process_chain(reservation.pid)
             except NotFound:
                 # A durable reservation whose process vanished is uncertain.
-                # Keep it visible to the root budget instead of silently freeing it.
-                chain_pids = {reservation.pid}
-            if owner_pid not in chain_pids:
+                # Keep it visible to its recorded owner instead of silently
+                # freeing that process's budget.
+                if reservation.pid != owner_pid:
+                    continue
+                direct_child_pid = None
+            else:
+                owner_index = next(
+                    (
+                        index
+                        for index, process in enumerate(chain)
+                        if process.pid == owner_pid
+                    ),
+                    None,
+                )
+                if owner_index is None:
+                    continue
+                direct_child_pid = (
+                    chain[owner_index - 1].pid if owner_index > 0 else None
+                )
+            value = self._usage_value(
+                reservation.usage,
+                budget_field,
+                usage_fields,
+            )
+            if value <= 0:
                 continue
-            total += self._usage_value(reservation.usage, budget_field, usage_fields)
+            if direct_child_pid is None:
+                total += value
+                continue
+            usage_by_child[direct_child_pid] = (
+                usage_by_child.get(
+                    direct_child_pid,
+                    self._budget_zero(budget_field),
+                )
+                + value
+            )
+
+        if not usage_by_child:
+            return total
+
+        reserved_by_child = {
+            reservation.child_pid: self._budget_number(
+                budget_field,
+                reservation.reserved.get(
+                    budget_field,
+                    self._budget_zero(budget_field),
+                ),
+            )
+            for reservation in self.resource_repository.list_resource_reservations(
+                parent_pid=owner_pid
+            )
+        }
+        for child_pid, value in usage_by_child.items():
+            # A finite child budget already reserves this capacity from its
+            # parent. Only an active envelope beyond that allocation is an
+            # additional commitment at the parent boundary.
+            total += max(
+                self._budget_zero(budget_field),
+                value
+                - reserved_by_child.get(
+                    child_pid,
+                    self._budget_zero(budget_field),
+                ),
+            )
         return total
 
     def _usage_value(

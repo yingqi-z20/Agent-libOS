@@ -389,6 +389,51 @@ class TestLLMProfiles:
             first.close()
             second.close()
 
+    def test_profile_budget_envelope_does_not_change_provider_or_client_identity(self) -> None:
+        first = Runtime(
+            SQLiteStore(":memory:"),
+            config=AgentLibOSConfig(
+                llm=LLMDefaults(
+                    profiles={
+                        "default": LLMProfile(
+                            max_input_tokens_per_call=100_000,
+                            max_total_tokens_per_call=120_000,
+                        )
+                    }
+                )
+            ),
+        )
+        second = Runtime(
+            SQLiteStore(":memory:"),
+            config=AgentLibOSConfig(
+                llm=LLMDefaults(
+                    profiles={
+                        "default": LLMProfile(
+                            max_input_tokens_per_call=110_000,
+                            max_total_tokens_per_call=130_000,
+                        )
+                    }
+                )
+            ),
+        )
+        try:
+            first_snapshot = first.llms.profile_snapshot("default")
+            second_snapshot = second.llms.profile_snapshot("default")
+            assert first_snapshot.identity_sha256 == second_snapshot.identity_sha256
+            assert (
+                first_snapshot.client_cache_sha256
+                == second_snapshot.client_cache_sha256
+            )
+            first_resolved = first.llms.resolve("default")
+            second_resolved = second.llms.resolve("default")
+            assert first_resolved.max_input_tokens_per_call == 100_000
+            assert first_resolved.max_total_tokens_per_call == 120_000
+            assert second_resolved.max_input_tokens_per_call == 110_000
+            assert second_resolved.max_total_tokens_per_call == 130_000
+        finally:
+            first.close()
+            second.close()
+
     def test_cached_default_client_is_rebuilt_for_new_effective_release_policy(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -756,6 +801,23 @@ class TestLLMProfiles:
         finally:
             runtime.close()
 
+    def test_dynamic_llm_profile_rejects_nonpositive_budget_envelope(self) -> None:
+        runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+        try:
+            with pytest.raises(
+                ValidationError,
+                match="max_input_tokens_per_call must be positive",
+            ):
+                runtime.llms.register_profile(
+                    "invalid-budget",
+                    LLMProfile(
+                        model="invalid-budget",
+                        max_input_tokens_per_call=0,
+                    ),
+                )
+        finally:
+            runtime.close()
+
     def test_only_default_profile_inherits_legacy_openai_environment(self, monkeypatch) -> None:
         for env_name in _AMBIENT_ACCOUNT_POLICY_ENV:
             monkeypatch.delenv(env_name, raising=False)
@@ -1030,6 +1092,8 @@ class TestUserLLMProfileStore:
                     "api_mode": "chat",
                     "temperature": 0.1,
                     "max_tokens": 8192,
+                    "max_input_tokens_per_call": 180000,
+                    "max_total_tokens_per_call": 190000,
                     "context_window_tokens": 200000,
                     "auto_wait_on_empty_tool_calls": True,
                     "fallback_json_actions": True,
@@ -1058,11 +1122,51 @@ class TestUserLLMProfileStore:
             assert saved.prompt_cache_retention == "in_memory"
             assert loaded["qwen3.7-max"].prompt_cache_retention == "in_memory"
             assert loaded["qwen3.7-max"].context_window_tokens == 200000
+            assert loaded["qwen3.7-max"].max_input_tokens_per_call == 180000
+            assert loaded["qwen3.7-max"].max_total_tokens_per_call == 190000
             persisted = json.loads(path.read_text(encoding="utf-8"))["profiles"]["qwen3.7-max"]
             assert persisted["allow_custom_base_url"] is False
             assert persisted["prompt_cache_retention"] == "in_memory"
+            assert persisted["max_input_tokens_per_call"] == 180000
+            assert persisted["max_total_tokens_per_call"] == 190000
             assert "secret" not in path.read_text(encoding="utf-8")
             assert "api_key" not in persisted
+
+    def test_user_profile_editor_payload_preserves_core_only_budget_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "llm-profiles.json"
+            store = UserLLMProfileStore(path)
+            store.upsert(
+                "preserved-budget",
+                {
+                    "model": "first-model",
+                    "api_key_env": "PRESERVED_API_KEY",
+                    "max_input_tokens_per_call": 90_000,
+                    "max_total_tokens_per_call": 100_000,
+                },
+            )
+
+            preserved = store.upsert(
+                "preserved-budget",
+                {
+                    "model": "edited-model",
+                    "api_key_env": "PRESERVED_API_KEY",
+                },
+            )
+            assert preserved.max_input_tokens_per_call == 90_000
+            assert preserved.max_total_tokens_per_call == 100_000
+
+            cleared = store.upsert(
+                "preserved-budget",
+                {
+                    "model": "edited-model",
+                    "api_key_env": "PRESERVED_API_KEY",
+                    "max_input_tokens_per_call": None,
+                    "max_total_tokens_per_call": None,
+                },
+            )
+            assert cleared.max_input_tokens_per_call is None
+            assert cleared.max_total_tokens_per_call is None
 
     def test_user_llm_profile_store_normalizes_legacy_retention_on_load_and_save(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1123,6 +1227,33 @@ class TestUserLLMProfileStore:
                         "api_key_env": "SMALL_API_KEY",
                         "max_tokens": 32_768,
                         "context_window_tokens": 32_768,
+                    },
+                )
+
+            with pytest.raises(
+                ValidationError,
+                match="max_input_tokens_per_call must not exceed",
+            ):
+                store.upsert(
+                    "budget-envelope-invalid",
+                    {
+                        "model": "budget-envelope-invalid",
+                        "api_key_env": "BUDGET_API_KEY",
+                        "max_input_tokens_per_call": 20_001,
+                        "max_total_tokens_per_call": 20_000,
+                    },
+                )
+
+            with pytest.raises(
+                ValidationError,
+                match="max_input_tokens_per_call must be an integer",
+            ):
+                store.upsert(
+                    "budget-envelope-bool",
+                    {
+                        "model": "budget-envelope-bool",
+                        "api_key_env": "BUDGET_API_KEY",
+                        "max_input_tokens_per_call": True,
                     },
                 )
 

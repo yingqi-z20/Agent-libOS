@@ -11,6 +11,18 @@ from agent_libos.llm.client import LLMCompletion, LLMTransientError
 from agent_libos.models import ProcessStatus, ResourceBudget
 
 
+def _hard_llm_budget_config():
+    return replace(
+        DEFAULT_CONFIG,
+        llm=replace(
+            DEFAULT_CONFIG.llm,
+            max_tokens=5,
+            max_input_tokens_per_call=100_000,
+            max_total_tokens_per_call=100_005,
+        ),
+    )
+
+
 class TestResourceBudgets:
     def test_tool_call_budget_is_consumed_and_denies_next_tool_before_execution(self) -> None:
         runtime = Runtime.open("local")
@@ -71,13 +83,14 @@ class TestResourceBudgets:
             runtime.close()
 
     def test_llm_token_overage_kills_process_before_dispatching_tool(self) -> None:
-        runtime = Runtime.open("local")
+        runtime = Runtime.open("local", config=_hard_llm_budget_config())
         try:
-            runtime.llm.client = UsageClient(total_tokens=11)
+            client = UsageClient(total_tokens=100_006)
+            runtime.llm.client = client
             pid = runtime.process.spawn(
                 image="base-agent:v0",
                 goal="exit but over budget",
-                resource_budget=ResourceBudget(max_llm_total_tokens=10),
+                resource_budget=ResourceBudget(max_llm_total_tokens=100_005),
             )
 
             result = runtime.run_next_process_once()
@@ -86,19 +99,52 @@ class TestResourceBudgets:
             assert not result["ok"]
             assert result["resource_limit_exceeded"]
             assert process.status == ProcessStatus.KILLED
-            assert process.resource_usage.llm_total_tokens == 11
+            assert client.calls == 1
+            assert process.resource_usage.llm_calls == 1
+            assert process.resource_usage.llm_prompt_tokens == 0
+            assert process.resource_usage.llm_completion_tokens == 0
+            assert process.resource_usage.llm_total_tokens == 100_005
             assert not any(record.action == "process.exit" and record.actor == pid for record in runtime.audit.trace())
         finally:
             runtime.close()
 
-    def test_llm_missing_usage_with_token_budget_kills_process(self) -> None:
+    def test_llm_budget_smaller_than_envelope_denies_before_provider(self) -> None:
         runtime = Runtime.open("local")
+        try:
+            client = UsageClient(total_tokens=7)
+            runtime.llm.client = client
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="deny before provider",
+                resource_budget=ResourceBudget(max_llm_total_tokens=10),
+            )
+
+            result = runtime.run_next_process_once()
+            process = runtime.process.get(pid)
+
+            assert not result["ok"]
+            assert result["resource_limit_exceeded"]
+            assert client.calls == 0
+            assert process.resource_usage.llm_calls == 0
+            assert process.resource_usage.llm_total_tokens == 0
+            assert runtime.store.list_llm_calls(pid=pid) == []
+            assert runtime.store.list_external_effects(pid=pid) == []
+            assert runtime.store.list_resource_usage_reservations(pid=pid) == []
+            assert any(
+                record.action == "llm.budget_admission_denied"
+                for record in runtime.audit.trace(actor=pid)
+            )
+        finally:
+            runtime.close()
+
+    def test_llm_missing_usage_with_token_budget_kills_process(self) -> None:
+        runtime = Runtime.open("local", config=_hard_llm_budget_config())
         try:
             runtime.llm.client = UsageClient(total_tokens=None)
             pid = runtime.process.spawn(
                 image="base-agent:v0",
                 goal="missing usage",
-                resource_budget=ResourceBudget(max_llm_total_tokens=10),
+                resource_budget=ResourceBudget(max_llm_total_tokens=100_005),
             )
 
             result = runtime.run_next_process_once()
@@ -108,18 +154,20 @@ class TestResourceBudgets:
             assert result["resource_limit_exceeded"]
             assert process.status == ProcessStatus.KILLED
             assert process.resource_usage.llm_calls == 1
-            assert process.resource_usage.llm_total_tokens == 0
+            assert process.resource_usage.llm_prompt_tokens == 0
+            assert process.resource_usage.llm_completion_tokens == 0
+            assert process.resource_usage.llm_total_tokens == 100_005
         finally:
             runtime.close()
 
     def test_llm_malformed_usage_cannot_bypass_token_budget(self) -> None:
-        runtime = Runtime.open("local")
+        runtime = Runtime.open("local", config=_hard_llm_budget_config())
         try:
             runtime.llm.client = MalformedUsageClient()
             pid = runtime.process.spawn(
                 image="base-agent:v0",
                 goal="malformed usage",
-                resource_budget=ResourceBudget(max_llm_total_tokens=10),
+                resource_budget=ResourceBudget(max_llm_total_tokens=100_005),
             )
 
             result = runtime.run_next_process_once()
@@ -127,27 +175,29 @@ class TestResourceBudgets:
 
             assert not result["ok"]
             assert result["resource_limit_exceeded"]
-            assert "invalid total_tokens" in result["error"]
+            assert "invalid token usage fields: total_tokens" in result["error"]
             assert process.status == ProcessStatus.KILLED
             assert process.resource_usage.llm_calls == 1
-            assert process.resource_usage.llm_total_tokens == 0
+            assert process.resource_usage.llm_prompt_tokens == 0
+            assert process.resource_usage.llm_completion_tokens == 0
+            assert process.resource_usage.llm_total_tokens == 100_005
             assert not any(record.action == "process.exit" and record.actor == pid for record in runtime.audit.trace())
         finally:
             runtime.close()
 
     def test_child_llm_usage_counts_against_parent_budget(self) -> None:
-        runtime = Runtime.open("local")
+        runtime = Runtime.open("local", config=_hard_llm_budget_config())
         try:
             runtime.llm.client = UsageClient(total_tokens=7)
             parent = runtime.process.spawn(
                 image="base-agent:v0",
                 goal="parent",
-                resource_budget=ResourceBudget(max_llm_total_tokens=20),
+                resource_budget=ResourceBudget(max_llm_total_tokens=200_010),
             )
             child = runtime.process.spawn_child(
                 parent,
                 goal="child",
-                resource_budget=ResourceBudget(max_llm_total_tokens=10),
+                resource_budget=ResourceBudget(max_llm_total_tokens=100_005),
             )
 
             runtime.run_process_once(child)
@@ -175,6 +225,12 @@ class TestResourceBudgets:
             assert not result["ok"]
             assert process.status == ProcessStatus.FAILED
             assert process.resource_usage.llm_calls == 1
+            assert process.resource_usage.llm_prompt_tokens == 0
+            assert process.resource_usage.llm_completion_tokens == 0
+            assert (
+                process.resource_usage.llm_total_tokens
+                == config.llm.max_total_tokens_per_call
+            )
             assert len(calls) == 1
             assert calls[0].status == "error"
             retention_key = "$agent_libos_payload_retention"
@@ -316,8 +372,10 @@ class TestResourceBudgets:
 class UsageClient:
     def __init__(self, total_tokens: int | None) -> None:
         self.total_tokens = total_tokens
+        self.calls = 0
 
     def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
+        self.calls += 1
         usage = {} if self.total_tokens is None else {"prompt_tokens": 5, "completion_tokens": self.total_tokens - 5, "total_tokens": self.total_tokens}
         return LLMCompletion(
             content="",

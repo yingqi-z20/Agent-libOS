@@ -554,7 +554,78 @@ class TestConfigDefaults:
         assert DEFAULT_CONFIG.llm.fallback_json_actions is False
         assert DEFAULT_CONFIG.llm.context_window_tokens == 131_072
         assert DEFAULT_CONFIG.llm.max_tokens == 16_384
+        assert DEFAULT_CONFIG.llm.max_input_tokens_per_call == 114_688
+        assert DEFAULT_CONFIG.llm.max_total_tokens_per_call == 131_072
         assert DEFAULT_CONFIG.llm.max_tokens < DEFAULT_CONFIG.llm.context_window_tokens
+
+    def test_llm_per_call_budget_envelope_is_positive_and_consistent(self) -> None:
+        configured = AgentLibOSConfig(
+            llm=LLMDefaults(
+                max_tokens=2_000,
+                max_input_tokens_per_call=8_000,
+                max_total_tokens_per_call=9_000,
+                profiles={
+                    "default": LLMProfile(),
+                    "tight": LLMProfile(
+                        max_tokens=500,
+                        max_input_tokens_per_call=1_500,
+                        max_total_tokens_per_call=1_750,
+                    ),
+                },
+            )
+        )
+        assert configured.llm.max_input_tokens_per_call == 8_000
+        assert configured.llm.profiles["tight"].max_total_tokens_per_call == 1_750
+
+        with pytest.raises(ValueError, match="max_input_tokens_per_call"):
+            AgentLibOSConfig(
+                llm=LLMDefaults(
+                    max_input_tokens_per_call=10_001,
+                    max_total_tokens_per_call=10_000,
+                )
+            )
+        with pytest.raises(ValueError, match="max_tokens must not exceed"):
+            AgentLibOSConfig(
+                llm=LLMDefaults(
+                    max_tokens=10_001,
+                    max_input_tokens_per_call=9_999,
+                    max_total_tokens_per_call=10_000,
+                )
+            )
+        with pytest.raises(ValueError, match="effective max_input_tokens_per_call"):
+            AgentLibOSConfig(
+                llm=LLMDefaults(
+                    profiles={
+                        "default": LLMProfile(
+                            max_input_tokens_per_call=10_001,
+                            max_total_tokens_per_call=10_000,
+                        )
+                    }
+                )
+            )
+        for field_name in (
+            "max_input_tokens_per_call",
+            "max_total_tokens_per_call",
+        ):
+            for invalid_value in (0, -1):
+                with pytest.raises(ValueError, match=field_name):
+                    AgentLibOSConfig(
+                        llm=LLMDefaults(**{field_name: invalid_value})
+                    )
+                with pytest.raises(ValueError, match=field_name):
+                    AgentLibOSConfig(
+                        llm=LLMDefaults(
+                            profiles={
+                                "default": LLMProfile(
+                                    **{field_name: invalid_value}
+                                )
+                            }
+                        )
+                    )
+            with pytest.raises(PydanticValidationError, match=field_name):
+                LLMDefaults(**{field_name: True})
+            with pytest.raises(PydanticValidationError, match=field_name):
+                LLMProfile(**{field_name: True})
 
     def test_llm_context_storage_compaction_threshold_has_hard_limit_headroom(
         self,

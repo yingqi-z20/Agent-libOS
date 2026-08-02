@@ -1478,13 +1478,13 @@ def test_auto_attempt_marker_prevents_replay_after_interrupted_reopen(
                 "error": "test failure",
             }
 
-        def interrupt_before_provider(_pid: str) -> None:
+        def interrupt_before_provider(_state: object) -> None:
             raise SimulatedInterruption("simulated Runtime interruption")
 
         monkeypatch.setattr(runtime.llm, "adispatch", dispatch)
         monkeypatch.setattr(
             runtime.llm,
-            "_preflight_llm_call",
+            "_prepare_llm_budget_envelope",
             interrupt_before_provider,
         )
         try:

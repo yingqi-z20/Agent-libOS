@@ -246,7 +246,7 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint --actor-pid <actor_pid> i
 
 ## Persistent Runtime Basics
 
-Agent libOS 1.3.0 opens only store schema v4. A schema-v3 database from 1.0.1
+Agent libOS 1.3.2 opens only store schema v4. A schema-v3 database from 1.0.1
 is rejected before `init`, recovery, audit, or any other write; use 1.0.1 to
 inspect/archive it. There is no v3 migration or read-only compatibility mode.
 
@@ -668,6 +668,14 @@ subprocess wall/CPU/RSS usage, filesystem bytes, JSON-RPC bytes, MCP bytes,
 Deno syscalls, and child-process creation are charged to the acting process and
 its ancestors. Capabilities, Skill activation, image exec, checkpoint restore,
 and human approval do not increase these budgets.
+
+For each executor-level logical LLM call, Runtime reserves one call plus the
+configured prompt/completion/total token envelope before Provider dispatch.
+Active reservations reduce the displayed remaining budget for the full process
+ancestry. Valid usage settles exactly, certified non-start releases, and an
+unknown outcome charges the aggregate maximum. Internal SDK retries remain one
+logical call, so these counters are not exact Provider request or monetary-cost
+meters.
 
 Calls, tokens, syscalls, bytes, child counts, and peak-memory values are
 non-negative integers. Runtime and subprocess wall/CPU seconds are continuous

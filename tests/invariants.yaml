@@ -3273,6 +3273,7 @@
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_tool_call_budget_is_consumed_and_denies_next_tool_before_execution",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_parallel_tool_batch_budget_denial_leaves_no_partial_tool_execution",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_child_llm_usage_counts_against_parent_budget",
+        "tests/runtime/test_llm_usage_reservations.py::test_finite_child_llm_budget_covers_active_reservation_at_parent",
         "tests/runtime/test_tool_result_limits.py::TestToolResultLimits::test_terminalization_during_result_persistence_fails_closed_and_is_audited",
         "tests/security/test_resource_constraints.py::TestResourceConstraints::test_capability_grant_does_not_expand_tool_call_budget",
         "tests/security/test_resource_constraints.py::TestResourceConstraints::test_exec_process_does_not_reset_resource_usage_or_budget",
@@ -3287,13 +3288,37 @@
       "benchmark_attack_classes": []
     },
     {
-      "id": "llm-token-usage-is-charged-before-tool-dispatch",
-      "title": "LLM token usage is charged before model-selected tool dispatch.",
+      "id": "llm-provider-usage-is-reserved-before-dispatch",
+      "title": "Each logical LLM call durably reserves its call and token envelope before provider dispatch, including hierarchical admission and crash-safe recovery.",
       "lane": "runtime",
       "node_ids": [
+        "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_llm_budget_smaller_than_envelope_denies_before_provider",
+        "tests/runtime/test_llm_usage_reservations.py::test_call_budget_denial_rolls_back_effect_and_reservation",
+        "tests/runtime/test_llm_usage_reservations.py::test_llm_reservation_is_active_before_provider_and_settles_exactly",
+        "tests/runtime/test_llm_usage_reservations.py::test_concurrent_sibling_reservations_cannot_oversell_parent_llm_budget",
+        "tests/runtime/test_llm_usage_reservations.py::test_finite_child_llm_budget_covers_active_reservation_at_parent",
+        "tests/runtime/test_llm_usage_reservations.py::test_provider_not_started_certificate_releases_llm_reservation",
+        "tests/runtime/test_llm_usage_reservations.py::test_async_provider_cancellation_charges_unknown_llm_maximum",
+        "tests/runtime/test_llm_usage_reservations.py::test_committed_llm_effect_with_interrupted_settlement_recovers_maximum",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_conditional_llm_release_opt_out_does_not_persist_prepared_prompt",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_retries_malformed_empty_tool_name_once",
+        "tests/runtime/test_resource_usage_reservation_recovery_paging.py::test_llm_unknown_recovery_charges_aggregate_without_inventing_components[sqlite]",
+        "tests/runtime/test_resource_usage_reservation_recovery_paging.py::test_llm_unknown_recovery_charges_aggregate_without_inventing_components[postgres]"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "llm-token-usage-is-charged-before-tool-dispatch",
+      "title": "LLM token usage is exactly or conservatively settled before model-selected tool dispatch.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_llm_usage_reservations.py::test_llm_reservation_is_active_before_provider_and_settles_exactly",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_llm_token_overage_kills_process_before_dispatching_tool",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_llm_missing_usage_with_token_budget_kills_process",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_llm_malformed_usage_cannot_bypass_token_budget",
+        "tests/runtime/test_llm_usage_reservations.py::test_inconsistent_provider_usage_charges_maximum_before_tool_dispatch[6]",
+        "tests/runtime/test_llm_usage_reservations.py::test_inconsistent_provider_usage_charges_maximum_before_tool_dispatch[8]",
+        "tests/runtime/test_llm_usage_reservations.py::test_malformed_usage_is_not_treated_as_compatible_missing_usage",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_failed_llm_provider_call_consumes_call_budget_and_persists_sanitized_error_record"
       ],
       "benchmark_attack_classes": []

@@ -318,7 +318,7 @@ longer defines.
   pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
   typed boundaries compute the next state generation, preventing a direct-write
   rewind from reviving a stale token.
-- `v4-persisted-state-is-strict-and-versioned`: a 1.3.0 store accepts only the
+- `v4-persisted-state-is-strict-and-versioned`: a 1.3.2 store accepts only the
   frozen version-4 physical schema (including Durable Task Run and typed process
   state) and canonical security carriers. Schema-v3, older, incomplete, or
   malformed state is rejected before mutation; no compatibility path is
@@ -856,9 +856,14 @@ longer defines.
   audit commit atomically; overage terminal callbacks run after releasing the
   store lock. Discrete counts/bytes/tokens are integers while runtime and
   subprocess wall/CPU seconds are continuous finite values.
+- `llm-provider-usage-is-reserved-before-dispatch`: every executor-level logical
+  LLM call atomically persists a prepared effect and maximum call/token
+  reservation before Provider dispatch. Active reservations constrain the full
+  process ancestry; certified non-start releases, while ambiguous outcomes
+  charge one call and the aggregate maximum during failure or startup recovery.
 - `llm-token-usage-is-charged-before-tool-dispatch`: provider-reported LLM token
-  usage is validated (including type, sign, and component consistency) and
-  settled before any model-selected tool call is dispatched.
+  usage is validated against the reserved envelope and settled exactly or
+  conservatively before any model-selected tool call is dispatched.
 - `subprocess-resource-profiles-are-enforced`: shell and Deno subprocess wall,
   CPU, and RSS limits are enforced by supporting providers and audited on
   exceedance. POSIX PTY supervision runs independently from output reads,

@@ -639,6 +639,15 @@ including:
   hashes and non-sensitive resume metadata while the exact pending request
   stays in executor memory.
 
+Each executor-level logical LLM call uses the protected-operation resource
+contract: after exact request assembly, Runtime atomically persists the
+prepared effect and a maximum call/token reservation before Provider dispatch.
+The reservation constrains the process ancestry; exact usage settles before
+the LLM row and selected tools, certified non-start releases, and ambiguous
+outcomes maximum-settle during the call or startup recovery. Internal SDK and
+compatibility retries remain within one logical call, so this boundary is not
+an exact physical-request, Provider-billing, currency, or monetary-spend cap.
+
 Payload retention is an explicit Host maintenance surface, not startup
 recovery. It is disabled by default. When enabled and applied, bounded keyset
 pages may reduce eligible terminal LLM-call and external-effect payloads
