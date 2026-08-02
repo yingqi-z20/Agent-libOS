@@ -114,6 +114,10 @@ def test_recovery_gate_rejects_executed_offset_shape(
         )
 
 
+# Windows hosted runners can spend several minutes seeding the 1,000 durable
+# recoverable runs; benchmark timings are informational, while the assertions
+# below enforce the bounded recovery query contract.
+@pytest.mark.timeout(600)
 def test_release_profile_converges_in_two_pages_per_startup_phase() -> None:
     profile = BENCHMARK_PROFILES["ci"]
     result = run_task_run_recovery_scale_benchmark(
@@ -153,6 +157,41 @@ def test_scale_artifact_is_atomic_machine_readable_output(
     assert payload["recoverable_runs"] == 10
     assert payload["timing_is_informational_only"] is True
     assert json.loads(output.read_text(encoding="utf-8")) == payload
+
+
+def test_scale_output_replaces_symlink_without_modifying_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {
+        "schema_version": 1,
+        "total_runs": 1,
+        "recoverable_runs": 1,
+        "timing_is_informational_only": True,
+    }
+
+    class Result:
+        def as_dict(self) -> dict[str, Any]:
+            return expected
+
+    monkeypatch.setattr(
+        "experiments.run_task_run_recovery_scale."
+        "run_task_run_recovery_scale_benchmark",
+        lambda **_kwargs: Result(),
+    )
+    target = tmp_path / "unrelated.json"
+    output = tmp_path / "task-run-recovery.json"
+    try:
+        output.symlink_to(target.name)
+    except (NotImplementedError, OSError):
+        pytest.skip("host does not permit file symlink creation")
+
+    payload = run("ci", output)
+
+    assert payload == expected
+    assert not output.is_symlink()
+    assert not target.exists()
+    assert json.loads(output.read_text(encoding="utf-8")) == expected
 
 
 @pytest.mark.parametrize(

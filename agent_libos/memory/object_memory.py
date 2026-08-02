@@ -2749,13 +2749,6 @@ class ObjectMemoryManager:
             consume=False,
         )
 
-    def _can_read_namespace(self, pid: str, namespace: str) -> bool:
-        return self.capabilities.check(
-            pid,
-            self._namespace_resource(namespace),
-            "read",
-        )
-
     def _require_unique_name(self, name: str, namespace: str, except_oid: str | None = None) -> None:
         if self.store.object_name_exists(name, except_oid=except_oid, namespace=namespace):
             raise ValidationError(f"object name already exists in namespace {namespace}: {name}")

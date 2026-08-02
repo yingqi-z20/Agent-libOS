@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import ast
 import hashlib
 import json
@@ -27,7 +26,6 @@ from agent_libos.models import (
     ObjectMetadata,
     ObjectOwnerKind,
     ObjectRight,
-    ObjectType,
     ProcessStatus,
     SinkTrustRule,
 )
@@ -3088,7 +3086,3 @@ def _write_json_atomic(path: Path, value: Any) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
-
-
-def env_has_real_llm_config() -> bool:
-    return bool(os.getenv("OPENAI_API_KEY") and (os.getenv("OPENAI_LANGUAGE_MODEL") or os.getenv("OPENAI_MODEL")))

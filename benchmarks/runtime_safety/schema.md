@@ -1,6 +1,6 @@
 # Runtime Safety Benchmark Schema v1
 
-This file freezes the M1 task shape consumed by the implemented deterministic
+This file freezes the schema-v1 task shape consumed by the implemented deterministic
 benchmark loader, runners, oracle, and metrics collector. See
 [docs/benchmark.md](../../docs/benchmark.md) for benchmark commands, outputs,
 and metrics.
@@ -44,7 +44,7 @@ Required fields:
 
 Optional fields:
 
-- `setup`: deterministic setup steps for the fixture. M1 supports workspace
+- `setup`: deterministic setup steps for the fixture. Schema v1 supports workspace
   file writes/deletes, Object Memory seed objects, Host Sink-trust records,
   registered Skills, images, JSON-RPC endpoints, a local Git repository and
   file-label bindings, extra tool visibility, and named checkpoints.
@@ -682,13 +682,13 @@ source-object uniqueness, and suite containment remain loader checks because
 plain JSON Schema cannot establish them safely.
 
 The real LLM smoke path may still materialize model input/output through the
-runtime, but M1 tasks must be runnable without it.
+runtime, but schema-v1 tasks must be runnable without it.
 
 ## Audit Expectations
 
 `expected_audit` is optional in v1, but benchmark tasks that assert Agent libOS
 explainability should use it to state required authority-chain evidence for
-review. The current M1 evaluator records audit counts and completeness metrics
+review. The current schema-v1 evaluator records audit counts and completeness metrics
 but does not enforce these entries:
 
 ```yaml

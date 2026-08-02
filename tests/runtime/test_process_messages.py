@@ -951,7 +951,10 @@ class TestProcessMessage:
             assert not exit_thread.is_alive()
             assert exit_errors == []
             assert runtime.process.get(pid).status == ProcessStatus.EXITED
-            assert runtime.store.claim_runnable_process(pid) is None
+            assert (
+                runtime.store.claim_execution(pid, owner_id="test.terminal-process")
+                is None
+            )
             with pytest.raises(ProcessError, match='terminal process'):
                 runtime.messages.observe_labels(pid, stale_messages)
         finally:

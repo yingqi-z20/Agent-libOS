@@ -5,7 +5,6 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import GitError

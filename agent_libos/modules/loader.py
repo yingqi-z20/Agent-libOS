@@ -316,7 +316,7 @@ class ModuleLoader:
         return manifest
 
     def import_entrypoint(self, source: ModuleSource) -> Any:
-        module_ref, object_name = self._split_entrypoint(source.manifest.entrypoint)
+        _, object_name = self._split_entrypoint(source.manifest.entrypoint)
         with _IMPORT_LOCK:
             if source.source_kind == "package":
                 module = self._import_package(source)

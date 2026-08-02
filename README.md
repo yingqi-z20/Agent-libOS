@@ -1,9 +1,8 @@
 # Agent libOS
 
 Agent libOS is an experimental agent-native libOS runtime written in Python.
-It supports the paper theme:
-
-> Agent libOS: A Runtime Substrate for Capability-Controlled Self-Evolving LLM Agents
+It provides a capability-controlled substrate for persistent, self-extending
+LLM agents.
 
 The runtime models an agent as a long-running, schedulable, interruptible,
 capability-controlled `AgentProcess`, not as a single chat request or workflow
@@ -141,7 +140,8 @@ The implementation currently includes:
   negotiation. Tool capabilities, provider-classified external effects, audit,
   and resource accounting retain the same authority-before-lookup and
   transactional registry semantics.
-  The 1.2.1 surface remains client-only and Tools-only: MRTR/OAuth/listen,
+  The client surface introduced in 1.2.1 remains client-only and Tools-only:
+  MRTR/OAuth/listen,
   Resources, Prompts, Tasks, Apps, Roots, Sampling, Logging, OpenTelemetry
   product support, and an MCP server surface are intentionally excluded.
 - A deterministic runtime-safety benchmark harness with 32 checked-in schema-v1
@@ -225,10 +225,10 @@ Start here, then read the deeper references as needed:
 - [docs/support_matrix.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/support_matrix.md): declared support, CI-covered
   environments, and explicit platform/provider release gates.
 - [docs/invariants.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/invariants.md): current invariant-to-test map.
-- [docs/artifact_anonymity.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/artifact_anonymity.md): anonymous artifact
-  hygiene checklist.
-- [docs/paper_thesis.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/paper_thesis.md): current paper thesis and
-  non-goals.
+- [docs/artifact_anonymity.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/artifact_anonymity.md): contributor-only
+  publication and anonymity scan checklist.
+- [docs/paper_thesis.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/paper_thesis.md): research framing and
+  non-goals; not an implementation or release contract.
 - [benchmarks/runtime_safety/schema.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/benchmarks/runtime_safety/schema.md):
   benchmark task schema v1 and run-output schema v2.
 - [benchmarks/external_effect_recovery/README.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/benchmarks/external_effect_recovery/README.md):
@@ -254,13 +254,12 @@ Start here, then read the deeper references as needed:
 These files are retained for design and project history. Do not use them to
 infer current commands, interfaces, security guarantees, or release evidence:
 
-- [agent_libos_design_doc.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/agent_libos_design_doc.md): historical design
-  archive containing planned and superseded interfaces.
-- [plan.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/plan.md): dated paper-submission roadmap, not an implementation
-  reference.
+- [agent_libos_design_doc.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/agent_libos_design_doc.md): migration notice for
+  the retired historical design archive.
+- [plan.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/plan.md): migration notice for the retired paper-submission
+  roadmap.
 - [docs/prelaunch_hardening_report.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/prelaunch_hardening_report.md):
-  historical, source-bound subsystem review and validation snapshot, not the
-  current release-status source.
+  notice for the retired commit-bound prelaunch report.
 
 ## Quick Start
 
@@ -268,20 +267,22 @@ Prerequisites are Python 3.11–3.14 and [uv](https://docs.astral.sh/uv/). CI
 currently pins uv `0.11.32`; use that version when reproducing a CI or release
 receipt exactly. The
 typed Git provider and full test matrix require system Git 2.26 or newer. GUI
-development requires Node `>=22.12.0` and npm 8 or newer; CI uses
-Node 24. Deno is optional unless running real TypeScript/JIT coverage.
+development requires Node `^24.15.0 || >=26.0.0` and npm 11 or newer; CI uses
+the Node 24 LTS line. Deno is optional unless running real TypeScript/JIT
+coverage.
 
 Install dependencies:
 
 ```bash
-uv sync --frozen --all-groups
+uv sync --frozen
 ```
 
-Dependency groups and optional extras are separate in uv: `--all-groups` does
-not install the `mcp`, `postgres`, or `pty` extras. Add the relevant
-`--extra <name>` when exercising that integration. In particular, a complete
-Windows test checkout needs `uv sync --frozen --all-groups --extra pty` for
-native ConPTY coverage.
+The default sync includes the development group used by the standard Python
+checks. Optional package extras remain separate: add `--extra mcp`,
+`--extra postgres`, or `--extra pty` only when exercising that integration.
+In particular, a complete Windows test checkout needs
+`uv sync --frozen --extra pty` for native ConPTY coverage. The release group is
+installed explicitly only for release-artifact validation.
 
 ### Distribution artifacts
 
@@ -304,9 +305,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.2.1-py3-none-any.whl dist/agent_libos-1.2.1.tar.gz
+  dist/agent_libos-1.3.0-py3-none-any.whl dist/agent_libos-1.3.0.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.2.1-py3-none-any.whl
+  dist/agent_libos-1.3.0-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 uv export --frozen --no-dev --no-emit-project --output-file runtime-requirements.txt
 uv export --frozen --only-group release --no-emit-project --output-file release-build-requirements.txt
@@ -320,7 +321,7 @@ uv venv /tmp/agent-libos-wheel-check
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
   --require-hashes -r runtime-requirements.txt
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
-  --no-deps dist/agent_libos-1.2.1-py3-none-any.whl
+  --no-deps dist/agent_libos-1.3.0-py3-none-any.whl
 uv pip check --python /tmp/agent-libos-wheel-check/bin/python
 /tmp/agent-libos-wheel-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-wheel-check/bin/agent-libos --help
@@ -333,7 +334,7 @@ uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
   --require-hashes -r release-build-requirements.txt
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
-  --no-deps --no-build-isolation dist/agent_libos-1.2.1.tar.gz
+  --no-deps --no-build-isolation dist/agent_libos-1.3.0.tar.gz
 uv pip check --python /tmp/agent-libos-sdist-check/bin/python
 /tmp/agent-libos-sdist-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-sdist-check/bin/agent-libos --help
@@ -421,8 +422,8 @@ object creation, and audit trace generation.
 Run a small deterministic benchmark smoke:
 
 ```bash
-uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --require-all-passed --output .benchmark_runs/m1-smoke
-uv run python experiments/collect_metrics.py .benchmark_runs/m1-smoke
+uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --require-all-passed --output .benchmark_runs/smoke
+uv run python experiments/collect_metrics.py .benchmark_runs/smoke
 ```
 
 The benchmark defaults to mock/planned actions and does not spend model tokens.
@@ -432,25 +433,12 @@ Real-model benchmark smoke is opt-in, must select exactly one task after all
 filters, and supports only one or more Agent-libOS-family runners; wrapper and
 sandbox baselines cannot use `--llm real`.
 
-The historical deterministic snapshot was produced from clean
-source snapshot `c03a4ec764e02bd4df59e2769edeb1278d5ea545`; its ignored local
-artifact is `.benchmark_runs/release-c03a4ec`. For that source snapshot it is
-valid with 28/28 task
-success and
-safety pass, 122 normalized effects, unauthorized performed effects `0/97`,
-allowed denials `0/97`, and zero unknown outcomes/classifications. Its
-`metadata.json` SHA-256 is
-`7ef7b0054f1e4fbd2bcb9b33e803016e62010254a122dffa8c692f0837ba6b54` and its
-`metrics.json` SHA-256 is
-`f6b3b0aa5e2a403c3ed0a7c848dcbccffa7faabe5eda7edf6cfe26ebccde53b6`.
-That artifact is not evidence for the current tree: its counts do not carry
-over across history consolidation or later runtime changes unless content
-identity is proved and a new validation artifact records that proof. It uses
-historical run-output schema v1; the current v2 collector intentionally rejects
-it, so it remains archival evidence only.
-The two rate denominators are qualified effect populations, not task counts,
-and missing/unknown evidence invalidates rates instead of being inferred from
-`result.ok`. The ignored artifact must be packaged separately. See the
+Benchmark output is source-bound evidence, not a standing claim about the
+current checkout. Preserve its generated `metadata.json`, `metrics.json`, and
+bound result/effect files together; the current collector accepts only complete
+run-output schema v2 artifacts. Rate denominators are qualified effect
+populations rather than task counts, and missing or unknown evidence
+invalidates rates instead of being inferred from `result.ok`. See the
 [current release status](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/release_status.md) and
 [benchmark contract](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/benchmark.md).
 
@@ -517,14 +505,14 @@ variables so credentials are not committed. A PostgreSQL backend without
 `runtime.store_dsn` is rejected at config load time:
 
 ```bash
-uv sync --frozen --all-groups --extra postgres
+uv sync --frozen --extra postgres
 uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" init
 ```
 
-Agent libOS 1.2.1 creates and opens only RuntimeStore schema v4. It rejects a
+Agent libOS 1.3.0 creates and opens only RuntimeStore schema v4. It rejects a
 schema-v3 store before initialization or any write; use Agent libOS 1.0.1 only
 to view or archive that store. There is no v3 migration, read-only bridge, or
-dual-schema mode in 1.2.1.
+dual-schema mode in 1.3.0.
 
 Both backends implement the same runtime store contract. Process metadata,
 capabilities, audit/events, messages, human requests, LLM call records,
@@ -763,7 +751,7 @@ file, not a file shipped at the repository root.
 Register and call a preconfigured MCP tool:
 
 ```bash
-uv sync --frozen --all-groups --extra mcp
+uv sync --frozen --extra mcp
 uv run agent-libos --db .agent_libos.sqlite mcp register <path-to-server-manifest.yaml>
 uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-mcp
 # Manifest v2 with protocol_mode auto or 2026-07-28 only:
@@ -936,7 +924,7 @@ See [docs/invariants.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/doc
 Run the standard local checks:
 
 ```bash
-uv sync --frozen --all-groups
+uv sync --frozen
 npm --prefix gui install
 uv run python -m compileall agent_libos tests scripts experiments benchmarks modules
 uv run python scripts/test_matrix.py --lane all --workers 4

@@ -12,7 +12,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMDefaults
-from agent_libos.llm.openai_schema import (
+from agent_libos.utils.openai_schema import (
     normalize_openai_chat_tool_schema,
     normalize_openai_structured_output_schema,
     openai_responses_tool_schema,
@@ -755,13 +755,13 @@ class LLMClient:
                 last_error = exc
                 retry = self._compatibility_retry_payload(request, exc, api=api)
                 if retry is None:
-                    raise _openai_sdk_request_error(api, exc) from exc
+                    raise _openai_sdk_request_error(exc) from exc
                 removed_options.update(
                     key for key in request if key not in retry
                 )
                 request = retry
         assert last_error is not None
-        raise _openai_sdk_request_error(api, last_error) from last_error
+        raise _openai_sdk_request_error(last_error) from last_error
 
     def _compatibility_retry_payload(self, payload: dict[str, Any], exc: Exception, api: str) -> dict[str, Any] | None:
         message = str(exc).lower()
@@ -1562,8 +1562,7 @@ def _safe_provider_diagnostic_text(value: object) -> str:
         return "provider diagnostic text is unavailable"
 
 
-def _openai_sdk_request_error(api: str, exc: Exception) -> LLMError:
-    del api  # The API mode is Host-controlled but not needed in the envelope.
+def _openai_sdk_request_error(exc: Exception) -> LLMError:
     return llm_provider_failure_error(
         exc,
         transient=_is_transient_openai_sdk_error(exc),

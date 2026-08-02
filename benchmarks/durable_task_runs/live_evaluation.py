@@ -153,7 +153,7 @@ def run_evaluation(
 
 
 def report_release_gate_passed(report: dict[str, Any]) -> bool:
-    """Apply the repository-maintenance half of the 1.1.0 live gate."""
+    """Apply the repository-maintenance half of the live gate."""
 
     runs = report.get("runs")
     if not isinstance(runs, list) or len(runs) != RELEASE_REPETITIONS:

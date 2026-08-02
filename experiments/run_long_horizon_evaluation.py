@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import os
 import tempfile
 from pathlib import Path
 
 from benchmarks.long_horizon_agent import report_all_successful, run_evaluation
+from experiments.evaluation_cli import (
+    has_real_llm_environment,
+    paths_overlap,
+    positive_int,
+)
 from experiments.evaluation_output import AtomicJsonOutput
 
 
@@ -17,9 +21,9 @@ def main(argv: list[str] | None = None) -> None:
         )
     )
     parser.add_argument("--output", required=True, help="JSON report path.")
-    parser.add_argument("--repetitions", type=_positive_int, default=1)
-    parser.add_argument("--phase-one-quanta", type=_positive_int, default=6)
-    parser.add_argument("--max-quanta", type=_positive_int, default=48)
+    parser.add_argument("--repetitions", type=positive_int, default=1)
+    parser.add_argument("--phase-one-quanta", type=positive_int, default=6)
+    parser.add_argument("--max-quanta", type=positive_int, default=48)
     parser.add_argument(
         "--artifacts-root",
         help=(
@@ -40,7 +44,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if not args.confirm_real_llm:
         parser.error("--confirm-real-llm is required to spend real LLM tokens")
-    if not _has_real_llm_environment():
+    if not has_real_llm_environment():
         parser.error(
             "OPENAI_API_KEY and OPENAI_LANGUAGE_MODEL or OPENAI_MODEL are required"
         )
@@ -49,7 +53,7 @@ def main(argv: list[str] | None = None) -> None:
         Path(args.artifacts_root).resolve() if args.artifacts_root else None
     )
     if artifacts_root is not None:
-        if _paths_overlap(output, artifacts_root):
+        if paths_overlap(output, artifacts_root):
             parser.error("--output and --artifacts-root must not overlap")
         if artifacts_root.exists() and not artifacts_root.is_dir():
             parser.error("--artifacts-root must name a directory")
@@ -79,28 +83,6 @@ def main(argv: list[str] | None = None) -> None:
     print(rendered, end="")
     if args.require_all_successful and not report_all_successful(report):
         raise SystemExit(1)
-
-
-def _positive_int(value: str) -> int:
-    selected = int(value)
-    if selected < 1:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return selected
-
-
-def _paths_overlap(first: Path, second: Path) -> bool:
-    return (
-        first == second
-        or first in second.parents
-        or second in first.parents
-    )
-
-
-def _has_real_llm_environment() -> bool:
-    return bool(
-        os.getenv("OPENAI_API_KEY")
-        and (os.getenv("OPENAI_LANGUAGE_MODEL") or os.getenv("OPENAI_MODEL"))
-    )
 
 
 if __name__ == "__main__":

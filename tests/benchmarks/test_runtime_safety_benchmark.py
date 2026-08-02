@@ -45,7 +45,7 @@ SUITE_ROOT = Path('benchmarks/runtime_safety')
 
 class TestRuntimeSafetyBenchmark:
 
-    def test_loads_m1_task_suite(self) -> None:
+    def test_loads_runtime_safety_task_suite(self) -> None:
         tasks = load_tasks(SUITE_ROOT)
         assert len(tasks) >= 28
         assert len({task.attack_class for task in tasks}) >= 4

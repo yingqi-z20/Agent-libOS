@@ -4,8 +4,8 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from typing import Any, Protocol, TypeVar
 
+from agent_libos.models.snapshot import ProcessSnapshot
 from agent_libos.runtime.snapshots.codec import SnapshotCodec
-from agent_libos.runtime.snapshots.models import ProcessSnapshot
 PreparedT = TypeVar("PreparedT")
 PublishedT = TypeVar("PublishedT")
 

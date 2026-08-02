@@ -150,8 +150,6 @@ from agent_libos.models import (
     StaleExecutionProcessWait,
     StaleExecutionRecoverySummary,
     ProcessExecutionToken,
-    TASK_RUN_DISPATCHABLE_STATUSES,
-    TASK_RUN_TERMINAL_STATUSES,
     TaskRunCommand,
     TaskRunCursor,
     TaskRunLedgerCursor,
@@ -170,7 +168,6 @@ from agent_libos.models import (
     TaskRunRetention,
     TaskRunStatus,
     canonical_task_run_json,
-    task_run_payload_sha256,
     PausedProcessWait,
     legacy_status_message,
     process_outcome_from_json,
@@ -1451,7 +1448,7 @@ class SQLRuntimeStore:
                 if version == 3:
                     raise UnsupportedStoreVersion(
                         "Agent libOS store schema v3 is not writable or readable by "
-                        "1.2.1; expected 4. Use Agent libOS 1.0.1 to view or "
+                        "1.3.0; expected 4. Use Agent libOS 1.0.1 to view or "
                         "archive this store. No migration was attempted."
                     )
                 raise UnsupportedStoreVersion(
@@ -1464,7 +1461,7 @@ class SQLRuntimeStore:
         if cls._probe_user_schema_objects(conn):
             raise UnsupportedStoreVersion(
                 "unversioned Agent libOS store detected; pre-v4 stores are "
-                "archive-only and cannot be opened by 1.2.1; use Agent libOS "
+                "archive-only and cannot be opened by 1.3.0; use Agent libOS "
                 "1.0.1 to view or archive a v3 store"
             )
         return True
@@ -1842,15 +1839,6 @@ class SQLRuntimeStore:
             return True, {"schema_version": row["schema_version"]}
         except (KeyError, TypeError, IndexError):
             return True, {"schema_version": None}
-
-    @classmethod
-    def _probe_table(cls, conn: SqlEngine, table: str) -> bool:
-        try:
-            conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
-        except Exception:
-            cls._rollback_probe(conn)
-            return False
-        return True
 
     @staticmethod
     def _rollback_probe(conn: SqlEngine) -> None:
@@ -9744,8 +9732,6 @@ class SQLRuntimeStore:
         self,
         run_id: str,
         linked_pids: Iterable[str],
-        *,
-        purged_at: str,
     ) -> int:
         """Delete only messages with Host-owned metadata for this Run.
 
@@ -9754,7 +9740,6 @@ class SQLRuntimeStore:
         inbound message for a Run member, independent of its user channel.
         """
 
-        del purged_at  # the append-only Run ledger owns purge-time evidence
         selected = tuple(dict.fromkeys(str(pid) for pid in linked_pids if str(pid)))
         if any(pid != pid.strip() or "\x00" in pid for pid in selected):
             raise ValidationError("TaskRun message purge PID scope is invalid")
@@ -9824,7 +9809,6 @@ class SQLRuntimeStore:
         run_id: str,
         linked_pids: Iterable[str],
         *,
-        purged_at: str,
         cursor: Any | None = None,
     ) -> int:
         """Delete only pending-action rows owned by a finalizing Run.
@@ -9834,7 +9818,6 @@ class SQLRuntimeStore:
         method joins it, so terminal payload reduction can remain atomic.
         """
 
-        del purged_at  # the append-only Run ledger owns purge-time evidence
         selected = tuple(dict.fromkeys(str(pid) for pid in linked_pids if str(pid)))
 
         def _purge(cur: Any) -> int:
@@ -9999,7 +9982,7 @@ class SQLRuntimeStore:
         return [self._row_to_authority_manifest(row) for row in self._query(sql, params)]
 
     def claim_runnable_process(self, pid: str) -> AgentProcess | None:
-        """Compatibility facade for legacy callers without an owner token."""
+        """Compatibility facade for callers without an execution-owner token."""
 
         token = self.claim_execution(pid, owner_id="legacy.scheduler")
         if token is None:
@@ -15949,7 +15932,7 @@ class SQLRuntimeStore:
         *,
         task_run_id: Any,
     ) -> None:
-        """Recognize the narrow 1.0.1 non-Run compaction replay guard."""
+        """Recognize the narrow pre-TaskRun compaction replay guard."""
 
         filters = decoded.get("filters")
         metadata = (

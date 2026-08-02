@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.snapshot import ProcessSnapshot, SnapshotHeader, SnapshotRows
 from agent_libos.models.process_state import (
     StaleExecutionProcessWait,
     legacy_status_message,
@@ -15,7 +16,6 @@ from agent_libos.models.process_state import (
     remap_process_outcome,
     remap_process_wait_state,
 )
-from agent_libos.runtime.snapshots.models import ProcessSnapshot, SnapshotHeader, SnapshotRows
 from agent_libos.utils.serde import bounded_json_loads, dumps
 
 

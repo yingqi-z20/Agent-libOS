@@ -157,7 +157,6 @@ async function renderApp(): Promise<HTMLDivElement> {
     }),
     chooseDatabase: vi.fn().mockResolvedValue(null),
     chooseImagePackage: vi.fn().mockResolvedValue(null),
-    useDatabase: vi.fn().mockResolvedValue(null),
     openExternal: vi.fn().mockResolvedValue(true)
   };
   const container = document.createElement("div");

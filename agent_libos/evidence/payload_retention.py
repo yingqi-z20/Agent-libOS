@@ -718,46 +718,7 @@ def retain_llm_call_payload(
         and target is PayloadRetentionTier.HASH_ONLY
     ):
         raise ValueError("LLM payload retention cannot skip the summary tier")
-    source_fields = _llm_payload_sources(record, current=current)
-    trust_retention_envelopes = _has_retention_marker(record.observability)
-    retained_fields: dict[str, Any] = {}
-    for field_name in _LLM_PAYLOAD_FIELDS:
-        value = source_fields[field_name]
-        if value is None and field_name in {"reasoning", "raw_response", "error"}:
-            retained_fields[field_name] = None
-            continue
-        envelope = content_free_payload_envelope(
-            value,
-            target,
-            source_tier=current,
-            trust_retention_envelopes=trust_retention_envelopes,
-        )
-        retained_fields[field_name] = (
-            dumps(envelope)
-            if field_name in {"response_content", "error"}
-            else envelope
-        )
-    payload_sha256 = _field_digest(retained_fields, source_tier=target)
-    source_observability_sha256 = _source_observability_sha256(record)
-    retained_observability = {
-        _RETENTION_KEY: {
-            "schema_version": _RETENTION_SCHEMA_VERSION,
-            "tier": target.value,
-            "payload_sha256": payload_sha256,
-            "source_observability_sha256": source_observability_sha256,
-        }
-    }
-    return replace(
-        record,
-        messages=retained_fields["messages"],
-        tools=retained_fields["tools"],
-        response_content=retained_fields["response_content"],
-        tool_calls=retained_fields["tool_calls"],
-        reasoning=retained_fields["reasoning"],
-        raw_response=retained_fields["raw_response"],
-        observability=retained_observability,
-        error=retained_fields["error"],
-    )
+    return _retained_llm_call_payload(record, target=target, source_tier=current)
 
 
 def redact_terminal_task_run_llm_call(record: LLMCallRecord) -> LLMCallRecord:
@@ -781,7 +742,25 @@ def redact_terminal_task_run_llm_call(record: LLMCallRecord) -> LLMCallRecord:
         llm_call_payload_sha256(record)
         return record
 
-    source_fields = _llm_payload_sources(record, current=current)
+    redacted = _retained_llm_call_payload(
+        record,
+        target=PayloadRetentionTier.HASH_ONLY,
+        source_tier=current,
+    )
+    if llm_call_payload_sha256(redacted) != llm_call_payload_sha256(record):
+        raise RuntimeError("TaskRun LLM redaction changed payload provenance")
+    return redacted
+
+
+def _retained_llm_call_payload(
+    record: LLMCallRecord,
+    *,
+    target: PayloadRetentionTier,
+    source_tier: PayloadRetentionTier,
+) -> LLMCallRecord:
+    """Project all LLM payload fields through one canonical retention path."""
+
+    source_fields = _llm_payload_sources(record, current=source_tier)
     trust_retention_envelopes = _has_retention_marker(record.observability)
     retained_fields: dict[str, Any] = {}
     for field_name in _LLM_PAYLOAD_FIELDS:
@@ -791,8 +770,8 @@ def redact_terminal_task_run_llm_call(record: LLMCallRecord) -> LLMCallRecord:
             continue
         envelope = content_free_payload_envelope(
             value,
-            PayloadRetentionTier.HASH_ONLY,
-            source_tier=current,
+            target,
+            source_tier=source_tier,
             trust_retention_envelopes=trust_retention_envelopes,
         )
         retained_fields[field_name] = (
@@ -800,19 +779,18 @@ def redact_terminal_task_run_llm_call(record: LLMCallRecord) -> LLMCallRecord:
             if field_name in {"response_content", "error"}
             else envelope
         )
-    payload_sha256 = _field_digest(
-        retained_fields,
-        source_tier=PayloadRetentionTier.HASH_ONLY,
-    )
     retained_observability = {
         _RETENTION_KEY: {
             "schema_version": _RETENTION_SCHEMA_VERSION,
-            "tier": PayloadRetentionTier.HASH_ONLY.value,
-            "payload_sha256": payload_sha256,
+            "tier": target.value,
+            "payload_sha256": _field_digest(
+                retained_fields,
+                source_tier=target,
+            ),
             "source_observability_sha256": _source_observability_sha256(record),
         }
     }
-    redacted = replace(
+    return replace(
         record,
         messages=retained_fields["messages"],
         tools=retained_fields["tools"],
@@ -823,9 +801,6 @@ def redact_terminal_task_run_llm_call(record: LLMCallRecord) -> LLMCallRecord:
         observability=retained_observability,
         error=retained_fields["error"],
     )
-    if llm_call_payload_sha256(redacted) != llm_call_payload_sha256(record):
-        raise RuntimeError("TaskRun LLM redaction changed payload provenance")
-    return redacted
 
 
 def validate_terminal_task_run_llm_redaction(

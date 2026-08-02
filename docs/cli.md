@@ -15,7 +15,7 @@ Use `--db` to select a runtime store. The sentinel target `local` is in-memory
 SQLite. Any other filesystem path creates or opens a persistent SQLite
 database. A `postgresql://` or `postgres://` DSN opens a PostgreSQL runtime
 store. PostgreSQL support is optional; install it before using a DSN, for
-example with `uv sync --frozen --all-groups --extra postgres`.
+example with `uv sync --frozen --extra postgres`.
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite <command>
@@ -246,7 +246,7 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint --actor-pid <actor_pid> i
 
 ## Persistent Runtime Basics
 
-Agent libOS 1.2.1 opens only store schema v4. A schema-v3 database from 1.0.1
+Agent libOS 1.3.0 opens only store schema v4. A schema-v3 database from 1.0.1
 is rejected before `init`, recovery, audit, or any other write; use 1.0.1 to
 inspect/archive it. There is no v3 migration or read-only compatibility mode.
 
@@ -1111,7 +1111,7 @@ headers, raw JSON-RPC method names, or request ids.
 ## MCP Commands
 
 ```bash
-uv sync --frozen --all-groups --extra mcp
+uv sync --frozen --extra mcp
 uv run agent-libos --db .agent_libos.sqlite mcp register <path-to-server-manifest.yaml>
 uv run agent-libos --db .agent_libos.sqlite mcp list
 uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-mcp
@@ -1202,8 +1202,8 @@ duplicate path is rejected rather than silently loaded twice.
 ## Benchmark Scripts
 
 ```bash
-uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --require-all-passed --output .benchmark_runs/m1-smoke
-uv run python experiments/collect_metrics.py .benchmark_runs/m1-smoke
+uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --require-all-passed --output .benchmark_runs/smoke
+uv run python experiments/collect_metrics.py .benchmark_runs/smoke
 ```
 
 Use repeated `--task` or `--attack-class` to select a subset. `--runner all`

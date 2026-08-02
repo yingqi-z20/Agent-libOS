@@ -286,6 +286,8 @@ def test_skill_storage_search_uses_unicode_casefold_and_bounded_catalog() -> Non
         store.close()
 
 
+@pytest.mark.platform_darwin
+@pytest.mark.platform_linux
 def test_failed_sqlite_constructor_retains_lease_until_retry(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,

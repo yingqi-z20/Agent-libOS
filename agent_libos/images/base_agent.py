@@ -1,3 +1,5 @@
+"""Compatibility exports for the original default-agent module path."""
+
 from __future__ import annotations
 
 from agent_libos.images.default_agents import (

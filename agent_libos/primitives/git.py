@@ -11,7 +11,7 @@ import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from functools import wraps
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, TypeVar
 
 from agent_libos.capability.manager import CapabilityManager
@@ -85,7 +85,6 @@ _REF_RE = re.compile(r"refs/(?:heads|tags|remotes|agent-libos)/[A-Za-z0-9][A-Za-
 _REMOTE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _WORKTREE_ID_RE = re.compile(r"(?:main|wt_[A-Za-z0-9_-]{1,96})\Z")
 _PR_ID_RE = re.compile(r"pr_[A-Za-z0-9_-]{1,96}\Z")
-_ZERO_SHA256 = hashlib.sha256(b"").hexdigest()
 _GIT_ERROR_PATTERNS: tuple[tuple[GitErrorCode, tuple[bytes, ...]], ...] = (
     (GitErrorCode.NOT_REPOSITORY, (b"not a git repository",)),
     (
@@ -1834,7 +1833,7 @@ class GitPrimitive:
             for raw in remote_rows:
                 name = raw.decode("utf-8", errors="strict")
                 self._validate_remote(name)
-                fetch_url, push_url, fingerprint = self.provider.remote_configuration(
+                _, _, fingerprint = self.provider.remote_configuration(
                     name,
                     worktree=self._worktree_path(worktree_id),
                 )
@@ -4988,7 +4987,7 @@ class GitPrimitive:
         index: bool = False,
         worktree_id: str = "main",
     ) -> GitOperationResult:
-        obj, payload, patch, paths = self._load_patch_artifact(pid, patch_oid)
+        _obj, payload, patch, paths = self._load_patch_artifact(pid, patch_oid)
         deletes = b"\ndeleted file mode " in b"\n" + patch or b"\n+++ /dev/null" in b"\n" + patch
         source_context = (
             self.data_flow.context_from_source_oids(pid, [patch_oid])

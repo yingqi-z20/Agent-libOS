@@ -964,11 +964,12 @@ class TestMcpPrimitive:
         assert called.call_started
         assert calls == [("demo.echo", {"text": "hello"})]
 
+    @pytest.mark.mcp
     def test_sdk_http_client_uses_snapshotted_headers_and_disables_ambient_env(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        import httpx2
+        httpx2 = pytest.importorskip("httpx2")
         provider = SdkMcpProvider()
         server = McpServerSpec(
             schema_version=1,
@@ -1146,31 +1147,34 @@ class TestMcpPrimitive:
             *,
             http_client: Any,
             terminate_on_close: bool = True,
+            legacy_listen: bool = False,
         ):
             assert url == server.http.url
             assert http_client is selected_http_client
             assert terminate_on_close
+            assert legacy_listen
             yield object(), object(), None
 
         class FakeClientSession:
-            def __init__(self, _read: Any, _write: Any) -> None:
-                pass
+            pass
 
-            async def __aenter__(self) -> 'FakeClientSession':
-                return self
-
-            async def __aexit__(self, *_exc: Any) -> None:
-                return None
-
-            async def initialize(self) -> None:
-                return None
+        @contextlib.asynccontextmanager
+        async def fake_sdk_v2_client(
+            client_session_type: Any,
+            transport: Any,
+            **kwargs: Any,
+        ):
+            assert client_session_type is FakeClientSession
+            assert kwargs['sdk_mode'] == 'legacy'
+            async with transport:
+                yield object()
 
         class UnusedStdioServerParameters:
             pass
 
         mcp_module = ModuleType('mcp')
-        mcp_module.ClientSession = FakeClientSession  # type: ignore[attr-defined]
         mcp_client_module = ModuleType('mcp.client')
+        mcp_client_module.ClientSession = FakeClientSession  # type: ignore[attr-defined]
         mcp_stdio_module = ModuleType('mcp.client.stdio')
         mcp_stdio_module.StdioServerParameters = UnusedStdioServerParameters  # type: ignore[attr-defined]
         mcp_http_module = ModuleType('mcp.client.streamable_http')
@@ -1187,6 +1191,10 @@ class TestMcpPrimitive:
             'agent_libos.substrate.local._mcp_tools_only_streamable_http_client',
             fake_streamable_http_client,
         )
+        monkeypatch.setattr(
+            'agent_libos.substrate.local._mcp_sdk_v2_client',
+            fake_sdk_v2_client,
+        )
         monkeypatch.setattr(provider, '_http_client', fake_http_client)
 
         async def exercise() -> None:
@@ -1202,6 +1210,40 @@ class TestMcpPrimitive:
 
         assert http_environments == [runtime_environment]
         assert http_environments[0] is runtime_environment
+
+    def test_sdk_session_rejects_pre_v2_sdk(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = SdkMcpProvider()
+        server = McpServerSpec(
+            schema_version=1,
+            server_id='pre-v2-sdk',
+            transport='streamable_http',
+            tools=[],
+            timeout_s=1,
+            max_request_bytes=1024,
+            max_response_bytes=1024,
+            http=McpHttpTransportSpec(url='https://mcp.example.test/tools'),
+        )
+        mcp_module = ModuleType('mcp')
+        mcp_client_module = ModuleType('mcp.client')
+        monkeypatch.setitem(sys.modules, 'mcp', mcp_module)
+        monkeypatch.setitem(sys.modules, 'mcp.client', mcp_client_module)
+
+        async def exercise() -> None:
+            async with provider._session(
+                server,
+                timeout_s=server.timeout_s,
+                max_response_bytes=server.max_response_bytes,
+            ):
+                pass
+
+        with pytest.raises(
+            ValidationError,
+            match='requires the optional MCP Python SDK v2 dependency',
+        ):
+            asyncio.run(exercise())
 
     def test_http_environment_snapshot_excludes_stdio_platform_keys(
         self,
@@ -1348,17 +1390,18 @@ class TestMcpPrimitive:
             yield object(), object()
 
         class FakeClientSession:
-            def __init__(self, _read: Any, _write: Any) -> None:
-                pass
+            pass
 
-            async def __aenter__(self) -> 'FakeClientSession':
-                return self
-
-            async def __aexit__(self, *_exc: Any) -> None:
-                return None
-
-            async def initialize(self) -> None:
-                return None
+        @contextlib.asynccontextmanager
+        async def fake_sdk_v2_client(
+            client_session_type: Any,
+            transport: Any,
+            **kwargs: Any,
+        ):
+            assert client_session_type is FakeClientSession
+            assert kwargs['sdk_mode'] == 'legacy'
+            async with transport:
+                yield object()
 
         class FakeStdioServerParameters:
             def __init__(
@@ -1378,8 +1421,8 @@ class TestMcpPrimitive:
             raise AssertionError('stdio session must not use HTTP transport')
 
         mcp_module = ModuleType('mcp')
-        mcp_module.ClientSession = FakeClientSession  # type: ignore[attr-defined]
         mcp_client_module = ModuleType('mcp.client')
+        mcp_client_module.ClientSession = FakeClientSession  # type: ignore[attr-defined]
         mcp_stdio_module = ModuleType('mcp.client.stdio')
         mcp_stdio_module.StdioServerParameters = FakeStdioServerParameters  # type: ignore[attr-defined]
         mcp_http_module = ModuleType('mcp.client.streamable_http')
@@ -1396,6 +1439,10 @@ class TestMcpPrimitive:
         monkeypatch.setattr(
             'agent_libos.substrate.local._strict_stdio_client',
             fake_stdio_client,
+        )
+        monkeypatch.setattr(
+            'agent_libos.substrate.local._mcp_sdk_v2_client',
+            fake_sdk_v2_client,
         )
 
         async def exercise() -> None:

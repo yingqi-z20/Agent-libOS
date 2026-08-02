@@ -1077,18 +1077,42 @@ class TestStoreTransactionRecovery:
         finally:
             store.close()
 
-    def test_claim_runnable_process_does_not_commit_outer_transaction(self) -> None:
+    def test_claim_execution_does_not_commit_outer_transaction(self) -> None:
         store = SQLiteStore(":memory:")
         try:
             store.insert_process(_runnable_process("pid_claim"))
             with pytest.raises(RuntimeError, match="rollback claim"):
                 with store.transaction():
-                    claimed = store.claim_runnable_process("pid_claim")
+                    token = store.claim_execution(
+                        "pid_claim",
+                        owner_id="test.transaction",
+                    )
+                    assert token is not None
+                    claimed = store.get_process("pid_claim")
                     assert claimed is not None
                     assert claimed.status == ProcessStatus.RUNNING
                     raise RuntimeError("rollback claim")
 
             process = store.get_process("pid_claim")
+            assert process is not None
+            assert process.status == ProcessStatus.RUNNABLE
+        finally:
+            store.close()
+
+    def test_claim_runnable_process_compatibility_facade_does_not_commit_outer_transaction(
+        self,
+    ) -> None:
+        store = SQLiteStore(":memory:")
+        try:
+            store.insert_process(_runnable_process("pid_compat_claim"))
+            with pytest.raises(RuntimeError, match="rollback compatibility claim"):
+                with store.transaction():
+                    claimed = store.claim_runnable_process("pid_compat_claim")
+                    assert claimed is not None
+                    assert claimed.status == ProcessStatus.RUNNING
+                    raise RuntimeError("rollback compatibility claim")
+
+            process = store.get_process("pid_compat_claim")
             assert process is not None
             assert process.status == ProcessStatus.RUNNABLE
         finally:

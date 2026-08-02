@@ -19,7 +19,6 @@ from agent_libos.substrate.local import (
 
 
 pytestmark = pytest.mark.mcp
-httpx = pytest.importorskip("httpx2")
 
 
 def _handler(
@@ -60,6 +59,12 @@ def _serve(handler: type[BaseHTTPRequestHandler]) -> Iterator[str]:
 
 
 async def _get(url: str, *, max_response_bytes: int) -> bytes:
+    # Keep the optional SDK import inside the marked test path.  Pytest still
+    # imports this module while collecting unrelated lanes (including the
+    # PostgreSQL --fail-on-skip gate), where an importorskip at module scope
+    # would turn an unselected MCP dependency into a session-wide skip.
+    import httpx2 as httpx
+
     transport = _McpPolicyAsyncHTTPTransport(
         max_response_bytes=max_response_bytes,
     )

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import tempfile
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from benchmarks.builtin_tool_skills import (
     report_all_correct,
     run_evaluation,
 )
+from experiments.evaluation_cli import has_real_llm_environment
 from experiments.evaluation_output import AtomicJsonOutput
 
 
@@ -91,27 +91,22 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--output is required")
     if not args.confirm_real_llm:
         parser.error("--confirm-real-llm is required to spend real LLM tokens")
-    if not _has_real_llm_environment():
+    if not has_real_llm_environment():
         parser.error(
             "OPENAI_API_KEY and OPENAI_LANGUAGE_MODEL or OPENAI_MODEL are required"
         )
 
     output = Path(args.output).resolve()
     with AtomicJsonOutput(output) as artifact:
-        with tempfile.TemporaryDirectory(prefix="agent-libos-builtin-skill-eval-") as temp_dir:
+        with tempfile.TemporaryDirectory(
+            prefix="agent-libos-builtin-skill-eval-"
+        ) as temp_dir:
             report = run_evaluation(temp_dir, scenario_ids=args.scenario)
         rendered = artifact.commit(report)
     print(rendered, end="")
 
     if args.require_all_correct and not report_all_correct(report):
         raise SystemExit(1)
-
-
-def _has_real_llm_environment() -> bool:
-    return bool(
-        os.getenv("OPENAI_API_KEY")
-        and (os.getenv("OPENAI_LANGUAGE_MODEL") or os.getenv("OPENAI_MODEL"))
-    )
 
 
 if __name__ == "__main__":

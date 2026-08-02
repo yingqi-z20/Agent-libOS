@@ -662,13 +662,6 @@ class AuthorityManifestManager:
                     f"parent={sorted(parent_values)} child={sorted(child_values)}"
                 )
 
-    @staticmethod
-    def _dedupe_specs(values: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-        selected: dict[str, dict[str, Any]] = {}
-        for value in values:
-            selected[dumps(value)] = dict(value)
-        return [selected[key] for key in sorted(selected)]
-
     def _normalize_spec(self, value: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise ValidationError("authority manifest capability entries must be objects")

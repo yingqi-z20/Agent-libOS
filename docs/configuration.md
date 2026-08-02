@@ -247,6 +247,13 @@ same change.
 | `launcher` | `permission_presets`, `default_permission_preset`, `read_only_preset`, `edit_preset`, `full_preset` |
 | `scripts` | `ask_file_max_bytes`, `ask_file_max_quanta`, `document_summary_max_bytes`, `document_summary_max_read_bytes`, `document_summary_max_quanta`, `document_context_min_tokens`, `document_context_slack_tokens`, `document_context_max_tokens`, `object_copy_max_quanta`, `llm_write_smoke_max_quanta`, `clock_demo_iterations`, `clock_demo_interval_s`, `clock_demo_timezone`, `chat_max_turns`, `chat_context_tokens`, `chat_quanta_per_turn`, `chat_quanta_overhead` |
 
+Three fields remain accepted only so existing 1.x configuration files keep
+loading: `runtime.runtime_db_filename`, `tools.sandbox_timeout_s`, and
+`image_commit.metadata_preview_chars`. They are validated but ignored; new
+configurations should omit them. Store targets, operation-specific timeouts,
+and full bounded image metadata are authoritative. Removing these compatibility
+inputs requires a major-version migration.
+
 `launcher` and `scripts` are validated code-level default catalogs, not settings
 consumed by the CLI or GUI Runtime assembly. The current standalone scripts bind
 those values directly from `DEFAULT_CONFIG` and do not load project or explicit

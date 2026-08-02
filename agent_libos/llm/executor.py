@@ -20,10 +20,7 @@ from agent_libos.models.exceptions import (
     ValidationError,
 )
 from agent_libos.utils.ids import new_id, utc_now
-from agent_libos.utils.public_errors import (
-    internal_exception_observation,
-    public_error_envelope,
-)
+from agent_libos.utils.public_errors import public_error_envelope
 from agent_libos.utils.serde import dumps, to_jsonable
 from agent_libos.llm.client import (
     LLMClient,

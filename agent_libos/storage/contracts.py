@@ -263,8 +263,6 @@ class ProcessStateRepository(ProcessRestoreEpochRepositoryPort, Protocol):
         expected_revision: int,
     ) -> AgentProcess: ...
 
-    def claim_runnable_process(self, pid: str) -> AgentProcess | None: ...
-
     def claim_execution(
         self,
         pid: str,
@@ -590,8 +588,6 @@ class TaskRunBackendProtocol(Protocol):
         self,
         run_id: str,
         linked_pids: Iterable[str],
-        *,
-        purged_at: str,
     ) -> int: ...
 
     def purge_task_run_llm_pending_actions(
@@ -599,7 +595,6 @@ class TaskRunBackendProtocol(Protocol):
         run_id: str,
         linked_pids: Iterable[str],
         *,
-        purged_at: str,
         cursor: Any | None = None,
     ) -> int: ...
 
@@ -1437,8 +1432,6 @@ class ProcessBackendProtocol(
         publication_id: str,
         expected_revision: int,
     ) -> AgentProcess: ...
-
-    def claim_runnable_process(self, pid: str) -> AgentProcess | None: ...
 
     def claim_execution(
         self,

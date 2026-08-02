@@ -151,7 +151,7 @@ def _write_test_sdist(
     return target
 
 
-def _write_release_pair(target: Path, *, version: str = "1.2.1") -> tuple[Path, Path]:
+def _write_release_pair(target: Path, *, version: str = "1.3.0") -> tuple[Path, Path]:
     wheel = _write_test_wheel(
         target / f"agent_libos-{version}-py3-none-any.whl",
         version=version,
@@ -164,31 +164,57 @@ def _write_release_pair(target: Path, *, version: str = "1.2.1") -> tuple[Path, 
 
 
 def test_release_version_identifiers_are_aligned() -> None:
-    assert validate_version_alignment(ROOT) == "1.2.1"
+    assert validate_version_alignment(ROOT) == "1.3.0"
 
 
-def test_agentdojo_lock_tracks_current_editable_agent_libos_version() -> None:
+def test_agentdojo_lock_tracks_current_editable_agent_libos_metadata() -> None:
     lock = tomllib.loads(
         (ROOT / "experiments" / "agentdojo" / "uv.lock").read_text(
             encoding="utf-8"
         )
     )
     package = next(item for item in lock["package"] if item["name"] == "agent-libos")
-    assert package["version"] == "1.2.1"
+    assert package["version"] == "1.3.0"
     assert package["source"] == {"editable": "../../"}
+    assert {
+        (item["specifier"], item["marker"])
+        for item in package["metadata"]["requires-dist"]
+        if item["name"] == "pywinpty"
+    } == {(">=3.0.5,<4", "sys_platform == 'win32' and extra == 'pty'")}
 
 
 def test_root_lock_resolves_the_reviewed_mcp_sdk_v2_graph() -> None:
     lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
     packages = {item["name"]: item for item in lock["package"]}
 
-    assert packages["agent-libos"]["version"] == "1.2.1"
+    assert packages["agent-libos"]["version"] == "1.3.0"
     assert packages["mcp"]["version"] == "2.0.0"
     assert packages["mcp-types"]["version"] == "2.0.0"
     assert {
         item["name"]
         for item in packages["agent-libos"]["optional-dependencies"]["mcp"]
-    } == {"mcp", "httpx2", "httpcore2", "opentelemetry-api"}
+    } == {"anyio", "mcp", "httpx2", "httpcore2", "opentelemetry-api"}
+
+
+def test_root_lock_resolves_the_reviewed_windows_pty_graph() -> None:
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    packages = {item["name"]: item for item in lock["package"]}
+    project = packages["agent-libos"]
+    pywinpty = packages["pywinpty"]
+
+    assert pywinpty["version"] == "3.0.5"
+    assert project["optional-dependencies"]["pty"] == [
+        {"name": "pywinpty", "marker": "sys_platform == 'win32'"}
+    ]
+    assert {
+        (item["specifier"], item["marker"])
+        for item in project["metadata"]["requires-dist"]
+        if item["name"] == "pywinpty"
+    } == {(">=3.0.5,<4", "sys_platform == 'win32' and extra == 'pty'")}
+    assert any(
+        "cp314-cp314-win_amd64.whl" in wheel["url"]
+        for wheel in pywinpty["wheels"]
+    )
 
 
 def test_gui_lockfile_uses_only_the_public_npm_registry() -> None:
@@ -246,17 +272,18 @@ def test_build_backend_runtime_dependencies_and_project_urls_are_bounded() -> No
     assert pyproject["project"]["optional-dependencies"] == {
         "postgres": ["psycopg[binary]>=3.2,<4"],
         "mcp": [
+            "anyio>=4.10,<5",
             "mcp>=2.0,<3",
             "httpx2>=2.5,<3",
             "httpcore2>=2.5,<3",
             "opentelemetry-api>=1.28,<2",
         ],
-        "pty": ["pywinpty>=2.0.13,<3; sys_platform == 'win32'"],
+        "pty": ["pywinpty>=3.0.5,<4; sys_platform == 'win32'"],
     }
     assert pyproject["dependency-groups"]["release"] == [
         "check-wheel-contents==0.6.3",
         "hatchling==1.31.0",
-        "twine==6.2.0",
+        "twine==7.0.0",
     ]
     assert pyproject["project"]["urls"] == {
         "Homepage": "https://github.com/yingqi-z20/Agent-libOS",
@@ -445,7 +472,7 @@ def test_release_checksum_manifest_records_and_verifies_exact_artifacts(
 
 def test_release_status_contains_current_version_state_only() -> None:
     text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
-    assert text.startswith("# Agent libOS 1.2.1 Status\n")
+    assert text.startswith("# Agent libOS 1.3.0 Status\n")
     forbidden = {
         "dirty state": r"\bdirty\b",
         "worktree state": r"\bwork(?:ing)?[ -]?tree\b",
@@ -502,7 +529,7 @@ def test_release_status_bounds_unarchived_evidence_and_volatile_counts() -> None
     text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
 
     assert "## Unarchived real-LLM observation" in text
-    assert "not Agent libOS 1.2.1 release evidence" in text
+    assert "not Agent libOS 1.3.0 release evidence" in text
     assert "AgentDojo harness is a required CI matrix" in text
     assert "collected pytest nodes" not in text
     assert not re.search(r"selects [\d,]+ tests", text)
@@ -536,6 +563,8 @@ def test_documented_no_skip_provider_gates_invoke_pytest_directly() -> None:
 
     for path in (
         "tests/providers/test_mcp_http_transport.py",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::"
+        "test_sdk_http_client_uses_snapshotted_headers_and_disables_ambient_env",
         "tests/providers/test_mcp_v2_adapter.py",
         "tests/providers/test_mcp_sdk_integration.py",
     ):
@@ -686,11 +715,11 @@ def test_release_builtin_skill_validation_rejects_missing_or_unparseable_package
 def test_readme_clean_install_smoke_covers_wheel_and_source_distribution() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "dist/agent_libos-1.2.1-py3-none-any.whl" in readme
-    assert "dist/agent_libos-1.2.1.tar.gz" in readme
+    assert "dist/agent_libos-1.3.0-py3-none-any.whl" in readme
+    assert "dist/agent_libos-1.3.0.tar.gz" in readme
     assert readme.count("--require-hashes") >= 3
-    assert "--no-deps dist/agent_libos-1.2.1-py3-none-any.whl" in readme
-    assert "--no-deps --no-build-isolation dist/agent_libos-1.2.1.tar.gz" in readme
+    assert "--no-deps dist/agent_libos-1.3.0-py3-none-any.whl" in readme
+    assert "--no-deps --no-build-isolation dist/agent_libos-1.3.0.tar.gz" in readme
     for entrypoint in EXPECTED_CONSOLE_SCRIPTS:
         assert readme.count(f"/{entrypoint} --help") >= 2
     assert readme.count("uv pip check --python /tmp/agent-libos-") >= 2
@@ -703,27 +732,79 @@ def test_declared_python_support_has_an_explicit_upper_bound() -> None:
     assert 'requires-python = ">=3.11, <3.15"' in lock_header
 
 
-def test_gui_runtime_engines_are_explicit_and_lockfile_aligned() -> None:
+def test_gui_dependency_baseline_is_current_and_lockfile_aligned() -> None:
     package = json.loads((ROOT / "gui" / "package.json").read_text(encoding="utf-8"))
     lockfile = json.loads(
         (ROOT / "gui" / "package-lock.json").read_text(encoding="utf-8")
     )
 
-    assert package["engines"] == {
-        "node": ">=22.12.0",
-        "npm": ">=8",
+    assert package["version"] == "1.3.0"
+    assert package["dependencies"] == {
+        "lucide-react": "^1.28.0",
+        "react": "^19.2.8",
+        "react-dom": "^19.2.8",
+        "react-markdown": "^10.1.0",
+        "remark-gfm": "^4.0.1",
     }
-    assert lockfile["packages"][""]["engines"] == package["engines"]
+    assert package["devDependencies"] == {
+        "@testing-library/dom": "^10.4.1",
+        "@testing-library/user-event": "^14.6.1",
+        "@types/node": "^24.13.3",
+        "@types/react": "^19.2.18",
+        "@types/react-dom": "^19.2.4",
+        "@vitejs/plugin-react": "^6.0.5",
+        "electron": "^43.2.0",
+        "jsdom": "^30.0.1",
+        "typescript": "^7.0.2",
+        "vite": "^8.2.0",
+        "vitest": "^4.1.10",
+    }
+    assert package["engines"] == {
+        "node": "^24.15.0 || >=26.0.0",
+        "npm": ">=11",
+    }
+    assert "overrides" not in package
+    locked_root = lockfile["packages"][""]
+    assert locked_root["version"] == "1.3.0"
+    assert locked_root["dependencies"] == package["dependencies"]
+    assert locked_root["devDependencies"] == package["devDependencies"]
+    assert locked_root["engines"] == package["engines"]
+    expected_locked_versions = {
+        "node_modules/lucide-react": "1.28.0",
+        "node_modules/react": "19.2.8",
+        "node_modules/react-dom": "19.2.8",
+        "node_modules/@types/node": "24.13.3",
+        "node_modules/@types/react": "19.2.18",
+        "node_modules/@types/react-dom": "19.2.4",
+        "node_modules/@vitejs/plugin-react": "6.0.5",
+        "node_modules/electron": "43.2.0",
+        "node_modules/jsdom": "30.0.1",
+        "node_modules/typescript": "7.0.2",
+        "node_modules/vite": "8.2.0",
+        "node_modules/vitest": "4.1.10",
+    }
+    for path, expected_version in expected_locked_versions.items():
+        assert lockfile["packages"][path]["version"] == expected_version
+    assert "node_modules/esbuild" not in lockfile["packages"]
+    postcss_version = lockfile["packages"]["node_modules/postcss"]["version"]
+    assert tuple(map(int, postcss_version.split("."))) >= (8, 5, 23)
     development = " ".join(
         (ROOT / "docs" / "development.md").read_text(encoding="utf-8").split()
     )
     support = " ".join(
         (ROOT / "docs" / "support_matrix.md").read_text(encoding="utf-8").split()
     )
-    assert "GUI package declares Node `>=22.12.0` with npm 8 or newer" in development
-    assert "CI exercises Node 24 with the npm version supplied" in development
-    assert "lower compatibility bounds are not separate per-change CI jobs" in support
-    assert "^20.19.0" not in development
+    release_status = " ".join(
+        (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8").split()
+    )
+    assert "GUI package declares Node `^24.15.0 || >=26.0.0`" in development
+    assert "npm 11 or newer" in development
+    assert "Per-change CI exercises the Node 24 LTS line" in development
+    assert "Node `^24.15.0 || >=26.0.0` and npm `>=11`" in support
+    assert "Node 26 Current satisfies the engine contract" in support
+    assert "Node `^24.15.0 || >=26.0.0` and npm `>=11`" in release_status
+    assert "Node 26 Current satisfies the engine contract" in release_status
+    assert ">=22.12.0" not in development + support + release_status
 
 
 def test_local_release_recipe_keeps_the_release_only_environment() -> None:
@@ -971,6 +1052,26 @@ def test_release_workflow_runs_release_smokes_without_repeating_lane_matrix() ->
     assert "--limit" not in runtime_safety_step
 
 
+def test_benchmark_only_workflow_uses_the_frozen_runtime_environment() -> None:
+    workflow = (
+        ROOT / ".github" / "workflows" / "external-effect-recovery-scale.yml"
+    ).read_text(encoding="utf-8")
+    parsed = yaml.safe_load(workflow)
+    steps = parsed["jobs"]["million-record-recovery"]["steps"]
+
+    install_step = next(
+        step for step in steps if step.get("name") == "Install dependencies"
+    )
+    assert install_step["run"] == "uv sync --frozen --no-dev"
+    benchmark_steps = [
+        step for step in steps if str(step.get("name") or "").startswith("Run ")
+    ]
+    assert len(benchmark_steps) == 2
+    for step in benchmark_steps:
+        assert str(step["run"]).startswith("uv run --frozen --no-dev python ")
+    assert "--all-groups" not in workflow
+
+
 def test_agentdojo_ci_uses_its_isolated_frozen_environment() -> None:
     workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(
         encoding="utf-8"
@@ -1054,10 +1155,31 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
     assert python_matrix["python-version"] == ["3.11", "3.14"]
     assert python_matrix["lane"] == [
         "unit",
-        "runtime",
         "self-evolution",
         "providers",
         "benchmark",
+    ]
+    assert python_matrix["include"] == [
+        {
+            "python-version": "3.11",
+            "lane": "runtime",
+            "shard_args": "--shard-count 2 --shard-index 0",
+        },
+        {
+            "python-version": "3.11",
+            "lane": "runtime",
+            "shard_args": "--shard-count 2 --shard-index 1",
+        },
+        {
+            "python-version": "3.14",
+            "lane": "runtime",
+            "shard_args": "--shard-count 2 --shard-index 0",
+        },
+        {
+            "python-version": "3.14",
+            "lane": "runtime",
+            "shard_args": "--shard-count 2 --shard-index 1",
+        },
     ]
     security_matrix = parsed["jobs"]["security"]["strategy"]["matrix"]
     assert security_matrix["python-version"] == ["3.11", "3.14"]
@@ -1079,14 +1201,24 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
             "include": [
                 {"name": "unit", "lane": "unit", "shard_args": ""},
                 {
-                    "name": "runtime 1/2",
+                    "name": "runtime 1/4",
                     "lane": "runtime",
-                    "shard_args": "--shard-count 2 --shard-index 0",
+                    "shard_args": "--shard-count 4 --shard-index 0",
                 },
                 {
-                    "name": "runtime 2/2",
+                    "name": "runtime 2/4",
                     "lane": "runtime",
-                    "shard_args": "--shard-count 2 --shard-index 1",
+                    "shard_args": "--shard-count 4 --shard-index 1",
+                },
+                {
+                    "name": "runtime 3/4",
+                    "lane": "runtime",
+                    "shard_args": "--shard-count 4 --shard-index 2",
+                },
+                {
+                    "name": "runtime 4/4",
+                    "lane": "runtime",
+                    "shard_args": "--shard-count 4 --shard-index 3",
                 },
                 {"name": "security", "lane": "security", "shard_args": ""},
                 {
@@ -1109,7 +1241,16 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
                     "lane": "providers",
                     "shard_args": "--shard-count 3 --shard-index 2",
                 },
-                {"name": "benchmark", "lane": "benchmark", "shard_args": ""},
+                {
+                    "name": "benchmark 1/2",
+                    "lane": "benchmark",
+                    "shard_args": "--shard-count 2 --shard-index 0",
+                },
+                {
+                    "name": "benchmark 2/2",
+                    "lane": "benchmark",
+                    "shard_args": "--shard-count 2 --shard-index 1",
+                },
             ]
         },
     }
@@ -1124,7 +1265,13 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         for item in windows_job["steps"]
         if item.get("name") == "Install dependencies with native PTY support"
     )
-    assert windows_install["run"] == "uv sync --frozen --all-groups --extra pty"
+    assert windows_install["run"] == "uv sync --frozen --extra pty"
+    windows_tests = next(
+        item
+        for item in windows_job["steps"]
+        if item.get("name") == "Run deterministic Python lane"
+    )
+    assert windows_tests["env"]["PYTEST_ADDOPTS"] == "--timeout=300"
     host_identity_job = parsed["jobs"]["host-filesystem-identity"]
     assert host_identity_job["runs-on"] == "${{ matrix.runner }}"
     assert host_identity_job["needs"] == "static"
@@ -1155,7 +1302,7 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         for item in host_identity_job["steps"]
         if item.get("name") == "Install dependencies"
     )
-    assert host_identity_install["run"] == "uv sync --frozen --all-groups"
+    assert host_identity_install["run"] == "uv sync --frozen"
     host_identity_test = next(
         item
         for item in host_identity_job["steps"]
@@ -1176,10 +1323,52 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         if item.get("name") == "Check root lockfile is current"
     )
     assert root_lock_step["run"] == "uv lock --check"
+    static_steps = parsed["jobs"]["static"]["steps"]
+    static_install = next(
+        item for item in static_steps if item.get("name") == "Install dependencies"
+    )
+    assert static_install["run"] == "uv sync --frozen"
+    assert all(item.get("name") != "Set up Deno" for item in static_steps)
+    assert all(
+        item.get("name") != "Set up Deno"
+        for item in parsed["jobs"]["deterministic-release"]["steps"]
+    )
+    expected_dependency_installs = {
+        "static": ("Install dependencies", "uv sync --frozen"),
+        "python": ("Install dependencies", "uv sync --frozen"),
+        "security": ("Install dependencies", "uv sync --frozen"),
+        "host-filesystem-identity": (
+            "Install dependencies",
+            "uv sync --frozen",
+        ),
+        "mcp-sdk": (
+            "Install frozen MCP SDK dependencies",
+            "uv sync --frozen --extra mcp",
+        ),
+        "windows": (
+            "Install dependencies with native PTY support",
+            "uv sync --frozen --extra pty",
+        ),
+        "deterministic-release": (
+            "Install dependencies",
+            "uv sync --frozen --no-dev",
+        ),
+        "postgres": (
+            "Install dependencies",
+            "uv sync --frozen --extra postgres",
+        ),
+    }
+    for job_name, (step_name, expected_command) in expected_dependency_installs.items():
+        install_step = next(
+            item
+            for item in parsed["jobs"][job_name]["steps"]
+            if item.get("name") == step_name
+        )
+        assert install_step["run"] == expected_command
+    assert "--all-groups" not in workflow
     for job_name in (
         "python",
         "security",
-        "deterministic-release",
         "windows",
     ):
         deno_step = next(
@@ -1233,6 +1422,8 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
             "Run complete MCP SDK integration suite",
             (
                 "tests/providers/test_mcp_http_transport.py",
+                "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::"
+                "test_sdk_http_client_uses_snapshotted_headers_and_disables_ambient_env",
                 "tests/providers/test_mcp_v2_adapter.py",
                 "tests/providers/test_mcp_sdk_integration.py",
                 "--run-mcp --fail-on-skip",
@@ -1334,7 +1525,7 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         for item in mcp_job["steps"]
         if item.get("name") == "Install frozen MCP SDK dependencies"
     )
-    assert mcp_install["run"] == "uv sync --frozen --all-groups --extra mcp"
+    assert mcp_install["run"] == "uv sync --frozen --extra mcp"
     mcp_test = next(
         item
         for item in mcp_job["steps"]
@@ -1343,6 +1534,8 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
     mcp_command = str(mcp_test["run"])
     for path in (
         "tests/providers/test_mcp_http_transport.py",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::"
+        "test_sdk_http_client_uses_snapshotted_headers_and_disables_ambient_env",
         "tests/providers/test_mcp_v2_adapter.py",
         "tests/providers/test_mcp_sdk_integration.py",
     ):
@@ -1372,8 +1565,8 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         "cancel-in-progress": True,
     }
     assert parsed["env"] == {
-        "RELEASE_WHEEL": "dist/agent_libos-1.2.1-py3-none-any.whl",
-        "RELEASE_SDIST": "dist/agent_libos-1.2.1.tar.gz",
+        "RELEASE_WHEEL": "dist/agent_libos-1.3.0-py3-none-any.whl",
+        "RELEASE_SDIST": "dist/agent_libos-1.3.0.tar.gz",
         "RELEASE_CHECKSUMS": "dist/SHA256SUMS",
     }
     release_steps = release_job["steps"]
@@ -1416,6 +1609,20 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
     assert "experiments/run_benchmark.py" in runtime_safety_step
     assert "--require-all-passed" in runtime_safety_step
     assert "--limit" not in runtime_safety_step
+    benchmark_only_steps = {
+        step["name"]: str(step["run"])
+        for step in parsed["jobs"]["deterministic-release"]["steps"]
+        if str(step.get("name") or "").startswith("Run ")
+    }
+    assert set(benchmark_only_steps) == {
+        "Run runtime-safety release smoke",
+        "Run 100k external-effect recovery scale smoke",
+        "Run 10k runtime-publication handler scale smoke",
+        "Run Durable TaskRun six-barrier crash gate",
+        "Run 100k Durable TaskRun recovery scale gate",
+    }
+    for command in benchmark_only_steps.values():
+        assert command.startswith("uv run --frozen --no-dev python ")
     smoke_steps = smoke_job["steps"]
     download_step = next(
         step

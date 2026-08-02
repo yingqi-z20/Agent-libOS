@@ -468,9 +468,6 @@ class CapabilityEvaluator:
             result["reason"] = "authority rule denied operation"
         return result
 
-    def evaluate_authority_rules(self, rules: list[Any], context: dict[str, Any]) -> dict[str, Any]:
-        return self._evaluate_authority_rules(rules, context)
-
     def _rule_condition_error(self, rule: Any, operation: str) -> dict[str, Any] | None:
         unknown = self._unknown_authority_rule_conditions(rule)
         malformed = self._malformed_authority_rule_conditions(rule)
@@ -645,10 +642,6 @@ class CapabilityEvaluator:
         except (TypeError, ValueError):
             return None
         return selected if math.isfinite(selected) and selected >= 0 else None
-
-    @staticmethod
-    def finite_nonnegative_timeout(value: Any) -> float | None:
-        return CapabilityEvaluator._finite_nonnegative_timeout(value)
 
     @staticmethod
     def _argv_condition_matches(conditions: dict[str, Any], context: dict[str, Any]) -> bool:

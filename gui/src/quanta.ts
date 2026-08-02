@@ -12,7 +12,3 @@ export function parseQuantaDraft(value: string): QuantaDraft {
   const valid = Number.isSafeInteger(parsed) && parsed > 0;
   return { raw: value, value: valid ? parsed : null, valid };
 }
-
-export function parseOptionalQuanta(value: string): OptionalQuanta {
-  return parseQuantaDraft(value).value;
-}

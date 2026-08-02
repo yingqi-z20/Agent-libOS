@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY, RuleMatch, ShellRuleEngine
-from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, ShellCommandRule, ShellPolicyLevel
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, ShellPolicyLevel
 from agent_libos.models import (
     AuthorityRisk,
     AuthorityRule,
@@ -559,9 +559,6 @@ class ShellAdapter:
                 },
             )
         raise ResourceLimitExceeded(reason) from error
-
-    def _harden_read_only_git_argv(self, argv: list[str]) -> list[str]:
-        return self.harden_read_only_git_argv(argv)
 
     def harden_read_only_git_argv(self, argv: list[str]) -> list[str]:
         """Apply the shared exact-read Git hardening used by Shell and PTY."""
@@ -1292,38 +1289,6 @@ class ShellAdapter:
             },
         )
 
-    def _emit_run_event(
-        self,
-        pid: str,
-        resource: str,
-        argv: list[str],
-        proc: CommandResult,
-        decision: ShellPolicyDecision,
-        *,
-        cwd: str | os.PathLike[str] | None,
-        correlation_id: str | None,
-    ) -> Any:
-        if self.events is None:
-            return None
-        return self.events.emit(
-            EventType.EXTERNAL_WRITE,
-            source=pid,
-            target=resource,
-            payload={
-                "adapter": "shell",
-                "operation": "run",
-                "argv": argv,
-                "returncode": proc.returncode,
-                "policy_level": decision.policy_level,
-                "high_risk": decision.high_risk,
-                "risk": decision.risk.value,
-                "rule_id": decision.rule_id,
-                "cwd": os.fspath(cwd) if cwd is not None else None,
-            },
-            correlation_id=correlation_id,
-            causality={"audit_parent_record_id": correlation_id} if correlation_id else {},
-        )
-
     def _configured_rules(self) -> list[AuthorityRule]:
         rules: list[AuthorityRule] = list(self.config.shell.rules)
         for rule in self.config.shell.whitelist:
@@ -1539,47 +1504,6 @@ class ShellAdapter:
         if normalized not in allowed:
             raise ValidationError(f"unknown shell policy level: {value!r}")
         return normalized
-
-    def _first_matching_blacklist_rule(self, argv: list[str]) -> ShellCommandRule | None:
-        direct = self._first_matching_rule(argv, self.config.shell.blacklist, allow_bare_only=False)
-        if direct is not None:
-            return direct
-        # Some executables such as env/nohup/sudo can dispatch another program.
-        # In blacklist mode, scan later tokens for exact executable identities
-        # so `env bash -c ...` still requires human approval.
-        executable_tokens = {self._normalize_executable(rule.argv[0]) for rule in self.config.shell.blacklist}
-        for token in argv[1:]:
-            if self._normalize_executable(token) in executable_tokens:
-                return ShellCommandRule((token,), match="exact", description="nested blacklist executable")
-        return None
-
-    def _first_matching_rule(
-        self,
-        argv: list[str],
-        rules: tuple[ShellCommandRule, ...],
-        *,
-        allow_bare_only: bool,
-    ) -> ShellCommandRule | None:
-        return next((rule for rule in rules if self._rule_matches(argv, rule, allow_bare_only=allow_bare_only)), None)
-
-    def _rule_matches(self, argv: list[str], rule: ShellCommandRule, *, allow_bare_only: bool) -> bool:
-        if not rule.argv:
-            return False
-        if allow_bare_only and self._argv0_has_path(argv[0]) and not self._argv0_has_path(rule.argv[0]):
-            return False
-        if rule.match == "exact" and len(argv) != len(rule.argv):
-            return False
-        if len(argv) < len(rule.argv):
-            return False
-        for index, expected in enumerate(rule.argv):
-            actual = argv[index]
-            if index == 0:
-                if self._normalize_executable(actual) != self._normalize_executable(expected):
-                    return False
-                continue
-            if actual != expected:
-                return False
-        return True
 
     def validate_argv(self, argv: list[str]) -> list[str]:
         if not isinstance(argv, list) or not argv:

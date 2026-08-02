@@ -1186,27 +1186,6 @@ class ResourceManager:
                 values[name] = current_value + delta_value
         return ResourceUsage(**values)
 
-    def _first_exceeded(
-        self,
-        budget: ResourceBudget,
-        usage: ResourceUsage,
-        *,
-        relevant_fields: set[str] | None = None,
-    ) -> dict[str, Any] | None:
-        for budget_field, usage_fields in _BUDGET_USAGE_MAP.items():
-            if relevant_fields is not None and not (set(usage_fields) & relevant_fields):
-                continue
-            limit = getattr(budget, budget_field)
-            if limit is None:
-                continue
-            if budget_field == "max_subprocess_memory_bytes":
-                value = getattr(usage, "subprocess_peak_memory_bytes")
-            else:
-                value = sum(getattr(usage, usage_field) for usage_field in usage_fields)
-            if value > limit:
-                return {"budget": budget_field, "usage": list(usage_fields), "value": value, "limit": limit}
-        return None
-
     def _first_exceeded_effective(
         self,
         process: AgentProcess,

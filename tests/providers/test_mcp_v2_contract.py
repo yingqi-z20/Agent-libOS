@@ -5,6 +5,7 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 import pytest
@@ -1136,7 +1137,10 @@ def test_stdio_discover_requires_spawn_and_exact_executable_authority() -> None:
     provider = _ModernFakeProvider()
     runtime.mcp.provider = provider
     stdio = McpStdioTransportSpec(
-        command="python3",
+        # Use the exact interpreter under test.  Bare commands are
+        # intentionally rejected on Windows unless the manifest also pins the
+        # child PATH and PATHEXT authority.
+        command=str(Path(sys.executable).resolve()),
         args=["-m", "demo_server"],
     )
     spec = McpServerSpec(

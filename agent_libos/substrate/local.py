@@ -22,7 +22,6 @@ import stat
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unicodedata
@@ -3531,7 +3530,7 @@ async def _mcp_sdk_v2_client(
     del sdk_mode
     client_info = mcp_types.Implementation(
         name=("mcp" if server.schema_version == 1 else "agent-libos"),
-        version=("0.1.0" if server.schema_version == 1 else "1.2.1"),
+        version=("0.1.0" if server.schema_version == 1 else "1.3.0"),
     )
     negotiation_started = time.monotonic()
     session: Any = None
@@ -4972,25 +4971,11 @@ class SdkMcpProvider:
         try:
             from mcp.client import ClientSession
             from mcp.client.stdio import StdioServerParameters
-        except ModuleNotFoundError as exc:
+        except ImportError as exc:
             raise ValidationError(
-                "MCP provider requires the optional dependency; install with `uv sync --extra mcp --all-groups`"
+                "MCP provider requires the optional MCP Python SDK v2 dependency; "
+                "install with `uv sync --frozen --extra mcp`"
             ) from exc
-        except ImportError:
-            # Compatibility seam for tests and environments still carrying the
-            # pre-v2 SDK. The released MCP extra requires SDK v2, but keeping
-            # this path avoids changing the established Manifest v1 Provider
-            # SPI and makes the upgrade failure explicit at the package edge.
-            async with self._legacy_sdk_session(
-                server,
-                deadline=deadline,
-                max_response_bytes=max_response_bytes,
-                executable_snapshot=executable_snapshot,
-                runtime_environment=runtime_environment,
-                limits=limits,
-            ) as session:
-                yield session
-            return
 
         mode = _mcp_protocol_mode(server)
         sdk_mode = "legacy" if mode is McpProtocolMode.LEGACY else "auto"
@@ -5132,87 +5117,6 @@ class SdkMcpProvider:
         raise RuntimeError(f"unsupported MCP transport: {server.transport}")
 
     @contextlib.asynccontextmanager
-    async def _legacy_sdk_session(
-        self,
-        server: McpServerSpec,
-        *,
-        deadline: float,
-        max_response_bytes: int,
-        executable_snapshot: ExecutableSnapshot | None,
-        runtime_environment: Mapping[str, str] | None,
-        limits: SubprocessLimits | None,
-    ):
-        if server.schema_version != 1 or _mcp_protocol_mode(server) is not McpProtocolMode.LEGACY:
-            raise ValidationError("Manifest v2 requires MCP Python SDK v2")
-        from mcp import ClientSession
-        from mcp.client.stdio import StdioServerParameters
-
-        if server.transport == "stdio":
-            if server.stdio is None:
-                raise RuntimeError("MCP stdio transport is missing stdio configuration")
-            command = (
-                str(executable_snapshot.executable_path)
-                if executable_snapshot is not None
-                else str(
-                    self._stdio_command_candidate(
-                        server,
-                        runtime_environment=runtime_environment,
-                    )
-                )
-            )
-            with self._stdio_dispatch_cwd(server) as (dispatch_cwd, cwd_fd):
-                params = StdioServerParameters(
-                    command=command,
-                    args=list(server.stdio.args),
-                    env=self._stdio_dispatch_env(
-                        server,
-                        executable_snapshot,
-                        runtime_environment=runtime_environment,
-                    ),
-                    cwd=dispatch_cwd,
-                )
-                async with _strict_stdio_client(
-                    params,
-                    max_frame_bytes=max_response_bytes,
-                    max_request_bytes=server.max_request_bytes,
-                    cwd_fd=cwd_fd,
-                    deadline=deadline,
-                    limits=limits,
-                ) as (read, write):
-                    async with ClientSession(read, write) as session:
-                        await _mcp_await_with_deadline(
-                            session.initialize(),
-                            deadline=deadline,
-                            stage="stdio initialize",
-                        )
-                        yield session
-            return
-        if server.transport == "streamable_http":
-            if server.http is None:
-                raise RuntimeError("MCP streamable_http transport is missing HTTP configuration")
-            async with self._http_client(
-                server,
-                timeout_s=_mcp_remaining_timeout(deadline, stage="HTTP client setup"),
-                max_response_bytes=max_response_bytes,
-                runtime_environment=runtime_environment,
-                deadline=deadline,
-            ) as http_client:
-                async with _mcp_tools_only_streamable_http_client(
-                    server.http.url,
-                    http_client=http_client,
-                ) as streams:
-                    read, write = streams[:2]
-                    async with ClientSession(read, write) as session:
-                        await _mcp_await_with_deadline(
-                            session.initialize(),
-                            deadline=deadline,
-                            stage="HTTP initialize",
-                        )
-                        yield session
-            return
-        raise RuntimeError(f"unsupported MCP transport: {server.transport}")
-
-    @contextlib.asynccontextmanager
     async def _http_client(
         self,
         server: McpServerSpec,
@@ -5227,7 +5131,7 @@ class SdkMcpProvider:
         except ModuleNotFoundError as exc:
             raise ValidationError(
                 "MCP provider requires httpx2 from the optional MCP dependency; "
-                "install with `uv sync --extra mcp --all-groups`"
+                "install with `uv sync --frozen --extra mcp`"
             ) from exc
         selected_deadline = (
             time.monotonic() + timeout_s if deadline is None else deadline
@@ -5910,11 +5814,11 @@ class _McpPolicyAsyncHTTPTransport:
     ) -> None:
         try:
             import httpcore2 as httpcore
-            import httpx2 as httpx  # noqa: F401
+            __import__("httpx2")
         except ModuleNotFoundError as exc:
             raise ValidationError(
                 "MCP HTTP transport requires httpx2/httpcore2 from the optional MCP dependency; "
-                "install with `uv sync --extra mcp --all-groups`"
+                "install with `uv sync --frozen --extra mcp`"
             ) from exc
         if isinstance(max_response_bytes, bool) or max_response_bytes < 1:
             raise ValidationError("MCP HTTP max_response_bytes must be a positive integer")
@@ -6287,7 +6191,7 @@ class _McpPolicyNetworkBackend:
         except ModuleNotFoundError as exc:
             raise ValidationError(
                 "MCP HTTP transport requires httpcore2 from the optional MCP dependency; "
-                "install with `uv sync --extra mcp --all-groups`"
+                "install with `uv sync --frozen --extra mcp`"
             ) from exc
         self._backend = httpcore.AnyIOBackend()
         self.deadline = float("inf") if deadline is None else deadline
@@ -6598,7 +6502,7 @@ def _mcp_stdio_dependencies() -> tuple[Any, Any, Any]:
     except ModuleNotFoundError as exc:
         raise ValidationError(
             "MCP stdio transport requires the optional MCP dependency; "
-            "install with `uv sync --extra mcp --all-groups`"
+            "install with `uv sync --frozen --extra mcp`"
         ) from exc
     return anyio, mcp_types, SessionMessage
 
@@ -7343,16 +7247,6 @@ def _mcp_metadata(item: Any) -> dict[str, Any]:
         for key, value in raw.items()
         if key not in {"name", "description", "inputSchema", "input_schema"}
     }
-
-
-def _mcp_tools_list_has_continuation(result: Any) -> bool:
-    """Return whether an MCP tools/list result is only one page of a catalog."""
-
-    for field in ("nextCursor", "next_cursor"):
-        cursor = getattr(result, field, None)
-        if cursor is not None:
-            return True
-    return False
 
 
 def _bounded_mcp_content(value: Any) -> Any:

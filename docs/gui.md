@@ -219,10 +219,12 @@ excludes both renderer and Electron build output, and the production Electron
 TypeScript configuration excludes `*.test.ts`; generated JavaScript therefore
 cannot become a second copy of the source test suite.
 
-The DOM-level Markdown security regression uses jsdom 28 because that major
-supports the GUI package's declared Node 22.12 floor. jsdom 29 raises its Node
-22 floor to 22.13, so adopting it requires an intentional engine-support
-change rather than an incidental test-dependency update.
+The GUI uses React and React DOM 19.2.8 with Lucide React 1.28.0. Its
+development toolchain uses Electron 43.2, Vite 8 with plugin-react 6, Vitest 4,
+TypeScript 7, and jsdom 30. Vite owns the Rolldown and PostCSS dependency graph;
+no direct esbuild or PostCSS override is required. The supported runtime is
+reflected in the package engine contract: Node `^24.15.0 || >=26.0.0` and npm
+11 or newer. Use the Node 24 LTS line for parity with CI.
 
 A useful clean-build check is:
 
@@ -342,7 +344,7 @@ retention, and only the controls returned in `allowed_actions`. A
 Retry or Resume action. The server-derived `payloads_purged` summary flag, not
 the configured retention policy alone, controls whether rerun requires a
 replacement goal; this also covers a `permanent` Run that a Host explicitly
-purged. Legacy processes remain selectable, and the operator
+purged. Process groups remain selectable, and the operator
 console keeps their process grouping. Its **Task Runs** tab pages through the
 selected Run ledger and resolves linked Operation/evidence rows through
 **Explain**. The former generic Tasks panel is labeled **Object tasks** so its
@@ -581,10 +583,11 @@ mutation previews explicitly identify Host-admin mode. Skill and remote
 registration can instead use the selected process authority; workspace Skill
 registration always requires it. Process cancel/terminate signals and generic
 workflow execution remain server/API-only and require a same-build client to
-present its own confirmation UX. `LibOSClient.runWorkflow` accepts an explicit
-`confirmed` option for that purpose. The server rejects a missing or false
-confirmation before invoking any high-risk runtime operation, regardless of
-renderer state.
+present its own confirmation UX. A client calling `POST /api/workflows/run`
+must submit `confirmed: true` when the server classifies the request as
+high-risk; the bundled `LibOSClient` has no generic workflow convenience
+method. The server rejects a missing or false confirmation before invoking any
+high-risk runtime operation, regardless of renderer state.
 
 The Object Tasks panel also presents review dialogs before start and cancel,
 but those dialogs are renderer UX rather than the server's `confirmed: true`
@@ -707,7 +710,7 @@ Important endpoints:
   Collection, ledger, and Human pages accept opaque `cursor` values and return
   `next_cursor`; clients must not parse or synthesize them. The embedded
   requirements page also returns `next_cursor`. Requirement changes are linked
-  ledger items, and 1.2.1 has no independent Task Run requirements or wait HTTP
+  ledger items, and 1.3.0 has no independent Task Run requirements or wait HTTP
   route.
 - `POST /api/task-runs/{run_id}/run|pause|resume|cancel|follow-ups|recover|rerun`.
   Every existing-Run mutation carries a command id and expected revision.

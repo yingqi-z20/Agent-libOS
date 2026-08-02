@@ -6,7 +6,6 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import ValidationError as LibOSValidationError
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
-_IMAGE_DEFAULTS = DEFAULT_CONFIG.image
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 

@@ -123,7 +123,7 @@ class _PostgresConnection:
         except ModuleNotFoundError as exc:  # pragma: no cover - exercised without optional dependency
             raise ValidationError(
                 "PostgreSQL runtime store requires the optional dependency; "
-                "install with `uv sync --extra postgres --all-groups`"
+                "install with `uv sync --frozen --extra postgres`"
             ) from exc
         self._conn = psycopg.connect(dsn, row_factory=dict_row, autocommit=True)
         self._dialect = _PostgresDialect()

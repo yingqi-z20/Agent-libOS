@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -27,14 +27,12 @@ from agent_libos.models import (
     OperationOutcome,
     ProcessMessageKind,
     ProcessStatus,
-    PausedProcessWait,
     StaleExecutionProcessWait,
     TaskRunCommand,
     TaskRunCursor,
     TaskRunLedgerCursor,
     TaskRunLedgerItem,
     TaskRunLedgerKind,
-    TaskRunLedgerPage,
     TaskRunLink,
     TaskRunPayload,
     TaskRunPayloadRetention,
@@ -1003,9 +1001,6 @@ class TaskRunManager:
         selected = self._normalize_pids(scoped_pids)
         run_ids = self._store.list_active_task_run_ids_for_pids(selected)
         return tuple(self.get(run_id) for run_id in sorted(run_ids))
-
-    def active_intersections(self, pids: Iterable[str]) -> tuple[str, ...]:
-        return tuple(summary.run_id for summary in self.active_runs_for_pids(pids))
 
     def require_process_epoch(
         self,
@@ -2333,7 +2328,7 @@ class TaskRunManager:
         selected_kind = self._identifier(kind, "dispatch kind")
         if selected_kind not in {"provider", "tool"}:
             raise ValidationError("TaskRun dispatch kind is unsupported")
-        process, record = self._bound_process_run(pid)
+        _, record = self._bound_process_run(pid)
         if record is None:
             yield
             return
@@ -7669,7 +7664,7 @@ class TaskRunManager:
         """Finish local receipt settlement without consulting the provider again."""
 
         (
-            command,
+            _command,
             effect_id,
             expected_state,
             cancel_generation,
@@ -8697,7 +8692,7 @@ class TaskRunManager:
         ],
     ) -> TaskRunRecord:
         (
-            command,
+            _command,
             pause_generation,
             cancel_generation,
             prior_status,
@@ -9386,12 +9381,11 @@ class TaskRunManager:
         self._store.purge_task_run_llm_pending_actions(
             run_id,
             pids,
-            purged_at=purged_at,
         )
         purge_messages = getattr(self._store, "purge_task_run_messages", None)
         if not callable(purge_messages):
             raise RuntimeError("Store lacks TaskRun message purge support")
-        purge_messages(run_id, pids, purged_at=purged_at)
+        purge_messages(run_id, pids)
         self._store.purge_task_run_payloads(run_id, purged_at=purged_at)
 
     def _status_from_processes(
@@ -11975,10 +11969,6 @@ class TaskRunManager:
                 and effect.transaction_state in _SETTLED_EFFECT_STATES
             )
         ]
-
-    def _all_unsafe_effects_certify_not_started(self, run_id: str) -> bool:
-        effects = self._unsafe_effects(run_id)
-        return bool(effects) and all(self._effect_certifies_not_started(effect) for effect in effects)
 
     def _current_effect_seq(self) -> int:
         method = getattr(self._uow.evidence, "current_effect_ledger_seq", None)

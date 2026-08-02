@@ -27,7 +27,3 @@ class HumanRequestService:
 
     def transaction(self) -> AbstractContextManager[Any]:
         return self._processes.transaction()
-
-
-class HumanRequestNotFound(LookupError):
-    pass

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import asdict, dataclass, field

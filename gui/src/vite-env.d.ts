@@ -19,7 +19,6 @@ declare global {
       getConnection(): Promise<GuiConnection | null>;
       chooseDatabase(): Promise<GuiConnection | null>;
       chooseImagePackage(): Promise<ImagePackageFile | null>;
-      useDatabase(db: string): Promise<GuiConnection | null>;
       openExternal(url: string): Promise<boolean>;
     };
   }

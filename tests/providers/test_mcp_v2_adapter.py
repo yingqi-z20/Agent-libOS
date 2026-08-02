@@ -1626,7 +1626,10 @@ def test_manifest_v1_http_preserves_sdk_v1_post_get_and_cleanup_sequence() -> No
             server_id="legacy-http-network",
             transport="streamable_http",
             tools=[tool],
-            timeout_s=2,
+            # This test validates wire ordering and byte budgets, not a
+            # two-second startup SLA.  Importing and initializing the optional
+            # SDK can exceed that on cold Windows/Python 3.14 runners.
+            timeout_s=10,
             max_request_bytes=160,
             max_response_bytes=250,
             http=McpHttpTransportSpec(
@@ -1643,7 +1646,7 @@ def test_manifest_v1_http_preserves_sdk_v1_post_get_and_cleanup_sequence() -> No
                 "unicode": "你好",
                 "nested": {"value": -2.5e20},
             },
-            timeout_s=2,
+            timeout_s=spec.timeout_s,
             max_response_bytes=spec.max_response_bytes,
         )
 
@@ -1655,14 +1658,19 @@ def test_manifest_v1_http_preserves_sdk_v1_post_get_and_cleanup_sequence() -> No
         assert handler.methods.count("notifications/initialized") == 1
         assert handler.methods.count("tools/list") == 1
         assert handler.methods.count("tools/call") == 1
-        assert [item["method"] for item in handler.requests] == [
+        request_methods = [item["method"] for item in handler.requests]
+        # The SDK starts the legacy SSE reader concurrently with its
+        # initialized notification.  Their relative wire order is scheduler
+        # dependent (notably across Python 3.11 and 3.14), while initialization
+        # must still lead and cleanup must still trail every request.
+        assert [method for method in request_methods if method != "GET"] == [
             "POST",
             "POST",
-            "GET",
             "POST",
             "POST",
             "DELETE",
         ]
+        assert 0 < request_methods.index("GET") < request_methods.index("DELETE")
         assert [
             item["body"]
             for item in handler.requests

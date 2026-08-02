@@ -13,8 +13,8 @@ describe("i18n", () => {
   });
 
   it("interpolates translated messages", () => {
-    expect(translate("zh-CN", "user.llmCalls", { count: 3 })).toBe("3 次 LLM 调用");
-    expect(translate("en", "user.llmCalls", { count: 3 })).toBe("3 LLM calls");
+    expect(translate("zh-CN", "image.requiredCaps", { count: 3 })).toBe("3 个 required caps");
+    expect(translate("en", "image.requiredCaps", { count: 3 })).toBe("3 required caps");
   });
 
   it("falls back to English or the key for missing translations", () => {

@@ -88,10 +88,16 @@ class TestToolProtocol:
         assert normalize_process_path_argument(path, cwd) == expected
 
     def test_workspace_tool_arguments_reject_absolute_paths(self) -> None:
-        with pytest.raises(ValueError, match="path must be relative"):
-            normalize_process_path_argument("/pkg/module.py", ".")
-        with pytest.raises(ValueError, match="path must be relative"):
-            ReadTextFileArgs(path="/pkg/module.py")
+        absolute_paths = (
+            ("/pkg/module.py", "\\pkg\\module.py")
+            if os.name == "nt"
+            else ("/pkg/module.py",)
+        )
+        for path in absolute_paths:
+            with pytest.raises(ValueError, match="path must be relative"):
+                normalize_process_path_argument(path, ".")
+            with pytest.raises(ValueError, match="path must be relative"):
+                ReadTextFileArgs(path=path)
 
     def test_process_exit_schema_distinguishes_result_storage_from_human_output(self) -> None:
         process_exit = ProcessExitTool()

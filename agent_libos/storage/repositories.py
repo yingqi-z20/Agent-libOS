@@ -80,19 +80,6 @@ from agent_libos.models import (
     RuntimePublicationState,
     ToolCandidate,
     ToolSpec,
-    TaskRunCommand,
-    TaskRunCursor,
-    TaskRunLedgerCursor,
-    TaskRunLedgerItem,
-    TaskRunLedgerPage,
-    TaskRunLink,
-    TaskRunPage,
-    TaskRunPayload,
-    TaskRunRecord,
-    TaskRunRequirement,
-    TaskRunRequirementStatus,
-    TaskRunResumePoint,
-    TaskRunStatus,
     parse_runtime_publication_kind,
     validate_runtime_publication_record,
 )
@@ -750,12 +737,6 @@ class ProcessRepository(_RepositoryFacade):
                 publication_id=publication_id,
                 expected_revision=expected_revision,
             ),
-        )
-
-    def claim_runnable_process(self, pid: str) -> AgentProcess | None:
-        return cast(
-            AgentProcess | None,
-            self._process_backend.claim_runnable_process(pid),
         )
 
     def claim_execution(

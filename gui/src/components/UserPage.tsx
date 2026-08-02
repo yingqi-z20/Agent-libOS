@@ -460,14 +460,14 @@ export function UserPage({
           </label>
 
           {taskRuns.length && (snapshot?.processes.length ?? 0) > 0 ? (
-            <details className="sidebarDisclosure legacyProcesses">
-              <summary>{t("taskRuns.legacyProcesses")}</summary>
+            <details className="sidebarDisclosure processGroups">
+              <summary>{t("taskRuns.processGroups")}</summary>
               <div className="sidebarDisclosureBody">
                 <select value={selectedRun ? "" : selectedPid ?? ""} onChange={(event) => {
                   onSelectRun?.("");
                   onSelectPid(event.currentTarget.value);
                 }}>
-                  {selectedRun ? <option value="">{t("taskRuns.legacyProcesses")}</option> : null}
+                  {selectedRun ? <option value="">{t("taskRuns.processGroups")}</option> : null}
                   {(snapshot?.processes ?? []).map((process) => <option key={process.pid} value={process.pid}>{shortProcessId(process.pid)} · {process.status}</option>)}
                 </select>
               </div>

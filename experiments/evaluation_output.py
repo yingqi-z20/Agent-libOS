@@ -14,11 +14,16 @@ class AtomicJsonOutput:
     ``in_progress`` marker while retaining the prior complete artifact beside
     it.  A failed invocation leaves a non-favorable ``failed`` marker and the
     retained prior artifact; a successful commit atomically replaces the
-    marker and removes the retained copy.
+    marker and removes the retained copy.  Output writes never follow a
+    final-component symlink; a file symlink is replaced as the report entry.
     """
 
     def __init__(self, path: str | Path) -> None:
-        self.path = Path(path).expanduser().resolve(strict=False)
+        # Canonicalize the parent while preserving the final path component.
+        # Atomic replacement must replace an output symlink rather than
+        # redirecting report writes into its target.
+        absolute = Path(os.path.abspath(Path(path).expanduser()))
+        self.path = absolute.parent.resolve(strict=False) / absolute.name
         self.invocation_id = f"evaluation_{uuid.uuid4().hex}"
         self._lock_path = self.path.with_name(f".{self.path.name}.lock")
         self._backup_path = self.path.with_name(
@@ -55,6 +60,7 @@ class AtomicJsonOutput:
     def commit(self, value: Any, *, sort_keys: bool = False) -> str:
         rendered = json.dumps(
             value,
+            allow_nan=False,
             ensure_ascii=False,
             indent=2,
             sort_keys=sort_keys,

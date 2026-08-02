@@ -25,7 +25,7 @@ _TIMEZONE_KEY_PATTERN = re.compile(
 )
 _FIXED_TIMEZONE_FALLBACK_KEYS = frozenset({"Asia/Shanghai"})
 
-# MCP 1.2.1 release contract: automatic modern discovery may consume no more
+# The current MCP release contract allows automatic modern discovery to consume no more
 # than five seconds, even when the enclosing operation has a longer deadline.
 MCP_PROTOCOL_PROBE_TIMEOUT_MAX_S: Final[float] = 5.0
 
@@ -235,6 +235,7 @@ class ShellCommandRule:
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class RuntimeDefaults:
     local_store_target: str = "local"
+    # Compatibility-only 1.x input; the runtime store target is authoritative.
     runtime_db_filename: str = ".agent_libos.sqlite"
     store_backend: Literal["sqlite", "postgres"] = "sqlite"
     store_dsn: str | None = None
@@ -584,11 +585,14 @@ class ToolDefaults:
     object_file_max_bytes: int = 1_048_576
     object_file_hard_limit_bytes: int = 10_485_760
     shell_timeout_s: float = 30.0
+    # Compatibility-only 1.x input; individual sandbox limits are authoritative.
     sandbox_timeout_s: float = 5.0
     jit_source_max_chars: int = 65_536
     jit_tests_max_count: int = 32
     jit_test_case_max_bytes: int = 32_768
-    jit_validation_timeout_s: float = 5.0
+    # Static checks start a fresh Deno process and can exceed the interactive
+    # execution window on cold or contended Windows hosts.
+    jit_validation_timeout_s: float = 15.0
     jit_validation_log_max_chars: int = 131_072
     deno_executable: str = "deno"
     deno_timeout_s: float = 5.0
@@ -818,6 +822,7 @@ class ImageCommitDefaults:
     max_required_capabilities: int = 128
     max_committed_tools: int = 256
     max_committed_jit_sources: int = 64
+    # Compatibility-only 1.x input; image metadata is no longer preview-truncated.
     metadata_preview_chars: int = 512
 
 

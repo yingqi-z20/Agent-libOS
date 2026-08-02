@@ -950,8 +950,9 @@ def _recovery_class_for_barrier(barrier: DurabilityBarrier) -> RecoveryClass:
 
 
 def _expected_returncode(barrier: DurabilityBarrier) -> int:
-    if barrier is DurabilityBarrier.PROVIDER_DISPATCHED:
-        return -signal.SIGKILL
+    kill_signal = getattr(signal, "SIGKILL", None)
+    if barrier is DurabilityBarrier.PROVIDER_DISPATCHED and kill_signal is not None:
+        return -int(kill_signal)
     return CRASH_EXIT_CODE
 
 

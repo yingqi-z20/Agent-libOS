@@ -33,13 +33,6 @@ from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.utils.ids import new_id, utc_now
 
 
-OBJECT_TASK_ACTIVE_STATUSES = {
-    ObjectTaskStatus.QUEUED,
-    ObjectTaskStatus.RUNNING,
-    ObjectTaskStatus.WAITING_HUMAN,
-    ObjectTaskStatus.WAITING_PROCESS,
-    ObjectTaskStatus.WAITING_MESSAGE,
-}
 OBJECT_TASK_TERMINAL_STATUSES = {
     ObjectTaskStatus.SUCCEEDED,
     ObjectTaskStatus.FAILED,

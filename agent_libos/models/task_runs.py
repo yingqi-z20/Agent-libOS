@@ -257,7 +257,7 @@ class TaskRunSpecV1:
         if not isinstance(value, Mapping):
             raise ValueError("TaskRun spec must be a mapping")
         raw = dict(value)
-        # Input-only aliases ease 1.1.0-rc callers. They are never emitted.
+        # Legacy input aliases remain accepted; canonical output never emits them.
         if "goal" not in raw and "objective" in raw:
             raw["goal"] = raw.pop("objective")
         if "display_title" not in raw and "title" in raw:

@@ -1099,7 +1099,7 @@ def test_terminal_run_scoped_pending_and_message_purge_is_atomic(
         store.upsert_llm_pending_action(other_pid, pending("other-token"))
         with pytest.raises(ValidationError, match="finalizing"):
             store.purge_task_run_llm_pending_actions(
-                "run-purge", (owned_pid,), purged_at=LATER
+                "run-purge", (owned_pid,)
             )
         assert store.get_llm_pending_action(owned_pid) is not None
 
@@ -1112,7 +1112,7 @@ def test_terminal_run_scoped_pending_and_message_purge_is_atomic(
         assert finalizing.status is TaskRunStatus.FINALIZING
         with pytest.raises(ValidationError, match="unowned PID"):
             store.purge_task_run_llm_pending_actions(
-                "run-purge", (owned_pid, other_pid), purged_at=LATER
+                "run-purge", (owned_pid, other_pid)
             )
         assert store.get_llm_pending_action(owned_pid) is not None
 
@@ -1141,18 +1141,18 @@ def test_terminal_run_scoped_pending_and_message_purge_is_atomic(
         with pytest.raises(RuntimeError, match="rollback purge"):
             with store.transaction():
                 assert store.purge_task_run_llm_pending_actions(
-                    "run-purge", (owned_pid,), purged_at=LATER
+                    "run-purge", (owned_pid,)
                 ) == 1
                 raise RuntimeError("rollback purge")
         assert store.get_llm_pending_action(owned_pid) is not None
 
         assert store.purge_task_run_llm_pending_actions(
-            "run-purge", (owned_pid,), purged_at=LATER
+            "run-purge", (owned_pid,)
         ) == 1
         assert store.get_llm_pending_action(owned_pid) is None
         assert store.get_llm_pending_action(other_pid) is not None
         assert store.purge_task_run_messages(
-            "run-purge", (owned_pid,), purged_at=LATER
+            "run-purge", (owned_pid,)
         ) == 2
         assert store.get_process_message(related.message_id) is None
         assert store.get_process_message(unrelated.message_id) is None

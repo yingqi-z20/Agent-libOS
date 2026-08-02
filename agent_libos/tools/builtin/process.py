@@ -215,8 +215,6 @@ class ProcessExitOutput(BaseModel):
 class GetWorkingDirectoryArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    pass
-
 
 class GetWorkingDirectoryOutput(BaseModel):
     working_directory: str
@@ -1494,12 +1492,6 @@ def _successful_tool_calls_from_receipts(
         if name not in names:
             names.append(name)
     return names
-
-
-def _successful_tool_calls(runtime: Any, pid: str) -> list[str]:
-    return _successful_tool_calls_from_receipts(
-        _successful_tool_receipts(runtime, pid)
-    )
 
 
 def _explicit_unobserved_tool_hints(

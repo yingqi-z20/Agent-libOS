@@ -449,7 +449,7 @@ cannot silently abandon an owned store or partially assembled component graph.
 
 ## Compatibility boundary
 
-- Agent libOS 1.2.1 is experimental. The top-level `agent_libos.__all__` names
+- Agent libOS 1.3.0 is experimental. The top-level `agent_libos.__all__` names
   and the Runtime entrypoints documented here are the intended application
   import surface for this release. Pin the package version when depending on
   exact signatures or dataclass fields.
@@ -476,8 +476,8 @@ cannot silently abandon an owned store or partially assembled component graph.
   `McpSubprocessLimitsProvider`. The Runtime never passes that keyword to a
   legacy provider; when a stdio operation has a configured subprocess budget,
   a provider without the extension is rejected before provider dispatch.
-  Agent libOS 1.2.1 adds modern discovery/negotiation through the optional
-  `McpModernProtocolProvider`; it does not add required parameters to those
+  Agent libOS 1.2.1 added modern discovery/negotiation through the optional
+  `McpModernProtocolProvider`; it did not add required parameters to those
   three methods.
 - Persisted Runtime state has a strict schema generation. Opening an older,
   newer, incomplete, or hand-built schema may raise `UnsupportedStoreVersion`;

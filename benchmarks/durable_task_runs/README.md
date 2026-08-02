@@ -2,7 +2,8 @@
 
 `crash_harness.py` executes a separate worker at six commit/effect barriers.
 Five barriers terminate with `os._exit`; the provider-dispatched barrier uses
-`SIGKILL`. Provider observations go to a canonical JSONL ledger that fsyncs
+`SIGKILL` where the host provides it, and the same no-cleanup `os._exit`
+termination on Windows. Provider observations go to a canonical JSONL ledger that fsyncs
 independently of RuntimeStore. The provider-idempotent path is a real scripted
 LLM action through `call_jsonrpc_method`, the protected effect boundary, and
 the independent provider ledger. Reopen probes the same endpoint idempotency
@@ -39,6 +40,11 @@ uv run python experiments/run_task_run_recovery_scale.py \
 
 The output files and independently fsynced provider ledgers are local test
 artifacts and must not be committed.
+
+Both commands reserve the selected output path before measured work begins and
+publish only complete JSON with an atomic replace. An unsuccessful rerun leaves
+a non-favorable failure marker and retains the prior complete artifact beside
+it instead of exposing stale favorable evidence.
 
 ## Opt-in live repository-maintenance gate
 

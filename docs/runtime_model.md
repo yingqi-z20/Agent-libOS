@@ -6,8 +6,7 @@ complete callable tool table, a separate model tool projection, loaded Skills,
 capabilities, children, a Task Authority Manifest, message queue state, an
 `llm_profile_id`, and resource budgets.
 
-The paper frames this process model as the substrate for self-evolving agents:
-a process can change visible tools, activate Skills, register process-local JIT
+A process can change visible tools, activate Skills, register process-local JIT
 tools, register or exec AgentImages, fork children, and fork from checkpoints,
 while resource authority remains separate in Capability.
 

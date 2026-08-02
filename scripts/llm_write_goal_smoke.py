@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
-from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import CapabilityRight, ProcessStatus
 from agent_libos.utils.serde import to_jsonable

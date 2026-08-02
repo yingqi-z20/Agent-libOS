@@ -41,11 +41,12 @@ from agent_libos.models.exceptions import (
 from agent_libos.process_transition import ProcessTransitionService
 from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.runtime.syscall_descriptors import (
-    BUILTIN_SYSCALL_NAMES,
+    BUILTIN_SYSCALL_NAMES as _BUILTIN_SYSCALL_NAMES,
     BUILTIN_SYSCALL_ROUTES,
 )
-from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import to_jsonable
+
+BUILTIN_SYSCALL_NAMES = _BUILTIN_SYSCALL_NAMES
 
 if TYPE_CHECKING:
     from agent_libos.runtime.runtime import Runtime

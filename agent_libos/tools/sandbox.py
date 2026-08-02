@@ -41,11 +41,6 @@ from agent_libos.utils.public_errors import (
 from agent_libos.utils.serde import to_jsonable
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
-_EXACT_JSR_VERSION_RE = re.compile(
-    r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
-    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
-    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
-)
 _RUNTIME_CODE_GENERATION_NAMES = {"eval", "Function", "AsyncFunction", "GeneratorFunction", "AsyncGeneratorFunction"}
 _RUNTIME_GLOBAL_OBJECT_NAMES = {"globalThis", "window"}
 _TYPESCRIPT_DEPENDENCY_DIRECTIVE_RE = re.compile(
@@ -1304,7 +1299,6 @@ class DenoTypescriptSandbox(SandboxBackend):
                     raise SandboxError("Deno resource monitor cannot enforce subprocess limits") from exc
                 # The outer wall timeout and process-group containment remain
                 # active even where the host denies process-tree inspection.
-                pass
             limit_kind = self._limit_kind(
                 wall_seconds=wall_seconds,
                 cpu_seconds=cpu_seconds,
@@ -1775,21 +1769,6 @@ class DenoTypescriptSandbox(SandboxBackend):
                 return True
         return False
 
-    def _token_is_call(self, tokens: list[tuple[str, str]], index: int) -> bool:
-        return self._token_is_call_after(tokens, index)
-
-    def _token_is_call_after(self, tokens: list[tuple[str, str]], index: int) -> bool:
-        cursor = index + 1
-        if cursor < len(tokens) and tokens[cursor] == ("punct", "?"):
-            cursor += 1
-            if cursor < len(tokens) and tokens[cursor] == ("punct", "."):
-                cursor += 1
-        if cursor < len(tokens) and tokens[cursor] == ("punct", "("):
-            return True
-        if cursor + 2 < len(tokens) and tokens[cursor] == ("punct", ".") and tokens[cursor + 1] == ("identifier", "call"):
-            return tokens[cursor + 2] == ("punct", "(")
-        return False
-
     def _token_is_bracketed_global_property(self, tokens: list[tuple[str, str]], index: int) -> bool:
         property_name, open_index, _ = self._constant_bracket_property_name_at(tokens, index)
         if property_name not in _RUNTIME_CODE_GENERATION_NAMES:
@@ -1802,10 +1781,6 @@ class DenoTypescriptSandbox(SandboxBackend):
         if tokens[object_index] == ("punct", "?") and object_index > 0:
             object_index -= 1
         return tokens[object_index][0] == "identifier" and tokens[object_index][1] in _RUNTIME_GLOBAL_OBJECT_NAMES
-
-    def _token_is_bracketed_property_call(self, tokens: list[tuple[str, str]], index: int) -> bool:
-        property_name, _, close_index = self._constant_bracket_property_name_at(tokens, index)
-        return property_name == "constructor" and self._token_is_call_after(tokens, close_index)
 
     def _token_is_bracketed_property(self, tokens: list[tuple[str, str]], index: int) -> bool:
         property_name, open_index, _ = self._constant_bracket_property_name_at(tokens, index)
@@ -2184,25 +2159,6 @@ class DenoTypescriptSandbox(SandboxBackend):
 
     def _is_identifier_part(self, char: str) -> bool:
         return self._is_identifier_start(char) or char.isdigit()
-
-    def _jsr_package_and_version(self, specifier: str) -> tuple[str, str | None] | None:
-        if not specifier.startswith("jsr:"):
-            return None
-        body = specifier[4:]
-        if not body.startswith("@"):
-            return None
-        parts = body.split("/")
-        if len(parts) < 2:
-            return None
-        scope = parts[0]
-        name_part = parts[1]
-        name, version = name_part.split("@", 1) if "@" in name_part else (name_part, None)
-        if not scope or not name:
-            return None
-        return f"{scope}/{name}", version or None
-
-    def _is_exact_jsr_version(self, version: str) -> bool:
-        return _EXACT_JSR_VERSION_RE.fullmatch(version) is not None
 
     def _resolve_deno(self) -> str:
         candidate = self.deno_executable

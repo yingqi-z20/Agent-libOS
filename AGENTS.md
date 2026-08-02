@@ -21,7 +21,7 @@ skills live in `skills/`.
 
 ## Build, Test, and Development Commands
 
-- `uv sync --frozen --all-groups`: install the locked Python environment,
+- `uv sync --frozen`: install the locked default development environment,
   including pytest tooling.
 - `uv run python -m compileall agent_libos tests scripts experiments benchmarks modules`:
   catch syntax/import errors.

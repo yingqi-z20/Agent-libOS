@@ -81,8 +81,7 @@ class TestResourceManager:
             lock_states: list[bool] = []
 
             def notifier(selected_pid: str) -> None:
-                is_owned = getattr(runtime.store._lock, '_is_owned', lambda: False)
-                lock_states.append(bool(is_owned()))
+                lock_states.append(runtime.store._lock.owned_by_current_thread)
                 if original is not None:
                     original(selected_pid)
 

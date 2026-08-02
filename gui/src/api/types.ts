@@ -359,11 +359,6 @@ export type DataReleaseApprovalContext = Record<string, unknown> & {
   operation: string;
 };
 
-export type DataReleaseApprovalPayload = HumanRequestPayload & {
-  type: "data_release_approval";
-  context: DataReleaseApprovalContext;
-};
-
 export type HumanRequest = {
   request_id: string;
   pid: string;
@@ -531,12 +526,6 @@ export type TaskRunLedgerItem = {
   metadata: Record<string, string | number | boolean>;
 };
 
-export type TaskRunPage = {
-  items: TaskRunSummary[];
-  next_cursor: string | null;
-  has_more: boolean;
-};
-
 export type TaskRunLedgerPage = {
   items: TaskRunLedgerItem[];
   next_cursor: string | null;
@@ -690,25 +679,6 @@ export type LLMProfileInput = {
   max_tokens?: number | null;
   context_window_tokens?: number | null;
   allow_custom_base_url?: boolean | null;
-};
-
-export type WorkflowRunResult = {
-  pid: string;
-  image: string;
-  tool: string;
-  ok: boolean;
-  status: string;
-  call_id: string | null;
-  tool_id: string | null;
-  result_oid: string | null;
-  payload: unknown;
-  error: string | null;
-  waiting_human: boolean;
-  request_id: string | null;
-  waiting_process: boolean;
-  child_pid: string | null;
-  waiting_message: boolean;
-  filters: Record<string, unknown> | null;
 };
 
 export type ObjectTask = {
@@ -882,14 +852,6 @@ export type SseMessage = {
 };
 
 export type StreamConnectionStatus = "connecting" | "connected" | "reconnecting" | "failed";
-
-export type RuntimeHealth = {
-  ok: boolean;
-  db: string;
-  scheduler: SchedulerStatus;
-  process_count: number | null;
-  runtime_busy: boolean;
-};
 
 const snapshotCollections = [
   "processes",

@@ -208,7 +208,7 @@ def _context_management_prompt(raw: Mapping[str, Any]) -> str:
 
 
 def estimate_multilingual_tokens(text: str) -> int:
-    """Compatibility alias for the shared Provider-neutral estimator."""
+    """Compatibility alias for the shared provider-neutral estimator."""
 
     return estimate_tokens(text)
 

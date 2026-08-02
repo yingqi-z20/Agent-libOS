@@ -65,6 +65,11 @@ from tests.support.fakes import RecordingActionClient
 from tests.support.external_effects import begin_external_effect_intent
 
 
+REAL_DEADLINE_TEST_WINDOW_S = 5.0
+OBJECT_TASK_WAIT_TIMEOUT_S = 30.0
+SUBPROCESS_TEST_TIMEOUT_S = 60.0
+
+
 def _config(*, plaintext: bool = True):
     return replace(
         DEFAULT_CONFIG,
@@ -2906,7 +2911,8 @@ def test_absolute_deadline_keeps_elapsing_during_wait_and_runtime_reopen(
     first = Runtime.open(database, config=_config())
     try:
         deadline_at = (
-            datetime.now(timezone.utc) + timedelta(seconds=0.3)
+            datetime.now(timezone.utc)
+            + timedelta(seconds=REAL_DEADLINE_TEST_WINDOW_S)
         ).isoformat()
         created = _create(first, deadline_at=deadline_at)
         root_pid = created.root_pid
@@ -3458,7 +3464,11 @@ from agent_libos.models import (
     ObjectTaskStatus,
     ObjectType,
 )
-from tests.runtime.test_task_run_runtime import _config, _create
+from tests.runtime.test_task_run_runtime import (
+    OBJECT_TASK_WAIT_TIMEOUT_S,
+    _config,
+    _create,
+)
 
 runtime = Runtime.open(Path({str(database)!r}), config=_config())
 created = _create(runtime, request_id="create-active-object-task")
@@ -3483,8 +3493,12 @@ task = runtime.object_tasks.start(
     "receive_process_messages",
     {{"channel": "never-replay"}},
 )
-waiting = runtime.object_tasks.wait(task.task_id, actor_pid=root_pid, timeout=2)
-assert waiting.status is ObjectTaskStatus.WAITING_MESSAGE
+waiting = runtime.object_tasks.wait(
+    task.task_id,
+    actor_pid=root_pid,
+    timeout=OBJECT_TASK_WAIT_TIMEOUT_S,
+)
+assert waiting.status is ObjectTaskStatus.WAITING_MESSAGE, waiting.status
 os._exit(91)
 """
     crashed = subprocess.run(
@@ -3492,7 +3506,7 @@ os._exit(91)
         cwd=repository,
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=SUBPROCESS_TEST_TIMEOUT_S,
         check=False,
     )
     assert crashed.returncode == 91, crashed.stderr

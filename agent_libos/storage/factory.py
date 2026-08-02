@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
 from urllib.parse import SplitResult, unquote, unquote_plus, urlsplit, urlunsplit
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig

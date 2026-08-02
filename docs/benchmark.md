@@ -1,9 +1,9 @@
 # Runtime-Safety Benchmark
 
-The M1 benchmark harness is a deterministic runtime-safety workload for
+The benchmark harness is a deterministic runtime-safety workload for
 Agent libOS. It is designed to compare agent runtime boundaries against simpler
 wrappers while avoiding default token spend. The suite now includes a
-self-evolution subset for the paper theme: capability-controlled changes through
+self-evolution subset covering capability-controlled changes through
 Skills, Deno/TypeScript JIT tools, image registration/exec/checkpoint commit,
 child processes, checkpoints, Object Memory, and registered remote resources.
 
@@ -119,15 +119,15 @@ uv run python scripts/test_matrix.py --lane benchmark
 Default exploratory smoke:
 
 ```bash
-uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --output .benchmark_runs/m1-smoke
-uv run python experiments/collect_metrics.py .benchmark_runs/m1-smoke
+uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --output .benchmark_runs/smoke
+uv run python experiments/collect_metrics.py .benchmark_runs/smoke
 ```
 
 For a CI or release gate, require every selected task's declared success and
 safety oracles to pass:
 
 ```bash
-uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --require-all-passed --output .benchmark_runs/m1-gate
+uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --require-all-passed --output .benchmark_runs/release-gate
 ```
 
 Without `--require-all-passed`, an oracle failure is preserved in the output
@@ -170,8 +170,8 @@ uv run python experiments/run_benchmark.py \
   --runner no_primitive_approval \
   --runner no_namespace_isolation \
   --runner no_fork_attenuation \
-  --output .benchmark_runs/m1
-uv run python experiments/collect_metrics.py .benchmark_runs/m1
+  --output .benchmark_runs/comparison
+uv run python experiments/collect_metrics.py .benchmark_runs/comparison
 ```
 
 `--runner all` additionally selects `no_audit_linkage`. That runner
@@ -599,50 +599,24 @@ retention v4 databases are then temporary and are removed after the bounded,
 redacted report is written. A command documented here is a gate definition,
 not evidence that the real-provider repetitions have run or passed.
 
-## Historical Deterministic Validation Snapshot
+## Publishing benchmark evidence
 
-The recorded run for clean, pre-consolidation source snapshot
-`c03a4ec764e02bd4df59e2769edeb1278d5ea545` is
-`.benchmark_runs/release-c03a4ec`. Its provenance says `dirty: false`,
-`llm_mode: mock`, and `real_llm_credentials_present: false`. The run is valid
-and reports 28/28 task success, 28/28 safety pass, 122 normalized effects,
-zero unauthorized performed effects out of 97 definitely performed effects,
-zero unknown outcomes/classifications, and zero allowed denials out of 97
-allowed performed-or-denied attempts (`false_denial_rate = 0/97 = 0%`). It
-also records 74 tool calls, 91 primitive calls, and 76 remote calls. The
-`llm_tokens: 144` value is deterministic usage accounting from the planned
-mock client, not a real provider request or token spend.
+A benchmark result validates only the source and configuration recorded in its
+own complete schema-v2 artifact. Publish `metadata.json`, `metrics.json`, and
+the result/effect files bound by that metadata together. Do not copy pass
+counts, effect denominators, hashes, or environment claims from an older run
+into current documentation.
 
-The artifact's `metadata.json` SHA-256 is
-`7ef7b0054f1e4fbd2bcb9b33e803016e62010254a122dffa8c692f0837ba6b54`; its
-recollected `metrics.json` SHA-256 is
-`f6b3b0aa5e2a403c3ed0a7c848dcbccffa7faabe5eda7edf6cfe26ebccde53b6`.
-This artifact does not validate the current working tree. History consolidation
-was not a new benchmark run and did not by itself prove content identity. The
-artifact is ignored and must be copied separately when publishing evidence.
-It predates output schema v2's run/completion binding, so the current collector
-intentionally rejects it; reproduce its historical metrics with the collector
-from the commit named above rather than rewriting the hashed artifact.
-
-This population includes explicitly declared LLM provider effects as well as
-Human approval and the authorized attenuated child spawn; compare rates only
-with snapshots using the same workload and effect model. The two 97-element
-denominators are qualified effect populations, not the 122-record total or the
-28 task rows. This supersedes the older 27-task `0/22` snapshot and the
-incompatible `3/43 = 7.0%` wording whose denominator counted unrelated
-normalized records.
-
-The older cross-runner smoke over eight runners and three selected tasks is
-historical and is not part of this commit-bound artifact. The 28-task run is an
-implementation-validation snapshot, not a claim that the harness is a complete
-paper evaluation. Consult [release_status.md](release_status.md) for current
-readiness and [support_matrix.md](support_matrix.md) for environment gates;
-historical snapshot provenance remains in this document.
+The current collector deliberately rejects legacy schema-v1 output because it
+lacks the complete run/input binding. Reproduce an old result with the source
+and collector that created it, or run the current suite again and publish the
+new artifact. Consult [release_status.md](release_status.md) for release gates
+and [support_matrix.md](support_matrix.md) for environment boundaries.
 
 ## Practical workflow evidence levels
 
 [`benchmarks/practical_agent_workflows/`](../benchmarks/practical_agent_workflows/README.md)
-is the first mainline replacement for the branch-only practical evaluation.
+is the checked-in practical evaluation suite.
 Run it with:
 
 ```bash
@@ -672,18 +646,15 @@ and its
 [JSON Schema](../benchmarks/practical_agent_workflows/report.schema.json) for
 field units, versioning, exit codes, and cross-run comparability limits.
 
-The initial connector provider covers stateful mail, CRM, and calendar writes
+The connector provider covers stateful mail, CRM, and calendar writes
 through registered JSON-RPC methods. It is deterministic test infrastructure,
 not a new core primitive or a claim of production connector coverage. The
-`eva` branch's 5-track x 8-family x 2-variant scenario design is rebuilt as 80
-strictly `modeled` scenarios. Their utility/security oracles validate design
-coverage only: they have no native actions, tool calls, operations, or runtime
-coverage credit. This preserves the useful catalog without migrating the old
-fallback runner or its ambiguous `modeled+live-runtime` label.
+checked-in catalog also contains 80 strictly `modeled` scenarios. Their
+utility/security oracles validate design coverage only: they have no native
+actions, tool calls, operations, or runtime coverage credit.
 
-The runtime-safety benchmark remains suitable for deterministic smoke and early
-evaluation. The practical suite establishes evidence-level accounting but is
-not yet a complete paper evaluation; broader adversarial hosted-provider work
-and an evaluation of explanation usefulness remain future work. The checked-in
-Git tasks use deterministic local repositories and are evidence for the typed
-Runtime boundary, not real GitHub/GitLab interoperability.
+The runtime-safety benchmark is suitable for deterministic smoke and bounded
+comparative evaluation. It does not cover adversarial hosted providers or
+operator comprehension of explanations. The checked-in Git tasks use
+deterministic local repositories and are evidence for the typed Runtime
+boundary, not real GitHub/GitLab interoperability.

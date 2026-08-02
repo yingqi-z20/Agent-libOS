@@ -30,7 +30,11 @@ def normalize_process_path_argument(path: str, cwd: str) -> str:
     del cwd
     normalized = str(path)
     has_windows_drive = os.name == "nt" and bool(os.path.splitdrive(normalized)[0])
-    if os.path.isabs(normalized) or has_windows_drive:
+    # Python 3.13+ no longer treats a single leading slash or backslash as
+    # absolute in ntpath.isabs().  It is still rooted rather than relative to
+    # the process working directory, so reject it explicitly on Windows.
+    has_windows_root = os.name == "nt" and normalized.startswith(("/", "\\"))
+    if os.path.isabs(normalized) or has_windows_drive or has_windows_root:
         raise ValueError("path must be relative to the process working directory")
     if os.name == "nt":
         return normalized.replace("\\", "/")

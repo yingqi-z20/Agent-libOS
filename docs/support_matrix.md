@@ -35,7 +35,7 @@ Legend:
 
 | Surface | Per-change CI | Environment gate |
 | --- | --- | --- |
-| React/Vitest | Ubuntu, Node 24 with the npm version supplied by that toolchain, source tests | The package declares Node `>=22.12.0` and npm `>=8`, but those lower compatibility bounds are not separate per-change CI jobs; browser accessibility and operator usability studies are not automated |
+| React/Vitest | Ubuntu, Node 24 LTS with the npm version supplied by that toolchain, source tests | The package declares Node `^24.15.0 || >=26.0.0` and npm `>=11`; Node 26 Current satisfies the engine contract but is not a separate per-change CI job. Browser accessibility and operator usability studies are not automated |
 | Web and Electron TypeScript | Typecheck and production build on Ubuntu | Native Electron packaging/signing/notarization are not configured release jobs |
 | Python GUI HTTP/SSE server | Providers lane exercises auth, route validation, bounded event windows, shutdown, CORS, schema-v2 snapshots, Durable Task Run pagination/mutations, stable 409 conflicts, confirmation gates, and redacted monotonic SSE summaries | Native desktop process lifecycle remains platform-specific |
 | Headless Electron main-process smoke | Not in the default GUI lane | Run `AGENT_LIBOS_GUI_SMOKE=1 npm --prefix gui run electron:dev` |
@@ -46,7 +46,7 @@ Legend:
 
 | Suite | Default evidence | Boundary |
 | --- | --- | --- |
-| `benchmarks/runtime_safety` | 32 deterministic schema-v1 tasks, including data-label exfiltration plus Git worktree containment, malicious config, remote misuse, and patch lineage; fail-closed metrics and provenance-bearing CLI metadata | Early runtime-safety workload, not a complete paper evaluation or formal proof; Git network tasks use controlled local state rather than a hosted provider |
+| `benchmarks/runtime_safety` | 32 deterministic schema-v1 tasks, including data-label exfiltration plus Git worktree containment, malicious config, remote misuse, and patch lineage; fail-closed metrics and provenance-bearing CLI metadata | Bounded runtime-safety workload, not a comprehensive production evaluation or formal proof; Git network tasks use controlled local state rather than a hosted provider |
 | `benchmarks/practical_agent_workflows` | Exactly two labels: `native-live` and `modeled`; native has no modeled fallback | Checked-in scenarios do not imply a real GitHub/provider integration |
 | `benchmarks/external_effect_recovery` | 100k-record `ci` profile on each change; one-million-record `million` profile in the manual/nightly workflow | Structural paging/index/convergence checks are gates; elapsed times are diagnostic, not SLAs |
 | `benchmarks/runtime_publication_recovery` | 10k terminal publications with 1,001 unreconciled rows in the only named profile, `ci` | No one-million-publication profile is currently implemented; custom sizes are explicit CLI overrides |
@@ -73,8 +73,8 @@ service, GUI, AgentDojo, scale, and artifact gates nor repeats the equivalent
 per-lane CI matrix. Before advertising a platform or provider configuration as
 release-validated, record a fresh native run for the corresponding
 environment-gate cells above. Do not copy counts or “remaining gates” from
-`docs/prelaunch_hardening_report.md`; that file is bound to its historical
-commit.
+prior revisions of `docs/prelaunch_hardening_report.md`; that path now contains
+only a retirement notice for the old commit-bound report.
 
 The checked-in Windows 3.11 jobs are CI evidence for the deterministic paths
 they actually execute; they are not a claim of a separate local Windows run and

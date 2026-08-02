@@ -903,8 +903,7 @@ separate controls are:
 - `payload_capture_limit_bytes`, for each captured Object payload;
 - `max_required_capabilities`;
 - `max_committed_tools`;
-- `max_committed_jit_sources`;
-- `metadata_preview_chars`.
+- `max_committed_jit_sources`.
 
 Exceeding an image-commit limit fails the commit even when creation of the
 source checkpoint succeeded. Conversely, increasing a checkpoint snapshot

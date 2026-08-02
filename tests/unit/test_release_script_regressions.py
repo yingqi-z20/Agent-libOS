@@ -88,17 +88,6 @@ def test_object_copy_visibility_check_uses_structured_text_not_json_encoding() -
     assert _contains_text({"nested": [{"digest": "abc"}]}, source) is False
 
 
-def test_legacy_interactive_scripts_are_import_safe_and_chat_goal_is_text() -> None:
-    from scripts import testChat, testCoding
-
-    assert isinstance(testChat.CHAT_GOAL, str)
-    assert "ask_human" in testChat.CHAT_GOAL
-    assert callable(testChat.run_chat)
-    assert callable(testCoding.run_coding)
-    assert not hasattr(testChat, "runtime")
-    assert not hasattr(testCoding, "runtime")
-
-
 def test_write_evidence_requires_matching_receipt_and_committed_exact_effect() -> None:
     expected_path = "agent_outputs/result.txt"
     resource = f"filesystem:workspace:{expected_path}"

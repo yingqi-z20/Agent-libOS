@@ -43,6 +43,8 @@ from agent_libos.runtime.syscalls import LibOSSyscallSession
 
 CHILD_PROCESS_SKILL = "agent-libos-child-processes"
 HUMAN_COLLABORATION_SKILL = "agent-libos-human-collaboration"
+REAL_DEADLINE_TEST_WINDOW_S = 5.0
+THREAD_SYNC_TIMEOUT_S = 30.0
 
 
 def _config():
@@ -346,7 +348,7 @@ class _BlockingExitClient:
         self.calls += 1
         self.messages = [dict(message) for message in _messages]
         self.entered.set()
-        if not self.release.wait(timeout=10):
+        if not self.release.wait(timeout=THREAD_SYNC_TIMEOUT_S):
             raise AssertionError("test did not release the blocked LLM provider")
         return _completion(
             f"blocked-{self.calls}",
@@ -367,7 +369,7 @@ class _BlockingDiscoverClient:
     ) -> LLMCompletion:
         self.calls += 1
         self.entered.set()
-        if not self.release.wait(timeout=10):
+        if not self.release.wait(timeout=THREAD_SYNC_TIMEOUT_S):
             raise AssertionError("test did not release the blocked LLM provider")
         return _completion(
             f"blocked-discover-{self.calls}",
@@ -664,7 +666,7 @@ def test_tool_dispatched_after_follow_up_keeps_frozen_old_requirement_binding(
                 command_id="run:frozen-binding-before-follow-up",
                 max_quanta=1,
             )
-            assert provider.entered.wait(timeout=5)
+            assert provider.entered.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             running = runtime.task_runs.get(created.run_id)
             followed = runtime.task_runs.follow_up(
                 created.run_id,
@@ -675,7 +677,7 @@ def test_tool_dispatched_after_follow_up_keeps_frozen_old_requirement_binding(
                 command_id="follow-up:frozen-binding-race",
             )
             provider.release.set()
-            future.result(timeout=10)
+            future.result(timeout=THREAD_SYNC_TIMEOUT_S)
 
         tool_operations = [
             operation
@@ -1516,7 +1518,7 @@ def test_task_run_large_quantum_budget_returns_at_real_human_wait(
             tools: list[dict[str, Any]],
         ) -> LLMCompletion:
             entered_provider.set()
-            if not release_provider.wait(timeout=5):
+            if not release_provider.wait(timeout=THREAD_SYNC_TIMEOUT_S):
                 raise AssertionError("test did not release the slow LLM provider")
             return super().complete_action(messages, tools)
 
@@ -1553,9 +1555,9 @@ def test_task_run_large_quantum_budget_returns_at_real_human_wait(
                 command_id="run:large-budget-human-wait",
                 max_quanta=48,
             )
-            assert entered_provider.wait(timeout=2)
+            assert entered_provider.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             release_provider.set()
-            waiting = future.result(timeout=5)
+            waiting = future.result(timeout=THREAD_SYNC_TIMEOUT_S)
 
         assert waiting.status is TaskRunStatus.WAITING_HUMAN
         assert client.calls == 1
@@ -2015,7 +2017,7 @@ def test_task_run_cancel_during_inflight_llm_never_fakes_terminal_success(
                 command_id="run:inflight",
                 max_quanta=1,
             )
-            assert client.entered.wait(timeout=5)
+            assert client.entered.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             running = runtime.task_runs.get(created.run_id)
             assert running.status is TaskRunStatus.RUNNING
             cancellation = runtime.task_runs.cancel(
@@ -2029,7 +2031,7 @@ def test_task_run_cancel_during_inflight_llm_never_fakes_terminal_success(
                 blocker["kind"] for blocker in cancellation.blockers
             }
             client.release.set()
-            worker_result = future.result(timeout=10)
+            worker_result = future.result(timeout=THREAD_SYNC_TIMEOUT_S)
 
         final = runtime.task_runs.get(created.run_id)
         assert client.calls == 1
@@ -2068,12 +2070,12 @@ def test_task_run_quantum_budget_drains_admitted_provider_before_returning(
                 command_id="run:budget-drains-provider",
                 max_quanta=1,
             )
-            assert client.entered.wait(timeout=5)
+            assert client.entered.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             time.sleep(0.05)
             assert not future.done()
 
             client.release.set()
-            completed = future.result(timeout=10)
+            completed = future.result(timeout=THREAD_SYNC_TIMEOUT_S)
 
         assert completed.status is TaskRunStatus.SUCCEEDED
         assert runtime.process.get(root_pid).status is ProcessStatus.EXITED
@@ -2094,14 +2096,20 @@ def test_inflight_settlement_cannot_strand_control_attention_on_revision_race(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    deadline_at = (
-        (datetime.now(timezone.utc) + timedelta(seconds=0.5)).isoformat()
-        if control == "deadline"
-        else None
-    )
     runtime = Runtime.open(
         tmp_path / f"{control}-attention-revision-race.sqlite",
         config=_config(),
+    )
+    # Start the real-time window after the potentially slow Windows store
+    # setup.  This test exercises settlement/deadline linearization, not the
+    # startup speed of a loaded CI runner.
+    deadline_at = (
+        (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=REAL_DEADLINE_TEST_WINDOW_S)
+        ).isoformat()
+        if control == "deadline"
+        else None
     )
     client = _BlockingExitClient()
     try:
@@ -2145,7 +2153,7 @@ def test_inflight_settlement_cannot_strand_control_attention_on_revision_race(
                 # `_mark_attention` has already read this expected revision. Let
                 # the admitted Provider settlement advance it before the CAS.
                 attention_read.set()
-                if not settlement_committed.wait(timeout=10):
+                if not settlement_committed.wait(timeout=THREAD_SYNC_TIMEOUT_S):
                     raise AssertionError(
                         "admitted Provider settlement did not advance the Run revision"
                     )
@@ -2164,7 +2172,7 @@ def test_inflight_settlement_cannot_strand_control_attention_on_revision_race(
                 command_id=f"run:{control}-attention-revision-race",
                 max_quanta=1,
             )
-            assert client.entered.wait(timeout=5)
+            assert client.entered.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             running = runtime.task_runs.get(created.run_id)
             assert running.status is TaskRunStatus.RUNNING
 
@@ -2186,10 +2194,10 @@ def test_inflight_settlement_cannot_strand_control_attention_on_revision_race(
                     command_id="cancel:attention-revision-race",
                 )
 
-            assert attention_read.wait(timeout=5)
+            assert attention_read.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             client.release.set()
-            controlled = control_future.result(timeout=10)
-            run_future.result(timeout=10)
+            controlled = control_future.result(timeout=THREAD_SYNC_TIMEOUT_S)
+            run_future.result(timeout=THREAD_SYNC_TIMEOUT_S)
 
         assert settlement_committed.is_set()
         assert attention_attempts >= 2
@@ -2250,7 +2258,7 @@ def test_cancel_intent_dominates_an_already_admitted_process_exit(
         ) -> dict[str, Any]:
             if action.get("action") == "process_exit":
                 tool_admitted.set()
-                if not release_tool.wait(timeout=10):
+                if not release_tool.wait(timeout=THREAD_SYNC_TIMEOUT_S):
                     raise AssertionError("test did not release admitted process_exit")
             return await original_adispatch(pid, action, **kwargs)
 
@@ -2259,7 +2267,7 @@ def test_cancel_intent_dominates_an_already_admitted_process_exit(
 
         def blocked_stage_completed_transcript(**kwargs: Any) -> None:
             stage_entered.set()
-            if not release_stage.wait(timeout=10):
+            if not release_stage.wait(timeout=THREAD_SYNC_TIMEOUT_S):
                 raise AssertionError("test did not release local result staging")
             original_stage(**kwargs)
 
@@ -2283,7 +2291,7 @@ def test_cancel_intent_dominates_an_already_admitted_process_exit(
                 command_id="run:cancel-admitted-process-exit",
                 max_quanta=1,
             )
-            assert tool_admitted.wait(timeout=5)
+            assert tool_admitted.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             running = runtime.task_runs.get(created.run_id)
             assert running.status is TaskRunStatus.RUNNING
 
@@ -2296,7 +2304,7 @@ def test_cancel_intent_dominates_an_already_admitted_process_exit(
             assert runtime.process.get(root_pid).status is ProcessStatus.RUNNING
 
             release_tool.set()
-            assert stage_entered.wait(timeout=5)
+            assert stage_entered.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             raced_projection = runtime.task_runs._project(
                 runtime.task_runs._require_run(created.run_id),
                 allow_finalize=True,
@@ -2307,7 +2315,7 @@ def test_cancel_intent_dominates_an_already_admitted_process_exit(
             }
             assert raced_projection.completed_at is None
             release_stage.set()
-            worker_result = run_future.result(timeout=10)
+            worker_result = run_future.result(timeout=THREAD_SYNC_TIMEOUT_S)
 
         current = runtime.task_runs.get(created.run_id)
         requirements = runtime.store.list_task_run_requirements(created.run_id)
@@ -2501,7 +2509,7 @@ def test_pause_persists_generation_then_drains_inflight_provider_without_tool_di
                 command_id="run:pause-drain",
                 max_quanta=1,
             )
-            assert client.entered.wait(timeout=5)
+            assert client.entered.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             running = runtime.task_runs.get(created.run_id)
             before_lease = runtime.process.get(root_pid)
             assert before_lease.status is ProcessStatus.RUNNING
@@ -2512,7 +2520,7 @@ def test_pause_persists_generation_then_drains_inflight_provider_without_tool_di
                 expected_revision=running.revision,
                 command_id="pause:drain",
             )
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + THREAD_SYNC_TIMEOUT_S
             persisted = runtime.store.get_task_run(created.run_id)
             while (
                 persisted is not None
@@ -2538,9 +2546,9 @@ def test_pause_persists_generation_then_drains_inflight_provider_without_tool_di
             assert not replay_future.done()
 
             client.release.set()
-            paused = pause_future.result(timeout=10)
-            replayed = replay_future.result(timeout=10)
-            worker_result = run_future.result(timeout=10)
+            paused = pause_future.result(timeout=THREAD_SYNC_TIMEOUT_S)
+            replayed = replay_future.result(timeout=THREAD_SYNC_TIMEOUT_S)
+            worker_result = run_future.result(timeout=THREAD_SYNC_TIMEOUT_S)
 
         assert paused.status is TaskRunStatus.PAUSED
         assert replayed == paused
@@ -2579,7 +2587,7 @@ def test_concurrent_and_repeated_evidence_projection_is_idempotent(
 
     def synchronized_tree_processes(run_id: str) -> list[Any]:
         processes = original_tree_processes(run_id)
-        projection_barrier.wait(timeout=5)
+        projection_barrier.wait(timeout=THREAD_SYNC_TIMEOUT_S)
         return processes
 
     try:
@@ -2600,7 +2608,7 @@ def test_concurrent_and_repeated_evidence_projection_is_idempotent(
                 pool.submit(runtime.task_runs.list_ledger, created.run_id, limit=100)
                 for _ in range(2)
             ]
-            pages = [future.result(timeout=10) for future in futures]
+            pages = [future.result(timeout=THREAD_SYNC_TIMEOUT_S) for future in futures]
         assert pages[0].records == pages[1].records
 
         monkeypatch.setattr(
@@ -2685,7 +2693,7 @@ def test_control_generation_is_checked_before_each_tool_in_a_batch(
         tool_calls.append(handle.name)
         if len(tool_calls) == 1:
             first_entered.set()
-            if not release_first.wait(timeout=10):
+            if not release_first.wait(timeout=THREAD_SYNC_TIMEOUT_S):
                 raise AssertionError("test did not release the first tool")
         return await original_acall(
             pid,
@@ -2712,7 +2720,7 @@ def test_control_generation_is_checked_before_each_tool_in_a_batch(
                 command_id=f"run:batch-{control}",
                 max_quanta=1,
             )
-            assert first_entered.wait(timeout=5)
+            assert first_entered.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             running = runtime.task_runs.get(created.run_id)
             if control == "pause":
                 control_future = pool.submit(
@@ -2730,7 +2738,7 @@ def test_control_generation_is_checked_before_each_tool_in_a_batch(
                     expected_revision=running.revision,
                     command_id="interrupt:batch",
                 )
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + THREAD_SYNC_TIMEOUT_S
             intent = runtime.store.get_task_run(created.run_id)
             while (
                 intent is not None
@@ -2745,8 +2753,8 @@ def test_control_generation_is_checked_before_each_tool_in_a_batch(
             assert not control_future.done()
 
             release_first.set()
-            controlled = control_future.result(timeout=10)
-            worker = run_future.result(timeout=10)
+            controlled = control_future.result(timeout=THREAD_SYNC_TIMEOUT_S)
+            worker = run_future.result(timeout=THREAD_SYNC_TIMEOUT_S)
 
         assert client.calls == 1
         assert tool_calls == ["discover_skills"]
@@ -2808,7 +2816,7 @@ def test_interrupt_generation_fences_old_run_command_before_scope_admission(
     @contextmanager
     def delayed_dispatch(run_id: str, *, pause_generation: int):
         dispatch_ready.set()
-        if not release_old_dispatch.wait(timeout=10):
+        if not release_old_dispatch.wait(timeout=THREAD_SYNC_TIMEOUT_S):
             raise AssertionError("test did not release the old run command")
         with original_dispatch(
             run_id,
@@ -2834,7 +2842,7 @@ def test_interrupt_generation_fences_old_run_command_before_scope_admission(
                 command_id="run:old-generation",
                 max_quanta=1,
             )
-            assert dispatch_ready.wait(timeout=5)
+            assert dispatch_ready.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             running = runtime.task_runs.get(created.run_id)
             interrupted = runtime.task_runs.follow_up(
                 created.run_id,
@@ -2849,7 +2857,7 @@ def test_interrupt_generation_fences_old_run_command_before_scope_admission(
             assert persisted is not None and persisted.pause_generation == 1
 
             release_old_dispatch.set()
-            worker = run_future.result(timeout=10)
+            worker = run_future.result(timeout=THREAD_SYNC_TIMEOUT_S)
 
         assert worker.status is TaskRunStatus.RUNNING
         assert client.calls == 0
@@ -2978,7 +2986,7 @@ def test_follow_up_interrupt_during_inflight_llm_remains_unsatisfied(
                 command_id="run:before-follow-up",
                 max_quanta=1,
             )
-            assert client.entered.wait(timeout=5)
+            assert client.entered.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             running = runtime.task_runs.get(created.run_id)
             follow_future = pool.submit(
                 runtime.task_runs.follow_up,
@@ -2989,7 +2997,7 @@ def test_follow_up_interrupt_during_inflight_llm_remains_unsatisfied(
                 expected_revision=running.revision,
                 command_id="follow-up:interrupt",
             )
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + THREAD_SYNC_TIMEOUT_S
             intent = runtime.store.get_task_run(created.run_id)
             while (
                 intent is not None
@@ -3011,8 +3019,8 @@ def test_follow_up_interrupt_during_inflight_llm_remains_unsatisfied(
                 sort_keys=True,
             )
             client.release.set()
-            followed = follow_future.result(timeout=10)
-            worker_result = run_future.result(timeout=10)
+            followed = follow_future.result(timeout=THREAD_SYNC_TIMEOUT_S)
+            worker_result = run_future.result(timeout=THREAD_SYNC_TIMEOUT_S)
 
         requirements = runtime.store.list_task_run_requirements(created.run_id)
         follow_up = requirements[-1]
@@ -3082,7 +3090,7 @@ def test_normal_follow_up_during_inflight_llm_cannot_be_satisfied_by_old_exit(
                 command_id="run:before-normal-follow-up",
                 max_quanta=1,
             )
-            assert client.entered.wait(timeout=5)
+            assert client.entered.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             running = runtime.task_runs.get(created.run_id)
             followed = runtime.task_runs.follow_up(
                 created.run_id,
@@ -3094,7 +3102,7 @@ def test_normal_follow_up_during_inflight_llm_cannot_be_satisfied_by_old_exit(
             )
             assert followed.requirement_count == 2
             client.release.set()
-            worker_result = future.result(timeout=10)
+            worker_result = future.result(timeout=THREAD_SYNC_TIMEOUT_S)
 
         requirements = runtime.store.list_task_run_requirements(created.run_id)
         follow_up = requirements[-1]

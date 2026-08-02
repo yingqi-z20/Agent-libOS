@@ -26,12 +26,6 @@ else:
 class ImageCheckpointPort(Protocol):
     """Checkpoint operations needed to build a checkpoint-derived image."""
 
-    def load_checkpoint_artifact(
-        self,
-        checkpoint_id: str,
-    ) -> tuple[Any, dict[str, Any]]:
-        ...
-
     def load_checkpoint_artifact_for_read(
         self,
         checkpoint_id: str,
@@ -48,9 +42,6 @@ class ImageCheckpointPort(Protocol):
         *,
         purpose: str,
     ) -> AbstractContextManager[Any]:
-        ...
-
-    def preflight_checkpoint(self, checkpoint_id: str) -> None:
         ...
 
     def preflight_checkpoint_read(

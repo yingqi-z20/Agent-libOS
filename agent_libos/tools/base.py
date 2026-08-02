@@ -1203,7 +1203,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
         *,
         config: AgentLibOSConfig,
     ) -> InputT:
-        """Call old and new parser overrides once, based on their signatures."""
+        """Call parser overrides once, with runtime config when accepted."""
 
         parser = self.parse_args
         try:

@@ -324,25 +324,6 @@ def capture_explicit_dotenv_environment(
     )
 
 
-def validate_explicit_dotenv_environment(env_file: str | Path) -> dict[str, str]:
-    """Require the selected dotenv file to be the effective OpenAI config.
-
-    ``LLMClient.from_env`` intentionally gives the process environment precedence
-    over a dotenv file.  Evaluation runs need a stronger provenance contract: an
-    ambient setting may be present only when it is byte-for-byte identical to the
-    selected file.  Reject conflicts before constructing a provider client, and
-    never include secret values in the diagnostic.
-    """
-
-    env_path = Path(env_file)
-    try:
-        dotenv = _read_dotenv_bytes(env_path.read_bytes())
-    except OSError as exc:
-        raise PipelineRunError(f"dotenv file does not exist: {env_path}") from exc
-    _validate_explicit_dotenv_values(dotenv)
-    return dotenv
-
-
 def _read_dotenv_bytes(raw: bytes) -> dict[str, str]:
     values: dict[str, str] = {}
     for raw_line in raw.decode("utf-8").splitlines():

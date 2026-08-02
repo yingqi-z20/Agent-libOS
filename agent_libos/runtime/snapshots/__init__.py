@@ -1,7 +1,7 @@
 from agent_libos.runtime.snapshots.codec import SnapshotCodec, SnapshotVersionError
 from agent_libos.runtime.snapshots.coordinator import SnapshotCoordinator
 from agent_libos.runtime.snapshots.exec_state import ProcessExecStateService
-from agent_libos.runtime.snapshots.models import (
+from agent_libos.models.snapshot import (
     ExecRollbackState,
     SNAPSHOT_SCHEMA_VERSION,
     ProcessSnapshot,

@@ -680,7 +680,7 @@ export function App() {
     }
   }
 
-  function selectLegacyProcess(pid: string) {
+  function selectProcessGroup(pid: string) {
     setSelectedRunId(null);
     setSelectedPid(pid || null);
   }
@@ -765,7 +765,6 @@ export function App() {
       return succeeded;
     }
     if (!client || !selectedProcess || !requireValidQuanta()) return false;
-    const pid = selectedProcess.pid;
     return safe(async () => {
       mergeProcessResult(await runOrResumeProcess(client, selectedProcess, maxQuanta));
     }, "process.run", false);
@@ -1199,7 +1198,7 @@ export function App() {
           message={message}
           images={snapshot?.images ?? []}
           llmProfiles={snapshot?.llm_profiles ?? []}
-          onSelectPid={selectLegacyProcess}
+          onSelectPid={selectProcessGroup}
           onSelectRun={selectTaskRun}
           onLoadMoreTaskRunHumanRequests={() => void loadSelectedRunHumanRequests(true)}
           onMaxQuantaChange={setMaxQuantaInput}

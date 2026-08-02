@@ -39,7 +39,6 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.ports import AuditPort, CapabilityStorePort, EventPort, OperationPort
-from agent_libos.utils.ids import utc_now
 
 
 CAPABILITY_MANAGER_MUTATION_PUBLIC_METHODS = frozenset(
@@ -137,8 +136,6 @@ class CapabilityManager:
     APPROVAL_BINDING_KEY = APPROVAL_BINDING_CONSTRAINT_KEY
     DATA_RELEASE_BINDING_KEY = DATA_RELEASE_BINDING_CONSTRAINT_KEY
     POLICY_VALUES = {ALWAYS_ALLOW, ALWAYS_DENY, ASK_EACH_TIME, ALLOW_ONCE}
-
-    _KNOWN_CONSTRAINT_KEYS = KNOWN_CONSTRAINT_KEYS
 
     def __init__(
         self,
@@ -1518,8 +1515,11 @@ class CapabilityManager:
 
     def constraints_satisfied(self, cap: Capability, context: OperationContext | dict[str, Any] | None = None) -> bool:
         selected_context = self._context_dict(context)
-        results = self._evaluate_constraints(cap, selected_context)
-        return all(bool(item.get("ok")) for item in results.values()) and self._constraint_effect(results) != CapabilityEffect.DENY
+        results = self.evaluator.evaluate_constraints(cap, selected_context)
+        return (
+            all(bool(item.get("ok")) for item in results.values())
+            and self.evaluator.constraint_effect(results) != CapabilityEffect.DENY
+        )
 
     def spec(
         self,
@@ -1771,13 +1771,13 @@ class CapabilityManager:
                 f"capability {cap.cap_id} has malformed authority rules"
             ) from exc
         for rule in rules:
-            unknown_conditions = self._unknown_authority_rule_conditions(rule)
+            unknown_conditions = self.evaluator.unknown_authority_rule_conditions(rule)
             if unknown_conditions:
                 raise CapabilityDenied(
                     f"{subject} cannot {action} {sorted(spec.rights)} on {spec.resource}; "
                     f"capability {cap.cap_id} has unknown authority rule conditions"
                 )
-            malformed_conditions = self._malformed_authority_rule_conditions(rule)
+            malformed_conditions = self.evaluator.malformed_authority_rule_conditions(rule)
             if malformed_conditions:
                 raise CapabilityDenied(
                     f"{subject} cannot {action} {sorted(spec.rights)} on {spec.resource}; "
@@ -2258,46 +2258,18 @@ class CapabilityManager:
         if AUTHORITY_RULES_KEY in constraints:
             rules = self.rule_codec.coerce_many(constraints[AUTHORITY_RULES_KEY])
             for rule in rules:
-                unknown = self._unknown_authority_rule_conditions(rule)
+                unknown = self.evaluator.unknown_authority_rule_conditions(rule)
                 if unknown:
                     raise ValidationError(
                         "capability authority rule contains unknown conditions: "
                         + ", ".join(unknown)
                     )
-                malformed = self._malformed_authority_rule_conditions(rule)
+                malformed = self.evaluator.malformed_authority_rule_conditions(rule)
                 if malformed:
                     raise ValidationError(
                         "capability authority rule contains malformed conditions: "
                         + ", ".join(malformed)
                     )
-
-    def _evaluate_constraints(self, cap: Capability, context: dict[str, Any]) -> dict[str, Any]:
-        return self.evaluator.evaluate_constraints(cap, context)
-
-    def _constraint_effect(self, constraint_results: dict[str, Any]) -> CapabilityEffect | None:
-        return self.evaluator.constraint_effect(constraint_results)
-
-    def _constraint_failure_is_scoped_miss(self, constraint_results: dict[str, Any]) -> bool:
-        return self.evaluator.constraint_failure_is_scoped_miss(constraint_results)
-
-    def _evaluate_authority_rules(self, rules: list[Any], context: dict[str, Any]) -> dict[str, Any]:
-        return self.evaluator.evaluate_authority_rules(rules, context)
-
-    def _unknown_authority_rule_conditions(self, rule: Any) -> list[str]:
-        return self.evaluator.unknown_authority_rule_conditions(rule)
-
-    def _malformed_authority_rule_conditions(self, rule: Any) -> list[str]:
-        return self.evaluator.malformed_authority_rule_conditions(rule)
-
-    def _authority_rule_matches(self, rule: Any, context: dict[str, Any]) -> bool:
-        return self.evaluator.authority_rule_matches(rule, context)
-
-    @staticmethod
-    def _finite_nonnegative_timeout(value: Any) -> float | None:
-        return CapabilityEvaluator.finite_nonnegative_timeout(value)
-
-    def _argv_condition_matches(self, conditions: dict[str, Any], context: dict[str, Any]) -> bool:
-        return self.evaluator.argv_condition_matches(conditions, context)
 
     def _require_constraint_attenuation(self, parent_cap: Capability, spec: CapabilitySpec) -> None:
         error = self._constraint_attenuation_error(
@@ -2318,7 +2290,7 @@ class CapabilityManager:
         for key in delegated_constraints:
             if key in parent_constraints:
                 continue
-            if key not in self._KNOWN_CONSTRAINT_KEYS:
+            if key not in KNOWN_CONSTRAINT_KEYS:
                 return f"delegated capability uses unknown constraint: {key}"
             # These constraints select an authority effect rather than merely
             # narrowing the operation context. Adding either one can turn an

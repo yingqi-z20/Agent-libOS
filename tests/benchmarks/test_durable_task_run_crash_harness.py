@@ -16,6 +16,7 @@ from benchmarks.durable_task_runs import (
     run_crash_matrix,
     run_unpaired_committed_result_scenario,
 )
+from experiments import run_task_run_crash_matrix as crash_matrix_cli
 from experiments.run_task_run_crash_matrix import main as crash_matrix_main
 
 
@@ -26,9 +27,10 @@ def test_six_durability_barriers_use_independent_fsync_provider_truth(
 
     assert {result.barrier for result in results} == set(DurabilityBarrier)
     by_barrier = {result.barrier: result for result in results}
+    kill_signal = getattr(signal, "SIGKILL", None)
     assert (
         by_barrier[DurabilityBarrier.PROVIDER_DISPATCHED].process_returncode
-        == -signal.SIGKILL
+        == (-int(kill_signal) if kill_signal is not None else CRASH_EXIT_CODE)
     )
     assert all(
         result.process_returncode == CRASH_EXIT_CODE
@@ -204,3 +206,38 @@ def test_crash_matrix_cli_writes_only_a_complete_passing_artifact(
         persisted["unpaired_committed_after_safe_point"]["recovery_class"]
         == RecoveryClass.UNKNOWN_EFFECT.value
     )
+
+
+def test_crash_matrix_output_replaces_symlink_without_modifying_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PassingResult:
+        passed = True
+
+    result = PassingResult()
+    monkeypatch.setattr(crash_matrix_cli, "run_crash_matrix", lambda _work: (result,))
+    monkeypatch.setattr(
+        crash_matrix_cli,
+        "run_unpaired_committed_result_scenario",
+        lambda _work: result,
+    )
+    monkeypatch.setattr(
+        crash_matrix_cli,
+        "_result_payload",
+        lambda item: {"passed": item.passed},
+    )
+    target = tmp_path / "unrelated.json"
+    original = '{"unrelated": true}\n'
+    target.write_text(original, encoding="utf-8")
+    output = tmp_path / "matrix.json"
+    try:
+        output.symlink_to(target)
+    except (NotImplementedError, OSError):
+        pytest.skip("host does not permit file symlink creation")
+
+    payload = crash_matrix_cli.run(output)
+
+    assert not output.is_symlink()
+    assert target.read_text(encoding="utf-8") == original
+    assert json.loads(output.read_text(encoding="utf-8")) == payload

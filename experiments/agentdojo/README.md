@@ -1,4 +1,4 @@
-# AgentDojo native-semantics pilot
+# AgentDojo native-semantics evaluation harness
 
 This isolated subproject evaluates Agent libOS with AgentDojo without adding
 AgentDojo's broad SDK dependency graph to the repository's root lock.
@@ -18,25 +18,19 @@ The harness fixes two paired arms:
   are ambiently available. This is an integration/behavior arm, not a claim
   that Capability, approval, IFC, or protected external effects are enforced.
 
-The default ambient prompt envelope remains `minimal_runtime`, preserving the
-configuration selected by the initial pilot. Commit `bac4764` deliberately
-redefined `image_only`: it now sends the exact AgentDojo system message, the raw
-user goal, and a durable native assistant/tool transcript. The earlier
-`image_only` evidence used the removed Object Memory snapshot semantics and is
-kept only as a historical baseline. A new four-suite direct acceptance run is
-recorded in [the 2026-07-25 initial report](INITIAL_REPORT_2026-07-25.md). The
-complete 2,162-trajectory paired evaluation, including strict artifact hashes,
-is recorded in [the 2026-07-26 final report](FINAL_REPORT_2026-07-26.md). Use
-`--libos-prompt-mode` to select these modes explicitly.
+The default ambient prompt envelope is `minimal_runtime`. The `image_only`
+mode sends the exact AgentDojo system message, the raw user goal, and a durable
+native assistant/tool transcript. The `minimal_runtime` and `libos_default`
+modes use Agent libOS runtime prompt composition instead. Use
+`--libos-prompt-mode` to select a mode explicitly.
 
 With `image_only`, both arms begin with system/user messages and continue with
 native assistant/tool history; Capability, approval, IFC, audit, and external
 effect controls remain outside the model-visible transcript. The
-`minimal_runtime` and `libos_default` ablations still use Agent libOS runtime
-prompt composition. Provider-request traces preserve these differences. The
-trace captures LLMClient input before provider schema normalization; the
-verifier separately checks paired tool-name sets and normalized chat schema
-maps. Tool ordering can still differ and is reported as an observation.
+provider-request traces preserve these differences. The trace captures
+LLMClient input before provider schema normalization; the verifier separately
+checks paired tool-name sets and normalized chat schema maps. Tool ordering can
+still differ and is reported as an observation.
 Trajectory execution is also deterministic rather than counterbalanced:
 `upstream_control` runs immediately before `libos_ambient` for each semantic
 case and repetition. Pairing therefore aligns case inputs but does not eliminate
@@ -206,3 +200,12 @@ The model naturally ends with assistant text, whereas the current Agent libOS
 scheduler requires an action. `libos_ambient` therefore registers a runtime-only
 terminal carrier. It is removed from every provider tool list and excluded from
 tool-call metrics; deterministic tests verify both properties.
+
+## Historical evaluation record
+
+The [2026-07-26 evaluation report](FINAL_REPORT_2026-07-26.md) records one
+dated run against AgentDojo benchmark `v1.2.2`. Its local artifacts use an
+older evidence schema and are intentionally rejected by the current verifier.
+Treat the report as historical methodology and results, not as a current
+release performance or security claim. Generate and strictly verify a new run
+when current release evidence is required.

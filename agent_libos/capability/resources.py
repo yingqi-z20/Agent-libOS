@@ -43,8 +43,6 @@ class ResourceAuthority:
             request = self.parse(requested, requested=True)
         except CapabilityDenied:
             return False
-        if pattern.scope == ResourceScope.GLOBAL:
-            return True
         if pattern.kind != request.kind:
             return False
         if pattern.scope == ResourceScope.EXACT:
@@ -60,12 +58,7 @@ class ResourceAuthority:
 
     def covers(self, granted: str, requested_pattern: str) -> bool:
         try:
-            selected_grant = self.parse(granted)
             requested = self.parse(requested_pattern)
         except CapabilityDenied:
             return False
-        if selected_grant.raw == requested.raw:
-            return True
-        if requested.scope in {ResourceScope.PREFIX, ResourceScope.SUBTREE}:
-            return self.matches(selected_grant.raw, requested.raw)
-        return self.matches(selected_grant.raw, requested.raw)
+        return self.matches(granted, requested.raw)

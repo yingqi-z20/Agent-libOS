@@ -145,28 +145,6 @@ describe("LibOSClient", () => {
     );
   });
 
-  it("can explicitly confirm a high-risk workflow request", async () => {
-    const fetchMock = mockFetch({});
-    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
-
-    await client.runWorkflow({
-      tool: "write_text_file",
-      args: { path: "result.txt", content: "done" },
-      confirmed: true
-    });
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      "http://127.0.0.1:1/api/workflows/run",
-      expect.objectContaining({
-        body: JSON.stringify({
-          tool: "write_text_file",
-          args: { path: "result.txt", content: "done" },
-          confirmed: true
-        })
-      })
-    );
-  });
-
   it("passes typed permission decisions and scheduler options through human responses", async () => {
     const fetchMock = mockFetch({});
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
@@ -337,10 +315,10 @@ describe("LibOSClient", () => {
     const fetchMock = mockFetch({ ok: true });
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
 
-    await client.health();
+    await client.images();
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://127.0.0.1:1/api/health",
+      "http://127.0.0.1:1/api/images",
       expect.objectContaining({
         method: "GET",
         headers: { Authorization: "Bearer token", Accept: "application/json" }
@@ -364,13 +342,13 @@ describe("LibOSClient", () => {
     await expect(request).rejects.toMatchObject({ status: 403, message: "denied" });
   });
 
-  it("supports a per-call requestJson deadline", async () => {
+  it("supports a per-call request deadline", async () => {
     vi.stubGlobal("fetch", vi.fn((_url: string, init: RequestInit) => new Promise((_resolve, reject) => {
       init.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
     })));
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
 
-    await expect(client.requestJson("GET", "/api/snapshot", undefined, { timeoutMs: 5 })).rejects.toMatchObject({ name: "TimeoutError" });
+    await expect(client.request("GET", "/api/snapshot", undefined, { timeoutMs: 5 })).rejects.toMatchObject({ name: "TimeoutError" });
   });
 
   it("keeps the default read deadline while leaving non-idempotent mutations unbounded", async () => {
@@ -383,14 +361,14 @@ describe("LibOSClient", () => {
     })));
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
 
-    const readResult = client.requestJson("GET", "/api/snapshot").catch((error: unknown) => error);
+    const readResult = client.request("GET", "/api/snapshot").catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(29_999);
     expect(signals[0].aborted).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     await expect(readResult).resolves.toMatchObject({ name: "TimeoutError" });
 
     const mutationAbort = new AbortController();
-    const mutationResult = client.requestJson(
+    const mutationResult = client.request(
       "POST",
       "/api/processes",
       { goal: "slow mutation" },

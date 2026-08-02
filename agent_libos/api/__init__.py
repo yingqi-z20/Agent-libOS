@@ -1,1 +1,1 @@
-"""Host-facing API surfaces: CLI, GUI server, and future adapters."""
+"""Host-facing CLI and local GUI HTTP surfaces."""

@@ -58,9 +58,10 @@ class ScenarioContract:
 
 
 # This is deliberately not an upstream suite name.  The official ``draft`` and
-# ``all`` suites include OAuth, MRTR, and other product surfaces that 1.2.1 does
-# not implement.  The allowlist is the complete non-auth, non-MRTR client set at
-# the pinned commit that exercises the shipped Tools-only modern surface.
+# ``all`` suites include OAuth, MRTR, and other product surfaces that the current
+# release does not implement.  The allowlist is the complete non-auth, non-MRTR
+# client set at the pinned commit that exercises the shipped Tools-only modern
+# surface.
 OFFICIAL_TOOLS_ONLY_SCENARIOS: Mapping[str, ScenarioContract] = {
     "tools_call": ScenarioContract(
         required_success_ids=frozenset(

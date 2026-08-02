@@ -42,10 +42,6 @@ from agent_libos.models import (
     TaskRunSpecV1,
     process_state_to_mapping,
 )
-from agent_libos.storage.gui_visibility import (
-    is_gui_presentation_audit,
-    is_gui_presentation_event,
-)
 from agent_libos.models.exceptions import (
     CapabilityDenied,
     HumanApprovalRequired,
@@ -913,8 +909,8 @@ class GuiRuntimeService:
                     if remaining <= 0:
                         return False
                     self._lifecycle.wait(timeout=remaining)
-            # Exclude untracked legacy callers that still use runtime_lock
-            # directly while the owned Runtime releases its store handles.
+            # Exclude callers that use runtime_lock directly while the owned
+            # Runtime releases its store handles.
             remaining = max(0.0, deadline - time.monotonic())
             acquired = self.runtime_lock.acquire(timeout=remaining)
             if not acquired:
@@ -1133,14 +1129,6 @@ class GuiRuntimeService:
             include_gui_presentation=False,
         )
 
-    @staticmethod
-    def _is_gui_presentation_event(event: Any) -> bool:
-        return is_gui_presentation_event(event)
-
-    @staticmethod
-    def _is_gui_presentation_audit(record: Any) -> bool:
-        return is_gui_presentation_audit(record)
-
     def human_request_views(
         self,
         *,
@@ -1267,9 +1255,9 @@ class GuiRuntimeService:
         # Activity rows intentionally read only a bounded recent LLM window.
         # Use the process' durable, hierarchical resource counters for the
         # user-facing totals so long-running tasks are not reported as if they
-        # stopped at ``snapshot_process_llm_call_limit``.  The bounded values
-        # remain a compatibility floor for imported/manual call rows that
-        # predate resource accounting.
+        # stopped at ``snapshot_process_llm_call_limit``. The bounded values
+        # also cover persisted/manual call rows not represented in resource
+        # counters.
         llm_call_count = max(
             int(process.resource_usage.llm_calls),
             int(activity_row["llm_call_count"]),
@@ -1937,7 +1925,6 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             "recovery_options": _task_run_recovery_options(
                 manager,
                 run_id,
-                summary,
             ),
         }
 
@@ -1967,7 +1954,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 )
             )
         if action == "human-requests":
-            return self._task_run_human_request_page(run_id, query)
+            return self._task_run_human_request_page(manager, run_id, query)
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown task-runs endpoint")
 
     def _mutate_task_run(
@@ -2086,11 +2073,11 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
 
     def _task_run_human_request_page(
         self,
+        manager: Any,
         run_id: str,
         query: dict[str, list[str]],
     ) -> dict[str, Any]:
         service = self.server.service
-        manager = service.runtime.task_runs
         limit = _bounded_query_limit(
             query,
             "limit",
@@ -2102,65 +2089,22 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         )
         cursor = _query_str(query, "cursor")
         statuses = _task_run_human_query_statuses(query)
-        list_human_requests = getattr(manager, "list_human_requests", None)
-        if callable(list_human_requests):
-            page = list_human_requests(
-                run_id,
-                statuses=statuses,
-                limit=limit,
-                cursor=cursor,
-            )
-            raw_items, next_cursor, has_more = _task_run_raw_page(page)
-            items = [
-                service.human_request_view(_task_run_human_request(service, item))
-                for item in raw_items
-            ]
-            return {
-                "items": items,
-                "next_cursor": next_cursor,
-                "has_more": has_more,
-                "presentation_truncated": False,
-            }
-
-        # Compatibility fallback for a partially upgraded Runtime.  It never
-        # performs an unbounded per-process or aggregate read.  Because the
-        # legacy Human manager lacks a source cursor, advertise the incomplete
-        # presentation explicitly rather than implying a complete page walk.
-        after = _decode_task_run_human_cursor(cursor)
-        selected_statuses = set(statuses) if statuses is not None else None
-        requests: list[Any] = []
-        member_pids = tuple(sorted(set(manager.member_pids(run_id))))
-        scan_budget = limit + 1
-        for pid in member_pids:
-            if scan_budget <= 0:
-                break
-            batch = service.runtime.human.list(pid=pid, limit=scan_budget)
-            scan_budget -= len(batch)
-            for request in batch:
-                if selected_statuses is not None and _human_request_status(request) not in selected_statuses:
-                    continue
-                key = _human_request_page_key(request)
-                if after is not None and key >= after:
-                    continue
-                requests.append(request)
-                if len(requests) >= limit + 1:
-                    break
-            if scan_budget <= 0 or len(requests) >= limit + 1:
-                break
-        requests.sort(key=_human_request_page_key, reverse=True)
-        has_more = len(requests) > limit
-        selected = requests[:limit]
-        items = [service.human_request_view(request) for request in selected]
-        next_cursor = (
-            _encode_task_run_human_cursor(_human_request_page_key(selected[-1]))
-            if has_more and selected
-            else None
+        page = manager.list_human_requests(
+            run_id,
+            statuses=statuses,
+            limit=limit,
+            cursor=cursor,
         )
+        raw_items, next_cursor, has_more = _task_run_raw_page(page)
+        items = [
+            service.human_request_view(_task_run_human_request(service, item))
+            for item in raw_items
+        ]
         return {
             "items": items,
             "next_cursor": next_cursor,
             "has_more": has_more,
-            "presentation_truncated": True,
+            "presentation_truncated": False,
         }
 
     def _dispatch_workflows(self, method: str, route: list[str]) -> Any:
@@ -3379,67 +3323,6 @@ def _task_run_optional_reason(body: dict[str, Any]) -> str:
     return value
 
 
-def _encode_task_run_human_cursor(key: tuple[str, str]) -> str:
-    encoded = json.dumps(
-        {"created_at": key[0], "request_id": key[1]},
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return "h1." + base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
-
-
-def _decode_task_run_human_cursor(value: str | None) -> tuple[str, str] | None:
-    if value is None or value == "":
-        return None
-    if not value.startswith("h1.") or len(value) > 1_024:
-        raise GuiServerError(
-            HTTPStatus.BAD_REQUEST,
-            "task run human-request cursor is invalid",
-        )
-    try:
-        raw = value[3:]
-        raw += "=" * (-len(raw) % 4)
-        decoded = base64.b64decode(raw, altchars=b"-_", validate=True)
-        payload = bounded_json_loads(decoded, max_bytes=512)
-    except (ValueError, UnicodeError) as exc:
-        raise GuiServerError(
-            HTTPStatus.BAD_REQUEST,
-            "task run human-request cursor is invalid",
-        ) from exc
-    if not isinstance(payload, dict) or set(payload) != {"created_at", "request_id"}:
-        raise GuiServerError(
-            HTTPStatus.BAD_REQUEST,
-            "task run human-request cursor is invalid",
-        )
-    created_at = payload.get("created_at")
-    request_id = payload.get("request_id")
-    if (
-        not isinstance(created_at, str)
-        or len(created_at) > 128
-        or not isinstance(request_id, str)
-        or not request_id
-        or len(request_id) > 256
-    ):
-        raise GuiServerError(
-            HTTPStatus.BAD_REQUEST,
-            "task run human-request cursor is invalid",
-        )
-    return created_at, request_id
-
-
-def _human_request_page_key(request: Any) -> tuple[str, str]:
-    return (
-        str(getattr(request, "created_at", "")),
-        str(getattr(request, "request_id", "")),
-    )
-
-
-def _human_request_status(request: Any) -> str:
-    status = getattr(request, "status", "")
-    return str(getattr(status, "value", status))
-
-
 def _task_run_human_request(service: GuiRuntimeService, value: Any) -> Any:
     if (
         not isinstance(value, dict)
@@ -4008,11 +3891,6 @@ def _task_run_summary_object(summary: Any) -> dict[str, Any]:
     payload = to_jsonable(summary)
     if not isinstance(payload, dict):
         raise TypeError("TaskRun summary must serialize to a JSON object")
-    schema_version = payload.get("schema_version")
-    if schema_version is None and type(summary).__name__ == "TaskRunSummary":
-        # TaskRunSummary is the v1 public model. Keep the wire discriminator
-        # explicit while older 1.1.0 release candidates are still readable.
-        payload = {"schema_version": 1, **payload}
     return payload
 
 
@@ -4119,14 +3997,8 @@ def _task_run_summary_default_requirement_counts(
         selected["requirement_counts"] = requirement_counts
 
 
-def _task_run_recovery_options(manager: Any, run_id: str, summary: Any) -> list[dict[str, Any]]:
-    del summary  # Recovery options are deliberately not read from Summary.
-    provider = getattr(manager, "recovery_options", None)
-    if not callable(provider):
-        provider = getattr(manager, "list_recovery_options", None)
-    if not callable(provider):
-        return []
-    raw = provider(run_id)
+def _task_run_recovery_options(manager: Any, run_id: str) -> list[dict[str, Any]]:
+    raw = manager.recovery_options(run_id)
     if not isinstance(raw, (list, tuple)):
         raw, _cursor, _has_more = _task_run_raw_page(raw)
     return [

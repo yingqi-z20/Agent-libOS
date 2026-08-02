@@ -1,9 +1,9 @@
-# Artifact Anonymity Checklist
+# Artifact Publication and Anonymity Checklist
 
-This checklist is the M0 artifact hygiene baseline for an anonymous systems
-submission. It is not a legal review or a release checklist; it is the minimum
-set of checks required before sharing a paper artifact or benchmark bundle with
-reviewers.
+This contributor-only checklist covers identity and secret scanning for a
+source archive, benchmark bundle, or anonymous research artifact. It is not a
+legal review, an end-user setup guide, or evidence that any particular release
+artifact has passed these checks.
 
 ## Paper Title And System Name
 
@@ -449,10 +449,10 @@ On systems without `shasum`, use `sha256sum` and record that substitution.
 
 ## Runtime Artifact Commands
 
-These commands are the M0 baseline checks for the code artifact:
+These commands are baseline checks for a source artifact:
 
 ```bash
-uv sync --frozen --all-groups
+uv sync --frozen
 uv run python -m compileall agent_libos tests scripts experiments benchmarks modules
 uv run python scripts/test_matrix.py --lane all
 uv run python scripts/check_test_invariants.py
@@ -461,7 +461,7 @@ uv run python scripts/check_test_invariants.py
 For an anonymous artifact branch, add a fresh-clone dry run before submission:
 
 ```bash
-uv sync --frozen --all-groups
+uv sync --frozen
 uv run python scripts/test_matrix.py --lane all
 ```
 
@@ -471,41 +471,16 @@ real Deno installation skip with a clear message when `deno` is missing; use
 
 ## Documentation Consistency
 
-- README is the current project entrypoint and documentation index.
-- `docs/release_status.md` describes the current version's candidate scope,
-  validation contract, and remaining environment boundaries; it is not a CI
-  receipt or a claim of observed validation outcomes;
-  `docs/prelaunch_hardening_report.md` is historical evidence only.
-- `agent_libos_design_doc.md` is a historical design archive.
-- `docs/invariants.md` is the invariant-to-test map.
-- `docs/paper_thesis.md` carries the fixed paper title, thesis, contributions,
-  and non-goals.
-- `docs/architecture.md`, `docs/threat_model.md`, `docs/runtime_model.md`,
-  `docs/events.md`,
-  `docs/python_api.md`, `docs/capabilities.md`,
-  `docs/task_authority_manifest.md`, `docs/data_flow.md`,
-  `docs/object_memory.md`, `docs/tools_and_jit.md`, `docs/skills.md`,
-  `docs/checkpoints.md`, `docs/git.md`, `docs/jsonrpc.md`, `docs/mcp.md`,
-  `docs/modules.md`,
-  `docs/storage.md`, `docs/evidence_payload_retention.md`,
-  `docs/protected_operation_sdk.md`, `docs/explainable_operations.md`,
-  `docs/gui.md`, `docs/cli.md`, `docs/configuration.md`, `docs/providers.md`,
-  `docs/support_matrix.md`, `docs/development.md`, and `docs/benchmark.md` are
-  the core implementation guides.
-- `docs/gui_api_schema.json` is the versioned machine-readable subset for GUI
-  snapshots, errors, and confirmed high-risk mutations; it is not a complete
-  public OpenAPI contract.
-- `docs/mini_swe_agent_image.md` documents the package-only mini-swe-agent
-  compatibility image.
-- `benchmarks/runtime_safety/schema.md` defines benchmark task shape for the M1
-  runtime-safety harness.
-- Documentation must not describe Python JIT, direct external framework
-  adapters, real GitHub providers, MCP Resources/Prompts, or unsupported
-  rollback semantics as current behavior.
+Use [README.md](../README.md) as the documentation index,
+[release_status.md](release_status.md) for the release contract, and
+[support_matrix.md](support_matrix.md) for environment coverage. Archived
+design and prelaunch notices are not current evidence. Documentation must not
+present Python JIT, direct external framework adapters, real GitHub providers,
+MCP Resources/Prompts, or unsupported rollback semantics as implemented.
 
-## Submission Exit Gate
+## Publication Exit Gate
 
-M0 is complete when:
+The artifact is ready to share only when:
 
 - the license metadata is internally consistent,
 - the CI workflow runs static compilation on Python 3.11 and deterministic
@@ -513,11 +488,8 @@ M0 is complete when:
   `docs/support_matrix.md`; Python 3.12/3.13 remain declared but are not claimed
   as per-change CI jobs,
 - every core invariant has test coverage or an explicit gap,
-- benchmark task/output schema v1 existed at the M0 milestone; the current
-  contract keeps task schema v1 and uses run-output schema v2,
+- the benchmark contract uses task schema v1 and complete run-output schema v2,
 - benchmark harness documentation exists,
-- a one-page paper thesis with the fixed Agent libOS title exists,
-- this anonymity checklist exists and is linked from README,
 - the raw tracked-blob tree, archive projection, and generated-output
   inventories cover the exact commit and exact artifacts to be shared,
 - the recorded identity, absolute-path, credential, and secret scans have been
@@ -534,4 +506,4 @@ M0 is complete when:
 
 The checklist's existence is not evidence that these checks ran. Any unresolved
 hit, uninspected generated file, changed post-scan hash, or missing human review
-keeps the M0 anonymity gate open.
+keeps the publication gate open.

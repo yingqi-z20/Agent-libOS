@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { parseOptionalQuanta, parseQuantaDraft } from "./quanta";
+import { parseQuantaDraft } from "./quanta";
 
-describe("parseOptionalQuanta", () => {
+describe("parseQuantaDraft", () => {
   it("accepts only positive safe integers", () => {
-    expect(parseOptionalQuanta("")).toBeNull();
-    expect(parseOptionalQuanta(" 3 ")).toBe(3);
-    expect(parseOptionalQuanta("0")).toBeNull();
-    expect(parseOptionalQuanta("-1")).toBeNull();
-    expect(parseOptionalQuanta("1.5")).toBeNull();
-    expect(parseOptionalQuanta("abc")).toBeNull();
+    expect(parseQuantaDraft("").value).toBeNull();
+    expect(parseQuantaDraft(" 3 ").value).toBe(3);
+    expect(parseQuantaDraft("0").value).toBeNull();
+    expect(parseQuantaDraft("-1").value).toBeNull();
+    expect(parseQuantaDraft("1.5").value).toBeNull();
+    expect(parseQuantaDraft("abc").value).toBeNull();
   });
 
   it("preserves invalid drafts while distinguishing them from unlimited", () => {

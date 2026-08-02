@@ -606,8 +606,13 @@ class TestStorageBackendBoundaries:
         db_path = tmp_path / "runtime.sqlite"
         seeded = SQLiteStore(db_path)
         lease = seeded._lease_handle
-        assert lease is not None
-        assert lease.identity_path.parent == identity_directory
+        if sqlite_backend.fcntl is not None and hasattr(os, "O_NOFOLLOW"):
+            assert lease is not None
+            assert lease.identity_path.parent == identity_directory
+        else:
+            # Windows uses the SQLite connection itself as the runtime lease;
+            # POSIX-only path/inode sidecars are intentionally absent.
+            assert lease is None
         seeded.close()
         adjacent_lease = db_path.with_suffix(db_path.suffix + ".runtime.lock")
         adjacent_lease.unlink(missing_ok=True)

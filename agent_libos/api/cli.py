@@ -863,18 +863,13 @@ def _add_task_run_parser_args(parser: argparse.ArgumentParser) -> None:
     _add_task_run_command_args(rerun)
 
 
-def _add_task_run_command_args(
-    parser: argparse.ArgumentParser,
-    *,
-    expected_revision: bool = True,
-) -> None:
-    if expected_revision:
-        parser.add_argument(
-            "--expected-revision",
-            type=_task_run_revision_arg,
-            required=True,
-            help="Revision last observed by this client; stale revisions are rejected.",
-        )
+def _add_task_run_command_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--expected-revision",
+        type=_task_run_revision_arg,
+        required=True,
+        help="Revision last observed by this client; stale revisions are rejected.",
+    )
     parser.add_argument(
         "--command-id",
         help="Stable idempotency id; omitted generates one for this invocation.",
@@ -1084,15 +1079,6 @@ def _task_run_client_request_id(value: str | None) -> str:
     selected = value.strip()
     if not selected:
         raise LibOSValidationError("--client-request-id must be a non-empty string")
-    return selected
-
-
-def _optional_nonempty_cli_value(value: str | None, label: str) -> str | None:
-    if value is None:
-        return None
-    selected = value.strip()
-    if not selected:
-        raise LibOSValidationError(f"{label} must be a non-empty string")
     return selected
 
 

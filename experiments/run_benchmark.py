@@ -15,7 +15,10 @@ from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import GitError
+from agent_libos.substrate import LocalGitProvider
+from agent_libos.utils.serde import to_jsonable
 from benchmarks.runtime_safety.loader import load_tasks
+from benchmarks.runtime_safety.metrics import write_metrics
 from benchmarks.runtime_safety.runners import (
     AGENT_LIBOS_RUNNERS,
     RUNNER_INTERVENTIONS,
@@ -24,9 +27,7 @@ from benchmarks.runtime_safety.runners import (
     run_suite,
     write_run_outputs,
 )
-from benchmarks.runtime_safety.metrics import write_metrics
-from agent_libos.utils.serde import to_jsonable
-from agent_libos.substrate import LocalGitProvider
+from experiments.evaluation_cli import positive_int
 
 MAX_FAILURE_PREVIEW = 20
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -78,8 +79,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--runner", action="append", default=[], help="Runner name, repeated; use 'all' for every runner.")
     parser.add_argument("--task", action="append", default=[], help="Task id to include, repeated.")
     parser.add_argument("--attack-class", action="append", default=[], help="Attack class to include, repeated.")
-    parser.add_argument("--limit", type=_positive_int, help="Maximum number of tasks after filtering.")
-    parser.add_argument("--output", default=".benchmark_runs/m1", help="Output run directory.")
+    parser.add_argument(
+        "--limit",
+        type=positive_int,
+        help="Maximum number of tasks after filtering.",
+    )
+    parser.add_argument(
+        "--output",
+        default=".benchmark_runs/runtime-safety",
+        help="Output run directory.",
+    )
     parser.add_argument(
         "--llm",
         choices=["mock", "real"],
@@ -88,7 +97,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--max-quanta",
-        type=_positive_int,
+        type=positive_int,
         help="Maximum scheduler quanta per Agent libOS task.",
     )
     parser.add_argument(
@@ -240,16 +249,6 @@ def _selected_runners(values: list[str]) -> list[str]:
             raise SystemExit(f"unknown runner {value!r}; choose one of {list(RUNNER_NAMES)} or 'all'")
         selected.append(value)
     return list(dict.fromkeys(selected))
-
-
-def _positive_int(value: str) -> int:
-    try:
-        selected = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a positive integer") from exc
-    if selected <= 0:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return selected
 
 
 def _build_provenance(
@@ -535,24 +534,6 @@ def _hash_files(paths: list[Path], *, relative_to: Path) -> str:
         _update_digest_from_path(digest, path, budget)
         digest.update(b"\0")
     return digest.hexdigest()
-
-
-def _path_bytes(path: Path) -> bytes:
-    """Return one explicitly bounded provenance input for compatibility tests."""
-
-    if path.is_symlink():
-        target = os.readlink(path).encode("utf-8", errors="surrogateescape")
-        if len(target) > _MAX_PROVENANCE_FILE_BYTES:
-            raise RuntimeError(f"benchmark provenance symlink is too large: {path}")
-        return b"symlink\0" + target
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_PROVENANCE_FILE_BYTES:
-        raise RuntimeError(f"benchmark provenance file is invalid or too large: {path}")
-    with path.open("rb") as stream:
-        data = stream.read(_MAX_PROVENANCE_FILE_BYTES + 1)
-    if len(data) > _MAX_PROVENANCE_FILE_BYTES:
-        raise RuntimeError(f"benchmark provenance file is too large: {path}")
-    return b"file\0" + data
 
 
 def _update_digest_from_path(

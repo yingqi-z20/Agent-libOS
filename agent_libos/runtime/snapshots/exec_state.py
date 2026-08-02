@@ -3,11 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from agent_libos.memory.object_memory import ObjectMemoryManager
+from agent_libos.models.snapshot import ExecRollbackState, SNAPSHOT_SCHEMA_VERSION
 from agent_libos.runtime.snapshots.codec import SnapshotCodec
-from agent_libos.runtime.snapshots.models import (
-    ExecRollbackState,
-    SNAPSHOT_SCHEMA_VERSION,
-)
 from agent_libos.storage import SnapshotCheckpointRepositoryProtocol
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import loads

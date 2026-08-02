@@ -232,9 +232,6 @@ class SkillManager:
     def trust_resource(self, package_sha256: str = "*") -> str:
         return self.config.skills.trust_resource if package_sha256 == "*" else f"skill_trust:{package_sha256}"
 
-    def source_resource(self, source_type: str, source: str) -> str:
-        return f"skill_source:{source_type}:{source}"
-
     def validate_package_path(self, path: str | Path) -> dict[str, Any]:
         package, source = self._load_package_from_host_path(path)
         return {
@@ -363,7 +360,7 @@ class SkillManager:
         require_capability: bool = True,
     ) -> dict[str, Any]:
         package, source = self._load_package_from_host_path(path)
-        absolute, source_id = self._normalize_global_source(source)
+        _, source_id = self._normalize_global_source(source)
         return self.register_skill_package(
             package,
             actor=actor,
@@ -963,7 +960,7 @@ class SkillManager:
                     else "registered"
                 )
                 if activation_kind == "builtin_projection":
-                    skill, tool_ids = self._validate_loaded_builtin_projection_record(
+                    skill, _ = self._validate_loaded_builtin_projection_record(
                         skill_id,
                         loaded,
                     )
@@ -2228,8 +2225,6 @@ class SkillManager:
     def _load_package_from_host_path(self, path: str | Path) -> tuple[SkillPackage, str]:
         skill_md = self._resolve_host_skill_md(path)
         root = skill_md.parent
-        if skill_md.suffix.lower() in {".yaml", ".yml"}:
-            raise ValidationError("legacy YAML Skill manifests are not supported; use a SKILL.md package")
         raw_resources, source = self._read_host_resources(root)
         raw_skill = raw_resources["SKILL.md"]
         frontmatter, body = self._parse_skill_markdown(raw_skill.decode("utf-8"), expected_dir_name=root.name)
@@ -3234,7 +3229,7 @@ class SkillManager:
             for field in ("base_tool_ids", "base_model_tool_ids")
         ):
             raise ValidationError(
-                "0.3 loaded Skill state is missing canonical tool provenance"
+                "loaded Skill state is missing canonical tool provenance"
             )
         activation_kind = loaded.get("activation_kind", "registered")
         if activation_kind not in {"registered", "builtin_projection"}:

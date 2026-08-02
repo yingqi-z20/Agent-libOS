@@ -7,7 +7,7 @@ import json
 import math
 import os
 import re
-import socket
+import socket  # pylint: disable=unused-import  # shared DNS test seam
 import threading
 import time
 from functools import partial
@@ -1780,10 +1780,6 @@ class JsonRpcPrimitive:
             "rule_id": profile.rule_id,
             "restrictions": dict(profile.restrictions),
         }
-
-    def _preview(self, text: str) -> str:
-        limit = self.config.jsonrpc.audit_preview_chars
-        return text if len(text) <= limit else f"{text[:limit]}..."
 
     def _body_observation(self, value: bytes) -> dict[str, Any]:
         return sanitize_for_observability(

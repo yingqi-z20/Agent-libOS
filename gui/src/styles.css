@@ -16,47 +16,35 @@
   --color-border: #e7e0ec;
   --color-control-border: #91869c;
   --color-accent: #7c3aed;
-  --color-accent-hover: #6d28d9;
   --color-accent-fg: #6d28d9;
   --color-accent-strong: #5b21b6;
   --color-accent-border: #d8b4fe;
   --color-focus: rgb(124 58 237 / 26%);
-  --color-success-fg: #067647;
-  --color-success-bg: #ecfdf3;
-  --color-success-border: #abefc6;
   --color-warning-fg: #b54708;
   --color-warning-bg: #fffaeb;
   --color-warning-border: #fedf89;
   --color-danger-fg: #b42318;
-  --color-danger-bg: #fef3f2;
-  --color-danger-border: #fecdca;
   --color-code-bg: #1b1326;
   --color-code-fg: #f7f2ff;
   --control-sm: 32px;
   --control-md: 36px;
   --control-touch: 44px;
   --accent: var(--color-accent);
-  --accent-hover: var(--color-accent-hover);
   --accent-soft: #f3e8ff;
   --accent-subtle: #faf5ff;
-  --success: #087e63;
-  --success-soft: #e8f7f2;
   --panel: var(--color-panel);
   --surface: var(--color-canvas);
-  --surface-raised: var(--color-subtle);
   --border: var(--color-border);
   --border-strong: var(--color-control-border);
   --muted: var(--color-text-tertiary);
   --muted-light: var(--color-text-tertiary);
   --danger: #d92d20;
-  --danger-soft: #fef3f2;
   --warning: #b54708;
   --warning-soft: #fffaeb;
   --radius-sm: 8px;
   --radius-md: 12px;
   --radius-lg: 18px;
   --shadow-sm: 0 1px 2px rgb(49 24 67 / 6%);
-  --shadow-md: 0 8px 24px rgb(49 24 67 / 9%);
   --shadow-lg: 0 24px 70px rgb(49 24 67 / 15%);
 }
 
@@ -333,10 +321,7 @@ textarea {
 }
 
 .userBrand,
-.userTopActions,
-.userRunControls,
-.userStatus,
-.userProcessMeta {
+.userTopActions {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -347,9 +332,7 @@ textarea {
   gap: 1px;
 }
 
-.userBrand span,
-.userProcessMeta,
-.userStatus {
+.userBrand span {
   color: #627d98;
   font-size: 12px;
 }
@@ -387,34 +370,6 @@ textarea {
   background: #b42318;
 }
 
-.userTaskBar {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 10px 14px;
-  border-bottom: 1px solid #d9e2ec;
-  background: #fbfcfd;
-}
-
-.userTaskMain {
-  min-width: 0;
-  display: grid;
-  gap: 7px;
-}
-
-.userTaskMain label {
-  display: grid;
-  grid-template-columns: auto minmax(280px, 520px);
-  align-items: center;
-  gap: 8px;
-  color: #52606d;
-  font-size: 12px;
-}
-
-.userTaskMain select {
-  height: 32px;
-}
-
 .statusDot {
   width: 8px;
   height: 8px;
@@ -424,39 +379,6 @@ textarea {
 
 .statusDot.running {
   background: #0f7b6c;
-}
-
-.userNotices {
-  display: grid;
-  min-height: 0;
-}
-
-.userStart {
-  display: grid;
-  grid-template-columns: minmax(240px, 1fr) auto;
-  gap: 10px;
-  align-items: end;
-  padding: 12px 14px;
-  border-bottom: 1px solid #d9e2ec;
-  background: #ffffff;
-}
-
-.userStart .imageSelect {
-  grid-column: 1 / -1;
-}
-
-.userStart .llmProfileSelect {
-  grid-column: 1 / -1;
-}
-
-.userStart h1 {
-  grid-column: 1 / -1;
-  margin: 0;
-  font-size: 16px;
-}
-
-.userStart input {
-  grid-column: 1 / -1;
 }
 
 .taskAuthorityField {
@@ -503,21 +425,6 @@ textarea {
   padding: 10px 14px;
   border-bottom: 1px solid #e0b98d;
   background: #fff8ed;
-}
-
-.userImageControls {
-  display: grid;
-  grid-template-columns: minmax(260px, 1.4fr) auto minmax(130px, 1fr) minmax(120px, 0.8fr) 86px auto;
-  gap: 8px;
-  align-items: center;
-  min-width: 0;
-  padding: 10px 14px;
-  border-bottom: 1px solid #d9e2ec;
-  background: #ffffff;
-}
-
-.userImageControls input {
-  min-width: 0;
 }
 
 .agentRatingPanel {
@@ -861,10 +768,6 @@ textarea {
   background: #ffffff;
 }
 
-.userComposerStatus {
-  min-width: 0;
-}
-
 .topBar {
   display: flex;
   align-items: center;
@@ -874,18 +777,6 @@ textarea {
   background: #ffffff;
   overflow-x: auto;
   scrollbar-width: thin;
-}
-
-.dbGroup {
-  display: grid;
-  grid-template-columns: 18px minmax(260px, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  min-width: 420px;
-}
-
-.dbGroup input {
-  height: 32px;
 }
 
 .toggle, .quanta {
@@ -2278,10 +2169,6 @@ textarea {
     grid-template-columns: 260px minmax(360px, 1fr) 350px;
   }
 
-  .dbGroup {
-    min-width: 300px;
-  }
-
   .topBar {
     gap: 7px;
   }
@@ -2291,9 +2178,6 @@ textarea {
     font-size: 12px;
   }
 
-  .userImageControls {
-    grid-template-columns: minmax(230px, 1fr) auto minmax(120px, 1fr) minmax(110px, 0.8fr) 78px auto;
-  }
 }
 
 @media (max-width: 1000px) {
@@ -2316,23 +2200,19 @@ textarea {
     border-top: 1px solid #d9e2ec;
   }
 
-  .userTopBar,
-  .userTaskBar {
+  .userTopBar {
     align-items: flex-start;
     flex-wrap: wrap;
   }
 
-  .userTopActions,
-  .userRunControls {
+  .userTopActions {
     flex-wrap: wrap;
   }
 
-  .userImageControls,
   .agentRatingPanel {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .userImageControls .imageSelect,
   .agentRatingPanel .ratingHeader,
   .agentRatingPanel textarea {
     grid-column: 1 / -1;
@@ -2366,12 +2246,6 @@ textarea {
     z-index: 20;
     flex-wrap: wrap;
     overflow: visible;
-  }
-
-  .dbGroup {
-    width: 100%;
-    min-width: 0;
-    grid-template-columns: 18px minmax(0, 1fr) auto;
   }
 
   .scheduler {
@@ -2410,35 +2284,23 @@ textarea {
   }
 
   .userTopBar,
-  .userTaskBar,
-  .userTopActions,
-  .userRunControls {
+  .userTopActions {
     display: flex;
   }
 
-  .userTopActions,
-  .userRunControls,
-  .userTaskMain {
+  .userTopActions {
     width: 100%;
   }
 
-  .userTaskMain label {
-    grid-template-columns: 1fr;
-  }
-
-  .userImageControls,
   .agentRatingPanel,
   .userRequestCard,
-  .humanCard,
-  .userStart {
+  .humanCard {
     grid-template-columns: 1fr;
   }
 
-  .userImageControls > *,
   .agentRatingPanel > *,
   .userRequestCard > *,
-  .humanCard > *,
-  .userStart > * {
+  .humanCard > * {
     grid-column: 1;
   }
 
@@ -2449,10 +2311,6 @@ textarea {
 
   .userComposer {
     grid-template-columns: minmax(0, 1fr) auto;
-  }
-
-  .userComposerStatus {
-    grid-column: 1 / -1;
   }
 
   .factGrid,
@@ -6134,21 +5992,10 @@ button.timelineExplain:hover:not(:disabled) {
   background: #fdfaff;
 }
 
-.taskSettingsSectionHeader {
-  min-width: 0;
-  display: grid;
-  gap: 3px;
-  padding-bottom: 10px;
-  border-bottom: 1px solid var(--color-border);
-}
-
-.taskSettingsSectionHeader h3,
-.taskSettingsSectionHeader p,
 .taskSettingsSection > h3 {
   margin: 0;
 }
 
-.taskSettingsSectionHeader h3,
 .taskSettingsSection > h3 {
   color: #344054;
   font-size: 13px;
@@ -6159,12 +6006,6 @@ button.timelineExplain:hover:not(:disabled) {
   border-bottom: 1px solid var(--color-border);
 }
 
-.taskSettingsSectionHeader p {
-  color: var(--muted);
-  font-size: 10px;
-  line-height: 1.45;
-}
-
 .taskSettingsGrid {
   min-width: 0;
   display: grid;
@@ -6172,8 +6013,7 @@ button.timelineExplain:hover:not(:disabled) {
   gap: 12px;
 }
 
-.taskSettingsField,
-.taskSettingsFieldWide {
+.taskSettingsField {
   min-width: 0;
   display: grid;
   gap: 5px;
@@ -6181,19 +6021,13 @@ button.timelineExplain:hover:not(:disabled) {
   font-size: 11px;
 }
 
-.taskSettingsFieldWide {
-  grid-column: 1 / -1;
-}
-
-.taskSettingsField :is(input:not([type="checkbox"]):not([type="radio"]), select, textarea),
-.taskSettingsFieldWide :is(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
+.taskSettingsField :is(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
   width: 100%;
   min-width: 0;
   max-width: 100%;
 }
 
-.taskSettingsField :is(.imageSelect, .llmProfileSelect, .llmProfileSelectRow, .taskAuthorityField),
-.taskSettingsFieldWide :is(.imageSelect, .llmProfileSelect, .llmProfileSelectRow, .taskAuthorityField) {
+.taskSettingsField :is(.imageSelect, .llmProfileSelect, .llmProfileSelectRow, .taskAuthorityField) {
   min-width: 0;
   max-width: 100%;
 }
@@ -6294,15 +6128,12 @@ button.timelineExplain:hover:not(:disabled) {
   }
 
   .taskSettingsField .imageSelect,
-  .taskSettingsFieldWide .imageSelect,
   .taskSettingsSection .imageSelect {
     grid-template-columns: minmax(0, 1fr);
   }
 
   .taskSettingsField :is(button, input:not([type="checkbox"]):not([type="radio"]), select, textarea),
-  .taskSettingsFieldWide :is(button, input:not([type="checkbox"]):not([type="radio"]), select, textarea),
   .taskSettingsField :is(.taskAuthorityToggle, .switchControl),
-  .taskSettingsFieldWide :is(.taskAuthorityToggle, .switchControl),
   .taskSettingsSection :is(.taskAuthorityToggle, .switchControl) {
     min-height: var(--control-touch);
   }

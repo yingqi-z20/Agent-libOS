@@ -13,10 +13,8 @@ def test_shared_estimator_is_conservative_for_ascii_cjk_and_mixed_text() -> None
     assert estimate_tokens(cjk_text) == 4
     assert estimate_tokens(mixed_text) == 2 + 4
 
-    # Object/context materialization calls estimate_tokens directly. Request
-    # pressure must never apply a larger estimate to the same prompt text.
+    # The compatibility request estimator must not exceed the shared estimator.
     assert estimate_tokens(mixed_text) >= estimate_multilingual_tokens(mixed_text)
-
 
 def test_estimator_canonicalizes_structured_values_without_repr_addresses() -> None:
     first = {"cjk": "你好", "ascii": ["abc", 1], "empty": None}

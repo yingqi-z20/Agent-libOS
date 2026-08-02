@@ -12,25 +12,34 @@ from benchmarks.durable_task_runs import (
     run_crash_matrix,
     run_unpaired_committed_result_scenario,
 )
+from experiments.evaluation_output import AtomicJsonOutput
 
 
 def run(output: str | os.PathLike[str]) -> dict[str, Any]:
     target = Path(output)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="task-run-crash-") as work:
-        results = run_crash_matrix(work)
-        unpaired = run_unpaired_committed_result_scenario(work)
-    payload = {
-        "schema_version": 1,
-        "barrier_count": len(results),
-        "passed": all(result.passed for result in results) and unpaired.passed,
-        "results": [_result_payload(result) for result in results],
-        "unpaired_committed_after_safe_point": _result_payload(unpaired),
-        "timing_is_informational_only": True,
-    }
-    if not payload["passed"]:
-        raise RuntimeError("durable TaskRun crash matrix did not converge safely")
-    _atomic_write_json(target, payload)
+    with AtomicJsonOutput(target) as artifact:
+        with tempfile.TemporaryDirectory(prefix="task-run-crash-") as work:
+            results = run_crash_matrix(work)
+            unpaired = run_unpaired_committed_result_scenario(work)
+        payload = {
+            "schema_version": 1,
+            "barrier_count": len(results),
+            "passed": all(result.passed for result in results) and unpaired.passed,
+            "results": [_result_payload(result) for result in results],
+            "unpaired_committed_after_safe_point": _result_payload(unpaired),
+            "timing_is_informational_only": True,
+        }
+        if not payload["passed"]:
+            raise RuntimeError("durable TaskRun crash matrix did not converge safely")
+        artifact.commit_text(
+            json.dumps(
+                payload,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+            )
+            + "\n"
+        )
     return payload
 
 
@@ -59,27 +68,6 @@ def _result_payload(result: CrashMatrixResult) -> dict[str, Any]:
         "reopen_evidence_fingerprint": result.reopen_evidence_fingerprint,
         "passed": result.passed,
     }
-
-
-def _atomic_write_json(target: Path, payload: dict[str, Any]) -> None:
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{target.name}.",
-        suffix=".tmp",
-        dir=target.parent,
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, ensure_ascii=True, allow_nan=False, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, target)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        raise
 
 
 def main(argv: list[str] | None = None) -> int:

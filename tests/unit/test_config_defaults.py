@@ -44,6 +44,9 @@ from agent_libos.storage import SQLiteStore, display_store_target, open_store, r
 
 class TestConfigDefaults:
 
+    def test_jit_validation_default_allows_cold_deno_startup(self) -> None:
+        assert DEFAULT_CONFIG.tools.jit_validation_timeout_s == 15.0
+
     @pytest.mark.parametrize(
         ("defaults_type", "head_field_names"),
         (
@@ -993,6 +996,27 @@ class TestConfigDefaults:
             load_config_file(path)
 
         assert raised.value.__cause__ is parser_error
+
+    def test_load_config_file_accepts_retired_1x_compatibility_fields(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "legacy-config.yaml"
+        path.write_text(
+            "runtime:\n"
+            "  runtime_db_filename: legacy.sqlite\n"
+            "tools:\n"
+            "  sandbox_timeout_s: 7.5\n"
+            "image_commit:\n"
+            "  metadata_preview_chars: 640\n",
+            encoding="utf-8",
+        )
+
+        config = load_config_file(path)
+
+        assert config.runtime.runtime_db_filename == "legacy.sqlite"
+        assert config.tools.sandbox_timeout_s == 7.5
+        assert config.image_commit.metadata_preview_chars == 640
 
     def test_load_config_file_rejects_unknown_fields_and_invalid_values(self, tmp_path: Path) -> None:
         unknown = tmp_path / 'unknown.yaml'

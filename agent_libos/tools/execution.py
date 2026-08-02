@@ -278,7 +278,7 @@ class ToolExecutionService:
 
         started_at = time.perf_counter()
         try:
-            output = await self._invoke(prepared, args, started_at)
+            output = await self._invoke(prepared, args)
         except SubprocessLimitExceeded as exc:
             return self._subprocess_limit_result(prepared, exc)
         except SubprocessTimeoutExpired as exc:
@@ -294,7 +294,6 @@ class ToolExecutionService:
             raise
         except Exception as exc:
             output = self._invocation_error_output(
-                prepared,
                 exc,
                 policy_decision="allow",
             )
@@ -531,7 +530,6 @@ class ToolExecutionService:
         self,
         invocation: _Invocation,
         args: dict[str, Any],
-        started_at: float,
     ) -> _InvocationOutput | ToolCallResult:
         implementation = self._registry.implementation(invocation.handle.tool_id)
         if implementation is not None:
@@ -546,7 +544,7 @@ class ToolExecutionService:
             tool_metadata = self._merge_returned_context(dict(tool_result.metadata))
             tool_result.metadata = tool_metadata
             if not tool_result.ok:
-                return self._structured_failure(invocation, tool_result, started_at)
+                return self._structured_failure(invocation, tool_result)
             payload = tool_result.model_projection(
                 limit_bytes=self._tool_result_persistence_limit()
             )
@@ -629,7 +627,7 @@ class ToolExecutionService:
         try:
             self.validate_jit_arguments(invocation.handle, args)
         except Exception as exc:
-            return self._input_validation_error_output(invocation, exc)
+            return self._input_validation_error_output(exc)
         session = self._jit_session_factory(invocation.pid)
         source = self._registry.jit_source(invocation.handle.tool_id)
         if source is None:
@@ -672,7 +670,6 @@ class ToolExecutionService:
 
     def _input_validation_error_output(
         self,
-        invocation: _Invocation,
         error: Exception,
     ) -> _InvocationOutput:
         safe_message = "JIT tool arguments failed Host schema validation."
@@ -721,7 +718,6 @@ class ToolExecutionService:
         self,
         invocation: _Invocation,
         tool_result: ToolResult,
-        started_at: float,
     ) -> _InvocationOutput:
         provenance = exception_failure_provenance(tool_result)
         if provenance is not None:
@@ -932,7 +928,6 @@ class ToolExecutionService:
 
     def _invocation_error_output(
         self,
-        invocation: _Invocation,
         exc: Exception,
         *,
         policy_decision: str,
@@ -993,7 +988,6 @@ class ToolExecutionService:
         policy_decision: str,
     ) -> ToolCallResult:
         output = self._invocation_error_output(
-            invocation,
             exc,
             policy_decision=policy_decision,
         )

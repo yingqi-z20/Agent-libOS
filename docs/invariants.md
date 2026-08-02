@@ -318,7 +318,7 @@ longer defines.
   pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
   typed boundaries compute the next state generation, preventing a direct-write
   rewind from reviving a stale token.
-- `v4-persisted-state-is-strict-and-versioned`: a 1.2.1 store accepts only the
+- `v4-persisted-state-is-strict-and-versioned`: a 1.3.0 store accepts only the
   frozen version-4 physical schema (including Durable Task Run and typed process
   state) and canonical security carriers. Schema-v3, older, incomplete, or
   malformed state is rejected before mutation; no compatibility path is
@@ -1148,8 +1148,8 @@ longer defines.
 
 ## Known Test Gaps
 
-- The runtime-safety benchmark is an early deterministic workload, not a
-  complete paper evaluation suite.
+- The runtime-safety benchmark is a bounded deterministic workload, not a
+  comprehensive production evaluation or formal proof.
 - Explainability tests verify provenance completeness and deterministic
   summaries, but do not yet measure whether operators understand explanations
   better in a user study.

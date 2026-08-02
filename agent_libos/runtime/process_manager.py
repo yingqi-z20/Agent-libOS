@@ -182,23 +182,6 @@ class ProcessManager:
 
         self._host_managed_runner_checker = checker
 
-    def bind_task_run_fence(
-        self,
-        checker: Callable[[str | None, str, int, str], None],
-    ) -> None:
-        """Bind the durable TaskRun epoch/status admission fence.
-
-        TaskRun orchestration is assembled after the process primitive.  A
-        bound process fails closed until this callback proves that the exact
-        run incarnation may still publish a root or descendant launch.
-        """
-
-        if not callable(checker):
-            raise ValidationError("process TaskRun fence checker must be callable")
-        if self._task_run_fence_checker is not None:
-            raise ValidationError("process TaskRun fence checker is already bound")
-        self._task_run_fence_checker = checker
-
     def require_task_run_launch_fence(self, pid: str, *, action: str) -> None:
         """Fail closed before spending child-launch authority for a bound PID."""
 
@@ -3202,23 +3185,6 @@ class ProcessManager:
             ceiling_specs=selected_specs if manifest is not None else None,
         )
 
-    def _inherit_capability_specs(
-        self,
-        parent_pid: str,
-        child_pid: str,
-        specs: Iterable[dict[str, Any]],
-        issued_by: str,
-    ) -> None:
-        for spec in specs:
-            self.capabilities.inherit(
-                parent=parent_pid,
-                child=child_pid,
-                resource=spec["resource"],
-                rights=spec.get("rights", [CapabilityRight.READ.value]),
-                issued_by=issued_by,
-                constraints=spec.get("constraints") if isinstance(spec.get("constraints"), dict) else None,
-            )
-
     def _validate_inherit_capability_specs(self, parent_pid: str, specs: Iterable[dict[str, Any]]) -> None:
         for spec in specs:
             try:
@@ -3424,7 +3390,6 @@ class ProcessManager:
         self._require_recovery_lease()
 
         recovered: list[str] = []
-        page_size = self.config.runtime.publication_reconciliation_page_size
         for state in ("planning", "applying", "rollback_pending", "failed", "manual"):
             for operation_reconciled in (False, True):
                 self._recover_launch_publication_state(

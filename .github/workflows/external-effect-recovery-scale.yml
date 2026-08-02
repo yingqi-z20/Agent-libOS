@@ -35,17 +35,17 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --frozen --all-groups
+        run: uv sync --frozen --no-dev
 
       - name: Run one-million-record recovery scale benchmark
         run: >-
-          uv run python experiments/run_external_effect_recovery_scale.py
+          uv run --frozen --no-dev python experiments/run_external_effect_recovery_scale.py
           --profile million
           --output .benchmark_runs/external-effect-recovery-million.json
 
       - name: Run 10k runtime-publication handler scale benchmark
         run: >-
-          uv run python experiments/run_publication_reconciliation_scale.py
+          uv run --frozen --no-dev python experiments/run_publication_reconciliation_scale.py
           --profile ci
           --output .benchmark_runs/publication-reconciliation-ci.json
 

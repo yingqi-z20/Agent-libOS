@@ -435,7 +435,6 @@ def _run_migration(
     _assert_mutable_references_clean(
         cursor,
         static_tools=static_tools,
-        allow_planned_checkpoint_artifacts=frozenset(report.artifact_id_remaps),
     )
     if migration_needed:
         _delete_old_static_tools(cursor, static_tools, report)
@@ -1305,7 +1304,7 @@ def _migrate_checkpoint_artifact(
     source_process = selected.get("source_process")
     if not isinstance(source_process, dict):
         raise ToolSkillMigrationError(f"{path}.source_process must be an object")
-    migrated_process, changed = _migrate_snapshot_process_row(
+    migrated_process, _ = _migrate_snapshot_process_row(
         source_process,
         path=f"{path}.source_process",
         static_tools=static_tools,
@@ -1369,7 +1368,6 @@ def _migrate_checkpoint_artifact(
     }
     if any(str(tool_id) in legacy_ids for tool_id in jit_sources):
         raise ToolSkillMigrationError(f"{path}.jit_sources references a removed static tool")
-    del changed
     return selected
 
 
@@ -1824,9 +1822,7 @@ def _assert_mutable_references_clean(
     cursor: Any,
     *,
     static_tools: _StaticToolPlan,
-    allow_planned_checkpoint_artifacts: frozenset[str],
 ) -> None:
-    del allow_planned_checkpoint_artifacts
     tokens = _legacy_tokens(static_tools)
     for row in _rows(cursor, "SELECT pid, tool_table_json, model_tool_table_json FROM processes"):
         for field in ("tool_table_json", "model_tool_table_json"):

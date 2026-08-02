@@ -1,6 +1,6 @@
 # Runtime Storage
 
-Agent libOS 1.2.1 stores durable runtime state through a `UnitOfWork` composed of
+Agent libOS 1.3.0 stores durable runtime state through a `UnitOfWork` composed of
 explicit domain boundaries, including `ProcessRepository`,
 `ResourceRepository`, `RuntimePublicationRepository`,
 `SnapshotCheckpointRepository`, `RuntimeModuleRepository`,
@@ -80,11 +80,11 @@ this repository has a connection pool or concurrent per-Runtime transactions.
 
 ## Strict store schema v4
 
-Fresh databases created by Agent libOS 1.2.1 use store schema v4 and create a
+Fresh databases created by Agent libOS 1.3.0 use store schema v4 and create a
 `runtime_schema` table with one marker row; the canonical DDL constrains its
 `singleton` value to `1`. Opening an existing store requires the row selected
 by `singleton = 1` to contain schema version `4`. Product version and store
-schema version are independent identifiers: `1.2.1` is the current product
+schema version are independent identifiers: `1.3.0` is the current product
 release, while `4` is the persisted schema contract. Both backends apply
 the same acceptance rules, with one backend-specific initial probe order:
 
@@ -154,7 +154,7 @@ does not validate the collation of text columns outside the keyset manifest.
 
 There are no migrations, backfills, read-only compatibility modes, or dual
 schema paths from schema v3 to v4. A v3 database is archive-only for this
-release and must be opened with Agent libOS 1.0.1. Agent libOS 1.2.1 raises
+release and must be opened with Agent libOS 1.0.1. Agent libOS 1.3.0 raises
 `UnsupportedStoreVersion` during preflight, before initialization, index
 creation, seed insertion, recovery, audit, or any other write. The same
 zero-write rule applies to older/unversioned stores and malformed v4 stores.
@@ -629,7 +629,7 @@ Before either backend is backed up:
    not proceed from a recovery-required or incomplete shutdown result.
 4. Record the Agent libOS product version, backend configuration, and the value
    of `runtime_schema.schema_version`. For this release the expected pair is
-   product `1.2.1`, store schema `4`.
+   product `1.3.0`, store schema `4`.
 5. Prepare an owner-only backup directory and run the dump-producing command
    under `umask 077`. Before accepting either backend's archive, verify it is a
    regular, current-user-owned, single-link file with mode `0600`.

@@ -33,8 +33,6 @@ from agent_libos.models import (
     ObjectOwnerKind,
     PROMPT_MODE_IMAGE_ONLY,
     PROMPT_MODES,
-    ToolHandle,
-    ToolSpec,
     is_openai_tool_name,
 )
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
@@ -51,7 +49,7 @@ from agent_libos.runtime.task_run_reference import is_task_run_reference_payload
 from agent_libos.skills.schema import JitToolSpec
 from agent_libos.storage import ExtensionRepository, StoreAssemblyReadiness
 from agent_libos.tools.observability import ensure_json_size
-from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.ids import utc_now
 from agent_libos.utils.secure_host_files import (
     SecureDirectoryGuard,
     SecureFileChanged,

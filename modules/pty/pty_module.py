@@ -22,7 +22,6 @@ from agent_libos.memory.data_labels import propagate_object_labels
 from agent_libos.models import (
     AgentImage,
     CapabilityDecision,
-    CapabilityEffect,
     CapabilityRight,
     DataFlowContext,
     DataIntegrity,
@@ -39,7 +38,6 @@ from agent_libos.models import (
     ObjectRight,
     ObjectType,
     ResourceUsage,
-    ViewMode,
 )
 from agent_libos.models.exceptions import (
     CapabilityDenied,

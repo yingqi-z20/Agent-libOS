@@ -8,7 +8,6 @@ export function TopBar({
   db,
   scheduler,
   maxQuantaInput,
-  maxQuanta,
   quantaValid = true,
   selectedPid,
   onMaxQuantaChange,
@@ -28,9 +27,7 @@ export function TopBar({
 }: {
   db: string;
   scheduler: SchedulerStatus | null;
-  maxQuantaInput?: string;
-  /** @deprecated Use maxQuantaInput so invalid drafts are not erased. */
-  maxQuanta?: number | null;
+  maxQuantaInput: string;
   quantaValid?: boolean;
   selectedPid: string | null;
   onMaxQuantaChange(value: string): void;
@@ -89,7 +86,7 @@ export function TopBar({
             type="text"
             inputMode="numeric"
             disabled={busy}
-            value={maxQuantaInput ?? maxQuanta?.toString() ?? ""}
+            value={maxQuantaInput}
             aria-invalid={!quantaValid || undefined}
             aria-errormessage={!quantaValid ? quantaErrorId : undefined}
             placeholder={t("scheduler.unlimitedPlaceholder")}

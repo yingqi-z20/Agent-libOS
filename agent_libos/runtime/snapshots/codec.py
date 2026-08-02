@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from agent_libos.models.exceptions import ValidationError
-from agent_libos.runtime.snapshots.models import SNAPSHOT_SCHEMA_VERSION, ProcessSnapshot
+from agent_libos.models.snapshot import SNAPSHOT_SCHEMA_VERSION, ProcessSnapshot
 from agent_libos.utils.serde import bounded_json_loads, dumps
 
 
@@ -13,7 +13,7 @@ class SnapshotVersionError(ValidationError):
 
 
 class SnapshotCodec:
-    """Strict codec for the 0.3 typed process snapshot format."""
+    """Strict codec for the typed process snapshot format."""
 
     schema_version = SNAPSHOT_SCHEMA_VERSION
     max_document_bytes = 16_777_216

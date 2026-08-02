@@ -1,4 +1,4 @@
-import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LLMProfileInput, LLMProfileSummary, McpCallResult, McpDiscoveryResult, McpServerSummary, McpToolListResult, ModuleSummary, ObjectTask, OperationListResponse, RuntimeHealth, RuntimeSnapshot, SchedulerStatus, SkillSummary, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunPage, TaskRunSpecV1, TaskRunStatus, TaskRunSummary, WorkflowRunResult } from "./types";
+import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LLMProfileInput, LLMProfileSummary, McpCallResult, McpDiscoveryResult, McpServerSummary, McpToolListResult, ModuleSummary, ObjectTask, OperationListResponse, RuntimeSnapshot, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunSpecV1, TaskRunSummary } from "./types";
 import { assertMcpCallResult, assertMcpDiscoveryResult, assertMcpServerSummary, assertMcpToolListResult, assertRuntimeSnapshot, assertSchedulerStatus, assertTaskRunDetail, assertTaskRunSummary } from "./types";
 import type { OptionalQuanta } from "../quanta";
 
@@ -22,27 +22,10 @@ export class LibOSClient {
     return this.connection.db;
   }
 
-  updateConnection(connection: GuiConnection) {
-    this.connection = connection;
-  }
-
   async snapshot(options: RequestOptions = {}): Promise<RuntimeSnapshot> {
     const snapshot = await this.request<unknown>("GET", "/api/snapshot", undefined, options);
     assertRuntimeSnapshot(snapshot);
     return snapshot;
-  }
-
-  async health(): Promise<RuntimeHealth> {
-    return this.request<RuntimeHealth>("GET", "/api/health");
-  }
-
-  async listTaskRuns(params: { statuses?: TaskRunStatus[]; limit?: number; cursor?: string } = {}): Promise<TaskRunPage> {
-    const query = new URLSearchParams();
-    if (params.statuses?.length) query.set("status", params.statuses.join(","));
-    if (params.limit !== undefined) query.set("limit", String(params.limit));
-    if (params.cursor) query.set("cursor", params.cursor);
-    const suffix = query.toString() ? `?${query.toString()}` : "";
-    return taskRunPage(await this.request<unknown>("GET", `/api/task-runs${suffix}`));
   }
 
   async createTaskRun(
@@ -241,10 +224,6 @@ export class LibOSClient {
     return this.request<ImageSummary[]>("GET", "/api/images");
   }
 
-  async llmProfiles(): Promise<LLMProfileSummary[]> {
-    return this.request<LLMProfileSummary[]>("GET", "/api/llm-profiles");
-  }
-
   async createLLMProfile(profile: LLMProfileInput): Promise<LLMProfileSummary> {
     return this.request<LLMProfileSummary>("POST", "/api/llm-profiles", profile as unknown as JsonBody);
   }
@@ -312,11 +291,6 @@ export class LibOSClient {
         ...(actor ? { actor } : {})
       }
     );
-  }
-
-  async listSkills(text?: string): Promise<SkillSummary[]> {
-    const query = text ? `?text=${encodeURIComponent(text)}` : "";
-    return this.request<SkillSummary[]>("GET", `/api/skills${query}`);
   }
 
   async inspectSkill(skillId: string): Promise<Record<string, unknown>> {
@@ -570,41 +544,6 @@ export class LibOSClient {
     return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/run`, withOptionalQuanta({}, maxQuanta));
   }
 
-  async runWorkflow({
-    tool,
-    args = {},
-    image,
-    goal,
-    workingDirectory,
-    confirmed
-  }: {
-    tool: string;
-    args?: Record<string, unknown>;
-    image?: string;
-    goal?: string;
-    workingDirectory?: string;
-    confirmed?: boolean;
-  }) {
-    return this.request<WorkflowRunResult>("POST", "/api/workflows/run", {
-      tool,
-      args,
-      ...(image ? { image } : {}),
-      ...(goal ? { goal } : {}),
-      ...(workingDirectory ? { working_directory: workingDirectory } : {}),
-      ...(confirmed !== undefined ? { confirmed } : {})
-    });
-  }
-
-  async listObjectTasks(params: { pid?: string; ownerOid?: string; active?: boolean; limit?: number } = {}) {
-    const query = new URLSearchParams();
-    if (params.pid) query.set("pid", params.pid);
-    if (params.ownerOid) query.set("owner_oid", params.ownerOid);
-    if (params.active) query.set("active", "true");
-    if (params.limit !== undefined) query.set("limit", String(params.limit));
-    const suffix = query.toString() ? `?${query.toString()}` : "";
-    return this.request<ObjectTask[]>("GET", `/api/object-tasks${suffix}`);
-  }
-
   async startObjectTask({
     pid,
     ownerOid,
@@ -724,10 +663,6 @@ export class LibOSClient {
     return this.request("POST", `/api/processes/${encodeURIComponent(pid)}/cd`, { path });
   }
 
-  async getAgentRating(pid: string) {
-    return this.request<AgentRating | null>("GET", `/api/processes/${encodeURIComponent(pid)}/rating`);
-  }
-
   async submitAgentRating(pid: string, score: number, comment: string) {
     return this.request<AgentRating>("POST", `/api/processes/${encodeURIComponent(pid)}/rating`, { score, comment });
   }
@@ -755,10 +690,6 @@ export class LibOSClient {
   }
 
   async request<T = unknown>(method: string, path: string, body?: JsonBody, options: RequestOptions = {}): Promise<T> {
-    return this.requestJson<T>(method, path, body, options);
-  }
-
-  async requestJson<T = unknown>(method: string, path: string, body?: JsonBody, options: RequestOptions = {}): Promise<T> {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.connection.token}`,
       Accept: "application/json"
@@ -994,12 +925,6 @@ function requiredCommandId(value: string, name: string): string {
 function taskRunSummary(value: unknown): TaskRunSummary {
   assertTaskRunSummary(value);
   return value;
-}
-
-function taskRunPage(value: unknown): TaskRunPage {
-  const page = pagedItems(value, "task run");
-  for (const item of page.items) assertTaskRunSummary(item);
-  return page as TaskRunPage;
 }
 
 function taskRunLedgerPage(value: unknown): TaskRunLedgerPage {

@@ -36,7 +36,6 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import (
     HumanApprovalRequired,
-    NotFound,
     ProcessMessageWaitRequired,
     ProcessWaitRequired,
     RuntimeRecoveryRequired,
@@ -313,9 +312,6 @@ class Runtime:
             capability=self._recovery_diagnostics_release_capability,
         )
 
-    def _shutdown_component(self, component: Any) -> bool:
-        return self.lifecycle.shutdown_component(component)
-
     def bind_shutdown_finalizer(self, finalizer: Any) -> None:
         self.lifecycle.bind_finalizer(finalizer)
 
@@ -370,9 +366,6 @@ class Runtime:
                 [aggregate, *interruptions],
             )
         raise aggregate
-
-    async def _ashutdown_component(self, component: Any) -> bool:
-        return await self.lifecycle.ashutdown_component(component)
 
     def run_process_once(self, pid: str) -> dict[str, Any]:
         if self.scheduler.is_active_quantum(pid):
@@ -1143,12 +1136,6 @@ class Runtime:
 
     def set_process_working_directory(self, pid: str, path: str) -> Any:
         return self.launch.set_working_directory(pid, path)
-
-    def _require_process_spawn_authority(self, pid: str) -> None:
-        self.launch.require_spawn_authority(pid)
-
-    def _require_process_image_boot_authority(self, pid: str, image_id: str) -> None:
-        self.launch.require_image_boot_authority(pid, image_id)
 
     def _resolve_launch_llm_profile_id(self, image_id: str, explicit_profile_id: str | None) -> str:
         return self.launch.resolve_llm_profile_id(image_id, explicit_profile_id)

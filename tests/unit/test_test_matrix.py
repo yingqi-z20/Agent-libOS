@@ -13,7 +13,6 @@ from scripts import test_matrix
 def _args(**overrides: object) -> argparse.Namespace:
     defaults = {
         "lane": "runtime",
-        "run_real_deno": False,
         "skip_real_deno": False,
         "run_real_llm": False,
         "run_mcp": False,

@@ -1,6 +1,6 @@
-# Agent libOS 1.2.1 Status
+# Agent libOS 1.3.0 Status
 
-Agent libOS 1.2.1 is a release candidate for the core Python runtime scope
+Agent libOS 1.3.0 is a release candidate for the core Python runtime scope
 defined in `docs/support_matrix.md`. Release-ready status for any source tree is
 conditional on that exact tree passing the checked-in CI workflow; local
 deterministic results do not substitute for its Python-version, PostgreSQL, and
@@ -20,13 +20,13 @@ Without that complete binding, wording below such as “requires”, “gates”
 “checks” describes the workflow contract only, not an observed pass for a
 checkout or candidate artifact.
 
-## Closed release blockers and P1 architecture debt
+## Implemented release safeguards
 
 - Durable Task Runs are a first-class, versioned Host supervision boundary for
   one root AgentProcess tree. They persist requirements, idempotent command
   receipts, append-only ledger links, and locally integrity-bound resume points;
   they do not introduce a generic workflow DSL or distributed scheduler.
-- RuntimeStore schema v4 is the only store format accepted by 1.2.1. A schema
+- RuntimeStore schema v4 is the only store format accepted by 1.3.0. A schema
   v3 store is rejected before initialization or any write and remains
   archive-only under 1.0.1; this release has no migration, read-only bridge, or
   dual-schema mode.
@@ -304,7 +304,7 @@ checkout or candidate artifact.
   The profile must validate exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The `release-artifacts` CI job is configured to build one canonical 1.2.1
+- The `release-artifacts` CI job is configured to build one canonical 1.3.0
   wheel/source pair, reject extra or non-regular output, and record an exact
   checksum manifest.
   Python 3.11 through 3.14 smoke jobs download and verify that same pair, install
@@ -324,7 +324,7 @@ endpoint to read a policy and CSV, compute a report, emit `human_output`, and
 exit. No provenance-bearing report for that run is checked in with the source
 revision, model/profile identity, redacted configuration, environment, and raw
 test outcome needed to reproduce or compare it. It is therefore an unarchived
-observation, not Agent libOS 1.2.1 release evidence, and supports no call-count,
+observation, not Agent libOS 1.3.0 release evidence, and supports no call-count,
 token-count, approval-count, latency, or serial-versus-parallel claim. Promote a
 future rerun only after using a documented opt-in real-model gate and preserving
 its reproducible report outside this status summary.
@@ -339,9 +339,9 @@ its reproducible report outside this status summary.
   canonical release build job uses Python 3.11, while downstream artifact-smoke
   jobs cover Python 3.11 through 3.14; neither claim substitutes for evidence
   from an unrecorded local clean install.
-- The GUI package declares Node `>=22.12.0` and npm `>=8`. Per-change CI checks
-  Node 24 with its supplied npm version; it does not separately validate every
-  lower declared Node or npm version.
+- The GUI package declares Node `^24.15.0 || >=26.0.0` and npm `>=11`.
+  Per-change CI checks the Node 24 LTS line with its supplied npm version;
+  Node 26 Current satisfies the engine contract but is not a separate job.
 - The release workflow configures a separate Ubuntu/macOS 14 Python 3.11 matrix
   for the manifest v2 host-filesystem-identity platform nodes. Each shard uses
   its platform marker with `--fail-on-skip`, and canonical release artifacts
@@ -361,7 +361,7 @@ its reproducible report outside this status summary.
   non-bare workspace repository and system Git 2.26 or newer; unavailable Git
   fails individual calls without preventing Runtime startup. Host-configured
   remotes are the only first-class Git network exception. There is no Git CLI,
-  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.2.1.
+  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.3.0.
 
 ## Remaining environment gates and non-blocking debt
 

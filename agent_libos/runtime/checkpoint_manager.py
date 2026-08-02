@@ -36,7 +36,6 @@ from agent_libos.models import (
     ObjectTaskStatus,
     ObjectType,
     OperationOutcome,
-    ProcessMessageStatus,
     ProcessStatus,
     ProcessWaitState,
     PausedProcessWait,
@@ -249,26 +248,6 @@ class CheckpointManager:
 
     def bind_image_registry(self, image_registry: Any) -> None:
         self._image_registry = image_registry
-
-    def bind_task_runs(self, task_runs: Any) -> None:
-        """Bind the durable TaskRun query boundary used by restore guards.
-
-        TaskRun orchestration is assembled after checkpoint services.  Keep the
-        dependency narrow and late-bound so checkpoints can reject a restore
-        that intersects any non-terminal run without learning TaskRun mutation
-        or payload APIs.
-        """
-
-        if task_runs is None:
-            raise ValidationError("checkpoint TaskRun provider must not be null")
-        if self._task_runs is not None and self._task_runs is not task_runs:
-            raise ValidationError("checkpoint TaskRun provider is already bound")
-        active_runs_for_pids = getattr(task_runs, "active_runs_for_pids", None)
-        if not callable(active_runs_for_pids):
-            raise ValidationError(
-                "checkpoint TaskRun provider must implement active_runs_for_pids"
-            )
-        self._task_runs = task_runs
 
     def process_resource(self, pid: str) -> str:
         return f"{self.PROCESS_RESOURCE_PREFIX}{pid}"
@@ -657,14 +636,13 @@ class CheckpointManager:
                         )
                         current_pids = prepared["current_pids"]
                         snapshot_pids = prepared["snapshot_pids"]
-                        stale_tool_ids = prepared["stale_tool_ids"]
                         external_effects = prepared["external_effects"]
                         external_effect_summary = prepared["external_effect_summary"]
                         (
                             cancelled_human_requests,
                             superseded_messages,
                             superseded_object_tasks,
-                            release_finalizer_objects,
+                            _release_finalizer_objects,
                         ) = published
                         self._record_restore_commit_evidence(
                             actor=actor,
@@ -997,15 +975,6 @@ class CheckpointManager:
     def rollback(self, pid: str, checkpoint_id: str) -> dict[str, Any]:
         return self.restore(pid, checkpoint_id, require_capability=False)
 
-    def preflight_checkpoint(self, checkpoint_id: str) -> None:
-        """Reject an incompatible immutable artifact for a trusted caller."""
-
-        self._preflight_artifact.set(None)
-        self._cache_preflight_artifact(
-            checkpoint_id,
-            self._read_checkpoint_artifact(checkpoint_id),
-        )
-
     def preflight_checkpoint_read(
         self,
         checkpoint_id: str,
@@ -1091,14 +1060,6 @@ class CheckpointManager:
             CapabilityRight.EXECUTE,
             require_capability=require_capability,
         )
-
-    def load_checkpoint_artifact(
-        self,
-        checkpoint_id: str,
-    ) -> tuple[Checkpoint, dict[str, Any]]:
-        """Return one strictly decoded checkpoint artifact for an internal service."""
-
-        return self._load_checkpoint(checkpoint_id)
 
     def load_checkpoint_artifact_for_read(
         self,
@@ -2414,7 +2375,7 @@ class CheckpointManager:
             )
             if canonical is None:
                 raise ValidationError(
-                    "0.3 checkpoint pending action has no canonical data-flow context"
+                    "checkpoint pending action has no canonical data-flow context"
                 )
         for message in rows.get("process_messages", []):
             canonical = self._canonical_snapshot_message_metadata(
@@ -2422,7 +2383,7 @@ class CheckpointManager:
             )
             if canonical is None:
                 raise ValidationError(
-                    "0.3 checkpoint process message has no canonical label metadata"
+                    "checkpoint process message has no canonical label metadata"
                 )
 
     @staticmethod
@@ -2483,62 +2444,6 @@ class CheckpointManager:
         except (TypeError, ValueError):
             return None
         return decoded
-
-    def _run_restore_registry_post_commit_phases(
-        self,
-        *,
-        actor: str,
-        checkpoint: Checkpoint,
-        snapshot: dict[str, Any],
-        stale_tool_ids: set[str],
-        scoped_pids: set[str],
-    ) -> list[dict[str, Any]]:
-        phases = [
-            ("image_reconciliation", lambda: self._restore_images(snapshot)),
-            ("jit_source_reconciliation", lambda: self._restore_jit_sources(snapshot)),
-            (
-                "jit_pruning",
-                lambda: self._prune_stale_ephemeral_jit_tools(stale_tool_ids, scoped_pids=scoped_pids),
-            ),
-        ]
-        failures: list[dict[str, Any]] = []
-        for phase, operation in phases:
-            try:
-                operation()
-            except Exception as exc:
-                failures.append(
-                    self._restore_post_commit_failure(
-                        actor=actor,
-                        checkpoint=checkpoint,
-                        phase=phase,
-                        exc=exc,
-                    )
-                )
-        return failures
-
-    def _run_restore_object_release_finalizer_phase(
-        self,
-        *,
-        actor: str,
-        checkpoint: Checkpoint,
-        release_finalizer_objects: list[Any],
-    ) -> list[dict[str, Any]]:
-        try:
-            self._run_object_release_finalizers_for_objects(
-                release_finalizer_objects,
-                actor="checkpoint.restore",
-                reason="checkpoint_restore",
-            )
-        except Exception as exc:
-            return [
-                self._restore_post_commit_failure(
-                    actor=actor,
-                    checkpoint=checkpoint,
-                    phase="object_release_finalizers",
-                    exc=exc,
-                )
-            ]
-        return []
 
     def _restore_status(self, failures: list[dict[str, Any]]) -> str:
         return "restored_with_warnings" if failures else "restored"
@@ -3409,15 +3314,6 @@ class CheckpointManager:
         ):
             yield
 
-    def _require_checkpoint_or_process_read(self, actor: str, checkpoint: Checkpoint) -> None:
-        """Consume checkpoint/process read for non-diagnostic commit workflows."""
-        with self._checkpoint_or_process_read_scope(
-            actor,
-            checkpoint,
-            purpose="checkpoint image commit read",
-        ):
-            return
-
     def checkpoint_or_process_read_scope(
         self,
         actor: str,
@@ -4032,37 +3928,6 @@ class CheckpointManager:
             pids=selected_pids,
         )
 
-    def _external_effects_since(
-        self,
-        checkpoint: Checkpoint,
-        *,
-        snapshot: dict[str, Any] | None = None,
-        pids: Iterable[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        return [
-            external_effect_to_json(record)
-            for record in self._external_effect_records_since(
-                checkpoint,
-                snapshot=snapshot,
-                pids=pids,
-            )
-        ]
-
-    def _external_effect_summary_since(
-        self,
-        checkpoint: Checkpoint,
-        *,
-        snapshot: dict[str, Any] | None = None,
-        pids: Iterable[str] | None = None,
-    ) -> dict[str, Any]:
-        return external_effect_summary(
-            self._external_effect_records_since(
-                checkpoint,
-                snapshot=snapshot,
-                pids=pids,
-            )
-        )
-
     def _external_effect_pids(
         self,
         checkpoint: Checkpoint,
@@ -4406,7 +4271,7 @@ class CheckpointManager:
         )
 
     def _insert_row(self, cur: object, table: str, row: dict[str, Any]) -> None:
-        """Compatibility-only insert fault hook; persistence lives in the repository."""
+        """Manager-level transaction fault hook; persistence lives in the repository."""
 
         del cur, table, row
 
@@ -4677,7 +4542,7 @@ class CheckpointManager:
         canonical_metadata = self._canonical_snapshot_message_metadata(metadata)
         if canonical_metadata is None:
             raise ValidationError(
-                "0.3 checkpoint process message has no canonical label metadata"
+                "checkpoint process message has no canonical label metadata"
             )
         metadata = canonical_metadata
         carrier_oid = str(metadata.get("label_carrier_oid") or "").strip()

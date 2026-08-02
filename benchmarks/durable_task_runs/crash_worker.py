@@ -236,7 +236,7 @@ def _install_commit_barrier(
         original = runtime.task_runs.record_validated_transcript
 
         def crash_after_validated(**kwargs: Any) -> Any:
-            result = original(**kwargs)
+            original(**kwargs)
             _crash(False)
 
         runtime.task_runs.record_validated_transcript = crash_after_validated  # type: ignore[method-assign]
@@ -289,7 +289,7 @@ def _install_commit_barrier(
         original = runtime.task_runs.stage_completed_transcript
 
         def crash_after_staged(**kwargs: Any) -> Any:
-            result = original(**kwargs)
+            original(**kwargs)
             _crash(False)
 
         runtime.task_runs.stage_completed_transcript = crash_after_staged  # type: ignore[method-assign]
@@ -298,7 +298,7 @@ def _install_commit_barrier(
         original = runtime.task_runs.record_completed_transcript
 
         def crash_after_resume_point(**kwargs: Any) -> Any:
-            result = original(**kwargs)
+            original(**kwargs)
             _crash(False)
 
         runtime.task_runs.record_completed_transcript = crash_after_resume_point  # type: ignore[method-assign]
@@ -308,7 +308,7 @@ def _install_after_primitive_crash(runtime: Runtime) -> None:
     original = runtime.jsonrpc.call
 
     def crash_after_primitive(*args: Any, **kwargs: Any) -> Any:
-        result = original(*args, **kwargs)
+        original(*args, **kwargs)
         _crash(False)
 
     runtime.jsonrpc.call = crash_after_primitive  # type: ignore[method-assign]
@@ -330,8 +330,11 @@ def _crash(sigkill: bool) -> NoReturn:
     # No normal interpreter shutdown is allowed to flush Runtime-owned state.
     # The dispatched barrier uses SIGKILL so the matrix covers both an abrupt
     # signal and ``os._exit`` at independently durable commit boundaries.
-    if sigkill:
-        os.kill(os.getpid(), signal.SIGKILL)
+    # Windows does not expose SIGKILL, so retain the same no-cleanup crash
+    # property there with the portable os._exit fallback.
+    kill_signal = getattr(signal, "SIGKILL", None)
+    if sigkill and kill_signal is not None:
+        os.kill(os.getpid(), kill_signal)
         signal.pause()  # pragma: no cover - SIGKILL cannot return control
     os._exit(CRASH_EXIT_CODE)
 

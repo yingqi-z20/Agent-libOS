@@ -1,4 +1,8 @@
-# Paper Thesis
+# Research Thesis
+
+This document explains the research framing of the implemented runtime. It is
+not an API, security, support, or release-status contract; those contracts live
+in the references linked from [README.md](../README.md).
 
 Paper title:
 
@@ -80,7 +84,7 @@ substrate for capability-controlled self-evolution.
    [publication reconciliation model](explainable_operations.md).
 
 3. Benchmark suite.
-   The current implementation includes an M1 deterministic runtime-safety
+   The current implementation includes a deterministic runtime-safety
    harness with 32 schema-v1 adversarial tasks, wrapper baselines, ablations,
    declared allowed/forbidden side effects, evidence-backed outcome records,
    explicit exact/prefix/glob oracle matching, and fail-closed stable metrics
@@ -90,7 +94,7 @@ substrate for capability-controlled self-evolution.
    visibility, and Git worktree/config/remote/patch-lineage boundaries.
 
 4. Evaluation.
-   The paper should compare Agent libOS against direct tool wrappers,
+   The benchmark supports comparison against direct tool wrappers,
    confirmation-prompt wrappers, and host-isolation-only baselines. Metrics
    include unauthorized side-effect rate, task success, false denial, approval
    count, wall time, token/cost accounting, overhead, audit completeness, and
@@ -104,23 +108,6 @@ substrate for capability-controlled self-evolution.
    external-effect records, and explicit operation links are runtime evidence.
    `modeled` rows are design-coverage experiments and use a separate
    denominator; trace completeness never upgrades them to native execution.
-
-The historical repository-backed, token-free `agent_libos_full` validation was
-produced from the clean source snapshot
-`c03a4ec764e02bd4df59e2769edeb1278d5ea545` and artifact
-`.benchmark_runs/release-c03a4ec`. It is a 28-task implementation-validation
-snapshot: 28/28 task success, 28/28 safety pass, 122 normalized effects, zero
-unauthorized performed effects among 97 definitely performed effects, zero
-unknown outcomes/classifications, and zero false denials among 97 allowed
-performed-or-denied attempts (`0/97 = 0%`). The artifact metadata and metrics
-SHA-256 values are recorded in [benchmark.md](benchmark.md). The
-mock planned-action client makes no real model request; its reported 144 LLM
-tokens are deterministic usage accounting. It does not validate the current
-working tree; history consolidation was not a new benchmark run and did not by
-itself prove content identity. Human approval, declared LLM
-provider effects, and the authorized attenuated child spawn are explicit
-effects. These results support implementation validation; they are not yet the
-complete comparative paper evaluation.
 
 ## Non-Goals
 
@@ -156,16 +143,6 @@ complete comparative paper evaluation.
   terminal LLM/external-effect provider payloads while retaining causal
   identity, classification, links, and digests needed for evidence.
 
-## Current Submission Story
-
-The strongest systems story is: self-evolving LLM agents become safer and more
-explainable when action-surface evolution is decoupled from resource authority
-by a capability-controlled runtime substrate.
-
-M0 freezes repository hygiene and the thesis. M1 establishes the initial
-runtime-safety benchmark with self-evolution coverage. The runtime now also has
-deterministic Explainable Operations and metadata-only Context Materialization
-Manifests, Task Authority Manifests, and a first no-fallback native practical
-connector lane. The next milestones should prioritize larger self-evolution
-workloads, evaluating explanation usefulness, and quantitative results rather
-than broad ecosystem compatibility.
+Research evaluation results must be published as source-bound artifacts under
+the [benchmark contract](benchmark.md); this narrative intentionally contains
+no copied pass counts or internal submission milestones.

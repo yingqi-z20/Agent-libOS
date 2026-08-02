@@ -65,11 +65,6 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="test lane to run",
     )
-    parser.add_argument(
-        "--run-real-deno",
-        action="store_true",
-        help="deprecated; real_deno tests run by default when deno is installed",
-    )
     parser.add_argument("--skip-real-deno", action="store_true", help="exclude tests marked real_deno")
     parser.add_argument("--run-real-llm", action="store_true", help="include tests marked real_llm")
     parser.add_argument("--run-mcp", action="store_true", help="include tests marked mcp")
@@ -252,7 +247,7 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     if args.lane == "gui" and _workers_enabled(args):
         parser.error("--workers only applies to pytest lanes; run the gui lane separately")
     if _workers_enabled(args) and importlib.util.find_spec("xdist") is None:
-        parser.error("pytest-xdist is required for --workers; run `uv sync --all-groups` first")
+        parser.error("pytest-xdist is required for --workers; run `uv sync --frozen` first")
     if args.lane == "gui" and args.keep_agent_outputs:
         parser.error("--keep-agent-outputs only applies to pytest lanes")
     if args.shard_index >= args.shard_count:

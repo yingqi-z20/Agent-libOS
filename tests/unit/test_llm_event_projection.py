@@ -68,7 +68,7 @@ def test_message_projection_delegates_without_leaking_metadata() -> None:
     )
     rendered = projection.canonical_json()
 
-    assert projection.events == [
+    assert projection.visible_records == [
         {
             "type": "process_message_notice",
             "payload": {
@@ -112,7 +112,7 @@ def test_process_signal_keeps_only_control_type_and_reason_reference() -> None:
         payload_max_chars=2_048,
     )
 
-    assert projection.events[0]["payload"] == {
+    assert projection.visible_records[0]["payload"] == {
         "signal": "pause",
         "reason_ref": "oid-reason",
     }
@@ -141,7 +141,7 @@ def test_large_payload_is_bounded_canonical_and_deterministic() -> None:
         context_object_name="llm_context_pid-test",
         payload_max_chars=768,
     )
-    payload = first.events[0]["payload"]
+    payload = first.visible_records[0]["payload"]
     payload_json = canonical_prompt_json(payload)
 
     assert len(payload_json) <= 768
@@ -252,7 +252,7 @@ def test_denied_data_flow_projection_drops_source_payloads() -> None:
         context_object_name="llm_context_pid-test",
         payload_max_chars=2_048,
     )
-    payload = projection.events[0]["payload"]
+    payload = projection.visible_records[0]["payload"]
 
     assert payload == {
         "decision_id": "flow-deny",

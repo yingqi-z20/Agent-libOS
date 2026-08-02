@@ -58,17 +58,6 @@ _DESTRUCTIVE_EXECUTABLES = {
     "docker",
     "kubectl",
 }
-_HIGH_PACKAGE_SUBCOMMANDS = {
-    "install",
-    "add",
-    "remove",
-    "uninstall",
-    "update",
-    "upgrade",
-    "publish",
-    "run",
-    "exec",
-}
 _SHELL_SYNTAX_PATTERNS = (
     re.compile(r"[\r\n;|&<>#`'\"]"),
     re.compile(r"\$\(|\$\{"),
@@ -204,7 +193,7 @@ class ShellRuleEngine:
     def classify_builtin(self, argv: list[str]) -> RuleMatch:
         if not argv:
             raise ValidationError("shell argv must contain at least one token")
-        path_qualified_argv0 = self.argv0_has_path(argv[0]) if argv else False
+        path_qualified_argv0 = self.argv0_has_path(argv[0])
         normalized = self._normalize_argv(argv)
         direct = normalized[0]
         nested = self._nested_executables(normalized)
@@ -464,7 +453,7 @@ class ShellRuleEngine:
         token = self._first_shell_syntax_token(raw_argv)
         if token is None:
             return match
-        # Non always_allow policies must not silently accept shell metasyntax.
+        # Auto-allow classifications must not silently accept shell metasyntax.
         # The provider still executes with shell=False, but downgrading to ask
         # prevents future prefix allow rules from becoming parser-mismatch bugs
         # if a called program later feeds an argument into a shell.

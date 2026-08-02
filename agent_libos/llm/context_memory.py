@@ -29,7 +29,6 @@ from agent_libos.models import (
     DataFlowContext,
     DataLabels,
     Event,
-    EventType,
     MaterializedContext,
     MemoryView,
     ObjectHandle,

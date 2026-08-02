@@ -40,6 +40,7 @@ PERSISTENT_BACKENDS = [
     "sqlite-file",
     pytest.param("postgres", marks=pytest.mark.postgres),
 ]
+THREAD_SYNC_TIMEOUT_S = 30.0
 
 
 def _release_fenced_runtime_or_close(runtime: Runtime) -> None:
@@ -1718,7 +1719,7 @@ def test_failed_exec_serializes_concurrent_unowned_candidate_and_preserves_it(
 
             def pause_before_late_failure(*args: object, **kwargs: object) -> None:
                 exec_paused.set()
-                if not release_exec.wait(timeout=10):
+                if not release_exec.wait(timeout=THREAD_SYNC_TIMEOUT_S):
                     raise AssertionError("timed out waiting to release failed exec")
                 original_configure_skills(*args, **kwargs)
 
@@ -1766,7 +1767,7 @@ def test_failed_exec_serializes_concurrent_unowned_candidate_and_preserves_it(
                 name=proposal_thread_name,
             )
             exec_thread.start()
-            assert exec_paused.wait(timeout=10)
+            assert exec_paused.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             unexpected_lock_acquisition = (
                 runtime._registry_lifecycle_lock.acquire(blocking=False)
             )
@@ -1774,11 +1775,11 @@ def test_failed_exec_serializes_concurrent_unowned_candidate_and_preserves_it(
                 runtime._registry_lifecycle_lock.release()
             assert not unexpected_lock_acquisition
             proposal_thread.start()
-            assert proposal_reached_lock.wait(timeout=10)
+            assert proposal_reached_lock.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             assert not proposal_finished.is_set()
             release_exec.set()
-            exec_thread.join(timeout=15)
-            proposal_thread.join(timeout=15)
+            exec_thread.join(timeout=THREAD_SYNC_TIMEOUT_S)
+            proposal_thread.join(timeout=THREAD_SYNC_TIMEOUT_S)
 
             assert not exec_thread.is_alive()
             assert not proposal_thread.is_alive()

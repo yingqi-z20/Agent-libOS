@@ -7,16 +7,15 @@ real LLM paths, and documentation rules for Agent libOS contributors.
 
 Use Python 3.11–3.14 and uv. CI currently pins uv `0.11.32`; use that exact
 version when reproducing a CI or release receipt. The full matrix also requires
-system Git 2.26 or newer. The GUI package declares Node `>=22.12.0` with npm 8
-or newer. Per-change CI exercises Node 24 with the npm version supplied by that
-toolchain; the lower declared Node and npm bounds are compatibility targets,
-not separately tested CI matrix entries. Deno is optional unless validating
-real TypeScript/JIT execution.
+system Git 2.26 or newer. The GUI package declares Node
+`^24.15.0 || >=26.0.0` with npm 11 or newer. Per-change CI exercises the Node
+24 LTS line with the npm version supplied by that toolchain. Deno is optional
+unless validating real TypeScript/JIT execution.
 
 Install dependencies:
 
 ```bash
-uv sync --all-groups
+uv sync
 npm --prefix gui install
 ```
 
@@ -24,15 +23,16 @@ Use frozen resolution for the locked runtime/development dependency graph in
 artifact and CI-style checks:
 
 ```bash
-uv sync --frozen --all-groups
+uv sync --frozen
 npm --prefix gui ci
 ```
 
-uv dependency groups and package extras are independent. `--all-groups` does
-not install the optional `mcp`, `postgres`, or `pty` extras. Add the relevant
-`--extra` for an integration gate; the complete Windows matrix uses
-`uv sync --frozen --all-groups --extra pty` so native ConPTY tests are
-available.
+The default sync includes the development group used by standard checks.
+Optional package extras remain independent: add `--extra mcp`,
+`--extra postgres`, or `--extra pty` for the corresponding integration gate.
+The complete Windows matrix uses `uv sync --frozen --extra pty` so native
+ConPTY tests are available. Do not install the release group during ordinary
+development; the release path selects it explicitly.
 
 The release path installs its exact build backend from the frozen `release`
 dependency group and invokes `uv build --no-build-isolation` with that virtual
@@ -93,9 +93,10 @@ for a real-model evaluation.
 Optional provider gates are excluded unless selected explicitly:
 
 ```bash
-uv sync --frozen --all-groups --extra mcp
+uv sync --frozen --extra mcp
 uv run python -m pytest -q \
   tests/providers/test_mcp_http_transport.py \
+  tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_sdk_http_client_uses_snapshotted_headers_and_disables_ambient_env \
   tests/providers/test_mcp_v2_adapter.py \
   tests/providers/test_mcp_sdk_integration.py \
   --run-mcp --fail-on-skip
@@ -103,17 +104,18 @@ uv run python scripts/run_mcp_conformance.py
 uv run python -m pytest -q \
   tests/self_evolution/test_builtin_agent_images_real_llm.py \
   --run-real-llm --fail-on-skip
-uv sync --frozen --all-groups --extra postgres
+uv sync --frozen --extra postgres
 export AGENT_LIBOS_POSTGRES_DSN='postgresql://agent_libos:agent_libos@127.0.0.1:5432/agent_libos'
 uv run python -m pytest -m postgres --run-postgres --fail-on-skip
 ```
 
 The MCP integration job runs all three complete transport, adapter, and SDK
-integration files, without selection or ignored tests, on Ubuntu Python 3.11
-and 3.14. The `mcp` extra is the SDK v2 environment:
-`mcp>=2.0,<3` plus directly declared `httpx2`, `httpcore2`, and
-`opentelemetry-api` bounds. Legacy wire compatibility is tested through SDK v2
-and raw protocol fixtures; CI does not install SDK v1 beside it.
+integration files plus the scoped optional HTTP-client snapshot test, without
+ignored tests, on Ubuntu Python 3.11 and 3.14. The `mcp` extra is the SDK v2
+environment: `mcp>=2.0,<3` plus directly declared `anyio`, `httpx2`,
+`httpcore2`, and `opentelemetry-api` bounds. Legacy wire compatibility is
+tested through SDK v2 and raw protocol fixtures; CI does not install SDK v1
+beside it.
 The conformance runner checks out one reviewed upstream revision in a temporary
 directory and runs only the applicable strict Tools-client scenarios. It uses
 no expected-failure baseline; its generated results remain under ignored
@@ -236,9 +238,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.2.1-py3-none-any.whl dist/agent_libos-1.2.1.tar.gz
+  dist/agent_libos-1.3.0-py3-none-any.whl dist/agent_libos-1.3.0.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.2.1-py3-none-any.whl
+  dist/agent_libos-1.3.0-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 ```
 
@@ -651,11 +653,11 @@ Current behavior must not claim:
 - provider-level compensation for rollbackable external side effects,
 - Skill activation as a capability grant.
 
-`agent_libos_design_doc.md` and `plan.md` are retained only as historical design
-and planning records. They intentionally contain superseded interfaces and are
-not part of the current user-documentation contract. Do not use either file for
-current command syntax, authorization behavior, security guarantees, runtime
-semantics, or release evidence.
+`agent_libos_design_doc.md` and `plan.md` are migration notices for retired
+historical material. They are not part of the current user-documentation
+contract. Do not use prior revisions of either file for current command syntax,
+authorization behavior, security guarantees, runtime semantics, or release
+evidence.
 
 ## Adding Runtime Code
 

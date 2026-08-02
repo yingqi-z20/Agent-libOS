@@ -156,16 +156,19 @@ def _run_task_run_recovery_scale_benchmark_locked(
         runtime = Runtime.open(database, config=config)
         try:
             created_keys: list[tuple[str, str]] = []
-            for index in range(recoverable_runs):
-                summary = runtime.task_runs.create(
-                    TaskRunSpecV1(
-                        goal={"recovery_index": index},
-                        display_title=f"Recoverable Run {index}",
-                        image_id="base-agent:v0",
-                    ),
-                    client_request_id=f"scale-create-{index:06d}",
-                )
-                created_keys.append((summary.created_at, summary.run_id))
+            # Seed one coherent pre-restart snapshot. The benchmark measures
+            # recovery query shape, not the cost of 1,000 independent fsyncs.
+            with runtime.store.transaction(include_object_payloads=True):
+                for index in range(recoverable_runs):
+                    summary = runtime.task_runs.create(
+                        TaskRunSpecV1(
+                            goal={"recovery_index": index},
+                            display_title=f"Recoverable Run {index}",
+                            image_id="base-agent:v0",
+                        ),
+                        client_request_id=f"scale-create-{index:06d}",
+                    )
+                    created_keys.append((summary.created_at, summary.run_id))
             expected_keys = sorted(created_keys)
             expected_ids = [run_id for _, run_id in expected_keys]
         finally:

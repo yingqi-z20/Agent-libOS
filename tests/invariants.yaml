@@ -765,6 +765,14 @@
         "tests/unit/test_storage_backend_boundaries.py::TestStorageBackendBoundaries::test_postgres_storage_contract_uses_session_close_as_the_only_release_point",
         "tests/runtime/test_runtime_infra_release_repairs.py::test_failed_sqlite_constructor_retains_lease_until_retry"
       ],
+      "required_platform_nodes": {
+        "darwin": [
+          "tests/runtime/test_runtime_infra_release_repairs.py::test_failed_sqlite_constructor_retains_lease_until_retry"
+        ],
+        "linux": [
+          "tests/runtime/test_runtime_infra_release_repairs.py::test_failed_sqlite_constructor_retains_lease_until_retry"
+        ]
+      },
       "benchmark_attack_classes": []
     },
     {
@@ -783,7 +791,7 @@
         "tests/unit/test_storage_recovery.py::TestStoreTransactionRecovery::test_rollback_failure_poison_closes_store",
         "tests/unit/test_storage_recovery.py::TestStoreTransactionRecovery::test_release_savepoint_failure_rolls_back_nested_sql_and_payload",
         "tests/unit/test_storage_recovery.py::TestStoreTransactionRecovery::test_release_failure_with_failed_savepoint_rollback_poison_closes_store",
-        "tests/unit/test_storage_recovery.py::TestStoreTransactionRecovery::test_claim_runnable_process_does_not_commit_outer_transaction",
+        "tests/unit/test_storage_recovery.py::TestStoreTransactionRecovery::test_claim_execution_does_not_commit_outer_transaction",
         "tests/unit/test_storage_recovery.py::TestStoreTransactionRecovery::test_consume_capability_uses_does_not_commit_outer_transaction",
         "tests/unit/test_storage_recovery.py::TestStoreTransactionRecovery::test_set_object_payload_sql_failure_restores_previous_payload",
         "tests/unit/test_storage_recovery.py::TestStoreTransactionRecovery::test_set_object_payload_commit_failure_restores_previous_payload",
@@ -4443,7 +4451,7 @@
       "title": "Runtime-safety benchmark tasks and smoke runs remain deterministic and token-free by default.",
       "lane": "benchmark",
       "node_ids": [
-        "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_loads_m1_task_suite",
+        "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_loads_runtime_safety_task_suite",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_workspace_fixture_copy_rejects_symlinks",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_workspace_git_setup_rejects_preexisting_git_hooks",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_workspace_git_setup_uses_trusted_host_git_and_safe_path",

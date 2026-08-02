@@ -22,12 +22,6 @@ LANE_DIRS = {
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
-        "--run-real-deno",
-        action="store_true",
-        default=False,
-        help="deprecated; real Deno tests run by default when deno is installed",
-    )
-    parser.addoption(
         "--skip-real-deno",
         action="store_true",
         default=False,

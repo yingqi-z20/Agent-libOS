@@ -8,7 +8,7 @@ configuration at call time. They pass only:
 - `tool_id`
 - `arguments`, as a JSON object; `null` is normalized to `{}` by the primitive
 
-Agent libOS 1.2.1 uses the Python MCP SDK v2. “SDK v2” is not a wire-protocol
+Agent libOS 1.3.0 uses the Python MCP SDK v2. “SDK v2” is not a wire-protocol
 version: MCP protocol revisions are date strings. This release pins its modern
 wire contract to `2026-07-28` and also supports legacy initialize-based
 revisions. Manifest schema, SDK major, protocol revision, Agent libOS product
@@ -23,7 +23,7 @@ surface are not implemented. Static Host environment-backed Authorization
 headers remain supported transport inputs, but that is not OAuth conformance.
 
 Normative upstream references for this release are the MCP
-[`2026-07-28` versioning rules](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning),
+[protocol versioning rules](https://modelcontextprotocol.io/docs/learn/versioning),
 the [revision changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog),
 and the [Python SDK v2.0.0 release](https://github.com/modelcontextprotocol/python-sdk/releases/tag/v2.0.0).
 
@@ -705,11 +705,11 @@ before transaction entry cannot consume finite authority.
 The optional SDK-backed provider requires:
 
 ```bash
-uv sync --extra mcp --all-groups
+uv sync --frozen --extra mcp
 ```
 
 The extra installs Python MCP SDK `>=2.0,<3` plus the directly used bounded
-`httpx2`, `httpcore2`, and OpenTelemetry API dependencies. Agent libOS clears
+`anyio`, `httpx2`, `httpcore2`, and OpenTelemetry API dependencies. Agent libOS clears
 ambient trace and baggage context at the MCP adapter boundary, installs no
 exporter, and does not advertise an OpenTelemetry product capability. Reserved
 MCP negotiation/session/content headers, `Mcp-Param-*`, trace headers, and

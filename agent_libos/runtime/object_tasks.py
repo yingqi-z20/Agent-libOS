@@ -49,7 +49,6 @@ from agent_libos.runtime.object_task_notifications import (
     ObjectTaskNotificationService,
 )
 from agent_libos.runtime.object_task_state import (
-    OBJECT_TASK_ACTIVE_STATUSES,
     OBJECT_TASK_TERMINAL_STATUSES,
     ObjectTaskStateService,
 )
@@ -72,7 +71,6 @@ if TYPE_CHECKING:
     from agent_libos.tools.broker import ToolBroker
 
 
-_ACTIVE_STATUSES = OBJECT_TASK_ACTIVE_STATUSES
 _TERMINAL_STATUSES = OBJECT_TASK_TERMINAL_STATUSES
 _OWNER_WATCH_EVENTS = {"updated", "linked"}
 _MESSAGE_REPLAY_SAFE_TOOLS = {"receive_process_messages"}

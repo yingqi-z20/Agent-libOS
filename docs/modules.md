@@ -581,7 +581,7 @@ uses `pywinpty`; install it through the optional `pty` extra when real ConPTY
 support is needed:
 
 ```bash
-uv sync --all-groups --extra pty
+uv sync --frozen --extra pty
 ```
 
 ## CLI

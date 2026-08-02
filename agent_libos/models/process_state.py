@@ -582,7 +582,7 @@ def legacy_status_message(
     outcome: ProcessOutcome | None,
     fallback: str | None = None,
 ) -> str | None:
-    """Project typed state into the 0.3 public compatibility field.
+    """Project typed state into the public compatibility field.
 
     Runtime logic must never parse this projection. It exists so older CLI/GUI
     clients continue to receive the field while the typed API is adopted.
