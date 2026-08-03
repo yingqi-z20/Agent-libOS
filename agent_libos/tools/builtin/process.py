@@ -145,7 +145,11 @@ class ProcessExitArgs(BaseModel):
     result_oid: str | None = Field(
         default=None,
         min_length=1,
-        description="Existing non-empty object id to use as process result.",
+        description=(
+            "Existing non-empty object id to use as process result. Omit this "
+            "field when there is no existing result Object; do not pass the "
+            "text 'None' or 'null'."
+        ),
     )
     message: str | None = Field(
         default=None,
@@ -155,7 +159,9 @@ class ProcessExitArgs(BaseModel):
         default=None,
         description=(
             "Fresh token returned by a prior nonterminal cumulative completion "
-            "review. Supply it only after resolving every item surfaced by that review."
+            "review. Supply it only after resolving every item surfaced by "
+            "that review; otherwise omit it rather than passing the text "
+            "'None' or 'null'."
         ),
     )
     completion_evidence: ProcessCompletionEvidence | None = Field(
@@ -166,6 +172,13 @@ class ProcessExitArgs(BaseModel):
             "Each acceptance check must cite source_refs and observed tool-call evidence."
         ),
     )
+
+    @field_validator("result_oid", "review_token", mode="before")
+    @classmethod
+    def normalize_omitted_optional_ids(cls, value: object) -> object:
+        if isinstance(value, str) and value.strip().casefold() in {"none", "null"}:
+            return None
+        return value
 
     @field_validator("payload", mode="before")
     @classmethod

@@ -800,6 +800,7 @@ def test_skill_lifecycle_schema_exposes_hash_compare_and_swap(
             "activate_skill",
             "use_loaded_skill",
             "refine_search",
+            "catalog_access_required",
         ]
 
         activation_input = specs["activate_skill"]["input_schema"]
@@ -1197,7 +1198,24 @@ def test_builtin_discovery_obeys_the_same_search_and_page_limit(
         )
         assert no_match.ok
         assert no_match.payload["skills"] == []
-        assert no_match.payload["next_step"] == "refine_search"
+        assert no_match.payload["visibility_limited"] is True
+        assert no_match.payload["next_step"] == "catalog_access_required"
+
+        runtime.capability.grant(
+            pid,
+            runtime.config.skills.registry_resource,
+            [CapabilityRight.READ],
+            issued_by="test",
+        )
+        complete_no_match = runtime.tools.call(
+            pid,
+            "discover_skills",
+            {"text": "nonexistent-zebra-domain", "limit": 5},
+        )
+        assert complete_no_match.ok
+        assert complete_no_match.payload["skills"] == []
+        assert complete_no_match.payload["visibility_limited"] is False
+        assert complete_no_match.payload["next_step"] == "refine_search"
 
         oversized = runtime.tools.call(
             pid,

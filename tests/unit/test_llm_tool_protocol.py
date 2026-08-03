@@ -28,6 +28,7 @@ from agent_libos.tools.builtin.filesystem import (
 )
 from agent_libos.tools.builtin.object_files import CreateObjectFromFileTool, WriteObjectToFileTool
 from agent_libos.tools.builtin.human import HumanOutputTool
+from agent_libos.tools.builtin.jsonrpc import CallJsonRpcMethodArgs, CallJsonRpcMethodTool
 from agent_libos.tools.builtin.memory import (
     AppendMemoryObjectArgs,
     AppendMemoryObjectTool,
@@ -156,6 +157,33 @@ class TestToolProtocol:
 
         assert isinstance(parsed.completion_evidence, ProcessCompletionEvidence)
         assert parsed.completion_evidence.goal_oid == "obj_goal"
+
+    def test_jsonrpc_params_restore_only_stringified_containers(self) -> None:
+        description = CallJsonRpcMethodTool().spec().input_schema["properties"][
+            "params"
+        ]["description"]
+
+        assert "provider-stringified JSON object or array" in description
+        assert CallJsonRpcMethodArgs(
+            endpoint_id="portal",
+            method_id="snapshot",
+            params="{}",
+        ).params == {}
+        assert CallJsonRpcMethodArgs(
+            endpoint_id="portal",
+            method_id="batch",
+            params='[{"id": 1}]',
+        ).params == [{"id": 1}]
+        assert CallJsonRpcMethodArgs(
+            endpoint_id="portal",
+            method_id="literal",
+            params='"still a string"',
+        ).params == '"still a string"'
+        assert CallJsonRpcMethodArgs(
+            endpoint_id="portal",
+            method_id="literal",
+            params="plain text",
+        ).params == "plain text"
 
     def test_object_memory_schemas_explain_direct_structured_json(self) -> None:
         payload = CreateMemoryObjectTool().spec().input_schema["properties"]["payload"]

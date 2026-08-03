@@ -1,0 +1,724 @@
+[
+  {
+    "name": "create_task_plan",
+    "description": "Create a revisioned task plan as a mutable Object Memory plan ledger.",
+    "source_path": "scripts/create_task_plan.ts",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "namespace": {
+          "type": ["string", "null"],
+          "description": "Use JSON null, never the strings 'None' or 'null', for the process-default namespace. Use a string only for an exact existing authorized namespace.",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "explanation": {
+          "type": ["string", "null"],
+          "maxLength": 2048
+        },
+        "plan": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "properties": {
+              "step": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "blocked",
+                  "completed",
+                  "cancelled"
+                ]
+              }
+            },
+            "required": ["step", "status"],
+            "additionalProperties": false
+          },
+          "contains": {
+            "type": "object",
+            "properties": {
+              "status": {"const": "in_progress"}
+            },
+            "required": ["status"]
+          },
+          "minContains": 0,
+          "maxContains": 1
+        }
+      },
+      "required": ["name", "namespace", "explanation", "plan"],
+      "additionalProperties": false
+    },
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "created": {"const": true},
+        "oid": {
+          "type": "string",
+          "minLength": 1
+        },
+        "namespace": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {"const": 1},
+        "explanation": {
+          "type": ["string", "null"],
+          "maxLength": 2048
+        },
+        "plan": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "properties": {
+              "step": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "blocked",
+                  "completed",
+                  "cancelled"
+                ]
+              }
+            },
+            "required": ["step", "status"],
+            "additionalProperties": false
+          },
+          "contains": {
+            "type": "object",
+            "properties": {
+              "status": {"const": "in_progress"}
+            },
+            "required": ["status"]
+          },
+          "minContains": 0,
+          "maxContains": 1
+        },
+        "status_counts": {
+          "type": "object",
+          "properties": {
+            "pending": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "in_progress": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "blocked": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "completed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "cancelled": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "pending",
+            "in_progress",
+            "blocked",
+            "completed",
+            "cancelled"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "created",
+        "oid",
+        "namespace",
+        "name",
+        "revision",
+        "explanation",
+        "plan",
+        "status_counts"
+      ],
+      "additionalProperties": false
+    },
+    "tests": [
+      {
+        "args": {
+          "name": "release-plan",
+          "namespace": null,
+          "explanation": "Initial plan.",
+          "plan": [
+            {"step": "Inspect", "status": "completed"},
+            {"step": "Implement", "status": "in_progress"},
+            {"step": "Wait for access", "status": "blocked"},
+            {"step": "Verify", "status": "pending"},
+            {"step": "Remove obsolete work", "status": "cancelled"}
+          ]
+        },
+        "syscalls": [
+          {
+            "name": "memory.create_object",
+            "args": {
+              "type": "plan",
+              "payload": {
+                "schema_version": "task-plan/v1",
+                "entries": [
+                  {
+                    "revision": 1,
+                    "explanation": "Initial plan.",
+                    "plan": [
+                      {"step": "Inspect", "status": "completed"},
+                      {"step": "Implement", "status": "in_progress"},
+                      {"step": "Wait for access", "status": "blocked"},
+                      {"step": "Verify", "status": "pending"},
+                      {
+                        "step": "Remove obsolete work",
+                        "status": "cancelled"
+                      }
+                    ]
+                  }
+                ]
+              },
+              "metadata": {
+                "title": "release-plan",
+                "summary": "Revisioned task plan managed by the task-plan Skill.",
+                "tags": ["task-plan"]
+              },
+              "immutable": false,
+              "name": "release-plan",
+              "namespace": null
+            },
+            "result": {
+              "oid": "obj_release_plan",
+              "namespace": "process:test",
+              "name": "release-plan",
+              "type": "plan"
+            }
+          }
+        ],
+        "expected": {
+          "created": true,
+          "oid": "obj_release_plan",
+          "namespace": "process:test",
+          "name": "release-plan",
+          "revision": 1,
+          "explanation": "Initial plan.",
+          "plan": [
+            {"step": "Inspect", "status": "completed"},
+            {"step": "Implement", "status": "in_progress"},
+            {"step": "Wait for access", "status": "blocked"},
+            {"step": "Verify", "status": "pending"},
+            {"step": "Remove obsolete work", "status": "cancelled"}
+          ],
+          "status_counts": {
+            "pending": 1,
+            "in_progress": 1,
+            "blocked": 1,
+            "completed": 1,
+            "cancelled": 1
+          }
+        }
+      }
+    ],
+    "timeout_s": 10
+  },
+  {
+    "name": "read_task_plan",
+    "description": "Read and validate the latest revision of an Object Memory task plan ledger.",
+    "source_path": "scripts/read_task_plan.ts",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "namespace": {
+          "type": ["string", "null"],
+          "description": "Use JSON null, never the strings 'None' or 'null', for the process-default namespace. Use a string only for an exact existing authorized namespace.",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      },
+      "required": ["name", "namespace"],
+      "additionalProperties": false
+    },
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "oid": {
+          "type": "string",
+          "minLength": 1
+        },
+        "namespace": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "memory_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "explanation": {
+          "type": ["string", "null"],
+          "maxLength": 2048
+        },
+        "plan": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "properties": {
+              "step": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "blocked",
+                  "completed",
+                  "cancelled"
+                ]
+              }
+            },
+            "required": ["step", "status"],
+            "additionalProperties": false
+          },
+          "contains": {
+            "type": "object",
+            "properties": {
+              "status": {"const": "in_progress"}
+            },
+            "required": ["status"]
+          },
+          "minContains": 0,
+          "maxContains": 1
+        },
+        "status_counts": {
+          "type": "object",
+          "properties": {
+            "pending": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "in_progress": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "blocked": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "completed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "cancelled": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "pending",
+            "in_progress",
+            "blocked",
+            "completed",
+            "cancelled"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "oid",
+        "namespace",
+        "name",
+        "memory_version",
+        "revision",
+        "explanation",
+        "plan",
+        "status_counts"
+      ],
+      "additionalProperties": false
+    },
+    "tests": [
+      {
+        "args": {
+          "name": "release-plan",
+          "namespace": null
+        },
+        "syscalls": [
+          {
+            "name": "memory.read_object",
+            "args": {
+              "name": "release-plan",
+              "namespace": null
+            },
+            "result": {
+              "oid": "obj_release_plan",
+              "namespace": "process:test",
+              "name": "release-plan",
+              "type": "plan",
+              "version": 1,
+              "payload": {
+                "schema_version": "task-plan/v1",
+                "entries": [
+                  {
+                    "revision": 1,
+                    "explanation": "Initial plan.",
+                    "plan": [
+                      {"step": "Inspect", "status": "completed"},
+                      {"step": "Implement", "status": "in_progress"},
+                      {"step": "Wait for access", "status": "blocked"},
+                      {"step": "Verify", "status": "pending"},
+                      {
+                        "step": "Remove obsolete work",
+                        "status": "cancelled"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "expected": {
+          "oid": "obj_release_plan",
+          "namespace": "process:test",
+          "name": "release-plan",
+          "memory_version": 1,
+          "revision": 1,
+          "explanation": "Initial plan.",
+          "plan": [
+            {"step": "Inspect", "status": "completed"},
+            {"step": "Implement", "status": "in_progress"},
+            {"step": "Wait for access", "status": "blocked"},
+            {"step": "Verify", "status": "pending"},
+            {"step": "Remove obsolete work", "status": "cancelled"}
+          ],
+          "status_counts": {
+            "pending": 1,
+            "in_progress": 1,
+            "blocked": 1,
+            "completed": 1,
+            "cancelled": 1
+          }
+        }
+      }
+    ],
+    "timeout_s": 10
+  },
+  {
+    "name": "update_task_plan",
+    "description": "Append a complete task plan revision after validating the expected current revision.",
+    "source_path": "scripts/update_task_plan.ts",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "namespace": {
+          "type": ["string", "null"],
+          "description": "Use JSON null, never the strings 'None' or 'null', for the process-default namespace. Use a string only for an exact existing authorized namespace.",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "explanation": {
+          "type": ["string", "null"],
+          "maxLength": 2048
+        },
+        "plan": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "properties": {
+              "step": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "blocked",
+                  "completed",
+                  "cancelled"
+                ]
+              }
+            },
+            "required": ["step", "status"],
+            "additionalProperties": false
+          },
+          "contains": {
+            "type": "object",
+            "properties": {
+              "status": {"const": "in_progress"}
+            },
+            "required": ["status"]
+          },
+          "minContains": 0,
+          "maxContains": 1
+        }
+      },
+      "required": [
+        "name",
+        "namespace",
+        "expected_revision",
+        "explanation",
+        "plan"
+      ],
+      "additionalProperties": false
+    },
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "changed": {
+          "type": "boolean"
+        },
+        "oid": {
+          "type": "string",
+          "minLength": 1
+        },
+        "namespace": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "memory_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "explanation": {
+          "type": ["string", "null"],
+          "maxLength": 2048
+        },
+        "plan": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "properties": {
+              "step": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "blocked",
+                  "completed",
+                  "cancelled"
+                ]
+              }
+            },
+            "required": ["step", "status"],
+            "additionalProperties": false
+          },
+          "contains": {
+            "type": "object",
+            "properties": {
+              "status": {"const": "in_progress"}
+            },
+            "required": ["status"]
+          },
+          "minContains": 0,
+          "maxContains": 1
+        },
+        "status_counts": {
+          "type": "object",
+          "properties": {
+            "pending": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "in_progress": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "blocked": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "completed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "cancelled": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "pending",
+            "in_progress",
+            "blocked",
+            "completed",
+            "cancelled"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "changed",
+        "oid",
+        "namespace",
+        "name",
+        "memory_version",
+        "revision",
+        "explanation",
+        "plan",
+        "status_counts"
+      ],
+      "additionalProperties": false
+    },
+    "tests": [
+      {
+        "args": {
+          "name": "release-plan",
+          "namespace": null,
+          "expected_revision": 1,
+          "explanation": "Implementation is blocked; verification is cancelled.",
+          "plan": [
+            {"step": "Inspect", "status": "completed"},
+            {"step": "Implement", "status": "blocked"},
+            {"step": "Verify", "status": "cancelled"}
+          ]
+        },
+        "syscalls": [
+          {
+            "name": "memory.read_object",
+            "args": {
+              "name": "release-plan",
+              "namespace": null
+            },
+            "result": {
+              "oid": "obj_release_plan",
+              "namespace": "process:test",
+              "name": "release-plan",
+              "type": "plan",
+              "version": 1,
+              "payload": {
+                "schema_version": "task-plan/v1",
+                "entries": [
+                  {
+                    "revision": 1,
+                    "explanation": "Initial plan.",
+                    "plan": [
+                      {"step": "Inspect", "status": "in_progress"},
+                      {"step": "Implement", "status": "pending"},
+                      {"step": "Verify", "status": "pending"}
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "name": "memory.append_object",
+            "args": {
+              "name": "release-plan",
+              "namespace": null,
+              "entry": {
+                "revision": 2,
+                "explanation": "Implementation is blocked; verification is cancelled.",
+                "plan": [
+                  {"step": "Inspect", "status": "completed"},
+                  {"step": "Implement", "status": "blocked"},
+                  {"step": "Verify", "status": "cancelled"}
+                ]
+              },
+              "list_field": "entries"
+            },
+            "result": {
+              "oid": "obj_release_plan",
+              "namespace": "process:test",
+              "name": "release-plan",
+              "version": 2,
+              "list_field": "entries",
+              "length": 2
+            }
+          }
+        ],
+        "expected": {
+          "changed": true,
+          "oid": "obj_release_plan",
+          "namespace": "process:test",
+          "name": "release-plan",
+          "memory_version": 2,
+          "revision": 2,
+          "explanation": "Implementation is blocked; verification is cancelled.",
+          "plan": [
+            {"step": "Inspect", "status": "completed"},
+            {"step": "Implement", "status": "blocked"},
+            {"step": "Verify", "status": "cancelled"}
+          ],
+          "status_counts": {
+            "pending": 0,
+            "in_progress": 0,
+            "blocked": 1,
+            "completed": 1,
+            "cancelled": 1
+          }
+        }
+      }
+    ],
+    "timeout_s": 10
+  }
+]

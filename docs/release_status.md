@@ -1,6 +1,6 @@
-# Agent libOS 1.3.3 Status
+# Agent libOS 1.3.4 Status
 
-Agent libOS 1.3.3 is a release candidate for the core Python runtime scope
+Agent libOS 1.3.4 is a release candidate for the core Python runtime scope
 defined in `docs/support_matrix.md`. Release-ready status for any source tree is
 conditional on that exact tree passing the checked-in CI workflow; local
 deterministic results do not substitute for its Python-version, PostgreSQL, and
@@ -26,7 +26,7 @@ checkout or candidate artifact.
   one root AgentProcess tree. They persist requirements, idempotent command
   receipts, append-only ledger links, and locally integrity-bound resume points;
   they do not introduce a generic workflow DSL or distributed scheduler.
-- RuntimeStore schema v4 is the only store format accepted by 1.3.3. A schema
+- RuntimeStore schema v4 is the only store format accepted by 1.3.4. A schema
   v3 store is rejected before initialization or any write and remains
   archive-only under 1.0.1; this release has no migration, read-only bridge, or
   dual-schema mode.
@@ -242,14 +242,16 @@ checkout or candidate artifact.
   counts, bounded row work, and complete convergence are hard assertions;
   elapsed time is diagnostic only and is not a release SLA.
 - A Durable Task Run release claim also requires three real-LLM repository
-  maintenance runs and three browser-driven customer-flow runs against the
-  explicitly configured test endpoints. All six must preserve authority,
-  safety, and zero-duplicate-effect checks; utility must pass at least five of
-  six overall and two of three in each scenario family. Credentials, raw
+  maintenance runs, three browser-driven customer-flow runs against the
+  explicitly configured test endpoints, and three repetitions each of real-LLM
+  research and data-analysis scenarios. All twelve must preserve authority,
+  safety, and zero-duplicate-effect checks; utility must pass at least ten of
+  twelve overall, while every family gate retains its scenario-level minimum.
+  Credentials, raw
   provider content, browser profiles, and run artifacts are not release files;
   any result cited as evidence must instead use redacted, immutable provenance
   locators bound to the source revision.
-  The repository-maintenance half has a dedicated opt-in command:
+  The three families and the canonical combiner have dedicated commands:
 
   ```bash
   uv run --env-file .env python experiments/run_durable_task_run_evaluation.py \
@@ -257,6 +259,26 @@ checkout or candidate artifact.
     --require-release-gate \
     --repetitions 3 \
     --output "$TASK_RUN_REPORT"
+
+  uv run --env-file .env python experiments/run_browser_customer_flow_evaluation.py \
+    --confirm-real-llm \
+    --confirm-browser \
+    --require-release-gate \
+    --repetitions 3 \
+    --output "$BROWSER_TASK_RUN_REPORT"
+
+  uv run --env-file .env python experiments/run_knowledge_workflow_evaluation.py \
+    --confirm-real-llm \
+    --require-release-gate \
+    --repetitions 3 \
+    --output "$KNOWLEDGE_TASK_RUN_REPORT"
+
+  uv run python experiments/check_live_release_gate.py \
+    --repository-report "$TASK_RUN_REPORT" \
+    --browser-report "$BROWSER_TASK_RUN_REPORT" \
+    --knowledge-report "$KNOWLEDGE_TASK_RUN_REPORT" \
+    --require-release-gate \
+    --output "$COMPLETE_TASK_RUN_REPORT"
   ```
 
   `--require-release-gate` requires exactly three repetitions. That report
@@ -267,14 +289,22 @@ checkout or candidate artifact.
   least one successful receipt for the authority check to pass. The synthetic
   goal explicitly names its typed file, Git, checkpoint, Human-output, and
   terminal action contract, so the utility oracle has no hidden tool-shape
-  requirement. The evaluator
-  will not use an ambient real provider without `--confirm-real-llm`. The
-  recommended invocation omits `--artifacts-root`, so synthetic workspaces and
-  permanent-retention v4 databases are removed after the bounded report is
-  written; set `TASK_RUN_REPORT` to a file in the operating system's temporary
-  directory, outside the repository. This paragraph defines an outstanding
-  environment gate and does not assert that either live three-run family has
-  executed or passed for this source state.
+  requirement. The browser family independently requires fixed registered
+  methods, actual Chromium DOM actions, one service-level idempotency key, and
+  a post-mutation read-back. The knowledge family requires conflict-aware,
+  source-attributed research without mutation and reproducible analysis with
+  exact data-quality, segment, and guardrail oracles. No evaluator will use an ambient real
+  provider without `--confirm-real-llm`; Chromium additionally requires
+  `--confirm-browser`. Both family reports bind their start and end to the same
+  Git repository-content identity. The combined gate rejects deterministic
+  evidence, unstable or different source identities, and uncommitted source
+  changes.
+  Recommended invocations omit `--artifacts-root`, so synthetic workspaces,
+  browser state, and permanent-retention v4 databases are removed after the
+  bounded reports are written. Put all reports in the operating system's
+  temporary directory, outside the repository. These commands define an
+  environment gate; the documentation does not claim that a fresh clean-source
+  twelve-run receipt exists for the current revision.
 - The PostgreSQL CI job runs the complete `postgres` marker gate against a
   digest-pinned PostgreSQL 17.10 Bookworm image on Python 3.11 and permits no
   skips. This is a service-backed CI gate, not evidence that an arbitrary local
@@ -312,7 +342,7 @@ checkout or candidate artifact.
   The profile must validate exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The `release-artifacts` CI job is configured to build one canonical 1.3.3
+- The `release-artifacts` CI job is configured to build one canonical 1.3.4
   wheel/source pair, reject extra or non-regular output, and record an exact
   checksum manifest.
   Python 3.11 through 3.14 smoke jobs download and verify that same pair, install
@@ -332,7 +362,7 @@ endpoint to read a policy and CSV, compute a report, emit `human_output`, and
 exit. No provenance-bearing report for that run is checked in with the source
 revision, model/profile identity, redacted configuration, environment, and raw
 test outcome needed to reproduce or compare it. It is therefore an unarchived
-observation, not Agent libOS 1.3.3 release evidence, and supports no call-count,
+observation, not Agent libOS 1.3.4 release evidence, and supports no call-count,
 token-count, approval-count, latency, or serial-versus-parallel claim. Promote a
 future rerun only after using a documented opt-in real-model gate and preserving
 its reproducible report outside this status summary.
@@ -369,7 +399,7 @@ its reproducible report outside this status summary.
   non-bare workspace repository and system Git 2.26 or newer; unavailable Git
   fails individual calls without preventing Runtime startup. Host-configured
   remotes are the only first-class Git network exception. There is no Git CLI,
-  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.3.3.
+  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.3.4.
 
 ## Remaining environment gates and non-blocking debt
 

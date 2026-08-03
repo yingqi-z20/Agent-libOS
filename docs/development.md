@@ -238,9 +238,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.3.3-py3-none-any.whl dist/agent_libos-1.3.3.tar.gz
+  dist/agent_libos-1.3.4-py3-none-any.whl dist/agent_libos-1.3.4.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.3.3-py3-none-any.whl
+  dist/agent_libos-1.3.4-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 ```
 
@@ -305,8 +305,8 @@ Useful optional variables:
 endpoints require `AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1` or an explicit
 `allow_custom_base_url=True` client construction.
 
-To exercise all five built-in image contracts against one configured real
-model, run the scoped opt-in suite:
+To exercise the original five general/specialized image contracts against one
+configured real model, run the scoped opt-in suite:
 
 ```bash
 uv run --env-file .env python -m pytest -q \
@@ -315,7 +315,11 @@ uv run --env-file .env python -m pytest -q \
 ```
 
 The same suite covers the coding-image read/write/readback/exit path in an
-isolated temporary workspace. `scripts/run_coding_agent.py` and
+isolated temporary workspace. The four narrow direct long-horizon images have
+deterministic image-contract coverage; their end-to-end live coverage belongs
+to the repository-maintenance, evidence-synthesis, analysis, and browser/customer
+workflow evaluators so results retain scenario-specific utility and
+zero-duplicate-effect oracles. `scripts/run_coding_agent.py` and
 `scripts/llm_write_goal_smoke.py` remain useful for manual coding-image smoke
 runs. The coding and multi-round toolmaker cases each have a 360-second
 per-test timeout; the context-compressor case has a 600-second timeout and uses

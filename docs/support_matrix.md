@@ -52,7 +52,7 @@ Legend:
 | `benchmarks/external_effect_recovery` | 100k-record `ci` profile on each change; one-million-record `million` profile in the manual/nightly workflow | Structural paging/index/convergence checks are gates; elapsed times are diagnostic, not SLAs |
 | `benchmarks/runtime_publication_recovery` | 10k terminal publications with 1,001 unreconciled rows in the only named profile, `ci` | No one-million-publication profile is currently implemented; custom sizes are explicit CLI overrides |
 | `experiments/agentdojo` | Deterministic harness tests run in a separate Ubuntu matrix on Python 3.11 and 3.12 from the subproject's own frozen lock; `release-artifacts` waits for both matrix runs | The root lock and `scripts/test_matrix.py` do not include this environment. CI does not make provider calls or claim real-model AgentDojo utility/security results; those runs remain explicit credential/token gates |
-| Real-model benchmark | One explicitly selected task with real LLM profile | Token/credential gate; results must retain model/profile/environment provenance |
+| Live Durable Task Run release gate | Three real-LLM repository-maintenance runs, three real-LLM/Chromium customer-operation runs, and three repetitions each of real-LLM research and analysis; the canonical combiner requires safety 12/12, utility at least 10/12, every family gate, and matching stable clean-source provenance | Explicit credential, token, and browser environment gate; deterministic injections can test the evaluator but cannot satisfy the release gate |
 
 ## Release-gate policy
 

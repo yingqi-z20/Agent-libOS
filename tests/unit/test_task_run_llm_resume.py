@@ -24,6 +24,7 @@ from agent_libos.evidence.payload_retention import (
 )
 from agent_libos.evidence.external_effects import record_external_effect
 from agent_libos.llm.client import LLMCompletion
+from agent_libos.llm.executor import LLMProcessExecutor
 from agent_libos.llm.pending import PENDING_METADATA_FILTER_KEY
 from agent_libos.llm.task_runs import (
     completed_outcome_manifest,
@@ -51,6 +52,24 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.utils.serde import dumps, to_jsonable
 from tests.support.fakes import RecordingActionClient
+
+
+def test_task_run_result_oid_scan_ignores_non_object_argument_sentinels() -> None:
+    result = {
+        "action": {
+            "result_oid": "None",
+            "payload": {"result_oid": "external-provider-result"},
+        },
+        "result": {
+            "result_oid": "obj_runtime_result",
+            "nested": {"result_oid": "obj_nested_result"},
+        },
+    }
+
+    assert LLMProcessExecutor._task_run_result_oids(result) == (
+        "obj_nested_result",
+        "obj_runtime_result",
+    )
 
 
 class _CaptureTaskRunHook:

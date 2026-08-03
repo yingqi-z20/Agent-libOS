@@ -4701,7 +4701,14 @@ class LLMProcessExecutor:
                 raise RuntimeError("TaskRun result projection is too deeply nested")
             if isinstance(current, Mapping):
                 result_oid = current.get("result_oid")
-                if isinstance(result_oid, str) and result_oid:
+                # Tool results can contain the original model arguments as a
+                # nested diagnostic projection. Optional ids are sometimes
+                # rendered there as string sentinels (for example "None"),
+                # and external/domain payloads may reuse the key name. Only a
+                # Runtime Object id can contribute data labels; a syntactically
+                # valid but missing obj_* id still fails closed in the metadata
+                # lookup above.
+                if isinstance(result_oid, str) and result_oid.startswith("obj_"):
                     selected.add(result_oid)
                     if len(selected) > 256:
                         raise RuntimeError(

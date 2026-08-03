@@ -53,6 +53,14 @@ class TestCodingAgentImage:
 
     def test_builtin_agent_prompts_are_structured_and_within_registry_limits(self) -> None:
         expectations = {
+            'analysis-agent:v0': [
+                'long-horizon data analysis image',
+                'Analysis contract:',
+                'unit of analysis',
+                'join cardinality',
+                'reproducible script',
+                'cumulative review',
+            ],
             'base-agent:v0': [
                 'Role:',
                 'Instruction hierarchy:',
@@ -97,6 +105,27 @@ class TestCodingAgentImage:
                 'cumulative state from earlier chunks',
                 'target_tokens',
                 'exactly these keys',
+            ],
+            'maintenance-agent:v0': [
+                'long-horizon repository maintenance image',
+                'Durable execution contract:',
+                'acceptance ledger',
+                'Git status and the exact diff',
+                'cumulative review',
+            ],
+            'operator-agent:v0': [
+                'long-horizon customer and enterprise operations image',
+                'Transactional workflow contract:',
+                'stable service-level idempotency key',
+                'independent fresh read-back',
+                'needs-attention',
+            ],
+            'research-agent:v0': [
+                'long-horizon research and evidence-synthesis image',
+                'Research contract:',
+                'evidence ledger',
+                'primary evidence',
+                'cumulative review',
             ],
         }
 

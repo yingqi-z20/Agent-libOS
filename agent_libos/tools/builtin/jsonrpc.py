@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agent_libos.tools.base import BaseAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 from agent_libos.utils.serde import to_jsonable
@@ -36,7 +37,28 @@ class CallJsonRpcMethodArgs(BaseModel):
     method_id: str = Field(
         description="Allowed logical method id declared by the registered endpoint, not raw HTTP or argv."
     )
-    params: Any = Field(default=None, description="JSON-RPC params object, array, or null.")
+    params: Any = Field(
+        default=None,
+        description=(
+            "JSON-RPC params object, array, scalar, or null. A provider-stringified "
+            "JSON object or array is restored before endpoint-schema validation; "
+            "ordinary scalar strings remain literal."
+        ),
+    )
+
+    @field_validator("params", mode="before")
+    @classmethod
+    def restore_stringified_container(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        candidate = value.strip()
+        if not candidate or candidate[0] not in "[{":
+            return value
+        try:
+            decoded = json.loads(candidate)
+        except json.JSONDecodeError:
+            return value
+        return decoded if isinstance(decoded, (dict, list)) else value
 
 
 class CallJsonRpcMethodOutput(BaseModel):

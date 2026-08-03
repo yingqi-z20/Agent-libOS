@@ -129,11 +129,18 @@ class CreateCheckpointArgs(BaseModel):
         min_length=1,
         max_length=_CHECKPOINT_REASON_MAX_CHARS,
         description=(
-            "Why this checkpoint is being created. The complete UTF-8 value is "
-            f"limited to {_CHECKPOINT_REASON_MAX_BYTES} bytes."
+            "A concise reason of at most "
+            f"{_CHECKPOINT_REASON_MAX_CHARS} characters and "
+            f"{_CHECKPOINT_REASON_MAX_BYTES} bytes of UTF-8 text."
         ),
     )
-    pid: str | None = Field(default=None, description="Target process id. Defaults to the caller.")
+    pid: str | None = Field(
+        default=None,
+        description=(
+            "Target process id. Omit this field to checkpoint the caller; do "
+            "not pass null, the text 'None', or the caller pid."
+        ),
+    )
 
     @field_validator("reason")
     @classmethod
@@ -143,6 +150,17 @@ class CreateCheckpointArgs(BaseModel):
                 "checkpoint reason exceeds "
                 f"{_CHECKPOINT_REASON_MAX_BYTES} UTF-8 bytes"
             )
+        return value
+
+    @field_validator("pid", mode="before")
+    @classmethod
+    def _normalize_omitted_pid(cls, value: object) -> object:
+        if isinstance(value, str) and value.strip().casefold() in {
+            "",
+            "none",
+            "null",
+        }:
+            return None
         return value
 
 

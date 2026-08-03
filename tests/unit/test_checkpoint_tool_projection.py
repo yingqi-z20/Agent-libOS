@@ -13,6 +13,7 @@ from agent_libos.models.exceptions import (
 )
 from agent_libos.tools.base import ToolContext
 from agent_libos.tools.builtin.checkpoint import (
+    CreateCheckpointArgs,
     CreateCheckpointTool,
     DiffCheckpointTool,
     ForkCheckpointTool,
@@ -25,6 +26,13 @@ from agent_libos.tools.builtin.checkpoint import (
 _RECEIPT_SENTINEL = "provider-receipt-must-stay-out-of-model-output"
 _AUDIT_SENTINEL = "audit-event-id-must-stay-out-of-model-output"
 _LARGE_TEXT = "x" * 32_000
+
+
+@pytest.mark.parametrize("pid", (None, "", "None", " null "))
+def test_create_checkpoint_normalizes_omitted_pid_sentinels(pid: str | None) -> None:
+    args = CreateCheckpointArgs(reason="verified milestone", pid=pid)
+
+    assert args.pid is None
 
 
 def _context(checkpoint: Any, *, config: Any = DEFAULT_CONFIG) -> ToolContext:

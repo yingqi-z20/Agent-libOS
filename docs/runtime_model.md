@@ -467,6 +467,10 @@ The current built-in image contracts are:
 | --- | --- | --- | --- |
 | `base-agent:v0` | General runtime work and coordination | 5 Skill lifecycle/bootstrap schemas | configured Human write |
 | `coding-agent:v0` | Repository inspection, editing, Git, and verification | 5 Skill lifecycle/bootstrap schemas | configured Human write and workspace read |
+| `maintenance-agent:v0` | Durable repository maintenance with a fixed reproduce/edit/test/Git/checkpoint/delivery contract | 13 narrow direct schemas | configured Human write and workspace read |
+| `research-agent:v0` | Source-backed evidence collection and synthesis across local and Host-registered integrations | 30 narrow direct schemas | configured Human write and workspace read |
+| `analysis-agent:v0` | Reproducible data analysis with explicit quality and verification gates | 23 narrow direct schemas | configured Human write and workspace read |
+| `operator-agent:v0` | Transactional customer/enterprise workflows with read-back-before-replay recovery | 23 narrow direct schemas | configured Human write |
 | `review-agent:v0` | Evidence-first review; read-only unless repair is explicitly requested | 5 Skill lifecycle/bootstrap schemas | configured Human write and workspace read |
 | `toolmaker-agent:v0` | Import-free Deno/TypeScript JIT proposal, validation, and registration | 5 Skill lifecycle/bootstrap schemas | configured Human write |
 | `context-compressor:v0` | Structured context compaction | `process_exit` only | none |
@@ -483,9 +487,17 @@ binding; model-originated calls additionally require model projection; primitive
 authorization uses Capability and policy and treats neither table as resource
 authority. Skill activation itself grants no primitive authority.
 Requirement declarations remain Task Authority Manifest inputs, not grants.
-Configured base/coding ids must also remain distinct from the fixed review,
-toolmaker, and context-compressor ids; a collision fails Runtime construction
-instead of silently replacing an image.
+Configured base/coding ids must also remain distinct from the fixed maintenance,
+research, analysis, operator, review, toolmaker, and context-compressor ids; a
+collision fails Runtime construction instead of silently replacing an image.
+
+The four long-horizon specialist images deliberately omit
+`metadata.tool_projection`. Their complete, small `default_tools` tables are
+therefore model-visible at boot without Skill discovery turns. This is a
+visibility optimization, not an authority grant: every primitive still checks
+Capability, Task Authority, provider policy, data flow, budgets, and durable
+effect settlement. The broader general-purpose images retain source-neutral
+on-demand Skill projection for tasks whose tool domain is not known at launch.
 
 LLM selection is host-controlled and process-local. A process stores only an
 `llm_profile_id`; the host Runtime resolves that id to a configured
@@ -1481,7 +1493,13 @@ attempt can instead return `status="completion_review_required"` without making
 the process terminal; the caller must address the review and retry with its
 fresh token and evidence. The trusted Host API
 `ProcessManager.exit(..., failed=True)` is the separate path that can mark a
-process `failed`; the model-facing tool has no failure-state argument. A root
+process `failed`; the model-facing tool has no failure-state argument. Callers
+should omit `result_oid` and `review_token` until they have real values;
+the model boundary treats the literal strings `None` and `null` as omitted.
+Durable transcript label discovery follows only `obj_*` Runtime Object
+references. A non-Object domain field that happens to be named `result_oid` is
+ignored, while a referenced `obj_*` without persisted metadata still fails
+closed. A root
 process releases its process-owned memory on terminal exit
 except for any retained result. A non-root terminal child's process-owned
 memory remains available for its direct parent to merge or discard, and is

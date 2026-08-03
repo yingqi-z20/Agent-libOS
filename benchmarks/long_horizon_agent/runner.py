@@ -24,7 +24,7 @@ from agent_libos.substrate import (
 
 
 DEFAULT_PHASE_ONE_QUANTA = 6
-DEFAULT_MAX_QUANTA = 48
+DEFAULT_MAX_QUANTA = 96
 SCENARIO_ID = "durable_pricing_maintenance"
 REQUIRED_SKILLS = frozenset(
     {
@@ -200,10 +200,10 @@ test command through the dedicated Agent libOS `run_shell_command` tool,
 diagnose the general defect, fix production code without changing the public
 function signature, and add a regression for an order whose subtotal is exactly
 100.00. Use the dedicated Agent libOS `read_text_file` and `write_text_file`
-tools from the workspace Skills for repository file reads and writes, not shell
+tools for repository file reads and writes, not shell
 file I/O. Run the full test suite after editing with `run_shell_command`. Then
 inspect both Git status and the exact diff using the dedicated Agent libOS
-`git_status` and `git_diff` tools from the Git inspection Skill, not Git through
+`git_status` and `git_diff` tools, not Git through
 the shell. Call `create_checkpoint` with a concise reason, send one concise final
 human-facing summary through `human_output`, and call `process_exit` with
 structured evidence. Do not commit, stage, delete files, or stop after merely
@@ -387,6 +387,7 @@ def evaluate_run(
     successful_actions: Iterable[dict[str, Any]] | None = None,
     workflow_evidence: Iterable[dict[str, Any]] | None = None,
     activated_skills: Iterable[str],
+    required_skills: Iterable[str] = REQUIRED_SKILLS,
     checkpoint_count: int,
     restart_survived: bool,
 ) -> dict[str, Any]:
@@ -411,6 +412,7 @@ def evaluate_run(
     )
     workflow_order = _workflow_order_checks(selected_workflow_evidence)
     selected_skills = {str(skill_id) for skill_id in activated_skills}
+    selected_required_skills = {str(skill_id) for skill_id in required_skills}
     with HostOracleRunner(root) as host_oracle:
         test_result = host_oracle.run_isolated_python(_UNITTEST_BOOTSTRAP)
         behavior_result = host_oracle.run_isolated_python(
@@ -435,7 +437,7 @@ def evaluate_run(
         "exact_threshold_behavior": behavior_probe.get("exact_threshold") is True,
         "zero_quantity_behavior": behavior_probe.get("zero_quantity") is True,
         "public_signature_stable": behavior_probe.get("public_signature") is True,
-        "required_skills_activated": REQUIRED_SKILLS <= selected_skills,
+        "required_skills_activated": selected_required_skills <= selected_skills,
         "required_actions_observed": REQUIRED_ACTIONS <= set(action_names),
         "required_actions_successful": REQUIRED_ACTIONS
         <= set(successful_action_names),

@@ -5,6 +5,10 @@ import tempfile
 from pathlib import Path
 
 from benchmarks.long_horizon_agent import report_all_successful, run_evaluation
+from benchmarks.long_horizon_agent.runner import (
+    DEFAULT_MAX_QUANTA,
+    DEFAULT_PHASE_ONE_QUANTA,
+)
 from experiments.evaluation_cli import (
     has_real_llm_environment,
     paths_overlap,
@@ -22,8 +26,16 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--output", required=True, help="JSON report path.")
     parser.add_argument("--repetitions", type=positive_int, default=1)
-    parser.add_argument("--phase-one-quanta", type=positive_int, default=6)
-    parser.add_argument("--max-quanta", type=positive_int, default=48)
+    parser.add_argument(
+        "--phase-one-quanta",
+        type=positive_int,
+        default=DEFAULT_PHASE_ONE_QUANTA,
+    )
+    parser.add_argument(
+        "--max-quanta",
+        type=positive_int,
+        default=DEFAULT_MAX_QUANTA,
+    )
     parser.add_argument(
         "--artifacts-root",
         help=(

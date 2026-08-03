@@ -40,8 +40,10 @@ startup variables are not inherited. Truncated, limit-killed, incomplete, or
 unparseable oracle output fails closed.
 
 The JSON report contract is `schema_version: 1`. CLI defaults are one
-repetition, six phase-one scheduler quanta, and 48 total scheduler quanta per
-run (`--repetitions 1 --phase-one-quanta 6 --max-quanta 48`). All three values
+repetition, six phase-one scheduler quanta, and 96 total scheduler quanta per
+run (`--repetitions 1 --phase-one-quanta 6 --max-quanta 96`). The higher total
+bound leaves room for post-edit Git, checkpoint, cumulative-review, and final
+delivery actions after a restart; it remains a hard admission bound. All three values
 must be positive, and total quanta must be greater than phase-one quanta. These
 are evaluation bounds, not guarantees about how many successful model actions
 will occur.

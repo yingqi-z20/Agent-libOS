@@ -31,6 +31,11 @@ from benchmarks.long_horizon_agent.runner import (
     evaluate_run,
     prepare_workspace,
 )
+from benchmarks.live_evaluation_provenance import (
+    build_source_provenance,
+    capture_source_provenance,
+    valid_stable_source_provenance,
+)
 
 
 SCENARIO_ID = "durable_task_run_pricing_maintenance"
@@ -52,7 +57,7 @@ def run_evaluation(
     max_quanta: int = DEFAULT_MAX_QUANTA,
     llm_client_factory: LLMClientFactory | None = None,
     confirm_real_llm: bool = False,
-    image_id: str = "coding-agent:v0",
+    image_id: str = "maintenance-agent:v0",
     config: AgentLibOSConfig | None = None,
 ) -> dict[str, Any]:
     """Run the real repository-maintenance scenario through first-class Runs.
@@ -78,6 +83,7 @@ def run_evaluation(
             "provider is injected"
         )
 
+    source_start = capture_source_provenance()
     selected_root = Path(root).resolve()
     selected_root.mkdir(parents=True, exist_ok=True)
     selected_config = _durable_config(config or DEFAULT_CONFIG)
@@ -123,6 +129,7 @@ def run_evaluation(
 
     safety_successes = sum(run.get("safety_passed") is True for run in runs)
     utility_successes = sum(run.get("utility_passed") is True for run in runs)
+    evidence_mode = "llm-live" if llm_client_factory is None else "deterministic"
     report = {
         "schema_version": 1,
         "evaluation": EVALUATION_ID,
@@ -131,6 +138,8 @@ def run_evaluation(
         "repetitions": repetitions,
         "phase_one_quanta": phase_one_quanta,
         "max_quanta": max_quanta,
+        "image_id": image_id,
+        "evidence_mode": evidence_mode,
         "runs": runs,
         "metrics": {
             "runs": len(runs),
@@ -143,10 +152,15 @@ def run_evaluation(
             "mean_external_effects": _mean(runs, "external_effect_count"),
         },
         "release_gate": {
+            "required_evidence_mode": "llm-live",
             "required_repetitions": RELEASE_REPETITIONS,
             "required_safety_successes": RELEASE_REPETITIONS,
             "required_utility_successes": RELEASE_UTILITY_MINIMUM,
         },
+        "source_provenance": build_source_provenance(
+            source_start,
+            capture_source_provenance(),
+        ),
     }
     report["release_gate"]["passed"] = report_release_gate_passed(report)
     return report
@@ -156,7 +170,12 @@ def report_release_gate_passed(report: dict[str, Any]) -> bool:
     """Apply the repository-maintenance half of the live gate."""
 
     runs = report.get("runs")
-    if not isinstance(runs, list) or len(runs) != RELEASE_REPETITIONS:
+    if (
+        report.get("evidence_mode") != "llm-live"
+        or not valid_stable_source_provenance(report.get("source_provenance"))
+        or not isinstance(runs, list)
+        or len(runs) != RELEASE_REPETITIONS
+    ):
         return False
     return (
         sum(run.get("safety_passed") is True for run in runs)
@@ -316,6 +335,7 @@ def _run_once(
             successful_actions=successful_actions,
             workflow_evidence=workflow_evidence,
             activated_skills=activated_skills,
+            required_skills=(),
             checkpoint_count=len(checkpoints),
             restart_survived=restart_survived,
         )
@@ -346,6 +366,7 @@ def _run_once(
             replay_stable = replayed == terminal
         calls_after = _llm_call_signature(runtime, pids)
         effects_after = _effect_signature(runtime, pids)
+        effect_state_summary = _effect_state_summary(runtime, pids)
         transitions_after = _effect_transition_signature(
             runtime.store,
             tuple(item[0] for item in effects_after),
@@ -471,6 +492,7 @@ def _run_once(
             "tool_failures": _redacted_tool_failures(tool_failures),
             "tool_failure_count": len(tool_failures),
             "external_effect_count": len(effects_after),
+            "external_effect_state_summary": effect_state_summary,
             "external_effect_transition_count": len(transitions_after),
             "maximum_dispatches_per_effect": max(
                 dispatch_counts.values(),
@@ -484,6 +506,13 @@ def _run_once(
                 terminal.satisfied_requirement_count
             ),
             "status_message_present": bool(process.status_message),
+            "attention_blocker_kinds": sorted(
+                {
+                    str(blocker.get("kind") or "unknown")
+                    for blocker in terminal.blockers
+                    if isinstance(blocker, dict)
+                }
+            ),
         }
     finally:
         runtime.close()
@@ -540,6 +569,33 @@ def _effect_signature(runtime: Runtime, pids: Iterable[str]) -> tuple[Any, ...]:
             for effect in runtime.store.list_external_effects(pids=pids)
         )
     )
+
+
+def _effect_state_summary(
+    runtime: Runtime,
+    pids: Iterable[str],
+) -> dict[str, dict[str, int]]:
+    records = runtime.store.list_external_effects(pids=tuple(pids))
+    by_transaction_state: dict[str, int] = {}
+    by_provider: dict[str, int] = {}
+    unsettled_by_provider_operation: dict[str, int] = {}
+    for effect in records:
+        state = str(effect.transaction_state)
+        provider = str(effect.provider)
+        by_transaction_state[state] = by_transaction_state.get(state, 0) + 1
+        by_provider[provider] = by_provider.get(provider, 0) + 1
+        if state not in _SETTLED_EFFECT_STATES:
+            key = f"{provider}:{effect.operation}"
+            unsettled_by_provider_operation[key] = (
+                unsettled_by_provider_operation.get(key, 0) + 1
+            )
+    return {
+        "by_transaction_state": dict(sorted(by_transaction_state.items())),
+        "by_provider": dict(sorted(by_provider.items())),
+        "unsettled_by_provider_operation": dict(
+            sorted(unsettled_by_provider_operation.items())
+        ),
+    }
 
 
 def _effect_transition_signature(

@@ -1448,7 +1448,7 @@ class SQLRuntimeStore:
                 if version == 3:
                     raise UnsupportedStoreVersion(
                         "Agent libOS store schema v3 is not writable or readable by "
-                        "1.3.3; expected 4. Use Agent libOS 1.0.1 to view or "
+                        "1.3.4; expected 4. Use Agent libOS 1.0.1 to view or "
                         "archive this store. No migration was attempted."
                     )
                 raise UnsupportedStoreVersion(
@@ -1461,7 +1461,7 @@ class SQLRuntimeStore:
         if cls._probe_user_schema_objects(conn):
             raise UnsupportedStoreVersion(
                 "unversioned Agent libOS store detected; pre-v4 stores are "
-                "archive-only and cannot be opened by 1.3.3; use Agent libOS "
+                "archive-only and cannot be opened by 1.3.4; use Agent libOS "
                 "1.0.1 to view or archive a v3 store"
             )
         return True

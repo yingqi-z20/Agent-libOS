@@ -528,7 +528,10 @@ class LLMDefaults:
     max_input_tokens_per_call: StrictInt = 114_688
     max_total_tokens_per_call: StrictInt = 131_072
     context_window_tokens: int = 131_072
-    timeout_s: float = 60.0
+    # Long-context completion and final evidence synthesis can legitimately
+    # exceed one minute. A longer first attempt avoids three ambiguous,
+    # potentially billable retries against a still-working provider.
+    timeout_s: float = 180.0
     max_retries: int = 2
     api_mode: Literal["auto", "responses", "chat"] = "auto"
     store: bool = False

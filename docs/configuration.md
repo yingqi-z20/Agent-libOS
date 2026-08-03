@@ -194,6 +194,12 @@ libOS does not support `OPENAI_CUSTOM_HEADERS`, `OPENAI_ADMIN_KEY`, or
 are removed before any provider request rather than becoming untracked profile
 state.
 
+The default LLM timeout is 180 seconds. This accommodates long-context final
+verification without turning a slow but still-running request into multiple
+ambiguous, potentially billable transport retries. Hosts can lower or raise it
+with a selected profile's `timeout_s` or, for the default profile only,
+`OPENAI_TIMEOUT`.
+
 After the SDK exhausts its configured retries, timeout, connection, rate-limit,
 and retryable HTTP status failures are recorded and pause the AgentProcess for
 explicit Host resume. Resuming issues a new, separately accounted provider call
@@ -266,9 +272,10 @@ pass the selected values explicitly from library code.
 
 `runtime.default_image_id` and `runtime.coding_image_id` name two different
 built-in images. They must also not collide with the fixed
-`review-agent:v0`, `toolmaker-agent:v0`, or `context-compressor:v0` ids; startup
-fails on a collision rather than allowing one built-in definition to replace
-another.
+`maintenance-agent:v0`, `research-agent:v0`, `analysis-agent:v0`,
+`operator-agent:v0`, `review-agent:v0`, `toolmaker-agent:v0`, or
+`context-compressor:v0` ids; startup fails on a collision rather than allowing
+one built-in definition to replace another.
 
 The table is checked against the dataclass fields by
 `tests/unit/test_configuration_docs.py`.

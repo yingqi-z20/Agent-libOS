@@ -550,6 +550,7 @@ class TestConfigDefaults:
 
     def test_default_llm_config_persists_full_io(self) -> None:
         assert DEFAULT_CONFIG.llm.persist_full_io is True
+        assert DEFAULT_CONFIG.llm.timeout_s == 180.0
         assert DEFAULT_CONFIG.llm.auto_wait_on_empty_tool_calls is False
         assert DEFAULT_CONFIG.llm.fallback_json_actions is False
         assert DEFAULT_CONFIG.llm.context_window_tokens == 131_072

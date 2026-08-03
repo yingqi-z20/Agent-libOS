@@ -81,3 +81,11 @@ receipt.
 Omitting `--artifacts-root` deletes the synthetic workspaces and permanent-
 retention v4 databases after the report is complete. If artifacts are retained
 for diagnosis, put them outside the repository and remove them after review.
+
+The complete live release gate also requires the real-Chromium customer
+workflow documented in
+[`../browser_customer_workflows/README.md`](../browser_customer_workflows/README.md)
+and the research/analysis runs in
+[`../knowledge_workflows/README.md`](../knowledge_workflows/README.md).
+`experiments/check_live_release_gate.py` requires safety `12/12`, utility at
+least `10/12`, every family gate, and one matching stable clean-source identity.

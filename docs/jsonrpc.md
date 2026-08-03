@@ -262,10 +262,13 @@ Tool binding or model visibility does not grant remote authority. With
 projection contains only the five bootstrap tools, so none of these JSON-RPC
 schemas is initially model-visible. Activating the exact
 `agent-libos-jsonrpc` Skill projects all three without changing Capability
-authority. `toolmaker-agent:v0` and `context-compressor:v0` do not bind them and
-cannot activate that immutable built-in Skill. Custom or committed Images may
-choose another complete table/projection; a projected call still fails without
-the method capability.
+authority. The narrow direct `research-agent:v0`, `analysis-agent:v0`, and
+`operator-agent:v0` images expose the same three logical schemas at boot because
+their workflow domain is Host-selected in advance; calls still require the
+exact endpoint/method Capability and Task Authority. `maintenance-agent:v0`,
+`toolmaker-agent:v0`, and `context-compressor:v0` do not bind JSON-RPC. Custom
+or committed Images may choose another complete table/projection; a projected
+call still fails without the method capability.
 
 ## Bidirectional Data Flow
 

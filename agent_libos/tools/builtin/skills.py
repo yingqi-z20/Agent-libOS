@@ -61,11 +61,18 @@ class DiscoverSkillsOutput(BaseModel):
             "Skill source. This does not identify the source of any returned Skill."
         ),
     )
-    next_step: Literal["activate_skill", "use_loaded_skill", "refine_search"] = Field(
+    next_step: Literal[
+        "activate_skill",
+        "use_loaded_skill",
+        "refine_search",
+        "catalog_access_required",
+    ] = Field(
         description=(
             "Recommended next lifecycle step. Activate one plausible inactive exact id, use "
-            "the loaded snapshot when every returned match is current, or refine when no "
-            "returned Skill fits; never repeat an unchanged search."
+            "the loaded snapshot when every returned match is current, refine when a complete "
+            "visible catalog has no match, or stop discovery and report/request exact catalog "
+            "read authority when no match is visible and catalog access is limited; never "
+            "repeat an unchanged search."
         )
     )
 
@@ -161,9 +168,21 @@ class DiscoverSkillsTool(SyncAgentTool[DiscoverSkillsArgs]):
             limit=args.limit,
         )
         skills = discovered["skills"]
-        next_step: Literal["activate_skill", "use_loaded_skill", "refine_search"]
+        visibility_limited = (
+            discovered.get("catalog_scope") == "visibility_limited"
+        )
+        next_step: Literal[
+            "activate_skill",
+            "use_loaded_skill",
+            "refine_search",
+            "catalog_access_required",
+        ]
         if not skills:
-            next_step = "refine_search"
+            next_step = (
+                "catalog_access_required"
+                if visibility_limited
+                else "refine_search"
+            )
         elif all(bool(skill.get("active")) for skill in skills):
             next_step = "use_loaded_skill"
         else:
@@ -171,9 +190,7 @@ class DiscoverSkillsTool(SyncAgentTool[DiscoverSkillsArgs]):
         return DiscoverSkillsOutput(
             skills=skills,
             has_more=bool(discovered["has_more"]),
-            visibility_limited=(
-                discovered.get("catalog_scope") == "visibility_limited"
-            ),
+            visibility_limited=visibility_limited,
             next_step=next_step,
         )
 

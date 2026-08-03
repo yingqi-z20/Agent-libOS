@@ -1509,6 +1509,38 @@ def test_process_exit_rejects_empty_result_oid_before_terminal_transition(
         runtime.close()
 
 
+def test_process_exit_normalizes_optional_string_sentinels(
+    tmp_path: Path,
+) -> None:
+    runtime = Runtime.open(tmp_path / "process-exit-string-sentinels.sqlite")
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="omit optional process-exit ids",
+        )
+
+        result = runtime.tools.call(
+            pid,
+            "process_exit",
+            {
+                "result_oid": "None",
+                "review_token": "null",
+                "payload": {"normalized": True},
+            },
+        )
+
+        assert result.ok is True, result.error
+        process = runtime.process.get(pid)
+        assert process.status == ProcessStatus.EXITED
+        assert process.outcome is not None
+        assert process.outcome.result_oid is not None
+        assert runtime.store.get_object(process.outcome.result_oid).payload == {
+            "normalized": True
+        }
+    finally:
+        runtime.close()
+
+
 def test_exit_review_fails_closed_after_reopen_without_full_io_retention(
     tmp_path: Path,
 ) -> None:

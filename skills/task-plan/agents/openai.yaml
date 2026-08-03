@@ -1,0 +1,4 @@
+interface:
+  display_name: "Task Plan"
+  short_description: "Object Memory-backed task planning"
+  default_prompt: "Use $task-plan to create and maintain a revisioned task plan."

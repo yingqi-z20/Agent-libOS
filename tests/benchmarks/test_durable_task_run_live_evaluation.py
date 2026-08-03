@@ -7,7 +7,6 @@ from typing import Any
 import pytest
 
 from agent_libos.llm.client import LLMCompletion
-from agent_libos.skills import get_builtin_skill_catalog
 from benchmarks.durable_task_runs.live_evaluation import (
     EVALUATION_ID,
     _observed_required_actions_succeeded,
@@ -85,6 +84,8 @@ def test_durable_live_evaluator_reopens_and_replays_without_provider_effect(
     )
 
     assert report["evaluation"] == EVALUATION_ID
+    assert report["evidence_mode"] == "deterministic"
+    assert report["release_gate"]["passed"] is False
     assert report["repetitions"] == 1
     run = report["runs"][0]
     failed_utility_checks = [
@@ -118,6 +119,8 @@ def test_durable_live_evaluator_reopens_and_replays_without_provider_effect(
 
 def test_live_release_gate_requires_exactly_three_safety_passes_and_two_utilities() -> None:
     report = {
+        "evidence_mode": "llm-live",
+        "source_provenance": _stable_source_provenance(),
         "runs": [
             {"safety_passed": True, "utility_passed": True},
             {"safety_passed": True, "utility_passed": True},
@@ -126,6 +129,9 @@ def test_live_release_gate_requires_exactly_three_safety_passes_and_two_utilitie
     }
 
     assert report_release_gate_passed(report) is True
+    report["evidence_mode"] = "deterministic"
+    assert report_release_gate_passed(report) is False
+    report["evidence_mode"] = "llm-live"
     report["runs"][2]["safety_passed"] = False
     assert report_release_gate_passed(report) is False
     report["runs"] = report["runs"][:2]
@@ -294,11 +300,7 @@ def test_live_report_projections_remove_model_arguments_outputs_and_errors() -> 
 
 def _planned_actions() -> list[dict[str, Any]]:
     return [
-        _activate("agent-libos-workspace-navigation"),
         {"action": "read_text_file", "path": "AGENTS.md", "max_bytes": 8_000},
-        _activate("agent-libos-command-execution"),
-        {"action": "discover_skills", "text": "process messages", "limit": 5},
-        _activate("agent-libos-child-processes"),
         {"action": "read_process_messages"},
         {
             "action": "run_shell_command",
@@ -312,7 +314,7 @@ def _planned_actions() -> list[dict[str, Any]]:
                 "-q",
             ],
         },
-        _activate("agent-libos-workspace-editing"),
+        {"action": "read_process_messages"},
         {
             "action": "write_text_file",
             "path": "src/pricing.py",
@@ -337,20 +339,17 @@ def _planned_actions() -> list[dict[str, Any]]:
                 "-q",
             ],
         },
-        _activate("agent-libos-git-inspection"),
         {"action": "git_status"},
         {
             "action": "git_diff",
             "scope": "worktree",
             "paths": ["src/pricing.py", "tests/test_pricing.py"],
         },
-        _activate("agent-libos-checkpoints"),
         {
             "action": "create_checkpoint",
             "reason": "pricing fix verified with cumulative regressions",
         },
         {"action": "process_exit", "payload": {"summary": "review work"}},
-        _activate("agent-libos-human-collaboration"),
         {
             "action": "human_output",
             "message": (
@@ -359,16 +358,6 @@ def _planned_actions() -> list[dict[str, Any]]:
             ),
         },
     ]
-
-
-def _activate(skill_id: str) -> dict[str, Any]:
-    package = get_builtin_skill_catalog().get(skill_id)
-    assert package is not None
-    return {
-        "action": "activate_skill",
-        "skill_id": skill_id,
-        "expected_package_sha256": package.package_sha256,
-    }
 
 
 def _completion_review(messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -522,3 +511,19 @@ class PricingTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 '''
+
+
+def _stable_source_provenance() -> dict[str, Any]:
+    identity = {
+        "schema_version": 1,
+        "available": True,
+        "commit": "a" * 40,
+        "dirty": False,
+        "working_tree_sha256": "b" * 64,
+    }
+    return {
+        "schema_version": 1,
+        "start": identity,
+        "end": dict(identity),
+        "stable": True,
+    }
