@@ -2755,7 +2755,9 @@ class TestJitSecurity:
 
     @pytest.mark.real_deno
     def test_real_deno_result_frame_completes_even_with_live_handles(self) -> None:
-        sandbox = DenoTypescriptSandbox(deno_executable='deno', default_timeout_s=1.0)
+        # This asserts result-frame handling, not Deno startup latency; shared
+        # Windows runners can take more than one second to start the process.
+        sandbox = DenoTypescriptSandbox(deno_executable='deno', default_timeout_s=5.0)
         result = sandbox.run_source('\n            export function run(args, libos) {\n              setInterval(() => {}, 1000);\n              return { ok: true };\n            }\n            ', {})
         assert result == {'ok': True}
 

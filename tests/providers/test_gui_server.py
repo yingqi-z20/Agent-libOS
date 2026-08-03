@@ -1,4 +1,5 @@
 from __future__ import annotations
+import base64
 import asyncio
 import pytest
 import http.client
@@ -77,6 +78,31 @@ from agent_libos.runtime.syscalls import LibOSSyscallSession
 from tests.support.checkpoints import checkpoint_cli_json
 from tests.support.mcp import MCP_TEST_STDIO_COMMAND, MCP_TEST_STDIO_COMMAND_YAML
 from tests.support.skills import write_skill_package
+
+
+_BASE64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+# GUI requests can include runtime and SQLite transitions. Shared Windows
+# runners under xdist need more headroom than a local loopback-only request.
+_GUI_TEST_HTTP_TIMEOUT_S = 30.0
+
+
+def _noncanonical_base64url_alias(segment: str) -> str:
+    padding = "=" * (-len(segment) % 4)
+    decoded = base64.b64decode(
+        segment + padding,
+        altchars=b"-_",
+        validate=True,
+    )
+    assert base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") == segment
+    for replacement in _BASE64URL_ALPHABET:
+        candidate = segment[:-1] + replacement
+        if candidate != segment and base64.b64decode(
+            candidate + padding,
+            altchars=b"-_",
+            validate=True,
+        ) == decoded:
+            return candidate
+    raise AssertionError("base64url segment has no non-canonical alias")
 
 
 def test_gui_validates_user_profiles_before_opening_owned_runtime(
@@ -703,7 +729,11 @@ class TestGuiServer:
         token: str = 'test-token',
         extra_headers: dict[str, str] | None = None,
     ) -> tuple[int, Any]:
-        conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        conn = http.client.HTTPConnection(
+            self.host,
+            self.port,
+            timeout=_GUI_TEST_HTTP_TIMEOUT_S,
+        )
         headers = {'Authorization': f'Bearer {token}'}
         headers.update(extra_headers or {})
         payload = None
@@ -724,7 +754,11 @@ class TestGuiServer:
         *,
         extra_headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, str], bytes]:
-        conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        conn = http.client.HTTPConnection(
+            self.host,
+            self.port,
+            timeout=_GUI_TEST_HTTP_TIMEOUT_S,
+        )
         headers = {'Authorization': 'Bearer test-token'}
         headers.update(extra_headers or {})
         conn.request(method, path, headers=headers)
@@ -738,7 +772,11 @@ class TestGuiServer:
         return self.request_json_bytes(method, path, raw.encode('utf-8'))
 
     def request_json_bytes(self, method: str, path: str, raw: bytes) -> tuple[int, Any]:
-        conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        conn = http.client.HTTPConnection(
+            self.host,
+            self.port,
+            timeout=_GUI_TEST_HTTP_TIMEOUT_S,
+        )
         conn.request(
             method,
             path,
@@ -1250,9 +1288,8 @@ class TestGuiServer:
             )
             assert status == 404
             assert wrong_scope["error"]["code"] == "llm_call_not_found"
-        tampered = first["next_cursor"][:-1] + (
-            "A" if first["next_cursor"][-1] != "A" else "B"
-        )
+        cursor_prefix, signature = first["next_cursor"].rsplit(".", maxsplit=1)
+        tampered = f"{cursor_prefix}.{_noncanonical_base64url_alias(signature)}"
         status, invalid = self.request(
             "GET",
             f"/api/processes/{pid}/llm-calls?limit=2&cursor={tampered}",
@@ -2391,7 +2428,11 @@ class TestGuiServer:
             path: str,
             body: dict[str, Any] | None = None,
         ) -> tuple[int, Any]:
-            conn = http.client.HTTPConnection(reopened_host, reopened_port, timeout=10)
+            conn = http.client.HTTPConnection(
+                reopened_host,
+                reopened_port,
+                timeout=_GUI_TEST_HTTP_TIMEOUT_S,
+            )
             headers = {'Authorization': 'Bearer reopen-two'}
             payload = None
             if body is not None:
@@ -3619,7 +3660,10 @@ class TestGuiServer:
 
     def test_sse_replays_snapshot_event(self) -> None:
         request = urllib.request.Request(f'http://{self.host}:{self.port}/api/events/stream?cursor=0', headers={'Authorization': 'Bearer test-token'})
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=_GUI_TEST_HTTP_TIMEOUT_S,
+        ) as response:
             assert response.status == 200
             assert response.headers['Cache-Control'] == 'no-store'
             assert response.headers['X-Content-Type-Options'] == 'nosniff'
@@ -4100,7 +4144,11 @@ class TestGuiServer:
         try:
             host, port = typed_server.server_address
             def gui_inspect(checkpoint_id: str) -> dict[str, Any]:
-                conn = http.client.HTTPConnection(host, port, timeout=10)
+                conn = http.client.HTTPConnection(
+                    host,
+                    port,
+                    timeout=_GUI_TEST_HTTP_TIMEOUT_S,
+                )
                 conn.request(
                     'GET',
                     f'/api/checkpoints/{checkpoint_id}',
@@ -6190,7 +6238,11 @@ def _request_to_server(
     token: str,
 ) -> tuple[int, Any]:
     host, port = server.server_address
-    conn = http.client.HTTPConnection(host, port, timeout=10)
+    conn = http.client.HTTPConnection(
+        host,
+        port,
+        timeout=_GUI_TEST_HTTP_TIMEOUT_S,
+    )
     headers = {'Authorization': f'Bearer {token}'}
     payload = None
     if body is not None:

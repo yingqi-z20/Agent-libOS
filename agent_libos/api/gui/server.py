@@ -542,6 +542,20 @@ def _gui_llm_cursor_encode(
     )
 
 
+def _gui_llm_cursor_segment_decode(segment: str) -> bytes:
+    if not segment:
+        raise ValueError("empty cursor segment")
+    decoded = base64.b64decode(
+        segment + "=" * (-len(segment) % 4),
+        altchars=b"-_",
+        validate=True,
+    )
+    canonical = base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=")
+    if not hmac.compare_digest(segment, canonical):
+        raise ValueError("non-canonical base64url cursor segment")
+    return decoded
+
+
 def _gui_llm_cursor_decode(
     cursor: str,
     *,
@@ -562,8 +576,8 @@ def _gui_llm_cursor_decode(
             details={"code": "invalid_cursor"},
         )
     try:
-        encoded = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
-        signature = base64.urlsafe_b64decode(parts[2] + "=" * (-len(parts[2]) % 4))
+        encoded = _gui_llm_cursor_segment_decode(parts[1])
+        signature = _gui_llm_cursor_segment_decode(parts[2])
         expected = hmac.new(
             secret.encode("utf-8"),
             kind.encode("ascii") + b"\0" + encoded,
