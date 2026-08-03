@@ -1,4 +1,5 @@
 from __future__ import annotations
+import base64
 import asyncio
 import pytest
 import http.client
@@ -77,6 +78,28 @@ from agent_libos.runtime.syscalls import LibOSSyscallSession
 from tests.support.checkpoints import checkpoint_cli_json
 from tests.support.mcp import MCP_TEST_STDIO_COMMAND, MCP_TEST_STDIO_COMMAND_YAML
 from tests.support.skills import write_skill_package
+
+
+_BASE64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def _noncanonical_base64url_alias(segment: str) -> str:
+    padding = "=" * (-len(segment) % 4)
+    decoded = base64.b64decode(
+        segment + padding,
+        altchars=b"-_",
+        validate=True,
+    )
+    assert base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") == segment
+    for replacement in _BASE64URL_ALPHABET:
+        candidate = segment[:-1] + replacement
+        if candidate != segment and base64.b64decode(
+            candidate + padding,
+            altchars=b"-_",
+            validate=True,
+        ) == decoded:
+            return candidate
+    raise AssertionError("base64url segment has no non-canonical alias")
 
 
 def test_gui_validates_user_profiles_before_opening_owned_runtime(
@@ -1250,9 +1273,8 @@ class TestGuiServer:
             )
             assert status == 404
             assert wrong_scope["error"]["code"] == "llm_call_not_found"
-        tampered = first["next_cursor"][:-1] + (
-            "A" if first["next_cursor"][-1] != "A" else "B"
-        )
+        cursor_prefix, signature = first["next_cursor"].rsplit(".", maxsplit=1)
+        tampered = f"{cursor_prefix}.{_noncanonical_base64url_alias(signature)}"
         status, invalid = self.request(
             "GET",
             f"/api/processes/{pid}/llm-calls?limit=2&cursor={tampered}",
@@ -6190,7 +6212,9 @@ def _request_to_server(
     token: str,
 ) -> tuple[int, Any]:
     host, port = server.server_address
-    conn = http.client.HTTPConnection(host, port, timeout=10)
+    # Fresh runtimes can spend more than ten seconds initializing SQLite on
+    # oversubscribed Windows runners; the workflow still provides a hard bound.
+    conn = http.client.HTTPConnection(host, port, timeout=30.0)
     headers = {'Authorization': f'Bearer {token}'}
     payload = None
     if body is not None:
