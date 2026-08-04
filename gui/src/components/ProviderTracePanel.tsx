@@ -43,7 +43,7 @@ export function ProviderTracePanel({
 }) {
   const { formatTime, t } = useI18n();
   const seedCalls = useMemo(
-    () => snapshotCalls.filter((call) => call.pid === pid),
+    () => mergeLlmCallSummaries(snapshotCalls.filter((call) => call.pid === pid)),
     [pid, snapshotCalls]
   );
   const [calls, setCalls] = useState<LlmCallSummary[]>(seedCalls);
@@ -86,7 +86,7 @@ export function ProviderTracePanel({
     setListBusy(true);
     void client.listProcessLlmCalls(pid, 50, undefined, { signal: controller.signal, timeoutMs: 15_000 }).then((page) => {
       if (request !== listRequest.current) return;
-      setCalls(mergeLlmCallSummaries(page.items, seedCalls));
+      setCalls((current) => mergeLlmCallSummaries(page.items, current));
       setCursor(page.next_cursor);
       setSelectedCallId((current) => current ?? page.items[0]?.call_id ?? null);
     }).catch((reason) => {
@@ -143,7 +143,7 @@ export function ProviderTracePanel({
     try {
       const page = await client.listProcessLlmCalls(pid, 50, cursor, { signal: controller.signal, timeoutMs: 15_000 });
       if (request !== listRequest.current) return;
-      setCalls((current) => mergeLlmCallSummaries(current, page.items));
+      setCalls((current) => mergeLlmCallSummaries(page.items, current));
       setCursor(page.next_cursor);
     } catch (reason) {
       if (request === listRequest.current && !isAbort(reason)) setError(errorText(reason));
@@ -474,14 +474,18 @@ function InertJson({ value }: { value: unknown }) {
 
 export function mergeLlmCallSummaries(...pages: LlmCallSummary[][]): LlmCallSummary[] {
   const merged = new Map<string, LlmCallSummary>();
-  const order: string[] = [];
   for (const page of pages) {
     for (const item of page) {
-      if (!merged.has(item.call_id)) order.push(item.call_id);
       merged.set(item.call_id, item);
     }
   }
-  return order.map((id) => merged.get(id)!).filter(Boolean);
+  return Array.from(merged.values()).sort(compareLlmCallsNewestFirst);
+}
+
+function compareLlmCallsNewestFirst(left: LlmCallSummary, right: LlmCallSummary): number {
+  if (left.created_at !== right.created_at) return left.created_at < right.created_at ? 1 : -1;
+  if (left.call_id === right.call_id) return 0;
+  return left.call_id < right.call_id ? 1 : -1;
 }
 
 export function mergeSnapshotLlmCallSummaries(

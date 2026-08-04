@@ -266,6 +266,78 @@ describe("ProviderTracePanel", () => {
       reasoning_availability: "not_persisted"
     });
   });
+
+  it("normalizes every source to newest-first order", () => {
+    const oldest = summary();
+    const newest = {
+      ...summary(),
+      call_id: "call_newest",
+      created_at: "2026-08-03T02:00:00.000Z"
+    };
+
+    expect(mergeLlmCallSummaries([oldest, newest]).map((call) => call.call_id)).toEqual([
+      "call_newest",
+      "llmcall_e2e_trace"
+    ]);
+  });
+
+  it("keeps a live snapshot call when the initial page resolves later", async () => {
+    let resolvePage!: (page: {
+      schema_version: 1;
+      items: LlmCallSummary[];
+      next_cursor: null;
+      has_more: false;
+    }) => void;
+    const pendingPage = new Promise<{
+      schema_version: 1;
+      items: LlmCallSummary[];
+      next_cursor: null;
+      has_more: false;
+    }>((resolve) => {
+      resolvePage = resolve;
+    });
+    const client = {
+      ...traceClient(),
+      listProcessLlmCalls: vi.fn(() => pendingPage)
+    } as unknown as ProviderTraceClient;
+    const oldest = summary();
+    const newest = {
+      ...summary(),
+      call_id: "call_live",
+      created_at: "2026-08-03T02:00:00.000Z"
+    };
+    const container = document.createElement("div");
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <I18nProvider initialLanguage="en">
+          <ProviderTracePanel pid="pid_1" client={client} snapshotCalls={[oldest]} />
+        </I18nProvider>
+      );
+      await flushPromises();
+    });
+    await act(async () => {
+      root.render(
+        <I18nProvider initialLanguage="en">
+          <ProviderTracePanel pid="pid_1" client={client} snapshotCalls={[oldest, newest]} />
+        </I18nProvider>
+      );
+      await flushPromises();
+    });
+    await act(async () => {
+      resolvePage({ schema_version: 1, items: [oldest], next_cursor: null, has_more: false });
+      await flushPromises();
+    });
+
+    expect(Array.from(
+      container.querySelectorAll<HTMLElement>("[data-testid^='provider-trace-call-']")
+    ).map((element) => element.dataset.testid)).toEqual([
+      "provider-trace-call-call_live",
+      "provider-trace-call-llmcall_e2e_trace"
+    ]);
+    await act(() => root.unmount());
+  });
 });
 
 function traceClient(

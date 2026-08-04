@@ -292,8 +292,10 @@ checkout or candidate artifact.
   requirement. The browser family independently requires fixed registered
   methods, actual Chromium DOM actions, one service-level idempotency key, and
   a post-mutation read-back. The knowledge family requires conflict-aware,
-  source-attributed research without mutation and reproducible analysis with
-  exact data-quality, segment, and guardrail oracles. No evaluator will use an ambient real
+  source-attributed research without mutation and reproducible analysis with an
+  inert script, separately materialized JSON, and exact data-quality, segment,
+  and guardrail oracles. The analysis evaluator grants no shell authority and
+  never executes model-authored code. No evaluator will use an ambient real
   provider without `--confirm-real-llm`; Chromium additionally requires
   `--confirm-browser`. Both family reports bind their start and end to the same
   Git repository-content identity. The combined gate rejects deterministic

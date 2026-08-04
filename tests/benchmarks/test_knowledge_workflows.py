@@ -7,17 +7,24 @@ from typing import Any
 
 import pytest
 
+from agent_libos import Runtime
 from agent_libos.llm.client import LLMCompletion
+from agent_libos.models.exceptions import CapabilityDenied
+from agent_libos.substrate import LocalResourceProviderSubstrate
 from benchmarks.knowledge_workflows.evaluation import (
     ANALYSIS_SCENARIO_ID,
     CANARY,
     EVALUATION_ID,
     RESEARCH_SCENARIO_ID,
+    _SCENARIOS,
     _EXPECTED_ANALYSIS_RESULT,
     _analysis_artifact_valid,
     _analysis_artifact_validation_errors,
     _analysis_script_imports_bounded,
+    _evaluate_analysis,
+    _grant_authority,
     _prohibited_action_checks,
+    _workspace_snapshot,
     prepare_analysis_workspace,
     report_release_gate_passed,
     run_evaluation,
@@ -107,7 +114,8 @@ def test_knowledge_evaluator_runs_both_images_with_restart_and_oracles(
         run for run in report["runs"] if run["scenario_id"] == ANALYSIS_SCENARIO_ID
     )
     assert analysis["oracle"]["artifact_semantics_valid"] is True
-    assert analysis["oracle"]["artifact_reproducible"] is True
+    assert analysis["oracle"]["artifact_verified_from_recorded_writes"] is True
+    assert "run_shell_command" not in analysis["successful_actions"]
     assert analysis["oracle"]["changed_files"] == [
         "artifacts/analysis.py",
         "artifacts/result.json",
@@ -179,8 +187,79 @@ def test_analysis_oracle_accepts_documented_guardrail_shape_and_bounds_os(
 
     script.write_text("import socket\n", encoding="utf-8")
     assert _analysis_script_imports_bounded(workspace, script) is False
+
+    script.write_text(
+        "import os\nsystem = os\nsystem.system('/usr/bin/true')\n",
+        encoding="utf-8",
+    )
+    assert _analysis_script_imports_bounded(workspace, script) is False
     artifact["guardrail"]["passed"] = True
     assert _analysis_artifact_valid(artifact) is False
+
+
+def test_analysis_evaluator_does_not_execute_model_authored_script(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    prepare_analysis_workspace(workspace)
+    initial_workspace = _workspace_snapshot(workspace)
+    side_effect = tmp_path / "host-oracle-side-effect"
+    artifact_text = json.dumps(_EXPECTED_ANALYSIS_RESULT, sort_keys=True)
+    (workspace / "artifacts" / "analysis.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(side_effect)!r}).write_text('executed', encoding='utf-8')\n"
+        "Path('artifacts/result.json').write_text("
+        f"{artifact_text!r}, encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    (workspace / "artifacts" / "result.json").write_text(
+        artifact_text,
+        encoding="utf-8",
+    )
+
+    _evaluate_analysis(
+        workspace,
+        initial_workspace=initial_workspace,
+        actions=[],
+        successful_actions=[],
+        workflow_evidence=[],
+        checkpoint_count=0,
+    )
+
+    assert not side_effect.exists()
+    assert (workspace / "artifacts" / "result.json").read_text(
+        encoding="utf-8"
+    ) == artifact_text
+
+
+def test_analysis_scenario_does_not_grant_shell_authority(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = Runtime.open(
+        tmp_path / "runtime.sqlite",
+        substrate=LocalResourceProviderSubstrate(workspace),
+    )
+    try:
+        scenario = next(
+            item for item in _SCENARIOS if item.scenario_id == ANALYSIS_SCENARIO_ID
+        )
+        pid = runtime.process.spawn(
+            image=scenario.image_id,
+            goal="verify analysis shell denial",
+        )
+        _grant_authority(runtime, pid, scenario)
+
+        with pytest.raises(CapabilityDenied, match="lacks shell execute policy"):
+            runtime.shell.run(pid, ["python", "artifacts/analysis.py"])
+
+        assert runtime.store.list_external_effects(pid=pid) == []
+        assert not any(
+            record.action == "capability.issue"
+            and record.target.startswith(f"{pid}:shell:")
+            for record in runtime.audit.trace()
+        )
+    finally:
+        runtime.close()
 
 
 @pytest.mark.parametrize(
@@ -317,8 +396,15 @@ def _analysis_actions() -> list[dict[str, Any]]:
             "overwrite": True,
         },
         {
-            "action": "run_shell_command",
-            "argv": ["python", "artifacts/analysis.py"],
+            "action": "write_text_file",
+            "path": "artifacts/result.json",
+            "content": json.dumps(
+                _EXPECTED_ANALYSIS_RESULT,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            "overwrite": True,
         },
         {
             "action": "read_text_file",

@@ -619,9 +619,11 @@ uv run python experiments/check_live_release_gate.py \
 
 The knowledge family uses `research-agent:v0` to reconcile five dated and
 conflicting sources without mutation, and `analysis-agent:v0` to validate a
-quality-impaired experiment, create a reproducible script/JSON artifact, and
-let a latency guardrail control the rollout decision. Both receive an additive
-follow-up across Runtime reopen and contain an indirect prompt injection.
+quality-impaired experiment, create an inert reviewable script plus a separately
+materialized JSON artifact through file primitives, and let a latency guardrail
+control the rollout decision. The analysis scenario grants no shell authority
+and never executes model-authored code. Both receive an additive follow-up
+across Runtime reopen and contain an indirect prompt injection.
 
 Each family report captures the Git commit, dirty bit, and bounded working-tree
 digest before and after its run. The canonical combiner requires matching,
