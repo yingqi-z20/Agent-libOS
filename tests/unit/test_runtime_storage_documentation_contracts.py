@@ -27,6 +27,97 @@ def _section(document: str, heading: str) -> str:
     return match.group("body")
 
 
+def test_runtime_safety_task_count_is_consistent_across_current_docs() -> None:
+    task_count = len(
+        tuple((ROOT / "benchmarks/runtime_safety/tasks").glob("*.yaml"))
+    )
+    assert task_count == 33
+
+    expected_phrases = {
+        "README.md": "33 checked-in schema-v1",
+        "docs/benchmark.md": "contains 33 schema-v1 YAML tasks",
+        "docs/paper_thesis.md": "with 33 schema-v1 adversarial tasks",
+        "docs/release_status.md": "gate all 33 checked-in",
+        "docs/support_matrix.md": "33 deterministic schema-v1 tasks",
+    }
+    for path, expected_phrase in expected_phrases.items():
+        assert expected_phrase in _words(_read(path))
+
+
+def test_semantic_shadow_docs_keep_evidence_only_privacy_and_read_contract() -> None:
+    semantic = _words(_read("docs/semantic_shadow.md"))
+    cli = _words(_read("docs/cli.md"))
+    gui = _words(_read("docs/gui.md"))
+    storage = _words(_read("docs/storage.md"))
+
+    for required in (
+        "This release is **Shadow-only**",
+        "`mode: off` is the global kill switch and the default",
+        "There is no semantic `POST`, `PUT`, `PATCH`, or `DELETE` route",
+        "`action_id`, and `tenant_bucket_sha256` filters",
+        "does not itself publish a risk/tenant cube or an aggregate accuracy metric",
+        "The status response is schema v2",
+        "complete, exact-key `by_status` counters",
+        "strictly `0 / 0 / null`",
+        "Approval and provider-ingress capture are metadata-only",
+        "Root-goal capture may temporarily include a deterministic `redacted_intent`",
+        "the goal sensitivity is `public` or `normal`",
+        "4,096-node and 256 KiB budget",
+        "500,000-node and 64 MiB ceiling",
+        "payload-free descriptor of at most 4 KiB",
+        "every other dynamic or hostile type is reported as the fixed string `opaque`",
+        "neither the descriptor nor semantic persistence contains its original text or bytes",
+        "Local Host DLP evidence is independent of the external model",
+        "At most four local detections are frozen in a job",
+        "These Host findings merge into every terminal assessment path",
+        "remain advisory and never write labels back",
+        "Assembly freezes both the selected profile snapshot identity and its explicit model",
+        "an invocation-specific observer is additive and cannot replace or suppress it",
+        "The assembled Runtime defaults to `null`",
+        "`semantic_tenant_bucketer=`",
+        "deployment-keyed HMAC",
+        "completed external classifier dispatch, the producer may populate `input_tokens`, `output_tokens`, and `cost_microunits`",
+        "`prompt_tokens` aliases `input_tokens`",
+        "at most 64 exact string keys",
+        "safe-integer maximum (`2^53 - 1`)",
+        "canonical key and alias are both present, they must be valid and equal",
+        "Unknown keys and the raw usage object are never copied",
+        "Deterministic/scripted assessments and missing, malformed, conflicting, or untrusted counters remain `null`",
+        "valid counters can accompany an `invalid_schema` terminal assessment",
+        "provider-reported operational hints",
+        "Queue and assessment counts come from exact store aggregation",
+        "`capture_failures` is a runtime-local health counter and resets on reopen",
+    ):
+        assert required in semantic
+
+    for required in (
+        "The `semantic` group is read-only",
+        "--action-id filesystem.read",
+        "--tenant-bucket-sha256 <lowercase_sha256>",
+        "raw Human or classifier response",
+        "`prompt_tokens → input_tokens`",
+        "Unknown usage keys and the raw usage object are never emitted",
+    ):
+        assert required in cli
+
+    for required in (
+        "The read-only Semantic tab",
+        "`action_id`, `tenant_bucket_sha256`, `after`, and `limit`",
+        "There are no semantic write routes",
+        "reserved nullable input/output token and cost fields",
+        "status schema v2 with complete exact-key `by_status` and `by_domain` maps",
+        "never token aliases, unknown provider usage keys, or the raw usage object",
+    ):
+        assert required in gui
+
+    for required in (
+        "`2^53 - 1` are rejected before persistence",
+        "uses that same ceiling for latency and nullable token/cost counters",
+        "valid durable value remains exactly representable by the HTTP/CLI/GUI read",
+    ):
+        assert required in storage
+
+
 def test_event_catalog_tracks_the_complete_runtime_enum_in_order() -> None:
     documentation = _read("docs/events.md")
     catalog = _section(documentation, "Event type catalog")
@@ -191,13 +282,28 @@ def test_data_flow_docs_do_not_promise_decisions_for_pre_flow_denials() -> None:
 
 def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() -> None:
     documentation = _words(_read("docs/storage.md"))
+    readme = _words(_read("README.md"))
 
-    assert "Agent libOS 1.3.4 stores durable runtime state" in documentation
-    assert "## Strict store schema v4" in documentation
+    assert "Agent libOS 1.4.0 stores durable runtime state" in documentation
+    assert "## Strict store schema v5" in documentation
     assert "Product version and store schema version are independent" in documentation
-    assert "There are no migrations, backfills, read-only compatibility modes, or dual schema paths from schema v3 to v4" in documentation
+    assert "The only supported migration is the explicit, offline, operator-invoked canonical v4-to-v5 procedure" in documentation
+    assert "There are no automatic migrations, backfills, read-only compatibility modes, or dual runtime schema paths" in documentation
     assert "must be opened with Agent libOS 1.0.1" in documentation
+    assert "creates and opens only RuntimeStore schema v5" in readme
+    assert "offline, digest-bound v4-to-v5 migration" in readme
     for required in (
+        "## Offline v4 to v5 migration",
+        "performs zero source/lease/sidecar writes",
+        "`--expected-plan-sha256`",
+        "`--sqlite-backup`",
+        "`--postgres-snapshot-confirmed`",
+        "compare-and-swaps the singleton marker from 4 to 5",
+        "complete canonical v5 validator",
+        "both source and independent backup",
+        "exact mode `0600`",
+        "Dry-run does not chmod either file",
+        "canonical UTC with six fractional digits",
         "## Backup and restore runbook",
         "SQLite's own backup command",
         "Runtime has released its active-store lease",

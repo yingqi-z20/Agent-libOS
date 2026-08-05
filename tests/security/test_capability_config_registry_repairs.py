@@ -340,7 +340,9 @@ def test_capability_tools_preserve_large_receipts_and_page_large_inventory() -> 
                 f"object:large-list-{index:02d}",
                 [CapabilityRight.READ],
                 issued_by="test.host",
-                constraints={"payload": "c" * 15_000},
+                constraints={
+                    "git_allowed_refs": ["refs/heads/" + "c" * 14_980]
+                },
             )
             expected_ids.add(capability.cap_id)
 

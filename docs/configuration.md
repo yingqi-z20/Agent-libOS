@@ -254,6 +254,7 @@ same change.
 | `modules` | `schema_version`, `manifest_paths`, `trusted_modules`, `trusted_sha256`, `manifest_max_bytes`, `manifest_hard_limit_bytes`, `source_max_bytes`, `package_max_bytes`, `max_package_files`, `load_policy`, `discover_limit`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `entrypoint_max_chars`, `max_declared_tools`, `max_declared_images`, `max_declared_syscalls`, `max_declared_provider_hooks`, `max_declared_startup_hooks` |
 | `launcher` | `permission_presets`, `default_permission_preset`, `read_only_preset`, `edit_preset`, `full_preset` |
 | `scripts` | `ask_file_max_bytes`, `ask_file_max_quanta`, `document_summary_max_bytes`, `document_summary_max_read_bytes`, `document_summary_max_quanta`, `document_context_min_tokens`, `document_context_slack_tokens`, `document_context_max_tokens`, `object_copy_max_quanta`, `llm_write_smoke_max_quanta`, `clock_demo_iterations`, `clock_demo_interval_s`, `clock_demo_timezone`, `chat_max_turns`, `chat_context_tokens`, `chat_quanta_per_turn`, `chat_quanta_overhead` |
+| `semantic` | `mode`, `adapter`, `external_profile_id`, `max_concurrency`, `assessment_timeout_s`, `job_lease_s`, `shutdown_join_timeout_s`, `projection_ttl_s`, `recovery_batch_limit`, `intent_max_chars`, `projection_max_bytes`, `assessment_list_limit`, `assessment_list_hard_limit` |
 
 Three fields remain accepted only so existing 1.x configuration files keep
 loading: `runtime.runtime_db_filename`, `tools.sandbox_timeout_s`, and
@@ -298,6 +299,71 @@ The same test checks this nested inventory. Exact values remain authoritative
 in the live dump and typed source. Optional Runtime
 Modules may also own module-local settings that are not fields of
 `AgentLibOSConfig`.
+
+### Semantic Shadow configuration
+
+Semantic assessment is disabled by default:
+
+```yaml
+semantic:
+  mode: off
+  adapter: deterministic
+  external_profile_id: null
+  max_concurrency: 2
+  assessment_timeout_s: 30.0
+  job_lease_s: 60.0
+  shutdown_join_timeout_s: 2.0
+  projection_ttl_s: 300
+  recovery_batch_limit: 500
+  intent_max_chars: 2000
+  projection_max_bytes: 16384
+  assessment_list_limit: 100
+  assessment_list_hard_limit: 1000
+```
+
+`mode` is exactly `off` or `shadow`; off performs no capture writes and claims
+no jobs. `adapter` is `deterministic`, `scripted`, or `external`. Scripted is
+for deterministic development/test fixtures. An `external_profile_id` is
+forbidden for the other adapters. `max_concurrency` is positive and at most 32;
+assessment, lease, and shutdown-join timeouts are positive, and the lease must
+be at least as long as both timeout values.
+Projection TTL and list limits are positive; the selected list limit cannot
+exceed its hard limit. Recovery/cleanup pages use the positive
+`recovery_batch_limit`, capped at 500. The intent bound cannot exceed 2,000
+characters and the encoded projection bound must be from 512 through 16,384
+bytes.
+`assessment_list_limit` is the default for a direct Host service query and the
+effective direct-query maximum is the smaller of
+`assessment_list_hard_limit` and 500. CLI and GUI HTTP callers impose a
+separate, stricter default of 50 and maximum of 100.
+Approval and provider-ingress capture always set outbound intent to `null`.
+Root-goal capture can include deterministic `redacted_intent` only for a
+non-empty `public`/`normal`, non-mixed-identity goal no longer than
+`intent_max_chars` and only when local credential/secret DLP and conservative
+path detection find no match. Otherwise it falls back to metadata-only without
+truncating a secret; the local Host detector freezes only closed category/
+reason/evidence-digest findings for terminal merge. `intent_max_chars` tightens
+that root-goal bound but cannot exceed 2,000 characters; it is not a switch
+that enables approval or provider payload export.
+
+An external adapter can be staged while mode is off without resolving a
+profile. Enabling external Shadow requires a configured named profile other
+than `llm.default_profile_id`, with an explicit model, `store: false`,
+`max_retries: 0`, no prompt-cache key/retention, no previous-response chaining,
+and a finite timeout compatible with `semantic.assessment_timeout_s`. The
+runtime freezes the profile snapshot identity and explicit model at assembly;
+assessment rechecks snapshot/resolution/client identity and model/timeout, and
+the Protected Operation revalidates the profile-bound Sink. Drift fails closed
+instead of inheriting permissive default-profile state. This is a
+classifier-only profile; ordinary processes continue to use their own selected
+LLM profiles. See [Semantic Approval and Data
+Identification](semantic_shadow.md#external-classifier-configuration).
+
+Tenant bucketing is intentionally not a YAML setting. The default is no
+bucketer and persisted `tenant_bucket_sha256` remains `null`. An embedded Host
+may inject `semantic_tenant_bucketer=` at Runtime construction and should back
+it with a deployment-keyed HMAC; no CLI, HTTP, GUI, model, Skill, JIT, or Module
+surface can install or replace it.
 
 Checkpoint snapshot format versions are owned by the runtime codec and are not
 configurable. A runtime release emits only the snapshot version it can decode.

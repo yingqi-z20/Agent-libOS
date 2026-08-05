@@ -937,6 +937,490 @@ export type ExplainOperationResponse = {
   next_cursor: string | null;
 };
 
+export type SemanticMode = "off" | "shadow";
+export type SemanticAdapter = "deterministic" | "external" | "scripted";
+export type SemanticAssessmentKind = "approval" | "root_goal" | "provider_ingress";
+export type SemanticAssessmentStatus =
+  | "success"
+  | "skipped_policy"
+  | "egress_blocked"
+  | "timeout"
+  | "provider_error"
+  | "provider_outcome_unknown"
+  | "invalid_schema"
+  | "ood"
+  | "abstained"
+  | "stale_input";
+export type SemanticAssessmentDomain =
+  | "filesystem"
+  | "shell"
+  | "git"
+  | "jsonrpc"
+  | "mcp"
+  | "runtime"
+  | "unknown";
+export type SemanticShadowOutcome =
+  | "would_issue_exact_once"
+  | "would_deny"
+  | "require_human";
+export type SemanticFindingSeverity = "info" | "low" | "medium" | "high" | "critical";
+export type SemanticSensitivity = "public" | "normal" | "confidential" | "restricted" | "secret";
+export type SemanticIntegrity = "untrusted" | "unknown" | "checked" | "verified";
+export type SemanticTrust = "untrusted" | "unknown" | "user_asserted" | "verified" | "trusted";
+export type SemanticCalibrationBucket = "unknown" | "very_low" | "low" | "medium" | "high" | "very_high";
+export type SemanticHumanOutcome = "pending" | "approved" | "rejected" | "edited" | "cancelled" | "delivered";
+export type SemanticReasonCode =
+  | "policy_match"
+  | "hard_policy_violation"
+  | "malformed_request"
+  | "stale_binding"
+  | "stale_manifest"
+  | "stale_policy"
+  | "unsupported_action"
+  | "high_risk_action"
+  | "control_right"
+  | "data_release"
+  | "ceiling_miss"
+  | "missing_authoritative_predicate"
+  | "schema_invalid"
+  | "provider_error"
+  | "provider_outcome_unknown"
+  | "timeout"
+  | "egress_blocked"
+  | "out_of_distribution"
+  | "abstained"
+  | "risk_detected"
+  | "sensitive_data"
+  | "credential_material"
+  | "prompt_injection"
+  | "mixed_identity"
+  | "low_integrity";
+export type SemanticDataCategory =
+  | "credential"
+  | "personal"
+  | "financial"
+  | "health"
+  | "legal"
+  | "source_code"
+  | "business_secret"
+  | "instruction_attack"
+  | "untrusted_content"
+  | "other";
+export type SemanticDataLocator =
+  | "approval.request"
+  | "root_goal"
+  | "provider.result"
+  | "redacted_intent";
+export type SemanticPredicate =
+  | "schema_valid"
+  | "exact_external_operation"
+  | "binding_current"
+  | "manifest_current"
+  | "policy_current"
+  | "action_known"
+  | "action_auto_eligible"
+  | "low_risk"
+  | "resource_exact"
+  | "single_non_control_right"
+  | "ceiling_matched"
+  | "data_flow_allowed"
+  | "profile_pinned";
+
+export type SemanticStatus = {
+  schema_version: 2;
+  mode: SemanticMode;
+  adapter: SemanticAdapter;
+  profile_id: string | null;
+  queue: {
+    queued: number;
+    leased: number;
+    succeeded: number;
+    failed: number;
+    cancelled: number;
+    capture_failures: number;
+  };
+  assessments: {
+    total: number;
+    success: number;
+    error: number;
+    ood: number;
+    would_issue_exact_once: number;
+    would_deny: number;
+    require_human: number;
+    by_status: Record<SemanticAssessmentStatus, number>;
+    by_domain: Record<SemanticAssessmentDomain, number>;
+  };
+  actual_auto_approval: {
+    numerator: 0;
+    denominator: 0;
+    rate: null;
+  };
+};
+
+export type SemanticAssessmentSummary = {
+  assessment_id: string;
+  job_id: string;
+  kind: SemanticAssessmentKind;
+  status: SemanticAssessmentStatus;
+  domain: SemanticAssessmentDomain;
+  action_id: string;
+  pid: string;
+  request_id: string | null;
+  operation_id: string | null;
+  effect_id: string | null;
+  shadow_outcome: SemanticShadowOutcome;
+  reason_codes: SemanticReasonCode[];
+  ood: boolean;
+  abstain: boolean;
+  confidence_bps: number | null;
+  calibration_bucket: SemanticCalibrationBucket;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cost_microunits: number | null;
+  classifier_id: string;
+  classifier_version: string;
+  artifact_sha256: string | null;
+  input_sha256: string | null;
+  feature_snapshot_sha256: string | null;
+  policy_sha256: string | null;
+  created_at: string;
+  completed_at: string;
+  latency_ms: number | null;
+  human_outcome: SemanticHumanOutcome | null;
+  tenant_bucket_sha256: string | null;
+};
+
+export type SemanticFinding = {
+  code: SemanticReasonCode;
+  severity: SemanticFindingSeverity;
+  confidence_bps: number;
+  evidence_sha256: string;
+  source: "model" | "deterministic" | "host";
+};
+
+export type SemanticDataFinding = {
+  category: SemanticDataCategory;
+  field: SemanticDataLocator;
+  span_start: number | null;
+  span_end: number | null;
+  sensitivity_floor: SemanticSensitivity;
+  integrity_ceiling: SemanticIntegrity;
+  trust_ceiling: SemanticTrust;
+  confidence_bps: number;
+  evidence_sha256: string;
+};
+
+export type SemanticAssessmentDetail = SemanticAssessmentSummary & {
+  findings: SemanticFinding[];
+  data_findings: SemanticDataFinding[];
+  matched_rule_ids: string[];
+  proven_predicates: SemanticPredicate[];
+  missing_predicates: SemanticPredicate[];
+  source_refs_sha256: string | null;
+  data_labels_sha256: string | null;
+  sink_identity_sha256: string | null;
+  tool_schema_sha256: string | null;
+  provider_spec_sha256: string | null;
+  manifest_sha256: string | null;
+  action_sha256: string;
+  resource_sha256: string | null;
+  args_sha256: string | null;
+  state_sha256: string | null;
+  projection_sha256: string;
+};
+
+export type SemanticAssessmentPage = {
+  schema_version: 1;
+  items: SemanticAssessmentSummary[];
+  next_cursor: string | null;
+};
+
+export type SemanticAssessmentDetailResponse = {
+  schema_version: 1;
+  assessment: SemanticAssessmentDetail;
+};
+
+const semanticModeValues = new Set(["off", "shadow"]);
+const semanticAdapterValues = new Set(["deterministic", "external", "scripted"]);
+const semanticKindValues = new Set(["approval", "root_goal", "provider_ingress"]);
+const semanticStatusValues = new Set([
+  "success", "skipped_policy", "egress_blocked", "timeout", "provider_error",
+  "provider_outcome_unknown", "invalid_schema", "ood", "abstained", "stale_input"
+]);
+const semanticDomainValues = new Set(["filesystem", "shell", "git", "jsonrpc", "mcp", "runtime", "unknown"]);
+const semanticOutcomeValues = new Set(["would_issue_exact_once", "would_deny", "require_human"]);
+const semanticSeverityValues = new Set(["info", "low", "medium", "high", "critical"]);
+const semanticSensitivityValues = new Set(["public", "normal", "confidential", "restricted", "secret"]);
+const semanticIntegrityValues = new Set(["untrusted", "unknown", "checked", "verified"]);
+const semanticTrustValues = new Set(["untrusted", "unknown", "user_asserted", "verified", "trusted"]);
+const semanticCalibrationValues = new Set(["unknown", "very_low", "low", "medium", "high", "very_high"]);
+const semanticHumanOutcomeValues = new Set(["pending", "approved", "rejected", "edited", "cancelled", "delivered"]);
+const semanticReasonCodeValues = new Set([
+  "policy_match", "hard_policy_violation", "malformed_request", "stale_binding", "stale_manifest", "stale_policy",
+  "unsupported_action", "high_risk_action", "control_right", "data_release", "ceiling_miss",
+  "missing_authoritative_predicate", "schema_invalid", "provider_error", "provider_outcome_unknown", "timeout",
+  "egress_blocked", "out_of_distribution", "abstained", "risk_detected", "sensitive_data", "credential_material",
+  "prompt_injection", "mixed_identity", "low_integrity"
+]);
+const semanticDataCategoryValues = new Set([
+  "credential", "personal", "financial", "health", "legal", "source_code", "business_secret",
+  "instruction_attack", "untrusted_content", "other"
+]);
+const semanticDataLocatorValues = new Set<SemanticDataLocator>([
+  "approval.request", "root_goal", "provider.result", "redacted_intent"
+]);
+const semanticCoarseDataLocatorByKind: Record<SemanticAssessmentKind, SemanticDataLocator> = {
+  approval: "approval.request",
+  root_goal: "root_goal",
+  provider_ingress: "provider.result"
+};
+const semanticPredicateValues = new Set([
+  "schema_valid", "exact_external_operation", "binding_current", "manifest_current", "policy_current", "action_known",
+  "action_auto_eligible", "low_risk", "resource_exact", "single_non_control_right", "ceiling_matched",
+  "data_flow_allowed", "profile_pinned"
+]);
+const semanticStatusKeys = new Set(["schema_version", "mode", "adapter", "profile_id", "queue", "assessments", "actual_auto_approval"]);
+const semanticQueueKeys = new Set(["queued", "leased", "succeeded", "failed", "cancelled", "capture_failures"]);
+const semanticCountKeys = new Set([
+  "total", "success", "error", "ood", "would_issue_exact_once", "would_deny", "require_human", "by_status", "by_domain"
+]);
+const semanticScalarCountKeys = new Set(["total", "success", "error", "ood", "would_issue_exact_once", "would_deny", "require_human"]);
+const semanticActualApprovalKeys = new Set(["numerator", "denominator", "rate"]);
+const semanticSummaryKeys = new Set([
+  "assessment_id", "job_id", "kind", "status", "domain", "action_id", "pid", "request_id", "operation_id", "effect_id",
+  "shadow_outcome", "reason_codes", "ood", "abstain", "confidence_bps", "calibration_bucket", "input_tokens",
+  "output_tokens", "cost_microunits", "classifier_id", "classifier_version",
+  "artifact_sha256", "input_sha256", "feature_snapshot_sha256", "policy_sha256", "created_at", "completed_at",
+  "latency_ms", "human_outcome", "tenant_bucket_sha256"
+]);
+const semanticDetailExtraKeys = new Set([
+  "findings", "data_findings", "matched_rule_ids", "proven_predicates", "missing_predicates", "source_refs_sha256",
+  "data_labels_sha256", "sink_identity_sha256", "tool_schema_sha256", "provider_spec_sha256", "manifest_sha256",
+  "action_sha256", "resource_sha256", "args_sha256", "state_sha256", "projection_sha256"
+]);
+const semanticFindingKeys = new Set(["code", "severity", "confidence_bps", "evidence_sha256", "source"]);
+const semanticDataFindingKeys = new Set([
+  "category", "field", "span_start", "span_end", "sensitivity_floor", "integrity_ceiling", "trust_ceiling",
+  "confidence_bps", "evidence_sha256"
+]);
+const semanticPageKeys = new Set(["schema_version", "items", "next_cursor"]);
+const semanticDetailResponseKeys = new Set(["schema_version", "assessment"]);
+const semanticIdentifierPattern = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+const semanticRedactedIntentMaxChars = 2_000;
+const semanticActionPattern = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/;
+
+/** Reject malformed, unbounded, or private Semantic status fields before rendering. */
+export function assertSemanticStatus(value: unknown): asserts value is SemanticStatus {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticStatusKeys) || value.schema_version !== 2
+      || typeof value.mode !== "string" || !semanticModeValues.has(value.mode)
+      || typeof value.adapter !== "string" || !semanticAdapterValues.has(value.adapter)
+      || !(value.profile_id === null || isSemanticIdentifier(value.profile_id))
+      || !isExactNonNegativeCounterRecord(value.queue, semanticQueueKeys)
+      || !isRecord(value.assessments)
+      || !hasOnlyKeys(value.assessments, semanticCountKeys)
+      || !hasNonNegativeCounterFields(value.assessments, semanticScalarCountKeys)
+      || !isRecord(value.assessments.by_status)
+      || !isExactNonNegativeCounterRecord(value.assessments.by_status, semanticStatusValues)
+      || !isExactNonNegativeCounterRecord(value.assessments.by_domain, semanticDomainValues)
+      || sumCounters(value.assessments.by_status) !== Number(value.assessments.total)
+      || sumCounters(value.assessments.by_domain) !== Number(value.assessments.total)
+      || Number(value.assessments.success) + Number(value.assessments.error) !== Number(value.assessments.total)
+      || Number(value.assessments.would_issue_exact_once) + Number(value.assessments.would_deny)
+        + Number(value.assessments.require_human) !== Number(value.assessments.total)
+      || value.assessments.ood !== value.assessments.by_status.ood
+      || !isRecord(value.actual_auto_approval)
+      || !hasOnlyKeys(value.actual_auto_approval, semanticActualApprovalKeys)
+      || value.actual_auto_approval.numerator !== 0
+      || value.actual_auto_approval.denominator !== 0
+      || value.actual_auto_approval.rate !== null) {
+    throw new Error("GUI Semantic status is malformed.");
+  }
+}
+
+/** Reject unknown fields so prompt, raw content, and reasoning can never reach React. */
+export function assertSemanticAssessmentSummary(value: unknown): asserts value is SemanticAssessmentSummary {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticSummaryKeys)) {
+    throw new Error("GUI Semantic assessment summary is malformed or contains a private field.");
+  }
+  if (!isBoundedString(value.assessment_id, 512) || !isBoundedString(value.job_id, 512)
+      || typeof value.kind !== "string" || !semanticKindValues.has(value.kind)
+      || typeof value.status !== "string" || !semanticStatusValues.has(value.status)
+      || typeof value.domain !== "string" || !semanticDomainValues.has(value.domain)
+      || !isSemanticAction(value.action_id)
+      || !isBoundedString(value.pid, 1024)
+      || !isNullableBoundedString(value.request_id, 1024)
+      || !isNullableBoundedString(value.operation_id, 1024)
+      || !isNullableBoundedString(value.effect_id, 1024)
+      || typeof value.shadow_outcome !== "string" || !semanticOutcomeValues.has(value.shadow_outcome)
+      || !isSemanticEnumList(value.reason_codes, 128, semanticReasonCodeValues)
+      || typeof value.ood !== "boolean" || typeof value.abstain !== "boolean"
+      || !isNullableConfidenceBps(value.confidence_bps)
+      || typeof value.calibration_bucket !== "string" || !semanticCalibrationValues.has(value.calibration_bucket)
+      || !isNullableNonNegativeInteger(value.input_tokens)
+      || !isNullableNonNegativeInteger(value.output_tokens)
+      || !isNullableNonNegativeInteger(value.cost_microunits)
+      || !isBoundedString(value.classifier_id, 512) || !isBoundedString(value.classifier_version, 512)
+      || !isNullableSha256(value.artifact_sha256) || !isNullableSha256(value.input_sha256)
+      || !isNullableSha256(value.feature_snapshot_sha256) || !isNullableSha256(value.policy_sha256)
+      || !isBoundedString(value.created_at, 128) || !isBoundedString(value.completed_at, 128)
+      || !(value.latency_ms === null || isNonNegativeSafeInteger(value.latency_ms))
+      || !(value.human_outcome === null || (typeof value.human_outcome === "string" && semanticHumanOutcomeValues.has(value.human_outcome)))
+      || !isNullableSha256(value.tenant_bucket_sha256)) {
+    throw new Error("GUI Semantic assessment summary is malformed or contains a private field.");
+  }
+}
+
+export function assertSemanticAssessmentPage(value: unknown): asserts value is SemanticAssessmentPage {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticPageKeys) || value.schema_version !== 1
+      || !Array.isArray(value.items) || value.items.length > 100
+      || !isNullableBoundedString(value.next_cursor, 2048)) {
+    throw new Error("GUI Semantic assessment page is malformed.");
+  }
+  for (const item of value.items) assertSemanticAssessmentSummary(item);
+}
+
+export function assertSemanticAssessmentDetailResponse(value: unknown): asserts value is SemanticAssessmentDetailResponse {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticDetailResponseKeys) || value.schema_version !== 1
+      || !isRecord(value.assessment)) {
+    throw new Error("GUI Semantic assessment detail response is malformed.");
+  }
+  const assessment = value.assessment;
+  const detailKeys = new Set([...semanticSummaryKeys, ...semanticDetailExtraKeys]);
+  if (!hasOnlyKeys(assessment, detailKeys)) {
+    throw new Error("GUI Semantic assessment detail contains a private field.");
+  }
+  const summary = Object.fromEntries([...semanticSummaryKeys].map((key) => [key, assessment[key]]));
+  assertSemanticAssessmentSummary(summary);
+  if (!Array.isArray(assessment.findings) || assessment.findings.length > 128
+      || !Array.isArray(assessment.data_findings) || assessment.data_findings.length > 128
+      || !isSemanticIdentifierList(assessment.matched_rule_ids, 128)
+      || !isSemanticEnumList(assessment.proven_predicates, 128, semanticPredicateValues)
+      || !isSemanticEnumList(assessment.missing_predicates, 128, semanticPredicateValues)
+      || !isNullableSha256(assessment.source_refs_sha256)
+      || !isNullableSha256(assessment.data_labels_sha256)
+      || !isNullableSha256(assessment.sink_identity_sha256)
+      || !isNullableSha256(assessment.tool_schema_sha256)
+      || !isNullableSha256(assessment.provider_spec_sha256)
+      || !isNullableSha256(assessment.manifest_sha256)
+      || !isSha256(assessment.action_sha256)
+      || !isNullableSha256(assessment.resource_sha256)
+      || !isNullableSha256(assessment.args_sha256)
+      || !isNullableSha256(assessment.state_sha256)
+      || !isSha256(assessment.projection_sha256)) {
+    throw new Error("GUI Semantic assessment detail is malformed.");
+  }
+  for (const finding of assessment.findings) assertSemanticFinding(finding);
+  for (const finding of assessment.data_findings) {
+    assertSemanticDataFinding(finding, assessment.kind as SemanticAssessmentKind);
+  }
+}
+
+function assertSemanticFinding(value: unknown): asserts value is SemanticFinding {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticFindingKeys)
+      || typeof value.code !== "string" || !semanticReasonCodeValues.has(value.code)
+      || typeof value.severity !== "string" || !semanticSeverityValues.has(value.severity)
+      || !isConfidenceBps(value.confidence_bps)
+      || !isSha256(value.evidence_sha256)
+      || (value.source !== "model" && value.source !== "deterministic" && value.source !== "host")) {
+    throw new Error("GUI Semantic finding is malformed.");
+  }
+}
+
+function assertSemanticDataFinding(
+  value: unknown,
+  kind: SemanticAssessmentKind
+): asserts value is SemanticDataFinding {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticDataFindingKeys)
+      || typeof value.category !== "string" || !semanticDataCategoryValues.has(value.category)
+      || typeof value.field !== "string" || !semanticDataLocatorValues.has(value.field as SemanticDataLocator)
+      || !isNullableNonNegativeInteger(value.span_start) || !isNullableNonNegativeInteger(value.span_end)
+      || ((value.span_start === null) !== (value.span_end === null))
+      || (typeof value.span_start === "number" && typeof value.span_end === "number" && value.span_start >= value.span_end)
+      || typeof value.sensitivity_floor !== "string" || !semanticSensitivityValues.has(value.sensitivity_floor)
+      || typeof value.integrity_ceiling !== "string" || !semanticIntegrityValues.has(value.integrity_ceiling)
+      || typeof value.trust_ceiling !== "string" || !semanticTrustValues.has(value.trust_ceiling)
+      || !isConfidenceBps(value.confidence_bps) || !isSha256(value.evidence_sha256)) {
+    throw new Error("GUI Semantic data finding is malformed.");
+  }
+  const locator = value.field as SemanticDataLocator;
+  const validSpan = locator === "redacted_intent"
+    ? typeof value.span_start === "number"
+      && typeof value.span_end === "number"
+      && value.span_end <= semanticRedactedIntentMaxChars
+    : locator === semanticCoarseDataLocatorByKind[kind]
+      && value.span_start === null
+      && value.span_end === null;
+  if (!validSpan) throw new Error("GUI Semantic data finding is malformed.");
+}
+
+function isExactNonNegativeCounterRecord(value: unknown, keys: ReadonlySet<string>): boolean {
+  return isRecord(value) && hasOnlyKeys(value, keys)
+    && Object.values(value).every((item) => isNonNegativeSafeInteger(item));
+}
+
+function hasNonNegativeCounterFields(
+  value: Record<string, unknown>,
+  keys: ReadonlySet<string>
+): boolean {
+  return [...keys].every((key) => isNonNegativeSafeInteger(value[key]));
+}
+
+function sumCounters(value: unknown): number {
+  if (!isRecord(value)) return Number.NaN;
+  return Object.values(value).reduce<number>(
+    (total, item) => total + (typeof item === "number" ? item : Number.NaN),
+    0
+  );
+}
+
+function isSemanticIdentifier(value: unknown): value is string {
+  return typeof value === "string" && semanticIdentifierPattern.test(value);
+}
+
+function isSemanticAction(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 128 && semanticActionPattern.test(value);
+}
+
+function isSemanticIdentifierList(value: unknown, maxItems: number): value is string[] {
+  return Array.isArray(value) && value.length <= maxItems
+    && value.every(isSemanticIdentifier) && new Set(value).size === value.length;
+}
+
+function isSemanticEnumList(value: unknown, maxItems: number, allowed: ReadonlySet<string>): value is string[] {
+  return Array.isArray(value) && value.length <= maxItems
+    && value.every((item) => typeof item === "string" && allowed.has(item))
+    && new Set(value).size === value.length;
+}
+
+function isBoundedString(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= maxLength
+    && value === value.trim() && !value.includes("\0");
+}
+
+function isNullableBoundedString(value: unknown, maxLength: number): value is string | null {
+  return value === null || isBoundedString(value, maxLength);
+}
+
+function isConfidenceBps(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 10_000;
+}
+
+function isNullableConfidenceBps(value: unknown): value is number | null {
+  return value === null || isConfidenceBps(value);
+}
+
+function isNullableNonNegativeInteger(value: unknown): value is number | null {
+  return value === null || isNonNegativeSafeInteger(value);
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && canonicalSha256.test(value);
+}
+
+function isNullableSha256(value: unknown): value is string | null {
+  return value === null || isSha256(value);
+}
+
 export type GuiConnection = {
   url: string;
   token: string;

@@ -153,7 +153,7 @@ The implementation currently includes:
   MRTR/OAuth/listen,
   Resources, Prompts, Tasks, Apps, Roots, Sampling, Logging, OpenTelemetry
   product support, and an MCP server surface are intentionally excluded.
-- A deterministic runtime-safety benchmark harness with 32 checked-in schema-v1
+- A deterministic runtime-safety benchmark harness with 33 checked-in schema-v1
   tasks, including a self-evolution subset, baselines, evidence-backed
   side-effect oracle, fail-closed output validity, and explicit metric
   denominators.
@@ -196,6 +196,9 @@ Start here, then read the deeper references as needed:
 - [docs/data_flow.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/data_flow.md): label integrity, Host Sink trust,
   exact release, exit coverage, process identity domains, persistence, and
   guarantee boundaries.
+- [docs/semantic_shadow.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/semantic_shadow.md): default-off Phase 0+1
+  semantic approval/data-identification Shadow architecture, privacy contract,
+  read-only inspection surfaces, and explicit non-goals.
 - [docs/object_memory.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/object_memory.md): namespaces, object rights,
   file/object bridge, context materialization, and payload persistence.
 - [docs/tools_and_jit.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/tools_and_jit.md): built-in tools,
@@ -213,8 +216,8 @@ Start here, then read the deeper references as needed:
 - [docs/checkpoints.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/checkpoints.md): scoped snapshots, restore, fork,
   replay diagnostics, retained runtime history, and external-effect reporting.
 - [docs/storage.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/storage.md): transaction rollback/poison semantics,
-  Object payload durability, schema recovery, active-runtime leases, and the
-  backup/restore runbook.
+  Object payload durability, schema-v5 validation, offline v4-to-v5 migration,
+  active-runtime leases, and the backup/restore runbook.
 - [docs/evidence_payload_retention.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/evidence_payload_retention.md):
   explicit, auditable LLM/external-effect payload retention tiers and safety
   exclusions.
@@ -314,9 +317,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.3.4-py3-none-any.whl dist/agent_libos-1.3.4.tar.gz
+  dist/agent_libos-1.4.0-py3-none-any.whl dist/agent_libos-1.4.0.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.3.4-py3-none-any.whl
+  dist/agent_libos-1.4.0-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 uv export --frozen --no-dev --no-emit-project --output-file runtime-requirements.txt
 uv export --frozen --only-group release --no-emit-project --output-file release-build-requirements.txt
@@ -330,7 +333,7 @@ uv venv /tmp/agent-libos-wheel-check
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
   --require-hashes -r runtime-requirements.txt
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
-  --no-deps dist/agent_libos-1.3.4-py3-none-any.whl
+  --no-deps dist/agent_libos-1.4.0-py3-none-any.whl
 uv pip check --python /tmp/agent-libos-wheel-check/bin/python
 /tmp/agent-libos-wheel-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-wheel-check/bin/agent-libos --help
@@ -343,7 +346,7 @@ uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
   --require-hashes -r release-build-requirements.txt
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
-  --no-deps --no-build-isolation dist/agent_libos-1.3.4.tar.gz
+  --no-deps --no-build-isolation dist/agent_libos-1.4.0.tar.gz
 uv pip check --python /tmp/agent-libos-sdist-check/bin/python
 /tmp/agent-libos-sdist-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-sdist-check/bin/agent-libos --help
@@ -518,10 +521,12 @@ uv sync --frozen --extra postgres
 uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" init
 ```
 
-Agent libOS 1.3.4 creates and opens only RuntimeStore schema v4. It rejects a
-schema-v3 store before initialization or any write; use Agent libOS 1.0.1 only
-to view or archive that store. There is no v3 migration, read-only bridge, or
-dual-schema mode in 1.3.4.
+Agent libOS 1.4.0 creates and opens only RuntimeStore schema v5. A canonical v4
+store is rejected by ordinary startup until an operator runs the explicit,
+offline, digest-bound v4-to-v5 migration. A schema-v3 store is rejected before
+initialization or any write; use Agent libOS 1.0.1 only to view or archive it.
+There is no automatic migration, read-only bridge, or dual-schema Runtime mode
+in 1.4.0.
 
 Both backends implement the same runtime store contract. Process metadata,
 capabilities, audit/events, messages, human requests, LLM call records,

@@ -1,5 +1,5 @@
-import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LlmCallDetail, LlmCallPage, LlmTraceContentChunk, LlmTraceContentField, LLMProfileInput, LLMProfileSummary, McpCallResult, McpDiscoveryResult, McpServerSummary, McpToolListResult, ModuleSummary, ObjectTask, OperationListResponse, RuntimeSnapshot, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunSpecV1, TaskRunSummary } from "./types";
-import { assertLlmCallDetail, assertLlmCallPage, assertLlmTraceContentChunk, assertMcpCallResult, assertMcpDiscoveryResult, assertMcpServerSummary, assertMcpToolListResult, assertRuntimeSnapshot, assertSchedulerStatus, assertTaskRunDetail, assertTaskRunSummary } from "./types";
+import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LlmCallDetail, LlmCallPage, LlmTraceContentChunk, LlmTraceContentField, LLMProfileInput, LLMProfileSummary, McpCallResult, McpDiscoveryResult, McpServerSummary, McpToolListResult, ModuleSummary, ObjectTask, OperationListResponse, RuntimeSnapshot, SemanticAssessmentDetail, SemanticAssessmentDomain, SemanticAssessmentKind, SemanticAssessmentPage, SemanticAssessmentStatus, SemanticStatus, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunSpecV1, TaskRunSummary } from "./types";
+import { assertLlmCallDetail, assertLlmCallPage, assertLlmTraceContentChunk, assertMcpCallResult, assertMcpDiscoveryResult, assertMcpServerSummary, assertMcpToolListResult, assertRuntimeSnapshot, assertSchedulerStatus, assertSemanticAssessmentDetailResponse, assertSemanticAssessmentPage, assertSemanticStatus, assertTaskRunDetail, assertTaskRunSummary } from "./types";
 import type { OptionalQuanta } from "../quanta";
 
 type JsonBody = Record<string, unknown>;
@@ -8,11 +8,30 @@ const defaultReadRequestTimeoutMs = 30_000;
 export const objectTaskWaitDeadlineMarginMs = 5_000;
 export const capabilityInventoryMaxItems = 10_000;
 export const capabilityInventoryMaxPages = capabilityInventoryMaxItems;
+const semanticFilterMaxChars = 512;
+const semanticCursorMaxChars = 2_048;
+const semanticKinds = new Set(["approval", "root_goal", "provider_ingress"]);
+const semanticStatuses = new Set([
+  "success", "skipped_policy", "egress_blocked", "timeout", "provider_error",
+  "provider_outcome_unknown", "invalid_schema", "ood", "abstained", "stale_input"
+]);
+const semanticDomains = new Set(["filesystem", "shell", "git", "jsonrpc", "mcp", "runtime", "unknown"]);
 
 export type CapabilityPageResponse = {
   items: CapabilitySummary[];
   next_after: string | null;
   has_more: boolean;
+};
+
+export type SemanticAssessmentFilters = {
+  pid?: string;
+  requestId?: string;
+  operationId?: string;
+  kind?: SemanticAssessmentKind;
+  status?: SemanticAssessmentStatus;
+  domain?: SemanticAssessmentDomain;
+  actionId?: string;
+  tenantBucketSha256?: string;
 };
 
 export class LibOSClient {
@@ -218,6 +237,72 @@ export class LibOSClient {
       undefined,
       options
     );
+  }
+
+  async getSemanticStatus(options: RequestOptions = {}): Promise<SemanticStatus> {
+    const value = await this.request<unknown>("GET", "/api/semantic/status", undefined, options);
+    assertSemanticStatus(value);
+    return value;
+  }
+
+  async listSemanticAssessments(
+    filters: SemanticAssessmentFilters = {},
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticAssessmentPage> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("Semantic assessment page limit must be an integer from 1 to 100.");
+    }
+    const pid = semanticQueryText(filters.pid, "pid", semanticFilterMaxChars);
+    const requestId = semanticQueryText(filters.requestId, "request_id", semanticFilterMaxChars);
+    const operationId = semanticQueryText(filters.operationId, "operation_id", semanticFilterMaxChars);
+    const kind = semanticQueryEnum(filters.kind, "kind", semanticKinds);
+    const status = semanticQueryEnum(filters.status, "status", semanticStatuses);
+    const domain = semanticQueryEnum(filters.domain, "domain", semanticDomains);
+    const actionId = semanticQueryText(filters.actionId, "action_id", 128);
+    if (actionId !== undefined && !/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/.test(actionId)) {
+      throw new Error("Semantic assessment action_id is invalid.");
+    }
+    const tenantBucketSha256 = semanticQuerySha256(filters.tenantBucketSha256, "tenant_bucket_sha256");
+    const cursor = semanticQueryText(after, "after", semanticCursorMaxChars);
+    const query = new URLSearchParams();
+    if (pid !== undefined) query.set("pid", pid);
+    if (requestId !== undefined) query.set("request_id", requestId);
+    if (operationId !== undefined) query.set("operation_id", operationId);
+    if (kind !== undefined) query.set("kind", kind);
+    if (status !== undefined) query.set("status", status);
+    if (domain !== undefined) query.set("domain", domain);
+    if (actionId !== undefined) query.set("action_id", actionId);
+    if (tenantBucketSha256 !== undefined) query.set("tenant_bucket_sha256", tenantBucketSha256);
+    if (cursor !== undefined) query.set("after", cursor);
+    query.set("limit", String(limit));
+    const value = await this.request<unknown>(
+      "GET",
+      `/api/semantic/assessments?${query.toString()}`,
+      undefined,
+      options
+    );
+    assertSemanticAssessmentPage(value);
+    if (filters.pid && value.items.some((item) => item.pid !== filters.pid)) {
+      throw new Error("GUI Semantic assessment page contains an assessment from another process.");
+    }
+    return value;
+  }
+
+  async getSemanticAssessment(assessmentId: string, options: RequestOptions = {}): Promise<SemanticAssessmentDetail> {
+    semanticQueryText(assessmentId, "assessment_id", semanticFilterMaxChars);
+    const value = await this.request<unknown>(
+      "GET",
+      `/api/semantic/assessments/${encodeURIComponent(assessmentId)}`,
+      undefined,
+      options
+    );
+    assertSemanticAssessmentDetailResponse(value);
+    if (value.assessment.assessment_id !== assessmentId) {
+      throw new Error("GUI Semantic assessment identity does not match the requested id.");
+    }
+    return value.assessment;
   }
 
   async listProcessLlmCalls(pid: string, limit = 50, cursor?: string, options: RequestOptions = {}): Promise<LlmCallPage> {
@@ -898,6 +983,30 @@ function taskRunErrorEnvelope(error: ApiError): Record<string, unknown> | null {
   return envelope && typeof envelope === "object" && !Array.isArray(envelope)
     ? envelope as Record<string, unknown>
     : null;
+}
+
+function semanticQueryText(value: string | undefined, field: string, maximum: number): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !value.trim() || value.length > maximum) {
+    throw new Error(`Semantic assessment ${field} must be a non-empty string of at most ${maximum} characters.`);
+  }
+  return value;
+}
+
+function semanticQueryEnum<T extends string>(
+  value: T | undefined,
+  field: string,
+  allowed: ReadonlySet<string>
+): T | undefined {
+  if (value === undefined) return undefined;
+  if (!allowed.has(value)) throw new Error(`Semantic assessment ${field} is invalid.`);
+  return value;
+}
+
+function semanticQuerySha256(value: string | undefined, field: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (!/^[0-9a-f]{64}$/.test(value)) throw new Error(`Semantic assessment ${field} must be a lowercase SHA-256 digest.`);
+  return value;
 }
 
 function withOptionalQuanta(body: JsonBody, maxQuanta: OptionalQuanta): JsonBody {

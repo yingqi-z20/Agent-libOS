@@ -208,6 +208,8 @@ jsonrpc       JSON-RPC endpoint and call subcommands
 mcp           MCP server and tool-call subcommands
 modules       startup Runtime Module inspection and verification
 human         process pending human messages manually
+semantic      read-only semantic Shadow status and assessment evidence
+store         explicit offline Runtime-store administration
 ```
 
 The `processes` and `resources` responses, and the resulting process state from
@@ -246,9 +248,11 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint --actor-pid <actor_pid> i
 
 ## Persistent Runtime Basics
 
-Agent libOS 1.3.4 opens only store schema v4. A schema-v3 database from 1.0.1
-is rejected before `init`, recovery, audit, or any other write; use 1.0.1 to
-inspect/archive it. There is no v3 migration or read-only compatibility mode.
+Agent libOS 1.4.0 opens only store schema v5. A canonical schema-v4 database is
+rejected before `init`, recovery, audit, or any other write until an operator
+uses the explicit offline `store migrate --to 5` workflow below. Older,
+unversioned, and malformed stores remain unsupported; there is no implicit
+migration or read-only compatibility mode in ordinary Runtime startup.
 
 `run`, `llm-once`, and `exec --run` invoke the configured real LLM and may
 consume provider tokens. Process rows and capabilities survive a file-backed
@@ -362,6 +366,108 @@ llm:
       allow_custom_base_url: true
 ```
 
+## Semantic Shadow Inspection
+
+The `semantic` group is read-only and prints schema-versioned JSON:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite semantic status
+uv run agent-libos --db .agent_libos.sqlite semantic assessments \
+  --pid <pid> --request-id <request_id> --operation-id <operation_id> \
+  --kind approval --status success --domain filesystem \
+  --action-id filesystem.read \
+  --tenant-bucket-sha256 <lowercase_sha256> --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic assessments \
+  --after <opaque_next_cursor> --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic show <assessment_id>
+```
+
+Every assessment filter is optional. `--limit` defaults to 50 and must be from
+1 through 100. IDs and filters are bounded, and `--after` is an opaque bounded
+keyset cursor returned by the previous page; clients must not parse or
+synthesize it. Output contains the action id, typed findings, Shadow outcome,
+normalized observed Human outcome, calibration bucket, reserved nullable
+token/cost fields, latency, and provenance digests, but never a prompt,
+goal/provider body, raw Human or classifier response, safe projection, or model
+reasoning. The action filter is a dotted lower-case ontology id and the tenant
+filter is an exact lower-case SHA-256 bucket digest; neither accepts a display
+name.
+
+The assessment-row schema-v1 token/cost fields are reserved and nullable.
+External classifier rows may populate `input_tokens`, `output_tokens`, and
+`cost_microunits` only from an exact Host `LLMCompletion` whose exact usage
+dictionary contains bounded non-negative integer counters. The accepted token
+aliases are `prompt_tokens → input_tokens` and
+`completion_tokens → output_tokens`; canonical/alias disagreement or an
+invalid value—including anything above `2^53 - 1`—makes only that counter JSON
+`null`. Deterministic/scripted,
+missing, non-exact, and otherwise untrusted telemetry remains `null`. Unknown
+usage keys and the raw usage object are never emitted. Treat populated values
+as provider-reported operational telemetry, not authoritative billing data.
+
+`would_issue_exact_once` is not an approval. Phase 0+1 has no CLI command that
+settles a Human request or issues a Capability from semantic evidence. Status
+uses schema v2 and includes the complete closed-key `by_status` and `by_domain`
+maps. Each must sum to the assessment total, and scalar success/error,
+Shadow-outcome, and OOD counters must agree with those maps; malformed or
+inconsistent service output is rejected. The real auto-approval object is
+strictly `{"numerator":0,"denominator":0,"rate":null}`; any other value is
+rejected. See [Semantic Approval and Data
+Identification](semantic_shadow.md).
+
+## Offline Store Migration
+
+`store migrate` is handled before `Runtime.open()` and is the only supported
+schema-v4 to schema-v5 path. Stop every CLI/GUI/embedded Runtime using the
+target first. Dry-run validates the complete canonical v4 shape against a
+private snapshot, performs zero writes beside the source, and returns a
+deterministic `plan_sha256`:
+
+```bash
+# Create an independent, quiesced, owner-only backup first.
+sqlite3 .agent_libos.sqlite ".backup '.agent_libos.v4.backup.sqlite'"
+chmod 600 .agent_libos.v4.backup.sqlite
+
+uv run agent-libos --db .agent_libos.sqlite store migrate --to 5 \
+  --dry-run --sqlite-backup .agent_libos.v4.backup.sqlite
+```
+
+Review the plan and pass its exact digest to apply:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite store migrate --to 5 \
+  --apply --expected-plan-sha256 <plan_sha256> \
+  --sqlite-backup .agent_libos.v4.backup.sqlite
+```
+
+For apply, both the SQLite source and independent backup must be regular files
+owned by the current user, have exactly one hard link, and have mode `0600` on
+POSIX. The backup must contain no live journal/WAL/SHM sidecar and must still
+match the locked source's canonical logical v4 digest. Dry-run is zero-write:
+it reports an insecure source but never changes its permissions, so the
+operator must run `chmod 600` before apply. Apply obtains the exclusive offline
+lease, repeats validation, runs DDL plus marker CAS `4 -> 5` in one transaction,
+validates the complete v5 shape, then commits. Any failed check or injected
+DDL/readback failure rolls back the schema and marker.
+
+For PostgreSQL, create and verify an operator-managed snapshot of the exact
+database/schema first. Dry-run needs no acknowledgement; apply additionally
+requires `--postgres-snapshot-confirmed`:
+
+```bash
+uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" store migrate --to 5 --dry-run
+uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" store migrate --to 5 \
+  --apply --expected-plan-sha256 <plan_sha256> \
+  --postgres-snapshot-confirmed
+```
+
+The PostgreSQL path takes the Runtime advisory lock, validates canonical v4,
+performs the same single-transaction DDL/marker CAS/v5 readback, and releases
+the lock. The acknowledgement records only that the operator confirms an
+external snapshot exists; Agent libOS does not create or validate that snapshot
+artifact. Never use `init` or an ordinary Runtime command as a migration tool.
+The full runbook is in [Runtime Storage](storage.md#offline-v4-to-v5-migration).
+
 ## Workflow Run
 
 `workflow run` is a direct user entrypoint for tools. It spawns a fresh
@@ -392,7 +498,7 @@ status code 1.
 `task-run` is the Host CLI for a first-class Durable Task Run. It is separate
 from both the one-tool `workflow run` command and Object-bound background
 tasks. A Run supervises a root AgentProcess tree, persists a versioned goal and
-requirements, and exposes safe restart recovery through store schema v4.
+requirements, and exposes safe restart recovery through store schema v5.
 
 ```text
 task-run start

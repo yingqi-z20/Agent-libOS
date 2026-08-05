@@ -139,6 +139,45 @@ version in the one-shot capability. The capability reservation carries that
 same id into the provider intent, so a same-argument call cannot create a
 different approved effect ledger entry.
 
+### Semantic Shadow ceiling
+
+`approval_policy.semantic_auto_approval` is a separate, strict version-1
+ceiling for the advisory semantic subsystem. It is not an approval policy that
+can settle a request in this release. A canonical example is:
+
+```json
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "rule_id": "reports-read-v1",
+      "authority_operation": "filesystem.read",
+      "resource": "filesystem:workspace:reports/*",
+      "rights": ["read"]
+    }
+  ]
+}
+```
+
+Missing, `null`, and empty rules are deny-all. Legacy manifests are not
+backfilled, so their canonical hashes remain stable. The nested object and
+each rule are closed: unknown fields, duplicate rule ids, wildcard operations,
+unsupported/high-risk operations, control rights, permission administration,
+and data-release authority fail admission. The current candidate ontology is
+limited to filesystem read, Git read, and Git diff; Shell, JSON-RPC, MCP, data
+release, writes, deletes, remote Git effects, and administrative actions cannot
+be positive candidates even though Shadow may record an assessment for them.
+
+The parent and child must each declare this field. Child omission is deny-all.
+A child rule must preserve the exact authority operation and narrow the parent
+resource/right set; an ordinary Capability cannot add or widen the ceiling.
+Candidate lookup returns only the exact requested operation/resource/rights and
+Host provenance digests. It creates no Human request, Capability, permission
+policy, operation, event, or audit entry. Phase 0+1 has no machine settlement
+method, so even `would_issue_exact_once` remains evidence and the existing
+Human path remains authoritative. See [Semantic Approval and Data
+Identification](semantic_shadow.md).
+
 ## Closed input schema
 
 Manifest input is closed at the top level. The supported fields are

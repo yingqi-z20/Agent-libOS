@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import errno
+import hashlib
+import json
 import os
 import re
 import sqlite3
 import stat
 import tempfile
+from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
-from threading import RLock
-from typing import Any, ClassVar, Mapping
+from threading import RLock, local
+from typing import Any, ClassVar, Iterator, Mapping
 
 from agent_libos.config import AgentLibOSConfig
 from agent_libos.models.exceptions import UnsupportedStoreVersion, ValidationError
@@ -16,6 +20,17 @@ from agent_libos.storage.sql import (
     SQLRuntimeStore,
     _V4_KEYSET_TEXT_COLUMNS,
     _V4_REQUIRED_COLUMNS,
+    _V5_KEYSET_TEXT_COLUMNS,
+    _V5_REQUIRED_COLUMNS,
+)
+from agent_libos.storage.v5_schema_contract import (
+    HUMAN_REQUEST_INDEX_CONTRACTS,
+    V4_HUMAN_REQUEST_CHECKS,
+    V4_HUMAN_REQUEST_COLUMN_CONTRACTS,
+    V4_HUMAN_REQUEST_KEY_CONSTRAINTS,
+    V5_STORAGE_COLUMN_CONTRACTS,
+    V5_STORAGE_KEY_CONSTRAINTS,
+    V5_STORAGE_SQLITE_CHECKS,
 )
 from agent_libos.utils.ids import utc_now
 
@@ -74,8 +89,8 @@ def _sqlite_word_end(sql: str, index: int) -> int:
 def _sqlite_schema_token(sql: str, index: int) -> tuple[tuple[str, str], int]:
     char = sql[index]
     if char == "'":
-        _, end = _sqlite_delimited_value(sql, index, char)
-        return ("literal", ""), end
+        value, end = _sqlite_delimited_value(sql, index, char)
+        return ("literal", value), end
     if char in {'"', "`", "["}:
         closing = "]" if char == "[" else char
         value, end = _sqlite_delimited_value(sql, index, closing)
@@ -187,6 +202,361 @@ def _sqlite_column_collations(sql: str) -> dict[str, str]:
         if declared is not None:
             result[declared[0]] = declared[1]
     return result
+
+
+def _sqlite_contract_token(token: tuple[str, str]) -> tuple[str, str]:
+    kind, value = token
+    if kind in {"word", "quoted"}:
+        return "word", value.casefold()
+    return kind, value
+
+
+def _strip_redundant_sqlite_parentheses(
+    tokens: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    selected = tokens
+    while len(selected) >= 2 and selected[0] == ("symbol", "("):
+        depth = 0
+        closes_at_end = False
+        for index, token in enumerate(selected):
+            if token == ("symbol", "("):
+                depth += 1
+            elif token == ("symbol", ")"):
+                depth -= 1
+                if depth == 0:
+                    closes_at_end = index == len(selected) - 1
+                    break
+        if not closes_at_end:
+            break
+        selected = selected[1:-1]
+    return selected
+
+
+def _sqlite_contract_expression(sql: str) -> tuple[tuple[str, str], ...]:
+    tokens = tuple(
+        _sqlite_contract_token(token) for token in _sqlite_schema_tokens(sql)
+    )
+    return _strip_redundant_sqlite_parentheses(tokens)
+
+
+def _sqlite_check_expressions(sql: str) -> tuple[tuple[tuple[str, str], ...], ...]:
+    tokens = _sqlite_schema_tokens(sql)
+    expressions: list[tuple[tuple[str, str], ...]] = []
+    position = 0
+    while position < len(tokens):
+        kind, value = tokens[position]
+        if kind != "word" or value.casefold() != "check":
+            position += 1
+            continue
+        if position + 1 >= len(tokens) or tokens[position + 1] != (
+            "symbol",
+            "(",
+        ):
+            return ()
+        depth = 1
+        end = position + 2
+        while end < len(tokens) and depth:
+            if tokens[end] == ("symbol", "("):
+                depth += 1
+            elif tokens[end] == ("symbol", ")"):
+                depth -= 1
+            end += 1
+        if depth:
+            return ()
+        expression = tuple(
+            _sqlite_contract_token(token)
+            for token in tokens[position + 2 : end - 1]
+        )
+        expressions.append(_strip_redundant_sqlite_parentheses(expression))
+        position = end
+    return tuple(expressions)
+
+
+def _normalized_sqlite_default(value: Any) -> str | None:
+    if value is None:
+        return None
+    selected = str(value).strip()
+    while selected.startswith("(") and selected.endswith(")"):
+        selected = selected[1:-1].strip()
+    return selected.casefold()
+
+
+_SQLITE_CANONICAL_CATALOG_LOCK = RLock()
+_SQLITE_CANONICAL_CATALOGS: dict[int, dict[str, Any]] = {}
+_SQLITE_CANONICAL_CATALOG_BUILD = local()
+# Full catalog produced by the clean schema-v4 baseline commit ``4b43cb7``.
+# The synthesized reference is required to match this golden digest so a
+# future v5 DDL edit cannot silently redefine which production v4 stores are
+# eligible for the only supported offline migration.
+_SQLITE_CANONICAL_V4_CATALOG_SHA256 = (
+    "0bfa8d224a417aff3d672684f52638cb913ba0f6e17beac8e794bba467e62015"
+)
+# Schema v5 is also a versioned disk contract.  Changing runtime DDL while
+# leaving STORE_SCHEMA_VERSION at 5 must fail this ratchet instead of silently
+# redefining v5 and making previously created stores unreadable.
+_SQLITE_CANONICAL_V5_CATALOG_SHA256 = (
+    "d92abab9c668bb44f348de0f78e1be1198854bbfec64f61e17af93bb5a0902e6"
+)
+_SQLITE_CANONICAL_CATALOG_SHA256 = {
+    4: _SQLITE_CANONICAL_V4_CATALOG_SHA256,
+    5: _SQLITE_CANONICAL_V5_CATALOG_SHA256,
+}
+
+
+def _sqlite_quoted_identifier(value: str) -> str:
+    """Quote one catalog-provided SQLite identifier without trusting its shape."""
+
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _sqlite_normalized_schema_sql(value: Any) -> list[list[str]] | None:
+    """Return a whitespace/comment/identifier-quote independent DDL token stream.
+
+    The complete stream is deliberately retained.  PRAGMA metadata does not
+    expose column/table conflict policies, DEFERRABLE clauses, or every table
+    option.  Comparing normalized ``sqlite_master.sql`` therefore closes gaps
+    such as ``PRIMARY KEY ON CONFLICT REPLACE`` while the structured catalog
+    probes below independently cover effective types, generated columns,
+    collations, foreign keys, and index keys.
+    """
+
+    if value is None:
+        return None
+    return [
+        list(_sqlite_contract_token(token))
+        for token in _sqlite_schema_tokens(str(value))
+    ]
+
+
+def _sqlite_table_catalog(
+    conn: Any,
+    table: str,
+    options: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], set[str]]:
+    quoted_table = _sqlite_quoted_identifier(table)
+    columns = []
+    for row in conn.execute(f"PRAGMA table_xinfo({quoted_table})"):
+        selected = dict(row)
+        columns.append(
+            {
+                "ordinal": int(selected["cid"]),
+                "name": str(selected["name"]),
+                "type": str(selected["type"]).casefold(),
+                "not_null": bool(selected["notnull"]),
+                "default": _sqlite_normalized_schema_sql(
+                    selected["dflt_value"]
+                ),
+                "primary_key_position": int(selected["pk"]),
+                "hidden": int(selected["hidden"]),
+            }
+        )
+    foreign_keys = []
+    for row in conn.execute(f"PRAGMA foreign_key_list({quoted_table})"):
+        selected = dict(row)
+        foreign_keys.append(
+            {
+                "id": int(selected["id"]),
+                "sequence": int(selected["seq"]),
+                "table": str(selected["table"]),
+                "from": (
+                    None if selected["from"] is None else str(selected["from"])
+                ),
+                "to": None if selected["to"] is None else str(selected["to"]),
+                "on_update": str(selected["on_update"]).casefold(),
+                "on_delete": str(selected["on_delete"]).casefold(),
+                "match": str(selected["match"]).casefold(),
+            }
+        )
+    foreign_keys.sort(key=lambda item: (item["id"], item["sequence"]))
+    index_rows = []
+    index_names: set[str] = set()
+    for row in conn.execute(f"PRAGMA index_list({quoted_table})"):
+        selected = dict(row)
+        index_name = str(selected["name"])
+        index_names.add(index_name)
+        index_rows.append(
+            {
+                "name": index_name,
+                "unique": bool(selected["unique"]),
+                "origin": str(selected["origin"]),
+                "partial": bool(selected["partial"]),
+            }
+        )
+    index_rows.sort(key=lambda item: item["name"])
+    return (
+        {
+            "options": dict(options) if options is not None else None,
+            "columns": columns,
+            "foreign_keys": foreign_keys,
+            "indexes": index_rows,
+        },
+        index_names,
+    )
+
+
+def _sqlite_index_catalog(conn: Any, index_name: str) -> dict[str, Any]:
+    quoted_index = _sqlite_quoted_identifier(index_name)
+    key_rows = []
+    auxiliary_rows = []
+    for row in conn.execute(f"PRAGMA index_xinfo({quoted_index})"):
+        selected = dict(row)
+        item = {
+            "sequence": int(selected["seqno"]),
+            "column_id": int(selected["cid"]),
+            "name": None if selected["name"] is None else str(selected["name"]),
+            "descending": bool(selected["desc"]),
+            "collation": (
+                None
+                if selected["coll"] is None
+                else str(selected["coll"]).upper()
+            ),
+            "key": bool(selected["key"]),
+        }
+        (key_rows if item["key"] else auxiliary_rows).append(item)
+    return {
+        "keys": sorted(key_rows, key=lambda item: item["sequence"]),
+        "auxiliary": sorted(auxiliary_rows, key=lambda item: item["sequence"]),
+    }
+
+
+def _sqlite_full_catalog_snapshot(conn: Any) -> dict[str, Any]:
+    """Read the complete durable user-schema catalog without mutating ``conn``."""
+
+    encoding_row = conn.execute("PRAGMA encoding").fetchone()
+    encoding = (
+        "missing"
+        if encoding_row is None
+        else str(
+            encoding_row[0]
+            if not isinstance(encoding_row, dict)
+            else encoding_row["encoding"]
+        )
+    )
+    master_rows = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT type, name, tbl_name, sql
+              FROM sqlite_master
+             WHERE (
+                    type = 'table' AND name NOT LIKE 'sqlite_%'
+                   )
+                OR (
+                    type IN ('index', 'trigger')
+                    AND tbl_name NOT LIKE 'sqlite_%'
+                   )
+                OR (
+                    type = 'view' AND name NOT LIKE 'sqlite_%'
+                   )
+             ORDER BY type, name
+            """
+        )
+    ]
+    objects = [
+        {
+            "type": str(row["type"]),
+            "name": str(row["name"]),
+            "table": str(row["tbl_name"]),
+            "sql": _sqlite_normalized_schema_sql(row["sql"]),
+        }
+        for row in master_rows
+    ]
+    table_names = sorted(
+        str(row["name"])
+        for row in master_rows
+        if str(row["type"]) == "table"
+    )
+
+    table_list_by_name: dict[str, dict[str, Any]] = {}
+    try:
+        table_list_rows = list(conn.execute("PRAGMA main.table_list"))
+    except sqlite3.DatabaseError as exc:  # pragma: no cover - supported runtime
+        raise UnsupportedStoreVersion(
+            "SQLite runtime cannot inspect canonical table options"
+        ) from exc
+    for row in table_list_rows:
+        selected = dict(row)
+        name = str(selected.get("name", ""))
+        if name not in table_names:
+            continue
+        table_list_by_name[name] = {
+            "type": str(selected.get("type", "")),
+            "columns": int(selected.get("ncol", -1)),
+            "without_rowid": bool(selected.get("wr", 0)),
+            "strict": bool(selected.get("strict", 0)),
+        }
+
+    tables: dict[str, Any] = {}
+    all_index_names: set[str] = set()
+    for table in table_names:
+        tables[table], index_names = _sqlite_table_catalog(
+            conn,
+            table,
+            table_list_by_name.get(table),
+        )
+        all_index_names.update(index_names)
+
+    indexes = {
+        name: _sqlite_index_catalog(conn, name)
+        for name in sorted(all_index_names)
+    }
+
+    return {
+        "database": {"encoding": encoding.upper()},
+        "objects": objects,
+        "tables": tables,
+        "indexes": indexes,
+    }
+
+
+def _sqlite_catalog_sha256(catalog: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        catalog,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _sqlite_catalog_difference(
+    expected: Mapping[str, Any],
+    actual: Mapping[str, Any],
+) -> str:
+    expected_objects = expected.get("objects")
+    actual_objects = actual.get("objects")
+    if isinstance(expected_objects, list) and isinstance(actual_objects, list):
+        expected_by_name = {
+            str(item.get("name")): item
+            for item in expected_objects
+            if isinstance(item, dict)
+        }
+        actual_by_name = {
+            str(item.get("name")): item
+            for item in actual_objects
+            if isinstance(item, dict)
+        }
+        binding_index = "idx_operations_runtime_publication"
+        if expected_by_name.get(binding_index) != actual_by_name.get(binding_index):
+            return "exact durable runtime-publication binding index differs"
+    for section in ("database", "objects", "tables", "indexes"):
+        expected_section = expected.get(section)
+        actual_section = actual.get(section)
+        if expected_section != actual_section:
+            if isinstance(expected_section, dict) and isinstance(actual_section, dict):
+                missing = sorted(set(expected_section) - set(actual_section))
+                extra = sorted(set(actual_section) - set(expected_section))
+                changed = sorted(
+                    key
+                    for key in set(expected_section) & set(actual_section)
+                    if expected_section[key] != actual_section[key]
+                )
+                return (
+                    f"{section}: missing={missing[:3]!r}, extra={extra[:3]!r}, "
+                    f"changed={changed[:3]!r}"
+                )
+            return f"{section} differs"
+    return "catalog differs"
 
 
 class _SQLiteRuntimeLease:
@@ -440,6 +810,105 @@ class SQLiteStore(SQLRuntimeStore):
                 if conn is not None:
                     conn.close()
 
+    @classmethod
+    @contextmanager
+    def _migration_snapshot_connection(
+        cls,
+        path: Path,
+        *,
+        label: str,
+        error_type: type[ValidationError],
+    ) -> Iterator[Any]:
+        """Open a disposable recovered snapshot for an offline migration probe."""
+
+        helper = cls.__new__(cls)
+        connection: sqlite3.Connection | None = None
+        with tempfile.TemporaryDirectory(
+            prefix="agent-libos-v5-migration-preflight-"
+        ) as directory:
+            snapshot_path = Path(directory) / "store.sqlite"
+            try:
+                helper._copy_preflight_database_family(path, snapshot_path)
+                connection = sqlite3.connect(
+                    f"{snapshot_path.as_uri()}?mode=rw",
+                    timeout=0.0,
+                    uri=True,
+                )
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA schema_version").fetchone()
+                yield connection
+            except sqlite3.Error as exc:
+                raise error_type(
+                    f"unable to inspect {label} for schema-v5 migration"
+                ) from exc
+            finally:
+                if connection is not None:
+                    connection.close()
+
+    @classmethod
+    @contextmanager
+    def _migration_apply_connection(
+        cls,
+        path: Path,
+        *,
+        error_type: type[ValidationError],
+    ) -> Iterator[Any]:
+        """Open the source under the backend's exclusive offline migration lease."""
+
+        helper = cls.__new__(cls)
+        helper._lease_handle = None
+        lease_acquired = False
+        connection: sqlite3.Connection | None = None
+        try:
+            helper._secure_database_files(
+                path,
+                tighten=False,
+                create_if_missing=False,
+            )
+            # On POSIX use the same pathname and inode leases as Runtime.open().
+            # Other platforms retain SQLite's kernel-managed exclusive lock below.
+            if fcntl is not None and hasattr(os, "O_NOFOLLOW"):
+                helper._lease_handle = helper._acquire_runtime_lease(path)
+                lease_acquired = True
+            connection = sqlite3.connect(
+                f"{path.as_uri()}?mode=rw",
+                timeout=0.0,
+                uri=True,
+            )
+            connection.row_factory = sqlite3.Row
+            if lease_acquired:
+                helper._require_database_lease_identity(path)
+            connection.execute("PRAGMA foreign_keys = ON")
+            locking = connection.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()
+            if locking is None or str(locking[0]).lower() != "exclusive":
+                raise error_type(
+                    f"SQLite refused exclusive migration lease mode: {path}"
+                )
+            connection.execute("BEGIN EXCLUSIVE")
+            yield connection
+        except sqlite3.Error as exc:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+            busy_codes = {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+            if getattr(exc, "sqlite_errorcode", None) in busy_codes:
+                raise error_type(f"runtime store is already open: {path}") from exc
+            raise error_type(f"SQLite schema-v5 migration failed: {path}") from exc
+        except BaseException:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+            raise
+        finally:
+            if connection is not None:
+                connection.close()
+            if lease_acquired:
+                helper._release_runtime_lease()
+
     def _copy_preflight_database_family(
         self,
         db_path: Path,
@@ -608,13 +1077,391 @@ class SQLiteStore(SQLRuntimeStore):
                 f"{invalid_relations}; expected type 'table'"
             )
         super()._require_v4_schema_shape(conn)
+        cls._require_v4_human_request_contract(conn)
+        cls._require_full_schema_catalog(conn, version=4)
+
+    @classmethod
+    def _require_v4_human_request_contract(cls, conn: Any) -> None:
+        problems = {
+            **cls._storage_column_problems(
+                conn,
+                V4_HUMAN_REQUEST_COLUMN_CONTRACTS,
+            ),
+            **cls._storage_check_problems(
+                conn,
+                V4_HUMAN_REQUEST_CHECKS,
+            ),
+            **cls._storage_key_constraint_problems(
+                conn,
+                V4_HUMAN_REQUEST_KEY_CONSTRAINTS,
+            ),
+            **cls._human_request_index_problems(conn),
+            **cls._v5_semantic_boundary_problems(conn),
+        }
+        if problems:
+            raise UnsupportedStoreVersion(
+                "unsupported Agent libOS schema v4 human request contract: "
+                f"{problems}"
+            )
+
+    @classmethod
+    def _require_v5_schema_shape(cls, conn: Any) -> None:
+        """Require every schema-v5 manifest relation to be a SQLite table."""
+
+        required_tables = sorted(_V5_REQUIRED_COLUMNS)
+        placeholders = ", ".join("?" for _ in required_tables)
+        rows = conn.execute(
+            "SELECT name, type FROM sqlite_master "
+            f"WHERE name IN ({placeholders})",
+            required_tables,
+        )
+        relation_types = {
+            str(row["name"]): str(row["type"]).lower()
+            for row in rows
+        }
+        invalid_relations = {
+            table: relation_types.get(table, "missing")
+            for table in required_tables
+            if relation_types.get(table) != "table"
+        }
+        if invalid_relations:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v5 "
+                "manifest relation types: "
+                f"{invalid_relations}; expected type 'table'"
+            )
+        super()._require_v5_schema_shape(conn)
+        cls._require_v5_storage_contract(conn)
+        cls._require_full_schema_catalog(conn, version=5)
+
+    @classmethod
+    def _require_full_schema_catalog(cls, conn: Any, *, version: int) -> None:
+        """Require every SQLite schema object to match the canonical catalog."""
+
+        # A canonical reference is itself initialized through SQLiteStore.  Its
+        # ordinary focused validators still run, but the thread-local guard
+        # prevents the full comparator from recursively asking for a reference.
+        if bool(getattr(_SQLITE_CANONICAL_CATALOG_BUILD, "active", False)):
+            return
+        expected = cls._canonical_full_schema_catalog(version)
+        actual = _sqlite_full_catalog_snapshot(conn)
+        if actual == expected:
+            return
+        raise UnsupportedStoreVersion(
+            f"unsupported Agent libOS SQLite schema v{version} full catalog: "
+            f"{_sqlite_catalog_difference(expected, actual)}; "
+            f"expected_sha256={_sqlite_catalog_sha256(expected)}, "
+            f"actual_sha256={_sqlite_catalog_sha256(actual)}"
+        )
+
+    @classmethod
+    def _canonical_full_schema_catalog(cls, version: int) -> dict[str, Any]:
+        if version not in {4, 5}:
+            raise UnsupportedStoreVersion(
+                f"unsupported Agent libOS SQLite schema catalog version: {version}"
+            )
+        cached = _SQLITE_CANONICAL_CATALOGS.get(version)
+        if cached is not None:
+            return cached
+        with _SQLITE_CANONICAL_CATALOG_LOCK:
+            cached = _SQLITE_CANONICAL_CATALOGS.get(version)
+            if cached is not None:
+                return cached
+            _SQLITE_CANONICAL_CATALOG_BUILD.active = True
+            reference: SQLiteStore | None = None
+            try:
+                # Build through the exact runtime DDL path, never by accepting
+                # the target's definitions as the reference.  The v4 catalog
+                # is the canonical v5 base with only the explicit 4->5 delta
+                # reversed, matching the supported offline migration source.
+                reference = SQLiteStore(":memory:")
+                if version == 4:
+                    reference.conn.execute("DROP TABLE semantic_assessments")
+                    reference.conn.execute("DROP TABLE semantic_assessment_jobs")
+                    reference.conn.execute(
+                        "ALTER TABLE human_requests DROP COLUMN revision"
+                    )
+                    changed = reference.conn.execute(
+                        "UPDATE runtime_schema SET schema_version = 4 "
+                        "WHERE singleton = 1 AND schema_version = 5"
+                    )
+                    if changed.rowcount != 1:
+                        raise UnsupportedStoreVersion(
+                            "unable to construct canonical SQLite schema-v4 catalog"
+                        )
+                    reference.conn.commit()
+                catalog = _sqlite_full_catalog_snapshot(reference.conn)
+                actual_digest = _sqlite_catalog_sha256(catalog)
+                if actual_digest != _SQLITE_CANONICAL_CATALOG_SHA256[version]:
+                    raise UnsupportedStoreVersion(
+                        "runtime DDL no longer synthesizes the canonical "
+                        f"Agent libOS SQLite schema-v{version} catalog"
+                    )
+            finally:
+                try:
+                    if reference is not None:
+                        reference.close()
+                finally:
+                    _SQLITE_CANONICAL_CATALOG_BUILD.active = False
+            _SQLITE_CANONICAL_CATALOGS[version] = catalog
+            return catalog
+
+    @classmethod
+    def _require_v5_storage_contract(cls, conn: Any) -> None:
+        column_problems = cls._storage_column_problems(
+            conn,
+            V5_STORAGE_COLUMN_CONTRACTS,
+        )
+        if column_problems:
+            raise UnsupportedStoreVersion(
+                "unsupported Agent libOS schema v5 storage column contract: "
+                f"{column_problems}"
+            )
+        check_problems = cls._storage_check_problems(
+            conn,
+            V5_STORAGE_SQLITE_CHECKS,
+        )
+        if check_problems:
+            raise UnsupportedStoreVersion(
+                "unsupported Agent libOS schema v5 storage CHECK contract: "
+                f"{check_problems}"
+            )
+        key_problems = cls._storage_key_constraint_problems(
+            conn,
+            V5_STORAGE_KEY_CONSTRAINTS,
+        )
+        if key_problems:
+            raise UnsupportedStoreVersion(
+                "unsupported Agent libOS schema v5 storage key constraint "
+                f"contract: {key_problems}"
+            )
+        index_problems = cls._human_request_index_problems(conn)
+        if index_problems:
+            raise UnsupportedStoreVersion(
+                "unsupported Agent libOS schema v5 human request index contract: "
+                f"{index_problems}"
+            )
+        boundary_problems = cls._v5_semantic_boundary_problems(conn)
+        if boundary_problems:
+            raise UnsupportedStoreVersion(
+                "unsupported Agent libOS schema v5 semantic relation boundary: "
+                f"{boundary_problems}"
+            )
+
+    @classmethod
+    def _storage_column_problems(
+        cls,
+        conn: Any,
+        contracts: Mapping[str, tuple[tuple[str, Any], ...]],
+    ) -> dict[str, Any]:
+        problems: dict[str, Any] = {}
+        for table, contract_items in contracts.items():
+            rows = [
+                dict(row) for row in conn.execute(f"PRAGMA table_xinfo({table})")
+            ]
+            selected_rows = rows
+            expected_names = tuple(name for name, _ in contract_items)
+            actual_names = tuple(str(row["name"]) for row in selected_rows)
+            if actual_names != expected_names:
+                problems[f"{table}.columns"] = {
+                    "expected": expected_names,
+                    "actual": actual_names,
+                }
+                continue
+            ddl_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            ddl = str(ddl_row["sql"]) if ddl_row and ddl_row["sql"] else ""
+            collations = _sqlite_column_collations(ddl)
+            for row, (name, contract) in zip(selected_rows, contract_items):
+                actual = {
+                    "type": str(row["type"]).casefold(),
+                    "nullable": not bool(row["notnull"]),
+                    "default": _normalized_sqlite_default(row["dflt_value"]),
+                    "primary_key_position": int(row["pk"]),
+                    "hidden": int(row["hidden"]),
+                    "collation": (
+                        collations.get(name) if contract.sql_type == "text" else None
+                    ),
+                }
+                expected = {
+                    "type": contract.sql_type,
+                    "nullable": (
+                        True
+                        if table == "human_requests" and name == "request_id"
+                        else contract.nullable
+                    ),
+                    "default": contract.default,
+                    "primary_key_position": contract.primary_key_position,
+                    "hidden": 0,
+                    "collation": (
+                        cls.KEYSET_TEXT_COLLATION
+                        if contract.sql_type == "text"
+                        else None
+                    ),
+                }
+                if table != "human_requests":
+                    actual["ordinal"] = int(row["cid"]) + 1
+                    expected["ordinal"] = expected_names.index(name) + 1
+                if actual != expected:
+                    problems[f"{table}.{name}"] = {
+                        "expected": expected,
+                        "actual": actual,
+                    }
+        return problems
+
+    @staticmethod
+    def _storage_check_problems(
+        conn: Any,
+        contracts: Mapping[str, tuple[str, ...]],
+    ) -> dict[str, Any]:
+        problems: dict[str, Any] = {}
+        for table, expected_expressions in contracts.items():
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            ddl = str(row["sql"]) if row and row["sql"] else ""
+            actual = Counter(_sqlite_check_expressions(ddl))
+            expected = Counter(
+                _sqlite_contract_expression(expression)
+                for expression in expected_expressions
+            )
+            if actual != expected:
+                problems[table] = {
+                    "expected_count": sum(expected.values()),
+                    "actual_count": sum(actual.values()),
+                    "missing": sum((expected - actual).values()),
+                    "extra": sum((actual - expected).values()),
+                }
+        return problems
+
+    @staticmethod
+    def _storage_key_constraint_problems(
+        conn: Any,
+        contracts: Mapping[
+            str,
+            tuple[tuple[str, tuple[str, ...]], ...],
+        ],
+    ) -> dict[str, Any]:
+        problems: dict[str, Any] = {}
+        for table, expected_constraints in contracts.items():
+            actual: Counter[tuple[str, tuple[str, ...]]] = Counter()
+            for index_row in conn.execute(f"PRAGMA index_list({table})"):
+                origin = str(index_row["origin"])
+                if origin == "c":
+                    continue
+                name = str(index_row["name"])
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+                    actual[("invalid_index", (name,))] += 1
+                    continue
+                key_rows = [
+                    row
+                    for row in conn.execute(f"PRAGMA index_xinfo({name})")
+                    if int(row["key"]) == 1
+                ]
+                key_rows.sort(key=lambda row: int(row["seqno"]))
+                columns = tuple(
+                    str(row["name"])
+                    if row["name"] is not None
+                    else "<expression>"
+                    for row in key_rows
+                )
+                kind = {
+                    "pk": "primary_key",
+                    "u": "unique",
+                }.get(origin, f"unknown:{origin}")
+                actual[(kind, columns)] += 1
+            expected = Counter(expected_constraints)
+            if actual != expected:
+                problems[f"{table}.keys"] = {
+                    "expected": sorted(expected.elements()),
+                    "actual": sorted(actual.elements()),
+                }
+        return problems
+
+    @classmethod
+    def _human_request_index_problems(cls, conn: Any) -> dict[str, Any]:
+        shapes = cls._probe_index_shapes(conn, {"human_requests"})
+        problems: dict[str, Any] = {}
+        for name, expected in HUMAN_REQUEST_INDEX_CONTRACTS.items():
+            problem = cls._v4_index_shape_problem(
+                name,
+                expected,
+                shapes.get(name),
+            )
+            if problem is not None:
+                problems[name] = problem
+        declared = {
+            name
+            for name, shape in shapes.items()
+            if shape.get("origin") == "declared"
+        }
+        extra = sorted(declared - set(HUMAN_REQUEST_INDEX_CONTRACTS))
+        if extra:
+            problems["<extra human indexes>"] = extra
+        unique_problem = cls._v4_unique_shape_problem(
+            "human_requests",
+            frozenset({("request_id",)}),
+            shapes,
+        )
+        if unique_problem is not None:
+            problems["human_requests.unique"] = unique_problem
+        return problems
+
+    @staticmethod
+    def _v5_semantic_boundary_problems(conn: Any) -> dict[str, Any]:
+        guarded_tables = (
+            "human_requests",
+            "semantic_assessment_jobs",
+            "semantic_assessments",
+        )
+        problems: dict[str, Any] = {}
+        for table in guarded_tables:
+            foreign_keys = [dict(row) for row in conn.execute(
+                f"PRAGMA foreign_key_list({table})"
+            )]
+            if foreign_keys:
+                problems[f"{table}.foreign_keys"] = len(foreign_keys)
+            ddl_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            ddl = str(ddl_row["sql"]) if ddl_row and ddl_row["sql"] else ""
+            tokens = _sqlite_schema_tokens(ddl)
+            for left, right in zip(tokens, tokens[1:]):
+                if (
+                    left[0] == "word"
+                    and left[1].casefold() == "on"
+                    and right[0] == "word"
+                    and right[1].casefold() == "conflict"
+                ):
+                    problems[f"{table}.conflict_clause"] = "noncanonical"
+                    break
+        placeholders = ", ".join("?" for _ in guarded_tables)
+        trigger_rows = list(
+            conn.execute(
+                "SELECT name, tbl_name FROM sqlite_master "
+                "WHERE type = 'trigger' "
+                f"AND tbl_name IN ({placeholders})",
+                guarded_tables,
+            )
+        )
+        if trigger_rows:
+            problems["triggers"] = sorted(
+                f"{row['tbl_name']}.{row['name']}" for row in trigger_rows
+            )
+        return problems
 
     @classmethod
     def _probe_text_column_collations(
         cls,
         conn: Any,
+        *,
+        keyset_columns: Mapping[str, frozenset[str]] = _V4_KEYSET_TEXT_COLUMNS,
     ) -> Mapping[tuple[str, str], str]:
-        tables = sorted(_V4_KEYSET_TEXT_COLUMNS)
+        tables = sorted(keyset_columns)
         placeholders = ", ".join("?" for _ in tables)
         rows = conn.execute(
             "SELECT name, sql FROM sqlite_master "
@@ -626,7 +1473,7 @@ class SQLiteStore(SQLRuntimeStore):
             for row in rows
         }
         result: dict[tuple[str, str], str] = {}
-        for table, columns in _V4_KEYSET_TEXT_COLUMNS.items():
+        for table, columns in keyset_columns.items():
             ddl = ddl_by_table.get(table)
             if ddl is None:
                 continue

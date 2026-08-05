@@ -97,6 +97,44 @@ Trusted deployment configuration may tighten core descriptors by exact name
 through `data_flow.operation_minimum_integrity`. It cannot weaken a
 code-declared floor or configure an unknown/non-egress descriptor.
 
+`ProtectedOperationInvocation.data_flow_request_release` defaults to `true` for
+backward compatibility. A trusted runtime-internal caller may set it to
+`false` when recursively prompting for release would be unsafe. The SDK still
+runs the complete DataFlow checks, but a conditional result is returned as a
+denial rather than creating a `data_release_approval`. Semantic classifier
+egress uses this flag and records `egress_blocked` without dispatching the
+classifier.
+
+The Host may bind one default post-commit result observer to the SDK. Binding is
+one-shot: a second default registration is rejected. An invocation may add its
+own observer, but it cannot replace or suppress the Host observer. After a
+successful provider effect/evidence commit, both callbacks receive the original
+result plus stable effect, process, provider, operation, target, DataFlow, and
+result-identity metadata. They run independently; one exception neither skips
+the other nor changes the already committed result, and failures are reduced to
+a bounded payload-free envelope.
+
+Result identity never invokes arbitrary provider conversion hooks. The general
+safe canonical projection accepts only exact scalars, string-keyed mappings,
+lists/tuples, bytes, enums, and explicitly allowlisted Host result dataclasses,
+subject to 4,096 nodes and 256 KiB. When that small projection is insufficient,
+Filesystem, Shell, Git, JSON-RPC, and MCP contracts plus explicitly Host-bound
+result dataclasses may use a streaming digest capped at 500,000 nodes and 64
+MiB. Streaming reads only exact built-in containers and Host-bound enum/
+dataclass storage; it neither constructs a second aggregate plaintext value nor
+persists source text.
+
+The observation descriptor is at most 4 KiB and contains only schema version,
+bounded type identity, digest mode, and canonical byte count. Type identity is
+named only for exact built-ins and module-bound Host-allowlisted classes;
+everything else becomes the fixed `opaque` label. Unsupported, cyclic,
+colliding-key, non-finite, opaque, or over-budget values yield a null digest and
+`digest_unavailable`, not a type-only substitute. Semantic
+provider-ingress capture requires the real digest and therefore records only an
+isolated capture failure in that case. Callers must prevent the classifier's
+own runtime-internal operation from recursively becoming a new ingress
+assessment.
+
 If `prepare` changes durable domain state, declare a named
 `prepared_recovery` policy on the contract and register its trusted recovery
 handler during Runtime composition with

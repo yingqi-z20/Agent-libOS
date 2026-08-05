@@ -3513,6 +3513,9 @@ class TestRuntimeShutdown:
                 presentation="gui",
             ),
             "ask": lambda: runtime.human.ask(pid, "rejected question", blocking=False),
+            "bind_host_request_capture": lambda: (
+                runtime.human.bind_host_request_capture(lambda _request: None)
+            ),
             "cancel_pending_for_process": lambda: runtime.human.cancel_pending_for_process(
                 pid,
                 actor="test",
@@ -3545,6 +3548,9 @@ class TestRuntimeShutdown:
                 {"type": "question", "question": "rejected query"},
                 blocking=False,
             ),
+            "reconcile_terminal_retry_fence": lambda: (
+                runtime.human.reconcile_terminal_retry_fence(request_id)
+            ),
             "recover_prepared_output": lambda: runtime.human.recover_prepared_output(effect),
             "reject": lambda: runtime.human.reject(request_id),
             "reject_for_presentation": lambda: runtime.human.reject_for_presentation(
@@ -3573,6 +3579,7 @@ class TestRuntimeShutdown:
                 pid,
                 "rejected message",
             ),
+            "set_request_capture": lambda: runtime.human.set_request_capture(None),
         }
         async_calls = {
             "adrain_terminal_queue": lambda: runtime.human.adrain_terminal_queue(),

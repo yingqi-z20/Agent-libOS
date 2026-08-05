@@ -233,6 +233,12 @@ EXPLAIN_BOUNDARY_DESCRIPTORS = (
 # admission.  Methods in this set may persist state, publish protected
 # evidence, call a provider, or update Host data-flow/presentation state.
 HUMAN_CONTROL_MUTATION_ADMISSION_BOUNDARIES = (
+    ("human", "set_request_capture", "control.human.set_request_capture"),
+    (
+        "human",
+        "bind_host_request_capture",
+        "control.human.bind_host_request_capture",
+    ),
     ("human", "request_data_release", "control.human.request_data_release"),
     ("human", "answer_for_request", "control.human.answer_for_request"),
     ("human", "approve", "control.human.approve"),
@@ -253,6 +259,11 @@ HUMAN_CONTROL_MUTATION_ADMISSION_BOUNDARIES = (
     ("human", "adrain_terminal_queue", "control.human.adrain_terminal_queue"),
     ("human", "present_terminal_request", "control.human.present_terminal_request"),
     ("human", "recover_prepared_output", "control.human.recover_prepared_output"),
+    (
+        "human",
+        "reconcile_terminal_retry_fence",
+        "control.human.reconcile_terminal_retry_fence",
+    ),
 )
 
 # These are the only public HumanObjectManager methods intentionally excluded

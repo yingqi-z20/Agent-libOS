@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import os
 import threading
+from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -140,6 +141,12 @@ class ProcessManager:
         self.data_flow = data_flow
         self._before_spawn_hooks: builtins.list[Callable[[str], None]] = []
         self._after_spawn_hooks: builtins.list[Callable[[str, str, str], None]] = []
+        self._post_commit_spawn_observers: builtins.list[
+            Callable[[str, str, str], None]
+        ] = []
+        self._post_commit_spawn_observer_failures: deque[dict[str, str]] = deque(
+            maxlen=64
+        )
         self._object_task_terminal_notifier = object_task_terminal_notifier
         self._host_managed_runner_checker: Callable[[str], bool] | None = None
         if task_run_fence_checker is not None and not callable(
@@ -221,6 +228,25 @@ class ProcessManager:
             self._after_spawn_hooks.append(legacy_hook)
             return
         self._after_spawn_hooks.append(hook)
+
+    def add_post_commit_spawn_observer(
+        self,
+        observer: Callable[[str, str, str], None],
+    ) -> None:
+        """Observe a committed launch without joining launch correctness.
+
+        These Host-owned observers run only after the launch publication and
+        process transition transaction returns.  Their failures are bounded,
+        payload-free diagnostics and can never enter failed-launch cleanup.
+        """
+
+        if not callable(observer):
+            raise TypeError("post-commit spawn observer must be callable")
+        self._post_commit_spawn_observers.append(observer)
+
+    @property
+    def post_commit_spawn_observer_failures(self) -> tuple[dict[str, str], ...]:
+        return tuple(dict(item) for item in self._post_commit_spawn_observer_failures)
 
     def add_before_spawn_hook(self, hook: Callable[[str], None]) -> None:
         self._before_spawn_hooks.append(hook)
@@ -421,6 +447,11 @@ class ProcessManager:
                         "revision": process.revision,
                     },
                 )
+            self._run_post_commit_spawn_observers(
+                pid,
+                selected_image,
+                publication_id,
+            )
             if execution_token is not None:
                 assert _execution_token_out is not None
                 _execution_token_out.append(execution_token)
@@ -653,6 +684,11 @@ class ProcessManager:
                         "revision": child.revision,
                     },
                 )
+            self._run_post_commit_spawn_observers(
+                child_pid,
+                child.image_id,
+                publication_id,
+            )
             return child_pid
         except BaseException as exc:
             return self._finish_failed_launch(publication_id, child_pid, exc)
@@ -839,6 +875,11 @@ class ProcessManager:
                         "revision": child.revision,
                     },
                 )
+            self._run_post_commit_spawn_observers(
+                child_pid,
+                child.image_id,
+                publication_id,
+            )
             return child_pid
         except BaseException as exc:
             return self._finish_failed_launch(publication_id, child_pid, exc)
@@ -3213,6 +3254,31 @@ class ProcessManager:
     ) -> None:
         for hook in self._after_spawn_hooks:
             hook(pid, image_id, publication_id)
+
+    def _run_post_commit_spawn_observers(
+        self,
+        pid: str,
+        image_id: str,
+        publication_id: str,
+    ) -> None:
+        for observer in self._post_commit_spawn_observers:
+            try:
+                result = observer(pid, image_id, publication_id)
+                if inspect.isgenerator(result):
+                    result.close()
+                    raise TypeError("post-commit spawn observer must be synchronous")
+                if inspect.isawaitable(result):
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    raise TypeError("post-commit spawn observer must be synchronous")
+            except BaseException as error:
+                self._post_commit_spawn_observer_failures.append(
+                    {
+                        "pid": str(pid)[:256],
+                        "publication_id": str(publication_id)[:256],
+                        "error_type": (type(error).__name__ or "BaseException")[:128],
+                    }
+                )
 
     def _run_before_spawn_hooks(self, image_id: str) -> None:
         for hook in self._before_spawn_hooks:

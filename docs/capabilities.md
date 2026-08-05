@@ -234,9 +234,12 @@ primitive acts on an `ask` decision, the Human subsystem owns the durable
 request and direct Host calls receive its id through
 `HumanApprovalRequired`/`HumanResponseRequired`.
 
-Unknown constraint keys fail closed. Primitive-specific evaluators can define
-new constraint keys, but the default manager does not silently ignore unknown
-policy language.
+New capability writes reject unknown constraint keys, explicit `null`, wrong
+JSON types, and values with no defined comparison/evaluation semantics. Key
+omission is not equivalent to an explicit null. A historical row containing an
+unknown, null, or malformed constraint remains readable for diagnosis, but it
+cannot authorize an operation or be delegated/granted onward; the runtime does
+not silently clean or reinterpret it.
 
 ## Authority Rules And Profiles
 
@@ -279,11 +282,16 @@ All authority mutation goes through explicit operations:
   constraints, and delegation depth. Finite-use capabilities are consumed by
   direct use and cannot be delegated. Delegated records keep a parent link, so a
   later parent revocation or expiry stops the child record from authorizing.
-  Child records cannot drop parent constraints. Authority-shaping constraints
-  such as `shell_policy_level` and `authority_rules` also cannot be introduced
-  unless the parent already carries the identical constraint; ordinary
-  context-matching constraints such as `git_allowed_refs` may be added to
-  narrow the delegated authority.
+  Every parent constraint key must be explicitly present in the child.
+  Binding, version, path, policy, approval, and other equality constraints must
+  retain the exact typed value. `git_allowed_refs` is the one subset-ordered
+  collection: a child may keep or narrow the parent's refs but cannot add a ref.
+  Authority-shaping constraints such as `shell_policy_level` and
+  `authority_rules` cannot be introduced by a child and must remain identical
+  when inherited. A well-defined restrictive `git_allowed_refs` value may be
+  introduced when the parent has no such key. These same attenuation rules
+  apply when `grant` transfers authority and when manifest transitions derive
+  child capabilities.
   Delegation also cannot launder an overlapping parent `deny`/`ask` or malformed
   authority rule by selecting a narrower allow. The child record is not
   observable unless its process attachment, event, and audit evidence all

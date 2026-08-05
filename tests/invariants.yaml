@@ -814,13 +814,24 @@
       "benchmark_attack_classes": []
     },
     {
-      "id": "v4-persisted-state-is-strict-and-versioned",
-      "title": "A store accepts only the complete v4 schema and canonical security carriers; schema v3 and older or malformed state are rejected without mutation.",
+      "id": "v5-persisted-state-is-strict-and-versioned",
+      "title": "Runtime startup accepts only the complete v5 schema and canonical security carriers; canonical v4 migration is explicit and older or malformed state is rejected without mutation.",
       "lane": "runtime",
       "node_ids": [
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_schema_v3_is_zero_write_rejected_with_101_archive_hint",
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_wrong_schema_marker_is_rejected_without_mutation",
-        "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_v4_schema_manifest_matches_fresh_store",
+        "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_v5_schema_manifest_matches_fresh_store",
+        "tests/unit/test_v5_storage_schema_contract.py::test_tampered_v5_sqlite_human_primary_key_is_rejected_on_reopen",
+        "tests/unit/test_v5_storage_schema_contract.py::test_tampered_v5_sqlite_action_tenant_index_is_rejected_on_reopen",
+        "tests/unit/test_v5_storage_schema_contract.py::test_v4_migration_plan_rejects_missing_human_primary_key",
+        "tests/unit/test_semantic_v5_migration.py::test_v5_plan_is_deterministic_and_dry_run_is_zero_write",
+        "tests/unit/test_semantic_v5_migration.py::test_v5_apply_requires_expected_plan_and_verified_backup",
+        "tests/unit/test_semantic_v5_migration.py::test_v5_apply_rejects_plan_digest_mismatch_without_schema_writes",
+        "tests/unit/test_semantic_v5_migration.py::test_v5_apply_rejects_stale_backup_under_locked_source",
+        "tests/unit/test_semantic_v5_migration.py::test_v5_apply_rolls_back_ddl_and_marker_on_failure",
+        "tests/unit/test_semantic_v5_migration.py::test_v5_plan_rejects_noncanonical_v4_without_writes",
+        "tests/unit/test_semantic_v5_migration.py::test_v5_apply_requires_owner_only_self_contained_backup",
+        "tests/runtime/test_semantic_v5_postgres_migration.py::test_postgres_v4_to_v5_migration_round_trip",
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_fresh_schema_rejects_a_second_schema_marker",
         "tests/runtime/test_postgres_store.py::TestPostgresStore::test_fresh_schema_rejects_a_second_schema_marker",
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_incomplete_v4_schema_is_rejected_without_mutation",
@@ -4637,6 +4648,121 @@
       "benchmark_attack_classes": []
     },
     {
+      "id": "semantic-shadow-has-no-machine-mutation-entry",
+      "title": "Semantic Shadow exposes evidence only and has no reachable machine settlement, Capability issuance, label/release mutation, or semantic HTTP write path.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_shadow_isolation.py::test_semantic_surface_has_no_machine_settlement_or_mutation_entrypoint",
+        "tests/runtime/test_semantic_authority_ceiling.py::test_semantic_auto_approval_candidate_is_read_only_host_ceiling_evidence",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_semantic_protected_port_never_creates_data_release_request",
+        "tests/unit/test_semantic_core.py::test_shadow_broker_requires_host_predicates_and_never_returns_a_permit",
+        "tests/providers/test_semantic_gui_api.py::test_semantic_status_rejects_nonzero_actual_auto_approval_metrics"
+      ],
+      "benchmark_attack_classes": ["semantic_classifier_authority_injection"]
+    },
+    {
+      "id": "semantic-candidates-are-exact-and-attenuated",
+      "title": "Semantic candidate ceilings are explicit deny-all by default, strictly parent-to-child attenuated, and bind one exact operation, resource, non-control right set, manifest, and policy.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_semantic_authority_ceiling.py::test_semantic_auto_approval_is_deny_all_when_absent_null_or_empty",
+        "tests/runtime/test_semantic_authority_ceiling.py::test_semantic_auto_approval_candidate_is_read_only_host_ceiling_evidence",
+        "tests/runtime/test_semantic_authority_ceiling.py::test_child_semantic_auto_approval_requires_explicit_parent_subset",
+        "tests/runtime/test_semantic_authority_ceiling.py::test_child_cannot_create_semantic_ceiling_from_ordinary_capability",
+        "tests/runtime/test_semantic_authority_ceiling.py::test_checkpoint_fork_preserves_but_does_not_widen_semantic_ceiling",
+        "tests/runtime/test_semantic_authority_ceiling.py::test_semantic_ceiling_and_legacy_manifest_hashes_survive_reopen",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_approval_binding_tamper_is_fail_closed_without_authority_delta"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-shadow-is-authority-neutral",
+      "title": "Off and Shadow preserve authoritative Human, Process, Capability, permission, DataFlow, release, and business-effect outcomes while capture and classifier failures remain isolated.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_shadow_isolation.py::test_default_off_has_zero_semantic_capture_and_preserves_human_authority",
+        "tests/security/test_semantic_shadow_isolation.py::test_shadow_and_off_have_identical_authority_business_and_label_outcomes",
+        "tests/security/test_semantic_shadow_isolation.py::test_classifier_failure_and_capture_failure_have_zero_authority_delta",
+        "tests/security/test_semantic_shadow_isolation.py::test_mode_off_scrubs_legacy_unclaimed_projection_without_claiming",
+        "tests/security/test_semantic_shadow_isolation.py::test_late_assessment_records_but_never_overwrites_human_outcome",
+        "tests/runtime/test_protected_operation_sdk.py::test_sdk_post_commit_observer_failure_is_bounded_and_preserves_result",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_process_post_commit_spawn_observer_is_late_and_failure_isolated",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_sdk_default_and_invocation_observers_are_additive_and_isolated",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_approval_binding_tamper_is_fail_closed_without_authority_delta",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_host_tenant_bucketer_is_keyed_optional_and_failure_isolated"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-data-findings-are-monotonic-advisory",
+      "title": "Semantic data findings can only tighten sensitivity/integrity/trust suggestions and cannot mutate input or ambient labels, endorsement, declassification, Sink clearance, or release state.",
+      "lane": "unit",
+      "node_ids": [
+        "tests/unit/test_semantic_core.py::test_data_finding_suggestion_is_monotonic_and_does_not_mutate_input",
+        "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_rejects_authority_or_label_upgrade_output[declassify]",
+        "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_rejects_authority_or_label_upgrade_output[endorse-integrity]",
+        "tests/providers/test_semantic_privacy.py::test_root_goal_and_provider_ingress_are_digest_bound_without_label_writeback",
+        "tests/unit/test_semantic_core.py::test_external_projection_freezes_payload_free_local_dlp_evidence[Use password=semantic-credential-value-credential-credential_material]",
+        "tests/unit/test_semantic_core.py::test_external_projection_freezes_payload_free_local_dlp_evidence[Inspect reports/payroll.csv-business_secret-sensitive_data]",
+        "tests/runtime/test_semantic_storage.py::test_worker_merges_frozen_host_dlp_findings_for_every_adapter_terminal_path[deterministic-success-success]",
+        "tests/runtime/test_semantic_storage.py::test_worker_merges_frozen_host_dlp_findings_for_every_adapter_terminal_path[deterministic-error-provider_error]",
+        "tests/runtime/test_semantic_storage.py::test_worker_merges_frozen_host_dlp_findings_for_every_adapter_terminal_path[scripted-success-success]",
+        "tests/runtime/test_semantic_storage.py::test_worker_merges_frozen_host_dlp_findings_for_every_adapter_terminal_path[scripted-error-provider_error]",
+        "tests/runtime/test_semantic_storage.py::test_worker_merges_frozen_host_dlp_findings_for_every_adapter_terminal_path[external-success-success]",
+        "tests/runtime/test_semantic_storage.py::test_worker_merges_frozen_host_dlp_findings_for_every_adapter_terminal_path[external-error-provider_outcome_unknown]",
+        "tests/runtime/test_semantic_storage.py::test_worker_merges_frozen_host_dlp_findings_for_every_adapter_terminal_path[external-egress_blocked-egress_blocked]"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-evidence-is-plaintext-free",
+      "title": "Semantic evidence excludes unsafe plaintext: only a bounded privacy-gated root-goal redacted intent may exist in a nonterminal projection, while terminal jobs, assessments, protected evidence, and read-only APIs remain source-text-free.",
+      "lane": "providers",
+      "node_ids": [
+        "tests/unit/test_semantic_core.py::test_semantic_models_are_strict_payload_free_and_round_trip",
+        "tests/unit/test_semantic_core.py::test_external_projection_redacts_or_drops_sensitive_intent_and_raw_ids",
+        "tests/runtime/test_semantic_storage.py::test_semantic_projection_rejects_content_fields_and_requires_terminal_hash_only",
+        "tests/security/test_semantic_shadow_isolation.py::test_mode_off_scrubs_legacy_unclaimed_projection_without_claiming",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_semantic_protected_port_records_only_digests_and_suppresses_recursion",
+        "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_uses_safe_projection_and_protected_single_dispatch",
+        "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_sanitizes_provider_exception_and_context",
+        "tests/providers/test_semantic_privacy.py::test_terminal_semantic_evidence_never_persists_secret_sentinel",
+        "tests/providers/test_semantic_gui_api.py::test_semantic_assessment_detail_is_typed_and_payload_free",
+        "tests/providers/test_semantic_gui_api.py::test_semantic_assessment_projection_rejects_nested_payload_in_scalar_field",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_host_tenant_bucketer_is_keyed_optional_and_failure_isolated",
+        "tests/providers/test_semantic_usage_telemetry.py::test_external_usage_ignores_untrusted_or_unknown_values[unknown-secret-key]",
+        "tests/providers/test_semantic_usage_telemetry.py::test_external_usage_ignores_unknown_secret_but_keeps_valid_known_counters",
+        "tests/providers/test_semantic_usage_telemetry.py::test_external_usage_rejects_non_exact_completion_or_usage_container",
+        "tests/providers/test_semantic_usage_telemetry.py::test_usage_survives_invalid_provider_schema_without_retaining_response",
+        "tests/unit/test_semantic_core.py::test_external_projection_freezes_payload_free_local_dlp_evidence[Use password=semantic-credential-value-credential-credential_material]",
+        "tests/unit/test_semantic_core.py::test_external_projection_freezes_payload_free_local_dlp_evidence[Inspect reports/payroll.csv-business_secret-sensitive_data]",
+        "tests/runtime/test_semantic_storage.py::test_worker_rejects_non_allowlisted_frozen_dlp_evidence[injected0]",
+        "tests/runtime/test_semantic_storage.py::test_worker_rejects_non_allowlisted_frozen_dlp_evidence[injected1]",
+        "tests/runtime/test_semantic_storage.py::test_worker_rejects_non_allowlisted_frozen_dlp_evidence[injected2]",
+        "tests/runtime/test_semantic_manager_usage_telemetry.py::test_worker_persists_usage_after_any_completed_provider_response[True-invalid_schema]",
+        "tests/runtime/test_semantic_manager_usage_telemetry.py::test_worker_keeps_missing_usage_null_for_deterministic_assessor",
+        "tests/runtime/test_semantic_manager_usage_telemetry.py::test_two_workers_do_not_cross_assign_usage",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_sdk_result_descriptor_is_bounded_and_carries_ingress_labels",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_host_provider_result_digest_matrix_is_bounded_complete_and_payload_free"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-assessments-are-provenance-bound-and-append-only",
+      "title": "Semantic terminal job CAS and assessment append are atomic; assessments are immutable, idempotent only for identical records, provenance-bound, and queried through bounded Unicode-stable keysets.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_semantic_storage.py::test_semantic_job_claim_terminalization_is_single_winner_and_scrubs_projection",
+        "tests/runtime/test_semantic_storage.py::test_semantic_assessment_append_is_idempotent_but_never_overwrites",
+        "tests/runtime/test_semantic_storage.py::test_semantic_query_is_bounded_and_unicode_keyset_is_lossless",
+        "tests/security/test_semantic_shadow_isolation.py::test_late_assessment_records_but_never_overwrites_human_outcome",
+        "tests/providers/test_semantic_privacy.py::test_root_goal_and_provider_ingress_are_digest_bound_without_label_writeback",
+        "tests/self_evolution/test_checkpoint_semantic_ledger.py::test_checkpoint_fork_and_restore_leave_semantic_assessment_ledger_global",
+        "tests/unit/test_semantic_v5_migration.py::test_v5_plan_is_deterministic_and_dry_run_is_zero_write"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "rating-mutations-are-audit-atomic",
       "title": "Rating updates and their required audit records commit or roll back in one transaction.",
       "lane": "runtime",
@@ -4664,6 +4790,7 @@
     "git_repository_config_execution": "git-provider-is-pinned-and-non-executable",
     "git_remote_authority_bypass": "git-mutations-require-authority-state-and-evidence",
     "git_patch_lineage": "git-patches-remotes-and-prs-preserve-cas-lineage",
-    "prompt_injection_write": "protected-egress-enforces-minimum-integrity"
+    "prompt_injection_write": "protected-egress-enforces-minimum-integrity",
+    "semantic_classifier_authority_injection": "semantic-shadow-has-no-machine-mutation-entry"
   }
 }

@@ -34,6 +34,18 @@ def _capability_admission_state(runtime: Runtime, pid: str) -> tuple[object, ...
     )
 
 
+def _inject_legacy_capability_constraints(
+    runtime: Runtime,
+    capability: Capability,
+    constraints: dict[str, object],
+) -> Capability:
+    """Simulate a pre-admission capability row without using a public writer."""
+
+    injected = replace(capability, constraints=dict(constraints))
+    runtime.store.update_capability(injected)
+    return injected
+
+
 def _assert_rule_rejected_at_admission(
     runtime: Runtime,
     pid: str,
@@ -439,18 +451,70 @@ class TestCapabilityManager:
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='malformed restrictive policy')
             runtime.capability.grant(pid, 'filesystem:workspace:*', [CapabilityRight.READ], issued_by='test')
-            runtime.capability.issue_trusted(
+            restrictive = runtime.capability.issue_trusted(
                 pid,
                 'filesystem:workspace:secret.txt',
                 [CapabilityRight.READ],
                 issued_by='test',
                 effect=CapabilityEffect.DENY,
-                constraints={'unknown_constraint': True},
+            )
+            _inject_legacy_capability_constraints(
+                runtime,
+                restrictive,
+                {'unknown_constraint': True},
             )
             decision = runtime.capability.authorize(pid, 'filesystem:workspace:secret.txt', CapabilityRight.READ)
             assert not decision.allowed
             assert decision.effect == CapabilityEffect.DENY
-            assert 'unknown_constraint' in decision.constraint_results
+            assert 'invalid_persisted_constraint' in decision.constraint_results
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        'constraints',
+        [
+            {'unknown_constraint': True},
+            {'git_remote': None},
+            {'git_remote': 7},
+            {'git_allowed_refs': 'refs/heads/main'},
+            {'git_allowed_refs': ['refs/heads/main', None]},
+            {'authority_rules': None},
+            {'approval_binding': None},
+            {'data_release_binding': None},
+            {'shell_policy_level': None},
+            {'inherited_from': None},
+        ],
+        ids=[
+            'unknown',
+            'git-remote-null',
+            'git-remote-type',
+            'git-refs-container',
+            'git-refs-item',
+            'authority-rules-null',
+            'approval-binding-null',
+            'data-release-binding-null',
+            'shell-policy-null',
+            'inherited-from-null',
+        ],
+    )
+    def test_new_capability_writes_reject_undefined_constraints(
+        self,
+        constraints: dict[str, object],
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            before = _capability_admission_state(runtime, 'worker')
+
+            with pytest.raises(ValidationError, match='constraint|binding|rules'):
+                runtime.capability.issue_trusted(
+                    'worker',
+                    'object:strict-constraints',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                    constraints=constraints,
+                )
+
+            assert _capability_admission_state(runtime, 'worker') == before
         finally:
             runtime.close()
 
@@ -2427,6 +2491,243 @@ class TestCapabilityManager:
         finally:
             runtime.close()
 
+    def test_legacy_null_parent_constraint_is_not_covered_by_an_omitted_child_constraint(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='legacy parent')
+            parent_capability = runtime.capability.grant(
+                parent,
+                'git_remote:workspace:origin',
+                [CapabilityRight.READ],
+                issued_by='test',
+                delegable=True,
+            )
+            legacy = _inject_legacy_capability_constraints(
+                runtime,
+                parent_capability,
+                {'git_remote': None},
+            )
+
+            assert not runtime.capability.spec_covers(
+                legacy,
+                CapabilitySpec(
+                    resource='git_remote:workspace:origin',
+                    rights={CapabilityRight.READ.value},
+                ),
+            )
+        finally:
+            runtime.close()
+
+    def test_legacy_invalid_constraints_remain_readable_but_fail_closed(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='legacy reader')
+            capability = runtime.capability.grant(
+                pid,
+                'object:legacy-invalid',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            legacy_constraints = {'authority_rules': {'invalid': 'container'}}
+            _inject_legacy_capability_constraints(
+                runtime,
+                capability,
+                legacy_constraints,
+            )
+
+            inspected = runtime.capability.inspect(capability.cap_id)
+            decision = runtime.capability.authorize(
+                pid,
+                'object:legacy-invalid',
+                CapabilityRight.READ,
+            )
+
+            assert inspected['constraints'] == legacy_constraints
+            assert inspected['rules'] == []
+            assert not decision.allowed
+            assert 'invalid_persisted_constraint' in decision.constraint_results
+        finally:
+            runtime.close()
+
+    def test_delegate_cannot_drop_legacy_null_parent_constraint(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='legacy parent')
+            child = runtime.process.spawn(image='base-agent:v0', goal='legacy child')
+            parent_capability = runtime.capability.grant(
+                parent,
+                'git_remote:workspace:origin',
+                [CapabilityRight.READ],
+                issued_by='test',
+                delegable=True,
+            )
+            _inject_legacy_capability_constraints(
+                runtime,
+                parent_capability,
+                {'git_remote': None},
+            )
+
+            with pytest.raises(CapabilityDenied, match='invalid parent constraint'):
+                runtime.capability.delegate(
+                    parent,
+                    child,
+                    CapabilitySpec(
+                        resource='git_remote:workspace:origin',
+                        rights={CapabilityRight.READ.value},
+                    ),
+                )
+        finally:
+            runtime.close()
+
+    def test_grant_transfer_cannot_drop_legacy_null_parent_constraint(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(image='base-agent:v0', goal='legacy grant actor')
+            recipient = runtime.process.spawn(image='base-agent:v0', goal='legacy recipient')
+            parent_capability = runtime.capability.grant(
+                actor,
+                'git_remote:workspace:origin',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            _inject_legacy_capability_constraints(
+                runtime,
+                parent_capability,
+                {'git_remote': None},
+            )
+            runtime.capability.grant(
+                actor,
+                'git_remote:workspace:origin',
+                [CapabilityRight.GRANT],
+                issued_by='test',
+            )
+
+            with pytest.raises(CapabilityDenied, match='invalid parent constraint'):
+                runtime.capability.issue(
+                    actor,
+                    recipient,
+                    CapabilitySpec(
+                        resource='git_remote:workspace:origin',
+                        rights={CapabilityRight.READ.value},
+                    ),
+                )
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        'legacy_constraints',
+        [
+            {'unknown_constraint': True},
+            {'git_remote': None},
+            {'git_allowed_refs': 'refs/heads/main'},
+        ],
+        ids=['unknown', 'null', 'wrong-type'],
+    )
+    def test_historical_invalid_ancestor_blocks_continued_derivation_after_reopen(
+        self,
+        legacy_constraints: dict[str, object],
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / 'runtime.sqlite'
+            runtime = Runtime.open(db_path)
+            try:
+                root_subject = runtime.process.spawn(goal='legacy constraint root')
+                child_subject = runtime.process.spawn(goal='legacy constraint child')
+                root_read = runtime.capability.grant(
+                    root_subject,
+                    'object:legacy-chain',
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                    delegable=True,
+                )
+                child_read = runtime.capability.delegate(
+                    root_subject,
+                    child_subject,
+                    CapabilitySpec(
+                        resource='object:legacy-chain',
+                        rights={CapabilityRight.READ.value},
+                        delegable=True,
+                    ),
+                )
+                runtime.capability.grant(
+                    root_subject,
+                    'object:legacy-chain',
+                    [CapabilityRight.GRANT],
+                    issued_by='test',
+                    delegable=True,
+                )
+                runtime.capability.delegate(
+                    root_subject,
+                    child_subject,
+                    CapabilitySpec(
+                        resource='object:legacy-chain',
+                        rights={CapabilityRight.GRANT.value},
+                    ),
+                )
+                _inject_legacy_capability_constraints(
+                    runtime,
+                    root_read,
+                    legacy_constraints,
+                )
+            finally:
+                runtime.close()
+
+            reopened = Runtime.open(db_path)
+            try:
+                persisted_root = reopened.store.get_capability(root_read.cap_id)
+                persisted_child = reopened.store.get_capability(child_read.cap_id)
+                assert persisted_root is not None
+                assert persisted_root.constraints == legacy_constraints
+                assert persisted_child is not None
+                assert persisted_child.parent_cap_id == persisted_root.cap_id
+                assert not reopened.capability.check(
+                    child_subject,
+                    'object:legacy-chain',
+                    CapabilityRight.READ,
+                )
+
+                grandchild = reopened.process.spawn(goal='blocked delegate target')
+                recipient = reopened.process.spawn(goal='blocked grant target')
+
+                def mutation_state(pid: str) -> tuple[object, ...]:
+                    process = reopened.process.get(pid)
+                    return (
+                        tuple(process.capabilities),
+                        _capability_admission_state(reopened, pid),
+                    )
+
+                before_delegate = mutation_state(grandchild)
+                with pytest.raises(
+                    CapabilityDenied,
+                    match='invalid parent constraint chain',
+                ):
+                    reopened.capability.delegate(
+                        child_subject,
+                        grandchild,
+                        CapabilitySpec(
+                            resource='object:legacy-chain',
+                            rights={CapabilityRight.READ.value},
+                        ),
+                    )
+                assert mutation_state(grandchild) == before_delegate
+
+                before_transfer = mutation_state(recipient)
+                with pytest.raises(
+                    CapabilityDenied,
+                    match='invalid parent constraint chain',
+                ):
+                    reopened.capability.issue(
+                        child_subject,
+                        recipient,
+                        CapabilitySpec(
+                            resource='object:legacy-chain',
+                            rights={CapabilityRight.READ.value},
+                        ),
+                    )
+                assert mutation_state(recipient) == before_transfer
+            finally:
+                reopened.close()
+
     def test_delegate_can_add_git_ref_allowlist_as_restrictive_constraint(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -2472,6 +2773,51 @@ class TestCapabilityManager:
                 CapabilityRight.READ,
                 {'git_remote_ref': 'refs/heads/private'},
             ).allowed
+        finally:
+            runtime.close()
+
+    def test_delegate_can_narrow_but_not_widen_parent_git_ref_allowlist(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            child = runtime.process.spawn(image='base-agent:v0', goal='child')
+            parent_capability = runtime.capability.grant(
+                parent,
+                'git_remote:workspace:origin',
+                [CapabilityRight.READ],
+                issued_by='test',
+                constraints={
+                    'git_allowed_refs': [
+                        'refs/heads/main',
+                        'refs/heads/release',
+                    ]
+                },
+                delegable=True,
+            )
+            narrowed = CapabilitySpec(
+                resource='git_remote:workspace:origin',
+                rights={CapabilityRight.READ.value},
+                constraints={'git_allowed_refs': ['refs/heads/main']},
+            )
+            widened = CapabilitySpec(
+                resource='git_remote:workspace:origin',
+                rights={CapabilityRight.READ.value},
+                constraints={
+                    'git_allowed_refs': [
+                        'refs/heads/main',
+                        'refs/heads/private',
+                    ]
+                },
+            )
+
+            assert runtime.capability.spec_covers(parent_capability, narrowed)
+            assert not runtime.capability.spec_covers(parent_capability, widened)
+            delegated = runtime.capability.delegate(parent, child, narrowed)
+            assert delegated.constraints == {
+                'git_allowed_refs': ['refs/heads/main']
+            }
+            with pytest.raises(CapabilityDenied, match='cannot widen'):
+                runtime.capability.delegate(parent, child, widened)
         finally:
             runtime.close()
 

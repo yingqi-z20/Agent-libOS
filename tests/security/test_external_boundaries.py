@@ -195,17 +195,21 @@ class TestExternalBoundary:
     ) -> None:
         pid = self.runtime.process.spawn(image='review-agent:v0', goal='human final update failure')
         self.runtime.capability.grant(pid, 'human:owner', [CapabilityRight.WRITE], issued_by='test')
-        original_update = self.runtime.store.update_human_request
+        original_compare_and_set = self.runtime.store.compare_and_set_human_request
         calls = 0
 
-        def fail_second_update(request: object) -> None:
+        def fail_second_update(expected: object, target: object) -> bool:
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise RuntimeError('late update failed')
-            original_update(request)
+            return original_compare_and_set(expected, target)
 
-        monkeypatch.setattr(self.runtime.store, 'update_human_request', fail_second_update)
+        monkeypatch.setattr(
+            self.runtime.store,
+            'compare_and_set_human_request',
+            fail_second_update,
+        )
 
         result = self.runtime.tools.call(pid, 'human_output', {'message': 'visible'})
 

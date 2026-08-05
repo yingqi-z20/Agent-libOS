@@ -1039,7 +1039,10 @@ def test_task_run_human_redaction_is_linked_atomic_and_backend_equivalent(
             expected_payload_sha256=source_sha256,
             expected_status=linked.status.value,
         )
-        assert store.get_human_request(linked.request_id) == redacted
+        assert store.get_human_request(linked.request_id) == replace(
+            redacted,
+            revision=linked.revision + 1,
+        )
         assert human_request_payload_sha256(redacted) == source_sha256
         assert "HUMAN_PROMPT_SENTINEL" not in repr(redacted)
         assert "HUMAN_DECISION_SENTINEL" not in repr(redacted)

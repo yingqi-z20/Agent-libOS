@@ -18,6 +18,7 @@ from agent_libos.storage.contracts import (
     ResourceRepositoryProtocol,
     RuntimeModuleBackendProtocol,
     RuntimePublicationBackendProtocol,
+    SemanticAssessmentBackendProtocol,
     SnapshotCheckpointBackendProtocol,
     SnapshotCheckpointRepositoryProtocol,
     TransactionBackendProtocol,
@@ -42,7 +43,17 @@ from agent_libos.storage.repositories import (
     SnapshotCheckpointRepository,
     RuntimePublicationRepository,
     RuntimeModuleRepository,
+    SemanticAssessmentRepository,
     UnitOfWork,
+)
+from agent_libos.storage.semantic import (
+    SemanticAssessmentCursor,
+    SemanticAssessmentJobRecord,
+    SemanticAssessmentJobStatus,
+    SemanticAssessmentPage,
+    SemanticAssessmentRecord,
+    SemanticProjectionRetention,
+    SemanticStatusAggregate,
 )
 from agent_libos.storage.sql import STORE_SCHEMA_VERSION, SQLRuntimeStore
 from agent_libos.storage.sqlite import SQLiteStore
@@ -86,6 +97,15 @@ __all__ = [
     "RuntimeModuleRepository",
     "RuntimeModuleRepositoryProtocol",
     "RuntimeModuleBackendProtocol",
+    "SemanticAssessmentBackendProtocol",
+    "SemanticAssessmentRepository",
+    "SemanticAssessmentCursor",
+    "SemanticAssessmentJobRecord",
+    "SemanticAssessmentJobStatus",
+    "SemanticAssessmentPage",
+    "SemanticAssessmentRecord",
+    "SemanticProjectionRetention",
+    "SemanticStatusAggregate",
     "UnitOfWorkBackendProtocol",
     "SQLiteStore",
     "PostgresStore",

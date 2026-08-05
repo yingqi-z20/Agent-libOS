@@ -2,7 +2,7 @@
 name: swe-agent
 description: SWE-Agent inspired coding workflow for fixing, reviewing, and improving software repositories through a compact agent-computer interface.
 license: Apache-2.0
-compatibility: agent-libos==1.3.4
+compatibility: agent-libos==1.4.0
 allowed-tools: read_directory read_text_file write_text_file write_directory run_shell_command get_working_directory set_working_directory parse_pytest_log create_checkpoint diff_checkpoint create_memory_object append_memory_object read_memory_object create_object_from_file write_object_to_file request_permission human_output process_exit
 metadata:
   agent-libos.version: v0

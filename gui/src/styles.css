@@ -3805,6 +3805,265 @@ button.promptChip:hover:not(:disabled) {
   }
 }
 
+/* Semantic Shadow evidence is read-only and intentionally payload-free. */
+.semanticOverview,
+.semanticFindings,
+.semanticDigestList {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+}
+
+.semanticHeader > span:nth-child(2) {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  flex: 1;
+}
+
+.semanticFindings article small {
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.semanticShadowNotice {
+  margin: 0;
+  padding: 8px 10px;
+  color: var(--color-accent-strong);
+  background: var(--accent-subtle);
+  border: 1px solid var(--color-accent-border);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.semanticRefresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.semanticRuntimeFacts,
+.semanticCounters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 7px;
+}
+
+.semanticRuntimeFacts > span,
+.semanticCounters > span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  padding: 8px;
+  background: var(--color-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.semanticRuntimeFacts small,
+.semanticCounters small {
+  color: var(--color-text-tertiary);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.semanticRuntimeFacts strong,
+.semanticCounters strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.semanticOutcomeCounts,
+.semanticBadges,
+.semanticCodeGroup > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.semanticOutcomeCounts > span:not(.semanticBadge) {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.semanticAggregateGroups {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.semanticAggregateGroups h4 {
+  margin: 0 0 8px;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+}
+
+.semanticCounters.compact {
+  grid-template-columns: repeat(auto-fit, minmax(105px, 1fr));
+}
+
+.semanticBadge {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-height: 21px;
+  padding: 2px 7px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.semanticBadge.success {
+  color: #176b4d;
+  background: #e8f7ef;
+  border-color: #9ed6bc;
+}
+
+.semanticBadge.warning {
+  color: var(--color-warning-fg);
+  background: var(--color-warning-bg);
+  border-color: var(--color-warning-border);
+}
+
+.semanticBadge.danger {
+  color: #9e2d37;
+  background: #fff0f1;
+  border-color: #edb6ba;
+}
+
+.semanticBadge.neutral {
+  color: var(--color-text-secondary);
+  background: var(--color-subtle);
+}
+
+.semanticFilters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.semanticFilters label {
+  display: grid;
+  min-width: min(180px, 100%);
+  gap: 4px;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.semanticLayout {
+  grid-template-columns: minmax(190px, 250px) minmax(0, 1fr);
+  align-items: start;
+}
+
+.semanticList > h3,
+.semanticFindings > h4,
+.semanticDigestList > h4,
+.semanticCodeGroup > h4 {
+  margin: 0;
+  font-size: 12px;
+}
+
+.semanticFindings article > span:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 8px;
+}
+
+.semanticFindings article {
+  min-width: 0;
+  padding: 8px;
+  background: var(--color-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.semanticDigestList dt {
+  color: var(--color-text-tertiary);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.semanticDigestList dd {
+  min-width: 0;
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.semanticCodeGroup {
+  display: grid;
+  gap: 6px;
+}
+
+.semanticCodeGroup code,
+.semanticDigestList code,
+.semanticFindings article > code {
+  max-width: 100%;
+  padding: 3px 6px;
+  overflow-wrap: anywhere;
+  color: var(--color-code-fg);
+  background: var(--color-code-bg);
+  border-radius: 5px;
+  font-size: 10px;
+  unicode-bidi: plaintext;
+}
+
+.semanticDigestList dl {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+}
+
+.semanticDigestList dl > div {
+  display: grid;
+  grid-template-columns: minmax(100px, 150px) minmax(0, 1fr);
+  gap: 8px;
+}
+
+.semanticFindings article {
+  display: grid;
+  gap: 6px;
+}
+
+@media (max-width: 720px) {
+  .semanticLayout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .semanticList {
+    max-height: 280px;
+    overflow: auto;
+  }
+
+  .semanticHeader {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .semanticRefresh {
+    margin-left: 42px;
+  }
+
+  .semanticDigestList dl > div {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 /* Provider-returned reasoning is an inert, on-demand diagnostic surface. */
 .providerTracePanel {
   display: grid;

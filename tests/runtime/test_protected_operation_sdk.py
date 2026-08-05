@@ -165,6 +165,13 @@ def test_protected_operation_value_objects_validate_runtime_types() -> None:
             target=None,
             data_flow_allow_recovered_source_snapshots=1,  # type: ignore[arg-type]
         )
+    with pytest.raises(ValueError, match="data_flow_request_release must be boolean"):
+        ProtectedOperationInvocation(
+            pid="pid",
+            actor="pid",
+            target=None,
+            data_flow_request_release=1,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize(
@@ -393,6 +400,10 @@ def test_sdk_registry_guard_covers_live_compare_and_provider_callable() -> None:
         )
         guard_active = False
         trace: list[str] = []
+        observations: list[object] = []
+        runtime.protected_operations.bind_post_commit_result_observer(
+            lambda _result, observation: observations.append(observation)
+        )
 
         @contextmanager
         def phase_guard():
@@ -434,6 +445,10 @@ def test_sdk_registry_guard_covers_live_compare_and_provider_callable() -> None:
             operation.complete(result, _evidence(pid))
 
         assert trace == ["guard_enter", "resolve", "provider", "guard_exit"]
+        assert len(observations) == 1
+        assert observations[0].provider_spec_sha256 == (
+            captured.registry_spec_sha256
+        )
 
 
 def test_sdk_registry_guard_rejects_async_phase_before_provider_dispatch() -> None:
@@ -825,6 +840,151 @@ def test_sdk_success_consumes_authority_and_persists_safe_evidence() -> None:
                 "commits_authority": True,
             }
         ]
+
+
+def test_sdk_post_commit_result_observer_runs_after_durable_effect_settlement() -> None:
+    with temporary_runtime() as runtime:
+        pid, _capability, contract, invocation = _setup(runtime)
+        observed: list[tuple[object, object]] = []
+
+        def observe(result, context) -> None:
+            effect = runtime.store.get_external_effect(context.effect_id)
+            assert effect is not None
+            assert effect.effect_state == "finalized"
+            assert effect.transaction_state == "committed"
+            observed.append((result, context))
+
+        invocation = replace(invocation, post_commit_result_observer=observe)
+        with runtime.protected_operations.start(
+            contract,
+            invocation,
+            provider=_Provider(),
+        ) as operation:
+            result = operation.call(
+                ProviderPhase("read", information_flow=True),
+                lambda: {"provider": "result"},
+            )
+            assert operation.complete(result, _evidence(pid)) is result
+
+        assert len(observed) == 1
+        observed_result, context = observed[0]
+        assert observed_result is result
+        assert context.effect_id == operation.effect_id
+        assert context.pid == pid
+        assert context.provider == contract.provider
+        assert context.operation == contract.operation
+        assert context.target == invocation.target
+        assert operation.post_commit_observer_ran is True
+        assert operation.post_commit_observer_failure is None
+
+
+def test_sdk_post_commit_observer_failure_is_bounded_and_preserves_result() -> None:
+    sentinel = "POST_COMMIT_OBSERVER_SECRET_SENTINEL"
+    with temporary_runtime() as runtime:
+        pid, _capability, contract, invocation = _setup(runtime)
+        failures = []
+
+        def fail_observation(_result, _context) -> None:
+            raise RuntimeError(sentinel)
+
+        def report_failure(failure) -> None:
+            failures.append(failure)
+            raise RuntimeError("failure reporter also failed")
+
+        invocation = replace(
+            invocation,
+            post_commit_result_observer=fail_observation,
+            post_commit_observer_failure=report_failure,
+        )
+        with runtime.protected_operations.start(
+            contract,
+            invocation,
+            provider=_Provider(),
+        ) as operation:
+            result = operation.call(
+                ProviderPhase("read", information_flow=True),
+                lambda: "original-result",
+            )
+            assert operation.complete(result, _evidence(pid)) == "original-result"
+
+        assert operation.post_commit_observer_ran is True
+        failure = operation.post_commit_observer_failure
+        assert failure is not None
+        assert failures == [failure]
+        assert failure.effect_id == operation.effect_id
+        assert failure.provider == contract.provider
+        assert failure.operation == contract.operation
+        assert failure.error_type == "RuntimeError"
+        assert sentinel not in repr(failure)
+        effect = runtime.store.get_external_effect(str(operation.effect_id))
+        assert effect is not None
+        assert effect.transaction_state == "committed"
+
+
+def test_sdk_post_commit_observer_does_not_run_for_failed_settlement(monkeypatch) -> None:
+    with temporary_runtime() as runtime:
+        pid, _capability, contract, invocation = _setup(runtime)
+        observed: list[object] = []
+        invocation = replace(
+            invocation,
+            post_commit_result_observer=lambda result, _context: observed.append(result),
+        )
+        with pytest.raises(RuntimeError, match="event persistence failed"):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                result = operation.call(
+                    ProviderPhase("read", information_flow=True),
+                    lambda: "provider-result",
+                )
+                monkeypatch.setattr(
+                    runtime.events,
+                    "emit",
+                    lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        RuntimeError("event persistence failed")
+                    ),
+                )
+                operation.complete(result, _evidence(pid))
+
+        assert observed == []
+        assert operation.post_commit_observer_ran is False
+        assert operation.post_commit_observer_failure is None
+
+
+def test_sdk_can_forbid_automatic_data_release_requests() -> None:
+    with temporary_runtime() as runtime:
+        (
+            _pid,
+            capability,
+            contract,
+            invocation,
+            _primary_sink,
+            _additional_sink,
+            _source,
+        ) = _multi_sink_egress_setup(runtime)
+        invocation = replace(invocation, data_flow_request_release=False)
+        provider_calls: list[str] = []
+
+        with pytest.raises(
+            CapabilityDenied,
+            match="conditional Sink requires an exact one-shot data release",
+        ):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                operation.call(
+                    ProviderPhase("send", information_flow=True),
+                    lambda: provider_calls.append("called"),
+                )
+
+        assert provider_calls == []
+        assert runtime.human.pending() == []
+        assert runtime.store.get_capability(capability.cap_id).uses_remaining == 1
+        assert runtime.store.list_external_effects(pid=invocation.pid) == []
 
 
 def test_sdk_explicit_idempotency_key_blocks_retained_duplicate_before_provider() -> None:

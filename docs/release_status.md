@@ -1,6 +1,6 @@
-# Agent libOS 1.3.4 Status
+# Agent libOS 1.4.0 Status
 
-Agent libOS 1.3.4 is a release candidate for the core Python runtime scope
+Agent libOS 1.4.0 is a release candidate for the core Python runtime scope
 defined in `docs/support_matrix.md`. Release-ready status for any source tree is
 conditional on that exact tree passing the checked-in CI workflow; local
 deterministic results do not substitute for its Python-version, PostgreSQL, and
@@ -26,10 +26,17 @@ checkout or candidate artifact.
   one root AgentProcess tree. They persist requirements, idempotent command
   receipts, append-only ledger links, and locally integrity-bound resume points;
   they do not introduce a generic workflow DSL or distributed scheduler.
-- RuntimeStore schema v4 is the only store format accepted by 1.3.4. A schema
-  v3 store is rejected before initialization or any write and remains
-  archive-only under 1.0.1; this release has no migration, read-only bridge, or
+- RuntimeStore schema v5 is the only store format accepted by ordinary 1.4.0
+  startup. A canonical v4 store has one explicit offline, digest-bound migration
+  path to v5; Runtime startup never migrates it. Schema v3 remains archive-only
+  under 1.0.1, and malformed/older stores have no read-only bridge or
   dual-schema mode.
+- Semantic approval and ingress classification are opt-in Shadow evidence only.
+  `semantic.mode=off` is the zero-capture default; Shadow cannot settle Human
+  requests, issue Capabilities, mutate permission/DataLabels/release state, or
+  change provider results. Its CLI and GUI HTTP surfaces are read-only, and an
+  optional external classifier uses a dedicated non-default, no-retry,
+  `store=false` LLM profile through Protected Operation and DataFlow gates.
 - Useful Task Run restart recovery requires explicit Host opt-in to bounded
   plaintext payload persistence, which is disabled by default. The default
   `purge_on_terminal` policy hash-reduces readable Run-owned content before a
@@ -228,8 +235,8 @@ checkout or candidate artifact.
   environment gates. Deterministic mocked MCP coverage is part of the normal
   matrix. Platform-specific skips stay documented and real Deno runs by default
   when installed.
-- The Durable Task Run gate requires fresh schema-v4 SQLite/PostgreSQL shape,
-  v3 zero-write refusal, revision/command conflicts, stale Runtime-epoch
+- The Durable Task Run gate requires fresh schema-v5 SQLite/PostgreSQL shape,
+  older-store zero-write refusal, revision/command conflicts, stale Runtime-epoch
   fencing, plaintext opt-in and terminal purge, unknown-effect/ObjectTask
   blocking, checkpoint intersection refusal, and GUI snapshot schema-v3 behavior. Its
   crash harness exercises `os._exit` and `SIGKILL` durability barriers through
@@ -302,7 +309,7 @@ checkout or candidate artifact.
   evidence, unstable or different source identities, and uncommitted source
   changes.
   Recommended invocations omit `--artifacts-root`, so synthetic workspaces,
-  browser state, and permanent-retention v4 databases are removed after the
+  browser state, and permanent-retention v5 databases are removed after the
   bounded reports are written. Put all reports in the operating system's
   temporary directory, outside the repository. These commands define an
   environment gate; the documentation does not claim that a fresh clean-source
@@ -319,10 +326,11 @@ checkout or candidate artifact.
   checking, and the production frontend build. Exact file and test counts are
   intentionally left to the bound CI receipt because they change as coverage
   grows.
-- The runtime-safety release job is configured to gate all 32 checked-in
+- The runtime-safety release job is configured to gate all 33 checked-in
   deterministic tasks on complete audit evidence, no unauthorized effects, and
   no false denials. Its focused Git tasks cover managed-checkout containment,
-  malicious repository config, remote misuse, and patch-label lineage.
+  malicious repository config, remote misuse, patch-label lineage, and
+  Semantic Shadow authority injection.
 - The practical-workflow gate requires three `native-live` scenarios and 80
   modeled scenarios to retain their distinct evidence labels, with no modeled
   fallback for native scenarios.
@@ -344,7 +352,7 @@ checkout or candidate artifact.
   The profile must validate exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The `release-artifacts` CI job is configured to build one canonical 1.3.4
+- The `release-artifacts` CI job is configured to build one canonical 1.4.0
   wheel/source pair, reject extra or non-regular output, and record an exact
   checksum manifest.
   Python 3.11 through 3.14 smoke jobs download and verify that same pair, install
@@ -364,7 +372,7 @@ endpoint to read a policy and CSV, compute a report, emit `human_output`, and
 exit. No provenance-bearing report for that run is checked in with the source
 revision, model/profile identity, redacted configuration, environment, and raw
 test outcome needed to reproduce or compare it. It is therefore an unarchived
-observation, not Agent libOS 1.3.4 release evidence, and supports no call-count,
+observation, not Agent libOS 1.4.0 release evidence, and supports no call-count,
 token-count, approval-count, latency, or serial-versus-parallel claim. Promote a
 future rerun only after using a documented opt-in real-model gate and preserving
 its reproducible report outside this status summary.
@@ -388,7 +396,8 @@ its reproducible report outside this status summary.
   depend on that job. This is a configured CI gate, not a claim that a separate
   local macOS CI run was performed.
 - SQLite and PostgreSQL implement the covered RuntimeStore contract. This
-  release accepts only store schema v4. A schema-v3 store is rejected before
+  release accepts only store schema v5 at Runtime startup. A canonical v4 store
+  may use the explicit offline migration; a schema-v3 store is rejected before
   mutation and may be viewed or archived only with Agent libOS 1.0.1; still
   older stores require their matching archived release. Checkpoint and Image
   artifact versions remain independent of the store schema.
@@ -401,7 +410,7 @@ its reproducible report outside this status summary.
   non-bare workspace repository and system Git 2.26 or newer; unavailable Git
   fails individual calls without preventing Runtime startup. Host-configured
   remotes are the only first-class Git network exception. There is no Git CLI,
-  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.3.4.
+  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.4.0.
 
 ## Remaining environment gates and non-blocking debt
 

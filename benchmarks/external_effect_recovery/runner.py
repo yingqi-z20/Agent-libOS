@@ -19,7 +19,7 @@ from agent_libos.models import ExternalEffectRecoveryQuery
 from agent_libos.runtime import RuntimeBuilder
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import sqlite as sqlite_storage
-from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS
+from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS, _V5_REQUIRED_COLUMNS
 from agent_libos.storage.sqlite import SQLiteStore
 from agent_libos.utils.serde import dumps
 
@@ -127,10 +127,20 @@ _EXTERNAL_EFFECT_SCHEMA_INDEXES = frozenset(
         "idx_external_effects_pid_idempotency",
     }
 )
+_EXTERNAL_EFFECT_SCHEMA_CATALOG_INDEXES = (
+    _EXTERNAL_EFFECT_SCHEMA_INDEXES
+    | {"sqlite_autoindex_external_effects_1"}
+)
 _SQLITE_V4_MANIFEST_TABLES = tuple(sorted(_V4_REQUIRED_COLUMNS))
 _SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE = (
     "SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN ("
     + ", ".join("?" for _ in _SQLITE_V4_MANIFEST_TABLES)
+    + ")"
+)
+_SQLITE_V5_MANIFEST_TABLES = tuple(sorted(_V5_REQUIRED_COLUMNS))
+_SQLITE_V5_MANIFEST_SCHEMA_PROBE_SHAPE = (
+    "SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN ("
+    + ", ".join("?" for _ in _SQLITE_V5_MANIFEST_TABLES)
     + ")"
 )
 _GLOBAL_PATCH_SCOPE_LOCK = threading.RLock()
@@ -859,19 +869,47 @@ def _handler_statement_kind(sql: str) -> str | None:
 def _startup_statement_kind(sql: str) -> str | None:
     normalized = " ".join(str(sql).upper().split()).rstrip(";")
     normalized_literals = _SQL_TEXT_LITERAL_RE.sub("?", normalized)
-    if normalized_literals == _SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE:
-        manifest_tables = tuple(
-            literal[1:-1].replace("''", "'")
-            for literal in _SQL_TEXT_LITERAL_RE.findall(str(sql))
-        )
-        if manifest_tables == _SQLITE_V4_MANIFEST_TABLES:
-            return "v4_manifest_schema_probe"
+    manifest_tables = tuple(
+        literal[1:-1].replace("''", "'")
+        for literal in _SQL_TEXT_LITERAL_RE.findall(str(sql))
+    )
+    for version, expected_shape, expected_tables in (
+        (
+            4,
+            _SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE,
+            _SQLITE_V4_MANIFEST_TABLES,
+        ),
+        (
+            5,
+            _SQLITE_V5_MANIFEST_SCHEMA_PROBE_SHAPE,
+            _SQLITE_V5_MANIFEST_TABLES,
+        ),
+    ):
+        if (
+            normalized_literals == expected_shape
+            and manifest_tables == expected_tables
+        ):
+            return f"v{version}_manifest_schema_probe"
     if re.fullmatch(
         r"SELECT NAME, SQL FROM SQLITE_MASTER WHERE TYPE = \?"
         r" AND NAME IN \(\?(?:, \?)*\)",
         normalized_literals,
     ):
         return "keyset_collation_schema_probe"
+    if normalized == 'PRAGMA TABLE_XINFO("EXTERNAL_EFFECTS")':
+        return "catalog_table_xinfo"
+    if normalized == 'PRAGMA FOREIGN_KEY_LIST("EXTERNAL_EFFECTS")':
+        return "catalog_foreign_key_list"
+    if normalized == 'PRAGMA INDEX_LIST("EXTERNAL_EFFECTS")':
+        return "catalog_index_list"
+    catalog_index_match = re.fullmatch(
+        r'PRAGMA INDEX_XINFO\("([A-Z0-9_]+)"\)',
+        normalized,
+    )
+    if catalog_index_match is not None:
+        index_name = catalog_index_match.group(1).lower()
+        if index_name in _EXTERNAL_EFFECT_SCHEMA_CATALOG_INDEXES:
+            return f"catalog_index_xinfo:{index_name}"
     if normalized == "PRAGMA TABLE_INFO(EXTERNAL_EFFECTS)":
         return "schema_probe"
     if (
@@ -950,18 +988,28 @@ def _strip_sql_comments(sql: str) -> str:
 
 
 def _assert_startup_statement_contract(actual: Counter[str]) -> None:
-    # Existing-store validation runs against an isolated safety snapshot. This
-    # ledger covers only the subsequently opened measured main connection.
+    # Existing-store validation first runs against an isolated safety snapshot,
+    # then repeats on the measured main connection to close the snapshot/open
+    # race.  The latter includes the canonical v5 full-catalog probes below.
     expected = Counter(
         {
             "schema_probe": 1,
             "keyset_collation_schema_probe": 1,
-            "v4_manifest_schema_probe": 1,
+            "v5_manifest_schema_probe": 1,
+            "catalog_table_xinfo": 1,
+            "catalog_foreign_key_list": 1,
+            "catalog_index_list": 1,
             "schema_table": 1,
         }
     )
     expected.update(
         {f"schema_index:{name}": 1 for name in _EXTERNAL_EFFECT_SCHEMA_INDEXES}
+    )
+    expected.update(
+        {
+            f"catalog_index_xinfo:{name}": 1
+            for name in _EXTERNAL_EFFECT_SCHEMA_CATALOG_INDEXES
+        }
     )
     if actual != expected:
         raise AssertionError(

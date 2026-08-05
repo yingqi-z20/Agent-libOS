@@ -1051,6 +1051,8 @@ def test_process_resource_and_publication_methods_are_explicit_facades() -> None
         "insert_process",
         "get_process",
         "get_human_request",
+        "update_human_request",
+        "compare_and_set_human_request",
         "get_object_task",
         "list_object_tasks",
         "list_processes_by_status",
@@ -1139,6 +1141,7 @@ def test_mutating_backend_bool_protocol_inventory_is_exact_and_transactional() -
         "advance_runtime_publication",
         "begin_checkpoint_payload_delivery_attempt",
         "commit_capability_use_reservation",
+        "compare_and_set_human_request",
         "complete_execution",
         "delete_tool_if_unreferenced",
         "insert_operation_evidence",
@@ -1150,6 +1153,7 @@ def test_mutating_backend_bool_protocol_inventory_is_exact_and_transactional() -
         "settle_resource_usage_reservation",
         "transition_checkpoint_restore_payload_delivery",
         "update_external_effect_payload_retention",
+        "update_human_request",
         "update_llm_call_payload_retention",
         "update_operation",
         "update_runtime_publication_plan",
@@ -1158,6 +1162,8 @@ def test_mutating_backend_bool_protocol_inventory_is_exact_and_transactional() -
 
     facade_inventory = (
         (ProcessRepository, "ack_process_message"),
+        (ProcessRepository, "update_human_request"),
+        (ProcessRepository, "compare_and_set_human_request"),
         (ProcessRepository, "complete_execution"),
         (ProcessRepository, "release_execution"),
         (AuthorityRepository, "commit_capability_use_reservation"),
@@ -1316,6 +1322,54 @@ def test_checkpoint_human_cancellation_preserves_a_competing_terminal_decision(
         assert before_checkpoint is not None
         assert before_checkpoint.status is HumanRequestStatus.PENDING
         assert before_checkpoint.decision is None
+    finally:
+        store.close()
+
+
+def test_checkpoint_human_cancellation_preserves_provider_unknown_fence() -> None:
+    store = SQLiteStore(":memory:")
+    try:
+        unit = UnitOfWork(store)
+        request = HumanRequest(
+            request_id="human-provider-unknown-after-checkpoint",
+            pid="pid-human-provider-unknown",
+            human="operator",
+            payload={"question": "must not be replayed"},
+            status=HumanRequestStatus.PENDING,
+            decision={
+                "provider_outcome": "unknown",
+                "automatic_retry_disabled": True,
+                "manual_recovery_required": True,
+                "process_reconciliation_required": True,
+                "operation": "read",
+                "purpose": "text_answer",
+                "error_type": "RuntimeError",
+            },
+            blocking=True,
+            created_at="2026-01-03T00:00:00Z",
+            updated_at="2026-01-03T00:00:00Z",
+        )
+        store.insert_human_request(request)
+
+        cancelled = unit.snapshots.cancel_pending_human_requests_after_checkpoint(
+            (request.pid,),
+            Checkpoint(
+                checkpoint_id="checkpoint-provider-unknown",
+                pid=request.pid,
+                reason="test",
+                created_at="2026-01-02T00:00:00Z",
+            ),
+        )
+
+        assert cancelled == [request.request_id]
+        persisted = store.get_human_request(request.request_id)
+        assert persisted is not None
+        assert persisted.status is HumanRequestStatus.CANCELLED
+        assert persisted.revision == request.revision + 1
+        assert persisted.decision == {
+            **dict(request.decision or {}),
+            "cancelled_by": "checkpoint:checkpoint-provider-unknown",
+        }
     finally:
         store.close()
 

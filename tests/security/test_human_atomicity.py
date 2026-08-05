@@ -679,24 +679,24 @@ def test_ambiguous_provider_outcome_requires_explicit_host_resume(
             raise RuntimeError("ambiguous provider failure")
 
         runtime.substrate.human.input_reader = fail_provider
-        original_update = runtime.human.requests.update
+        original_compare_and_set = runtime.human.requests.compare_and_set
         failed_marker = False
 
-        def fail_first_unknown_marker(request: Any) -> None:
+        def fail_first_unknown_marker(expected: Any, target: Any) -> Any:
             nonlocal failed_marker
             if (
                 not failed_marker
-                and request.status == HumanRequestStatus.CANCELLED
-                and (request.decision or {}).get("provider_outcome") == "unknown"
+                and target.status == HumanRequestStatus.CANCELLED
+                and (target.decision or {}).get("provider_outcome") == "unknown"
             ):
                 failed_marker = True
                 raise RuntimeError("transient marker persistence failure")
-            original_update(request)
+            return original_compare_and_set(expected, target)
 
         if force_minimal_retry_fence:
             monkeypatch.setattr(
                 runtime.human.requests,
-                "update",
+                "compare_and_set",
                 fail_first_unknown_marker,
             )
 
@@ -705,13 +705,39 @@ def test_ambiguous_provider_outcome_requires_explicit_host_resume(
 
         persisted = runtime.human.get(request_id)
         assert failed_marker is force_minimal_retry_fence
-        assert persisted.status == HumanRequestStatus.CANCELLED
         assert persisted.decision is not None
         assert persisted.decision["provider_outcome"] == "unknown"
         assert persisted.decision["automatic_retry_disabled"] is True
         assert persisted.decision["manual_recovery_required"] is True
         if force_minimal_retry_fence:
+            assert persisted.status == HumanRequestStatus.PENDING
+            assert persisted.decision["process_reconciliation_required"] is True
+            assert runtime.process.get(pid).status == ProcessStatus.WAITING_HUMAN
+            with pytest.raises(ValidationError, match="requires Host reconciliation"):
+                runtime.human.approve(
+                    request_id,
+                    {"approved": True, "answer": "unsafe stale response"},
+                    responder="human:gui",
+                )
+            with pytest.raises(ValidationError, match="requires Host reconciliation"):
+                runtime.human.reject(
+                    request_id,
+                    {"approved": False},
+                    responder="human:cli",
+                )
+            with pytest.raises(ValidationError, match="requires Host reconciliation"):
+                runtime.human.present_terminal_request(
+                    persisted,
+                    suffix="must not be presented",
+                )
+            assert runtime.human.process_next_terminal() is None
+            assert provider_calls == 1
+            persisted = runtime.human.reconcile_terminal_retry_fence(request_id)
+            assert persisted.decision is not None
             assert persisted.decision["process_reconciliation_required"] is False
+        else:
+            assert persisted.status == HumanRequestStatus.CANCELLED
+
         paused = runtime.process.get(pid)
         assert paused.status == ProcessStatus.PAUSED
         assert isinstance(paused.wait_state, HostResumeProcessWait)
@@ -725,18 +751,17 @@ def test_ambiguous_provider_outcome_requires_explicit_host_resume(
         ]
         assert len(effects) == 1
         assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
-        if not force_minimal_retry_fence:
-            assert any(
-                event.type == EventType.HUMAN_RESPONSE
-                and event.payload.get("request_id") == request_id
-                and event.payload.get("provider_outcome") == "unknown"
-                for event in runtime.events.list(target=pid)
-            )
-            assert any(
-                record.action == "human.request.provider_outcome_unknown"
-                and record.target == f"human_request:{request_id}"
-                for record in runtime.audit.trace()
-            )
+        assert any(
+            event.type == EventType.HUMAN_RESPONSE
+            and event.payload.get("request_id") == request_id
+            and event.payload.get("provider_outcome") == "unknown"
+            for event in runtime.events.list(target=pid)
+        )
+        assert any(
+            record.action == "human.request.provider_outcome_unknown"
+            and record.target == f"human_request:{request_id}"
+            for record in runtime.audit.trace()
+        )
 
         with pytest.raises(ProcessError, match="requires explicit Host resume"):
             runtime.process.signal_child(parent, pid, ProcessSignal.RESUME)
@@ -748,6 +773,285 @@ def test_ambiguous_provider_outcome_requires_explicit_host_resume(
         assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
         assert runtime.human.process_next_terminal() is None
         assert provider_calls == 1
+        with pytest.raises(ValidationError, match="not pending"):
+            runtime.human.approve(
+                request_id,
+                {"approved": True, "answer": "unsafe stale response"},
+                responder="human:gui",
+            )
+        with pytest.raises(ValidationError, match="not pending"):
+            runtime.human.reject(
+                request_id,
+                {"approved": False},
+                responder="human:cli",
+            )
+        assert runtime.human.get(request_id) == persisted
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("failed_sink", ["event", "audit"])
+def test_durable_ambiguous_provider_fence_survives_reconcile_failure_and_reopen(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    failed_sink: str,
+) -> None:
+    database = tmp_path / f"human-retry-fence-{failed_sink}.sqlite"
+    runtime = Runtime.open(database)
+    pid = runtime.process.spawn(goal="durably fence ambiguous Human provider I/O")
+    request_id = runtime.human.query(
+        pid,
+        "owner",
+        {"type": "question", "question": "Ask at most once"},
+        blocking=True,
+    )
+    before_process = runtime.process.get(pid)
+    provider_calls = 0
+
+    def fail_provider(_prompt: str) -> str:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise RuntimeError("ambiguous provider failure")
+
+    runtime.substrate.human.input_reader = fail_provider
+    original_compare_and_set = runtime.human.requests.compare_and_set
+    primary_failed = False
+
+    def fail_primary_terminal_cas(expected: Any, target: Any) -> Any:
+        nonlocal primary_failed
+        if (
+            not primary_failed
+            and target.status == HumanRequestStatus.CANCELLED
+            and (target.decision or {}).get("provider_outcome") == "unknown"
+        ):
+            primary_failed = True
+            raise RuntimeError("force durable retry fence")
+        return original_compare_and_set(expected, target)
+
+    try:
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                runtime.human.requests,
+                "compare_and_set",
+                fail_primary_terminal_cas,
+            )
+            if failed_sink == "event":
+                original_emit = runtime.events.emit
+
+                def fail_response_event(*args: Any, **kwargs: Any) -> Any:
+                    result = original_emit(*args, **kwargs)
+                    event_type = args[0] if args else kwargs.get("event_type")
+                    if EventType(event_type) == EventType.HUMAN_RESPONSE:
+                        raise RuntimeError("retry fence response event failure")
+                    return result
+
+                scoped.setattr(runtime.events, "emit", fail_response_event)
+            else:
+                original_record = runtime.audit.record
+
+                def fail_response_audit(*args: Any, **kwargs: Any) -> Any:
+                    result = original_record(*args, **kwargs)
+                    if kwargs.get("action") == "human.request.provider_outcome_unknown":
+                        raise RuntimeError("retry fence response audit failure")
+                    return result
+
+                scoped.setattr(runtime.audit, "record", fail_response_audit)
+
+            with pytest.raises(RuntimeError, match="ambiguous provider failure"):
+                runtime.human.process_next_terminal()
+
+            durable_fence = runtime.human.get(request_id)
+            assert durable_fence.status == HumanRequestStatus.PENDING
+            assert durable_fence.decision is not None
+            assert durable_fence.decision["process_reconciliation_required"] is True
+            with pytest.raises(RuntimeError, match="retry fence response"):
+                runtime.human.reconcile_terminal_retry_fence(request_id)
+
+        assert primary_failed
+        fenced = runtime.human.get(request_id)
+        assert fenced.status == HumanRequestStatus.PENDING
+        assert fenced.revision == 1
+        assert fenced.decision is not None
+        assert fenced.decision["provider_outcome"] == "unknown"
+        assert fenced.decision["automatic_retry_disabled"] is True
+        assert fenced.decision["manual_recovery_required"] is True
+        assert fenced.decision["process_reconciliation_required"] is True
+        after_failed_reconcile = runtime.process.get(pid)
+        assert after_failed_reconcile.status == before_process.status
+        assert after_failed_reconcile.revision == before_process.revision
+        assert (
+            after_failed_reconcile.state_generation
+            == before_process.state_generation
+        )
+        assert after_failed_reconcile.wait_state == before_process.wait_state
+        assert not [
+            event
+            for event in runtime.events.list(target=pid)
+            if event.type == EventType.HUMAN_RESPONSE
+            and event.payload.get("request_id") == request_id
+        ]
+        assert not [
+            record
+            for record in runtime.audit.trace(target=f"human_request:{request_id}")
+            if record.action == "human.request.provider_outcome_unknown"
+        ]
+        assert runtime.human.process_next_terminal() is None
+        assert provider_calls == 1
+        with pytest.raises(ValidationError, match="requires Host reconciliation"):
+            runtime.human.approve(
+                request_id,
+                {"approved": True, "answer": "must not settle"},
+                responder="human:gui",
+            )
+        with pytest.raises(ValidationError, match="requires Host reconciliation"):
+            runtime.human.reject(
+                request_id,
+                {"approved": False},
+                responder="human:cli",
+            )
+        with pytest.raises(ValidationError, match="requires Host reconciliation"):
+            runtime.human.present_terminal_request(
+                fenced,
+                suffix="must not cross provider boundary",
+            )
+        assert runtime.human.get(request_id) == fenced
+    finally:
+        runtime.close()
+
+    reopened = Runtime.open(database)
+    reopened_provider_calls = 0
+
+    def unexpected_provider(_prompt: str) -> str:
+        nonlocal reopened_provider_calls
+        reopened_provider_calls += 1
+        return "must not be dispatched"
+
+    reopened.substrate.human.input_reader = unexpected_provider
+    reopened.substrate.human.output_sink = unexpected_provider
+    try:
+        reopened_fence = reopened.human.get(request_id)
+        assert reopened_fence.status == HumanRequestStatus.PENDING
+        assert reopened_fence.decision is not None
+        assert reopened_fence.decision["process_reconciliation_required"] is True
+        assert reopened.human.process_next_terminal() is None
+        assert reopened_provider_calls == 0
+        gui_view = reopened.human.present_request_view(
+            reopened_fence,
+            presentation="gui",
+            provider=object(),
+        )
+        assert gui_view["payload"]["release_required"] is True
+        assert "Ask at most once" not in json.dumps(gui_view, sort_keys=True)
+        with pytest.raises(ValidationError, match="requires Host reconciliation"):
+            reopened.human.present_terminal_request(
+                reopened_fence,
+                suffix="must not be replayed after reopen",
+            )
+        assert reopened_provider_calls == 0
+        process_before_manual_recovery = reopened.process.get(pid)
+
+        reconciled = reopened.human.reconcile_terminal_retry_fence(request_id)
+
+        assert reconciled.status == HumanRequestStatus.CANCELLED
+        assert reconciled.revision == reopened_fence.revision + 1
+        assert reconciled.decision is not None
+        assert reconciled.decision["process_reconciliation_required"] is False
+        paused = reopened.process.get(pid)
+        assert paused.status == ProcessStatus.PAUSED
+        assert isinstance(paused.wait_state, HostResumeProcessWait)
+        assert paused.revision == process_before_manual_recovery.revision + 1
+        assert (
+            paused.state_generation
+            == process_before_manual_recovery.state_generation + 1
+        )
+        response_events = [
+            event
+            for event in reopened.events.list(target=pid)
+            if event.type == EventType.HUMAN_RESPONSE
+            and event.payload.get("request_id") == request_id
+        ]
+        response_audits = [
+            record
+            for record in reopened.audit.trace(target=f"human_request:{request_id}")
+            if record.action == "human.request.provider_outcome_unknown"
+        ]
+        assert len(response_events) == 1
+        assert len(response_audits) == 1
+        assert reopened.human.reconcile_terminal_retry_fence(request_id) == reconciled
+        assert len(
+            [
+                event
+                for event in reopened.events.list(target=pid)
+                if event.type == EventType.HUMAN_RESPONSE
+                and event.payload.get("request_id") == request_id
+            ]
+        ) == 1
+        assert reopened_provider_calls == 0
+
+        reopened.process.resume(pid)
+        assert reopened.process.get(pid).status == ProcessStatus.RUNNABLE
+        assert reopened.human.process_next_terminal() is None
+        assert reopened_provider_calls == 0
+    finally:
+        reopened.close()
+
+
+def test_malformed_provider_retry_marker_fails_closed_and_terminal_cancel_preserves_it() -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(goal="fail closed on malformed Human retry fence")
+        request_id = runtime.human.query(
+            pid,
+            "owner",
+            {"type": "question", "question": "MALFORMED_FENCE_SECRET"},
+            blocking=True,
+        )
+        pending = runtime.human.get(request_id)
+        malformed = runtime.human.requests.replace_current(
+            pending,
+            decision={"provider_outcome": "unknown"},
+        )
+        provider_calls = 0
+
+        def unexpected_provider(_text: str) -> str:
+            nonlocal provider_calls
+            provider_calls += 1
+            return "must not run"
+
+        runtime.substrate.human.input_reader = unexpected_provider
+        runtime.substrate.human.output_sink = unexpected_provider
+
+        assert runtime.human.process_next_terminal() is None
+        with pytest.raises(ValidationError, match="requires Host reconciliation"):
+            runtime.human.approve(
+                request_id,
+                {"approved": True, "answer": "unsafe"},
+            )
+        with pytest.raises(ValidationError, match="requires Host reconciliation"):
+            runtime.human.reject(request_id, {"approved": False})
+        with pytest.raises(ValidationError, match="requires Host reconciliation"):
+            runtime.human.present_terminal_request(
+                malformed,
+                suffix="must not be displayed",
+            )
+        with pytest.raises(ValidationError, match="not a canonical"):
+            runtime.human.reconcile_terminal_retry_fence(request_id)
+        assert provider_calls == 0
+        assert runtime.human.get(request_id) == malformed
+
+        runtime.human.interrupt(
+            pid,
+            "cancel",
+            {"reason": "terminal process cancellation"},
+        )
+        cancelled = runtime.human.get(request_id)
+        assert cancelled.status == HumanRequestStatus.CANCELLED
+        assert cancelled.revision == malformed.revision + 1
+        assert cancelled.decision is not None
+        assert cancelled.decision["provider_outcome"] == "unknown"
+        assert cancelled.decision["process_reconciliation_required"] is False
+        assert cancelled.decision["cancelled_by"] == "human"
+        assert provider_calls == 0
     finally:
         runtime.close()
 

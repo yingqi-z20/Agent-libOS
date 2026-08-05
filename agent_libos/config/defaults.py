@@ -559,6 +559,25 @@ class LLMDefaults:
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
+class SemanticDefaults:
+    """Host-owned Shadow assessment settings; ``off`` has no capture effects."""
+
+    mode: Literal["off", "shadow"] = "off"
+    adapter: Literal["deterministic", "scripted", "external"] = "deterministic"
+    external_profile_id: str | None = None
+    max_concurrency: StrictInt = 2
+    assessment_timeout_s: StrictFloat = 30.0
+    job_lease_s: StrictFloat = 60.0
+    shutdown_join_timeout_s: StrictFloat = 2.0
+    projection_ttl_s: StrictInt = 300
+    recovery_batch_limit: StrictInt = 500
+    intent_max_chars: StrictInt = 2_000
+    projection_max_bytes: StrictInt = 16_384
+    assessment_list_limit: StrictInt = 100
+    assessment_list_hard_limit: StrictInt = 1_000
+
+
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ToolDefaults:
     version: str = "1.0.0"
     default_timeout_s: float = 30.0
@@ -1052,6 +1071,7 @@ class AgentLibOSConfig:
     modules: ModuleDefaults = field(default_factory=ModuleDefaults)
     launcher: LauncherDefaults = field(default_factory=LauncherDefaults)
     scripts: ScriptDefaults = field(default_factory=ScriptDefaults)
+    semantic: SemanticDefaults = field(default_factory=SemanticDefaults)
 
     def __post_init__(self) -> None:
         _validate_config(self)
@@ -1409,7 +1429,7 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     _nonnegative("process.fork_min_tool_calls", process.fork_min_tool_calls)
     _nonnegative("process.fork_min_child_processes", process.fork_min_child_processes)
 
-    _validate_llm_config(config.llm)
+    _validate_llm_config(config.llm, config.semantic)
 
     tools = config.tools
     _require_non_empty("tools.version", tools.version)
@@ -1659,7 +1679,10 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     _require_at_least("scripts.document_context_max_tokens", scripts.document_context_max_tokens, "scripts.document_context_min_tokens", scripts.document_context_min_tokens)
 
 
-def _validate_llm_config(llm: LLMDefaults) -> None:
+def _validate_llm_config(
+    llm: LLMDefaults,
+    semantic: SemanticDefaults | None = None,
+) -> None:
     _require_non_empty("llm.default_profile_id", llm.default_profile_id)
     if llm.default_profile_id not in llm.profiles:
         raise ValueError(
@@ -1781,6 +1804,100 @@ def _validate_llm_config(llm: LLMDefaults) -> None:
     )
     _require_non_empty("llm.json_instruction", llm.json_instruction)
     _require_status_codes("llm.fallback_status_codes", llm.fallback_status_codes)
+    if semantic is not None:
+        _validate_semantic_config(semantic, llm)
+
+
+def _validate_semantic_config(semantic: SemanticDefaults, llm: LLMDefaults) -> None:
+    _positive("semantic.max_concurrency", semantic.max_concurrency)
+    if semantic.max_concurrency > 32:
+        raise ValueError("semantic.max_concurrency must not exceed 32")
+    _positive("semantic.assessment_timeout_s", semantic.assessment_timeout_s)
+    _positive("semantic.job_lease_s", semantic.job_lease_s)
+    _positive(
+        "semantic.shutdown_join_timeout_s",
+        semantic.shutdown_join_timeout_s,
+    )
+    _require_at_least(
+        "semantic.job_lease_s",
+        semantic.job_lease_s,
+        "semantic.assessment_timeout_s",
+        semantic.assessment_timeout_s,
+    )
+    _require_at_least(
+        "semantic.job_lease_s",
+        semantic.job_lease_s,
+        "semantic.shutdown_join_timeout_s",
+        semantic.shutdown_join_timeout_s,
+    )
+    _positive("semantic.projection_ttl_s", semantic.projection_ttl_s)
+    _positive("semantic.recovery_batch_limit", semantic.recovery_batch_limit)
+    if semantic.recovery_batch_limit > 500:
+        raise ValueError("semantic.recovery_batch_limit must not exceed 500")
+    _require_at_least(
+        "semantic.projection_ttl_s",
+        semantic.projection_ttl_s,
+        "semantic.job_lease_s",
+        semantic.job_lease_s,
+    )
+    _positive("semantic.intent_max_chars", semantic.intent_max_chars)
+    if semantic.intent_max_chars > 2_000:
+        raise ValueError("semantic.intent_max_chars must not exceed 2000")
+    if semantic.projection_max_bytes < 512 or semantic.projection_max_bytes > 16_384:
+        raise ValueError("semantic.projection_max_bytes must be from 512 through 16384")
+    _positive("semantic.assessment_list_limit", semantic.assessment_list_limit)
+    _positive("semantic.assessment_list_hard_limit", semantic.assessment_list_hard_limit)
+    _require_at_least(
+        "semantic.assessment_list_hard_limit",
+        semantic.assessment_list_hard_limit,
+        "semantic.assessment_list_limit",
+        semantic.assessment_list_limit,
+    )
+    if semantic.adapter != "external":
+        if semantic.external_profile_id is not None:
+            raise ValueError(
+                "semantic.external_profile_id is allowed only with adapter=external"
+            )
+        return
+    if semantic.mode != "shadow":
+        # An external adapter can be staged while disabled without resolving
+        # credentials or requiring an installed profile.
+        return
+    _validate_semantic_external_profile(semantic.external_profile_id, llm)
+
+
+def _validate_semantic_external_profile(
+    profile_id: str | None,
+    llm: LLMDefaults,
+) -> None:
+    _require_non_empty("semantic.external_profile_id", profile_id)
+    assert profile_id is not None
+    if profile_id == llm.default_profile_id:
+        raise ValueError("semantic external adapter requires a non-default LLM profile")
+    profile = llm.profiles.get(profile_id)
+    if profile is None:
+        raise ValueError("semantic.external_profile_id does not reference an LLM profile")
+    if profile.model is None or not profile.model.strip():
+        raise ValueError("semantic external LLM profile must set model explicitly")
+    if profile.store is not False:
+        raise ValueError("semantic external LLM profile must set store=false")
+    if profile.max_retries != 0:
+        raise ValueError("semantic external LLM profile must set max_retries=0")
+    if profile.timeout_s is None:
+        raise ValueError("semantic external LLM profile must set a finite timeout_s")
+    if profile.api_mode not in {"chat", "responses"}:
+        raise ValueError("semantic external LLM profile must set api_mode explicitly")
+    if (
+        profile.prompt_cache_key is not None
+        or profile.prompt_cache_retention is not None
+        or llm.prompt_cache_key is not None
+        or llm.prompt_cache_retention is not None
+    ):
+        raise ValueError("semantic external LLM profile must disable prompt caching")
+    if profile.responses_previous_response_id is not False:
+        raise ValueError("semantic external LLM profile must disable response chaining")
+    if profile.fallback_json_actions is not False:
+        raise ValueError("semantic external LLM profile must disable JSON action fallback")
 
 
 def _positive_or_non_empty(name: str, value: object) -> None:

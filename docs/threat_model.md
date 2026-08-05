@@ -64,7 +64,8 @@ through an authorized channel:
   package hash; it does not turn the Skill's prompt text into authority;
 - Deno/TypeScript JIT source and syscall arguments;
 - JSON-RPC results, MCP tool metadata/results, LLM responses, PTY or shell
-  output, Human free-text answers, and errors derived from providers; and
+  output, Human free-text answers, semantic classifier output, and errors
+  derived from providers; and
 - identifiers and arguments selected by an `AgentProcess`, including attempts
   to request new permission or target a known resource.
 
@@ -88,7 +89,8 @@ The security properties below depend on this TCB:
 
 - the Python runtime core, especially primitives, Capability and Task Authority
   managers, data-flow enforcement, the Protected Operation SDK, process and
-  publication lifecycle, resource accounting, and recovery code;
+  publication lifecycle, semantic ontology/broker/queue boundaries, resource
+  accounting, and recovery code;
 - Host/admin configuration and bootstrap code, trusted capability issuers,
   Sink-registry administrators, and the Human operator when an approval or data
   release is accepted;
@@ -362,6 +364,53 @@ These controls cannot make an intentionally broad Host grant least-privileged.
 Capability and Sink configuration should be reviewed as security policy, and
 Human approval UI must not be treated as protection against a compromised
 operator.
+
+### Semantic classifier and Shadow evidence
+
+The semantic model, scripted adapter input, goal/provider content, and every
+classifier response are untrusted. Relevant attacks include prompt injection,
+fabricated confidence, malformed or duplicate-key JSON, model/profile/Sink
+drift, OOD evasion, sensitive projection exfiltration, lease replay, forged
+provenance, and attempts to turn a `would_*` record into real authority.
+
+Phase 0+1 contains these attacks structurally. Approval and provider ingress
+are metadata-only. Root-goal redacted intent is allowed only for bounded
+`public`/`normal`, non-mixed-identity text after local secret and path detection;
+the external projection is then DataFlow-gated, and conditional egress cannot
+open a recursive release request. External startup freezes profile identity and
+model; assessment and dispatch revalidate profile resolution, client, and Sink
+identity. The provider schema is closed and the model supplies findings only.
+The deterministic broker requires Host-derived positive predicates and a
+strictly attenuated Task Authority ceiling. Human settlement, Capability
+issuance, permission policy, DataLabel/release mutation, and business provider
+dispatch have no semantic mutation entrypoint. The Host provider-result
+observer is one-shot bound, invocation observers are additive, and only a
+bounded canonical Host digest can create ingress evidence. The generic digest
+has a 4,096-node/256 KiB ceiling; the five core provider domains and Host-bound
+dataclasses may use a 500,000-node/64 MiB incremental path, while the persisted
+descriptor remains payload-free and at most 4 KiB. An unavailable digest is an
+isolated capture failure. Incremental local DLP over allowlisted Host result
+structures persists only closed finding codes/digests, never scanned text.
+Observer failure cannot change the original result, and an ambiguous external
+classifier request is never automatically replayed.
+
+Semantic assessment rows are append-only through the Runtime API and carry
+Host provenance digests, but they are not cryptographically tamper-proof
+against the database administrator. Hashes bind identity/content for comparison;
+they are not signatures or proof that a classifier was truthful. Real-provider
+retention, account isolation, training, abuse-monitoring, billing, and deletion
+are deployment/service properties even when the request declares
+`store=false`. Provider usage metadata is also untrusted: only three bounded
+nullable counters from exact Host containers survive, aliases must agree, and
+unknown/raw fields are discarded. A persisted `cost_microunits` value is not a
+reconciled bill. See [Semantic Approval and Data
+Identification](semantic_shadow.md).
+
+Tenant grouping is absent by default. A deployment that injects the Host-only
+semantic tenant bucketer adds that callback and its secret key to the TCB; it
+should return a keyed HMAC digest rather than an unsalted hash of a low-entropy
+tenant name. The raw tenant is not a semantic-table field, and no model- or
+HTTP-facing path can install the callback.
 
 ### Data exfiltration and cross-domain flow
 
