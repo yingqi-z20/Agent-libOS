@@ -1263,10 +1263,10 @@ def test_source_neutral_discovery_ranks_concrete_task_terms(
 
 
 # The complete routing corpus opens and exercises every built-in Skill. On
-# Windows hosted runners it can exceed five minutes when SQLite and four xdist
-# workers share the workspace filesystem; the lane deadline still detects a
-# genuinely stuck routing contract.
-@pytest.mark.timeout(600 if os.name == "nt" else 120)
+# Windows hosted runners it can approach ten minutes when SQLite and four
+# xdist workers share the workspace filesystem. Leave load headroom here; the
+# 1,400-second lane deadline still detects a genuinely stuck routing contract.
+@pytest.mark.timeout(900 if os.name == "nt" else 120)
 def test_every_builtin_skill_has_positive_and_adjacent_negative_routing(
     tmp_path: Path,
 ) -> None:
@@ -1309,6 +1309,7 @@ def test_every_builtin_skill_has_positive_and_adjacent_negative_routing(
             BUILTIN_SKILL_IDS
         )
 
+        ranked_by_skill_id: dict[str, dict[str, object]] = {}
         for case in REAL_LLM_ROUTING_CATALOG:
             assert case.expected_skill_id not in case.intent
             positive = runtime.skills.discover_skills_result(
@@ -1320,34 +1321,29 @@ def test_every_builtin_skill_has_positive_and_adjacent_negative_routing(
                 case.scenario_id,
                 positive["skills"],
             )
+            ranked_by_skill_id[case.expected_skill_id] = positive["skills"][0]
 
+        # Each adjacent intent is already exercised above. Reuse that exact
+        # routing result so the complete negative corpus does not repeat
+        # capability reservations and SQLite reads under Windows xdist load.
+        for case in REAL_LLM_ROUTING_CATALOG:
             assert case.adjacent_skill_ids
             for adjacent_skill_id in case.adjacent_skill_ids:
                 assert adjacent_skill_id != case.expected_skill_id
-                adjacent_case = cases[adjacent_skill_id]
-                negative = runtime.skills.discover_skills_result(
-                    adjacent_case.intent,
-                    actor=pid,
-                    limit=1,
-                )
-                assert negative["skills"][0]["skill_id"] == adjacent_skill_id, (
+                negative = ranked_by_skill_id[adjacent_skill_id]
+                assert negative["skill_id"] == adjacent_skill_id, (
                     case.scenario_id,
                     adjacent_skill_id,
-                    negative["skills"],
+                    negative,
                 )
-                assert (
-                    negative["skills"][0]["skill_id"]
-                    != case.expected_skill_id
-                )
+                assert negative["skill_id"] != case.expected_skill_id
 
                 stale_activation = runtime.tools.call(
                     pid,
                     "activate_skill",
                     {
                         "skill_id": case.expected_skill_id,
-                        "expected_package_sha256": negative["skills"][0][
-                            "package_sha256"
-                        ],
+                        "expected_package_sha256": negative["package_sha256"],
                     },
                 )
                 assert not stale_activation.ok
@@ -1356,7 +1352,7 @@ def test_every_builtin_skill_has_positive_and_adjacent_negative_routing(
                     not in runtime.process.get(pid).loaded_skills
                 )
 
-            selected = positive["skills"][0]
+            selected = ranked_by_skill_id[case.expected_skill_id]
             activation = runtime.tools.call(
                 pid,
                 "activate_skill",

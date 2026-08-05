@@ -306,6 +306,7 @@ def test_v5_plan_rejects_noncanonical_v4_without_writes(
     assert _schema_version(source) == 4
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are unavailable")
 def test_v5_apply_requires_owner_only_self_contained_backup(
     tmp_path: Path,
 ) -> None:
