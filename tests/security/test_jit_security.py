@@ -819,6 +819,101 @@ class TestJitSecurity:
         assert proc.killed
         assert proc.waited
 
+    @pytest.mark.skipif(os.name != 'nt', reason='Windows process-tree cleanup semantics')
+    def test_deno_cleanup_waits_for_windows_descendants_before_returning(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sandbox = DenoTypescriptSandbox()
+        waited: list[Any] = []
+
+        class Child:
+            killed = False
+
+            def kill(self) -> None:
+                self.killed = True
+
+        class Root:
+            def __init__(self, child: Child) -> None:
+                self.child = child
+
+            def children(self, recursive: bool = False) -> list[Child]:
+                assert recursive is True
+                return [self.child]
+
+        class Proc:
+            pid = 7334
+            returncode: int | None = None
+            killed = False
+            waited = False
+
+            def kill(self) -> None:
+                self.killed = True
+
+            async def wait(self) -> int:
+                self.waited = True
+                self.returncode = -9
+                return self.returncode
+
+        child = Child()
+        proc = Proc()
+
+        def wait_for_children(
+            processes: list[Child],
+            *,
+            timeout: float,
+        ) -> tuple[list[Child], list[Child]]:
+            assert processes == [child]
+            assert timeout == 0.0
+            assert child.killed
+            waited.extend(processes)
+            return processes, []
+
+        monkeypatch.setattr('agent_libos.tools.sandbox.psutil.Process', lambda _pid: Root(child))
+        monkeypatch.setattr('agent_libos.tools.sandbox.psutil.wait_procs', wait_for_children)
+
+        asyncio.run(sandbox._kill_process(proc))
+
+        assert waited == [child]
+        assert proc.killed
+        assert proc.waited
+
+    @pytest.mark.skipif(os.name != 'nt', reason='Windows process-tree cleanup semantics')
+    def test_deno_cleanup_fails_closed_when_windows_descendants_do_not_settle(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sandbox = DenoTypescriptSandbox()
+
+        class Child:
+            def kill(self) -> None:
+                pass
+
+        class Root:
+            def children(self, recursive: bool = False) -> list[Child]:
+                assert recursive is True
+                return [Child()]
+
+        class Proc:
+            pid = 7335
+            returncode: int | None = None
+
+            def kill(self) -> None:
+                pass
+
+            async def wait(self) -> int:
+                self.returncode = -9
+                return self.returncode
+
+        async def descendants_do_not_settle(_descendants: list[Any]) -> bool:
+            return False
+
+        monkeypatch.setattr('agent_libos.tools.sandbox.psutil.Process', lambda _pid: Root())
+        monkeypatch.setattr(sandbox, '_wait_for_deno_descendants', descendants_do_not_settle)
+
+        with pytest.raises(SandboxError, match='Deno descendants .* did not terminate'):
+            asyncio.run(sandbox._kill_process(Proc()))
+
     @pytest.mark.skipif(os.name == 'nt', reason='POSIX process-group semantics')
     def test_deno_cleanup_group_permission_error_uses_verified_tree_fallback(
         self,
