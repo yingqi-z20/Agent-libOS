@@ -2098,16 +2098,26 @@ def test_inflight_settlement_cannot_strand_control_attention_on_revision_race(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    clock = {"now": datetime.now(timezone.utc)}
+
+    class ControlledDatetime(datetime):
+        @classmethod
+        def now(cls, tz: Any | None = None) -> datetime:
+            selected = clock["now"]
+            if tz is None:
+                return selected.replace(tzinfo=None)
+            return selected.astimezone(tz)
+
+    monkeypatch.setattr("agent_libos.runtime.task_runs.datetime", ControlledDatetime)
     runtime = Runtime.open(
         tmp_path / f"{control}-attention-revision-race.sqlite",
         config=_config(),
     )
-    # Start the real-time window after the potentially slow Windows store
-    # setup.  This test exercises settlement/deadline linearization, not the
-    # startup speed of a loaded CI runner.
+    # Keep deadline progression under test control. Runner load must not expire
+    # the deadline before the Provider and Run reach the intended race point.
     deadline_at = (
         (
-            datetime.now(timezone.utc)
+            clock["now"]
             + timedelta(seconds=REAL_DEADLINE_TEST_WINDOW_S)
         ).isoformat()
         if control == "deadline"
@@ -2180,10 +2190,9 @@ def test_inflight_settlement_cannot_strand_control_attention_on_revision_race(
 
             if control == "deadline":
                 assert deadline_at is not None
-                remaining = datetime.fromisoformat(deadline_at) - datetime.now(
-                    timezone.utc
+                clock["now"] = datetime.fromisoformat(deadline_at) + timedelta(
+                    microseconds=1
                 )
-                time.sleep(max(0.0, remaining.total_seconds()) + 0.02)
                 control_future = pool.submit(
                     runtime.task_runs.get,
                     created.run_id,
