@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import math
+import re
 import sys
 import threading
 import uuid
@@ -34,6 +35,9 @@ from agent_libos.models import (
     ProcessMessage,
     ProcessMessageKind,
     ProcessStatus,
+    SEMANTIC_REDACTED_INTENT_MAX_CHARS,
+    SemanticAssessmentKind,
+    SemanticDataLocator,
     ToolCallResult,
     ViewMode,
     process_state_to_mapping,
@@ -66,6 +70,125 @@ _TASK_RUN_STATUSES = frozenset(
     }
 )
 _TASK_RUN_RETENTIONS = ("purge_on_terminal", "permanent")
+_SEMANTIC_ASSESSMENT_PAGE_DEFAULT = 50
+_SEMANTIC_ASSESSMENT_PAGE_MAX = 100
+_SEMANTIC_CURSOR_MAX_CHARS = 2_048
+_SEMANTIC_FILTER_MAX_CHARS = 512
+_SEMANTIC_ID_MAX_CHARS = 512
+_SEMANTIC_STATUS_MODES = frozenset({"off", "shadow"})
+_SEMANTIC_STATUS_ADAPTERS = frozenset(
+    {"deterministic", "external", "scripted"}
+)
+_SEMANTIC_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_SEMANTIC_MAX_SAFE_COUNTER = 2**53 - 1
+_SEMANTIC_ASSESSMENT_SUMMARY_FIELDS = (
+    "assessment_id",
+    "job_id",
+    "kind",
+    "status",
+    "domain",
+    "action_id",
+    "pid",
+    "request_id",
+    "operation_id",
+    "effect_id",
+    "shadow_outcome",
+    "reason_codes",
+    "ood",
+    "abstain",
+    "confidence_bps",
+    "calibration_bucket",
+    "classifier_id",
+    "classifier_version",
+    "artifact_sha256",
+    "input_sha256",
+    "feature_snapshot_sha256",
+    "policy_sha256",
+    "tenant_bucket_sha256",
+    "created_at",
+    "completed_at",
+    "latency_ms",
+    "input_tokens",
+    "output_tokens",
+    "cost_microunits",
+    "human_outcome",
+)
+_SEMANTIC_ASSESSMENT_DETAIL_FIELDS = (
+    "findings",
+    "data_findings",
+    "matched_rule_ids",
+    "proven_predicates",
+    "missing_predicates",
+    "source_refs_sha256",
+    "data_labels_sha256",
+    "sink_identity_sha256",
+    "tool_schema_sha256",
+    "provider_spec_sha256",
+    "manifest_sha256",
+    "action_sha256",
+    "resource_sha256",
+    "args_sha256",
+    "state_sha256",
+    "projection_sha256",
+)
+_SEMANTIC_STATUS_QUEUE_FIELDS = (
+    "queued",
+    "leased",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "capture_failures",
+)
+_SEMANTIC_STATUS_ASSESSMENT_FIELDS = (
+    "total",
+    "success",
+    "error",
+    "ood",
+    "would_issue_exact_once",
+    "would_deny",
+    "require_human",
+)
+_SEMANTIC_ASSESSMENT_KINDS = (
+    "approval",
+    "root_goal",
+    "provider_ingress",
+)
+_SEMANTIC_ASSESSMENT_STATUSES = (
+    "success",
+    "skipped_policy",
+    "egress_blocked",
+    "timeout",
+    "provider_error",
+    "provider_outcome_unknown",
+    "invalid_schema",
+    "ood",
+    "abstained",
+    "stale_input",
+)
+_SEMANTIC_ASSESSMENT_DOMAINS = (
+    "filesystem",
+    "shell",
+    "git",
+    "jsonrpc",
+    "mcp",
+    "runtime",
+    "unknown",
+)
+_SEMANTIC_HUMAN_OUTCOMES = frozenset(
+    {
+        "pending",
+        "approved",
+        "rejected",
+        "edited",
+        "cancelled",
+        "delivered",
+    }
+)
+_SEMANTIC_COARSE_DATA_LOCATOR_BY_KIND = {
+    SemanticAssessmentKind.APPROVAL.value: SemanticDataLocator.APPROVAL_REQUEST.value,
+    SemanticAssessmentKind.ROOT_GOAL.value: SemanticDataLocator.ROOT_GOAL.value,
+    SemanticAssessmentKind.PROVIDER_INGRESS.value: SemanticDataLocator.PROVIDER_RESULT.value,
+}
 
 DEMO_PATCH_PREVIEW_PATH = "agent_outputs/demo_patch_preview.txt"
 DEMO_PATCH_PREVIEW_CONTENT = "change add() expected value\n"
@@ -96,6 +219,7 @@ _MANAGEMENT_COMMANDS = frozenset(
         "mcp",
         "modules",
         "human",
+        "semantic",
     }
 )
 
@@ -364,7 +488,598 @@ def _parse_cli_args(
     modules_parser = sub.add_parser("modules", help="List, inspect, or verify startup runtime modules")
     _add_modules_parser_args(modules_parser)
     sub.add_parser("human", help="Process pending human messages in terminal order")
+    semantic_parser = sub.add_parser(
+        "semantic",
+        help="Inspect advisory semantic assessment status and evidence",
+    )
+    _add_semantic_parser_args(semantic_parser)
+    store_parser = sub.add_parser(
+        "store",
+        help="Perform explicit offline Runtime store administration",
+    )
+    _add_store_parser_args(store_parser)
     return parser, parser.parse_args(argv)
+
+
+def _add_semantic_parser_args(parser: argparse.ArgumentParser) -> None:
+    sub = parser.add_subparsers(dest="semantic_command", required=True)
+    sub.add_parser("status", help="Print advisory semantic subsystem health and counters")
+    assessments = sub.add_parser(
+        "assessments",
+        help="List a bounded keyset page of semantic assessments",
+    )
+    for option, destination in (
+        ("--pid", "pid"),
+        ("--request-id", "request_id"),
+        ("--operation-id", "operation_id"),
+        ("--action-id", "action_id"),
+        ("--tenant-bucket-sha256", "tenant_bucket_sha256"),
+    ):
+        assessments.add_argument(
+            option,
+            dest=destination,
+            type=_semantic_filter_arg,
+        )
+    for option, destination, choices in (
+        ("--kind", "kind", _SEMANTIC_ASSESSMENT_KINDS),
+        ("--status", "status", _SEMANTIC_ASSESSMENT_STATUSES),
+        ("--domain", "domain", _SEMANTIC_ASSESSMENT_DOMAINS),
+    ):
+        assessments.add_argument(
+            option,
+            dest=destination,
+            choices=choices,
+        )
+    assessments.add_argument(
+        "--after",
+        type=_semantic_cursor_arg,
+        help="Opaque keyset cursor returned by the previous page.",
+    )
+    assessments.add_argument(
+        "--limit",
+        type=_semantic_limit_arg,
+        default=_SEMANTIC_ASSESSMENT_PAGE_DEFAULT,
+        help=(
+            "Maximum assessments to return "
+            f"(1-{_SEMANTIC_ASSESSMENT_PAGE_MAX}; default "
+            f"{_SEMANTIC_ASSESSMENT_PAGE_DEFAULT})."
+        ),
+    )
+    show = sub.add_parser("show", help="Print one semantic assessment")
+    show.add_argument("assessment_id", type=_semantic_id_arg)
+
+
+def _add_store_parser_args(parser: argparse.ArgumentParser) -> None:
+    sub = parser.add_subparsers(dest="store_command", required=True)
+    migrate = sub.add_parser(
+        "migrate",
+        help="Plan or apply an explicit offline Runtime store migration",
+    )
+    migrate.add_argument("--to", dest="store_schema_version", type=int, choices=(5,), required=True)
+    mode = migrate.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and print the canonical migration plan without writing.",
+    )
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the canonical plan after verifying its digest and backup evidence.",
+    )
+    migrate.add_argument(
+        "--expected-plan-sha256",
+        type=_sha256_cli_arg,
+        help="Exact plan digest printed by a prior --dry-run; required with --apply.",
+    )
+    migrate.add_argument(
+        "--sqlite-backup",
+        type=Path,
+        help="Existing verified SQLite backup required before applying a SQLite migration.",
+    )
+    migrate.add_argument(
+        "--postgres-snapshot-confirmed",
+        action="store_true",
+        help="Confirm an operator snapshot exists before applying a PostgreSQL migration.",
+    )
+
+
+def _semantic_filter_arg(value: str) -> str:
+    return _bounded_non_empty_cli_text(
+        value,
+        label="semantic filter",
+        maximum=_SEMANTIC_FILTER_MAX_CHARS,
+    )
+
+
+def _semantic_cursor_arg(value: str) -> str:
+    return _bounded_non_empty_cli_text(
+        value,
+        label="semantic cursor",
+        maximum=_SEMANTIC_CURSOR_MAX_CHARS,
+    )
+
+
+def _semantic_id_arg(value: str) -> str:
+    return _bounded_non_empty_cli_text(
+        value,
+        label="semantic assessment id",
+        maximum=_SEMANTIC_ID_MAX_CHARS,
+    )
+
+
+def _bounded_non_empty_cli_text(value: str, *, label: str, maximum: int) -> str:
+    if (
+        not value.strip()
+        or len(value) > maximum
+        or any(not character.isprintable() for character in value)
+    ):
+        raise argparse.ArgumentTypeError(
+            f"{label} must contain 1 through {maximum} printable characters"
+        )
+    return value
+
+
+def _semantic_limit_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"semantic assessment limit must be an integer from 1 through {_SEMANTIC_ASSESSMENT_PAGE_MAX}"
+        ) from exc
+    if parsed < 1 or parsed > _SEMANTIC_ASSESSMENT_PAGE_MAX:
+        raise argparse.ArgumentTypeError(
+            f"semantic assessment limit must be an integer from 1 through {_SEMANTIC_ASSESSMENT_PAGE_MAX}"
+        )
+    return parsed
+
+
+def _sha256_cli_arg(value: str) -> str:
+    normalized = value.casefold()
+    if len(normalized) != 64 or any(character not in "0123456789abcdef" for character in normalized):
+        raise argparse.ArgumentTypeError("expected plan sha256 must be 64 hexadecimal characters")
+    return normalized
+
+
+def _run_semantic_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any]:
+    semantic = runtime.semantic
+    if args.semantic_command == "status":
+        return _semantic_status_payload(semantic.status())
+    if args.semantic_command == "assessments":
+        page = semantic.query_assessments(
+            pid=args.pid,
+            request_id=args.request_id,
+            operation_id=args.operation_id,
+            kind=args.kind,
+            status=args.status,
+            domain=args.domain,
+            action_id=args.action_id,
+            tenant_bucket_sha256=args.tenant_bucket_sha256,
+            after=args.after,
+            limit=args.limit,
+        )
+        items, next_cursor = _semantic_assessment_page(
+            page,
+            maximum_items=args.limit,
+        )
+        return {
+            "schema_version": 1,
+            "items": [_semantic_assessment_summary(item) for item in items],
+            "next_cursor": _semantic_response_cursor(next_cursor),
+        }
+    if args.semantic_command == "show":
+        assessment = semantic.get_assessment(args.assessment_id)
+        if assessment is None:
+            raise NotFound(f"semantic assessment not found: {args.assessment_id}")
+        return {
+            "schema_version": 1,
+            "assessment": _semantic_assessment_detail(assessment),
+        }
+    raise AssertionError(f"unsupported semantic command: {args.semantic_command}")
+
+
+def _semantic_mapping(value: Any, *, label: str) -> dict[str, Any]:
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        value = to_dict()
+    converted = to_jsonable(value)
+    if not isinstance(converted, dict):
+        raise TypeError(f"{label} must be a mapping")
+    return converted
+
+
+def _semantic_status_payload(value: Any) -> dict[str, Any]:
+    status = _semantic_mapping(value, label="semantic status")
+    if status.get("schema_version") != 2:
+        raise TypeError("semantic status has an unsupported schema version")
+    queue = _semantic_mapping(status.get("queue", {}), label="semantic queue status")
+    assessments = _semantic_mapping(
+        status.get("assessments", {}),
+        label="semantic assessment counters",
+    )
+    by_status = _semantic_status_counter_mapping(
+        assessments.get("by_status"),
+        expected=_SEMANTIC_ASSESSMENT_STATUSES,
+        label="semantic assessment status counters",
+    )
+    by_domain = _semantic_status_counter_mapping(
+        assessments.get("by_domain"),
+        expected=_SEMANTIC_ASSESSMENT_DOMAINS,
+        label="semantic assessment domain counters",
+    )
+    actual = _semantic_mapping(
+        status.get("actual_auto_approval", {}),
+        label="semantic actual auto-approval counters",
+    )
+    scalar_assessments = {
+        field: _semantic_status_counter(
+            assessments.get(field, 0),
+            label=f"semantic assessment {field} counter",
+        )
+        for field in _SEMANTIC_STATUS_ASSESSMENT_FIELDS
+    }
+    if (
+        sum(by_status.values()) != scalar_assessments["total"]
+        or sum(by_domain.values()) != scalar_assessments["total"]
+        or scalar_assessments["success"] + scalar_assessments["error"]
+        != scalar_assessments["total"]
+        or (
+            scalar_assessments["would_issue_exact_once"]
+            + scalar_assessments["would_deny"]
+            + scalar_assessments["require_human"]
+        )
+        != scalar_assessments["total"]
+        or scalar_assessments["ood"] != by_status["ood"]
+    ):
+        raise TypeError("semantic assessment aggregate counters are inconsistent")
+    actual_numerator = _semantic_status_counter(
+        actual.get("numerator", 0),
+        label="semantic actual auto-approval numerator",
+    )
+    actual_denominator = _semantic_status_counter(
+        actual.get("denominator", 0),
+        label="semantic actual auto-approval denominator",
+    )
+    actual_rate = actual.get("rate")
+    if actual_numerator != 0 or actual_denominator != 0 or actual_rate is not None:
+        raise TypeError("semantic actual auto-approval counters must be 0/0/null")
+    return {
+        "schema_version": 2,
+        "mode": _semantic_status_enum(
+            status.get("mode"),
+            allowed=_SEMANTIC_STATUS_MODES,
+            label="semantic mode",
+        ),
+        "adapter": _semantic_status_enum(
+            status.get("adapter"),
+            allowed=_SEMANTIC_STATUS_ADAPTERS,
+            label="semantic adapter",
+        ),
+        "profile_id": _semantic_status_profile_id(status.get("profile_id")),
+        "queue": {
+            field: _semantic_status_counter(
+                queue.get(field, 0),
+                label=f"semantic queue {field} counter",
+            )
+            for field in _SEMANTIC_STATUS_QUEUE_FIELDS
+        },
+        "assessments": {
+            **scalar_assessments,
+            "by_status": by_status,
+            "by_domain": by_domain,
+        },
+        "actual_auto_approval": {
+            "numerator": actual_numerator,
+            "denominator": actual_denominator,
+            "rate": actual_rate,
+        },
+    }
+
+
+def _semantic_status_enum(
+    value: Any,
+    *,
+    allowed: frozenset[str],
+    label: str,
+) -> str:
+    if isinstance(value, str) and value in allowed:
+        return value
+    raise TypeError(f"{label} is invalid")
+
+
+def _semantic_status_profile_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and _SEMANTIC_PROFILE_ID_RE.fullmatch(value):
+        return value
+    raise TypeError("semantic profile_id is invalid")
+
+
+def _semantic_status_counter(value: Any, *, label: str) -> int:
+    if type(value) is int and 0 <= value <= _SEMANTIC_MAX_SAFE_COUNTER:
+        return value
+    raise TypeError(f"{label} is invalid")
+
+
+def _semantic_status_counter_mapping(
+    value: Any,
+    *,
+    expected: tuple[str, ...],
+    label: str,
+) -> dict[str, int]:
+    raw = _semantic_mapping(value, label=label)
+    if set(raw) != set(expected):
+        raise TypeError(f"{label} must contain every canonical key exactly once")
+    selected: dict[str, int] = {}
+    for key in expected:
+        counter = raw[key]
+        if (
+            type(counter) is not int
+            or counter < 0
+            or counter > _SEMANTIC_MAX_SAFE_COUNTER
+        ):
+            raise TypeError(f"{label} contains an invalid counter")
+        selected[key] = counter
+    return selected
+
+
+def _semantic_assessment_page(
+    value: Any,
+    *,
+    maximum_items: int,
+) -> tuple[list[Any], str | None]:
+    page = _semantic_mapping(value, label="semantic assessment page")
+    items = page.get("items")
+    next_cursor = page.get("next_cursor")
+    if not isinstance(items, list) or len(items) > maximum_items:
+        raise TypeError("semantic assessment page items must be a sequence")
+    if next_cursor is not None and not isinstance(next_cursor, str):
+        raise TypeError("semantic assessment next cursor is invalid")
+    return list(items), next_cursor
+
+
+def _semantic_assessment_summary(value: Any) -> dict[str, Any]:
+    assessment = _semantic_mapping(value, label="semantic assessment")
+    return {
+        field: _semantic_assessment_summary_field(assessment, field)
+        for field in _SEMANTIC_ASSESSMENT_SUMMARY_FIELDS
+    }
+
+
+def _semantic_assessment_summary_field(
+    assessment: dict[str, Any],
+    field: str,
+) -> Any:
+    value = assessment.get(field)
+    if field == "reason_codes":
+        return _semantic_string_list(value)
+    if field == "human_outcome":
+        return _semantic_human_outcome(value)
+    if field in {"input_tokens", "output_tokens", "cost_microunits", "latency_ms"}:
+        if value is None:
+            return None
+        return _semantic_status_counter(
+            value,
+            label=f"semantic assessment {field}",
+        )
+    return _semantic_safe_scalar(value)
+
+
+def _semantic_assessment_detail(value: Any) -> dict[str, Any]:
+    assessment = _semantic_mapping(value, label="semantic assessment")
+    digest_fields = (
+        "source_refs_sha256",
+        "data_labels_sha256",
+        "sink_identity_sha256",
+        "tool_schema_sha256",
+        "provider_spec_sha256",
+        "manifest_sha256",
+        "resource_sha256",
+        "args_sha256",
+        "state_sha256",
+    )
+    return {
+        **_semantic_assessment_summary(assessment),
+        "findings": _semantic_finding_list(assessment.get("findings")),
+        "data_findings": _semantic_data_finding_list(
+            assessment.get("data_findings"),
+            kind=assessment.get("kind"),
+        ),
+        "matched_rule_ids": _semantic_string_list(
+            assessment.get("matched_rule_ids")
+        ),
+        "proven_predicates": _semantic_string_list(
+            assessment.get("proven_predicates")
+        ),
+        "missing_predicates": _semantic_string_list(
+            assessment.get("missing_predicates")
+        ),
+        **{
+            field: _semantic_nullable_sha256(assessment.get(field))
+            for field in digest_fields
+        },
+        "action_sha256": _semantic_required_sha256(
+            assessment.get("action_sha256")
+        ),
+        "projection_sha256": _semantic_required_sha256(
+            assessment.get("projection_sha256")
+        ),
+    }
+
+
+def _semantic_safe_scalar(value: Any) -> str | int | float | bool | None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    raise TypeError("semantic service response contains a non-scalar value")
+
+
+def _semantic_human_outcome(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value in _SEMANTIC_HUMAN_OUTCOMES:
+        return value
+    raise TypeError("semantic service response contains an invalid human outcome")
+
+
+def _semantic_nullable_sha256(value: Any) -> str | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    ):
+        return value
+    raise TypeError("semantic service response contains an invalid sha256 digest")
+
+
+def _semantic_required_sha256(value: Any) -> str:
+    selected = _semantic_nullable_sha256(value)
+    if selected is None:
+        raise TypeError("semantic service response is missing a required sha256 digest")
+    return selected
+
+
+def _semantic_scalar_projection(
+    value: Any,
+    fields: tuple[str, ...],
+) -> dict[str, str | int | float | bool | None]:
+    raw = _semantic_mapping(value, label="semantic finding")
+    return {field: _semantic_safe_scalar(raw.get(field)) for field in fields}
+
+
+def _semantic_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if (
+        not isinstance(value, list)
+        or len(value) > 128
+        or any(not isinstance(item, str) or len(item) > 4_096 for item in value)
+    ):
+        raise TypeError("semantic service response contains an invalid string list")
+    return list(value)
+
+
+def _semantic_finding_list(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 128:
+        raise TypeError("semantic service response contains invalid findings")
+    fields = (
+        "code",
+        "severity",
+        "confidence_bps",
+        "evidence_sha256",
+        "source",
+    )
+    return [_semantic_scalar_projection(item, fields) for item in value]
+
+
+def _semantic_data_finding_list(
+    value: Any,
+    *,
+    kind: Any,
+) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 128:
+        raise TypeError("semantic service response contains invalid data findings")
+    fields = (
+        "category",
+        "field",
+        "span_start",
+        "span_end",
+        "sensitivity_floor",
+        "integrity_ceiling",
+        "trust_ceiling",
+        "confidence_bps",
+        "evidence_sha256",
+    )
+    coarse_locator = _SEMANTIC_COARSE_DATA_LOCATOR_BY_KIND.get(kind)
+    if coarse_locator is None:
+        raise TypeError("semantic service response contains an invalid assessment kind")
+    selected: list[dict[str, Any]] = []
+    for item in value:
+        finding = _semantic_scalar_projection(item, fields)
+        locator = finding["field"]
+        span_start = finding["span_start"]
+        span_end = finding["span_end"]
+        if locator == SemanticDataLocator.REDACTED_INTENT.value:
+            if (
+                type(span_start) is not int
+                or type(span_end) is not int
+                or not 0
+                <= span_start
+                < span_end
+                <= SEMANTIC_REDACTED_INTENT_MAX_CHARS
+            ):
+                raise TypeError(
+                    "semantic service response contains an invalid data finding"
+                )
+        elif locator != coarse_locator or span_start is not None or span_end is not None:
+            raise TypeError(
+                "semantic service response contains an invalid data finding"
+            )
+        selected.append(finding)
+    return selected
+
+
+def _semantic_response_cursor(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > _SEMANTIC_CURSOR_MAX_CHARS:
+        raise TypeError("semantic assessment next cursor is invalid")
+    return value
+
+
+def _run_store_command(
+    config: AgentLibOSConfig,
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> dict[str, Any]:
+    if args.store_command != "migrate":
+        raise AssertionError(f"unsupported store command: {args.store_command}")
+    if args.store_schema_version != 5:
+        raise AssertionError("argparse admitted an unsupported store migration target")
+    if args.apply and args.expected_plan_sha256 is None:
+        parser.error("store migrate --apply requires --expected-plan-sha256")
+    if args.dry_run and args.expected_plan_sha256 is not None:
+        parser.error("store migrate --dry-run does not accept --expected-plan-sha256")
+
+    target: str | Path
+    if args.db is not None:
+        target = args.db
+    elif config.runtime.store_backend == "postgres":
+        if config.runtime.store_dsn is None:  # pragma: no cover - config validation owns this
+            raise LibOSValidationError("PostgreSQL runtime store requires runtime.store_dsn")
+        target = config.runtime.store_dsn
+    else:
+        target = config.runtime.local_store_target
+
+    # Keep the offline migrator out of Runtime startup imports.  This also
+    # makes it impossible for an ordinary CLI command to run a migration as a
+    # side effect of importing the command module.
+    from agent_libos.storage.semantic_v5_migration import (
+        apply_store_v5_migration,
+        plan_store_v5_migration,
+    )
+
+    common = {
+        "sqlite_backup": args.sqlite_backup,
+        "postgres_snapshot_confirmed": args.postgres_snapshot_confirmed,
+    }
+    result = (
+        apply_store_v5_migration(
+            target,
+            expected_plan_sha256=args.expected_plan_sha256,
+            **common,
+        )
+        if args.apply
+        else plan_store_v5_migration(target, **common)
+    )
+    return _semantic_mapping(result, label="store migration result")
 
 
 def _run_primary_cli_command(
@@ -498,6 +1213,9 @@ def _run_management_cli_command(runtime: Runtime, args: argparse.Namespace) -> N
             [request.__dict__ for request in runtime.human.drain_terminal_queue()]
         )
         return
+    if args.command == "semantic":
+        _print_json(_run_semantic_command(runtime, args))
+        return
     raise AssertionError(f"unsupported management command: {args.command}")
 
 
@@ -549,6 +1267,8 @@ def main(argv: list[str] | None = None) -> None:
     selected_config = _load_runtime_config(args.config, parser)
     if args.command == "modules" and args.modules_command == "verify":
         return _print_json(_verify_module_manifest(selected_config, args))
+    if args.command == "store":
+        return _print_json(_run_store_command(selected_config, args, parser))
     try:
         selected_db_display = display_store_target(args.db, config=selected_config)
     except LibOSValidationError as exc:
@@ -2604,6 +3324,7 @@ def _first_interactive_input_request(runtime: Runtime, human: str) -> Any | None
         request
         for request in runtime.human.pending(human=human)
         if request.payload.get("type") != "output"
+        and not _is_terminal_retry_fence_view(request)
     ]
     return next(
         (
@@ -2632,9 +3353,26 @@ def _interactive_input_request_by_id(
         request.human != human
         or request.status is not HumanRequestStatus.PENDING
         or request.payload.get("type") == "output"
+        or _is_terminal_retry_fence_view(request)
     ):
         return None
     return request
+
+
+def _is_terminal_retry_fence_view(request: Any) -> bool:
+    """Keep ambiguous-provider fences out of interactive provider paths."""
+
+    decision = getattr(request, "decision", None)
+    if not isinstance(decision, dict):
+        return False
+    return bool(
+        {
+            "provider_outcome",
+            "automatic_retry_disabled",
+            "manual_recovery_required",
+            "process_reconciliation_required",
+        }.intersection(decision)
+    )
 
 
 def _process_cli_summary(process: Any) -> dict[str, Any]:

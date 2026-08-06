@@ -18,6 +18,7 @@ describe("DetailTabs", () => {
     const html = renderTabs();
 
     expect(html).toContain("MCP");
+    expect(html).toContain("Semantic");
     expect(html).toContain('role="tablist"');
     expect(html).toContain('role="tabpanel"');
     expect(html).toContain('aria-selected="true"');

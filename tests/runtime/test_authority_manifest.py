@@ -1490,6 +1490,74 @@ def test_manifest_capability_boolean_fields_compile_exact_values() -> None:
         runtime.close()
 
 
+@pytest.mark.parametrize("derived", [False, True], ids=["root", "child"])
+def test_authorized_manifest_rejects_explicit_null_constraints_without_residue_after_reopen(
+    tmp_path: Path,
+    derived: bool,
+) -> None:
+    database = tmp_path / f"manifest-null-constraints-{derived}.sqlite"
+    invalid_pid = f"pid_manifest_null_constraints_{derived}"
+    runtime = Runtime.open(database)
+    try:
+        parent_pid = None
+        if derived:
+            parent_pid = runtime.process.spawn(
+                goal="explicit manifest constraint ceiling",
+                authority_manifest={
+                    "authorized_capabilities": [
+                        {
+                            "resource": "object:manifest-null-constraints",
+                            "rights": [CapabilityRight.READ.value],
+                        }
+                    ]
+                },
+            )
+        before_manifests = runtime.store.list_authority_manifests()
+        before_capabilities = runtime.store.list_capabilities()
+        before_events = runtime.store.list_events()
+        before_audit = runtime.store.list_audit()
+
+        with pytest.raises(
+            ValidationError,
+            match="capability constraints must be an object",
+        ):
+            runtime.authority_manifests.prepare_launch(
+                pid=invalid_pid,
+                image_id="base-agent:v0",
+                goal_ref=None,
+                parent_pid=parent_pid,
+                supplied={
+                    "authorized_capabilities": [
+                        {
+                            "resource": "object:manifest-null-constraints",
+                            "rights": [CapabilityRight.READ.value],
+                            "constraints": None,
+                        }
+                    ]
+                },
+            )
+
+        assert runtime.store.list_authority_manifests() == before_manifests
+        assert runtime.store.list_capabilities() == before_capabilities
+        assert runtime.store.list_events() == before_events
+        assert runtime.store.list_audit() == before_audit
+        assert runtime.authority_manifests.get_for_process(invalid_pid) is None
+    finally:
+        runtime.close()
+
+    reopened = Runtime.open(database)
+    try:
+        assert reopened.authority_manifests.get_for_process(invalid_pid) is None
+        assert reopened.store.list_capabilities(subject=invalid_pid) == []
+        assert not [
+            record
+            for record in reopened.store.list_audit()
+            if record.target == f"process:{invalid_pid}"
+        ]
+    finally:
+        reopened.close()
+
+
 def test_root_compiler_rejects_a_derived_manifest_without_publishing_authority() -> None:
     runtime = Runtime.open("local")
     try:

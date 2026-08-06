@@ -732,6 +732,64 @@ describe("LibOSClient", () => {
       "identity does not match"
     );
   });
+
+  it("loads only bounded read-only Semantic status, pages, and exact details", async () => {
+    const summary = semanticSummaryFixture();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(semanticStatusFixture()))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [summary], next_cursor: "cursor/2" }))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, assessment: semanticDetailFixture() }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.getSemanticStatus();
+    await client.listSemanticAssessments({
+      pid: "pid/1",
+      requestId: "request/1",
+      operationId: "operation/1",
+      kind: "approval",
+      status: "success",
+      domain: "filesystem",
+      actionId: "filesystem.read",
+      tenantBucketSha256: "6".repeat(64)
+    }, 25, "cursor/1");
+    await client.getSemanticAssessment("assessment/1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "http://127.0.0.1:1/api/semantic/status", expect.objectContaining({ method: "GET" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://127.0.0.1:1/api/semantic/assessments?pid=pid%2F1&request_id=request%2F1&operation_id=operation%2F1&kind=approval&status=success&domain=filesystem&action_id=filesystem.read&tenant_bucket_sha256=${"6".repeat(64)}&after=cursor%2F1&limit=25`,
+      expect.objectContaining({ method: "GET" })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "http://127.0.0.1:1/api/semantic/assessments/assessment%2F1", expect.objectContaining({ method: "GET" }));
+  });
+
+  it("rejects malformed Semantic projections and mismatched identities", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [{ ...semanticSummaryFixture(), prompt: "secret" }], next_cursor: null }))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, assessment: { ...semanticDetailFixture(), assessment_id: "other" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await expect(client.listSemanticAssessments()).rejects.toThrow(/private field/);
+    await expect(client.getSemanticAssessment("assessment/1")).rejects.toThrow(/identity does not match/);
+  });
+
+  it("rejects unbounded Semantic pagination before issuing a request", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await expect(client.listSemanticAssessments({}, 0)).rejects.toThrow(/1 to 100/);
+    await expect(client.listSemanticAssessments({}, 101)).rejects.toThrow(/1 to 100/);
+    await expect(client.listSemanticAssessments({ pid: "" })).rejects.toThrow(/pid/);
+    await expect(client.listSemanticAssessments({ kind: "permission" as never })).rejects.toThrow(/kind/);
+    await expect(client.listSemanticAssessments({ actionId: "filesystem" })).rejects.toThrow(/action_id/);
+    await expect(client.listSemanticAssessments({ tenantBucketSha256: "A".repeat(64) })).rejects.toThrow(/tenant_bucket_sha256/);
+    await expect(client.listSemanticAssessments({}, 50, "x".repeat(2_049))).rejects.toThrow(/after/);
+    await expect(client.getSemanticAssessment(" ")).rejects.toThrow(/assessment_id/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 function mockFetch(payload: unknown) {
@@ -778,6 +836,110 @@ function taskRunSummary() {
     blockers: [],
     retention: "purge_on_terminal",
     payloads_purged: false
+  };
+}
+
+function semanticStatusFixture() {
+  return {
+    schema_version: 2,
+    mode: "shadow",
+    adapter: "deterministic",
+    profile_id: null,
+    queue: { queued: 1, leased: 0, succeeded: 2, failed: 0, cancelled: 0, capture_failures: 0 },
+    assessments: {
+      total: 2,
+      success: 2,
+      error: 0,
+      ood: 0,
+      would_issue_exact_once: 1,
+      would_deny: 0,
+      require_human: 1,
+      by_status: {
+        success: 2,
+        skipped_policy: 0,
+        egress_blocked: 0,
+        timeout: 0,
+        provider_error: 0,
+        provider_outcome_unknown: 0,
+        invalid_schema: 0,
+        ood: 0,
+        abstained: 0,
+        stale_input: 0
+      },
+      by_domain: {
+        filesystem: 2,
+        shell: 0,
+        git: 0,
+        jsonrpc: 0,
+        mcp: 0,
+        runtime: 0,
+        unknown: 0
+      }
+    },
+    actual_auto_approval: { numerator: 0, denominator: 0, rate: null }
+  };
+}
+
+function semanticSummaryFixture() {
+  return {
+    assessment_id: "assessment/1",
+    job_id: "job/1",
+    kind: "approval",
+    status: "success",
+    domain: "filesystem",
+    action_id: "filesystem.read",
+    pid: "pid/1",
+    request_id: "request/1",
+    operation_id: "operation/1",
+    effect_id: "effect/1",
+    shadow_outcome: "require_human",
+    reason_codes: ["missing_authoritative_predicate"],
+    ood: false,
+    abstain: false,
+    confidence_bps: 8000,
+    calibration_bucket: "high",
+    input_tokens: 120,
+    output_tokens: 20,
+    cost_microunits: 45,
+    classifier_id: "scripted",
+    classifier_version: "v1",
+    artifact_sha256: "a".repeat(64),
+    input_sha256: "b".repeat(64),
+    feature_snapshot_sha256: "c".repeat(64),
+    policy_sha256: "d".repeat(64),
+    created_at: "2030-01-01T00:00:00Z",
+    completed_at: "2030-01-01T00:00:01Z",
+    latency_ms: 1000,
+    human_outcome: null,
+    tenant_bucket_sha256: "6".repeat(64)
+  };
+}
+
+function semanticDetailFixture() {
+  return {
+    ...semanticSummaryFixture(),
+    findings: [{
+      code: "missing_authoritative_predicate",
+      severity: "medium",
+      confidence_bps: 8000,
+      evidence_sha256: "e".repeat(64),
+      source: "model"
+    }],
+    data_findings: [],
+    matched_rule_ids: [],
+    proven_predicates: [],
+    missing_predicates: ["low_risk"],
+    source_refs_sha256: "1".repeat(64),
+    data_labels_sha256: "2".repeat(64),
+    sink_identity_sha256: "3".repeat(64),
+    tool_schema_sha256: "4".repeat(64),
+    provider_spec_sha256: "5".repeat(64),
+    manifest_sha256: "7".repeat(64),
+    action_sha256: "8".repeat(64),
+    resource_sha256: "9".repeat(64),
+    args_sha256: "0".repeat(64),
+    state_sha256: "a".repeat(64),
+    projection_sha256: "b".repeat(64)
   };
 }
 

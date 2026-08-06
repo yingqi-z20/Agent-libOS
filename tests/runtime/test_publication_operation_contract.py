@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sqlite3
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -1060,23 +1061,34 @@ def test_reopen_rejects_multiple_reverse_operation_bindings(
                 publication_id=publication_id,
                 publication_kind=publication_kind,
             )
-            operation_snapshot = runtime.store.get_operation(operation_id)
-            duplicate_snapshot = runtime.store.get_operation(duplicate.operation_id)
+            operation_rows = _operation_storage_rows_from_store(
+                runtime,
+                (operation_id, duplicate.operation_id),
+            )
         finally:
             runtime.close()
 
         for _attempt in range(2):
             with pytest.raises(
                 ValidationError,
-                match="exact durable|already bound to another operation",
+                match=(
+                    "exact durable runtime-publication binding index|"
+                    "already bound to another operation"
+                ),
             ):
                 Runtime.open(target, config=config)
-            durable = open_store(target, config=config)
-            try:
-                assert durable.get_operation(operation_id) == operation_snapshot
-                assert durable.get_operation(duplicate.operation_id) == duplicate_snapshot
-            finally:
-                durable.close()
+            # The schema itself is corrupt, so the low-level supported-store API
+            # must reject it too.  Inspect raw rows read-only to prove both failed
+            # opens were non-mutating without weakening the canonical-v5 gate.
+            with pytest.raises(
+                ValidationError,
+                match="exact durable runtime-publication binding index",
+            ):
+                open_store(target, config=config)
+            assert _raw_operation_storage_rows(
+                target,
+                (operation_id, duplicate.operation_id),
+            ) == operation_rows
 
 
 @pytest.mark.parametrize("kind", PERSISTENT_BACKENDS)
@@ -2110,6 +2122,74 @@ def _forge_duplicate_reverse_binding(
             (publication_id,),
         )
         assert invalidated.rowcount == 1
+
+
+_OPERATION_STORAGE_COLUMNS = (
+    "operation_id",
+    "root_operation_id",
+    "parent_operation_id",
+    "kind",
+    "name",
+    "actor",
+    "pid",
+    "state",
+    "outcome",
+    "expected_roles_json",
+    "metadata_json",
+    "runtime_publication_id",
+    "started_at",
+    "updated_at",
+    "completed_at",
+)
+
+
+def _operation_storage_rows_from_store(
+    runtime: Runtime,
+    operation_ids: tuple[str, ...],
+) -> tuple[dict[str, Any], ...]:
+    placeholders = ", ".join("?" for _ in operation_ids)
+    columns = ", ".join(_OPERATION_STORAGE_COLUMNS)
+    rows = runtime.store._query(  # type: ignore[attr-defined]
+        f"SELECT {columns} FROM operations "
+        f"WHERE operation_id IN ({placeholders}) ORDER BY operation_id",
+        operation_ids,
+    )
+    return tuple(dict(row) for row in rows)
+
+
+def _raw_operation_storage_rows(
+    target: str | Path,
+    operation_ids: tuple[str, ...],
+) -> tuple[dict[str, Any], ...]:
+    columns = ", ".join(_OPERATION_STORAGE_COLUMNS)
+    if isinstance(target, Path):
+        connection = sqlite3.connect(
+            f"{target.resolve().as_uri()}?mode=ro",
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            placeholders = ", ".join("?" for _ in operation_ids)
+            rows = connection.execute(
+                f"SELECT {columns} FROM operations "
+                f"WHERE operation_id IN ({placeholders}) ORDER BY operation_id",
+                operation_ids,
+            )
+            return tuple(dict(row) for row in rows)
+        finally:
+            connection.close()
+
+    import psycopg
+    from psycopg.rows import dict_row
+
+    with psycopg.connect(str(target), row_factory=dict_row) as connection:
+        placeholders = ", ".join("%s" for _ in operation_ids)
+        rows = connection.execute(
+            f"SELECT {columns} FROM operations "
+            f"WHERE operation_id IN ({placeholders}) ORDER BY operation_id",
+            operation_ids,
+        )
+        return tuple(dict(row) for row in rows)
 
 
 def _reconcile_terminal_publications(runtime: Runtime, publication_kind: str) -> None:

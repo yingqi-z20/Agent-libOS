@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+import agent_libos.storage.postgres as postgres_backend
 import agent_libos.storage.sqlite as sqlite_backend
 from agent_libos.models import (
     AgentObject,
@@ -49,7 +50,11 @@ from agent_libos.storage import (
     SQLiteStore,
 )
 from agent_libos.storage.postgres import PostgresStore
-from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS, _V4_REQUIRED_INDEXES
+from agent_libos.storage.sql import (
+    _V4_REQUIRED_COLUMNS,
+    _V4_REQUIRED_INDEXES,
+    _V5_REQUIRED_COLUMNS,
+)
 from agent_libos.process_transition import ProcessTransitionService
 from agent_libos.utils.ids import utc_now
 from tests.support.external_effects import begin_external_effect_intent
@@ -1239,7 +1244,126 @@ class _PostgresLeaseConnection:
         self.closed = True
 
 
+class _PostgresLeaseOutcomeConnection(_PostgresLeaseConnection):
+    def __init__(
+        self,
+        database: str,
+        schema: str,
+        outcomes: tuple[object, ...],
+    ) -> None:
+        super().__init__(database, schema)
+        self.outcomes = list(outcomes)
+
+    def execute(self, sql: str, params: Any = ()) -> _PostgresResult:
+        selected = tuple(params)
+        self.calls.append((sql, selected))
+        if "current_database()" in sql:
+            return _PostgresResult(
+                {
+                    "database_name": self.database,
+                    "schema_name": self.schema,
+                }
+            )
+        if not self.outcomes:
+            raise AssertionError("unexpected PostgreSQL lease retry")
+        return _PostgresResult({"acquired": self.outcomes.pop(0)})
+
+
 class TestPostgresRuntimeLeaseIsolation:
+    def test_advisory_lease_malformed_result_fails_without_retry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sleeps: list[float] = []
+        monkeypatch.setattr(
+            postgres_backend.time,
+            "sleep",
+            lambda seconds: sleeps.append(seconds),
+        )
+        store = PostgresStore.__new__(PostgresStore)
+        store._runtime_lease_acquired = False
+        store._runtime_lease_key = None
+        connection = _PostgresLeaseOutcomeConnection(
+            "runtime",
+            "agent_libos",
+            (1,),
+        )
+
+        with pytest.raises(ValidationError, match="invalid runtime lease result"):
+            store._acquire_runtime_lease(connection)  # type: ignore[arg-type]
+
+        assert sum(
+            "pg_try_advisory_lock" in sql for sql, _params in connection.calls
+        ) == 1
+        assert sleeps == []
+        assert store._runtime_lease_acquired is False
+        assert store._runtime_lease_key is None
+
+    def test_advisory_lease_retries_transient_session_release_lag(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sleeps: list[float] = []
+        monkeypatch.setattr(
+            postgres_backend.time,
+            "sleep",
+            lambda seconds: sleeps.append(seconds),
+        )
+        store = PostgresStore.__new__(PostgresStore)
+        store._runtime_lease_acquired = False
+        store._runtime_lease_key = None
+        connection = _PostgresLeaseOutcomeConnection(
+            "runtime",
+            "agent_libos",
+            (False, False, True),
+        )
+
+        store._acquire_runtime_lease(connection)  # type: ignore[arg-type]
+
+        lock_calls = [
+            call
+            for call in connection.calls
+            if "pg_try_advisory_lock" in call[0]
+        ]
+        assert len(lock_calls) == 3
+        assert len(sleeps) == 2
+        assert all(0 < delay <= 0.01 for delay in sleeps)
+        assert store._runtime_lease_acquired is True
+        assert store._runtime_lease_key is not None
+
+    def test_advisory_lease_retry_is_bounded_for_live_owner(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sleeps: list[float] = []
+        monkeypatch.setattr(
+            postgres_backend.time,
+            "sleep",
+            lambda seconds: sleeps.append(seconds),
+        )
+        store = PostgresStore.__new__(PostgresStore)
+        store._runtime_lease_acquired = False
+        store._runtime_lease_key = None
+        connection = _PostgresLeaseOutcomeConnection(
+            "runtime",
+            "agent_libos",
+            (False,) * 11,
+        )
+
+        with pytest.raises(ValidationError, match="already open"):
+            store._acquire_runtime_lease(connection)  # type: ignore[arg-type]
+
+        lock_calls = [
+            call
+            for call in connection.calls
+            if "pg_try_advisory_lock" in call[0]
+        ]
+        assert len(lock_calls) == 11
+        assert len(sleeps) == 10
+        assert all(0 < delay <= 0.01 for delay in sleeps)
+        assert store._runtime_lease_acquired is False
+        assert store._runtime_lease_key is None
+
     def test_advisory_lease_key_isolated_by_database_and_schema(self) -> None:
         keys: list[int] = []
         stores: list[tuple[PostgresStore, _PostgresLeaseConnection]] = []
@@ -1266,14 +1390,14 @@ class TestPostgresRuntimeLeaseIsolation:
 
 
 class TestUnsupportedStoreVersion:
-    def test_v4_schema_manifest_matches_fresh_store(self) -> None:
+    def test_v5_schema_manifest_matches_fresh_store(self) -> None:
         store = SQLiteStore(":memory:")
         try:
-            assert set(_V4_REQUIRED_COLUMNS) == {
+            assert set(_V5_REQUIRED_COLUMNS) == {
                 "runtime_schema",
                 *store.ALLOWED_TABLES,
             }
-            for table, expected_columns in _V4_REQUIRED_COLUMNS.items():
+            for table, expected_columns in _V5_REQUIRED_COLUMNS.items():
                 actual_columns = {
                     str(row["name"])
                     for row in store.conn.execute(f"PRAGMA table_info({table})")
@@ -1535,7 +1659,7 @@ class TestUnsupportedStoreVersion:
             connection.close()
         before = db_path.read_bytes()
 
-        with pytest.raises(UnsupportedStoreVersion, match="expected 4"):
+        with pytest.raises(UnsupportedStoreVersion, match="expected 5"):
             SQLiteStore(db_path)
 
         assert db_path.read_bytes() == before

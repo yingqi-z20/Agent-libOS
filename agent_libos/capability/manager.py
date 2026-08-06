@@ -10,7 +10,10 @@ from agent_libos.capability.admission import (
     CapabilityAdmissionPort,
     install_instance_admission_guards,
 )
-from agent_libos.capability.effect_binding import APPROVAL_BINDING_KEY as APPROVAL_BINDING_CONSTRAINT_KEY
+from agent_libos.capability.effect_binding import (
+    APPROVAL_BINDING_KEY as APPROVAL_BINDING_CONSTRAINT_KEY,
+    normalize_approval_binding,
+)
 from agent_libos.capability.evaluator import (
     DATA_RELEASE_BINDING_KEY as DATA_RELEASE_BINDING_CONSTRAINT_KEY,
     KNOWN_CONSTRAINT_KEYS,
@@ -31,6 +34,7 @@ from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
     CapabilitySpec,
+    DataReleaseBinding,
     ObjectHandle,
     OperationContext,
     DelegationPolicy,
@@ -766,11 +770,22 @@ class CapabilityManager:
         selected_context: dict[str, Any],
         audit: bool,
     ) -> CapabilityDecision:
+        evaluation_matches = [
+            (
+                replace(
+                    capability,
+                    constraints={"invalid_persisted_constraint": True},
+                )
+                if self._authority_chain_constraint_error(capability) is not None
+                else capability
+            )
+            for capability in matches
+        ]
         decision = self.evaluator.decide(
             subject=subject,
             resource=resource,
             requested_right=requested_right,
-            matches=matches,
+            matches=evaluation_matches,
             context=selected_context,
         )
         selected = next(
@@ -1514,6 +1529,8 @@ class CapabilityManager:
         )
 
     def constraints_satisfied(self, cap: Capability, context: OperationContext | dict[str, Any] | None = None) -> bool:
+        if self._authority_chain_constraint_error(cap) is not None:
+            return False
         selected_context = self._context_dict(context)
         results = self.evaluator.evaluate_constraints(cap, selected_context)
         return (
@@ -1785,6 +1802,7 @@ class CapabilityManager:
                 )
 
     def _validate_delegation_parent(self, parent_cap: Capability, selected: CapabilitySpec) -> None:
+        self._require_valid_constraint_chain(parent_cap, action="delegated")
         if parent_cap.uses_remaining is not None:
             raise CapabilityDenied("finite-use capabilities cannot be delegated")
         if selected.delegable and not parent_cap.delegable:
@@ -1801,6 +1819,7 @@ class CapabilityManager:
         self._require_constraint_attenuation(parent_cap, selected)
 
     def _validate_transfer_parent(self, parent_cap: Capability, selected: CapabilitySpec) -> None:
+        self._require_valid_constraint_chain(parent_cap, action="transferred")
         if selected.effect != CapabilityEffect.ALLOW:
             raise CapabilityDenied("grant authority can only transfer allow capabilities")
         if parent_cap.uses_remaining is not None:
@@ -1814,6 +1833,18 @@ class CapabilityManager:
         if selected.delegable and parent_cap.delegation_depth + 1 >= parent_max_depth:
             raise CapabilityDenied("transferred capability cannot be delegable after depth exhaustion")
         self._require_constraint_attenuation(parent_cap, selected)
+
+    def _require_valid_constraint_chain(
+        self,
+        parent_cap: Capability,
+        *,
+        action: str,
+    ) -> None:
+        error = self._authority_chain_constraint_error(parent_cap)
+        if error is not None:
+            raise CapabilityDenied(
+                f"{action} capability has invalid parent constraint chain: {error}"
+            )
 
     def _require_temporal_attenuation(self, parent_cap: Capability, selected: CapabilitySpec, *, action: str) -> None:
         if (
@@ -2249,27 +2280,204 @@ class CapabilityManager:
             raise ValidationError(f"unknown authority risk: {value}") from exc
 
     def _validate_constraints(self, constraints: dict[str, Any]) -> None:
+        error = self._constraint_validation_error(constraints)
+        if error is not None:
+            raise ValidationError(error)
+
+    def _constraint_validation_error(
+        self,
+        constraints: dict[str, Any],
+    ) -> str | None:
+        validators = (
+            self._constraint_container_error,
+            self._authority_rules_constraint_error,
+            self._shell_policy_constraint_error,
+            self._inherited_from_constraint_error,
+            self._approval_binding_constraint_error,
+            self._data_release_binding_constraint_error,
+            self._git_constraint_error,
+        )
+        for validator in validators:
+            error = validator(constraints)
+            if error is not None:
+                return error
+        return None
+
+    def _constraint_container_error(
+        self,
+        constraints: dict[str, Any],
+    ) -> str | None:
         try:
             size = len(json.dumps(constraints, ensure_ascii=False, sort_keys=True).encode("utf-8"))
-        except TypeError as exc:
-            raise ValidationError("capability constraints must be JSON-serializable") from exc
+        except (
+            OverflowError,
+            RecursionError,
+            TypeError,
+            UnicodeEncodeError,
+            ValueError,
+        ):
+            return "capability constraints must be JSON-serializable"
         if size > self.config.capability.max_constraints_bytes:
-            raise ValidationError("capability constraints exceed configured byte limit")
-        if AUTHORITY_RULES_KEY in constraints:
+            return "capability constraints exceed configured byte limit"
+        unknown_keys = sorted(
+            key for key in constraints if key not in KNOWN_CONSTRAINT_KEYS
+        )
+        if unknown_keys:
+            return (
+                "capability constraints contain unknown keys: "
+                + ", ".join(unknown_keys)
+            )
+        null_key = next(
+            (key for key, value in constraints.items() if value is None),
+            None,
+        )
+        if null_key is not None:
+            return f"capability constraint {null_key} cannot be null"
+        return None
+
+    def _authority_rules_constraint_error(
+        self,
+        constraints: dict[str, Any],
+    ) -> str | None:
+        if AUTHORITY_RULES_KEY not in constraints:
+            return None
+        try:
             rules = self.rule_codec.coerce_many(constraints[AUTHORITY_RULES_KEY])
-            for rule in rules:
-                unknown = self.evaluator.unknown_authority_rule_conditions(rule)
-                if unknown:
-                    raise ValidationError(
-                        "capability authority rule contains unknown conditions: "
-                        + ", ".join(unknown)
-                    )
-                malformed = self.evaluator.malformed_authority_rule_conditions(rule)
-                if malformed:
-                    raise ValidationError(
-                        "capability authority rule contains malformed conditions: "
-                        + ", ".join(malformed)
-                    )
+        except ValidationError as exc:
+            return str(exc)
+        for rule in rules:
+            unknown = self.evaluator.unknown_authority_rule_conditions(rule)
+            if unknown:
+                return (
+                    "capability authority rule contains unknown conditions: "
+                    + ", ".join(unknown)
+                )
+            malformed = self.evaluator.malformed_authority_rule_conditions(rule)
+            if malformed:
+                return (
+                    "capability authority rule contains malformed conditions: "
+                    + ", ".join(malformed)
+                )
+        return None
+
+    def _shell_policy_constraint_error(
+        self,
+        constraints: dict[str, Any],
+    ) -> str | None:
+        shell_policy_key = self.config.shell.policy_capability_key
+        if shell_policy_key not in constraints:
+            return None
+        policy = constraints[shell_policy_key]
+        allowed_policies = {
+            self.config.shell.always_deny_level,
+            self.config.shell.allowlist_auto_else_ask_level,
+            self.config.shell.blocklist_ask_else_auto_level,
+            self.config.shell.always_allow_level,
+        }
+        if type(policy) is not str or policy not in allowed_policies:
+            return f"capability constraint {shell_policy_key} has an invalid shell policy level"
+        return None
+
+    @staticmethod
+    def _inherited_from_constraint_error(
+        constraints: dict[str, Any],
+    ) -> str | None:
+        inherited_from = constraints.get("inherited_from")
+        if "inherited_from" in constraints and (
+            type(inherited_from) is not str or not inherited_from
+        ):
+            return "capability constraint inherited_from must be a non-empty string"
+        return None
+
+    def _approval_binding_constraint_error(
+        self,
+        constraints: dict[str, Any],
+    ) -> str | None:
+        if self.APPROVAL_BINDING_KEY not in constraints:
+            return None
+        binding = constraints[self.APPROVAL_BINDING_KEY]
+        if type(binding) is not dict:
+            return "approval binding must be an object"
+        unknown_binding_fields = sorted(
+            set(binding)
+            - {"effect_id", "canonical_args_hash", "target_state_version"}
+        )
+        if unknown_binding_fields:
+            return (
+                "approval binding contains unknown fields: "
+                + ", ".join(unknown_binding_fields)
+            )
+        if type(binding.get("effect_id")) is not str:
+            return "approval binding effect_id must be a string"
+        if type(binding.get("canonical_args_hash")) is not str:
+            return "approval binding canonical_args_hash must be a string"
+        target_state_version = binding.get("target_state_version")
+        if target_state_version is not None and (
+            isinstance(target_state_version, bool)
+            or not isinstance(target_state_version, (str, int))
+        ):
+            return "approval binding target_state_version must be a string, integer, or null"
+        try:
+            normalize_approval_binding(binding)
+        except ValidationError as exc:
+            return str(exc)
+        return None
+
+    def _data_release_binding_constraint_error(
+        self,
+        constraints: dict[str, Any],
+    ) -> str | None:
+        if self.DATA_RELEASE_BINDING_KEY not in constraints:
+            return None
+        try:
+            DataReleaseBinding.normalize(
+                constraints[self.DATA_RELEASE_BINDING_KEY]
+            )
+        except (TypeError, ValueError) as exc:
+            return str(exc)
+        return None
+
+    @staticmethod
+    def _git_constraint_error(
+        constraints: dict[str, Any],
+    ) -> str | None:
+        for key in (
+            "git_remote",
+            "git_url_fingerprint",
+            "git_expected_state_token",
+            "git_old_oid",
+        ):
+            if key in constraints and (
+                type(constraints[key]) is not str or not constraints[key]
+            ):
+                return f"capability constraint {key} must be a non-empty string"
+        if "git_allowed_refs" in constraints:
+            refs = constraints["git_allowed_refs"]
+            if type(refs) is not list or any(
+                type(ref) is not str or not ref for ref in refs
+            ):
+                return "capability constraint git_allowed_refs must be a list of non-empty strings"
+        return None
+
+    def _authority_chain_constraint_error(
+        self,
+        capability: Capability,
+    ) -> str | None:
+        current: Capability | None = capability
+        seen: set[str] = set()
+        while current is not None:
+            if current.cap_id in seen:
+                return "capability parent chain contains a cycle"
+            seen.add(current.cap_id)
+            error = self._constraint_validation_error(current.constraints)
+            if error is not None:
+                return error
+            current = (
+                self.store.get_capability(current.parent_cap_id)
+                if current.parent_cap_id is not None
+                else None
+            )
+        return None
 
     def _require_constraint_attenuation(self, parent_cap: Capability, spec: CapabilitySpec) -> None:
         error = self._constraint_attenuation_error(
@@ -2284,14 +2492,24 @@ class CapabilityManager:
         parent_constraints: dict[str, Any],
         delegated_constraints: dict[str, Any],
     ) -> str | None:
+        parent_error = self._constraint_validation_error(parent_constraints)
+        if parent_error is not None:
+            return f"delegated capability has invalid parent constraint: {parent_error}"
+        delegated_error = self._constraint_validation_error(delegated_constraints)
+        if delegated_error is not None:
+            return f"delegated capability has invalid constraint: {delegated_error}"
         for key, value in parent_constraints.items():
-            if delegated_constraints.get(key) != value:
+            if key not in delegated_constraints:
                 return f"delegated capability cannot drop parent constraint: {key}"
+            delegated_value = delegated_constraints[key]
+            if key == "git_allowed_refs":
+                if not set(delegated_value).issubset(set(value)):
+                    return "delegated capability cannot widen parent constraint: git_allowed_refs"
+            elif delegated_value != value:
+                return f"delegated capability cannot change parent constraint: {key}"
         for key in delegated_constraints:
             if key in parent_constraints:
                 continue
-            if key not in KNOWN_CONSTRAINT_KEYS:
-                return f"delegated capability uses unknown constraint: {key}"
             # These constraints select an authority effect rather than merely
             # narrowing the operation context. Adding either one can turn an
             # otherwise inapplicable parent capability into explicit authority
@@ -2383,7 +2601,17 @@ class CapabilityManager:
     def _capability_json(self, cap: Capability) -> dict[str, Any]:
         rules = []
         if AUTHORITY_RULES_KEY in cap.constraints:
-            rules = [self.rule_codec.to_json(rule) for rule in self.rule_codec.coerce_many(cap.constraints[AUTHORITY_RULES_KEY])]
+            try:
+                rules = [
+                    self.rule_codec.to_json(rule)
+                    for rule in self.rule_codec.coerce_many(
+                        cap.constraints[AUTHORITY_RULES_KEY]
+                    )
+                ]
+            except ValidationError:
+                # Pre-admission rows remain inspectable, but authorization and
+                # further attenuation reject their malformed constraints.
+                rules = []
         return {
             "cap_id": cap.cap_id,
             "subject": cap.subject,

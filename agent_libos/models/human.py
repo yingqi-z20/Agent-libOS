@@ -26,3 +26,12 @@ class HumanRequest:
     blocking: bool
     created_at: str
     updated_at: str
+    revision: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.revision, bool)
+            or not isinstance(self.revision, int)
+            or self.revision < 0
+        ):
+            raise ValueError("human request revision must be a non-negative integer")

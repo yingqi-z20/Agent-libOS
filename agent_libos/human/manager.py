@@ -77,6 +77,14 @@ from agent_libos.human.requests import HumanRequestService
 from agent_libos.utils.serde import dumps, to_jsonable
 
 _SENSITIVE_HUMAN_AUDIT_KEYS = frozenset({"answer", "context", "decision", "message", "payload", "question", "reason"})
+_TERMINAL_RETRY_FENCE_KEYS = frozenset(
+    {
+        "provider_outcome",
+        "automatic_retry_disabled",
+        "manual_recovery_required",
+        "process_reconciliation_required",
+    }
+)
 _DATA_FLOW_CONTEXT_KEY = "_agent_libos_data_flow_context"
 _DATA_RELEASE_FOR_REQUEST_KEY = "_agent_libos_data_release_for_request_id"
 _DATA_RELEASE_REQUEST_KEY = "_agent_libos_data_release_request_id"
@@ -283,6 +291,7 @@ class HumanObjectManager:
         config: AgentLibOSConfig | None = None,
         transitions: ProcessTransitionService | None = None,
         process_terminal_cleanup: Callable[[str], Any] | None = None,
+        request_capture: Callable[[HumanRequest], Any] | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.processes = processes
@@ -298,6 +307,8 @@ class HumanObjectManager:
         self._blocking_work = blocking_work
         self._transitions = transitions or ProcessTransitionService(processes)
         self._process_terminal_cleanup = process_terminal_cleanup
+        self._request_capture = request_capture
+        self._host_request_capture: Callable[[HumanRequest], Any] | None = None
         self.requests = HumanRequestService(requests)
         self.delivery = HumanDeliveryService(provider)
         self.presentation = HumanPresentationService(
@@ -326,6 +337,51 @@ class HumanObjectManager:
             f"agent_libos_human_release_presentation_{id(self)}",
             default=None,
         )
+
+    def set_request_capture(
+        self,
+        callback: Callable[[HumanRequest], Any] | None,
+    ) -> None:
+        """Set the optional compatibility observer for persisted requests."""
+
+        if callback is not None and not callable(callback):
+            raise TypeError("Human request capture observer must be callable")
+        self._request_capture = callback
+
+    def bind_host_request_capture(
+        self,
+        callback: Callable[[HumanRequest], Any],
+    ) -> None:
+        """One-shot bind of the Host observer that compatibility APIs cannot clear."""
+
+        if not callable(callback):
+            raise TypeError("Host Human request capture observer must be callable")
+        if self._host_request_capture is not None:
+            raise RuntimeError("Host Human request capture observer is already bound")
+        self._host_request_capture = callback
+
+    def _capture_persisted_request(self, request_id: str) -> None:
+        callbacks = tuple(
+            callback
+            for callback in (
+                self._host_request_capture,
+                self._request_capture,
+            )
+            if callback is not None
+        )
+        if not callbacks:
+            return
+        persisted = self.requests.get(request_id)
+        if persisted is None:
+            return
+        for callback in callbacks:
+            try:
+                callback(persisted)
+            except Exception:
+                # Semantic/diagnostic capture is observational. It must never
+                # affect publication of the Human request or scheduler state,
+                # nor suppress another independently registered observer.
+                continue
 
     def query(
         self,
@@ -414,30 +470,38 @@ class HumanObjectManager:
                     raise ValidationError(
                         "data release parent Human request is not eligible for this release"
                     )
-                release_parent.payload = dict(release_parent.payload)
-                release_parent.payload[_DATA_RELEASE_REQUEST_KEY] = human_request.request_id
+                parent_payload = dict(release_parent.payload)
+                parent_payload[_DATA_RELEASE_REQUEST_KEY] = human_request.request_id
                 if isinstance(presentation, str) and presentation:
-                    raw_links = release_parent.payload.get(_DATA_RELEASE_REQUESTS_KEY)
+                    raw_links = parent_payload.get(_DATA_RELEASE_REQUESTS_KEY)
                     links = dict(raw_links) if isinstance(raw_links, Mapping) else {}
                     previous_id = links.get(presentation)
                     if isinstance(previous_id, str) and previous_id != human_request.request_id:
                         previous = self.requests.get(previous_id)
                         if previous is not None and previous.status == HumanRequestStatus.PENDING:
-                            previous.status = HumanRequestStatus.CANCELLED
-                            previous.decision = {
-                                "data_release_outcome": "superseded",
-                                "automatic_retry_disabled": True,
-                            }
-                            previous.updated_at = utc_now()
-                            self.requests.update(previous)
+                            self.requests.replace_current(
+                                previous,
+                                status=HumanRequestStatus.CANCELLED,
+                                decision={
+                                    "data_release_outcome": "superseded",
+                                    "automatic_retry_disabled": True,
+                                },
+                                updated_at=utc_now(),
+                            )
                     links[presentation] = human_request.request_id
-                    release_parent.payload[_DATA_RELEASE_REQUESTS_KEY] = links
+                    parent_payload[_DATA_RELEASE_REQUESTS_KEY] = links
                 # A presentation release is internal gate state.  It must not
                 # mutate the public view whose exact hash the release binds,
                 # otherwise creating the release would invalidate itself.
-                if not (isinstance(presentation, str) and presentation):
-                    release_parent.updated_at = utc_now()
-                self.requests.update(release_parent)
+                release_parent = self.requests.replace_current(
+                    release_parent,
+                    payload=parent_payload,
+                    updated_at=(
+                        release_parent.updated_at
+                        if isinstance(presentation, str) and presentation
+                        else utc_now()
+                    ),
+                )
             self.operations.expect("approval")
             self.operations.link_evidence(
                 "human_request",
@@ -486,6 +550,7 @@ class HumanObjectManager:
                     "request": request_observation,
                 },
             )
+        self._capture_persisted_request(human_request.request_id)
         return human_request.request_id
 
     def request_data_release(
@@ -1156,13 +1221,15 @@ class HumanObjectManager:
                             # A pre-effect failure must not leave a retryable
                             # request after returning one-shot authority.
                             if latest is not None:
-                                latest.status = HumanRequestStatus.CANCELLED
-                                latest.decision = {
-                                    "delivery_committed": False,
-                                    "cancelled_before_delivery": True,
-                                }
-                                latest.updated_at = utc_now()
-                                self.requests.update(latest)
+                                self.requests.replace_current(
+                                    latest,
+                                    status=HumanRequestStatus.CANCELLED,
+                                    decision={
+                                        "delivery_committed": False,
+                                        "cancelled_before_delivery": True,
+                                    },
+                                    updated_at=utc_now(),
+                                )
                             self._restore_one_time_decision(reservation_id)
                         else:
                             # The provider boundary was crossed or its outcome
@@ -1327,6 +1394,14 @@ class HumanObjectManager:
         # dispatch-time revalidation.
         with self.processes.locked():
             fresh = self.get(request.request_id)
+            if (
+                self._has_terminal_retry_fence_marker(fresh)
+                or fresh.request_id in self._terminal_retry_fences
+            ):
+                # A provider may already have observed the request.  GUI/API
+                # presentation is another provider boundary, so expose only a
+                # metadata-only recovery view until the Host reconciles it.
+                return self._withheld_public_request_view(fresh)
             raw = self._raw_public_request_view(fresh)
             if fresh.payload.get("type") == "data_release_approval":
                 return raw
@@ -1370,6 +1445,38 @@ class HumanObjectManager:
                     HumanRequestStatus.CANCELLED,
                 }:
                     return self.public_request_view(fresh)
+
+                # A successful first delivery persists the hidden visibility
+                # receipt through one more HumanRequest CAS.  Test an approved
+                # release against that exact settled public revision, not the
+                # pre-delivery row currently in the Store.
+                settled_raw = dict(raw)
+                settled_raw["revision"] = fresh.revision + 1
+                settled_sha256 = hashlib.sha256(
+                    dumps(to_jsonable(settled_raw)).encode("utf-8")
+                ).hexdigest()
+                if self._presentation_release_can_authorize(
+                    fresh,
+                    release=release,
+                    presentation=selected_presentation,
+                    view_sha256=settled_sha256,
+                ):
+                    raw = settled_raw
+                    view_sha256 = settled_sha256
+                else:
+                    # Creating or replacing a presentation release persists a
+                    # hidden link on the parent through HumanRequest CAS.  The
+                    # link and the later visibility receipt are excluded from
+                    # the public view, but both revision advances are not.
+                    # Bind the release to the exact settled revision that the
+                    # provider will receive after both CAS transitions;
+                    # otherwise the approval immediately becomes stale and
+                    # polling creates an endless chain of replacement releases.
+                    raw = dict(raw)
+                    raw["revision"] = fresh.revision + 2
+                    view_sha256 = hashlib.sha256(
+                        dumps(to_jsonable(raw)).encode("utf-8")
+                    ).hexdigest()
 
         try:
             return self._protected_presentation_view(
@@ -1493,6 +1600,43 @@ class HumanObjectManager:
         ):
             return False
         release = self.requests.get(release_id)
+        return self._presentation_release_authority_matches(
+            request,
+            release=release,
+            presentation=presentation,
+            view_sha256=view_sha256,
+            uses_remaining=0,
+        )
+
+    def _presentation_release_can_authorize(
+        self,
+        request: HumanRequest,
+        *,
+        release: HumanRequest | None,
+        presentation: str,
+        view_sha256: str,
+    ) -> bool:
+        """Return whether the current one-shot release can authorize this view."""
+
+        return self._presentation_release_authority_matches(
+            request,
+            release=release,
+            presentation=presentation,
+            view_sha256=view_sha256,
+            uses_remaining=1,
+        )
+
+    def _presentation_release_authority_matches(
+        self,
+        request: HumanRequest,
+        *,
+        release: HumanRequest | None,
+        presentation: str,
+        view_sha256: str,
+        uses_remaining: int,
+    ) -> bool:
+        """Validate one linked release against current Host state and authority."""
+
         if release is None or release.status != HumanRequestStatus.APPROVED:
             return False
         once = release.payload.get("requested_once_capability")
@@ -1519,7 +1663,7 @@ class HumanObjectManager:
         return any(
             capability.resource == resource
             and capability.constraints == dict(constraints)
-            and capability.uses_remaining == 0
+            and capability.uses_remaining == uses_remaining
             for capability in self.authority.list_capabilities(subject=request.pid)
         )
 
@@ -1639,6 +1783,10 @@ class HumanObjectManager:
             if latest is None:
                 raise NotFound(f"human request not found: {request.request_id}")
             latest_view = self._raw_public_request_view(latest)
+            # The receipt commit itself advances HumanRequest revision.  The
+            # provider payload and release binding are for that durable target
+            # view, not the transient pre-receipt row.
+            latest_view["revision"] = latest.revision + 1
             latest_sha256 = hashlib.sha256(
                 dumps(to_jsonable(latest_view)).encode("utf-8")
             ).hexdigest()
@@ -1653,9 +1801,9 @@ class HumanObjectManager:
                 "release_request_id": release_id,
                 "view_sha256": view_sha256,
             }
-            latest.payload = dict(latest.payload)
-            latest.payload[_DATA_RELEASE_VISIBLE_KEY] = visible
-            self.requests.update(latest)
+            latest_payload = dict(latest.payload)
+            latest_payload[_DATA_RELEASE_VISIBLE_KEY] = visible
+            self.requests.replace_current(latest, payload=latest_payload)
 
         parent_token = self._data_release_parent_request.set(request.request_id)
         presentation_token = self._data_release_presentation.set(presentation)
@@ -1848,10 +1996,13 @@ class HumanObjectManager:
             raise CapabilityDenied(
                 "linked Human data release is not approved at terminal settlement"
             )
-        latest.payload = dict(latest.payload)
-        latest.payload[_DATA_RELEASE_TERMINAL_COMMITTED_KEY] = release_request_id
-        latest.updated_at = utc_now()
-        self.requests.update(latest)
+        latest_payload = dict(latest.payload)
+        latest_payload[_DATA_RELEASE_TERMINAL_COMMITTED_KEY] = release_request_id
+        self.requests.replace_current(
+            latest,
+            payload=latest_payload,
+            updated_at=utc_now(),
+        )
 
     def list(self, pid: str | None = None, *, limit: int | None = None) -> builtins.list[HumanRequest]:
         # Pending decisions are liveness-critical and must never fall behind a
@@ -1896,27 +2047,33 @@ class HumanObjectManager:
                     pid=pid,
                     status=HumanRequestStatus.PENDING,
                 ):
-                    request.status = HumanRequestStatus.CANCELLED
-                    request.decision = {"cancelled_by": actor, "reason": reason}
-                    request.updated_at = utc_now()
-                    self.requests.update(request)
-                    cancelled.append(request.request_id)
-                    self.events.emit(
-                        EventType.HUMAN_RESPONSE,
-                        source=actor,
-                        target=pid,
-                        payload={
+                    decision = {"cancelled_by": actor, "reason": reason}
+                    if self._has_terminal_retry_fence_marker(request):
+                        # A process-terminal cancellation is authoritative and
+                        # needs no later process reconciliation, but it must not
+                        # erase evidence that provider completion was unknown.
+                        decision = {
+                            **dict(request.decision or {}),
+                            **decision,
+                            "process_reconciliation_required": False,
+                        }
+                    settled, _release_parent = self._terminalize_pending_request(
+                        request,
+                        status=HumanRequestStatus.CANCELLED,
+                        decision=decision,
+                        responder=actor,
+                        validate_and_apply_authority=False,
+                        transition_process=False,
+                        cancel_linked_release=False,
+                        event_payload={
                             "request_id": request.request_id,
                             "status": HumanRequestStatus.CANCELLED.value,
                             "reason": reason,
                         },
+                        audit_action="human.request_cancelled",
+                        audit_decision={"pid": pid, "reason": reason},
                     )
-                    self.audit.record(
-                        actor=actor,
-                        action="human.request_cancelled",
-                        target=f"human_request:{request.request_id}",
-                        decision={"pid": pid, "reason": reason},
-                    )
+                    cancelled.append(settled.request_id)
         return cancelled
 
     def _pending_terminal_requests(
@@ -1960,6 +2117,14 @@ class HumanObjectManager:
                 human=selected_human,
                 pids=pids,
             )
+            # A durable ambiguous-provider fence blocks only its owning
+            # process.  Other processes may keep using the shared Human
+            # terminal, while no request from the fenced process can cross a
+            # provider boundary before Host reconciliation.  The persisted
+            # decision marker makes this hold after Runtime reopen; the
+            # in-memory set is the last-resort fence when even that write
+            # failed.
+            pending = self._without_terminal_retry_fenced_pids(pending)
             if not pending:
                 return None
             # The terminal is the human's message queue. Host-created,
@@ -1976,10 +2141,7 @@ class HumanObjectManager:
                 ),
                 pending[0],
             )
-            if (
-                request.request_id in self._terminal_claims
-                or request.request_id in self._terminal_retry_fences
-            ):
+            if self._terminal_request_is_claimed_or_fenced(request):
                 return None
             self._terminal_claims.add(request.request_id)
         try:
@@ -2007,10 +2169,7 @@ class HumanObjectManager:
                         or release.payload.get("type") != "data_release_approval"
                     ):
                         raise
-                    if (
-                        release.request_id in self._terminal_claims
-                        or release.request_id in self._terminal_retry_fences
-                    ):
+                    if self._terminal_request_is_claimed_or_fenced(release):
                         return None
                     self._terminal_claims.add(release.request_id)
                 try:
@@ -2027,6 +2186,27 @@ class HumanObjectManager:
             with self._terminal_lock:
                 self._terminal_claims.discard(request.request_id)
 
+    def _without_terminal_retry_fenced_pids(
+        self,
+        pending: builtins.list[HumanRequest],
+    ) -> builtins.list[HumanRequest]:
+        fenced_pids = {
+            item.pid
+            for item in pending
+            if self._has_terminal_retry_fence_marker(item)
+            or item.request_id in self._terminal_retry_fences
+        }
+        if not fenced_pids:
+            return pending
+        return [item for item in pending if item.pid not in fenced_pids]
+
+    def _terminal_request_is_claimed_or_fenced(self, request: HumanRequest) -> bool:
+        return (
+            request.request_id in self._terminal_claims
+            or request.request_id in self._terminal_retry_fences
+            or self._has_terminal_retry_fence_marker(request)
+        )
+
     def _process_claimed_terminal_request(
         self,
         *,
@@ -2035,6 +2215,27 @@ class HumanObjectManager:
         auto_policy: str | None,
         auto_answer: str | None,
     ) -> HumanRequest:
+        # The queue selection snapshot may be stale after a concurrent Host
+        # transition.  Re-read immediately before any provider boundary and
+        # fail closed on both canonical and malformed durable retry markers.
+        with self._terminal_lock:
+            latest = self.requests.get(request.request_id)
+            if latest is None:
+                raise NotFound(f"human request not found: {request.request_id}")
+            if latest.status != HumanRequestStatus.PENDING:
+                raise ValidationError(
+                    "human request is not pending: "
+                    f"{latest.request_id} status={latest.status.value}"
+                )
+            if (
+                self._has_terminal_retry_fence_marker(latest)
+                or latest.request_id in self._terminal_retry_fences
+            ):
+                raise ValidationError(
+                    "human request has an ambiguous provider outcome and "
+                    f"requires Host reconciliation: {latest.request_id}"
+                )
+            request = latest
         request_type = request.payload.get("type")
         if request_type == "output":
             return self._deliver_output_request(request)
@@ -2178,6 +2379,14 @@ class HumanObjectManager:
                 request = self.requests.get(request_id)
                 if request is None:
                     raise NotFound(f"human request not found: {request_id}")
+                if (
+                    self._has_terminal_retry_fence_marker(request)
+                    or request.request_id in self._terminal_retry_fences
+                ):
+                    raise ValidationError(
+                        "human request has an ambiguous provider outcome and "
+                        f"requires Host reconciliation: {request_id}"
+                    )
                 if request.status != HumanRequestStatus.PENDING:
                     raise ValidationError(f"human request is not pending: {request_id} status={request.status.value}")
                 process = self.processes.get_process(request.pid)
@@ -2198,64 +2407,120 @@ class HumanObjectManager:
                         "human request payload has not been released for "
                         f"{required_presentation} presentation",
                     )
-                self._validate_decision_side_effects(request, status, decision)
-                self._apply_decision_side_effects(request, status, decision, responder)
-                # Capability/permission side effects may advance the process
-                # revision.  Never write the pre-side-effect snapshot back.
-                process = self.processes.get_process(request.pid)
-                permission_related = False
-                permission_spec = request.payload.get("requested_permission")
-                if isinstance(permission_spec, dict):
-                    permission_related = True
-
-                once_spec = request.payload.get("requested_once_capability")
-                if isinstance(once_spec, dict):
-                    permission_related = True
-                request.status = status
-                request.decision = decision
-                request.updated_at = utc_now()
-                self.requests.update(request)
-                release_parent = (
-                    self._cancel_linked_request_for_release(
-                        request,
-                        outcome=status.value,
-                        actor=responder,
-                    )
-                    if status != HumanRequestStatus.APPROVED
-                    else None
-                )
-                self._transition_after_human_decision(
-                    process,
+                request, _release_parent = self._terminalize_pending_request(
                     request,
-                    status,
-                    permission_related=permission_related,
-                    release_parent=release_parent,
-                )
-                response_evidence = {
-                    "request_id": request_id,
-                    "status": status.value,
-                    "decision": _sanitize_human_observability(decision),
-                }
-                if release_parent is not None:
-                    response_evidence.update(
-                        {
-                            "linked_request_id": release_parent.request_id,
-                            "linked_request_status": release_parent.status.value,
-                        }
-                    )
-                self.events.emit(
-                    EventType.HUMAN_RESPONSE,
-                    source=responder,
-                    target=request.pid,
-                    payload=response_evidence,
-                )
-                self.audit.record(
-                    actor=responder,
-                    action="human.response",
-                    target=f"human_request:{request_id}",
-                    decision=response_evidence,
+                    status=status,
+                    decision=decision,
+                    responder=responder,
+                    validate_and_apply_authority=True,
+                    transition_process=True,
+                    cancel_linked_release=status != HumanRequestStatus.APPROVED,
                 )
         return request
+
+    def _terminalize_pending_request(
+        self,
+        request: HumanRequest,
+        *,
+        status: HumanRequestStatus,
+        decision: dict[str, Any],
+        responder: str,
+        validate_and_apply_authority: bool,
+        transition_process: bool,
+        cancel_linked_release: bool,
+        provider_outcome_unknown: bool = False,
+        event_payload: dict[str, Any] | None = None,
+        event_source: str | None = None,
+        audit_action: str = "human.response",
+        audit_decision: dict[str, Any] | None = None,
+    ) -> tuple[HumanRequest, HumanRequest | None]:
+        """Commit one terminal Human transition inside the caller's unit.
+
+        Every caller owns an enclosing Store transaction.  The exact request
+        revision/status CAS, authority effects, linked-request handling,
+        process wait-set transition, event, and audit therefore succeed or
+        roll back together.  Building a distinct target is intentional: a
+        losing CAS can never leak an in-memory mutation into retry logic.
+        """
+
+        if request.status != HumanRequestStatus.PENDING:
+            raise ValidationError(
+                "human request is not pending: "
+                f"{request.request_id} status={request.status.value}"
+            )
+        if validate_and_apply_authority:
+            self._validate_decision_side_effects(request, status, decision)
+            self._apply_decision_side_effects(request, status, decision, responder)
+
+        # Capability/permission side effects may advance the process revision.
+        # Re-read after them and never write the pre-side-effect snapshot back.
+        process = self.processes.get_process(request.pid)
+        permission_related = any(
+            isinstance(request.payload.get(key), dict)
+            for key in ("requested_permission", "requested_once_capability")
+        )
+        settled = self.requests.replace_current(
+            request,
+            status=status,
+            decision=dict(decision),
+            updated_at=utc_now(),
+        )
+        release_parent = (
+            self._cancel_linked_request_for_release(
+                settled,
+                outcome=(
+                    "provider_outcome_unknown"
+                    if provider_outcome_unknown
+                    else status.value
+                ),
+                actor=responder,
+            )
+            if cancel_linked_release
+            else None
+        )
+        if transition_process:
+            self._transition_after_human_decision(
+                process,
+                settled,
+                status,
+                permission_related=permission_related,
+                release_parent=release_parent,
+                provider_outcome_unknown=provider_outcome_unknown,
+            )
+
+        response_evidence = (
+            dict(event_payload)
+            if event_payload is not None
+            else {
+                "request_id": settled.request_id,
+                "status": status.value,
+                "decision": _sanitize_human_observability(decision),
+            }
+        )
+        if release_parent is not None:
+            response_evidence.update(
+                {
+                    "linked_request_id": release_parent.request_id,
+                    "linked_request_status": release_parent.status.value,
+                }
+            )
+        self.events.emit(
+            EventType.HUMAN_RESPONSE,
+            source=event_source or responder,
+            target=settled.pid,
+            payload=response_evidence,
+        )
+        self.audit.record(
+            actor=responder,
+            action=audit_action,
+            target=f"human_request:{settled.request_id}",
+            decision=(
+                dict(audit_decision)
+                if audit_decision is not None
+                else response_evidence
+            ),
+        )
+        return settled, release_parent
 
     def _transition_after_human_decision(
         self,
@@ -2368,17 +2633,18 @@ class HumanObjectManager:
         parent = self.requests.get(parent_id)
         if parent is None or parent.status != HumanRequestStatus.PENDING:
             return None
-        parent.status = HumanRequestStatus.CANCELLED
-        parent.decision = {
-            "data_release_outcome": outcome,
-            "data_release_request_id": release.request_id,
-            "terminated_by": actor,
-            "automatic_retry_disabled": True,
-            "sensitive_payload_delivered": False,
-        }
-        parent.updated_at = utc_now()
-        self.requests.update(parent)
-        return parent
+        return self.requests.replace_current(
+            parent,
+            status=HumanRequestStatus.CANCELLED,
+            decision={
+                "data_release_outcome": outcome,
+                "data_release_request_id": release.request_id,
+                "terminated_by": actor,
+                "automatic_retry_disabled": True,
+                "sensitive_payload_delivered": False,
+            },
+            updated_at=utc_now(),
+        )
 
     def _validate_decision_side_effects(
         self,
@@ -2693,14 +2959,40 @@ class HumanObjectManager:
     ) -> None:
         """Present an interactive request through the protected Human Sink."""
 
-        question = self._terminal_question(request)
-        text = f"\nHuman request {request.request_id}: {question}\n{suffix}"
-        self._terminal_provider_io(
-            request,
-            operation="write",
-            text=text,
-            purpose="interactive_cli_presentation",
-        )
+        with self._terminal_lock:
+            latest = self.requests.get(request.request_id)
+            if latest is None:
+                raise NotFound(f"human request not found: {request.request_id}")
+            if latest.status != HumanRequestStatus.PENDING:
+                raise ValidationError(
+                    "human request is not pending: "
+                    f"{latest.request_id} status={latest.status.value}"
+                )
+            if (
+                self._has_terminal_retry_fence_marker(latest)
+                or latest.request_id in self._terminal_retry_fences
+            ):
+                raise ValidationError(
+                    "human request has an ambiguous provider outcome and "
+                    f"requires Host reconciliation: {latest.request_id}"
+                )
+            if latest.request_id in self._terminal_claims:
+                raise ValidationError(
+                    f"human request is already being presented: {latest.request_id}"
+                )
+            self._terminal_claims.add(latest.request_id)
+        try:
+            question = self._terminal_question(latest)
+            text = f"\nHuman request {latest.request_id}: {question}\n{suffix}"
+            self._terminal_provider_io(
+                latest,
+                operation="write",
+                text=text,
+                purpose="interactive_cli_presentation",
+            )
+        finally:
+            with self._terminal_lock:
+                self._terminal_claims.discard(latest.request_id)
 
     def _terminal_question(self, request: HumanRequest) -> str:
         raw_question = request.payload.get("question")
@@ -3066,9 +3358,9 @@ class HumanObjectManager:
         except Exception:
             # The primary transaction also reconciles linked requests and the
             # process wait state. If any of those writes fails, retry the
-            # smallest durable safety boundary independently: make this exact
-            # request non-pending. This deliberately does not retry provider
-            # I/O and cannot be rolled back by a secondary transition failure.
+            # smallest durable safety boundary independently: retain this
+            # exact request as PENDING but poison every automatic/provider
+            # response path. This deliberately does not retry provider I/O.
             if self._persist_terminal_retry_fence(
                 request.request_id,
                 operation=operation,
@@ -3092,57 +3384,103 @@ class HumanObjectManager:
                 latest = self.requests.get(request_id)
                 if latest is None or latest.status != HumanRequestStatus.PENDING:
                     return True
-                latest.status = HumanRequestStatus.CANCELLED
-                latest.decision = {
-                    "provider_outcome": "unknown",
-                    "automatic_retry_disabled": True,
-                    "manual_recovery_required": True,
-                    "process_reconciliation_required": True,
-                    "operation": operation,
-                    "purpose": purpose,
-                    "error_type": type(error).__name__,
-                }
-                latest.updated_at = utc_now()
-                self.requests.update(latest)
-            self._reconcile_terminal_retry_fence(request_id)
+                self.requests.replace_current(
+                    latest,
+                    decision={
+                        "provider_outcome": "unknown",
+                        "automatic_retry_disabled": True,
+                        "manual_recovery_required": True,
+                        "process_reconciliation_required": True,
+                        "operation": operation,
+                        "purpose": purpose,
+                        "error_type": type(error).__name__,
+                    },
+                    updated_at=utc_now(),
+                )
             return True
         except Exception:
             return False
 
-    def _reconcile_terminal_retry_fence(self, request_id: str) -> None:
-        """Best-effort liveness repair after the minimal fence is durable."""
+    def reconcile_terminal_retry_fence(self, request_id: str) -> HumanRequest:
+        """Host recovery for one durable ambiguous-provider retry fence.
 
-        try:
+        Provider I/O is never retried here.  The request CAS, linked request,
+        process Host-resume gate, response event, and audit evidence all use
+        the ordinary Human terminal kernel and therefore commit or roll back
+        together.  A failed attempt leaves the PENDING fence intact.
+        """
+
+        with self._terminal_lock:
             with self.requests.transaction():
                 latest = self.requests.get(request_id)
-                if latest is None or latest.status != HumanRequestStatus.CANCELLED:
-                    return
-                release_parent = self._cancel_linked_request_for_release(
+                if latest is None:
+                    raise NotFound(f"human request not found: {request_id}")
+                if (
+                    latest.status == HumanRequestStatus.CANCELLED
+                    and (latest.decision or {}).get("provider_outcome") == "unknown"
+                ):
+                    return latest
+                if not self._is_terminal_retry_fence(latest):
+                    raise ValidationError(
+                        "human request is not a canonical ambiguous-provider retry fence: "
+                        f"{request_id} status={latest.status.value}"
+                    )
+                decision = {
+                    **dict(latest.decision or {}),
+                    "process_reconciliation_required": False,
+                }
+                event_payload = {
+                    "request_id": latest.request_id,
+                    "status": HumanRequestStatus.CANCELLED.value,
+                    "provider_outcome": "unknown",
+                    "automatic_retry_disabled": True,
+                    "operation": decision.get("operation"),
+                    "purpose": decision.get("purpose"),
+                    "error_type": decision.get("error_type"),
+                }
+                settled, _release_parent = self._terminalize_pending_request(
                     latest,
-                    outcome="provider_outcome_unknown",
-                    actor="runtime:human-provider",
-                )
-                process = self.processes.get_process(latest.pid)
-                self._transition_after_human_decision(
-                    process,
-                    latest,
-                    HumanRequestStatus.CANCELLED,
-                    permission_related=False,
-                    release_parent=release_parent,
+                    status=HumanRequestStatus.CANCELLED,
+                    decision=decision,
+                    responder="runtime:human-provider",
+                    validate_and_apply_authority=False,
+                    transition_process=True,
+                    cancel_linked_release=True,
                     provider_outcome_unknown=True,
+                    event_payload=event_payload,
+                    event_source=f"human:{latest.human}",
+                    audit_action="human.request.provider_outcome_unknown",
                 )
-                latest = self.requests.get(request_id)
-                if latest is not None and latest.decision is not None:
-                    latest.decision = {
-                        **latest.decision,
-                        "process_reconciliation_required": False,
-                    }
-                    latest.updated_at = utc_now()
-                    self.requests.update(latest)
-        except Exception:
-            # The exact request is already non-pending in an earlier commit,
-            # so a failed liveness repair must never undo the retry fence.
-            return
+        return settled
+
+    @staticmethod
+    def _is_terminal_retry_fence(request: HumanRequest) -> bool:
+        decision = request.decision
+        return (
+            request.status == HumanRequestStatus.PENDING
+            and isinstance(decision, dict)
+            and decision.get("provider_outcome") == "unknown"
+            and decision.get("automatic_retry_disabled") is True
+            and decision.get("manual_recovery_required") is True
+            and decision.get("process_reconciliation_required") is True
+            and isinstance(decision.get("operation"), str)
+            and bool(str(decision.get("operation")).strip())
+            and isinstance(decision.get("purpose"), str)
+            and bool(str(decision.get("purpose")).strip())
+            and isinstance(decision.get("error_type"), str)
+            and bool(str(decision.get("error_type")).strip())
+        )
+
+    @staticmethod
+    def _has_terminal_retry_fence_marker(request: HumanRequest) -> bool:
+        """Detect any reserved retry-fence state and fail closed if malformed."""
+
+        decision = request.decision
+        return (
+            request.status == HumanRequestStatus.PENDING
+            and isinstance(decision, Mapping)
+            and bool(_TERMINAL_RETRY_FENCE_KEYS.intersection(decision))
+        )
 
     def _mark_terminal_provider_outcome_unknown_once(
         self,
@@ -3154,15 +3492,13 @@ class HumanObjectManager:
     ) -> None:
         """Persist a non-retryable terminal request after ambiguous provider I/O."""
 
-        evidence: dict[str, Any] | None = None
         latest: HumanRequest | None = None
         with self._terminal_lock:
             with self.requests.transaction():
                 latest = self.requests.get(request.request_id)
                 if latest is None or latest.status != HumanRequestStatus.PENDING:
                     return
-                latest.status = HumanRequestStatus.CANCELLED
-                latest.decision = {
+                decision = {
                     "provider_outcome": "unknown",
                     "automatic_retry_disabled": True,
                     "manual_recovery_required": True,
@@ -3170,63 +3506,27 @@ class HumanObjectManager:
                     "purpose": purpose,
                     "error_type": type(error).__name__,
                 }
-                latest.updated_at = utc_now()
-                self.requests.update(latest)
-                release_parent = self._cancel_linked_request_for_release(
+                latest, _release_parent = self._terminalize_pending_request(
                     latest,
-                    outcome="provider_outcome_unknown",
-                    actor="runtime:human-provider",
-                )
-
-                process = self.processes.get_process(latest.pid)
-                self._transition_after_human_decision(
-                    process,
-                    latest,
-                    HumanRequestStatus.CANCELLED,
-                    permission_related=False,
-                    release_parent=release_parent,
+                    status=HumanRequestStatus.CANCELLED,
+                    decision=decision,
+                    responder="runtime:human-provider",
+                    validate_and_apply_authority=False,
+                    transition_process=True,
+                    cancel_linked_release=True,
                     provider_outcome_unknown=True,
+                    event_payload={
+                        "request_id": latest.request_id,
+                        "status": HumanRequestStatus.CANCELLED.value,
+                        "provider_outcome": "unknown",
+                        "automatic_retry_disabled": True,
+                        "operation": operation,
+                        "purpose": purpose,
+                        "error_type": type(error).__name__,
+                    },
+                    event_source=f"human:{latest.human}",
+                    audit_action="human.request.provider_outcome_unknown",
                 )
-
-                evidence = {
-                    "request_id": latest.request_id,
-                    "status": latest.status.value,
-                    "provider_outcome": "unknown",
-                    "automatic_retry_disabled": True,
-                    "operation": operation,
-                    "purpose": purpose,
-                    "error_type": type(error).__name__,
-                }
-                if release_parent is not None:
-                    evidence.update(
-                        {
-                            "linked_request_id": release_parent.request_id,
-                            "linked_request_status": release_parent.status.value,
-                        }
-                    )
-        assert latest is not None and evidence is not None
-        # The non-retryable request transition is the safety boundary. Keep it
-        # committed even if secondary observability is temporarily unavailable;
-        # the protected-operation effect ledger still carries the provider
-        # uncertainty.
-        try:
-            self.events.emit(
-                EventType.HUMAN_RESPONSE,
-                source=f"human:{latest.human}",
-                target=latest.pid,
-                payload=evidence,
-            )
-        except Exception:
-            pass
-        try:
-            self.audit.record(
-                actor="runtime:human-provider",
-                action="human.request.provider_outcome_unknown",
-                target=f"human_request:{latest.request_id}",
-                decision=evidence,
-            )
-        except Exception:
-            pass
 
     def _protected(self) -> Any:
         return self.protected_operations
@@ -3404,30 +3704,40 @@ class HumanObjectManager:
                 raise ValidationError(
                     f"terminal process cannot deliver human output: {latest.pid} status={process.status.value}"
                 )
-            request = latest
-            request.status = HumanRequestStatus.DELIVERED
-            request.decision = {"delivery_committed": True}
-            request.updated_at = utc_now()
-            self.requests.update(request)
+            request = self.requests.replace_current(
+                latest,
+                status=HumanRequestStatus.DELIVERED,
+                decision={"delivery_committed": True},
+                updated_at=utc_now(),
+            )
 
         def restore_not_started() -> None:
             latest = self.requests.get(request.request_id)
             if latest is not None and latest.status == HumanRequestStatus.DELIVERED:
-                latest.status = HumanRequestStatus.PENDING
-                latest.decision = {
-                    "delivery_committed": False,
-                    "provider_not_started": True,
-                }
-                latest.updated_at = utc_now()
-                self.requests.update(latest)
+                self.requests.replace_current(
+                    latest,
+                    status=HumanRequestStatus.PENDING,
+                    decision={
+                        "delivery_committed": False,
+                        "provider_not_started": True,
+                    },
+                    updated_at=utc_now(),
+                )
 
         def settle_success() -> None:
             latest = self.requests.get(request.request_id)
             if latest is None:
                 raise NotFound(f"human request not found: {request.request_id}")
-            latest.decision = {"delivery_committed": True, "delivered": True}
-            latest.updated_at = utc_now()
-            self.requests.update(latest)
+            if latest.status != HumanRequestStatus.DELIVERED:
+                raise ValidationError(
+                    "human output delivery changed concurrently: "
+                    f"{latest.request_id} status={latest.status.value}"
+                )
+            self.requests.replace_current(
+                latest,
+                decision={"delivery_committed": True, "delivered": True},
+                updated_at=utc_now(),
+            )
 
         def update_latest_delivery_decision(
             decision: dict[str, Any],
@@ -3440,10 +3750,11 @@ class HumanObjectManager:
                 latest = self.requests.get(request.request_id)
                 if latest is None or latest.status != HumanRequestStatus.DELIVERED:
                     return latest
-                latest.decision = decision
-                latest.updated_at = utc_now()
-                self.requests.update(latest)
-                return latest
+                return self.requests.replace_current(
+                    latest,
+                    decision=dict(decision),
+                    updated_at=utc_now(),
+                )
 
         invocation = ProtectedOperationInvocation(
             pid=request.pid,
@@ -3646,14 +3957,16 @@ class HumanObjectManager:
                 f"prepared Human output recovery found incompatible status: {request_id} "
                 f"status={request.status.value}"
             )
-        request.status = HumanRequestStatus.PENDING
-        request.decision = {
-            "delivery_committed": False,
-            "provider_not_dispatched": True,
-            "startup_recovered": True,
-        }
-        request.updated_at = utc_now()
-        self.requests.update(request)
+        self.requests.replace_current(
+            request,
+            status=HumanRequestStatus.PENDING,
+            decision={
+                "delivery_committed": False,
+                "provider_not_dispatched": True,
+                "startup_recovered": True,
+            },
+            updated_at=utc_now(),
+        )
 
     def _default_message_subject(self, kind: ProcessMessageKind) -> str:
         if kind == ProcessMessageKind.INTERRUPT:

@@ -7,6 +7,13 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from agent_libos.evidence.payload_retention import PayloadRetentionStore
 from agent_libos.storage.base import StoreAssemblyReadiness
+from agent_libos.storage.semantic import (
+    SemanticAssessmentCursor,
+    SemanticAssessmentJobRecord,
+    SemanticAssessmentPage,
+    SemanticAssessmentRecord,
+    SemanticStatusAggregate,
+)
 from agent_libos.models import (
     AgentObject,
     AgentImage,
@@ -100,6 +107,78 @@ class ProcessScaffoldCleanup:
         return sum(self.deleted_by_table.values())
 
 
+class SemanticAssessmentBackendProtocol(Protocol):
+    """Durable queue and append-only semantic evidence surface."""
+
+    def enqueue_semantic_assessment_job(
+        self,
+        record: SemanticAssessmentJobRecord,
+    ) -> SemanticAssessmentJobRecord: ...
+
+    def get_semantic_assessment_job(
+        self,
+        job_id: str,
+    ) -> SemanticAssessmentJobRecord | None: ...
+
+    def claim_next_semantic_assessment_job(
+        self,
+        *,
+        lease_owner_id: str,
+        lease_id: str,
+        lease_expires_at: str,
+        updated_at: str,
+    ) -> SemanticAssessmentJobRecord | None: ...
+
+    def query_expired_semantic_assessment_jobs(
+        self,
+        *,
+        expired_before: str,
+        limit: int,
+    ) -> tuple[SemanticAssessmentJobRecord, ...]: ...
+
+    def query_semantic_assessment_jobs(
+        self,
+        *,
+        statuses: Iterable[str],
+        projection_expires_before: str | None,
+        limit: int,
+    ) -> tuple[SemanticAssessmentJobRecord, ...]: ...
+
+    def semantic_status_aggregate(self) -> SemanticStatusAggregate: ...
+
+    def terminalize_semantic_assessment_job(
+        self,
+        expected: SemanticAssessmentJobRecord,
+        target: SemanticAssessmentJobRecord,
+        assessment: SemanticAssessmentRecord,
+    ) -> bool: ...
+
+    def append_semantic_assessment(
+        self,
+        record: SemanticAssessmentRecord,
+    ) -> SemanticAssessmentRecord: ...
+
+    def get_semantic_assessment(
+        self,
+        assessment_id: str,
+    ) -> SemanticAssessmentRecord | None: ...
+
+    def query_semantic_assessments(
+        self,
+        *,
+        after: SemanticAssessmentCursor | None,
+        limit: int,
+        pid: str | None = None,
+        request_id: str | None = None,
+        operation_id: str | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        domain: str | None = None,
+        action_id: str | None = None,
+        tenant_bucket_sha256: str | None = None,
+    ) -> SemanticAssessmentPage: ...
+
+
 class ProcessStateRepository(ProcessRestoreEpochRepositoryPort, Protocol):
     """Typed persistence boundary for process state and execution fencing."""
 
@@ -140,6 +219,16 @@ class ProcessStateRepository(ProcessRestoreEpochRepositoryPort, Protocol):
     ) -> ProcessPage: ...
 
     def list_child_processes(self, parent_pid: str) -> list[AgentProcess]: ...
+
+    def insert_human_request(self, request: HumanRequest) -> None: ...
+
+    def update_human_request(self, request: HumanRequest) -> bool: ...
+
+    def compare_and_set_human_request(
+        self,
+        expected: HumanRequest,
+        target: HumanRequest,
+    ) -> bool: ...
 
     def get_human_request(self, request_id: str) -> HumanRequest | None: ...
 
@@ -1278,6 +1367,16 @@ class ProcessBackendProtocol(
 
     def list_child_processes(self, parent_pid: str) -> list[AgentProcess]: ...
 
+    def insert_human_request(self, request: HumanRequest) -> None: ...
+
+    def update_human_request(self, request: HumanRequest) -> bool: ...
+
+    def compare_and_set_human_request(
+        self,
+        expected: HumanRequest,
+        target: HumanRequest,
+    ) -> bool: ...
+
     def get_human_request(self, request_id: str) -> HumanRequest | None: ...
 
     def list_human_requests_for_pids(
@@ -2151,6 +2250,7 @@ class OperationEvidenceBackendProtocol(TransactionBackendProtocol, Protocol):
 
 
 class UnitOfWorkBackendProtocol(
+    SemanticAssessmentBackendProtocol,
     ProcessBackendProtocol,
     TaskRunBackendProtocol,
     ObjectQueryBackendProtocol,

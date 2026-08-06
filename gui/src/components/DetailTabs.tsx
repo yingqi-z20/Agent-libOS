@@ -17,6 +17,7 @@ import { RemoteRegistryPanel } from "./RemoteRegistryPanel";
 import { SkillsPanel } from "./SkillsPanel";
 import { RequestEpoch } from "../requestEpoch";
 import { ProviderTracePanel, type LlmTraceFocus } from "./ProviderTracePanel";
+import { SemanticPanel } from "./SemanticPanel";
 
 const tabs = [
   { key: "overview", label: "details.overview" },
@@ -29,13 +30,14 @@ const tabs = [
   { key: "audit", label: "details.audit" },
   { key: "explain", label: "details.explain" },
   { key: "llmCalls", label: "details.llmCalls" },
+  { key: "semantic", label: "details.semantic" },
   { key: "jsonRpc", label: "details.jsonRpc" },
   { key: "mcp", label: "details.mcp" },
   { key: "modules", label: "details.modules" },
   { key: "images", label: "details.images" },
   { key: "objectMemory", label: "details.objectMemory" }
 ] as const satisfies ReadonlyArray<{ key: string; label: TranslationKey }>;
-const hostTabs = new Set<TabKey>(["taskRuns", "toolsSkills", "jsonRpc", "mcp", "modules", "images"]);
+const hostTabs = new Set<TabKey>(["taskRuns", "toolsSkills", "semantic", "jsonRpc", "mcp", "modules", "images"]);
 
 type TabKey = (typeof tabs)[number]["key"];
 
@@ -214,7 +216,7 @@ function renderTab(
     confirmAction?(request: ConfirmationRequest): void;
   }
 ) {
-  if (!process && !["taskRuns", "jsonRpc", "mcp", "toolsSkills", "images", "modules"].includes(tab)) return <div className="empty">{t("details.selectProcess")}</div>;
+  if (!process && !["taskRuns", "jsonRpc", "mcp", "toolsSkills", "semantic", "images", "modules"].includes(tab)) return <div className="empty">{t("details.selectProcess")}</div>;
   const adminReady = imageActions.client && imageActions.runAction && imageActions.confirmAction;
   if (tab === "overview" && process) return <ProcessOverview process={process} />;
   if (tab === "rating") return <RatingPanel process={process} onSave={imageActions.onRate} />;
@@ -253,6 +255,17 @@ function renderTab(
     );
   }
   if (tab === "llmCalls") return <div className="empty">{t("app.clientUnavailable")}</div>;
+  if (tab === "semantic" && imageActions.client) {
+    return (
+      <SemanticPanel
+        key={`${imageActions.connectionEpoch}:${process?.pid ?? "host"}`}
+        pid={process?.pid ?? null}
+        client={imageActions.client}
+        connectionKey={String(imageActions.connectionEpoch)}
+      />
+    );
+  }
+  if (tab === "semantic") return <div className="empty">{t("app.clientUnavailable")}</div>;
   if (tab === "jsonRpc" && imageActions.client && imageActions.confirmAction) return <RemoteRegistryPanel key={`${imageActions.connectionEpoch}:jsonrpc:${process?.pid ?? "host"}`} kind="jsonrpc" process={process} entries={snapshot.jsonrpc_endpoints} client={imageActions.client} confirmAction={imageActions.confirmAction} />;
   if (tab === "jsonRpc") return <JsonBlock value={snapshot.jsonrpc_endpoints} />;
   if (tab === "mcp" && imageActions.client && imageActions.confirmAction) return <RemoteRegistryPanel key={`${imageActions.connectionEpoch}:mcp:${process?.pid ?? "host"}`} kind="mcp" process={process} entries={snapshot.mcp_servers} client={imageActions.client} confirmAction={imageActions.confirmAction} />;

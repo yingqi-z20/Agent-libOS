@@ -20,7 +20,7 @@ from agent_libos.runtime.process_manager import ProcessManager
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import sqlite as sqlite_storage
 from agent_libos.storage.repositories import CheckpointRestorePublicationWriter
-from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS
+from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS, _V5_REQUIRED_COLUMNS
 from agent_libos.storage.sqlite import SQLiteStore
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import dumps
@@ -45,6 +45,12 @@ _SQLITE_V4_MANIFEST_TABLES = tuple(sorted(_V4_REQUIRED_COLUMNS))
 _SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE = (
     "SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN ("
     + ", ".join("?" for _ in _SQLITE_V4_MANIFEST_TABLES)
+    + ")"
+)
+_SQLITE_V5_MANIFEST_TABLES = tuple(sorted(_V5_REQUIRED_COLUMNS))
+_SQLITE_V5_MANIFEST_SCHEMA_PROBE_SHAPE = (
+    "SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN ("
+    + ", ".join("?" for _ in _SQLITE_V5_MANIFEST_TABLES)
     + ")"
 )
 _OPERATION_RECONCILIATION_SELECT_RE = re.compile(
@@ -170,6 +176,13 @@ _PUBLICATION_SCHEMA_INDEXES = frozenset(
         "idx_checkpoint_payload_delivery_attempts_preparing",
     }
 )
+_PUBLICATION_SCHEMA_CATALOG_TABLES = frozenset(
+    {"checkpoint_payload_delivery_attempts", "runtime_publications"}
+)
+_PUBLICATION_SCHEMA_CATALOG_INDEXES = _PUBLICATION_SCHEMA_INDEXES | {
+    "sqlite_autoindex_checkpoint_payload_delivery_attempts_1",
+    "sqlite_autoindex_runtime_publications_1",
+}
 _EXPECTED_DOMAIN_INDEX_SQL = " ".join(
     """
     CREATE INDEX IDX_RUNTIME_PUBLICATIONS_INVALID_DOMAIN
@@ -1826,13 +1839,27 @@ def _publication_statement_shape(sql: str) -> str | None:
     raw_sql = str(sql)
     raw_normalized = " ".join(raw_sql.upper().split()).rstrip(";")
     raw_normalized_literals = _normalize_publication_select(raw_normalized)
-    if raw_normalized_literals == _SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE:
-        manifest_tables = tuple(
-            literal[1:-1].replace("''", "'")
-            for literal in _SQL_TEXT_LITERAL_RE.findall(raw_sql)
-        )
-        if manifest_tables == _SQLITE_V4_MANIFEST_TABLES:
-            return "v4_manifest_schema_probe"
+    manifest_tables = tuple(
+        literal[1:-1].replace("''", "'")
+        for literal in _SQL_TEXT_LITERAL_RE.findall(raw_sql)
+    )
+    for version, expected_shape, expected_tables in (
+        (
+            4,
+            _SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE,
+            _SQLITE_V4_MANIFEST_TABLES,
+        ),
+        (
+            5,
+            _SQLITE_V5_MANIFEST_SCHEMA_PROBE_SHAPE,
+            _SQLITE_V5_MANIFEST_TABLES,
+        ),
+    ):
+        if (
+            raw_normalized_literals == expected_shape
+            and manifest_tables == expected_tables
+        ):
+            return f"v{version}_manifest_schema_probe"
     uncommented = _strip_sql_comments(raw_sql)
     normalized = " ".join(uncommented.upper().split()).rstrip(";")
     normalized_literals = _normalize_publication_select(normalized)
@@ -1842,6 +1869,23 @@ def _publication_statement_shape(sql: str) -> str | None:
         normalized_literals,
     ):
         return "keyset_collation_schema_probe"
+    catalog_table_match = re.fullmatch(
+        r'PRAGMA (TABLE_XINFO|FOREIGN_KEY_LIST|INDEX_LIST)\("([A-Z0-9_]+)"\)',
+        normalized,
+    )
+    if catalog_table_match is not None:
+        operation, raw_table = catalog_table_match.groups()
+        table = raw_table.lower()
+        if table in _PUBLICATION_SCHEMA_CATALOG_TABLES:
+            return f"catalog_{operation.lower()}:{table}"
+    catalog_index_match = re.fullmatch(
+        r'PRAGMA INDEX_XINFO\("([A-Z0-9_]+)"\)',
+        normalized,
+    )
+    if catalog_index_match is not None:
+        index_name = catalog_index_match.group(1).lower()
+        if index_name in _PUBLICATION_SCHEMA_CATALOG_INDEXES:
+            return f"catalog_index_xinfo:{index_name}"
     if normalized == "PRAGMA TABLE_INFO(RUNTIME_PUBLICATIONS)":
         return "schema_probe"
     if normalized == "PRAGMA TABLE_INFO(CHECKPOINT_PAYLOAD_DELIVERY_ATTEMPTS)":
@@ -2344,14 +2388,15 @@ def _assert_publication_trace_contract(
     expected_handler_query_calls: int,
     expected_payload_delivery_page_calls: int,
 ) -> None:
-    # Existing-store validation runs against an isolated safety snapshot. This
-    # ledger covers only the subsequently opened measured main connection.
+    # Existing-store validation first runs against an isolated safety snapshot,
+    # then repeats on the measured main connection to close the snapshot/open
+    # race.  The latter includes the canonical v5 full-catalog probes below.
     expected = Counter(
         {
             "schema_probe": 1,
             "payload_attempt_schema_probe": 1,
             "keyset_collation_schema_probe": 1,
-            "v4_manifest_schema_probe": 1,
+            "v5_manifest_schema_probe": 1,
             "schema_table": 1,
             "schema_payload_attempt_table": 1,
             "domain_validation": 1,
@@ -2381,6 +2426,20 @@ def _assert_publication_trace_contract(
     )
     expected.update(
         {f"schema_index:{name}": 1 for name in _PUBLICATION_SCHEMA_INDEXES}
+    )
+    for table in _PUBLICATION_SCHEMA_CATALOG_TABLES:
+        expected.update(
+            {
+                f"catalog_table_xinfo:{table}": 1,
+                f"catalog_foreign_key_list:{table}": 1,
+                f"catalog_index_list:{table}": 1,
+            }
+        )
+    expected.update(
+        {
+            f"catalog_index_xinfo:{name}": 1
+            for name in _PUBLICATION_SCHEMA_CATALOG_INDEXES
+        }
     )
     if actual != expected:
         raise AssertionError(

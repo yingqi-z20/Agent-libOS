@@ -19,7 +19,11 @@ from agent_libos.models import ExternalEffectRecoveryQuery
 from agent_libos.runtime import RuntimeBuilder
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage.postgres import PostgresStore
-from agent_libos.storage.sql import SQLRuntimeStore, _V4_REQUIRED_COLUMNS
+from agent_libos.storage.sql import (
+    SQLRuntimeStore,
+    _V4_REQUIRED_COLUMNS,
+    _V5_REQUIRED_COLUMNS,
+)
 from benchmarks.external_effect_recovery import (
     BENCHMARK_PROFILES,
     run_recovery_scale_benchmark,
@@ -311,8 +315,15 @@ def test_runtime_assembly_select_allowlist_is_exact() -> None:
     )
 
 
-def test_startup_v4_manifest_schema_probe_allowlist_is_exact() -> None:
-    manifest_tables = sorted(_V4_REQUIRED_COLUMNS)
+@pytest.mark.parametrize(
+    ("version", "required_columns"),
+    [(4, _V4_REQUIRED_COLUMNS), (5, _V5_REQUIRED_COLUMNS)],
+)
+def test_startup_manifest_schema_probe_allowlist_is_exact(
+    version: int,
+    required_columns: dict[str, frozenset[str]],
+) -> None:
+    manifest_tables = sorted(required_columns)
 
     def manifest_probe(tables: list[str]) -> str:
         names = ", ".join(f"'{name}'" for name in tables)
@@ -324,7 +335,7 @@ def test_startup_v4_manifest_schema_probe_allowlist_is_exact() -> None:
     exact_probe = manifest_probe(manifest_tables)
     assert (
         recovery_runner._startup_statement_kind(exact_probe)
-        == "v4_manifest_schema_probe"
+        == f"v{version}_manifest_schema_probe"
     )
 
     near_or_arbitrary_probes = (
@@ -343,6 +354,42 @@ def test_startup_v4_manifest_schema_probe_allowlist_is_exact() -> None:
     assert all(
         recovery_runner._startup_statement_kind(probe) is None
         for probe in near_or_arbitrary_probes
+    )
+
+
+def test_startup_v5_catalog_probe_allowlist_is_exact() -> None:
+    assert (
+        recovery_runner._startup_statement_kind(
+            'PRAGMA table_xinfo("external_effects")'
+        )
+        == "catalog_table_xinfo"
+    )
+    assert (
+        recovery_runner._startup_statement_kind(
+            'PRAGMA foreign_key_list("external_effects")'
+        )
+        == "catalog_foreign_key_list"
+    )
+    assert (
+        recovery_runner._startup_statement_kind(
+            'PRAGMA index_list("external_effects")'
+        )
+        == "catalog_index_list"
+    )
+    assert (
+        recovery_runner._startup_statement_kind(
+            'PRAGMA index_xinfo("idx_external_effects_recovery_state")'
+        )
+        == "catalog_index_xinfo:idx_external_effects_recovery_state"
+    )
+    assert all(
+        recovery_runner._startup_statement_kind(probe) is None
+        for probe in (
+            "PRAGMA table_xinfo(external_effects)",
+            'PRAGMA table_xinfo("operations")',
+            'PRAGMA index_xinfo("idx_external_effects_not_canonical")',
+            'PRAGMA index_xinfo("idx_external_effects_recovery_state_extra")',
+        )
     )
 
 

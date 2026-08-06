@@ -3,7 +3,8 @@
 Agent libOS includes a local desktop management console for supervising
 Durable Task Runs, processes, messages, human approvals, AgentImage selection/registration/commit,
 checkpoints, capabilities, Skills, JSON-RPC endpoints, MCP servers, audit
-records, persisted LLM calls, and human Agent ratings.
+records, persisted LLM calls, semantic Shadow assessments, and human Agent
+ratings.
 
 The GUI is a local-only Electron app. Electron starts
 `agent-libos-gui-server`, receives a bearer token that is random by default,
@@ -29,13 +30,17 @@ Electron main process
 React renderer
   -> receives the bearer token through preload and calls localhost HTTP APIs
   -> subscribes to /api/events/stream
-  -> renders process, message, approval, audit, and LLM state
+  -> renders process, message, approval, audit, LLM, and semantic evidence
 
 Python GUI server
   -> owns Runtime.open(db)
   -> routes all operations through existing runtime managers
   -> never grants capability by GUI visibility
 ```
+
+Semantic history is deliberately not embedded in `/api/snapshot`; the renderer
+loads bounded keyset pages only when the Semantic tab is opened. This keeps the
+existing snapshot bound independent of assessment-history size.
 
 SSE sequence ids are scoped to one GUI-server process and the replay buffer is
 bounded. A reconnecting client sends its last id as `cursor`. If that cursor is
@@ -560,7 +565,7 @@ Either kind of lookahead becomes a `source_limited` lower-bound entry in
 Event and audit rows persist a derived `gui_snapshot_visible` flag. Snapshot
 queries filter that indexed flag before applying `LIMIT`, preventing internal
 GUI-presentation evidence from displacing causal runtime rows. The flag is
-required by store schema v4; missing or malformed persisted visibility state is
+required by store schema v5; missing or malformed persisted visibility state is
 rejected rather than repaired during open. Bounded event/audit page endpoints
 can still include presentation evidence when requested.
 The process window orders non-terminal processes before the most recently
@@ -574,6 +579,44 @@ batch queries. Message and LLM windows select the newest configured rows per
 process; messages are returned chronologically. Snapshot construction therefore
 does not issue one message, LLM-call, rating, or resource query for every listed
 process.
+
+## Semantic Shadow Panel
+
+The read-only Semantic tab is available at Host scope and process scope; the
+latter adds the selected `pid` filter. It fetches status and assessment history
+on demand rather than extending the Runtime snapshot. A page contains at most
+50 rows in the bundled UI, and “load more” follows the opaque keyset cursor
+while de-duplicating by `assessment_id`.
+
+The panel shows queue health, aggregate success/error/OOD and Shadow outcome
+counts, domain/status history filters, reason codes, normalized observed Human
+outcome, action, calibration, reserved nullable input/output token and cost
+fields, latency, classifier identity, matched rule/predicate codes, and input/policy/
+classifier-artifact/manifest/action/resource/arguments/state/source/Sink/tool/
+provider/projection/tenant digests.
+It does not render a prompt, goal/provider content, raw response, job
+projection, model explanation, or hidden reasoning. Structured strings are
+rendered as inert text. The same-build TypeScript decoder requires status
+schema v2 with complete exact-key `by_status` and `by_domain` maps, consistent
+aggregate totals, and strict real-auto-approval `0 / 0 / null`. Assessment
+page/detail envelopes and rows remain schema v1. Their decoders require exact
+keys and enum/digest/confidence/span shapes and reject unknown or private fields
+before React receives them.
+
+The panel shows validated external classifier token/cost counters when present
+and shows deterministic/scripted, missing, conflicting, or untrusted counters
+as unavailable. The API projection contains only the three nullable canonical
+integers—never token aliases, unknown provider usage keys, or the raw usage
+object. Each non-null value is a non-negative JavaScript-safe integer through
+`2^53 - 1`. Values are provider-reported telemetry rather than authoritative
+billing or classifier-quality metrics, and the status response does not
+aggregate them.
+
+Because Phase 0+1 cannot auto-approve, the real auto-approval denominator is
+zero and its rate is JSON `null`. The UI displays that value as not applicable,
+not as a misleading 0% rate. All controls are filters or pagination; the panel
+contains no semantic mutation control. See [Semantic Approval and Data
+Identification](semantic_shadow.md#inspection-surfaces).
 
 ## High-Risk Operations
 
@@ -714,6 +757,13 @@ Important endpoints:
   `GET /api/operations/resolve?kind=...&id=...` for host-only deterministic
   operation explanations. List/detail responses support cursor pagination;
   ambiguous evidence resolution returns `409` with candidate causal roots.
+- `GET /api/semantic/status`, `GET /api/semantic/assessments`, and
+  `GET /api/semantic/assessments/{assessment_id}` expose payload-free Shadow
+  evidence. The list accepts only `pid`, `request_id`, `operation_id`, `kind`,
+  `status`, `domain`, `action_id`, `tenant_bucket_sha256`, `after`, and `limit`;
+  the action is a dotted lower-case ontology id and the tenant bucket is an
+  exact lower-case SHA-256 digest. The default is 50 and the hard HTTP maximum
+  is 100. There are no semantic write routes.
 - `POST /api/workflows/run`
 - `GET /api/task-runs`, `POST /api/task-runs`, and
   `GET /api/task-runs/{run_id}` for Durable Task Run collection/detail state.
@@ -728,7 +778,7 @@ Important endpoints:
   Collection, ledger, and Human pages accept opaque `cursor` values and return
   `next_cursor`; clients must not parse or synthesize them. The embedded
   requirements page also returns `next_cursor`. Requirement changes are linked
-  ledger items, and 1.3.4 has no independent Task Run requirements or wait HTTP
+  ledger items, and 1.4.0 has no independent Task Run requirements or wait HTTP
   route.
 - `POST /api/task-runs/{run_id}/run|pause|resume|cancel|follow-ups|recover|rerun`.
   Every existing-Run mutation carries a command id and expected revision.

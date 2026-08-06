@@ -7,7 +7,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator
 
 from agent_libos.config import AgentLibOSConfig
 from agent_libos.llm.client import LLMClient
@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     from agent_libos.runtime.syscall_router import SyscallRouter
     from agent_libos.runtime.task_runs import TaskRunManager
     from agent_libos.sdk import ProtectedOperationSDK
+    from agent_libos.semantic.service import SemanticManager
     from agent_libos.skills.manager import SkillManager
     from agent_libos.storage import UnitOfWork
     from agent_libos.tools.broker import ToolBroker
@@ -149,6 +150,9 @@ class Runtime:
     memory: ObjectMemoryManager
     data_flow: DataFlowManager
     protected_operations: ProtectedOperationSDK
+    semantic: SemanticManager
+    _semantic_assessor_override: Any | None
+    _semantic_tenant_bucketer_override: Callable[[str], str] | None
     external_primitive_boundary_names: frozenset[str]
     process: ProcessManager
     process_transitions: ProcessTransitionService
@@ -216,9 +220,13 @@ class Runtime:
         startup_module_manifests: list[str | Path] | tuple[str | Path, ...] | None = None,
         trusted_modules: list[str] | tuple[str, ...] | None = None,
         trusted_module_sha256: list[str] | tuple[str, ...] | None = None,
+        semantic_assessor: Any | None = None,
+        semantic_tenant_bucketer: Callable[[str], str] | None = None,
     ):
         from agent_libos.runtime.builder import RuntimeBuilder
 
+        self._semantic_assessor_override = semantic_assessor
+        self._semantic_tenant_bucketer_override = semantic_tenant_bucketer
         RuntimeBuilder.assemble_existing(
             self,
             store,
@@ -239,6 +247,8 @@ class Runtime:
         module_manifests: list[str | Path] | tuple[str | Path, ...] | None = None,
         trusted_modules: list[str] | tuple[str, ...] | None = None,
         trusted_module_sha256: list[str] | tuple[str, ...] | None = None,
+        semantic_assessor: Any | None = None,
+        semantic_tenant_bucketer: Callable[[str], str] | None = None,
     ) -> "Runtime":
         from agent_libos.runtime.builder import RuntimeBuilder
 
@@ -249,6 +259,8 @@ class Runtime:
             module_manifests=module_manifests,
             trusted_modules=trusted_modules,
             trusted_module_sha256=trusted_module_sha256,
+            semantic_assessor=semantic_assessor,
+            semantic_tenant_bucketer=semantic_tenant_bucketer,
         ).open(target)
 
     @classmethod
@@ -260,6 +272,8 @@ class Runtime:
         module_manifests: list[str | Path] | tuple[str | Path, ...] | None = None,
         trusted_modules: list[str] | tuple[str, ...] | None = None,
         trusted_module_sha256: list[str] | tuple[str, ...] | None = None,
+        semantic_assessor: Any | None = None,
+        semantic_tenant_bucketer: Callable[[str], str] | None = None,
     ) -> "Runtime":
         """Assemble a Runtime in a blocking worker with caller-loop coordination."""
 
@@ -272,6 +286,8 @@ class Runtime:
             module_manifests=module_manifests,
             trusted_modules=trusted_modules,
             trusted_module_sha256=trusted_module_sha256,
+            semantic_assessor=semantic_assessor,
+            semantic_tenant_bucketer=semantic_tenant_bucketer,
         ).aopen(target)
 
     def shutdown(self, *, actor: str = "runtime", reason: str = "runtime.shutdown") -> dict[str, Any]:

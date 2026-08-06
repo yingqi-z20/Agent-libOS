@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
@@ -59,6 +60,35 @@ _UNREQUESTABLE_ROOT_PREFIX_RIGHTS = frozenset(
         CapabilityRight.DELETE.value,
     }
 )
+
+_SEMANTIC_AUTO_APPROVAL_POLICY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "rules",
+    }
+)
+
+_SEMANTIC_AUTO_APPROVAL_RULE_FIELDS = frozenset(
+    {
+        "rule_id",
+        "authority_operation",
+        "resource",
+        "rights",
+    }
+)
+
+# This is deliberately a closed, Host-owned registry.  Operations omitted
+# here can still be assessed in shadow mode, but a manifest cannot make them
+# eligible for automatic authority.  In particular, shell and remote provider
+# calls are not safe merely because a model classifies one invocation as low
+# risk.
+_SEMANTIC_AUTO_APPROVAL_OPERATIONS: dict[str, tuple[str, frozenset[str]]] = {
+    "filesystem.read": ("filesystem", frozenset({CapabilityRight.READ.value})),
+    "git.read": ("git", frozenset({CapabilityRight.READ.value})),
+    "git.diff": ("git", frozenset({CapabilityRight.DIFF.value})),
+}
+
+_SEMANTIC_AUTO_APPROVAL_RULE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 
 class AuthorityManifestManager:
@@ -119,18 +149,7 @@ class AuthorityManifestManager:
         if parent_is_ceiling:
             self._require_budget_attenuated(parent.resource_budget, selected_budget)
 
-        parent_approval_policy = dict(parent.approval_policy) if parent is not None else {}
-        supplied_approval_policy = self._mapping(
-            payload.get("approval_policy"),
-            "approval_policy",
-        )
-        approval_policy = {**parent_approval_policy, **supplied_approval_policy}
-        if "requestable_capabilities" in approval_policy:
-            approval_policy["requestable_capabilities"] = (
-                self._normalize_requestable_specs(
-                    approval_policy["requestable_capabilities"]
-                )
-            )
+        approval_policy = self._approval_policy_for_launch(parent, payload)
         permitted_effects = self._effect_classes(
             payload["permitted_effects"]
             if "permitted_effects" in payload
@@ -161,9 +180,16 @@ class AuthorityManifestManager:
                 parent.approval_policy,
                 approval_policy,
                 label="approval_policy",
-                ignored_keys={"requestable_capabilities"},
+                ignored_keys={
+                    "requestable_capabilities",
+                    "semantic_auto_approval",
+                },
             )
         if parent is not None:
+            self._require_semantic_auto_approval_attenuated(
+                parent.approval_policy.get("semantic_auto_approval"),
+                approval_policy.get("semantic_auto_approval"),
+            )
             self._require_data_flow_policy_attenuated(
                 parent_data_flow_policy,
                 data_flow_policy,
@@ -307,6 +333,13 @@ class AuthorityManifestManager:
         if source_is_ceiling and source is not None:
             self._require_budget_attenuated(source.resource_budget, selected_budget)
         now = utc_now()
+        approval_policy = dict(source.approval_policy) if source is not None else {}
+        if "semantic_auto_approval" in approval_policy:
+            approval_policy["semantic_auto_approval"] = (
+                self._normalize_semantic_auto_approval_policy(
+                    approval_policy["semantic_auto_approval"]
+                )
+            )
         manifest = TaskAuthorityManifest(
             manifest_id=new_id("authm"),
             pid=target_pid,
@@ -320,7 +353,7 @@ class AuthorityManifestManager:
                 else None
             ),
             resource_budget=selected_budget,
-            approval_policy=dict(source.approval_policy) if source is not None else {},
+            approval_policy=approval_policy,
             data_flow_policy=dict(source.data_flow_policy) if source is not None else {},
             expires_at=source.expires_at if source is not None else None,
             issued_by=issued_by,
@@ -421,6 +454,104 @@ class AuthorityManifestManager:
             f"permission request exceeds task authority manifest: "
             f"{spec['resource']} rights={spec['rights']}"
         )
+
+    def semantic_auto_approval_candidate(
+        self,
+        pid: str,
+        *,
+        authority_operation: str,
+        resource: str,
+        rights: Iterable[str | CapabilityRight],
+    ) -> dict[str, Any] | None:
+        """Return Host ceiling evidence for one exact shadow candidate.
+
+        This method is deliberately side-effect free.  A match is only proof
+        that the proposed operation falls inside a Host-reviewed ceiling; it
+        is not a permit and cannot settle a Human request or issue a
+        Capability.  Unsupported domains and non-exact requests simply have
+        no candidate.
+        """
+
+        manifest = self.get_for_process(pid)
+        if manifest is None:
+            return None
+        self._require_live(manifest)
+
+        selected_operation = self._semantic_authority_operation(
+            authority_operation,
+            require_supported=False,
+        )
+        operation_contract = _SEMANTIC_AUTO_APPROVAL_OPERATIONS.get(
+            selected_operation
+        )
+        if operation_contract is None:
+            return None
+
+        if not isinstance(resource, str) or resource != resource.strip():
+            raise ValidationError(
+                "semantic auto-approval candidate resource must be a canonical string"
+            )
+        try:
+            resource_pattern = self.capabilities.parse_resource_pattern(
+                resource,
+                requested=True,
+            )
+        except CapabilityDenied as exc:
+            raise ValidationError(
+                f"invalid semantic auto-approval candidate resource: {exc}"
+            ) from exc
+        if resource_pattern.raw != resource:
+            raise ValidationError(
+                "semantic auto-approval candidate resource must be canonical"
+            )
+        expected_kind, allowed_rights = operation_contract
+        if (
+            resource_pattern.scope is not ResourceScope.EXACT
+            or resource_pattern.kind != expected_kind
+        ):
+            return None
+
+        selected_rights = self._semantic_auto_approval_rights(
+            rights,
+            label="semantic auto-approval candidate rights",
+            require_list=False,
+        )
+        if not set(selected_rights).issubset(allowed_rights):
+            return None
+
+        policy = self._normalize_semantic_auto_approval_policy(
+            manifest.approval_policy.get("semantic_auto_approval")
+        )
+        requested_spec = {
+            "resource": resource,
+            "rights": selected_rights,
+        }
+        for rule in policy["rules"]:
+            if rule["authority_operation"] != selected_operation:
+                continue
+            if not self.capabilities.spec_covers(
+                {
+                    "resource": rule["resource"],
+                    "rights": rule["rights"],
+                },
+                requested_spec,
+            ):
+                continue
+            return {
+                "schema_version": 1,
+                "rule_id": rule["rule_id"],
+                "authority_operation": rule["authority_operation"],
+                # Bind the returned evidence to the exact candidate, never to
+                # the (possibly wildcard) ceiling that happened to match it.
+                "resource": resource,
+                "rights": list(selected_rights),
+                "manifest_id": manifest.manifest_id,
+                "manifest_sha256": manifest.manifest_hash,
+                "policy_sha256": hashlib.sha256(
+                    dumps(policy).encode("utf-8")
+                ).hexdigest(),
+            }
+        return None
 
     def assert_effect(self, pid: str, effect_class: str) -> None:
         manifest = self.get_for_process(pid)
@@ -563,6 +694,10 @@ class AuthorityManifestManager:
             for raw in raw_values:
                 if not isinstance(raw, dict):
                     continue
+                if "constraints" in raw and raw.get("constraints") != {}:
+                    raise ValidationError(
+                        "requestable capability constraints must be an empty object"
+                    )
                 if "uses_remaining" in raw:
                     raise ValidationError(
                         "requestable capability uses_remaining is not supported"
@@ -586,10 +721,6 @@ class AuthorityManifestManager:
                     "requestable capability root-prefix authority cannot include "
                     f"privileged rights: resource={spec['resource']} rights={privileged}"
                 )
-            if "constraints" in raw and raw.get("constraints") != {}:
-                raise ValidationError(
-                    "requestable capability constraints must be an empty object"
-                )
             if spec.get("delegable") is not False:
                 raise ValidationError(
                     "requestable capability delegable must be false"
@@ -599,6 +730,199 @@ class AuthorityManifestManager:
                     "requestable capability revocable must be true"
                 )
         return selected
+
+    def _approval_policy_for_launch(
+        self,
+        parent: TaskAuthorityManifest | None,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        parent_policy = dict(parent.approval_policy) if parent is not None else {}
+        supplied_policy = self._mapping(
+            payload.get("approval_policy"),
+            "approval_policy",
+        )
+        supplied_semantic_policy = (
+            self._normalize_semantic_auto_approval_policy(
+                supplied_policy["semantic_auto_approval"]
+            )
+            if "semantic_auto_approval" in supplied_policy
+            else None
+        )
+        selected = {**parent_policy, **supplied_policy}
+        # Semantic auto-approval is authority-shaping and therefore never
+        # inherits implicitly.  Omission (like null or an empty rule set) is a
+        # deny-all ceiling.  Keep the key absent when it was absent so legacy
+        # and otherwise unrelated manifest payloads are not rewritten.
+        selected.pop("semantic_auto_approval", None)
+        if supplied_semantic_policy is not None:
+            selected["semantic_auto_approval"] = supplied_semantic_policy
+        if "requestable_capabilities" in selected:
+            selected["requestable_capabilities"] = (
+                self._normalize_requestable_specs(
+                    selected["requestable_capabilities"]
+                )
+            )
+        return selected
+
+    def _normalize_semantic_auto_approval_policy(
+        self,
+        value: Any,
+    ) -> dict[str, Any]:
+        if value is None:
+            return {"schema_version": 1, "rules": []}
+        if not isinstance(value, dict):
+            raise ValidationError(
+                "approval_policy.semantic_auto_approval must be an object or null"
+            )
+        self._reject_unknown_fields(
+            value,
+            _SEMANTIC_AUTO_APPROVAL_POLICY_FIELDS,
+            label="approval_policy.semantic_auto_approval",
+        )
+        if set(value) != set(_SEMANTIC_AUTO_APPROVAL_POLICY_FIELDS):
+            missing = sorted(
+                set(_SEMANTIC_AUTO_APPROVAL_POLICY_FIELDS) - set(value)
+            )
+            raise ValidationError(
+                "approval_policy.semantic_auto_approval is missing required fields: "
+                f"{missing}"
+            )
+        schema_version = value["schema_version"]
+        if type(schema_version) is not int or schema_version != 1:
+            raise ValidationError(
+                "unsupported approval_policy.semantic_auto_approval schema_version"
+            )
+        raw_rules = value["rules"]
+        if not isinstance(raw_rules, list):
+            raise ValidationError(
+                "approval_policy.semantic_auto_approval.rules must be a list"
+            )
+        rules: list[dict[str, Any]] = []
+        rule_ids: set[str] = set()
+        for index, raw_rule in enumerate(raw_rules):
+            rule = self._normalize_semantic_auto_approval_rule(
+                raw_rule,
+                index=index,
+            )
+            if rule["rule_id"] in rule_ids:
+                raise ValidationError(
+                    "approval_policy.semantic_auto_approval contains duplicate "
+                    f"rule_id: {rule['rule_id']}"
+                )
+            rule_ids.add(rule["rule_id"])
+            rules.append(rule)
+        rules.sort(key=lambda rule: rule["rule_id"])
+        return {"schema_version": 1, "rules": rules}
+
+    def _normalize_semantic_auto_approval_rule(
+        self,
+        value: Any,
+        *,
+        index: int,
+    ) -> dict[str, Any]:
+        label = f"approval_policy.semantic_auto_approval.rules[{index}]"
+        if not isinstance(value, dict):
+            raise ValidationError(f"{label} must be an object")
+        self._reject_unknown_fields(
+            value,
+            _SEMANTIC_AUTO_APPROVAL_RULE_FIELDS,
+            label=label,
+        )
+        if set(value) != set(_SEMANTIC_AUTO_APPROVAL_RULE_FIELDS):
+            missing = sorted(set(_SEMANTIC_AUTO_APPROVAL_RULE_FIELDS) - set(value))
+            raise ValidationError(f"{label} is missing required fields: {missing}")
+
+        rule_id = value["rule_id"]
+        if (
+            not isinstance(rule_id, str)
+            or _SEMANTIC_AUTO_APPROVAL_RULE_ID.fullmatch(rule_id) is None
+        ):
+            raise ValidationError(
+                f"{label}.rule_id must be a canonical Host rule identifier"
+            )
+
+        authority_operation = self._semantic_authority_operation(
+            value["authority_operation"],
+            require_supported=True,
+        )
+        expected_kind, allowed_rights = _SEMANTIC_AUTO_APPROVAL_OPERATIONS[
+            authority_operation
+        ]
+
+        resource = value["resource"]
+        if not isinstance(resource, str) or resource != resource.strip():
+            raise ValidationError(f"{label}.resource must be a canonical string")
+        try:
+            resource_pattern = self.capabilities.parse_resource_pattern(resource)
+        except CapabilityDenied as exc:
+            raise ValidationError(f"invalid {label}.resource: {exc}") from exc
+        if resource_pattern.raw != resource:
+            raise ValidationError(f"{label}.resource must be canonical")
+        if resource_pattern.kind != expected_kind:
+            raise ValidationError(
+                f"{label}.resource kind must be {expected_kind!r} for "
+                f"{authority_operation}"
+            )
+
+        rights = self._semantic_auto_approval_rights(
+            value["rights"],
+            label=f"{label}.rights",
+            require_list=True,
+        )
+        if not set(rights).issubset(allowed_rights):
+            raise ValidationError(
+                f"{label}.rights are unsupported for {authority_operation}: {rights}"
+            )
+        return {
+            "rule_id": rule_id,
+            "authority_operation": authority_operation,
+            "resource": resource,
+            "rights": rights,
+        }
+
+    @staticmethod
+    def _semantic_authority_operation(
+        value: Any,
+        *,
+        require_supported: bool,
+    ) -> str:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or "*" in value
+            or "\x00" in value
+        ):
+            raise ValidationError(
+                "semantic auto-approval authority_operation must be a canonical exact string"
+            )
+        if require_supported and value not in _SEMANTIC_AUTO_APPROVAL_OPERATIONS:
+            raise ValidationError(
+                f"unsupported semantic auto-approval authority_operation: {value}"
+            )
+        return value
+
+    @staticmethod
+    def _semantic_auto_approval_rights(
+        value: Any,
+        *,
+        label: str,
+        require_list: bool,
+    ) -> list[str]:
+        valid_types = {list} if require_list else {list, tuple, set, frozenset}
+        if type(value) not in valid_types:
+            raise ValidationError(f"{label} must be a declared rights collection")
+        if any(not isinstance(right, str) for right in value):
+            raise ValidationError(f"{label} entries must be strings")
+        try:
+            rights = [CapabilityRight(right).value for right in value]
+        except ValueError as exc:
+            raise ValidationError(f"{label} contains an unknown right: {exc}") from exc
+        if not rights:
+            raise ValidationError(f"{label} must not be empty")
+        if len(set(rights)) != len(rights):
+            raise ValidationError(f"{label} must not contain duplicates")
+        return sorted(rights)
 
     def _normalize_data_flow_policy(self, value: Any) -> dict[str, Any]:
         selected = self._mapping(value, "data_flow_policy")
@@ -675,10 +999,16 @@ class AuthorityManifestManager:
         rights = sorted({CapabilityRight(str(right)).value for right in value.get("rights", [])})
         if not rights:
             raise ValidationError("authority manifest capability entry requires rights")
+        constraints: dict[str, Any] = {}
+        if "constraints" in value:
+            raw_constraints = value["constraints"]
+            if type(raw_constraints) is not dict:
+                raise ValidationError("capability constraints must be an object")
+            constraints = dict(raw_constraints)
         selected: dict[str, Any] = {
             "resource": resource,
             "rights": rights,
-            "constraints": self._mapping(value.get("constraints"), "capability constraints"),
+            "constraints": constraints,
             "delegable": self._capability_boolean(value, "delegable", default=False),
             "revocable": self._capability_boolean(value, "revocable", default=True),
         }
@@ -701,6 +1031,14 @@ class AuthorityManifestManager:
             if max_depth < 0:
                 raise ValidationError("max_delegation_depth must be a non-negative integer")
             selected["max_delegation_depth"] = max_depth
+        # Reuse the public Capability coverage boundary as strict admission
+        # validation.  A canonical ALLOW spec must cover itself; malformed,
+        # unknown, null, or wrongly typed constraints raise before a manifest
+        # row or its audit evidence can be published.
+        if not self.capabilities.spec_covers(selected, selected):
+            raise ValidationError(
+                "authority manifest capability entry is not self-covering"
+            )
         return selected
 
     def _require_spec_covered(
@@ -755,6 +1093,44 @@ class AuthorityManifestManager:
                 spec,
                 label="derived child requestable capability",
             )
+
+    def _require_semantic_auto_approval_attenuated(
+        self,
+        parent_value: Any,
+        child_value: Any,
+    ) -> None:
+        parent = self._normalize_semantic_auto_approval_policy(parent_value)
+        child = self._normalize_semantic_auto_approval_policy(child_value)
+        parent_rules = {rule["rule_id"]: rule for rule in parent["rules"]}
+        for child_rule in child["rules"]:
+            parent_rule = parent_rules.get(child_rule["rule_id"])
+            if parent_rule is None:
+                raise CapabilityDenied(
+                    "derived child semantic_auto_approval cannot add rule_id "
+                    f"outside parent ceiling: {child_rule['rule_id']}"
+                )
+            if (
+                child_rule["authority_operation"]
+                != parent_rule["authority_operation"]
+            ):
+                raise CapabilityDenied(
+                    "derived child semantic_auto_approval cannot change "
+                    f"authority_operation for rule_id {child_rule['rule_id']}"
+                )
+            if not self.capabilities.spec_covers(
+                {
+                    "resource": parent_rule["resource"],
+                    "rights": parent_rule["rights"],
+                },
+                {
+                    "resource": child_rule["resource"],
+                    "rights": child_rule["rights"],
+                },
+            ):
+                raise CapabilityDenied(
+                    "derived child semantic_auto_approval cannot widen resource or "
+                    f"rights for rule_id {child_rule['rule_id']}"
+                )
 
     def _require_effects_attenuated(
         self,

@@ -927,7 +927,7 @@ Independent version namespaces appear in this document:
 Changing one of these versions does not change or authorize either of the
 others.
 
-Git does not add another checkpoint schema. RuntimeStore uses schema v4 and
+Git does not add another checkpoint schema. RuntimeStore uses schema v5 and
 checkpoint snapshots remain v4. Image packages continue to reject `.git`
 metadata and do not embed managed worktrees or remote state.
 

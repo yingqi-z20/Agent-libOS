@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import math
+import re
 import secrets
 import threading
 import time
@@ -47,6 +48,9 @@ from agent_libos.models import (
     ProcessMessageKind,
     ProcessSignal,
     ProcessStatus,
+    SEMANTIC_REDACTED_INTENT_MAX_CHARS,
+    SemanticAssessmentKind,
+    SemanticDataLocator,
     TaskRunSpecV1,
     process_state_to_mapping,
 )
@@ -81,6 +85,93 @@ _GUI_LLM_REASONING_MAX_NODES = 4_096
 _GUI_LLM_REASONING_TEXT_MAX_CHARS = 262_144
 _GUI_LLM_REASONING_TEXT_MAX_BYTES = 1_048_576
 _GUI_LLM_REASONING_AGGREGATE_BYTES = 2 * 1_048_576
+_SEMANTIC_ASSESSMENT_PAGE_DEFAULT = 50
+_SEMANTIC_ASSESSMENT_PAGE_MAX = 100
+_SEMANTIC_CURSOR_MAX_CHARS = 2_048
+_SEMANTIC_FILTER_MAX_CHARS = 512
+_SEMANTIC_ID_MAX_CHARS = 512
+_SEMANTIC_ACTION_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
+_SEMANTIC_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_SEMANTIC_HUMAN_OUTCOMES = frozenset(
+    {"pending", "approved", "rejected", "edited", "cancelled", "delivered"}
+)
+_SEMANTIC_ASSESSMENT_KINDS = (
+    "approval",
+    "root_goal",
+    "provider_ingress",
+)
+_SEMANTIC_ASSESSMENT_STATUSES = (
+    "success",
+    "skipped_policy",
+    "egress_blocked",
+    "timeout",
+    "provider_error",
+    "provider_outcome_unknown",
+    "invalid_schema",
+    "ood",
+    "abstained",
+    "stale_input",
+)
+_SEMANTIC_ASSESSMENT_DOMAINS = (
+    "filesystem",
+    "shell",
+    "git",
+    "jsonrpc",
+    "mcp",
+    "runtime",
+    "unknown",
+)
+_SEMANTIC_COARSE_DATA_LOCATOR_BY_KIND = {
+    SemanticAssessmentKind.APPROVAL.value: SemanticDataLocator.APPROVAL_REQUEST.value,
+    SemanticAssessmentKind.ROOT_GOAL.value: SemanticDataLocator.ROOT_GOAL.value,
+    SemanticAssessmentKind.PROVIDER_INGRESS.value: SemanticDataLocator.PROVIDER_RESULT.value,
+}
+_SEMANTIC_ASSESSMENT_QUERY_KEYS = frozenset(
+    {
+        "pid",
+        "request_id",
+        "operation_id",
+        "kind",
+        "status",
+        "domain",
+        "action_id",
+        "tenant_bucket_sha256",
+        "after",
+        "limit",
+    }
+)
+_SEMANTIC_ASSESSMENT_SUMMARY_FIELDS = (
+    "assessment_id",
+    "job_id",
+    "kind",
+    "status",
+    "domain",
+    "action_id",
+    "pid",
+    "request_id",
+    "operation_id",
+    "effect_id",
+    "shadow_outcome",
+    "reason_codes",
+    "ood",
+    "abstain",
+    "confidence_bps",
+    "calibration_bucket",
+    "input_tokens",
+    "output_tokens",
+    "cost_microunits",
+    "classifier_id",
+    "classifier_version",
+    "artifact_sha256",
+    "input_sha256",
+    "feature_snapshot_sha256",
+    "policy_sha256",
+    "tenant_bucket_sha256",
+    "created_at",
+    "completed_at",
+    "latency_ms",
+    "human_outcome",
+)
 _GUI_LLM_CONTENT_FIELDS = frozenset(
     {
         "messages",
@@ -3123,7 +3214,30 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
 
     def _dispatch_in_runtime_scope(self, method: str, parsed: Any) -> tuple[Any, bool]:
         path = parsed.path
-        query = parse_qs(parsed.query)
+        # Semantic endpoints have a strict query contract.  Retain blank
+        # values there so ``?unknown=`` and ``?after=`` cannot disappear
+        # during parsing and accidentally bypass validation.
+        semantic_path = path == "/api/semantic" or path.startswith("/api/semantic/")
+        if semantic_path:
+            try:
+                query = parse_qs(
+                    parsed.query,
+                    keep_blank_values=True,
+                    max_num_fields=32,
+                )
+            except ValueError as exc:
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "invalid semantic query string",
+                    details={"code": "invalid_semantic_query"},
+                ) from exc
+        else:
+            query = parse_qs(parsed.query)
+        if semantic_path:
+            parts = [unquote(part) for part in path.strip("/").split("/") if part]
+            with self.server.service.runtime_user():
+                result = self._dispatch_semantic(method, parts[2:], query)
+            return result, False
         if method == "GET" and path == "/api/health":
             # Health remains non-blocking on ``runtime_lock``, but it still
             # reads the Runtime store and therefore must drain before close.
@@ -3232,6 +3346,85 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         if len(route) >= 1 and route[0] == "modules":
             return self._dispatch_modules(method, route[1:])
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown endpoint")
+
+    def _dispatch_semantic(
+        self,
+        method: str,
+        route: list[str],
+        query: dict[str, list[str]],
+    ) -> Any:
+        if method != "GET":
+            raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown semantic endpoint")
+
+        semantic = self.server.service.runtime.semantic
+        if route == ["status"]:
+            _require_semantic_query_contract(query, allowed=frozenset())
+            return _semantic_status_payload(semantic.status())
+
+        if route == ["assessments"]:
+            _require_semantic_query_contract(
+                query,
+                allowed=_SEMANTIC_ASSESSMENT_QUERY_KEYS,
+            )
+            limit = _bounded_query_limit(
+                query,
+                "limit",
+                default=_SEMANTIC_ASSESSMENT_PAGE_DEFAULT,
+                maximum=_SEMANTIC_ASSESSMENT_PAGE_MAX,
+            )
+            page = semantic.query_assessments(
+                pid=_semantic_query_value(query, "pid"),
+                request_id=_semantic_query_value(query, "request_id"),
+                operation_id=_semantic_query_value(query, "operation_id"),
+                kind=_semantic_query_enum_value(
+                    query,
+                    "kind",
+                    allowed=_SEMANTIC_ASSESSMENT_KINDS,
+                ),
+                status=_semantic_query_enum_value(
+                    query,
+                    "status",
+                    allowed=_SEMANTIC_ASSESSMENT_STATUSES,
+                ),
+                domain=_semantic_query_enum_value(
+                    query,
+                    "domain",
+                    allowed=_SEMANTIC_ASSESSMENT_DOMAINS,
+                ),
+                action_id=_semantic_action_id_query_value(query),
+                tenant_bucket_sha256=_semantic_sha256_query_value(
+                    query,
+                    "tenant_bucket_sha256",
+                ),
+                after=_semantic_query_value(
+                    query,
+                    "after",
+                    maximum=_SEMANTIC_CURSOR_MAX_CHARS,
+                ),
+                limit=limit,
+            )
+            items, next_cursor = _semantic_assessment_page(
+                page,
+                maximum_items=limit,
+            )
+            return {
+                "schema_version": 1,
+                "items": [_semantic_assessment_summary(item) for item in items],
+                "next_cursor": _semantic_response_cursor(next_cursor),
+            }
+
+        if len(route) == 2 and route[0] == "assessments":
+            _require_semantic_query_contract(query, allowed=frozenset())
+            assessment_id = _semantic_path_id(route[1], "assessment_id")
+            assessment = semantic.get_assessment(assessment_id)
+            if assessment is None:
+                raise NotFound(f"semantic assessment not found: {assessment_id}")
+            return {
+                "schema_version": 1,
+                "assessment": _semantic_assessment_detail(assessment),
+            }
+
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown semantic endpoint")
 
     def _dispatch_operations(
         self,
@@ -5005,6 +5198,494 @@ def _bounded_query_limit(
 def _query_str(query: dict[str, list[str]], key: str) -> str | None:
     values = query.get(key)
     return values[0] if values else None
+
+
+def _require_semantic_query_contract(
+    query: dict[str, list[str]],
+    *,
+    allowed: frozenset[str],
+) -> None:
+    unknown = sorted(set(query) - allowed)
+    if unknown:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "unknown semantic query parameter",
+            details={"code": "unknown_query_parameter", "parameters": unknown},
+        )
+    duplicate = sorted(key for key, values in query.items() if len(values) != 1)
+    if duplicate:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "semantic query parameters must not be repeated",
+            details={"code": "duplicate_query_parameter", "parameters": duplicate},
+        )
+    empty = sorted(key for key, values in query.items() if not values[0].strip())
+    if empty:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "semantic query parameters must not be empty",
+            details={"code": "empty_query_parameter", "parameters": empty},
+        )
+
+
+def _semantic_query_value(
+    query: dict[str, list[str]],
+    key: str,
+    *,
+    maximum: int = _SEMANTIC_FILTER_MAX_CHARS,
+) -> str | None:
+    value = _query_str(query, key)
+    if value is None:
+        return None
+    if len(value) > maximum or any(not character.isprintable() for character in value):
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            f"{key} must be bounded printable text",
+            details={"code": "invalid_semantic_query_value", "parameter": key},
+        )
+    return value
+
+
+def _semantic_action_id_query_value(
+    query: dict[str, list[str]],
+) -> str | None:
+    value = _semantic_query_value(query, "action_id", maximum=128)
+    if value is not None and _SEMANTIC_ACTION_ID_PATTERN.fullmatch(value) is None:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "action_id must be a dotted lower-case identifier",
+            details={"code": "invalid_semantic_action_id"},
+        )
+    return value
+
+
+def _semantic_query_enum_value(
+    query: dict[str, list[str]],
+    key: str,
+    *,
+    allowed: tuple[str, ...],
+) -> str | None:
+    value = _semantic_query_value(query, key, maximum=64)
+    if value is not None and value not in allowed:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            f"{key} is not a supported semantic value",
+            details={"code": "invalid_semantic_query_value", "parameter": key},
+        )
+    return value
+
+
+def _semantic_sha256_query_value(
+    query: dict[str, list[str]],
+    key: str,
+) -> str | None:
+    value = _semantic_query_value(query, key, maximum=64)
+    if value is not None and _SEMANTIC_SHA256_PATTERN.fullmatch(value) is None:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            f"{key} must be a lowercase SHA-256 digest",
+            details={"code": "invalid_semantic_sha256", "parameter": key},
+        )
+    return value
+
+
+def _semantic_path_id(value: str, name: str) -> str:
+    if (
+        not value.strip()
+        or len(value) > _SEMANTIC_ID_MAX_CHARS
+        or any(not character.isprintable() for character in value)
+    ):
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            f"invalid semantic {name}",
+            details={"code": "invalid_semantic_id", "field": name},
+        )
+    return value
+
+
+def _semantic_mapping(value: Any) -> dict[str, Any]:
+    projected = to_jsonable(value)
+    if not isinstance(projected, dict):
+        raise GuiServerError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "invalid semantic service response",
+            details={"code": "invalid_semantic_service_response"},
+        )
+    return projected
+
+
+def _semantic_status_payload(value: Any) -> dict[str, Any]:
+    raw = _semantic_mapping(value)
+    if raw.get("schema_version") != 2:
+        raise GuiServerError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "invalid semantic service response",
+            details={"code": "invalid_semantic_service_response"},
+        )
+    queue = _semantic_mapping(raw.get("queue", {}))
+    assessments = _semantic_mapping(raw.get("assessments", {}))
+    by_status = _semantic_counter_mapping(
+        assessments.get("by_status"),
+        expected=_SEMANTIC_ASSESSMENT_STATUSES,
+    )
+    by_domain = _semantic_counter_mapping(
+        assessments.get("by_domain"),
+        expected=_SEMANTIC_ASSESSMENT_DOMAINS,
+    )
+    actual = _semantic_mapping(raw.get("actual_auto_approval", {}))
+    actual_numerator = _semantic_counter(actual.get("numerator", 0))
+    actual_denominator = _semantic_counter(actual.get("denominator", 0))
+    actual_rate = actual.get("rate")
+    if actual_numerator != 0 or actual_denominator != 0 or actual_rate is not None:
+        raise GuiServerError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "invalid semantic service response",
+            details={"code": "invalid_semantic_service_response"},
+        )
+    scalar_assessments = {
+        key: _semantic_counter(assessments.get(key, 0))
+        for key in (
+            "total",
+            "success",
+            "error",
+            "ood",
+            "would_issue_exact_once",
+            "would_deny",
+            "require_human",
+        )
+    }
+    if (
+        sum(by_status.values()) != scalar_assessments["total"]
+        or sum(by_domain.values()) != scalar_assessments["total"]
+        or scalar_assessments["success"] + scalar_assessments["error"]
+        != scalar_assessments["total"]
+        or (
+            scalar_assessments["would_issue_exact_once"]
+            + scalar_assessments["would_deny"]
+            + scalar_assessments["require_human"]
+        )
+        != scalar_assessments["total"]
+        or scalar_assessments["ood"] != by_status["ood"]
+    ):
+        raise GuiServerError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "invalid semantic service response",
+            details={"code": "invalid_semantic_service_response"},
+        )
+    return {
+        "schema_version": 2,
+        "mode": _semantic_enum(raw.get("mode"), frozenset({"off", "shadow"})),
+        "adapter": _semantic_enum(
+            raw.get("adapter"),
+            frozenset({"deterministic", "external", "scripted"}),
+        ),
+        "profile_id": _semantic_nullable_string(raw.get("profile_id")),
+        "queue": {
+            key: _semantic_counter(queue.get(key, 0))
+            for key in (
+                "queued",
+                "leased",
+                "succeeded",
+                "failed",
+                "cancelled",
+                "capture_failures",
+            )
+        },
+        "assessments": {
+            **scalar_assessments,
+            "by_status": by_status,
+            "by_domain": by_domain,
+        },
+        "actual_auto_approval": {
+            "numerator": actual_numerator,
+            "denominator": actual_denominator,
+            "rate": actual_rate,
+        },
+    }
+
+
+def _semantic_enum(value: Any, allowed: frozenset[str]) -> str:
+    if isinstance(value, str) and value in allowed:
+        return value
+    raise GuiServerError(
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        "invalid semantic service response",
+        details={"code": "invalid_semantic_service_response"},
+    )
+
+
+def _semantic_nullable_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", value)
+    ):
+        return value
+    raise GuiServerError(
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        "invalid semantic service response",
+        details={"code": "invalid_semantic_service_response"},
+    )
+
+
+def _semantic_counter(value: Any) -> int:
+    if type(value) is int and 0 <= value <= (2**53 - 1):
+        return value
+    raise GuiServerError(
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        "invalid semantic service response",
+        details={"code": "invalid_semantic_service_response"},
+    )
+
+
+def _semantic_counter_mapping(
+    value: Any,
+    *,
+    expected: tuple[str, ...],
+) -> dict[str, int]:
+    raw = _semantic_mapping(value)
+    if set(raw) != set(expected):
+        raise GuiServerError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "invalid semantic service response",
+            details={"code": "invalid_semantic_service_response"},
+        )
+    return {key: _semantic_counter(raw[key]) for key in expected}
+
+
+def _semantic_assessment_page(
+    value: Any,
+    *,
+    maximum_items: int,
+) -> tuple[list[Any], str | None]:
+    raw = _semantic_mapping(value)
+    items = raw.get("items")
+    if not isinstance(items, list) or len(items) > maximum_items:
+        raise GuiServerError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "invalid semantic assessment page",
+            details={"code": "invalid_semantic_service_response"},
+        )
+    next_cursor = raw.get("next_cursor")
+    if next_cursor is not None and not isinstance(next_cursor, str):
+        raise GuiServerError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "invalid semantic assessment cursor",
+            details={"code": "invalid_semantic_service_response"},
+        )
+    return items, next_cursor
+
+
+def _semantic_response_cursor(value: str | None) -> str | None:
+    if value is not None and (not value or len(value) > _SEMANTIC_CURSOR_MAX_CHARS):
+        raise GuiServerError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "invalid semantic assessment cursor",
+            details={"code": "invalid_semantic_service_response"},
+        )
+    return value
+
+
+def _semantic_assessment_summary(value: Any) -> dict[str, Any]:
+    raw = _semantic_mapping(value)
+    return {
+        field: _semantic_assessment_summary_field(raw, field)
+        for field in _SEMANTIC_ASSESSMENT_SUMMARY_FIELDS
+    }
+
+
+def _semantic_assessment_summary_field(
+    raw: dict[str, Any],
+    field: str,
+) -> Any:
+    value = raw.get(field)
+    if field == "reason_codes":
+        return _semantic_string_list(value)
+    if field == "action_id":
+        if isinstance(value, str) and _SEMANTIC_ACTION_ID_PATTERN.fullmatch(value):
+            return value
+        raise _invalid_semantic_service_response()
+    if field == "calibration_bucket":
+        return _semantic_enum(
+            value,
+            frozenset({"unknown", "very_low", "low", "medium", "high", "very_high"}),
+        )
+    if field in {
+        "input_tokens",
+        "output_tokens",
+        "cost_microunits",
+        "latency_ms",
+    }:
+        return _semantic_nullable_counter(value)
+    if field == "tenant_bucket_sha256":
+        return _semantic_nullable_sha256(value)
+    if field == "human_outcome":
+        if value is None:
+            return None
+        return _semantic_enum(value, _SEMANTIC_HUMAN_OUTCOMES)
+    return _semantic_safe_scalar(value)
+
+
+def _semantic_assessment_detail(value: Any) -> dict[str, Any]:
+    raw = _semantic_mapping(value)
+    summary = _semantic_assessment_summary(raw)
+    return {
+        **summary,
+        "findings": _semantic_finding_list(raw.get("findings")),
+        "data_findings": _semantic_data_finding_list(
+            raw.get("data_findings"),
+            kind=raw.get("kind"),
+        ),
+        "matched_rule_ids": _semantic_string_list(raw.get("matched_rule_ids")),
+        "proven_predicates": _semantic_string_list(raw.get("proven_predicates")),
+        "missing_predicates": _semantic_string_list(raw.get("missing_predicates")),
+        "source_refs_sha256": _semantic_nullable_sha256(raw.get("source_refs_sha256")),
+        "data_labels_sha256": _semantic_nullable_sha256(raw.get("data_labels_sha256")),
+        "sink_identity_sha256": _semantic_nullable_sha256(raw.get("sink_identity_sha256")),
+        "tool_schema_sha256": _semantic_nullable_sha256(raw.get("tool_schema_sha256")),
+        "provider_spec_sha256": _semantic_nullable_sha256(raw.get("provider_spec_sha256")),
+        "manifest_sha256": _semantic_nullable_sha256(raw.get("manifest_sha256")),
+        "action_sha256": _semantic_required_sha256(raw.get("action_sha256")),
+        "resource_sha256": _semantic_nullable_sha256(raw.get("resource_sha256")),
+        "args_sha256": _semantic_nullable_sha256(raw.get("args_sha256")),
+        "state_sha256": _semantic_nullable_sha256(raw.get("state_sha256")),
+        "projection_sha256": _semantic_required_sha256(raw.get("projection_sha256")),
+    }
+
+
+def _semantic_safe_scalar(value: Any) -> str | int | float | bool | None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    raise GuiServerError(
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        "invalid semantic service response",
+        details={"code": "invalid_semantic_service_response"},
+    )
+
+
+def _invalid_semantic_service_response() -> GuiServerError:
+    return GuiServerError(
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        "invalid semantic service response",
+        details={"code": "invalid_semantic_service_response"},
+    )
+
+
+def _semantic_nullable_counter(value: Any) -> int | None:
+    if value is None:
+        return None
+    return _semantic_counter(value)
+
+
+def _semantic_nullable_sha256(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and _SEMANTIC_SHA256_PATTERN.fullmatch(value):
+        return value
+    raise _invalid_semantic_service_response()
+
+
+def _semantic_required_sha256(value: Any) -> str:
+    selected = _semantic_nullable_sha256(value)
+    if selected is None:
+        raise _invalid_semantic_service_response()
+    return selected
+
+
+def _semantic_scalar_projection(
+    value: Any,
+    fields: tuple[str, ...],
+) -> dict[str, str | int | float | bool | None]:
+    raw = _semantic_mapping(value)
+    return {field: _semantic_safe_scalar(raw.get(field)) for field in fields}
+
+
+def _semantic_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if (
+        not isinstance(value, list)
+        or len(value) > 128
+        or any(not isinstance(item, str) or len(item) > 4_096 for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise GuiServerError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "invalid semantic service response",
+            details={"code": "invalid_semantic_service_response"},
+        )
+    return list(value)
+
+
+def _semantic_finding_list(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 128:
+        raise GuiServerError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "invalid semantic findings",
+            details={"code": "invalid_semantic_service_response"},
+        )
+    fields = (
+        "code",
+        "severity",
+        "confidence_bps",
+        "evidence_sha256",
+        "source",
+    )
+    return [_semantic_scalar_projection(item, fields) for item in value]
+
+
+def _semantic_data_finding_list(
+    value: Any,
+    *,
+    kind: Any,
+) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 128:
+        raise GuiServerError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "invalid semantic data findings",
+            details={"code": "invalid_semantic_service_response"},
+        )
+    fields = (
+        "category",
+        "field",
+        "span_start",
+        "span_end",
+        "sensitivity_floor",
+        "integrity_ceiling",
+        "trust_ceiling",
+        "confidence_bps",
+        "evidence_sha256",
+    )
+    coarse_locator = _SEMANTIC_COARSE_DATA_LOCATOR_BY_KIND.get(kind)
+    if coarse_locator is None:
+        raise _invalid_semantic_service_response()
+    selected: list[dict[str, Any]] = []
+    for item in value:
+        finding = _semantic_scalar_projection(item, fields)
+        locator = finding["field"]
+        span_start = finding["span_start"]
+        span_end = finding["span_end"]
+        if locator == SemanticDataLocator.REDACTED_INTENT.value:
+            if (
+                type(span_start) is not int
+                or type(span_end) is not int
+                or not 0
+                <= span_start
+                < span_end
+                <= SEMANTIC_REDACTED_INTENT_MAX_CHARS
+            ):
+                raise _invalid_semantic_service_response()
+        elif locator != coarse_locator or span_start is not None or span_end is not None:
+            raise _invalid_semantic_service_response()
+        selected.append(finding)
+    return selected
 
 
 def _gui_llm_content_request(

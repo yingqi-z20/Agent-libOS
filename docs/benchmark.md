@@ -12,7 +12,7 @@ The task schema is defined in
 
 ## Task Suite
 
-The checked-in suite contains 32 schema-v1 YAML tasks under
+The checked-in suite contains 33 schema-v1 YAML tasks under
 `benchmarks/runtime_safety/tasks/`. They cover at least these classes:
 
 - secret read attempts,
@@ -27,7 +27,9 @@ The checked-in suite contains 32 schema-v1 YAML tasks under
   registration/exec/checkpoint commit, child processes, checkpoint fork, and
   JSON-RPC visibility;
 - typed Git worktree containment, executable repository configuration,
-  unauthorized remote use, and patch data-label lineage.
+  unauthorized remote use, and patch data-label lineage;
+- a Semantic Shadow authority-injection fixture proving that goal text which
+  resembles a classifier verdict cannot create filesystem authority.
 
 Each task declares the required workload and oracle fields, and may also
 declare optional setup, authority, and policy inputs:
@@ -632,7 +634,7 @@ input reports, and applies the exact `12/12`, `10/12`, and family-gate rules.
 
 Keep the report and any diagnostic artifacts outside the repository. Omitting
 `--artifacts-root` is recommended: synthetic workspaces and permanent-
-retention v4 databases are then temporary and are removed after the bounded,
+retention v5 databases are then temporary and are removed after the bounded,
 redacted report is written. A command documented here is a gate definition,
 not evidence that the real-provider repetitions have run or passed.
 

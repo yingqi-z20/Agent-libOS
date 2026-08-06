@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { allowedTaskRunActions, assertLlmCallDetail, assertLlmCallPage, assertLlmTraceContentChunk, assertMcpDiscoveryResult, assertRuntimeSnapshot, assertTaskRunDetail, runtimeSnapshotFromSseData, taskRunSummaryFromSseData, upsertTaskRunSummary } from "./types";
+import { allowedTaskRunActions, assertLlmCallDetail, assertLlmCallPage, assertLlmTraceContentChunk, assertMcpDiscoveryResult, assertRuntimeSnapshot, assertSemanticAssessmentDetailResponse, assertSemanticAssessmentPage, assertSemanticStatus, assertTaskRunDetail, runtimeSnapshotFromSseData, taskRunSummaryFromSseData, upsertTaskRunSummary } from "./types";
 
 describe("assertRuntimeSnapshot", () => {
   it("accepts the minimum same-build snapshot shape", () => {
@@ -154,6 +154,197 @@ describe("LLM Provider trace API projection", () => {
         attempts: [{ ...detail.attempts[0], usage }]
       })).toThrow(/attempt/);
     }
+  });
+});
+
+describe("Semantic observability API projection", () => {
+  it("accepts the bounded payload-free status, page, and detail contract", () => {
+    expect(() => assertSemanticStatus(semanticStatus())).not.toThrow();
+    expect(() => assertSemanticStatus({ ...semanticStatus(), adapter: "scripted" })).not.toThrow();
+    expect(() => assertSemanticAssessmentPage({
+      schema_version: 1,
+      items: [{ ...semanticSummary(), human_outcome: "approved" }],
+      next_cursor: "cursor_1"
+    })).not.toThrow();
+    expect(() => assertSemanticAssessmentDetailResponse(semanticDetailResponse())).not.toThrow();
+  });
+
+  it("accepts the safe-integer ceiling and rejects larger assessment metrics", () => {
+    const fields = ["input_tokens", "output_tokens", "cost_microunits", "latency_ms"] as const;
+    for (const field of fields) {
+      expect(() => assertSemanticAssessmentPage({
+        schema_version: 1,
+        items: [{ ...semanticSummary(), [field]: Number.MAX_SAFE_INTEGER }],
+        next_cursor: null
+      })).not.toThrow();
+      expect(() => assertSemanticAssessmentPage({
+        schema_version: 1,
+        items: [{ ...semanticSummary(), [field]: Number.MAX_SAFE_INTEGER + 1 }],
+        next_cursor: null
+      })).toThrow(/summary/);
+    }
+  });
+
+  it("rejects private or unknown fields at every response boundary", () => {
+    expect(() => assertSemanticStatus({ ...semanticStatus(), prompt: "secret" })).toThrow(/malformed/);
+    expect(() => assertSemanticAssessmentPage({
+      schema_version: 1,
+      items: [{ ...semanticSummary(), raw_content: "secret", job_error: "provider secret", error_code: "private" }],
+      next_cursor: null
+    })).toThrow(/private field/);
+    expect(() => assertSemanticAssessmentDetailResponse({
+      ...semanticDetailResponse(),
+      assessment: { ...semanticDetailResponse().assessment, reasoning: "hidden", raw_human_response: { body: "secret" } }
+    })).toThrow(/private field/);
+    expect(() => assertSemanticAssessmentDetailResponse({
+      ...semanticDetailResponse(),
+      assessment: {
+        ...semanticDetailResponse().assessment,
+        findings: [{ ...semanticDetailResponse().assessment.findings[0], explanation: "unbounded" }]
+      }
+    })).toThrow(/finding/);
+  });
+
+  it("rejects invalid digests, confidence, spans, and Shadow auto-approval rates", () => {
+    expect(() => assertSemanticAssessmentPage({
+      schema_version: 1,
+      items: [{ ...semanticSummary(), confidence_bps: 10_001 }],
+      next_cursor: null
+    })).toThrow(/summary/);
+    expect(() => assertSemanticAssessmentPage({
+      schema_version: 1,
+      items: [{ ...semanticSummary(), input_sha256: "A".repeat(64) }],
+      next_cursor: null
+    })).toThrow(/summary/);
+    expect(() => assertSemanticAssessmentPage({
+      schema_version: 1,
+      items: [{ ...semanticSummary(), reason_codes: ["model_says_allow"] }],
+      next_cursor: null
+    })).toThrow(/summary/);
+    expect(() => assertSemanticAssessmentPage({
+      schema_version: 1,
+      items: [{ ...semanticSummary(), human_outcome: "raw answer", cost_microunits: -1 }],
+      next_cursor: null
+    })).toThrow(/summary/);
+    const detail = semanticDetailResponse();
+    expect(() => assertSemanticAssessmentDetailResponse({
+      ...detail,
+      assessment: {
+        ...detail.assessment,
+        data_findings: [{ ...detail.assessment.data_findings[0], span_start: 9, span_end: 2 }]
+      }
+    })).toThrow(/data finding/);
+    expect(() => assertSemanticAssessmentDetailResponse({
+      ...detail,
+      assessment: {
+        ...detail.assessment,
+        data_findings: [{
+          ...detail.assessment.data_findings[0],
+          field: "XcHJvamVjdGVkX2ludGVudF9zZW50aW5lbA",
+          span_start: null,
+          span_end: null
+        }]
+      }
+    })).toThrow(/data finding/);
+    expect(() => assertSemanticAssessmentDetailResponse({
+      ...detail,
+      assessment: {
+        ...detail.assessment,
+        data_findings: [{ ...detail.assessment.data_findings[0], field: "root_goal" }]
+      }
+    })).toThrow(/data finding/);
+    expect(() => assertSemanticAssessmentDetailResponse({
+      ...detail,
+      assessment: {
+        ...detail.assessment,
+        data_findings: [{ ...detail.assessment.data_findings[0], span_start: 0, span_end: 1 }]
+      }
+    })).toThrow(/data finding/);
+    expect(() => assertSemanticAssessmentDetailResponse({
+      ...detail,
+      assessment: {
+        ...detail.assessment,
+        data_findings: [{
+          ...detail.assessment.data_findings[0],
+          field: "redacted_intent",
+          span_start: null,
+          span_end: null
+        }]
+      }
+    })).toThrow(/data finding/);
+    expect(() => assertSemanticAssessmentDetailResponse({
+      ...detail,
+      assessment: {
+        ...detail.assessment,
+        data_findings: [{ ...detail.assessment.data_findings[0], category: "model_private_category" }]
+      }
+    })).toThrow(/data finding/);
+    expect(() => assertSemanticAssessmentDetailResponse({
+      ...detail,
+      assessment: { ...detail.assessment, action_sha256: null }
+    })).toThrow(/detail/);
+    expect(() => assertSemanticAssessmentDetailResponse({
+      ...detail,
+      assessment: { ...detail.assessment, projection_sha256: "A".repeat(64) }
+    })).toThrow(/detail/);
+    expect(() => assertSemanticAssessmentDetailResponse({
+      ...detail,
+      assessment: {
+        ...detail.assessment,
+        manifest_sha256: null,
+        resource_sha256: null,
+        args_sha256: null,
+        state_sha256: null
+      }
+    })).not.toThrow();
+    expect(() => assertSemanticStatus({
+      ...semanticStatus(),
+      actual_auto_approval: { numerator: 0, denominator: 1, rate: 0 }
+    })).toThrow(/malformed/);
+  });
+
+  it.each([
+    ["mode", { mode: "enforce" }],
+    ["adapter", { adapter: "unknown" }],
+    ["profile traversal", { profile_id: "../classifier" }],
+    ["profile boolean", { profile_id: true }],
+    ["boolean counter", { queue: { ...semanticStatus().queue, queued: true } }],
+    ["string counter", { queue: { ...semanticStatus().queue, leased: "0" } }],
+    ["negative counter", { assessments: { ...semanticStatus().assessments, error: -1 } }]
+  ])("rejects malformed Semantic status %s", (_label, override) => {
+    expect(() => assertSemanticStatus({ ...semanticStatus(), ...override })).toThrow(/malformed/);
+  });
+
+  it("requires complete and consistent Semantic status aggregate mappings", () => {
+    const value = semanticStatus();
+    const { stale_input: _omitted, ...incompleteByStatus } = value.assessments.by_status;
+    expect(() => assertSemanticStatus({
+      ...value,
+      assessments: { ...value.assessments, by_status: incompleteByStatus }
+    })).toThrow(/malformed/);
+    expect(() => assertSemanticStatus({
+      ...value,
+      assessments: {
+        ...value.assessments,
+        by_domain: { ...value.assessments.by_domain, filesystem: 1 }
+      }
+    })).toThrow(/malformed/);
+  });
+
+  it("rejects inconsistent Semantic status derived totals", () => {
+    const value = semanticStatus();
+    expect(() => assertSemanticStatus({
+      ...value,
+      assessments: { ...value.assessments, success: 1 }
+    })).toThrow(/malformed/);
+    expect(() => assertSemanticStatus({
+      ...value,
+      assessments: { ...value.assessments, would_issue_exact_once: 0 }
+    })).toThrow(/malformed/);
+    expect(() => assertSemanticStatus({
+      ...value,
+      assessments: { ...value.assessments, ood: 1 }
+    })).toThrow(/malformed/);
   });
 });
 
@@ -347,5 +538,122 @@ function mcpDiscovery() {
       duration_s: 0.01,
       call_started: true
     }]
+  };
+}
+
+function semanticStatus() {
+  return {
+    schema_version: 2,
+    mode: "shadow",
+    adapter: "deterministic",
+    profile_id: null,
+    queue: { queued: 1, leased: 0, succeeded: 2, failed: 0, cancelled: 0, capture_failures: 0 },
+    assessments: {
+      total: 2,
+      success: 2,
+      error: 0,
+      ood: 0,
+      would_issue_exact_once: 1,
+      would_deny: 0,
+      require_human: 1,
+      by_status: {
+        success: 2,
+        skipped_policy: 0,
+        egress_blocked: 0,
+        timeout: 0,
+        provider_error: 0,
+        provider_outcome_unknown: 0,
+        invalid_schema: 0,
+        ood: 0,
+        abstained: 0,
+        stale_input: 0
+      },
+      by_domain: {
+        filesystem: 2,
+        shell: 0,
+        git: 0,
+        jsonrpc: 0,
+        mcp: 0,
+        runtime: 0,
+        unknown: 0
+      }
+    },
+    actual_auto_approval: { numerator: 0, denominator: 0, rate: null }
+  };
+}
+
+function semanticSummary() {
+  return {
+    assessment_id: "semantic_1",
+    job_id: "semantic_job_1",
+    kind: "approval",
+    status: "success",
+    domain: "filesystem",
+    action_id: "filesystem.read",
+    pid: "pid_1",
+    request_id: "human_1",
+    operation_id: "operation_1",
+    effect_id: "effect_1",
+    shadow_outcome: "require_human",
+    reason_codes: ["missing_authoritative_predicate"],
+    ood: false,
+    abstain: false,
+    confidence_bps: 8750,
+    calibration_bucket: "high",
+    input_tokens: 120,
+    output_tokens: 20,
+    cost_microunits: 45,
+    classifier_id: "scripted",
+    classifier_version: "v1",
+    artifact_sha256: "a".repeat(64),
+    input_sha256: "b".repeat(64),
+    feature_snapshot_sha256: "c".repeat(64),
+    policy_sha256: "d".repeat(64),
+    created_at: "2030-01-01T00:00:00Z",
+    completed_at: "2030-01-01T00:00:01Z",
+    latency_ms: 1000,
+    human_outcome: null,
+    tenant_bucket_sha256: "6".repeat(64)
+  };
+}
+
+function semanticDetailResponse() {
+  return {
+    schema_version: 1,
+    assessment: {
+      ...semanticSummary(),
+      findings: [{
+        code: "missing_authoritative_predicate",
+        severity: "medium",
+        confidence_bps: 8750,
+        evidence_sha256: "e".repeat(64),
+        source: "model"
+      }],
+      data_findings: [{
+        category: "source_code",
+        field: "approval.request",
+        span_start: null,
+        span_end: null,
+        sensitivity_floor: "confidential",
+        integrity_ceiling: "unknown",
+        trust_ceiling: "untrusted",
+        confidence_bps: 9200,
+        evidence_sha256: "f".repeat(64)
+      }],
+      matched_rule_ids: [],
+      proven_predicates: ["binding_current"],
+      missing_predicates: ["low_risk"],
+      source_refs_sha256: "1".repeat(64),
+      data_labels_sha256: "2".repeat(64),
+      sink_identity_sha256: "3".repeat(64),
+      tool_schema_sha256: "4".repeat(64),
+      provider_spec_sha256: "5".repeat(64),
+      manifest_sha256: "7".repeat(64),
+      action_sha256: "8".repeat(64),
+      resource_sha256: "9".repeat(64),
+      args_sha256: "0".repeat(64),
+      state_sha256: "a".repeat(64),
+      projection_sha256: "b".repeat(64)
+    }
   };
 }

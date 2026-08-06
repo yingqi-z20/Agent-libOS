@@ -1268,7 +1268,17 @@ status, timestamps, and audit linkage.
 
 If a primitive or human tool blocks on human approval, the process enters
 `waiting_human`. Human requests are terminally decided once: only pending
-requests can be approved or rejected. The runtime processes a terminal message
+requests can be approved or rejected. Store schema v5 gives every request a
+durable non-negative `revision`. Response, cancellation, claim/delivery, and
+retryable delivery-state updates compare the expected revision and status; a
+winner increments the revision, so a stale response cannot exploit a
+pending-to-pending ABA cycle. The common terminalization kernel commits the
+request CAS, permission/Capability side effect when applicable, typed wait-set
+change, process revision/state-generation transition, event, and audit in one
+transaction. A failure in any required participant rolls the whole decision
+back without a partial grant or wake.
+
+The runtime processes a terminal message
 and updates that request, but the resulting process transition depends on the
 request kind and outcome. Approval may release the matching Human wait;
 `request_permission` rejection installs the selected non-allow policy

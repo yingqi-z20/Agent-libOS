@@ -85,13 +85,14 @@ substrate for capability-controlled self-evolution.
 
 3. Benchmark suite.
    The current implementation includes a deterministic runtime-safety
-   harness with 32 schema-v1 adversarial tasks, wrapper baselines, ablations,
+   harness with 33 schema-v1 adversarial tasks, wrapper baselines, ablations,
    declared allowed/forbidden side effects, evidence-backed outcome records,
    explicit exact/prefix/glob oracle matching, and fail-closed stable metrics
    output. The suite includes a first self-evolution subset covering Skill
    activation, JIT registration, image registration/exec/checkpoint commit,
    child-process delegation, checkpoint fork, JSON-RPC remote-resource
-   visibility, and Git worktree/config/remote/patch-lineage boundaries.
+   visibility, Git worktree/config/remote/patch-lineage boundaries, and a
+   Semantic Shadow authority-injection fixture.
 
 4. Evaluation.
    The benchmark supports comparison against direct tool wrappers,

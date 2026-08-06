@@ -95,6 +95,7 @@ from agent_libos.storage.contracts import (
     ResourceBackendProtocol,
     RuntimeModuleBackendProtocol,
     RuntimePublicationBackendProtocol,
+    SemanticAssessmentBackendProtocol,
     SnapshotCheckpointBackendProtocol,
     ToolArtifactRepositoryProtocol,
     TaskRunBackendProtocol,
@@ -102,6 +103,12 @@ from agent_libos.storage.contracts import (
     UnitOfWorkBackendProtocol,
 )
 from agent_libos.storage.base import StoreAssemblyReadiness
+from agent_libos.storage.semantic import (
+    SemanticAssessmentCursor,
+    SemanticAssessmentJobRecord,
+    SemanticAssessmentPage,
+    SemanticAssessmentRecord,
+)
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads
 
@@ -388,7 +395,6 @@ class ProcessRepository(_RepositoryFacade):
     _METHODS = frozenset(
         {
             "insert_human_request",
-            "update_human_request",
             "list_human_requests",
             "list_human_requests_for_pids",
             "insert_llm_call",
@@ -503,6 +509,29 @@ class ProcessRepository(_RepositoryFacade):
 
     def get_human_request(self, request_id: str) -> HumanRequest | None:
         return self._process_backend.get_human_request(request_id)
+
+    def update_human_request(self, request: HumanRequest) -> bool:
+        return _transactional_backend_cas_result(
+            self._process_backend,
+            self.transaction,
+            lambda: self._process_backend.update_human_request(request),
+            operation="update human request",
+        )
+
+    def compare_and_set_human_request(
+        self,
+        expected: HumanRequest,
+        target: HumanRequest,
+    ) -> bool:
+        return _transactional_backend_cas_result(
+            self._process_backend,
+            self.transaction,
+            lambda: self._process_backend.compare_and_set_human_request(
+                expected,
+                target,
+            ),
+            operation="compare and set human request",
+        )
 
     def ack_process_message(
         self,
@@ -2775,22 +2804,33 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
                 for request in requests:
                     if request.created_at <= checkpoint.created_at:
                         continue
+                    decision: dict[str, Any] = {
+                        "cancelled_by": f"checkpoint:{checkpoint.checkpoint_id}"
+                    }
+                    prior_decision = request.decision
+                    if isinstance(prior_decision, Mapping) and {
+                        "provider_outcome",
+                        "automatic_retry_disabled",
+                        "manual_recovery_required",
+                        "process_reconciliation_required",
+                    }.intersection(prior_decision):
+                        # Checkpoint restore cannot roll back an external Human
+                        # provider.  Preserve the durable uncertainty marker
+                        # while cancelling the post-checkpoint request itself.
+                        decision = {**dict(prior_decision), **decision}
                     updated = cursor.execute(
                         "UPDATE human_requests "
-                        "SET status = ?, decision_json = ?, updated_at = ? "
-                        "WHERE request_id = ? AND status = ? AND created_at > ?",
+                        "SET status = ?, decision_json = ?, updated_at = ?, "
+                        "revision = revision + 1 "
+                        "WHERE request_id = ? AND status = ? AND revision = ? "
+                        "AND created_at > ?",
                         (
                             HumanRequestStatus.CANCELLED.value,
-                            dumps(
-                                {
-                                    "cancelled_by": (
-                                        f"checkpoint:{checkpoint.checkpoint_id}"
-                                    )
-                                }
-                            ),
+                            dumps(decision),
                             utc_now(),
                             request.request_id,
                             HumanRequestStatus.PENDING.value,
+                            request.revision,
                             checkpoint.created_at,
                         ),
                     )
@@ -4459,6 +4499,45 @@ class PayloadRetentionRepository(_RepositoryFacade):
         )
 
 
+class SemanticAssessmentRepository(_RepositoryFacade):
+    """Typed durable queue and append-only semantic evidence facade."""
+
+    _METHODS = frozenset(
+        {
+            "enqueue_semantic_assessment_job",
+            "get_semantic_assessment_job",
+            "claim_next_semantic_assessment_job",
+            "query_expired_semantic_assessment_jobs",
+            "query_semantic_assessment_jobs",
+            "semantic_status_aggregate",
+            "append_semantic_assessment",
+            "get_semantic_assessment",
+            "query_semantic_assessments",
+        }
+    )
+
+    def __init__(self, backend: SemanticAssessmentBackendProtocol) -> None:
+        super().__init__(backend)
+        self._semantic_backend = backend
+
+    def terminalize_semantic_assessment_job(
+        self,
+        expected: SemanticAssessmentJobRecord,
+        target: SemanticAssessmentJobRecord,
+        assessment: SemanticAssessmentRecord,
+    ) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._semantic_backend,
+            self.transaction,
+            lambda: self._semantic_backend.terminalize_semantic_assessment_job(
+                expected,
+                target,
+                assessment,
+            ),
+            operation="terminalize semantic assessment job",
+        )
+
+
 class ProtectedEffectRepository:
     """Cross-repository view used by the protected-operation SDK.
 
@@ -4531,6 +4610,7 @@ class ProtectedEffectRepository:
 
 
 _MIGRATED_BACKEND_PROTOCOLS: tuple[tuple[str, type[Any]], ...] = (
+    ("semantic-assessment", SemanticAssessmentBackendProtocol),
     ("task-run", TaskRunBackendProtocol),
     ("authority-recovery", AuthorityRecoveryBackendProtocol),
     ("object-query", ObjectQueryBackendProtocol),
@@ -4672,6 +4752,7 @@ class UnitOfWork:
         self.extensions = ExtensionRepository(store)
         self.module_publications = RuntimeModuleRepository(store)
         self.retention = PayloadRetentionRepository(store)
+        self.semantic = SemanticAssessmentRepository(store)
         self.protected_effects = ProtectedEffectRepository(self)
 
     def locked(self) -> AbstractContextManager[None]:

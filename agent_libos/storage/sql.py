@@ -45,6 +45,7 @@ from agent_libos.models.exceptions import (
     UnsupportedStoreVersion,
     ValidationError,
 )
+from agent_libos.models.semantic import SemanticAssessmentStatus, SemanticDomain
 from agent_libos.process_execution import (
     current_post_exec_completion_mutation,
     current_process_control_mutation,
@@ -221,6 +222,19 @@ from agent_libos.storage.engine import SqlEngine, split_sql_script
 from agent_libos.storage.gui_visibility import (
     is_gui_presentation_audit_fields,
     is_gui_presentation_event_fields,
+)
+from agent_libos.storage.semantic import (
+    SEMANTIC_QUERY_HARD_LIMIT,
+    _TERMINAL_JOB_STATUSES,
+    SemanticAssessmentCursor,
+    SemanticAssessmentJobRecord,
+    SemanticAssessmentJobStatus,
+    SemanticAssessmentPage,
+    SemanticAssessmentRecord,
+    SemanticProjectionRetention,
+    SemanticStatusAggregate,
+    _canonical_semantic_timestamp,
+    _parse_semantic_timestamp,
 )
 from agent_libos.utils.serde import bounded_json_loads, dumps, loads
 
@@ -816,7 +830,7 @@ def _dumps_strict_checkpoint_snapshot(snapshot: Any) -> str:
         ) from exc
 
 
-STORE_SCHEMA_VERSION = 4
+STORE_SCHEMA_VERSION = 5
 # Python cursor models compare strings by Unicode code point.  SQLite BINARY
 # and PostgreSQL "C" are the backend collations that preserve that ordering for
 # UTF-8 text.  Every durable text component used by a startup/recovery keyset
@@ -880,6 +894,12 @@ _V4_KEYSET_TEXT_COLUMNS: dict[str, frozenset[str]] = {
     "task_run_links": frozenset(
         {"evidence_id", "link_id", "run_id"}
     ),
+}
+
+_V5_KEYSET_TEXT_COLUMNS: dict[str, frozenset[str]] = {
+    **_V4_KEYSET_TEXT_COLUMNS,
+    "semantic_assessment_jobs": frozenset({"created_at", "job_id"}),
+    "semantic_assessments": frozenset({"assessment_id", "created_at"}),
 }
 _PROCESS_REVISION_COUNTER_PREFIX = "process_revision:"
 _PROCESS_EXECUTION_COUNTER_PREFIX = "process_execution_generation:"
@@ -1171,6 +1191,22 @@ _V4_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     ),
 }
 
+_V5_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
+    **_V4_REQUIRED_COLUMNS,
+    "human_requests": _V4_REQUIRED_COLUMNS["human_requests"] | {"revision"},
+    "semantic_assessment_jobs": frozenset(
+        "job_id assessment_id kind status domain pid request_id operation_id effect_id "
+        "revision attempt_count lease_owner_id lease_id lease_expires_at bindings_json "
+        "projection_json projection_sha256 projection_retention projection_expires_at "
+        "error_code created_at updated_at completed_at".split()
+    ),
+    "semantic_assessments": frozenset(
+        "assessment_id job_id kind status domain action_id tenant_bucket_sha256 pid "
+        "request_id operation_id effect_id shadow_outcome ood record_json "
+        "created_at completed_at".split()
+    ),
+}
+
 # Canonical declared indexes introduced or changed by schema v4.  Column order,
 # uniqueness, direction and partial/full shape are part of the on-disk
 # contract; an existing v4 store is rejected before CREATE IF NOT EXISTS can
@@ -1372,6 +1408,8 @@ class SQLRuntimeStore:
             "task_run_commands",
             "task_run_ledger",
             "task_run_links",
+            "semantic_assessment_jobs",
+            "semantic_assessments",
         }
     )
 
@@ -1425,9 +1463,9 @@ class SQLRuntimeStore:
                 self._write_store_schema_version()
                 # Validate the exact fresh contract inside the bootstrap
                 # transaction. A failed DDL surface rolls back to an empty
-                # database; existing v4 stores were already checked before
+                # database; existing v5 stores were already checked before
                 # initializer entry and cannot be repaired opportunistically.
-                self._require_v4_schema_shape(conn)
+                self._require_v5_schema_shape(conn)
 
     def _issue_checkpoint_restore_writer_token(self) -> object:
         """Issue the internal checkpoint publication mutation capability."""
@@ -1435,7 +1473,7 @@ class SQLRuntimeStore:
         return self.__checkpoint_restore_writer_token
 
     def _require_supported_store_version(self) -> bool:
-        """Reject every non-v4 store before initialization can mutate it."""
+        """Reject every non-v5 store before initialization can mutate it."""
 
         return self._require_supported_store_version_for(self.conn)
 
@@ -1445,26 +1483,58 @@ class SQLRuntimeStore:
         if marker_exists:
             version = marker_row.get("schema_version") if marker_row is not None else None
             if version != STORE_SCHEMA_VERSION:
+                if version == 4:
+                    raise UnsupportedStoreVersion(
+                        "Agent libOS store schema v4 requires the explicit offline "
+                        "v4-to-v5 migration; no migration was attempted"
+                    )
                 if version == 3:
                     raise UnsupportedStoreVersion(
                         "Agent libOS store schema v3 is not writable or readable by "
-                        "1.3.4; expected 4. Use Agent libOS 1.0.1 to view or "
+                        "this runtime; expected 5. Use Agent libOS 1.0.1 to view or "
                         "archive this store. No migration was attempted."
                     )
                 raise UnsupportedStoreVersion(
                     f"unsupported Agent libOS store schema: {version!r}; "
-                    f"expected {STORE_SCHEMA_VERSION}. Agent libOS 1.0.1 "
-                    "expected 3; use that version only to view or archive v3 stores"
+                    f"expected {STORE_SCHEMA_VERSION}; no migration was attempted"
                 )
-            cls._require_v4_schema_shape(conn)
+            cls._require_v5_schema_shape(conn)
             return False
         if cls._probe_user_schema_objects(conn):
             raise UnsupportedStoreVersion(
-                "unversioned Agent libOS store detected; pre-v4 stores are "
-                "archive-only and cannot be opened by 1.3.4; use Agent libOS "
-                "1.0.1 to view or archive a v3 store"
+                "unversioned Agent libOS store detected; pre-v5 stores are "
+                "archive-only unless an explicit supported offline migration exists"
             )
         return True
+
+    @classmethod
+    def _require_v5_schema_shape(cls, conn: SqlEngine) -> None:
+        mismatched: dict[str, dict[str, list[str]]] = {}
+        for table, required in _V5_REQUIRED_COLUMNS.items():
+            columns = cls._probe_columns(conn, table)
+            missing = sorted(required - columns)
+            extra = sorted(columns - required)
+            if missing or extra:
+                mismatched[table] = {"missing": missing, "extra": extra}
+        extra_tables = sorted(
+            cls._probe_user_tables(conn) - set(_V5_REQUIRED_COLUMNS)
+        )
+        if extra_tables:
+            mismatched["<tables>"] = {"missing": [], "extra": extra_tables}
+        if mismatched:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v5: "
+                f"{mismatched}"
+            )
+        cls._require_keyset_text_collations(
+            conn,
+            version=5,
+            keyset_columns=_V5_KEYSET_TEXT_COLUMNS,
+        )
+        # All v4 indexes and counter seeds remain required verbatim in v5.
+        cls._require_v4_index_manifest(conn)
+        cls._require_v5_semantic_index_manifest(conn)
+        cls._require_v4_counter_seed(conn)
 
     @classmethod
     def _require_v4_schema_shape(cls, conn: SqlEngine) -> None:
@@ -1491,14 +1561,31 @@ class SQLRuntimeStore:
 
     @classmethod
     def _require_v4_keyset_text_collations(cls, conn: SqlEngine) -> None:
+        cls._require_keyset_text_collations(
+            conn,
+            version=4,
+            keyset_columns=_V4_KEYSET_TEXT_COLUMNS,
+        )
+
+    @classmethod
+    def _require_keyset_text_collations(
+        cls,
+        conn: SqlEngine,
+        *,
+        version: int,
+        keyset_columns: Mapping[str, frozenset[str]],
+    ) -> None:
         expected = cls.KEYSET_TEXT_COLLATION
         if expected is None:
             raise NotImplementedError(
                 f"{cls.__name__} must declare its canonical keyset text collation"
             )
         incompatible: dict[str, list[str]] = {}
-        collations = cls._probe_text_column_collations(conn)
-        for table, columns in _V4_KEYSET_TEXT_COLUMNS.items():
+        collations = cls._probe_text_column_collations(
+            conn,
+            keyset_columns=keyset_columns,
+        )
+        for table, columns in keyset_columns.items():
             for column in sorted(columns):
                 actual = collations.get((table, column))
                 if actual != expected:
@@ -1507,7 +1594,7 @@ class SQLRuntimeStore:
                     )
         if incompatible:
             raise UnsupportedStoreVersion(
-                "unsupported Agent libOS store schema v4 keyset collation: "
+                f"unsupported Agent libOS store schema v{version} keyset collation: "
                 f"{incompatible}"
             )
 
@@ -1515,10 +1602,135 @@ class SQLRuntimeStore:
     def _probe_text_column_collations(
         cls,
         conn: SqlEngine,
+        *,
+        keyset_columns: Mapping[str, frozenset[str]] = _V4_KEYSET_TEXT_COLUMNS,
     ) -> Mapping[tuple[str, str], str]:
         raise NotImplementedError(
             f"{cls.__name__} must inspect durable text column collations in bulk"
         )
+
+    @classmethod
+    def _require_v5_semantic_index_manifest(cls, conn: SqlEngine) -> None:
+        required: dict[str, tuple[str, tuple[str, ...], bool, bool]] = {
+            "idx_semantic_jobs_status_created": (
+                "semantic_assessment_jobs", ("status", "created_at", "job_id"), False, False
+            ),
+            "idx_semantic_jobs_pid_created": (
+                "semantic_assessment_jobs", ("pid", "created_at", "job_id"), False, False
+            ),
+            "idx_semantic_jobs_request_created": (
+                "semantic_assessment_jobs", ("request_id", "created_at", "job_id"), False, False
+            ),
+            "idx_semantic_assessments_created": (
+                "semantic_assessments", ("created_at", "assessment_id"), False, False
+            ),
+            "idx_semantic_assessments_pid_created": (
+                "semantic_assessments", ("pid", "created_at", "assessment_id"), False, False
+            ),
+            "idx_semantic_assessments_request_created": (
+                "semantic_assessments", ("request_id", "created_at", "assessment_id"), False, False
+            ),
+            "idx_semantic_assessments_operation_created": (
+                "semantic_assessments", ("operation_id", "created_at", "assessment_id"), False, False
+            ),
+            "idx_semantic_assessments_filter_created": (
+                "semantic_assessments",
+                ("kind", "status", "domain", "created_at", "assessment_id"),
+                False,
+                False,
+            ),
+            "idx_semantic_assessments_action_tenant_created": (
+                "semantic_assessments",
+                (
+                    "action_id",
+                    "tenant_bucket_sha256",
+                    "created_at",
+                    "assessment_id",
+                ),
+                False,
+                False,
+            ),
+        }
+        shapes = cls._probe_index_shapes(
+            conn,
+            {spec[0] for spec in required.values()},
+        )
+        problems: dict[str, Any] = {}
+        for name, expected in required.items():
+            problem = cls._v5_index_shape_problem(name, expected, shapes.get(name))
+            if problem is not None:
+                problems[name] = problem
+        declared = {
+            name
+            for name, shape in shapes.items()
+            if shape.get("origin") == "declared"
+            and shape.get("table") in {
+                "semantic_assessment_jobs",
+                "semantic_assessments",
+            }
+        }
+        extra = sorted(declared - set(required))
+        if extra:
+            problems["<extra indexes>"] = extra
+        semantic_unique = {
+            "semantic_assessment_jobs": frozenset(
+                {("job_id",), ("assessment_id",)}
+            ),
+            "semantic_assessments": frozenset(
+                {("assessment_id",), ("job_id",)}
+            ),
+        }
+        for table, expected_unique in semantic_unique.items():
+            problem = cls._v4_unique_shape_problem(
+                table,
+                expected_unique,
+                shapes,
+            )
+            if problem is not None:
+                problems[f"{table}.unique"] = problem
+        if problems:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v5 semantic "
+                f"index manifest: {problems}"
+            )
+
+    @classmethod
+    def _v5_index_shape_problem(
+        cls,
+        name: str,
+        expected: tuple[str, tuple[str, ...], bool, bool],
+        shape: Mapping[str, Any] | None,
+    ) -> Any | None:
+        if shape is None:
+            return "missing"
+        table, columns, unique, partial = expected
+        expected_shape = {
+            "table": table,
+            "columns": columns,
+            "unique": unique,
+            "partial": partial,
+            "descending": tuple(False for _ in columns),
+        }
+        actual_shape = {
+            key: shape.get(key)
+            for key in ("table", "columns", "unique", "partial", "descending")
+        }
+        if actual_shape != expected_shape:
+            return {"expected": expected_shape, "actual": actual_shape}
+        operability_problem = cls._v4_index_operability_problem(shape)
+        if operability_problem is not None:
+            return operability_problem
+        if shape.get("predicate") is not None:
+            return {"expected_predicate": None, "actual_predicate": shape.get("predicate")}
+        collations = tuple(shape.get("collations", ()))
+        expected_collation = cls.KEYSET_TEXT_COLLATION
+        bad_collations = [
+            f"{column}={actual or 'missing'} expected {expected_collation}"
+            for column, actual in zip(columns, collations)
+            if column in _V5_KEYSET_TEXT_COLUMNS.get(table, frozenset())
+            and actual != expected_collation
+        ]
+        return {"collations": bad_collations} if bad_collations else None
 
     @classmethod
     def _require_v4_index_manifest(cls, conn: SqlEngine) -> None:
@@ -3096,7 +3308,8 @@ class SQLRuntimeStore:
               decision_json TEXT,
               blocking INTEGER NOT NULL,
               created_at TEXT COLLATE BINARY NOT NULL,
-              updated_at TEXT NOT NULL
+              updated_at TEXT NOT NULL,
+              revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
             );
 
             CREATE INDEX IF NOT EXISTS idx_human_requests_pid_created
@@ -3506,6 +3719,132 @@ class SQLRuntimeStore:
 
     def _finish_schema_initialization(self) -> None:
         self._initialize_v4_schema()
+        self._create_v5_semantic_schema()
+
+    def _create_v5_semantic_schema(self) -> None:
+        """Create the schema-v5 advisory semantic evidence surfaces.
+
+        Jobs are the only mutable semantic rows.  Completed assessments are an
+        append-only ledger and deliberately have no foreign keys so checkpoint
+        restore/fork and task retention cannot erase security evidence.
+        """
+
+        self._execute_script(
+            """
+            CREATE TABLE IF NOT EXISTS semantic_assessment_jobs (
+              job_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+              assessment_id TEXT COLLATE BINARY,
+              kind TEXT NOT NULL,
+              status TEXT NOT NULL CHECK (status IN (
+                'queued', 'claimed', 'succeeded', 'failed', 'egress_blocked',
+                'provider_outcome_unknown', 'cancelled', 'expired'
+              )),
+              domain TEXT NOT NULL,
+              pid TEXT,
+              request_id TEXT,
+              operation_id TEXT,
+              effect_id TEXT,
+              revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0),
+              attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                attempt_count >= 0 AND attempt_count <= 1
+              ),
+              lease_owner_id TEXT,
+              lease_id TEXT,
+              lease_expires_at TEXT,
+              bindings_json TEXT NOT NULL,
+              projection_json TEXT NOT NULL,
+              projection_sha256 TEXT NOT NULL,
+              projection_retention TEXT NOT NULL CHECK (
+                projection_retention IN ('redacted', 'hash_only')
+              ),
+              projection_expires_at TEXT,
+              error_code TEXT,
+              created_at TEXT COLLATE BINARY NOT NULL,
+              updated_at TEXT NOT NULL,
+              completed_at TEXT,
+              UNIQUE(assessment_id),
+              CHECK (
+                (lease_owner_id IS NULL AND lease_id IS NULL AND lease_expires_at IS NULL)
+                OR
+                (lease_owner_id IS NOT NULL AND lease_id IS NOT NULL
+                 AND lease_expires_at IS NOT NULL)
+              ),
+              CHECK ((status = 'claimed') = (lease_id IS NOT NULL)),
+              CHECK (
+                (status IN ('queued', 'claimed') AND completed_at IS NULL)
+                OR
+                (status NOT IN ('queued', 'claimed') AND completed_at IS NOT NULL)
+              ),
+              CHECK (
+                status IN ('queued', 'claimed')
+                OR (
+                  projection_retention = 'hash_only'
+                  AND projection_json = '{}'
+                  AND projection_expires_at IS NULL
+                )
+              )
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_semantic_jobs_status_created
+              ON semantic_assessment_jobs(
+                status, created_at COLLATE BINARY, job_id COLLATE BINARY
+              );
+            CREATE INDEX IF NOT EXISTS idx_semantic_jobs_pid_created
+              ON semantic_assessment_jobs(
+                pid, created_at COLLATE BINARY, job_id COLLATE BINARY
+              );
+            CREATE INDEX IF NOT EXISTS idx_semantic_jobs_request_created
+              ON semantic_assessment_jobs(
+                request_id, created_at COLLATE BINARY, job_id COLLATE BINARY
+              );
+
+            CREATE TABLE IF NOT EXISTS semantic_assessments (
+              assessment_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+              job_id TEXT NOT NULL UNIQUE,
+              kind TEXT NOT NULL,
+              status TEXT NOT NULL,
+              domain TEXT NOT NULL,
+              action_id TEXT NOT NULL,
+              tenant_bucket_sha256 TEXT,
+              pid TEXT,
+              request_id TEXT,
+              operation_id TEXT,
+              effect_id TEXT,
+              shadow_outcome TEXT,
+              ood INTEGER NOT NULL CHECK (ood IN (0, 1)),
+              record_json TEXT NOT NULL,
+              created_at TEXT COLLATE BINARY NOT NULL,
+              completed_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_semantic_assessments_created
+              ON semantic_assessments(
+                created_at COLLATE BINARY, assessment_id COLLATE BINARY
+              );
+            CREATE INDEX IF NOT EXISTS idx_semantic_assessments_pid_created
+              ON semantic_assessments(
+                pid, created_at COLLATE BINARY, assessment_id COLLATE BINARY
+              );
+            CREATE INDEX IF NOT EXISTS idx_semantic_assessments_request_created
+              ON semantic_assessments(
+                request_id, created_at COLLATE BINARY, assessment_id COLLATE BINARY
+              );
+            CREATE INDEX IF NOT EXISTS idx_semantic_assessments_operation_created
+              ON semantic_assessments(
+                operation_id, created_at COLLATE BINARY, assessment_id COLLATE BINARY
+              );
+            CREATE INDEX IF NOT EXISTS idx_semantic_assessments_filter_created
+              ON semantic_assessments(
+                kind, status, domain, created_at COLLATE BINARY,
+                assessment_id COLLATE BINARY
+              );
+            CREATE INDEX IF NOT EXISTS idx_semantic_assessments_action_tenant_created
+              ON semantic_assessments(
+                action_id, tenant_bucket_sha256, created_at COLLATE BINARY,
+                assessment_id COLLATE BINARY
+              );
+            """
+        )
         self._create_llm_call_indexes()
         self._create_object_task_indexes()
 
@@ -11338,6 +11677,10 @@ class SQLRuntimeStore:
 
     def insert_table_row(self, table: str, row: dict[str, Any]) -> None:
         table = self.validate_table_identifier(table)
+        if table in {"semantic_assessment_jobs", "semantic_assessments"}:
+            raise ValidationError(
+                "semantic persistence requires its typed repository"
+            )
         if table == "process_tool_bindings":
             raise ValidationError(
                 "process tool bindings are a derived typed projection"
@@ -11379,6 +11722,8 @@ class SQLRuntimeStore:
 
     def delete_table_rows(self, table: str, where_sql: str, params: Iterable[Any] = ()) -> None:
         table = self.validate_table_identifier(table)
+        if table in {"semantic_assessment_jobs", "semantic_assessments"}:
+            raise ValidationError("semantic evidence cannot be generically deleted")
         if table == "process_tool_bindings":
             raise ValidationError(
                 "process tool bindings are a derived typed projection"
@@ -14677,7 +15022,12 @@ class SQLRuntimeStore:
 
     def insert_human_request(self, request: HumanRequest) -> None:
         self._execute(
-            "INSERT INTO human_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO human_requests (
+                request_id, pid, human, payload_json, status, decision_json,
+                blocking, created_at, updated_at, revision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 request.request_id,
                 request.pid,
@@ -14688,29 +15038,118 @@ class SQLRuntimeStore:
                 int(request.blocking),
                 request.created_at,
                 request.updated_at,
+                request.revision,
             ),
         )
 
-    def update_human_request(self, request: HumanRequest) -> None:
-        self._execute(
+    def update_human_request(self, request: HumanRequest) -> bool:
+        """Compatibility CAS for callers that mutate a freshly read object.
+
+        New terminal paths should use :meth:`compare_and_set_human_request` so
+        the expected status remains explicit.  This method still prevents a
+        stale object from overwriting a winner and advances the passed
+        object's revision only after the durable update succeeds.
+        """
+
+        if not isinstance(request, HumanRequest):
+            raise ValidationError("human request update requires HumanRequest")
+        with self._join_or_begin_transaction() as cursor:
+            row = cursor.execute(
+                "SELECT * FROM human_requests WHERE request_id = ?",
+                (request.request_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            expected = self._row_to_human_request(row)
+            if expected.revision != request.revision:
+                return False
+            target = replace(request, revision=request.revision + 1)
+            self._validate_human_request_cas(expected, target)
+            changed = self._compare_and_set_human_request(
+                cursor,
+                expected=expected,
+                target=target,
+            )
+            if changed:
+                request.revision = target.revision
+            return changed
+
+    def compare_and_set_human_request(
+        self,
+        expected: HumanRequest,
+        target: HumanRequest,
+    ) -> bool:
+        """Atomically replace one exact request revision/status snapshot."""
+
+        self._validate_human_request_cas(expected, target)
+        with self._join_or_begin_transaction() as cursor:
+            return self._compare_and_set_human_request(
+                cursor,
+                expected=expected,
+                target=target,
+            )
+
+    @staticmethod
+    def _validate_human_request_cas(
+        expected: HumanRequest,
+        target: HumanRequest,
+    ) -> None:
+        if not isinstance(expected, HumanRequest) or not isinstance(target, HumanRequest):
+            raise ValidationError("human request CAS requires HumanRequest values")
+        immutable_fields = (
+            "request_id",
+            "pid",
+            "human",
+            "blocking",
+            "created_at",
+        )
+        changed_identity = [
+            field_name
+            for field_name in immutable_fields
+            if getattr(expected, field_name) != getattr(target, field_name)
+        ]
+        if changed_identity:
+            raise ValidationError(
+                "human request CAS cannot change immutable fields: "
+                f"{changed_identity}"
+            )
+        if target.revision != expected.revision + 1:
+            raise ValidationError(
+                "human request CAS target revision must advance exactly once"
+            )
+
+    @staticmethod
+    def _compare_and_set_human_request(
+        cursor: Any,
+        *,
+        expected: HumanRequest,
+        target: HumanRequest,
+    ) -> bool:
+        changed_count = cursor.execute(
             """
             UPDATE human_requests
-               SET pid = ?, human = ?, payload_json = ?, status = ?, decision_json = ?,
-                   blocking = ?, created_at = ?, updated_at = ?
-             WHERE request_id = ?
+               SET payload_json = ?, status = ?, decision_json = ?,
+                   updated_at = ?, revision = ?
+             WHERE request_id = ? AND pid = ? AND human = ?
+               AND blocking = ? AND created_at = ?
+               AND status = ? AND revision = ?
             """,
             (
-                request.pid,
-                request.human,
-                dumps(request.payload),
-                request.status.value,
-                dumps(request.decision) if request.decision is not None else None,
-                int(request.blocking),
-                request.created_at,
-                request.updated_at,
-                request.request_id,
+                dumps(target.payload),
+                target.status.value,
+                dumps(target.decision) if target.decision is not None else None,
+                target.updated_at,
+                target.revision,
+                expected.request_id,
+                expected.pid,
+                expected.human,
+                int(expected.blocking),
+                expected.created_at,
+                expected.status.value,
+                expected.revision,
             ),
-        )
+        ).rowcount
+        return changed_count == 1
 
     def get_human_request(self, request_id: str) -> HumanRequest | None:
         rows = self._query("SELECT * FROM human_requests WHERE request_id = ?", (request_id,))
@@ -15044,9 +15483,10 @@ class SQLRuntimeStore:
         changed_count = cursor.execute(
             """
             UPDATE human_requests
-               SET payload_json = ?, decision_json = ?
+               SET payload_json = ?, decision_json = ?, revision = revision + 1
              WHERE request_id = ? AND pid = ? AND human = ? AND status = ?
                AND blocking = ? AND created_at = ? AND updated_at = ?
+               AND revision = ?
                AND payload_json = ?
                AND ((decision_json IS NULL AND CAST(? AS TEXT) IS NULL)
                     OR decision_json = ?)
@@ -15077,6 +15517,7 @@ class SQLRuntimeStore:
                 int(current.blocking),
                 current.created_at,
                 current.updated_at,
+                current.revision,
                 dumps(current.payload),
                 current_decision,
                 current_decision,
@@ -15085,6 +15526,803 @@ class SQLRuntimeStore:
             ),
         ).rowcount
         return changed_count == 1
+
+    def enqueue_semantic_assessment_job(
+        self,
+        record: SemanticAssessmentJobRecord,
+    ) -> SemanticAssessmentJobRecord:
+        if not isinstance(record, SemanticAssessmentJobRecord):
+            raise ValidationError(
+                "semantic assessment enqueue requires a typed job record"
+            )
+        if (
+            record.status is not SemanticAssessmentJobStatus.QUEUED
+            or record.revision != 0
+            or record.attempt_count != 0
+        ):
+            raise ValidationError("new semantic assessment job must be pristine queued state")
+        with self._join_or_begin_transaction() as cursor:
+            existing_row = cursor.execute(
+                "SELECT * FROM semantic_assessment_jobs WHERE job_id = ?",
+                (record.job_id,),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._row_to_semantic_assessment_job(existing_row)
+                if existing != record:
+                    raise ValidationError(
+                        "semantic assessment job id conflicts with existing content"
+                    )
+                return existing
+            cursor.execute(
+                """
+                INSERT INTO semantic_assessment_jobs (
+                    job_id, assessment_id, kind, status, domain, pid,
+                    request_id, operation_id, effect_id, revision,
+                    attempt_count, lease_owner_id, lease_id, lease_expires_at,
+                    bindings_json, projection_json, projection_sha256,
+                    projection_retention, projection_expires_at, error_code,
+                    created_at, updated_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                self._semantic_job_row(record),
+            )
+        return record
+
+    def get_semantic_assessment_job(
+        self,
+        job_id: str,
+    ) -> SemanticAssessmentJobRecord | None:
+        if not isinstance(job_id, str) or not job_id:
+            raise ValidationError("semantic assessment job id is invalid")
+        rows = self._query(
+            "SELECT * FROM semantic_assessment_jobs WHERE job_id = ?",
+            (job_id,),
+        )
+        return (
+            self._row_to_semantic_assessment_job(rows[0])
+            if rows
+            else None
+        )
+
+    def claim_next_semantic_assessment_job(
+        self,
+        *,
+        lease_owner_id: str,
+        lease_id: str,
+        lease_expires_at: str,
+        updated_at: str,
+    ) -> SemanticAssessmentJobRecord | None:
+        for label, value in (
+            ("lease owner", lease_owner_id),
+            ("lease id", lease_id),
+            ("lease expiry", lease_expires_at),
+            ("updated_at", updated_at),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValidationError(f"semantic assessment {label} is invalid")
+        selected_lease_expires_at = _canonical_semantic_timestamp(
+            lease_expires_at,
+            "semantic assessment lease expiry",
+        )
+        selected_updated_at = _canonical_semantic_timestamp(
+            updated_at,
+            "semantic assessment claim time",
+        )
+        if _parse_semantic_timestamp(
+            selected_lease_expires_at,
+            "semantic assessment lease expiry",
+        ) <= _parse_semantic_timestamp(
+            selected_updated_at,
+            "semantic assessment claim time",
+        ):
+            raise ValidationError(
+                "semantic assessment lease expiry must follow its claim time"
+            )
+        with self._join_or_begin_transaction() as cursor:
+            row = cursor.execute(
+                """
+                SELECT * FROM semantic_assessment_jobs
+                 WHERE status = 'queued' AND attempt_count = 0
+                   AND (
+                     projection_expires_at IS NULL
+                     OR projection_expires_at COLLATE BINARY > ?
+                   )
+                 ORDER BY created_at COLLATE BINARY, job_id COLLATE BINARY
+                 LIMIT 1
+                """,
+                (selected_updated_at,),
+            ).fetchone()
+            if row is None:
+                return None
+            expected = self._row_to_semantic_assessment_job(row)
+            if (
+                expected.projection_expires_at is not None
+                and _parse_semantic_timestamp(
+                    expected.projection_expires_at,
+                    "semantic job projection expiry",
+                )
+                <= _parse_semantic_timestamp(
+                    selected_updated_at,
+                    "semantic assessment claim time",
+                )
+            ):
+                # Defend against a noncanonical legacy/corrupt timestamp that
+                # passed the raw SQL text predicate. Never claim or egress it.
+                return None
+            target = replace(
+                expected,
+                status=SemanticAssessmentJobStatus.CLAIMED,
+                revision=expected.revision + 1,
+                attempt_count=1,
+                lease_owner_id=lease_owner_id,
+                lease_id=lease_id,
+                lease_expires_at=selected_lease_expires_at,
+                updated_at=selected_updated_at,
+            )
+            changed = cursor.execute(
+                """
+                UPDATE semantic_assessment_jobs
+                   SET status = ?, revision = ?, attempt_count = ?,
+                       lease_owner_id = ?, lease_id = ?, lease_expires_at = ?,
+                       updated_at = ?
+                 WHERE job_id = ? AND status = 'queued' AND revision = ?
+                   AND attempt_count = 0
+                """,
+                (
+                    target.status.value,
+                    target.revision,
+                    target.attempt_count,
+                    target.lease_owner_id,
+                    target.lease_id,
+                    target.lease_expires_at,
+                    target.updated_at,
+                    expected.job_id,
+                    expected.revision,
+                ),
+            ).rowcount
+            return target if changed == 1 else None
+
+    def query_expired_semantic_assessment_jobs(
+        self,
+        *,
+        expired_before: str,
+        limit: int,
+    ) -> tuple[SemanticAssessmentJobRecord, ...]:
+        selected_limit = self._semantic_query_limit(limit, label="semantic job recovery")
+        selected_expired_before = _canonical_semantic_timestamp(
+            expired_before,
+            "semantic job recovery boundary",
+        )
+        rows = self._query(
+            """
+            SELECT * FROM semantic_assessment_jobs
+             WHERE status = 'claimed'
+               AND lease_expires_at COLLATE BINARY <= ?
+             ORDER BY lease_expires_at COLLATE BINARY,
+                      created_at COLLATE BINARY, job_id COLLATE BINARY
+             LIMIT ?
+            """,
+            (selected_expired_before, selected_limit),
+        )
+        return tuple(self._row_to_semantic_assessment_job(row) for row in rows)
+
+    def query_semantic_assessment_jobs(
+        self,
+        *,
+        statuses: Iterable[str],
+        projection_expires_before: str | None,
+        limit: int,
+    ) -> tuple[SemanticAssessmentJobRecord, ...]:
+        selected_limit = self._semantic_query_limit(limit, label="semantic job")
+        try:
+            selected_statuses = tuple(
+                dict.fromkeys(SemanticAssessmentJobStatus(value).value for value in statuses)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("semantic job status filter is invalid") from exc
+        if not selected_statuses:
+            return ()
+        clauses = [
+            f"status IN ({', '.join('?' for _ in selected_statuses)})"
+        ]
+        params: list[Any] = list(selected_statuses)
+        if projection_expires_before is not None:
+            selected_projection_boundary = _canonical_semantic_timestamp(
+                projection_expires_before,
+                "semantic projection expiry boundary",
+            )
+            clauses.append(
+                "projection_expires_at IS NOT NULL "
+                "AND projection_expires_at COLLATE BINARY <= ?"
+            )
+            params.append(selected_projection_boundary)
+        params.append(selected_limit)
+        rows = self._query(
+            "SELECT * FROM semantic_assessment_jobs "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at COLLATE BINARY, job_id COLLATE BINARY LIMIT ?",
+            params,
+        )
+        return tuple(self._row_to_semantic_assessment_job(row) for row in rows)
+
+    def semantic_status_aggregate(self) -> SemanticStatusAggregate:
+        """Return queue and assessment counts from one database snapshot."""
+
+        job_statuses = tuple(SemanticAssessmentJobStatus)
+        assessment_statuses = tuple(SemanticAssessmentStatus)
+        assessment_domains = tuple(SemanticDomain)
+        shadow_outcomes = (
+            "would_issue_exact_once",
+            "require_human",
+            "would_deny",
+        )
+        job_columns = ", ".join(
+            f"COUNT(CASE WHEN status = ? THEN 1 END) AS job_{status.value}"
+            for status in job_statuses
+        )
+        assessment_columns = ", ".join(
+            "COUNT(CASE WHEN status = ? THEN 1 END) "
+            f"AS assessment_{status.value}"
+            for status in assessment_statuses
+        )
+        domain_columns = ", ".join(
+            "COUNT(CASE WHEN domain = ? THEN 1 END) "
+            f"AS domain_{domain.value}"
+            for domain in assessment_domains
+        )
+        outcome_columns = ", ".join(
+            "COUNT(CASE WHEN shadow_outcome = ? THEN 1 END) "
+            f"AS outcome_{outcome}"
+            for outcome in shadow_outcomes
+        )
+        rows = self._query(
+            "WITH job_aggregate AS ("
+            f" SELECT COUNT(*) AS job_total, {job_columns}"
+            " FROM semantic_assessment_jobs"
+            "), assessment_aggregate AS ("
+            f" SELECT COUNT(*) AS assessment_total, {assessment_columns},"
+            f" {domain_columns},"
+            " COUNT(CASE WHEN ood = 1 THEN 1 END) AS assessment_ood_count,"
+            f" {outcome_columns}"
+            " FROM semantic_assessments"
+            ") SELECT job_aggregate.*, assessment_aggregate.*"
+            " FROM job_aggregate CROSS JOIN assessment_aggregate",
+            (
+                *(status.value for status in job_statuses),
+                *(status.value for status in assessment_statuses),
+                *(domain.value for domain in assessment_domains),
+                *shadow_outcomes,
+            ),
+        )
+        if len(rows) != 1:
+            raise ValidationError("semantic status aggregate query is inconsistent")
+        row = rows[0]
+
+        def count(column: str) -> int:
+            value = row[column]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValidationError(
+                    f"semantic status aggregate column {column} is invalid"
+                )
+            return value
+
+        return SemanticStatusAggregate(
+            job_total=count("job_total"),
+            job_counts={
+                status.value: count(f"job_{status.value}")
+                for status in job_statuses
+            },
+            assessment_total=count("assessment_total"),
+            assessment_status_counts={
+                status.value: count(f"assessment_{status.value}")
+                for status in assessment_statuses
+            },
+            assessment_domain_counts={
+                domain.value: count(f"domain_{domain.value}")
+                for domain in assessment_domains
+            },
+            assessment_ood_count=count("assessment_ood_count"),
+            shadow_outcome_counts={
+                outcome: count(f"outcome_{outcome}")
+                for outcome in shadow_outcomes
+            },
+        )
+
+    def terminalize_semantic_assessment_job(
+        self,
+        expected: SemanticAssessmentJobRecord,
+        target: SemanticAssessmentJobRecord,
+        assessment: SemanticAssessmentRecord,
+    ) -> bool:
+        self._validate_semantic_job_terminal_cas(expected, target, assessment)
+        with self._join_or_begin_transaction() as cursor:
+            changed = cursor.execute(
+                """
+                UPDATE semantic_assessment_jobs
+                   SET assessment_id = ?, status = ?, revision = ?,
+                       lease_owner_id = NULL, lease_id = NULL,
+                       lease_expires_at = NULL, projection_json = '{}',
+                       projection_retention = 'hash_only',
+                       projection_expires_at = NULL, error_code = ?,
+                       updated_at = ?, completed_at = ?
+                 WHERE job_id = ? AND status = ? AND revision = ?
+                   AND attempt_count = ?
+                   AND bindings_json = ? AND projection_sha256 = ?
+                   AND (
+                     (lease_id IS NULL AND CAST(? AS TEXT) IS NULL)
+                     OR lease_id = ?
+                   )
+                """,
+                (
+                    target.assessment_id,
+                    target.status.value,
+                    target.revision,
+                    target.error_code,
+                    target.updated_at,
+                    target.completed_at,
+                    expected.job_id,
+                    expected.status.value,
+                    expected.revision,
+                    expected.attempt_count,
+                    dumps(dict(expected.bindings)),
+                    expected.projection_sha256,
+                    expected.lease_id,
+                    expected.lease_id,
+                ),
+            ).rowcount
+            if changed != 1:
+                return False
+            self._append_semantic_assessment(cursor, assessment)
+            return True
+
+    @staticmethod
+    def _validate_semantic_job_terminal_cas(
+        expected: SemanticAssessmentJobRecord,
+        target: SemanticAssessmentJobRecord,
+        assessment: SemanticAssessmentRecord,
+    ) -> None:
+        if not all(
+            (
+                isinstance(expected, SemanticAssessmentJobRecord),
+                isinstance(target, SemanticAssessmentJobRecord),
+                isinstance(assessment, SemanticAssessmentRecord),
+            )
+        ):
+            raise ValidationError("semantic job terminal CAS requires typed records")
+        immutable_fields = (
+            "job_id",
+            "kind",
+            "domain",
+            "pid",
+            "request_id",
+            "operation_id",
+            "effect_id",
+            "bindings",
+            "projection_sha256",
+            "created_at",
+            "attempt_count",
+        )
+        changed = [
+            name
+            for name in immutable_fields
+            if getattr(expected, name) != getattr(target, name)
+        ]
+        if changed or target.revision != expected.revision + 1:
+            raise ValidationError(
+                "semantic job terminal CAS changed immutable state or revision"
+            )
+        if expected.status not in {
+            SemanticAssessmentJobStatus.QUEUED,
+            SemanticAssessmentJobStatus.CLAIMED,
+        } or target.status.value not in _TERMINAL_JOB_STATUSES:
+            raise ValidationError("semantic job terminal CAS status transition is invalid")
+        permitted_targets = {
+            SemanticAssessmentJobStatus.QUEUED: {
+                SemanticAssessmentJobStatus.CANCELLED,
+                SemanticAssessmentJobStatus.EXPIRED,
+            },
+            SemanticAssessmentJobStatus.CLAIMED: {
+                SemanticAssessmentJobStatus.SUCCEEDED,
+                SemanticAssessmentJobStatus.FAILED,
+                SemanticAssessmentJobStatus.EGRESS_BLOCKED,
+                SemanticAssessmentJobStatus.PROVIDER_OUTCOME_UNKNOWN,
+            },
+        }
+        expected_attempt_count = (
+            0
+            if expected.status is SemanticAssessmentJobStatus.QUEUED
+            else 1
+        )
+        if (
+            target.status not in permitted_targets[expected.status]
+            or expected.attempt_count != expected_attempt_count
+        ):
+            raise ValidationError(
+                "semantic job terminal CAS violates claim/attempt provenance"
+            )
+        if (
+            expected.status is SemanticAssessmentJobStatus.CLAIMED
+            and target.status
+            is not SemanticAssessmentJobStatus.PROVIDER_OUTCOME_UNKNOWN
+            and _parse_semantic_timestamp(
+                target.completed_at,
+                "semantic assessment job completion time",
+            )
+            >= _parse_semantic_timestamp(
+                expected.lease_expires_at,
+                "semantic assessment job lease expiry",
+            )
+        ):
+            raise ValidationError(
+                "expired semantic assessment lease can only record an unknown provider outcome"
+            )
+        SQLRuntimeStore._validate_semantic_assessment_provenance(
+            expected,
+            target,
+            assessment,
+        )
+        compatible_statuses = {
+            SemanticAssessmentJobStatus.SUCCEEDED: {"success"},
+            SemanticAssessmentJobStatus.FAILED: {
+                "timeout",
+                "provider_error",
+                "invalid_schema",
+                "ood",
+                "abstained",
+                "stale_input",
+            },
+            SemanticAssessmentJobStatus.EGRESS_BLOCKED: {"egress_blocked"},
+            SemanticAssessmentJobStatus.PROVIDER_OUTCOME_UNKNOWN: {
+                "provider_outcome_unknown"
+            },
+            SemanticAssessmentJobStatus.CANCELLED: {"skipped_policy"},
+            SemanticAssessmentJobStatus.EXPIRED: {"stale_input"},
+        }
+        if assessment.status not in compatible_statuses[target.status]:
+            raise ValidationError("semantic assessment status does not match terminal job")
+        failed_error_codes = {
+            "timeout": "timeout",
+            "provider_error": "provider_error",
+            "invalid_schema": "invalid_schema",
+            "ood": "out_of_distribution",
+            "abstained": "abstained",
+            "stale_input": "stale_input",
+        }
+        required_error_code = {
+            SemanticAssessmentJobStatus.SUCCEEDED: None,
+            SemanticAssessmentJobStatus.FAILED: failed_error_codes.get(
+                assessment.status
+            ),
+            SemanticAssessmentJobStatus.EGRESS_BLOCKED: "egress_blocked",
+            SemanticAssessmentJobStatus.PROVIDER_OUTCOME_UNKNOWN: (
+                "provider_outcome_unknown"
+            ),
+            SemanticAssessmentJobStatus.CANCELLED: "disabled",
+            SemanticAssessmentJobStatus.EXPIRED: "projection_expired",
+        }[target.status]
+        if target.error_code != required_error_code:
+            raise ValidationError(
+                "semantic job error code does not match terminal outcome"
+            )
+
+    @staticmethod
+    def _validate_semantic_assessment_provenance(
+        expected: SemanticAssessmentJobRecord,
+        target: SemanticAssessmentJobRecord,
+        assessment: SemanticAssessmentRecord,
+    ) -> None:
+        for name in (
+            "assessment_id",
+            "job_id",
+            "kind",
+            "domain",
+            "pid",
+            "request_id",
+            "operation_id",
+            "effect_id",
+        ):
+            if getattr(assessment, name) != getattr(target, name):
+                raise ValidationError(
+                    f"semantic assessment does not match terminal job field {name}"
+                )
+        for name in (
+            "artifact_sha256",
+            "input_sha256",
+            "feature_snapshot_sha256",
+            "policy_sha256",
+            "manifest_sha256",
+            "action_sha256",
+            "resource_sha256",
+            "args_sha256",
+            "state_sha256",
+            "source_refs_sha256",
+            "data_labels_sha256",
+            "sink_identity_sha256",
+            "tool_schema_sha256",
+            "provider_spec_sha256",
+            "tenant_bucket_sha256",
+        ):
+            if expected.bindings.get(name) != getattr(assessment, name):
+                raise ValidationError(
+                    f"semantic assessment digest does not match frozen job {name}"
+                )
+        if expected.projection_sha256 != assessment.projection_sha256:
+            raise ValidationError(
+                "semantic assessment digest does not match frozen job projection_sha256"
+            )
+        if expected.projection.get("action_id") != assessment.action_id:
+            raise ValidationError(
+                "semantic assessment action does not match frozen job projection"
+            )
+        if assessment.created_at != expected.created_at:
+            raise ValidationError(
+                "semantic assessment creation does not match frozen job"
+            )
+        if assessment.completed_at != target.completed_at:
+            raise ValidationError(
+                "semantic assessment completion does not match terminal job"
+            )
+
+    def append_semantic_assessment(
+        self,
+        record: SemanticAssessmentRecord,
+    ) -> SemanticAssessmentRecord:
+        if not isinstance(record, SemanticAssessmentRecord):
+            raise ValidationError("semantic assessment append requires a typed record")
+        with self._join_or_begin_transaction() as cursor:
+            return self._append_semantic_assessment(cursor, record)
+
+    def _append_semantic_assessment(
+        self,
+        cursor: Any,
+        record: SemanticAssessmentRecord,
+    ) -> SemanticAssessmentRecord:
+        rows = list(
+            cursor.execute(
+                "SELECT * FROM semantic_assessments "
+                "WHERE assessment_id = ? OR job_id = ?",
+                (record.assessment_id, record.job_id),
+            )
+        )
+        if rows:
+            if len(rows) != 1:
+                raise ValidationError("semantic assessment identity is inconsistent")
+            existing = self._row_to_semantic_assessment(rows[0])
+            if existing != record:
+                raise ValidationError(
+                    "semantic assessment identity conflicts with existing evidence"
+                )
+            return existing
+        cursor.execute(
+            """
+            INSERT INTO semantic_assessments (
+                assessment_id, job_id, kind, status, domain, action_id,
+                tenant_bucket_sha256, pid,
+                request_id, operation_id, effect_id, shadow_outcome,
+                ood, record_json, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.assessment_id,
+                record.job_id,
+                record.kind,
+                record.status,
+                record.domain,
+                record.action_id,
+                record.tenant_bucket_sha256,
+                record.pid,
+                record.request_id,
+                record.operation_id,
+                record.effect_id,
+                record.shadow_outcome,
+                int(record.ood),
+                dumps(record.to_dict()),
+                record.created_at,
+                record.completed_at,
+            ),
+        )
+        return record
+
+    def get_semantic_assessment(
+        self,
+        assessment_id: str,
+    ) -> SemanticAssessmentRecord | None:
+        if not isinstance(assessment_id, str) or not assessment_id:
+            raise ValidationError("semantic assessment id is invalid")
+        rows = self._query(
+            "SELECT * FROM semantic_assessments WHERE assessment_id = ?",
+            (assessment_id,),
+        )
+        return self._row_to_semantic_assessment(rows[0]) if rows else None
+
+    def query_semantic_assessments(
+        self,
+        *,
+        after: SemanticAssessmentCursor | None,
+        limit: int,
+        pid: str | None = None,
+        request_id: str | None = None,
+        operation_id: str | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        domain: str | None = None,
+        action_id: str | None = None,
+        tenant_bucket_sha256: str | None = None,
+    ) -> SemanticAssessmentPage:
+        selected_limit = self._semantic_query_limit(limit, label="semantic assessment")
+        if after is not None and not isinstance(after, SemanticAssessmentCursor):
+            raise ValidationError("semantic assessment cursor is invalid")
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("pid", pid),
+            ("request_id", request_id),
+            ("operation_id", operation_id),
+            ("kind", kind),
+            ("status", status),
+            ("domain", domain),
+            ("action_id", action_id),
+            ("tenant_bucket_sha256", tenant_bucket_sha256),
+        ):
+            if value is not None:
+                if not isinstance(value, str) or not value or len(value) > 512:
+                    raise ValidationError(f"semantic assessment {column} filter is invalid")
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if after is not None:
+            clauses.append(
+                "(created_at COLLATE BINARY, assessment_id COLLATE BINARY) > (?, ?)"
+            )
+            params.extend((after.created_at, after.assessment_id))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(selected_limit + 1)
+        rows = self._query(
+            "SELECT * FROM semantic_assessments"
+            f"{where} ORDER BY created_at COLLATE BINARY, "
+            "assessment_id COLLATE BINARY LIMIT ?",
+            params,
+        )
+        records = tuple(
+            self._row_to_semantic_assessment(row)
+            for row in rows[:selected_limit]
+        )
+        next_cursor = None
+        if len(rows) > selected_limit and records:
+            last = records[-1]
+            next_cursor = SemanticAssessmentCursor(
+                created_at=last.created_at,
+                assessment_id=last.assessment_id,
+            )
+        return SemanticAssessmentPage(records=records, next_cursor=next_cursor)
+
+    @staticmethod
+    def _semantic_query_limit(limit: int, *, label: str) -> int:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValidationError(f"{label} query limit must be positive")
+        if limit > SEMANTIC_QUERY_HARD_LIMIT:
+            raise ValidationError(
+                f"{label} query limit exceeds hard cap {SEMANTIC_QUERY_HARD_LIMIT}"
+            )
+        return limit
+
+    @staticmethod
+    def _semantic_job_row(record: SemanticAssessmentJobRecord) -> tuple[Any, ...]:
+        return (
+            record.job_id,
+            record.assessment_id,
+            record.kind,
+            record.status.value,
+            record.domain,
+            record.pid,
+            record.request_id,
+            record.operation_id,
+            record.effect_id,
+            record.revision,
+            record.attempt_count,
+            record.lease_owner_id,
+            record.lease_id,
+            record.lease_expires_at,
+            dumps(dict(record.bindings)),
+            dumps(dict(record.projection)),
+            record.projection_sha256,
+            record.projection_retention.value,
+            record.projection_expires_at,
+            record.error_code,
+            record.created_at,
+            record.updated_at,
+            record.completed_at,
+        )
+
+    def _row_to_semantic_assessment_job(
+        self,
+        row: Any,
+    ) -> SemanticAssessmentJobRecord:
+        with _persisted_model_decode(f"semantic assessment job {row['job_id']}"):
+            bindings = bounded_json_loads(
+                row["bindings_json"],
+                max_bytes=8 * 1024,
+            )
+            projection = bounded_json_loads(
+                row["projection_json"],
+                max_bytes=16 * 1024,
+            )
+            return SemanticAssessmentJobRecord(
+                job_id=row["job_id"],
+                assessment_id=row["assessment_id"],
+                kind=row["kind"],
+                status=SemanticAssessmentJobStatus(row["status"]),
+                domain=row["domain"],
+                pid=row["pid"],
+                request_id=row["request_id"],
+                operation_id=row["operation_id"],
+                effect_id=row["effect_id"],
+                revision=row["revision"],
+                attempt_count=row["attempt_count"],
+                lease_owner_id=row["lease_owner_id"],
+                lease_id=row["lease_id"],
+                lease_expires_at=row["lease_expires_at"],
+                bindings=bindings,
+                projection=projection,
+                projection_sha256=row["projection_sha256"],
+                projection_retention=SemanticProjectionRetention(
+                    row["projection_retention"]
+                ),
+                projection_expires_at=row["projection_expires_at"],
+                error_code=row["error_code"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                completed_at=row["completed_at"],
+            )
+
+    def _row_to_semantic_assessment(
+        self,
+        row: Any,
+    ) -> SemanticAssessmentRecord:
+        with _persisted_model_decode(f"semantic assessment {row['assessment_id']}"):
+            value = bounded_json_loads(
+                row["record_json"],
+                max_bytes=256 * 1024,
+            )
+            record = SemanticAssessmentRecord.from_dict(value)
+            column_projection = (
+                record.assessment_id,
+                record.job_id,
+                record.kind,
+                record.status,
+                record.domain,
+                record.action_id,
+                record.tenant_bucket_sha256,
+                record.pid,
+                record.request_id,
+                record.operation_id,
+                record.effect_id,
+                record.shadow_outcome,
+                int(record.ood),
+                record.created_at,
+                record.completed_at,
+            )
+            persisted_projection = (
+                row["assessment_id"],
+                row["job_id"],
+                row["kind"],
+                row["status"],
+                row["domain"],
+                row["action_id"],
+                row["tenant_bucket_sha256"],
+                row["pid"],
+                row["request_id"],
+                row["operation_id"],
+                row["effect_id"],
+                row["shadow_outcome"],
+                row["ood"],
+                row["created_at"],
+                row["completed_at"],
+            )
+            if column_projection != persisted_projection:
+                raise ValidationError(
+                    "semantic assessment indexed columns disagree with record"
+                )
+            return record
 
     def insert_llm_call(self, record: LLMCallRecord) -> None:
         retention_tier = llm_call_payload_retention_tier(record)
@@ -18789,6 +20027,7 @@ class SQLRuntimeStore:
                 blocking=bool(row["blocking"]),
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
+                revision=row["revision"],
             )
 
     def _row_to_llm_call(self, row: Any) -> LLMCallRecord:

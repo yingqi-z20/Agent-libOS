@@ -20,7 +20,8 @@ from agent_libos.runtime.checkpoint_reconciliation import (
     CheckpointRestoreReconciler,
 )
 from agent_libos.runtime.operation_manager import OperationManager
-from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS
+from agent_libos.models.exceptions import UnsupportedStoreVersion
+from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS, _V5_REQUIRED_COLUMNS
 
 
 def test_publication_scale_profile_and_workflows_are_stable() -> None:
@@ -204,8 +205,15 @@ def test_publication_scale_reviews_only_the_exact_domain_validation_query() -> N
     )
 
 
-def test_publication_startup_v4_manifest_schema_probe_allowlist_is_exact() -> None:
-    manifest_tables = sorted(_V4_REQUIRED_COLUMNS)
+@pytest.mark.parametrize(
+    ("version", "required_columns"),
+    [(4, _V4_REQUIRED_COLUMNS), (5, _V5_REQUIRED_COLUMNS)],
+)
+def test_publication_startup_manifest_schema_probe_allowlist_is_exact(
+    version: int,
+    required_columns: dict[str, frozenset[str]],
+) -> None:
+    manifest_tables = sorted(required_columns)
 
     def manifest_probe(tables: list[str]) -> str:
         names = ", ".join(f"'{name}'" for name in tables)
@@ -217,7 +225,7 @@ def test_publication_startup_v4_manifest_schema_probe_allowlist_is_exact() -> No
     exact_probe = manifest_probe(manifest_tables)
     assert (
         publication_runner._publication_statement_shape(exact_probe)
-        == "v4_manifest_schema_probe"
+        == f"v{version}_manifest_schema_probe"
     )
 
     near_or_arbitrary_probes = (
@@ -237,6 +245,50 @@ def test_publication_startup_v4_manifest_schema_probe_allowlist_is_exact() -> No
     assert all(
         publication_runner._publication_statement_shape(probe) == "unreviewed"
         for probe in near_or_arbitrary_probes
+    )
+
+
+def test_publication_v5_catalog_probe_allowlist_is_exact() -> None:
+    assert (
+        publication_runner._publication_statement_shape(
+            'PRAGMA table_xinfo("runtime_publications")'
+        )
+        == "catalog_table_xinfo:runtime_publications"
+    )
+    assert (
+        publication_runner._publication_statement_shape(
+            'PRAGMA foreign_key_list("checkpoint_payload_delivery_attempts")'
+        )
+        == (
+            "catalog_foreign_key_list:"
+            "checkpoint_payload_delivery_attempts"
+        )
+    )
+    assert (
+        publication_runner._publication_statement_shape(
+            'PRAGMA index_list("runtime_publications")'
+        )
+        == "catalog_index_list:runtime_publications"
+    )
+    assert (
+        publication_runner._publication_statement_shape(
+            'PRAGMA index_xinfo("idx_runtime_publications_state")'
+        )
+        == "catalog_index_xinfo:idx_runtime_publications_state"
+    )
+    assert all(
+        publication_runner._publication_statement_shape(probe) == "unreviewed"
+        for probe in (
+            "PRAGMA table_xinfo(runtime_publications)",
+            'PRAGMA index_xinfo("idx_runtime_publications_not_canonical")',
+            'PRAGMA index_xinfo("idx_runtime_publications_state_extra")',
+        )
+    )
+    assert (
+        publication_runner._publication_statement_shape(
+            'PRAGMA table_xinfo("operations")'
+        )
+        is None
     )
 
 
@@ -719,9 +771,12 @@ def test_publication_scale_rejects_same_name_weak_reconciliation_index(
         "_seed_terminal_publication_history",
         seed_with_weak_index,
     )
+    # Schema v5 now rejects the weakened same-name index during the store's
+    # full-catalog preflight, before the benchmark's redundant local shape
+    # assertion can run.
     with pytest.raises(
-        AssertionError,
-        match="reconciliation index columns changed",
+        UnsupportedStoreVersion,
+        match="schema v5 full catalog",
     ):
         run_publication_scale_benchmark(
             total_records=40,

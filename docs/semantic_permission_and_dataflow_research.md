@@ -5,6 +5,14 @@
 > 适用对象：Agent libOS 的运行时、Capability、Human approval、Protected Operation、Object Memory、provider 与审计子系统<br>
 > 文档性质：技术预研与立项建议，不构成法律或合规意见
 
+> 实施状态（2026-08-05）：本报告仍是调研与后续路线依据。仓库已按其
+> Phase 0+1 建议从干净基线 `4b43cb7` 实现默认关闭的 Shadow thin slice；
+> 当前能力、配置、存储迁移、
+> 隐私边界与明确未实现项以
+> [Semantic Approval and Data Identification](semantic_shadow.md) 为准。本文中
+> 关于自动签发、真实拒绝、完整 FlowGraph、长期记忆和生产放量的描述仍是后续
+> 提案，不能理解为当前运行时能力。
+
 ## 0. 结论先行
 
 本项目值得做，但“基于语义的自动审批”和“基于语义的数据流识别”不能被实现为一个拥有最终权限的 LLM 审查器。推荐的产品定义是：

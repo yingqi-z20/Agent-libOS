@@ -594,6 +594,56 @@ process-tree containment: an inherited death pipe plus isolated process group
 on POSIX, or a `KILL_ON_JOB_CLOSE` Job Object on Windows. Sandbox execution
 fails closed if that containment cannot be established.
 
+## Semantic Shadow Evidence Plane
+
+The optional semantic subsystem is a Host-owned evidence plane beside, not
+inside, the authority path. Approval-request, root-goal, and committed-provider
+ingress capture creates bounded durable jobs. A lease/CAS worker executes a
+typed deterministic, scripted, or explicitly configured external assessment;
+the pure broker records only `would_issue_exact_once`, `would_deny`, or
+`require_human`. The existing Human and protected-operation paths neither wait
+for nor consume that output.
+
+The default `semantic.mode` is `off`, which performs no capture writes and
+claims no jobs. `shadow` can add only semantic job/assessment evidence and
+bounded health diagnostics. Capture and post-commit observer exceptions are
+isolated from the process, Human decision, Capability/permission tables,
+`DataLabels`, data release, and business provider effect. There is no Runtime,
+CLI, HTTP, GUI, model Tool, Skill, JIT, or Module entrypoint that turns a Shadow
+result into a Human terminal state or Capability.
+
+Approval and provider-ingress jobs are metadata-only. A root-goal job may
+temporarily contain a deterministic redacted intent only for bounded
+`public`/`normal`, non-mixed-identity text that passes local secret and path
+detection; every other goal falls back to metadata-only, and terminalization
+scrubs the projection. The Host-owned provider-result observer is bound once at
+composition. Invocation observers are additive, cannot replace it, and fail
+independently. Provider ingress is captured only when the post-commit SDK can
+derive a bounded canonical result digest; its descriptor is payload-free and
+an unavailable digest becomes a capture failure without changing the result.
+Root goals and safely traversable provider results also pass through a bounded
+local Host DLP detector. It retains only closed category/reason/digest evidence,
+forces metadata-only projection on a hit, and merges monotonic Host findings
+into every terminal assessment without writing labels back.
+
+An optional classifier call is itself a runtime-internal Protected Operation
+named `semantic.llm.assess`, with effect class `llm.complete`, a frozen Host
+profile identity and model, a profile-bound Sink identity, and normal DataFlow
+preflight/revalidation. Snapshot/resolution/model/Sink drift fails closed. It
+disables automatic release-request creation; conditional egress therefore
+terminates the job as `egress_blocked`. Provider ambiguity is terminal and is
+never automatically replayed. The general LLM process executor is not reused,
+so its full-I/O persistence path cannot capture the semantic prompt or
+response.
+
+Store schema v5 keeps mutable queue state separate from the append-only
+assessment ledger. Temporary safe projections are bounded and reduced to
+hash-only at terminalization, expiry, cancellation, failure, or kill-switch
+cleanup. Assessment records retain closed findings and Host provenance digests,
+never prompts, raw task/provider text, classifier responses, or reasoning. See
+[Semantic Approval and Data Identification](semantic_shadow.md) for the full
+contract.
+
 ## Persistence And Audit
 
 The runtime store keeps durable mutable state and append-only evidence,
@@ -618,6 +668,8 @@ including:
 - Object Tasks and agent ratings,
 - Host Sink trust rows, data-flow decisions and releases, and durable file
   labels,
+- semantic assessment jobs with lease/CAS state and append-only, payload-free
+  Shadow assessment evidence,
 - explainable operations, evidence links, and context manifests,
 - durable LLM pending-action generations, `image_only` native transcript tool
   outputs, compatible Responses-continuation rows, and context generations,

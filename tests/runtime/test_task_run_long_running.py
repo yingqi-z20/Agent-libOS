@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 from collections import defaultdict
@@ -45,6 +46,7 @@ CHILD_PROCESS_SKILL = "agent-libos-child-processes"
 HUMAN_COLLABORATION_SKILL = "agent-libos-human-collaboration"
 REAL_DEADLINE_TEST_WINDOW_S = 5.0
 THREAD_SYNC_TIMEOUT_S = 30.0
+BATCH_CONTROL_SYNC_TIMEOUT_S = 90.0 if os.name == "nt" else THREAD_SYNC_TIMEOUT_S
 
 
 def _config():
@@ -2096,16 +2098,26 @@ def test_inflight_settlement_cannot_strand_control_attention_on_revision_race(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    clock = {"now": datetime.now(timezone.utc)}
+
+    class ControlledDatetime(datetime):
+        @classmethod
+        def now(cls, tz: Any | None = None) -> datetime:
+            selected = clock["now"]
+            if tz is None:
+                return selected.replace(tzinfo=None)
+            return selected.astimezone(tz)
+
+    monkeypatch.setattr("agent_libos.runtime.task_runs.datetime", ControlledDatetime)
     runtime = Runtime.open(
         tmp_path / f"{control}-attention-revision-race.sqlite",
         config=_config(),
     )
-    # Start the real-time window after the potentially slow Windows store
-    # setup.  This test exercises settlement/deadline linearization, not the
-    # startup speed of a loaded CI runner.
+    # Keep deadline progression under test control. Runner load must not expire
+    # the deadline before the Provider and Run reach the intended race point.
     deadline_at = (
         (
-            datetime.now(timezone.utc)
+            clock["now"]
             + timedelta(seconds=REAL_DEADLINE_TEST_WINDOW_S)
         ).isoformat()
         if control == "deadline"
@@ -2178,10 +2190,9 @@ def test_inflight_settlement_cannot_strand_control_attention_on_revision_race(
 
             if control == "deadline":
                 assert deadline_at is not None
-                remaining = datetime.fromisoformat(deadline_at) - datetime.now(
-                    timezone.utc
+                clock["now"] = datetime.fromisoformat(deadline_at) + timedelta(
+                    microseconds=1
                 )
-                time.sleep(max(0.0, remaining.total_seconds()) + 0.02)
                 control_future = pool.submit(
                     runtime.task_runs.get,
                     created.run_id,
@@ -2693,7 +2704,7 @@ def test_control_generation_is_checked_before_each_tool_in_a_batch(
         tool_calls.append(handle.name)
         if len(tool_calls) == 1:
             first_entered.set()
-            if not release_first.wait(timeout=THREAD_SYNC_TIMEOUT_S):
+            if not release_first.wait(timeout=BATCH_CONTROL_SYNC_TIMEOUT_S):
                 raise AssertionError("test did not release the first tool")
         return await original_acall(
             pid,
@@ -2720,7 +2731,7 @@ def test_control_generation_is_checked_before_each_tool_in_a_batch(
                 command_id=f"run:batch-{control}",
                 max_quanta=1,
             )
-            assert first_entered.wait(timeout=THREAD_SYNC_TIMEOUT_S)
+            assert first_entered.wait(timeout=BATCH_CONTROL_SYNC_TIMEOUT_S)
             running = runtime.task_runs.get(created.run_id)
             if control == "pause":
                 control_future = pool.submit(
@@ -2738,7 +2749,7 @@ def test_control_generation_is_checked_before_each_tool_in_a_batch(
                     expected_revision=running.revision,
                     command_id="interrupt:batch",
                 )
-            deadline = time.monotonic() + THREAD_SYNC_TIMEOUT_S
+            deadline = time.monotonic() + BATCH_CONTROL_SYNC_TIMEOUT_S
             intent = runtime.store.get_task_run(created.run_id)
             while (
                 intent is not None
@@ -2753,8 +2764,8 @@ def test_control_generation_is_checked_before_each_tool_in_a_batch(
             assert not control_future.done()
 
             release_first.set()
-            controlled = control_future.result(timeout=THREAD_SYNC_TIMEOUT_S)
-            worker = run_future.result(timeout=THREAD_SYNC_TIMEOUT_S)
+            controlled = control_future.result(timeout=BATCH_CONTROL_SYNC_TIMEOUT_S)
+            worker = run_future.result(timeout=BATCH_CONTROL_SYNC_TIMEOUT_S)
 
         assert client.calls == 1
         assert tool_calls == ["discover_skills"]

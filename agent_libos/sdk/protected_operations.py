@@ -3,9 +3,13 @@ from __future__ import annotations
 from contextlib import AbstractContextManager, nullcontext
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum, StrEnum
+import hashlib
 import inspect
+import json
+import math
 import sys
+from types import MemberDescriptorType, ModuleType
 from typing import Any, Awaitable, Callable, Iterable, Mapping, TypeVar
 
 from agent_libos.models import (
@@ -15,6 +19,7 @@ from agent_libos.models import (
     DataFlowDecision,
     DataFlowDirection,
     DataIntegrity,
+    DataLabels,
     DataSink,
     Event,
     EventPriority,
@@ -280,6 +285,801 @@ AuthorityRevalidator = Callable[[], Iterable[CapabilityDecision]]
 DataSinkRevalidator = Callable[[], DataSink]
 TargetStateVersionResolver = Callable[[], str | int | None]
 _DATA_FLOW_PAYLOAD_UNSET = object()
+_RESULT_DIGEST_MAX_BYTES = 256 * 1024
+_RESULT_DIGEST_MAX_NODES = 4_096
+_HOST_RESULT_DIGEST_MAX_BYTES = 64 * 1024 * 1024
+_HOST_RESULT_DIGEST_MAX_NODES = 500_000
+_RESULT_PROJECTION_MISSING = object()
+_HOST_RESULT_CONTRACT_PREFIXES = (
+    "primitive.filesystem.",
+    "primitive.shell.",
+    "primitive.git.",
+    "primitive.jsonrpc.",
+    "primitive.mcp.",
+)
+_TRUSTED_RESULT_DATACLASSES = frozenset(
+    {
+        "agent_libos.primitives.filesystem.DeleteResult",
+        "agent_libos.primitives.filesystem.DirectoryEntry",
+        "agent_libos.primitives.filesystem.DirectoryReadResult",
+        "agent_libos.primitives.filesystem.DirectoryWriteResult",
+        "agent_libos.primitives.filesystem.FileBytesReadResult",
+        "agent_libos.primitives.filesystem.FileReadResult",
+        "agent_libos.primitives.filesystem.FileWriteResult",
+        "agent_libos.models.data_flow.DataFlowContext",
+        "agent_libos.models.data_flow.DataLabels",
+        "agent_libos.models.data_flow.DataSourceRef",
+        "agent_libos.models.git.GitCommit",
+        "agent_libos.models.git.GitDiffResult",
+        "agent_libos.models.git.GitOperationResult",
+        "agent_libos.models.git.GitPatchArtifact",
+        "agent_libos.models.git.GitPath",
+        "agent_libos.models.git.GitPullRequest",
+        "agent_libos.models.git.GitPullRequestReview",
+        "agent_libos.models.git.GitRef",
+        "agent_libos.models.git.GitRemoteInfo",
+        "agent_libos.models.git.GitRepositoryInfo",
+        "agent_libos.models.git.GitStateToken",
+        "agent_libos.models.git.GitStatusEntry",
+        "agent_libos.models.git.GitStatusResult",
+        "agent_libos.models.git.GitWorktreeInfo",
+        "agent_libos.primitives.git._GitCleanSnapshot",
+        "agent_libos.primitives.git._GitFlowSnapshot",
+        "agent_libos.primitives.git._GitReadFlowSnapshot",
+        "agent_libos.substrate.base.CommandMetrics",
+        "agent_libos.substrate.base.CommandResult",
+        "agent_libos.substrate.base.DirectoryEntrySnapshot",
+        "agent_libos.substrate.base.GitCommandResult",
+        "agent_libos.substrate.base.PathState",
+        "agent_libos.models.jsonrpc.JsonRpcCallResult",
+        "agent_libos.models.mcp.McpCallResult",
+        "agent_libos.models.mcp.McpConnectionInfo",
+        "agent_libos.models.mcp.McpDiscoveryResult",
+        "agent_libos.models.mcp.McpExchangeReceipt",
+        "agent_libos.models.mcp.McpProviderCallResult",
+        "agent_libos.models.mcp.McpProviderDiscoveryResult",
+        "agent_libos.models.mcp.McpProviderTool",
+        "agent_libos.models.mcp.McpToolListResult",
+    }
+)
+_HOST_RESULT_IGNORED_FIELDS = {
+    "agent_libos.primitives.git._GitFlowSnapshot": frozenset(
+        {"state_version_resolver"}
+    ),
+    "agent_libos.primitives.git._GitReadFlowSnapshot": frozenset({"refresh"}),
+}
+_SAFE_BUILTIN_RESULT_TYPES = (
+    (type(None), "builtins.NoneType"),
+    (bool, "builtins.bool"),
+    (int, "builtins.int"),
+    (float, "builtins.float"),
+    (str, "builtins.str"),
+    (bytes, "builtins.bytes"),
+    (bytearray, "builtins.bytearray"),
+    (list, "builtins.list"),
+    (tuple, "builtins.tuple"),
+    (dict, "builtins.dict"),
+)
+
+
+def _safe_result_type_parts(value: Any) -> tuple[type[Any], str, str]:
+    value_type = type(value)
+    module = type.__getattribute__(value_type, "__module__")
+    qualname = type.__getattribute__(value_type, "__qualname__")
+    if type(module) is not str or type(qualname) is not str:
+        raise TypeError("provider result type identity is invalid")
+    return value_type, module, qualname
+
+
+def _is_exact_result_type(value: Any, *expected: type[Any]) -> bool:
+    value_type = type(value)
+    return any(value_type is item for item in expected)
+
+
+def _post_commit_result_identity(
+    result: Any,
+    *,
+    contract_name: str | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    """Return bounded Host provenance without invoking provider object hooks."""
+
+    result_type = _safe_result_descriptor_type(result)
+    bounded = _bounded_result_identity(result, result_type=result_type)
+    if bounded[0] is not None:
+        return bounded
+    if _uses_host_result_stream(result, contract_name=contract_name):
+        return _host_result_identity(result, result_type=result_type)
+    return bounded
+
+
+def _safe_result_descriptor_type(result: Any) -> str:
+    value_type = type(result)
+    for builtin_type, builtin_name in _SAFE_BUILTIN_RESULT_TYPES:
+        if value_type is builtin_type:
+            return builtin_name
+    value_type, module, qualname = _safe_result_type_parts(result)
+    identity_name = f"{module}.{qualname}"
+    try:
+        _validate_host_dataclass_identity(
+            value_type,
+            module,
+            qualname,
+            identity_name,
+        )
+    except BaseException:
+        return "opaque"
+    return identity_name
+
+
+def _bounded_result_identity(
+    result: Any,
+    *,
+    result_type: str,
+) -> tuple[str | None, dict[str, Any]]:
+    budget = [_RESULT_DIGEST_MAX_NODES, _RESULT_DIGEST_MAX_BYTES]
+    try:
+        projection = _trusted_result_projection(result, seen=set(), budget=budget)
+        encoded = json.dumps(
+            projection,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > _RESULT_DIGEST_MAX_BYTES:
+            raise ValueError("result projection exceeds digest bound")
+        digest = hashlib.sha256(encoded).hexdigest()
+        return digest, {
+            "schema_version": 1,
+            "result_type": result_type,
+            "digest_mode": "canonical_bounded",
+            "canonical_bytes": len(encoded),
+        }
+    except BaseException:
+        return None, {
+            "schema_version": 1,
+            "result_type": result_type,
+            "digest_mode": "digest_unavailable",
+            "canonical_bytes": None,
+        }
+
+
+def _uses_host_result_stream(result: Any, *, contract_name: str | None) -> bool:
+    if isinstance(contract_name, str) and contract_name.startswith(
+        _HOST_RESULT_CONTRACT_PREFIXES
+    ):
+        return True
+    _value_type, module, qualname = _safe_result_type_parts(result)
+    return f"{module}.{qualname}" in _TRUSTED_RESULT_DATACLASSES
+
+
+def _host_result_identity(
+    result: Any,
+    *,
+    result_type: str,
+) -> tuple[str | None, dict[str, Any]]:
+    budget = [_HOST_RESULT_DIGEST_MAX_NODES, _HOST_RESULT_DIGEST_MAX_BYTES]
+    digest = hashlib.sha256()
+    try:
+        _stream_host_result(result, digest=digest, seen=set(), budget=budget)
+        canonical_bytes = _HOST_RESULT_DIGEST_MAX_BYTES - budget[1]
+        return digest.hexdigest(), {
+            "schema_version": 1,
+            "result_type": result_type,
+            "digest_mode": "canonical_bounded",
+            "canonical_bytes": canonical_bytes,
+        }
+    except BaseException:
+        return None, {
+            "schema_version": 1,
+            "result_type": result_type,
+            "digest_mode": "digest_unavailable",
+            "canonical_bytes": None,
+        }
+
+
+def _stream_host_frame(
+    digest: Any,
+    budget: list[int],
+    tag: bytes,
+    payload: bytes = b"",
+) -> None:
+    amount = len(tag) + len(payload) + 9
+    _consume_host_result_budget(budget, nodes=0, bytes_count=amount)
+    digest.update(len(tag).to_bytes(1, "big"))
+    digest.update(tag)
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+
+
+def _consume_host_result_budget(
+    budget: list[int],
+    *,
+    nodes: int,
+    bytes_count: int,
+) -> None:
+    budget[0] -= nodes
+    budget[1] -= bytes_count
+    if budget[0] < 0 or budget[1] < 0:
+        raise ValueError("Host result identity exceeds its bounded budget")
+
+
+def _stream_host_scalar(value: Any, *, digest: Any, budget: list[int]) -> bool:
+    if value is None:
+        _stream_host_frame(digest, budget, b"none")
+        return True
+    if type(value) is bool:
+        _stream_host_frame(digest, budget, b"bool", b"1" if value else b"0")
+        return True
+    if type(value) is int:
+        _stream_host_frame(digest, budget, b"int", str(value).encode("ascii"))
+        return True
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("Host result contains a non-finite number")
+        _stream_host_frame(digest, budget, b"float", repr(value).encode("ascii"))
+        return True
+    return _stream_host_text_or_bytes(value, digest=digest, budget=budget)
+
+
+def _stream_host_text_or_bytes(
+    value: Any,
+    *,
+    digest: Any,
+    budget: list[int],
+) -> bool:
+    if type(value) is str:
+        _stream_host_frame(digest, budget, b"str", value.encode("utf-8"))
+        return True
+    if _is_exact_result_type(value, bytes, bytearray):
+        raw = value if type(value) is bytes else bytes(value)
+        _stream_host_frame(digest, budget, b"bytes", raw)
+        return True
+    return False
+
+
+def _trusted_host_enum_value(value: Any) -> str | None:
+    if not isinstance(value, Enum):
+        return None
+    value_type, module, qualname = _safe_result_type_parts(value)
+    module_object = sys.modules.get(module)
+    if not module.startswith("agent_libos.") or type(module_object) is not ModuleType:
+        raise TypeError("Host result enum is not Host owned")
+    if object.__getattribute__(module_object, "__dict__").get(qualname) is not value_type:
+        raise TypeError("Host result enum identity is not Host bound")
+    enum_value = object.__getattribute__(value, "_value_")
+    if type(enum_value) is not str:
+        raise TypeError("Host result enum value must be a string")
+    return enum_value
+
+
+def _stream_host_sequence(
+    value: list[Any] | tuple[Any, ...],
+    *,
+    digest: Any,
+    seen: set[int],
+    budget: list[int],
+) -> None:
+    _stream_host_frame(digest, budget, b"list" if type(value) is list else b"tuple")
+    _stream_host_frame(digest, budget, b"length", str(len(value)).encode("ascii"))
+    _stream_host_children(value, digest=digest, seen=seen, budget=budget)
+
+
+def _stream_host_children(
+    value: Any,
+    *,
+    digest: Any,
+    seen: set[int],
+    budget: list[int],
+) -> None:
+    identity = id(value)
+    if identity in seen:
+        raise ValueError("Host result contains a cycle")
+    seen.add(identity)
+    try:
+        for item in value:
+            _stream_host_result(item, digest=digest, seen=seen, budget=budget)
+    finally:
+        seen.remove(identity)
+
+
+def _stream_host_mapping(
+    value: dict[str, Any],
+    *,
+    digest: Any,
+    seen: set[int],
+    budget: list[int],
+) -> None:
+    if any(type(key) is not str for key in value):
+        raise TypeError("Host result mapping keys must be exact strings")
+    _stream_host_frame(digest, budget, b"dict")
+    _stream_host_frame(digest, budget, b"length", str(len(value)).encode("ascii"))
+    identity = id(value)
+    if identity in seen:
+        raise ValueError("Host result contains a cycle")
+    seen.add(identity)
+    try:
+        _stream_host_mapping_items(value, digest=digest, seen=seen, budget=budget)
+    finally:
+        seen.remove(identity)
+
+
+def _stream_host_mapping_items(
+    value: dict[str, Any],
+    *,
+    digest: Any,
+    seen: set[int],
+    budget: list[int],
+) -> None:
+    for key in sorted(value):
+        _stream_host_frame(digest, budget, b"key", key.encode("utf-8"))
+        _stream_host_result(value[key], digest=digest, seen=seen, budget=budget)
+
+
+def _host_dataclass_fields(value: Any) -> tuple[str, tuple[tuple[str, Any], ...]]:
+    value_type, module, qualname = _safe_result_type_parts(value)
+    identity_name = f"{module}.{qualname}"
+    _validate_host_dataclass_identity(value_type, module, qualname, identity_name)
+    class_values = type.__getattribute__(value_type, "__dict__")
+    field_names = tuple(class_values["__dataclass_fields__"])
+    ignored = _HOST_RESULT_IGNORED_FIELDS.get(identity_name, frozenset())
+    return identity_name, tuple(
+        (name, _host_dataclass_field(value, value_type, class_values, name))
+        for name in field_names
+        if name not in ignored
+    )
+
+
+def _validate_host_dataclass_identity(
+    value_type: type[Any],
+    module: str,
+    qualname: str,
+    identity_name: str,
+) -> None:
+    if identity_name not in _TRUSTED_RESULT_DATACLASSES:
+        raise TypeError("Host result dataclass is not allowlisted")
+    module_object = sys.modules.get(module)
+    if type(module_object) is not ModuleType:
+        raise TypeError("Host result module identity is unavailable")
+    if object.__getattribute__(module_object, "__dict__").get(qualname) is not value_type:
+        raise TypeError("Host result dataclass identity is not Host bound")
+    class_values = type.__getattribute__(value_type, "__dict__")
+    if type(class_values.get("__dataclass_fields__")) is not dict:
+        raise TypeError("Host result dataclass fields are unavailable")
+
+
+def _host_dataclass_field(
+    value: Any,
+    value_type: type[Any],
+    class_values: Mapping[str, Any],
+    name: str,
+) -> Any:
+    try:
+        instance_values = object.__getattribute__(value, "__dict__")
+    except AttributeError:
+        instance_values = None
+    if type(instance_values) is dict and name in instance_values:
+        return instance_values[name]
+    descriptor = class_values.get(name)
+    if type(descriptor) is not MemberDescriptorType:
+        raise TypeError("Host result slot storage is not safe")
+    return MemberDescriptorType.__get__(descriptor, value, value_type)
+
+
+def _stream_host_dataclass(
+    value: Any,
+    *,
+    digest: Any,
+    seen: set[int],
+    budget: list[int],
+) -> None:
+    identity_name, fields = _host_dataclass_fields(value)
+    _stream_host_frame(digest, budget, b"dataclass", identity_name.encode("ascii"))
+    identity = id(value)
+    if identity in seen:
+        raise ValueError("Host result contains a cycle")
+    seen.add(identity)
+    try:
+        for name, item in fields:
+            _stream_host_frame(digest, budget, b"field", name.encode("ascii"))
+            _stream_host_result(item, digest=digest, seen=seen, budget=budget)
+    finally:
+        seen.remove(identity)
+
+
+def _stream_host_result(
+    value: Any,
+    *,
+    digest: Any,
+    seen: set[int],
+    budget: list[int],
+) -> None:
+    _consume_host_result_budget(budget, nodes=1, bytes_count=0)
+    if _stream_host_scalar(value, digest=digest, budget=budget):
+        return
+    enum_value = _trusted_host_enum_value(value)
+    if enum_value is not None:
+        _stream_host_frame(digest, budget, b"enum", enum_value.encode("utf-8"))
+        return
+    if _is_exact_result_type(value, list, tuple):
+        _stream_host_sequence(value, digest=digest, seen=seen, budget=budget)
+        return
+    if type(value) is dict:
+        _stream_host_mapping(value, digest=digest, seen=seen, budget=budget)
+        return
+    _stream_host_dataclass(value, digest=digest, seen=seen, budget=budget)
+
+
+def visit_bounded_host_result_text(
+    result: Any,
+    *,
+    contract_name: str | None,
+    visitor: Callable[[str | bytes], None],
+) -> None:
+    """Visit exact provider text under the Host result identity allowlist.
+
+    The traversal uses only exact built-in containers, Host-bound dataclass
+    storage, and the same finite node/byte ceiling as Host result identity.
+    It never invokes provider ``__str__``, properties, iteration, or serializer
+    hooks.  Text is visited incrementally so a large allowed result is not
+    copied into a second aggregate payload.
+    """
+
+    if not callable(visitor):
+        raise TypeError("Host result text visitor must be callable")
+    safe_builtin = _is_exact_result_type(
+        result,
+        str,
+        bytes,
+        bytearray,
+        list,
+        tuple,
+        dict,
+        int,
+        bool,
+        float,
+        type(None),
+    )
+    if not safe_builtin and not _uses_host_result_stream(
+        result,
+        contract_name=contract_name,
+    ):
+        raise TypeError("provider result is not safe for Host text traversal")
+    _visit_host_result_text(
+        result,
+        visitor=visitor,
+        seen=set(),
+        budget=[_HOST_RESULT_DIGEST_MAX_NODES, _HOST_RESULT_DIGEST_MAX_BYTES],
+    )
+
+
+def _visit_host_result_text(
+    value: Any,
+    *,
+    visitor: Callable[[str | bytes], None],
+    seen: set[int],
+    budget: list[int],
+) -> None:
+    _consume_host_result_budget(budget, nodes=1, bytes_count=0)
+    if type(value) is str:
+        raw = value.encode("utf-8")
+        _consume_host_result_budget(budget, nodes=0, bytes_count=len(raw))
+        visitor(value)
+        return
+    if _is_exact_result_type(value, bytes, bytearray):
+        raw = value if type(value) is bytes else bytes(value)
+        _consume_host_result_budget(budget, nodes=0, bytes_count=len(raw))
+        visitor(raw)
+        return
+    if value is None or _is_exact_result_type(value, int, bool):
+        _consume_host_result_budget(budget, nodes=0, bytes_count=8)
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("Host result contains a non-finite number")
+        _consume_host_result_budget(budget, nodes=0, bytes_count=32)
+        return
+    if _trusted_host_enum_value(value) is not None:
+        _consume_host_result_budget(budget, nodes=0, bytes_count=32)
+        return
+    if type(value) is dict:
+        if any(type(key) is not str for key in value):
+            raise TypeError("Host result mapping keys must be exact strings")
+        identity = id(value)
+        if identity in seen:
+            raise ValueError("Host result contains a cycle")
+        seen.add(identity)
+        try:
+            for key in sorted(value):
+                raw_key = key.encode("utf-8")
+                _consume_host_result_budget(
+                    budget,
+                    nodes=0,
+                    bytes_count=len(raw_key),
+                )
+                visitor(key)
+                _visit_host_result_text(
+                    value[key],
+                    visitor=visitor,
+                    seen=seen,
+                    budget=budget,
+                )
+        finally:
+            seen.remove(identity)
+        return
+    if _is_exact_result_type(value, list, tuple):
+        identity = id(value)
+        if identity in seen:
+            raise ValueError("Host result contains a cycle")
+        seen.add(identity)
+        try:
+            for item in value:
+                _visit_host_result_text(
+                    item,
+                    visitor=visitor,
+                    seen=seen,
+                    budget=budget,
+                )
+        finally:
+            seen.remove(identity)
+        return
+    _identity_name, fields = _host_dataclass_fields(value)
+    identity = id(value)
+    if identity in seen:
+        raise ValueError("Host result contains a cycle")
+    seen.add(identity)
+    try:
+        for _name, item in fields:
+            _visit_host_result_text(
+                item,
+                visitor=visitor,
+                seen=seen,
+                budget=budget,
+            )
+    finally:
+        seen.remove(identity)
+
+
+def _consume_result_bytes(budget: list[int], amount: int) -> None:
+    budget[1] -= amount
+    if budget[1] < 0:
+        raise ValueError("result projection exceeds cumulative byte bound")
+
+
+def _trusted_result_scalar(value: Any, *, budget: list[int]) -> Any:
+    if value is None or _is_exact_result_type(value, int, bool):
+        _consume_result_bytes(budget, 8)
+        return value
+    if type(value) is str:
+        if len(value) > _RESULT_DIGEST_MAX_BYTES:
+            raise ValueError("result string exceeds digest bound")
+        _consume_result_bytes(
+            budget,
+            len(json.dumps(value, ensure_ascii=False).encode("utf-8")),
+        )
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("result projection contains non-finite number")
+        _consume_result_bytes(budget, 32)
+        return value
+    if isinstance(value, StrEnum):
+        enum_value = object.__getattribute__(value, "_value_")
+        if type(enum_value) is not str or len(enum_value) > _RESULT_DIGEST_MAX_BYTES:
+            raise ValueError("result enum value exceeds digest bound")
+        _consume_result_bytes(
+            budget,
+            len(json.dumps(enum_value, ensure_ascii=False).encode("utf-8")),
+        )
+        return enum_value
+    if _is_exact_result_type(value, bytes, bytearray):
+        if len(value) > _RESULT_DIGEST_MAX_BYTES:
+            raise ValueError("result bytes exceed digest bound")
+        raw = value if type(value) is bytes else bytes(value)
+        _consume_result_bytes(budget, 160)
+        return {
+            "bytes_sha256": hashlib.sha256(raw).hexdigest(),
+            "size_bytes": len(raw),
+        }
+    return _RESULT_PROJECTION_MISSING
+
+
+def _trusted_result_mapping(
+    value: dict[str, Any],
+    *,
+    seen: set[int],
+    budget: list[int],
+) -> dict[str, Any]:
+    if len(value) > _RESULT_DIGEST_MAX_NODES:
+        raise ValueError("result mapping exceeds node bound")
+    # JSON coerces scalar keys to strings. Requiring exact strings prevents
+    # collisions such as 1 and "1" from sharing one canonical representation.
+    if any(type(key) is not str for key in value):
+        raise TypeError("result mapping key must be an exact string")
+    _consume_result_bytes(budget, len(value) + 2)
+    for key in value:
+        if len(key) > _RESULT_DIGEST_MAX_BYTES:
+            raise ValueError("result mapping key exceeds digest bound")
+        _consume_result_bytes(
+            budget,
+            len(json.dumps(key, ensure_ascii=False).encode("utf-8")) + 1,
+        )
+    identity = id(value)
+    if identity in seen:
+        raise ValueError("result projection contains a cycle")
+    seen.add(identity)
+    try:
+        return {
+            key: _trusted_result_projection(item, seen=seen, budget=budget)
+            for key, item in value.items()
+        }
+    finally:
+        seen.remove(identity)
+
+
+def _trusted_result_sequence(
+    value: list[Any] | tuple[Any, ...],
+    *,
+    seen: set[int],
+    budget: list[int],
+) -> list[Any]:
+    if len(value) > _RESULT_DIGEST_MAX_NODES:
+        raise ValueError("result sequence exceeds node bound")
+    _consume_result_bytes(budget, len(value) + 2)
+    identity = id(value)
+    if identity in seen:
+        raise ValueError("result projection contains a cycle")
+    seen.add(identity)
+    try:
+        return [
+            _trusted_result_projection(item, seen=seen, budget=budget)
+            for item in value
+        ]
+    finally:
+        seen.remove(identity)
+
+
+def _trusted_result_dataclass(
+    value: Any,
+    *,
+    seen: set[int],
+    budget: list[int],
+) -> dict[str, Any]:
+    value_type, module, qualname = _safe_result_type_parts(value)
+    identity_name = f"{module}.{qualname}"
+    if identity_name not in _TRUSTED_RESULT_DATACLASSES:
+        raise TypeError("provider result dataclass is not Host allowlisted")
+    module_object = sys.modules.get(module)
+    if type(module_object) is not ModuleType:
+        raise TypeError("provider result module identity is unavailable")
+    module_values = object.__getattribute__(module_object, "__dict__")
+    if module_values.get(qualname) is not value_type:
+        raise TypeError("provider result type identity is not Host bound")
+    class_values = type.__getattribute__(value_type, "__dict__")
+    dataclass_fields = class_values.get("__dataclass_fields__")
+    instance_values = object.__getattribute__(value, "__dict__")
+    if type(dataclass_fields) is not dict or type(instance_values) is not dict:
+        raise TypeError("provider result dataclass storage is not safe")
+    field_names = tuple(dataclass_fields)
+    if any(type(name) is not str or name not in instance_values for name in field_names):
+        raise TypeError("provider result dataclass fields are incomplete")
+    _consume_result_bytes(budget, len(field_names) + 2)
+    identity = id(value)
+    if identity in seen:
+        raise ValueError("result projection contains a cycle")
+    seen.add(identity)
+    try:
+        return {
+            name: _trusted_result_projection(
+                instance_values[name],
+                seen=seen,
+                budget=budget,
+            )
+            for name in field_names
+        }
+    finally:
+        seen.remove(identity)
+
+
+def _trusted_result_projection(
+    value: Any,
+    *,
+    seen: set[int],
+    budget: list[int],
+) -> Any:
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise ValueError("result projection exceeds node bound")
+    scalar = _trusted_result_scalar(value, budget=budget)
+    if scalar is not _RESULT_PROJECTION_MISSING:
+        return scalar
+    if type(value) is dict:
+        return _trusted_result_mapping(value, seen=seen, budget=budget)
+    if _is_exact_result_type(value, list, tuple):
+        return _trusted_result_sequence(value, seen=seen, budget=budget)
+    return _trusted_result_dataclass(value, seen=seen, budget=budget)
+
+
+@dataclass(frozen=True)
+class PostCommitResultObservation:
+    """Host-owned context for observing one durably settled provider result.
+
+    The result itself is passed separately to the observer.  Keeping this
+    context limited to stable operation identities makes it suitable for
+    enqueueing payload-free follow-up evidence without exposing the effect
+    ledger implementation to callers.
+    """
+
+    effect_id: str
+    pid: str
+    provider: str
+    operation: str
+    target: str | None
+    contract_name: str | None = None
+    result_sha256: str | None = None
+    result_descriptor: Mapping[str, Any] = field(default_factory=dict)
+    data_labels: DataLabels | None = None
+    source_refs_sha256: str | None = None
+    provider_spec_sha256: str | None = None
+    tool_schema_sha256: str | None = None
+    data_flow_direction: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "result_sha256",
+            "source_refs_sha256",
+            "provider_spec_sha256",
+            "tool_schema_sha256",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"post-commit observation {name} is invalid")
+        if not isinstance(self.result_descriptor, Mapping):
+            raise TypeError("post-commit result descriptor must be a mapping")
+        descriptor = dict(self.result_descriptor)
+        if set(descriptor) - {
+            "schema_version",
+            "result_type",
+            "digest_mode",
+            "canonical_bytes",
+        }:
+            raise ValueError("post-commit result descriptor fields are invalid")
+        encoded = json.dumps(
+            descriptor,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > 4_096:
+            raise ValueError("post-commit result descriptor exceeds byte limit")
+        object.__setattr__(self, "result_descriptor", descriptor)
+        if self.data_labels is not None and not isinstance(self.data_labels, DataLabels):
+            raise TypeError("post-commit observation labels must be DataLabels")
+        if self.data_flow_direction is not None:
+            object.__setattr__(
+                self,
+                "data_flow_direction",
+                DataFlowDirection(self.data_flow_direction).value,
+            )
+
+
+@dataclass(frozen=True)
+class PostCommitObserverFailure:
+    """Bounded, payload-free evidence for a failed result observer."""
+
+    effect_id: str
+    provider: str
+    operation: str
+    error_type: str
+
+
+PostCommitResultObserver = Callable[[Any, PostCommitResultObservation], None]
+PostCommitObserverFailureHandler = Callable[[PostCommitObserverFailure], None]
 
 
 @dataclass(frozen=True)
@@ -351,13 +1151,30 @@ class ProtectedOperationInvocation:
     data_flow_target_state_version: str | int | None = None
     data_flow_target_state_version_resolver: TargetStateVersionResolver | None = None
     data_flow_allow_recovered_source_snapshots: bool = False
+    data_flow_request_release: bool = True
     additional_data_sinks: tuple[DataSink, ...] = ()
+    post_commit_result_observer: PostCommitResultObserver | None = None
+    post_commit_observer_failure: PostCommitObserverFailureHandler | None = None
 
     def __post_init__(self) -> None:
-        _require_bool(
-            "data_flow_allow_recovered_source_snapshots",
-            self.data_flow_allow_recovered_source_snapshots,
+        _require_bool_fields(
+            self,
+            (
+                "data_flow_allow_recovered_source_snapshots",
+                "data_flow_request_release",
+            ),
         )
+
+
+def _uses_nondefault_data_flow_policy(
+    invocation: ProtectedOperationInvocation,
+) -> bool:
+    return any(
+        (
+            invocation.data_flow_allow_recovered_source_snapshots,
+            not invocation.data_flow_request_release,
+        )
+    )
 
 
 class ProtectedOperationProtocolError(ValidationError):
@@ -418,6 +1235,8 @@ class ProtectedOperationSDK:
         operations: Any,
         require_recovery_lease: Callable[[], None],
         data_flow: Any | None = None,
+        post_commit_result_observer: PostCommitResultObserver | None = None,
+        post_commit_observer_failure: PostCommitObserverFailureHandler | None = None,
     ) -> None:
         self.effects = effects
         self.authority_policy = authority_policy
@@ -430,7 +1249,68 @@ class ProtectedOperationSDK:
         self.data_flow = data_flow
         self._contracts: dict[str, ProtectedOperationContract] = {}
         self._prepared_recovery_handlers: dict[str, PreparedRecoveryHandler] = {}
+        self._post_commit_result_observer = post_commit_result_observer
+        self._post_commit_observer_failure = post_commit_observer_failure
         self._identity = id(self)
+
+        for label, callback in (
+            ("post-commit result observer", post_commit_result_observer),
+            ("post-commit observer failure handler", post_commit_observer_failure),
+        ):
+            if callback is not None and not callable(callback):
+                raise TypeError(f"protected operation {label} must be callable")
+
+    def bind_post_commit_result_observer(
+        self,
+        observer: PostCommitResultObserver,
+        *,
+        failure: PostCommitObserverFailureHandler | None = None,
+    ) -> None:
+        """Bind the Host-owned default observer for committed provider results.
+
+        Invocation-specific observers are additive and cannot replace or
+        suppress this callback.  The default exists so composition roots can
+        attach one payload-minimizing ingress capture policy without modifying
+        every primitive.  Registration is deliberately one-shot to prevent
+        runtime modules or models from replacing this Host-owned boundary.
+        """
+
+        if not callable(observer):
+            raise TypeError("protected operation post-commit observer must be callable")
+        if failure is not None and not callable(failure):
+            raise TypeError(
+                "protected operation post-commit observer failure handler must be callable"
+            )
+        if self._post_commit_result_observer is not None:
+            raise RuntimeError(
+                "protected operation post-commit observer is already bound"
+            )
+        self._post_commit_result_observer = observer
+        self._post_commit_observer_failure = failure
+
+    def select_post_commit_result_observers(
+        self,
+        invocation_observer: PostCommitResultObserver | None,
+        invocation_failure: PostCommitObserverFailureHandler | None,
+    ) -> tuple[
+        tuple[PostCommitResultObserver, PostCommitObserverFailureHandler | None],
+        ...,
+    ]:
+        """Return independently isolated Host and invocation observers."""
+
+        selected: list[
+            tuple[PostCommitResultObserver, PostCommitObserverFailureHandler | None]
+        ] = []
+        if self._post_commit_result_observer is not None:
+            selected.append(
+                (
+                    self._post_commit_result_observer,
+                    self._post_commit_observer_failure,
+                )
+            )
+        if invocation_observer is not None:
+            selected.append((invocation_observer, invocation_failure))
+        return tuple(selected)
 
     def register_contract(self, contract: ProtectedOperationContract) -> ProtectedOperationContract:
         existing = self._contracts.get(contract.name)
@@ -821,10 +1701,20 @@ class ProtectedOperation:
         self._data_flow_ingress_observed = False
         self._operation_cm: Any | None = None
         self._resource_reservation_id: str | None = None
+        self._post_commit_observer_ran = False
+        self._post_commit_observer_failure: PostCommitObserverFailure | None = None
 
     @property
     def terminal(self) -> bool:
         return self._terminal
+
+    @property
+    def post_commit_observer_ran(self) -> bool:
+        return self._post_commit_observer_ran
+
+    @property
+    def post_commit_observer_failure(self) -> PostCommitObserverFailure | None:
+        return self._post_commit_observer_failure
 
     def __enter__(self) -> "ProtectedOperation":
         current = self.sdk.operations.current()
@@ -1059,8 +1949,137 @@ class ProtectedOperation:
                 return result
             raise
 
+        self._run_post_commit_result_observer(result)
         self._charge_resource(resource)
         return result
+
+    def _run_post_commit_result_observer(self, result: Any) -> None:
+        invocation_observer = self.invocation.post_commit_result_observer
+        observers = self.sdk.select_post_commit_result_observers(
+            invocation_observer,
+            self.invocation.post_commit_observer_failure,
+        )
+        if not observers:
+            return
+        self._post_commit_observer_ran = True
+        assert self.effect_id is not None
+        try:
+            result_sha256, result_descriptor = _post_commit_result_identity(
+                result,
+                contract_name=self.contract.name,
+            )
+            flow = self._post_commit_result_flow()
+            registry = self.invocation.provider_registry_binding
+            provider_spec_sha256 = (
+                registry.registry_spec_sha256
+                if registry is not None
+                else self._contract_provider_spec_sha256()
+            )
+            raw_tool_schema = self.invocation.observation.get(
+                "tool_schema_sha256"
+            )
+            tool_schema_sha256 = (
+                raw_tool_schema
+                if isinstance(raw_tool_schema, str)
+                and len(raw_tool_schema) == 64
+                and all(character in "0123456789abcdef" for character in raw_tool_schema)
+                else None
+            )
+            observation = PostCommitResultObservation(
+                effect_id=self.effect_id,
+                pid=self.invocation.pid,
+                provider=self.contract.provider,
+                operation=self.contract.operation,
+                target=self.invocation.target,
+                contract_name=self.contract.name,
+                result_sha256=result_sha256,
+                result_descriptor=result_descriptor,
+                data_labels=(flow.labels if flow is not None else None),
+                source_refs_sha256=(
+                    flow.source_refs_hash() if flow is not None else None
+                ),
+                provider_spec_sha256=provider_spec_sha256,
+                tool_schema_sha256=tool_schema_sha256,
+                data_flow_direction=self.contract.data_flow_direction.value,
+            )
+        except BaseException as error:
+            for _observer, handler in observers:
+                self._record_post_commit_observer_failure(error, handler)
+            return
+        for observer, handler in observers:
+            try:
+                _call_synchronous_hook(
+                    "post-commit result observer",
+                    observer,
+                    result,
+                    observation,
+                )
+            except BaseException as error:
+                self._record_post_commit_observer_failure(error, handler)
+
+    def _contract_provider_spec_sha256(self) -> str:
+        encoded = json.dumps(
+            {
+                "schema_version": 1,
+                "contract_name": self.contract.name,
+                "provider": self.contract.provider,
+                "operation": self.contract.operation,
+                "authority_mode": self.contract.authority_mode.value,
+                "data_flow_direction": self.contract.data_flow_direction.value,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _post_commit_result_flow(self) -> DataFlowContext | None:
+        direction = self.contract.data_flow_direction
+        if direction in {DataFlowDirection.INGRESS, DataFlowDirection.BIDIRECTIONAL}:
+            return self.invocation.data_flow_ingress_context
+        if direction is not DataFlowDirection.EGRESS:
+            return None
+        outbound = self.invocation.data_flow_context
+        sensitivity = (
+            outbound.labels.sensitivity if outbound is not None else "normal"
+        )
+        # A provider receipt is fresh untrusted ingress. It may inherit the
+        # outbound sensitivity floor to prevent implicit declassification, but
+        # never the outbound trust, integrity, identity, or source references.
+        return DataFlowContext(
+            labels=DataLabels(
+                sensitivity=sensitivity,
+                trust_level="untrusted",
+                integrity="untrusted",
+                origin=f"external:{self.contract.provider}",
+            )
+        )
+
+    def _record_post_commit_observer_failure(
+        self,
+        error: BaseException,
+        handler: PostCommitObserverFailureHandler | None,
+    ) -> None:
+        assert self.effect_id is not None
+        failure = PostCommitObserverFailure(
+            effect_id=self.effect_id,
+            provider=self.contract.provider[:256],
+            operation=self.contract.operation[:256],
+            error_type=(type(error).__name__ or "BaseException")[:128],
+        )
+        if self._post_commit_observer_failure is None:
+            self._post_commit_observer_failure = failure
+        if handler is not None:
+            try:
+                _call_synchronous_hook(
+                    "post-commit observer failure",
+                    handler,
+                    failure,
+                )
+            except BaseException:
+                # Observation is auxiliary Shadow evidence. Neither its
+                # callback nor failure reporting may change a committed
+                # provider operation's result.
+                pass
 
     def _prepare(self) -> None:
         self._validate_authority()
@@ -1426,7 +2445,7 @@ class ProtectedOperation:
                 or self.invocation.data_flow_operation is not None
                 or self.invocation.data_flow_target_state_version is not None
                 or self.invocation.data_flow_target_state_version_resolver is not None
-                or self.invocation.data_flow_allow_recovered_source_snapshots
+                or _uses_nondefault_data_flow_policy(self.invocation)
             ):
                 raise ValidationError(
                     f"non-egress protected operation declares data-flow egress state: {self.contract.name}"
@@ -1477,7 +2496,7 @@ class ProtectedOperation:
                 "payload": payload,
                 "operation": operation,
                 "target_state_version": self.invocation.data_flow_target_state_version,
-                "request_release": True,
+                "request_release": self.invocation.data_flow_request_release,
                 "minimum_integrity": self.contract.minimum_egress_integrity,
                 "allow_recovered_source_snapshots": (
                     self.invocation.data_flow_allow_recovered_source_snapshots
@@ -2275,6 +3294,8 @@ class ProtectedOperation:
 
 __all__ = [
     "AuthorityMode",
+    "PostCommitObserverFailure",
+    "PostCommitResultObservation",
     "PostProviderFailureMode",
     "ProtectedOperation",
     "ProtectedOperationContract",
@@ -2286,4 +3307,5 @@ __all__ = [
     "ProviderPhase",
     "ResourcePolicy",
     "ResourceSettlement",
+    "visit_bounded_host_result_text",
 ]

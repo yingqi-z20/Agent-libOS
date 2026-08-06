@@ -75,6 +75,12 @@ from agent_libos.runtime.syscalls import BUILTIN_SYSCALL_NAMES, LibOSSyscallSess
 from agent_libos.runtime.snapshots import ProcessExecStateService
 from agent_libos.runtime.task_runs import TaskRunManager
 from agent_libos.sdk import ProtectedOperationSDK
+from agent_libos.semantic.external import ExternalLLMSemanticAssessor
+from agent_libos.semantic.protected import SdkProtectedSemanticCallPort
+from agent_libos.semantic.service import (
+    DeterministicSemanticAssessor,
+    SemanticManager,
+)
 from agent_libos.skills.manager import SkillManager
 from agent_libos.storage import (
     RuntimeStore,
@@ -955,6 +961,8 @@ class RuntimeBuilder(Generic[RuntimeT]):
     module_manifests: tuple[str | Path, ...] | None = None
     trusted_modules: tuple[str, ...] | None = None
     trusted_module_sha256: tuple[str, ...] | None = None
+    semantic_assessor: Any | None = None
+    semantic_tenant_bucketer: Callable[[str], str] | None = None
 
     def open(self, target: str | Path | None = None) -> RuntimeT:
         self._require_sync_assembly_context()
@@ -1401,6 +1409,8 @@ class RuntimeBuilder(Generic[RuntimeT]):
         host = self.runtime_type.allocate_unassembled()
         if not isinstance(host, self.runtime_type):
             raise TypeError("Runtime allocation hook returned the wrong type")
+        host._semantic_assessor_override = self.semantic_assessor
+        host._semantic_tenant_bucketer_override = self.semantic_tenant_bucketer
         return host
 
     def _validate_runtime_allocation_contract(self) -> None:
@@ -1884,6 +1894,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
         cls._configure_evidence_and_authority(host)
         cls._configure_host_services(host)
         cls._configure_human_and_primitives(host)
+        cls._configure_semantic(host)
         cls._configure_execution_services(host)
         cls._configure_tail(
             host,
@@ -2762,6 +2773,166 @@ class RuntimeBuilder(Generic[RuntimeT]):
         )
 
     @staticmethod
+    def _configure_semantic(host: Runtime) -> None:
+        config = host.config.semantic
+        injected = getattr(host, "_semantic_assessor_override", None)
+        if injected is not None and not callable(getattr(injected, "assess", None)):
+            raise TypeError("semantic_assessor must implement synchronous assess()")
+        if config.mode == "shadow" and config.adapter == "scripted":
+            if injected is None:
+                raise ValueError(
+                    "semantic adapter=scripted requires a Host-injected assessor"
+                )
+            assessor = injected
+            classifier_id = "semantic.scripted"
+            classifier_version = "1"
+            artifact_sha256 = None
+        elif config.mode == "shadow" and config.adapter == "external":
+            if injected is not None:
+                raise ValueError(
+                    "semantic adapter=external cannot be replaced by an injected assessor"
+                )
+            profile_id = config.external_profile_id
+            assert profile_id is not None
+            snapshot = host.llms.profile_snapshot(profile_id)
+            model = snapshot.profile.model
+            assert model is not None
+            artifact_sha256 = snapshot.identity_sha256
+            classifier_id = f"semantic.external:{profile_id}"
+            classifier_version = model
+            assessor = ExternalLLMSemanticAssessor(
+                llms=host.llms,
+                profile_id=profile_id,
+                protected_calls=SdkProtectedSemanticCallPort(
+                    host.protected_operations,
+                    profile_identity_resolver=host.llms.profile_identity_sha256,
+                ),
+                classifier_id=classifier_id,
+                classifier_version=classifier_version,
+                classifier_artifact_sha256=artifact_sha256,
+                frozen_profile_identity_sha256=snapshot.identity_sha256,
+                frozen_model=model,
+                max_projection_bytes=config.projection_max_bytes,
+            )
+        else:
+            if injected is not None and config.adapter != "scripted":
+                raise ValueError(
+                    "semantic_assessor injection is reserved for adapter=scripted"
+                )
+            assessor = injected or DeterministicSemanticAssessor()
+            classifier_id = f"semantic.{config.adapter}"
+            classifier_version = "1"
+            artifact_sha256 = None
+        host.semantic = SemanticManager(
+            host.uow.semantic,
+            config=config,
+            assessor=assessor,
+            authority=host.authority_manifests,
+            processes=host.uow.processes,
+            objects=host.uow.objects,
+            human_outcome_reader=partial(
+                RuntimeBuilder._semantic_human_outcome_reader,
+                host,
+            ),
+            root_goal_reader=partial(
+                RuntimeBuilder._semantic_root_goal_reader,
+                host,
+            ),
+            classifier_id=classifier_id,
+            classifier_version=classifier_version,
+            artifact_sha256=artifact_sha256,
+            owner_id=host.instance_id,
+            tenant_bucketer=getattr(
+                host,
+                "_semantic_tenant_bucketer_override",
+                None,
+            ),
+            shutdown_registrar=partial(
+                host.lifecycle.bind_finalizer,
+                recovery_safe=True,
+            ),
+            request_capture_registrar=host.human.bind_host_request_capture,
+            spawn_observer_registrar=host.process.add_post_commit_spawn_observer,
+            result_observer_registrar=partial(
+                host.protected_operations.bind_post_commit_result_observer,
+                failure=partial(RuntimeBuilder._semantic_capture_failure, host),
+            ),
+            request_capture=partial(
+                RuntimeBuilder._semantic_capture_approval,
+                host,
+            ),
+            spawn_observer=partial(
+                RuntimeBuilder._semantic_capture_root_goal,
+                host,
+            ),
+            result_observer=partial(
+                RuntimeBuilder._semantic_capture_provider_ingress,
+                host,
+            ),
+        )
+
+    @staticmethod
+    def _start_semantic(host: Runtime) -> None:
+        try:
+            host.semantic.start()
+        except Exception:
+            host.semantic.degrade_after_startup_failure()
+
+    @staticmethod
+    def _semantic_root_goal_reader(host: Runtime, pid: str) -> Any | None:
+        process = host.uow.processes.get_process(pid)
+        if process is None or process.parent_pid is not None or process.goal_oid is None:
+            return None
+        return host.uow.objects.get_object(process.goal_oid)
+
+    @staticmethod
+    def _semantic_human_outcome_reader(
+        host: Runtime,
+        request_id: str,
+    ) -> str | None:
+        request = host.uow.processes.get_human_request(request_id)
+        return request.status.value if request is not None else None
+
+    @staticmethod
+    def _semantic_capture_approval(host: Runtime, request: Any) -> None:
+        host.semantic.capture_approval(request)
+
+    @staticmethod
+    def _semantic_capture_root_goal(
+        host: Runtime,
+        pid: str,
+        image_id: str,
+        publication_id: str,
+    ) -> None:
+        process = host.uow.processes.get_process(pid)
+        if process is None or process.parent_pid is not None:
+            return
+        host.semantic.capture_root_goal(
+            pid,
+            image_id=image_id,
+            publication_id=publication_id,
+        )
+
+    @staticmethod
+    def _semantic_capture_provider_ingress(
+        host: Runtime,
+        result: Any,
+        observation: Any,
+    ) -> None:
+        if observation.contract_name == "semantic.llm.assess":
+            return
+        host.semantic.capture_provider_ingress(result, observation)
+
+    @staticmethod
+    def _semantic_capture_failure(host: Runtime, failure: Any) -> None:
+        recorder = getattr(host.semantic, "record_capture_failure", None)
+        if callable(recorder):
+            recorder(
+                source="provider_result_observer",
+                error_type=str(getattr(failure, "error_type", "Exception"))[:128],
+            )
+
+    @staticmethod
     def _runtime_mcp_provider(host: Runtime) -> McpProvider:
         """Select an MCP provider without mutating a caller-owned substrate.
 
@@ -2954,6 +3125,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             trusted_module_sha256=trusted_module_sha256,
         )
         cls._finish_startup(host)
+        cls._start_semantic(host)
 
     @staticmethod
     def _commit_startup_payload_delivery_ack(
@@ -3487,6 +3659,8 @@ class RuntimeBuilder(Generic[RuntimeT]):
         module_manifests: list[str | Path] | tuple[str | Path, ...] | None = None,
         trusted_modules: list[str] | tuple[str, ...] | None = None,
         trusted_module_sha256: list[str] | tuple[str, ...] | None = None,
+        semantic_assessor: Any | None = None,
+        semantic_tenant_bucketer: Callable[[str], str] | None = None,
     ) -> "RuntimeBuilder[RuntimeT]":
         return cls(
             runtime_type=runtime_type,
@@ -3507,6 +3681,8 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 if trusted_module_sha256 is not None
                 else None
             ),
+            semantic_assessor=semantic_assessor,
+            semantic_tenant_bucketer=semantic_tenant_bucketer,
         )
 
 

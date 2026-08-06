@@ -455,6 +455,46 @@ phase dispatch is attempted, it restores only when the current phase certifies
 `commits_authority=False`. Crossing DNS, stdio, provider, or spawn closes that
 restoration floor even if a later phase fails.
 
+### Semantic classifier egress and advisory ingress findings
+
+Semantic Shadow classification does not create a second information-flow
+authority path. An external classifier call uses the runtime-internal
+`semantic.llm.assess` Protected Operation and the ordinary `llm.complete`
+effect class. Runtime assembly freezes the Host-selected non-default profile
+identity and explicit model; dispatch rechecks snapshot, resolution, resolved
+client, and profile-bound Sink identities. Its deterministic safe projection
+is checked by DataFlow before dispatch and again at the final provider
+boundary. Approval and provider-ingress projections are metadata-only. A root
+goal may contribute bounded redacted intent only at `public`/`normal`
+sensitivity, without mixed identity, and after local secret and path detection
+passes; all other root goals downgrade to metadata-only.
+
+That invocation explicitly sets `data_flow_request_release=false`. If the
+projection would need conditional release, DataFlow returns its denial and the
+job becomes `egress_blocked`; the semantic service cannot recursively create a
+`data_release_approval` request. A blocked, timed-out, malformed, OOD, or failed
+classification is evidence only and cannot relax the business operation's
+DataFlow result.
+
+`SemanticDataFinding` is likewise advisory in Phase 0+1. It may propose only a
+higher sensitivity floor or lower integrity/trust ceiling for a bounded
+field/span, but the semantic worker has no DataLabel mutation interface and
+does not update an Object, file label binding, process ambient context,
+declassification authority, endorsement, Sink clearance, or release row.
+Provider-ingress capture binds the committed result/effect/provider/source
+digests so the suggestion can be reviewed later. The result digest is derived
+only from the SDK's bounded Host canonicalization. The normal path is capped at
+4,096 nodes/256 KiB; five built-in provider domains and Host-bound dataclasses
+may use a 500,000-node/64 MiB incremental streaming digest. The descriptor is
+at most 4 KiB and never contains the result text. If the result is opaque,
+cyclic, ambiguous, or over budget, it reports `digest_unavailable` and semantic
+capture fails closed. Safely traversable provider text is also scanned
+incrementally by local Host DLP; hits persist only closed category/reason/
+evidence-digest findings and monotonically stricter advisory sensitivity, not
+the matched text or a label writeback. The provider result returned to the
+caller remains unchanged. See [Semantic Approval and Data
+Identification](semantic_shadow.md#captured-inputs-and-privacy).
+
 ## Process domains and persistence
 
 `TaskAuthorityManifest.data_flow_policy` is only the process receive-domain

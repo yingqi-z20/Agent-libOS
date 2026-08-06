@@ -240,6 +240,7 @@ enforce their own authority.
 | `checkpoint`, `image_registry`, `image_artifacts`, `skills`, `modules` | Checkpoint, image, Skill, and trusted-module registries |
 | `operations`, `explain`, `audit`, `events`, `payload_retention` | Causal operations, evidence, audit/events, and payload-retention maintenance |
 | `llms`, `llm` | LLM profile registry and process executor |
+| `semantic` | Host-only read access to semantic Shadow health and bounded assessment evidence; capture/worker mutation remains runtime-internal |
 | `substrate`, `store`, `uow` | Provider substrate and persistence composition boundary |
 
 Manager methods have per-operation authority contracts; the presence of an
@@ -301,6 +302,53 @@ not expose this manager to model code;
 every process action still goes through the normal Tool/Skill and primitive
 authority boundaries. See [Durable Task Runs](durable_task_runs.md) for payload
 opt-in, retention, recovery, and external-effect semantics.
+
+`Runtime.semantic` is an evidence service, not an authorization manager. Its
+public Host reads are `status()`,
+`query_assessments(pid=None, request_id=None, operation_id=None, kind=None,
+status=None, domain=None, action_id=None, tenant_bucket_sha256=None, after=None,
+limit=None)`, and
+`get_assessment(assessment_id)`. Queries are hard-bounded and keyset-paged. The
+omitted direct-Host limit uses `semantic.assessment_list_limit`; an explicit
+limit cannot exceed the smaller of `semantic.assessment_list_hard_limit` and
+500. The CLI and local HTTP API apply their stricter 50-row default and 100-row
+maximum.
+The returned mappings are payload-free projections containing typed findings,
+Shadow outcome, normalized Human observation, calibration, reserved nullable
+token/cost fields, and provenance digests. An external classifier may populate
+`input_tokens`, `output_tokens`, and `cost_microunits` from an exact
+`LLMCompletion.usage` dictionary, selecting only exact non-negative integers
+through `2^53 - 1`, matching JSON/TypeScript safe-integer decoding.
+`prompt_tokens` and `completion_tokens` are accepted aliases; canonical/alias
+conflict invalidates only that counter. Unknown/raw
+usage fields are never returned. Deterministic/scripted, missing, non-exact, or
+invalid telemetry remains `None`, and populated values are not authoritative
+billing evidence. Runtime-internal capture and worker methods are not exported
+as model Tools, Skills, JIT syscalls, Modules, HTTP writes, or machine
+settlement APIs. See [Semantic Approval and Data
+Identification](semantic_shadow.md).
+
+`status()` returns schema v2. Its `assessments.by_status` and
+`assessments.by_domain` mappings contain the complete closed enum key sets and
+must each sum to `assessments.total`; inconsistent mappings are rejected by the
+CLI and GUI adapters. Because this release has no real semantic auto-approval,
+`actual_auto_approval` is exactly
+`{"numerator": 0, "denominator": 0, "rate": null}`.
+
+Embedded Hosts may pass `semantic_assessor=` to `Runtime(...)`,
+`Runtime.open(...)`, or `Runtime.aopen(...)` only when the configured adapter is
+`scripted`; enabled scripted Shadow requires that injected object to implement
+the synchronous `assess()` port. The external adapter rejects an override, and
+other adapters reject this injection. This constructor dependency is Host code,
+not a CLI/HTTP/GUI/model/Skill/JIT/Module extension surface.
+
+The same three constructors accept the separate Host-only
+`semantic_tenant_bucketer=` callback. It receives a canonical tenant string and
+must return a 64-character lower-case SHA-256-shaped digest; deployments should
+derive that value with a deployment-keyed HMAC. When omitted, assessment rows
+use `tenant_bucket_sha256=None` and no tenant grouping occurs. The callback is
+not configurable through YAML or any CLI, HTTP, GUI, Tool, Skill, JIT, or
+Module entrypoint, and its failure is isolated as a semantic capture failure.
 
 ## JSON-RPC and MCP Host APIs
 
@@ -449,7 +497,7 @@ cannot silently abandon an owned store or partially assembled component graph.
 
 ## Compatibility boundary
 
-- Agent libOS 1.3.4 is experimental. The top-level `agent_libos.__all__` names
+- Agent libOS 1.4.0 is experimental. The top-level `agent_libos.__all__` names
   and the Runtime entrypoints documented here are the intended application
   import surface for this release. Pin the package version when depending on
   exact signatures or dataclass fields.

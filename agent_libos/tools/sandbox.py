@@ -48,6 +48,7 @@ _TYPESCRIPT_DEPENDENCY_DIRECTIVE_RE = re.compile(
 )
 _DENO_TYPES_DIRECTIVE_RE = re.compile(r"(?im)^\s*//\s*@deno-types\s*=")
 _PROCESS_CLEANUP_TIMEOUT_S = 1.0
+_DENO_PROCESS_EXIT_TIMEOUT_S = 5.0 if os.name == "nt" else _PROCESS_CLEANUP_TIMEOUT_S
 _PROCESS_CLEANUP_POLL_INTERVAL_S = 0.02
 _VALIDATION_SUMMARY_MAX_DEPTH = 64
 _SANDBOX_FAILURE_METRICS_ATTR = "_agent_libos_command_metrics"
@@ -1568,11 +1569,17 @@ class DenoTypescriptSandbox(SandboxBackend):
             except (ProcessLookupError, PermissionError):
                 pass
         root_settled = await self._wait_for_deno_process(proc)
+        descendants_settled = True
+        if os.name == "nt" or group_permission_error is not None:
+            descendants_settled = await self._wait_for_deno_descendants(descendants)
         if group_permission_error is None:
             if not root_settled:
                 raise SandboxError(f"Deno supervisor {proc.pid} did not terminate during cleanup")
+            if tree_available and not descendants_settled:
+                raise SandboxError(
+                    f"Deno descendants of supervisor {proc.pid} did not terminate during cleanup"
+                )
             return
-        descendants_settled = await self._wait_for_deno_descendants(descendants)
         if tree_available and root_settled and descendants_settled:
             return
         raise SandboxError(
@@ -1584,7 +1591,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         if proc.returncode is not None:
             return True
         try:
-            await asyncio.wait_for(proc.wait(), timeout=_PROCESS_CLEANUP_TIMEOUT_S)
+            await asyncio.wait_for(proc.wait(), timeout=_DENO_PROCESS_EXIT_TIMEOUT_S)
         except (TimeoutError, ProcessLookupError, PermissionError):
             return proc.returncode is not None
         return proc.returncode is not None
@@ -1594,7 +1601,7 @@ class DenoTypescriptSandbox(SandboxBackend):
         if not descendants:
             return True
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _PROCESS_CLEANUP_TIMEOUT_S
+        deadline = loop.time() + _DENO_PROCESS_EXIT_TIMEOUT_S
         alive = descendants
         while alive:
             try:

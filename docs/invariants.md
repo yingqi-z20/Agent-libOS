@@ -318,11 +318,13 @@ longer defines.
   pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
   typed boundaries compute the next state generation, preventing a direct-write
   rewind from reviving a stale token.
-- `v4-persisted-state-is-strict-and-versioned`: a 1.3.4 store accepts only the
-  frozen version-4 physical schema (including Durable Task Run and typed process
-  state) and canonical security carriers. Schema-v3, older, incomplete, or
-  malformed state is rejected before mutation; no compatibility path is
-  represented as a migration. Recovery operates only on valid schema-v4 state.
+- `v5-persisted-state-is-strict-and-versioned`: ordinary 1.4.0 Runtime startup
+  accepts only the frozen version-5 physical schema (including Durable Task
+  Run, typed process state, Human revision, and semantic job/evidence state)
+  plus canonical security carriers. A canonical v4 source is accepted only by
+  the explicit offline digest-bound migration command; v3, older, incomplete,
+  or malformed state is rejected before Runtime mutation. Recovery operates
+  only on valid schema-v5 state.
 - `durable-task-run-ledger-is-versioned-and-generation-fenced`: mutable Run
   projections advance through revision CAS under the current monotonic Runtime
   epoch. Stable command identities make retries idempotent, while requirements,
@@ -1156,6 +1158,55 @@ longer defines.
   require real tool, provider-state, external-effect, and operation evidence;
   modeled rows stay in a separate denominator.
 
+- `semantic-shadow-has-no-machine-mutation-entry`: every semantic public
+  surface is observation-only. The broker has no permit type, the Task
+  Authority candidate lookup is side-effect-free, and CLI/HTTP/GUI/model/Skill/
+  JIT/Module paths expose no semantic Human-settlement, Capability issuance,
+  permission-policy, DataLabel, release, or provider mutation.
+- `semantic-candidates-are-exact-and-attenuated`: absent, null, or empty
+  `semantic_auto_approval` is deny-all. Parent and child must declare the
+  closed versioned ceiling independently; the child can only preserve an exact
+  operation and narrow resource/rights. Candidate evidence binds the concrete
+  operation/resource/single non-control right and current manifest/policy
+  digests, never a wildcard permit.
+- `semantic-shadow-is-authority-neutral`: off mode performs no capture writes
+  or job claims; kill-switch cleanup may only terminalize and hash-reduce
+  pre-existing semantic jobs. Shadow may add only internal classifier job/
+  evidence state. Capture, observer, classifier, timeout, OOD, egress, and
+  late-Human races leave Human,
+  Process, Capability, permission, labels, releases, and business provider
+  results identical to the authoritative path; only `would_*` history differs.
+- `semantic-data-findings-are-monotonic-advisory`: a data finding can propose
+  only a higher sensitivity floor or lower integrity/trust ceiling. Projection
+  and service code do not mutate the input labels, ambient `DataFlowContext`,
+  Object/file labels, endorsement/declassification, Sink clearance, or release
+  state in Phase 0+1. Local Host DLP freezes only allowlisted category/reason/
+  digest evidence and merges monotonic Host findings into every terminal path;
+  it never persists matched text or turns a finding into authority.
+- `semantic-evidence-is-plaintext-free`: approval/provider projections are
+  metadata-only. A nonterminal root-goal projection may contain only bounded
+  `public`/`normal`, non-mixed-identity redacted intent after secret/path DLP;
+  unsafe input downgrades to metadata-only. Terminal jobs, assessments,
+  protected evidence, API, CLI, and GUI exclude goal/provider source text,
+  paths, argv/commands, bodies, credentials, prompts/responses, and reasoning.
+  External usage extraction retains only three bounded nullable counters from
+  exact Host containers; alias conflicts, invalid values, unknown fields, raw
+  usage, and secret sentinels are discarded.
+  Root/provider local DLP walks only bounded exact Host-owned structures,
+  freezes at most four payload-free findings, and never persists scanned text.
+  Provider identity uses either the 4,096-node/256 KiB generic projection or
+  the 500,000-node/64 MiB allowlisted streaming path; the descriptor remains at
+  most 4 KiB and source text is absent.
+  Terminal jobs are hash-only, and secret-sentinel regression tests cover
+  persisted and returned semantic evidence.
+- `semantic-assessments-are-provenance-bound-and-append-only`: every completed
+  assessment binds the required classifier artifact, input, feature snapshot,
+  and policy digests plus all applicable Host manifest/action/resource/
+  arguments/state/source/Sink/tool/provider and projection identity. Terminal
+  job CAS and assessment append
+  share a transaction; exact reappend is idempotent, conflicting overwrite and
+  delete are rejected, and queries use bounded Unicode-stable keyset pages.
+
 - `skill-discovery-catalogs-are-bounded-and-source-consistent`: Host and persisted Skill catalogs share Unicode matching and fail closed at the configured scan ceiling.
 - `runtime-registration-mutations-are-audit-atomic`: Tool and syscall route bindings roll back atomically when required audit recording fails.
 - `rating-mutations-are-audit-atomic`: rating updates and required audit records commit or roll back in one transaction.
@@ -1191,6 +1242,11 @@ longer defines.
 - Real LLM credentials and token-spending paths are opt-in. The default matrix
   covers mock/action-selection behavior, not a live request for every supported
   profile or provider deployment.
+- Semantic Shadow safety tests use deterministic/scripted classifiers and
+  adversarial fake-provider responses. A real classifier smoke is opt-in and
+  cannot establish production calibration, OOD coverage, provider retention,
+  tenant rollout safety, or a future machine-settlement policy. Phase 0+1 has
+  no such settlement path.
 - GUI CI covers React tests, TypeScript typechecking, production build, and the
   Python HTTP/SSE server on Ubuntu. Accessibility/usability studies, native
   Electron lifecycle, and the production-build custom-protocol BrowserWindow
