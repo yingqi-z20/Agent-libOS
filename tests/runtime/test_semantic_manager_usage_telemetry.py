@@ -7,7 +7,7 @@ import time
 import pytest
 
 from agent_libos.config import SemanticDefaults
-from agent_libos.models import DataLabels
+from agent_libos.models import DataFlowContext, DataLabels
 from agent_libos.models.semantic import (
     AuthoritativeApprovalFacts,
     SemanticAssessment,
@@ -17,10 +17,14 @@ from agent_libos.models.semantic import (
     SemanticDomain,
 )
 from agent_libos.semantic.external import (
+    HostSemanticAssessmentInvocation,
     SemanticProviderResponseError,
     SemanticUsageTelemetry,
 )
-from agent_libos.semantic.service import SemanticManager
+from agent_libos.semantic.service import (
+    SemanticManager,
+    _identity_safe_labels_sha256,
+)
 from agent_libos.storage import SQLiteStore, UnitOfWork
 
 
@@ -52,6 +56,12 @@ class _TelemetryAssessor:
             raise SemanticProviderResponseError("provider response was invalid")
         return SemanticAssessment(status=SemanticAssessmentStatus.SUCCESS)
 
+    def assess_host(
+        self,
+        invocation: HostSemanticAssessmentInvocation,
+    ) -> SemanticAssessment:
+        return self.assess(invocation.request)
+
     def take_last_usage_telemetry(self) -> SemanticUsageTelemetry | None:
         value = getattr(self._local, "value", None)
         if hasattr(self._local, "value"):
@@ -60,6 +70,7 @@ class _TelemetryAssessor:
 
 
 def _request(pid: str) -> SemanticAssessmentRequest:
+    flow = _safe_flow()
     return SemanticAssessmentRequest(
         kind=SemanticAssessmentKind.ROOT_GOAL,
         domain=SemanticDomain.RUNTIME,
@@ -70,7 +81,13 @@ def _request(pid: str) -> SemanticAssessmentRequest:
         features=AuthoritativeApprovalFacts(schema_valid=True),
         pid=pid,
         policy_sha256=_DIGEST,
+        source_refs_sha256=flow.source_refs_hash(),
+        data_labels_sha256=_identity_safe_labels_sha256(flow.labels),
     )
+
+
+def _safe_flow() -> DataFlowContext:
+    return DataFlowContext(labels=DataLabels())
 
 
 def _manager(
@@ -120,6 +137,7 @@ def test_worker_persists_usage_after_any_completed_provider_response(
             _request(pid),
             candidate=None,
             hard_violations=(),
+            data_flow_context=_safe_flow(),
         )
 
         assert manager.process_one()
@@ -148,6 +166,12 @@ def test_worker_keeps_missing_usage_null_for_deterministic_assessor() -> None:
         def assess(self, _request: SemanticAssessmentRequest) -> SemanticAssessment:
             return SemanticAssessment(status=SemanticAssessmentStatus.SUCCESS)
 
+        def assess_host(
+            self,
+            invocation: HostSemanticAssessmentInvocation,
+        ) -> SemanticAssessment:
+            return self.assess(invocation.request)
+
     store = SQLiteStore(":memory:")
     try:
         unit = UnitOfWork(store)
@@ -156,6 +180,7 @@ def test_worker_keeps_missing_usage_null_for_deterministic_assessor() -> None:
             _request("pid-no-usage"),
             candidate=None,
             hard_violations=(),
+            data_flow_context=_safe_flow(),
         )
 
         assert manager.process_one()
@@ -214,6 +239,12 @@ def test_worker_rejects_non_typed_usage_without_persisting_provider_fields() -> 
         def assess(self, _request: SemanticAssessmentRequest) -> SemanticAssessment:
             return SemanticAssessment(status=SemanticAssessmentStatus.SUCCESS)
 
+        def assess_host(
+            self,
+            invocation: HostSemanticAssessmentInvocation,
+        ) -> SemanticAssessment:
+            return self.assess(invocation.request)
+
         def take_last_usage_telemetry(self) -> dict[str, object]:
             return {
                 "input_tokens": 17,
@@ -228,6 +259,7 @@ def test_worker_rejects_non_typed_usage_without_persisting_provider_fields() -> 
             _request("pid-invalid-usage"),
             candidate=None,
             hard_violations=(),
+            data_flow_context=_safe_flow(),
         )
 
         assert manager.process_one()
@@ -264,6 +296,7 @@ def test_two_workers_do_not_cross_assign_usage() -> None:
                 _request(pid),
                 candidate=None,
                 hard_violations=(),
+                data_flow_context=_safe_flow(),
             )
 
         manager.start()

@@ -3415,7 +3415,33 @@ class PtyAdapter:
     ) -> None:
         if self.human is None:
             raise CapabilityDenied(f"{pid} requires human approval for pty spawn on {resource}")
-        request_id = self.human.query(
+        approval_context = self.shell_policy.operation_context(
+            pid,
+            argv,
+            resource,
+            timeout=timeout,
+            cwd=cwd,
+            profile=decision.sandbox_profile,
+            adapter="pty",
+            primitive="runtime.pty.spawn",
+            operation="pty.spawn",
+            authority_operation="pty.spawn",
+            include_timeout=False,
+            continuous_session=True,
+            extra={"startup_timeout_s": timeout},
+        )
+        approval_context.update(
+            {
+                "workspace_root": str(getattr(self.provider, "cwd", "")),
+                "working_directory": cwd,
+                "grant_scope": "one_time",
+                "policy_level": decision.policy_level,
+                "policy_reason": decision.reason,
+                "matched_rule": list(decision.matched_rule) if decision.matched_rule else None,
+                "high_risk": decision.high_risk,
+            }
+        )
+        request_id = self.human.query_authority_request(
             pid=pid,
             human=self.host.config.runtime.default_human,
             request={
@@ -3436,30 +3462,10 @@ class PtyAdapter:
                         description="one-shot human approval for exact PTY spawn",
                     ),
                 },
-                "context": {
-                    "adapter": "pty",
-                    "primitive": "runtime.pty.spawn",
-                    "operation": "pty.spawn",
-                    "continuous_session": True,
-                    "pid": pid,
-                    "workspace_root": str(getattr(self.provider, "cwd", "")),
-                    "working_directory": cwd,
-                    "argv": list(argv),
-                    "command": argv[0],
-                    "resource": resource,
-                    "right": CapabilityRight.EXECUTE.value,
-                    "grant_scope": "one_time",
-                    "policy_level": decision.policy_level,
-                    "policy_reason": decision.reason,
-                    "matched_rule": list(decision.matched_rule) if decision.matched_rule else None,
-                    "high_risk": decision.high_risk,
-                    "risk": decision.risk.value,
-                    "rule_id": decision.rule_id,
-                    "rule_effect": decision.rule_effect.value,
-                    "sandbox_profile": self.shell_policy.profile_json(decision.sandbox_profile),
-                },
+                "context": approval_context,
             },
             blocking=True,
+            authority_origin="external_operation",
             source_oids=source_oids,
         )
         raise HumanApprovalRequired(

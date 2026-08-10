@@ -1,5 +1,46 @@
 import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LlmCallDetail, LlmCallPage, LlmTraceContentChunk, LlmTraceContentField, LLMProfileInput, LLMProfileSummary, McpCallResult, McpDiscoveryResult, McpServerSummary, McpToolListResult, ModuleSummary, ObjectTask, OperationListResponse, RuntimeSnapshot, SemanticAssessmentDetail, SemanticAssessmentDomain, SemanticAssessmentKind, SemanticAssessmentPage, SemanticAssessmentStatus, SemanticStatus, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunSpecV1, TaskRunSummary } from "./types";
-import { assertLlmCallDetail, assertLlmCallPage, assertLlmTraceContentChunk, assertMcpCallResult, assertMcpDiscoveryResult, assertMcpServerSummary, assertMcpToolListResult, assertRuntimeSnapshot, assertSchedulerStatus, assertSemanticAssessmentDetailResponse, assertSemanticAssessmentPage, assertSemanticStatus, assertTaskRunDetail, assertTaskRunSummary } from "./types";
+import type {
+  SemanticControlHistoryPage,
+  SemanticControlState,
+  SemanticFlowDirection,
+  SemanticFlowEdgePage,
+  SemanticFlowEntityPage,
+  SemanticFlowLineage,
+  SemanticFlowStatus,
+  SemanticHealthEventPage,
+  SemanticMachineSettlementPage,
+  SemanticMetrics,
+  SemanticPolicyEpochPage,
+  SemanticRisk,
+  SemanticSettlementOutcome
+} from "./types";
+import {
+  assertHumanRequest,
+  assertLlmCallDetail,
+  assertLlmCallPage,
+  assertLlmTraceContentChunk,
+  assertMcpCallResult,
+  assertMcpDiscoveryResult,
+  assertMcpServerSummary,
+  assertMcpToolListResult,
+  assertRuntimeSnapshot,
+  assertSchedulerStatus,
+  assertSemanticAssessmentDetailResponse,
+  assertSemanticAssessmentPage,
+  assertSemanticControlHistoryPage,
+  assertSemanticControlState,
+  assertSemanticFlowEdgePage,
+  assertSemanticFlowEntityPage,
+  assertSemanticFlowLineage,
+  assertSemanticFlowStatus,
+  assertSemanticHealthEventPage,
+  assertSemanticMachineSettlementPage,
+  assertSemanticMetrics,
+  assertSemanticPolicyEpochPage,
+  assertSemanticStatus,
+  assertTaskRunDetail,
+  assertTaskRunSummary
+} from "./types";
 import type { OptionalQuanta } from "../quanta";
 
 type JsonBody = Record<string, unknown>;
@@ -16,6 +57,10 @@ const semanticStatuses = new Set([
   "provider_outcome_unknown", "invalid_schema", "ood", "abstained", "stale_input"
 ]);
 const semanticDomains = new Set(["filesystem", "shell", "git", "jsonrpc", "mcp", "runtime", "unknown"]);
+const semanticFlowDirections = new Set(["upstream", "downstream"]);
+const semanticSettlementOutcomes = new Set([
+  "issued", "denied", "require_human", "race_lost", "stale", "budget_exhausted", "revoked", "expired", "failed"
+]);
 
 export type CapabilityPageResponse = {
   items: CapabilitySummary[];
@@ -32,6 +77,22 @@ export type SemanticAssessmentFilters = {
   domain?: SemanticAssessmentDomain;
   actionId?: string;
   tenantBucketSha256?: string;
+};
+
+export type SemanticEvidenceFilters = {
+  pid?: string;
+  actionId?: string;
+  tenantBucketSha256?: string;
+  epochId?: string;
+};
+
+export type SemanticSettlementFilters = SemanticEvidenceFilters & {
+  outcome?: SemanticSettlementOutcome;
+};
+
+export type SemanticMetricsFilters = Pick<SemanticEvidenceFilters, "actionId" | "tenantBucketSha256" | "epochId"> & {
+  window?: string;
+  risk?: SemanticRisk;
 };
 
 export class LibOSClient {
@@ -303,6 +364,144 @@ export class LibOSClient {
       throw new Error("GUI Semantic assessment identity does not match the requested id.");
     }
     return value.assessment;
+  }
+
+  async getSemanticFlowStatus(options: RequestOptions = {}): Promise<SemanticFlowStatus> {
+    const value = await this.request<unknown>("GET", "/api/semantic/flow/status", undefined, options);
+    assertSemanticFlowStatus(value);
+    return value;
+  }
+
+  async listSemanticFlowEntities(
+    filters: Pick<SemanticEvidenceFilters, "pid" | "tenantBucketSha256"> = {},
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticFlowEntityPage> {
+    const query = semanticEvidenceQuery(filters, limit, after);
+    const value = await this.request<unknown>("GET", `/api/semantic/flow/entities?${query.toString()}`, undefined, options);
+    assertSemanticFlowEntityPage(value);
+    if (filters.pid && value.items.some((item) => item.pid !== filters.pid)) {
+      throw new Error("GUI Semantic flow entity page contains an entity from another process.");
+    }
+    return value;
+  }
+
+  async listSemanticFlowEdges(
+    filters: Pick<SemanticEvidenceFilters, "pid"> = {},
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticFlowEdgePage> {
+    const query = semanticEvidenceQuery(filters, limit, after);
+    const value = await this.request<unknown>("GET", `/api/semantic/flow/edges?${query.toString()}`, undefined, options);
+    assertSemanticFlowEdgePage(value);
+    if (filters.pid && value.items.some((item) => item.pid !== filters.pid)) {
+      throw new Error("GUI Semantic flow edge page contains an edge from another process.");
+    }
+    return value;
+  }
+
+  async getSemanticFlowLineage(
+    nodeId: string,
+    direction: SemanticFlowDirection,
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticFlowLineage> {
+    const selectedNodeId = semanticQueryIdentifier(nodeId, "node_id");
+    const selectedDirection = semanticQueryEnum(direction, "direction", semanticFlowDirections) as SemanticFlowDirection;
+    const query = semanticPageQuery(limit, after);
+    query.set("direction", selectedDirection);
+    const value = await this.request<unknown>(
+      "GET",
+      `/api/semantic/flow/lineage/${encodeURIComponent(selectedNodeId)}?${query.toString()}`,
+      undefined,
+      options
+    );
+    assertSemanticFlowLineage(value);
+    if (value.root_node_id !== selectedNodeId || value.direction !== selectedDirection) {
+      throw new Error("GUI Semantic flow lineage identity does not match the request.");
+    }
+    return value;
+  }
+
+  async listSemanticSettlements(
+    filters: SemanticSettlementFilters = {},
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticMachineSettlementPage> {
+    const query = semanticEvidenceQuery(filters, limit, after);
+    const outcome = semanticQueryEnum(filters.outcome, "outcome", semanticSettlementOutcomes);
+    if (outcome !== undefined) query.set("outcome", outcome);
+    const value = await this.request<unknown>("GET", `/api/semantic/settlements?${query.toString()}`, undefined, options);
+    assertSemanticMachineSettlementPage(value);
+    if (filters.pid && value.items.some((item) => item.pid !== filters.pid)) {
+      throw new Error("GUI Semantic settlement page contains a settlement from another process.");
+    }
+    return value;
+  }
+
+  async listSemanticPolicyEpochs(
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticPolicyEpochPage> {
+    const query = semanticPageQuery(limit, after);
+    const value = await this.request<unknown>("GET", `/api/semantic/policy/epochs?${query.toString()}`, undefined, options);
+    assertSemanticPolicyEpochPage(value);
+    return value;
+  }
+
+  async getSemanticControl(options: RequestOptions = {}): Promise<SemanticControlState> {
+    const value = await this.request<unknown>("GET", "/api/semantic/control", undefined, options);
+    assertSemanticControlState(value);
+    return value;
+  }
+
+  async listSemanticControlHistory(
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticControlHistoryPage> {
+    const query = semanticPageQuery(limit, after);
+    const value = await this.request<unknown>("GET", `/api/semantic/control/history?${query.toString()}`, undefined, options);
+    assertSemanticControlHistoryPage(value);
+    return value;
+  }
+
+  async listSemanticHealthEvents(
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticHealthEventPage> {
+    const query = semanticPageQuery(limit, after);
+    const value = await this.request<unknown>("GET", `/api/semantic/health?${query.toString()}`, undefined, options);
+    assertSemanticHealthEventPage(value);
+    return value;
+  }
+
+  async getSemanticMetrics(
+    filters: SemanticMetricsFilters = {},
+    options: RequestOptions = {}
+  ): Promise<SemanticMetrics> {
+    const query = semanticEvidenceQuery(filters, 50, undefined, false);
+    const risk = semanticQueryEnum(filters.risk, "risk", new Set(["low", "medium", "high", "critical"]));
+    if (risk !== undefined) query.set("risk", risk);
+    const window = semanticQueryText(filters.window, "window", 128);
+    if (window !== undefined) query.set("window", window);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const value = await this.request<unknown>("GET", `/api/semantic/metrics${suffix}`, undefined, options);
+    assertSemanticMetrics(value);
+    if ((filters.actionId && value.action_id !== filters.actionId)
+        || (filters.tenantBucketSha256 && value.tenant_bucket_sha256 !== filters.tenantBucketSha256)
+        || (filters.epochId && value.epoch_id !== filters.epochId)
+        || (filters.risk && value.risk !== filters.risk)
+        || (filters.window && value.window !== filters.window)) {
+      throw new Error("GUI Semantic metrics identity does not match the request.");
+    }
+    return value;
   }
 
   async listProcessLlmCalls(pid: string, limit = 50, cursor?: string, options: RequestOptions = {}): Promise<LlmCallPage> {
@@ -1009,6 +1208,45 @@ function semanticQuerySha256(value: string | undefined, field: string): string |
   return value;
 }
 
+function semanticQueryIdentifier(value: string, field: string): string {
+  const selected = semanticQueryText(value, field, semanticFilterMaxChars);
+  if (selected === undefined || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/.test(selected)) {
+    throw new Error(`Semantic evidence ${field} is invalid.`);
+  }
+  return selected;
+}
+
+function semanticPageQuery(limit: number, after?: string): URLSearchParams {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    throw new Error("Semantic evidence page limit must be an integer from 1 to 100.");
+  }
+  const query = new URLSearchParams({ limit: String(limit) });
+  const cursor = semanticQueryText(after, "after", semanticCursorMaxChars);
+  if (cursor !== undefined) query.set("after", cursor);
+  return query;
+}
+
+function semanticEvidenceQuery(
+  filters: SemanticEvidenceFilters,
+  limit: number,
+  after?: string,
+  includePage = true
+): URLSearchParams {
+  const query = includePage ? semanticPageQuery(limit, after) : new URLSearchParams();
+  const pid = semanticQueryText(filters.pid, "pid", semanticFilterMaxChars);
+  const actionId = semanticQueryText(filters.actionId, "action_id", 128);
+  if (actionId !== undefined && !/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/.test(actionId)) {
+    throw new Error("Semantic evidence action_id is invalid.");
+  }
+  const tenant = semanticQuerySha256(filters.tenantBucketSha256, "tenant_bucket_sha256");
+  const epoch = semanticQueryText(filters.epochId, "epoch_id", semanticFilterMaxChars);
+  if (pid !== undefined) query.set("pid", pid);
+  if (actionId !== undefined) query.set("action_id", actionId);
+  if (tenant !== undefined) query.set("tenant_bucket_sha256", tenant);
+  if (epoch !== undefined) query.set("epoch_id", epoch);
+  return query;
+}
+
 function withOptionalQuanta(body: JsonBody, maxQuanta: OptionalQuanta): JsonBody {
   return maxQuanta === null ? body : { ...body, max_quanta: maxQuanta };
 }
@@ -1119,21 +1357,8 @@ function taskRunHumanRequestPage(value: unknown): TaskRunHumanRequestPage {
 }
 
 function humanRequest(value: unknown): HumanRequest {
-  if (!isJsonObject(value)
-      || typeof value.request_id !== "string" || !value.request_id
-      || typeof value.pid !== "string" || !value.pid
-      || typeof value.human !== "string" || !value.human
-      || !isJsonObject(value.payload)
-      || typeof value.status !== "string" || !value.status
-      || !(value.decision === null || isJsonObject(value.decision))
-      || typeof value.blocking !== "boolean"
-      || typeof value.created_at !== "string" || !value.created_at
-      || typeof value.updated_at !== "string" || !value.updated_at
-      || (value.release_request_id !== undefined && typeof value.release_request_id !== "string")
-      || (value.release_for_request_id !== undefined && typeof value.release_for_request_id !== "string")) {
-    throw new Error("GUI human request response is malformed.");
-  }
-  return value as HumanRequest;
+  assertHumanRequest(value);
+  return value;
 }
 
 function pagedItems(value: unknown, label: string): { items: unknown[]; next_cursor: string | null; has_more: boolean } {

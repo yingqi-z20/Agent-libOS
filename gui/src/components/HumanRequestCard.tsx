@@ -1,11 +1,13 @@
 import { useId, useReducer, useRef } from "react";
 import type {
+  CanonicalApprovalPreviewV1,
   DataReleaseApprovalContext,
   HumanPermissionPolicy,
   HumanRequest,
   HumanRequestPayload,
   HumanResponseInput
 } from "../api/types";
+import { canonicalApprovalPreviewFromRequest } from "../api/types";
 import { useI18n, type TranslationKey } from "../i18n";
 import { CollapsibleJson } from "./CollapsibleJson";
 
@@ -82,6 +84,23 @@ export function buildHumanResponse(
     return { error: "release_required" };
   }
   const requestType = request.payload?.type;
+  if (requestType === "external_operation_approval") {
+    const preview = parseCanonicalApprovalPreview(request);
+    if (preview === null || request.preview_sha256 === undefined) {
+      // Preserve the 1.4.0 off/shadow Human path for malformed historical
+      // requests. Active enforcement modes reject this unfenced response at
+      // the Host boundary; a valid preview always uses the fenced variant.
+      return { response: { kind: "approval", approved } };
+    }
+    return {
+      response: {
+        kind: "external_approval",
+        approved,
+        expected_revision: preview.revision,
+        preview_sha256: request.preview_sha256
+      }
+    };
+  }
   if (requestType === "permission_request") {
     if (approved) {
       if (draft.policy === "always_deny") return { error: "permission_approve_deny" };
@@ -107,6 +126,7 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
   const isQuestion = requestType === "question";
   const isDataReleaseApproval = requestType === "data_release_approval";
   const isExternalOperationApproval = requestType === "external_operation_approval";
+  const approvalPreview = isExternalOperationApproval ? parseCanonicalApprovalPreview(request) : null;
   const permissionContext = isPermission && (request.payload.requested_permission || request.payload.context)
     ? {
         requested_permission: request.payload.requested_permission ?? null,
@@ -153,8 +173,11 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
     || (isQuestion && !state.answer.trim())
     || (isPermission && state.policy === "always_deny")
     || (isDataReleaseApproval && releaseContext === null);
-  const rejectDisabled = state.submitting || state.settled || state.ambiguousDecision === true || (isPermission && state.policy === "always_allow");
-  const prompt = String(request.payload?.question ?? request.payload?.reason ?? request.payload?.type ?? t("operator.humanRequestFallback"));
+  const rejectDisabled = state.submitting || state.settled || state.ambiguousDecision === true
+    || (isPermission && state.policy === "always_allow");
+  const prompt = isExternalOperationApproval
+    ? t("human.externalApprovalTitle")
+    : String(request.payload?.question ?? request.payload?.reason ?? request.payload?.type ?? t("operator.humanRequestFallback"));
   const releaseRequestId = request.release_request_id
     ?? (typeof request.payload.release_request_id === "string" ? request.payload.release_request_id : null);
   const approveActionLabel = state.ambiguousDecision === true
@@ -165,6 +188,10 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
   const rejectActionLabel = state.ambiguousDecision === false ? t("human.reconcile") : t("human.reject");
   const requestContextLabel = isDataReleaseApproval && releaseContext
     ? `${releaseContext.operation} · ${releaseContext.sink} · ${request.request_id}`
+    : isExternalOperationApproval && approvalPreview
+      ? `${approvalPreview.action_id} · ${approvalPreview.resource_display} · ${request.request_id}`
+    : isExternalOperationApproval
+      ? `${t("human.externalApprovalTitle")} · ${request.request_id}`
     : `${prompt} · ${request.request_id}`;
 
   if (releaseRequired) {
@@ -188,7 +215,11 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
       aria-labelledby={promptId}
     >
       <strong id={promptId} className="humanRequestPrompt">
-        {isDataReleaseApproval ? t("human.releaseApprovalTitle") : prompt}
+        {isDataReleaseApproval
+          ? t("human.releaseApprovalTitle")
+          : isExternalOperationApproval
+            ? t("human.externalApprovalTitle")
+            : prompt}
       </strong>
       {isDataReleaseApproval ? (
         <p className="humanReleaseNotice">{t("human.releaseApprovalHint")}</p>
@@ -245,12 +276,11 @@ export function HumanRequestCard({ request, className = "humanCard", onRespond }
           {t("human.releaseMetadataInvalid")}
         </span>
       ) : null}
-      {isExternalOperationApproval && request.payload.context ? (
-        <section className="humanApprovalContext" aria-label={t("human.approvalContext")}>
-          <strong>{t("human.approvalContext")}</strong>
-          <p>{t("human.approvalContextHint")}</p>
-          <CollapsibleJson value={request.payload.context} label={t("human.approvalContext")} defaultExpanded />
-        </section>
+      {isExternalOperationApproval && approvalPreview ? (
+        <ExternalApprovalPreview preview={approvalPreview} previewSha256={request.preview_sha256 as string} />
+      ) : null}
+      {isExternalOperationApproval && !approvalPreview ? (
+        <span className="humanDecisionError" role="alert">{t("human.externalPreviewInvalid")}</span>
       ) : null}
       <div className="humanDecisionActions">
         <button aria-label={`${approveActionLabel}: ${requestContextLabel}`} aria-describedby={promptId} disabled={approveDisabled} onClick={() => void submit(true)}>
@@ -270,6 +300,139 @@ function validationErrorKey(error: HumanResponseValidationError): TranslationKey
   if (error === "permission_approve_deny") return "human.approveDenyInvalid";
   if (error === "release_required") return "human.releaseRequiredMessageNoId";
   return "human.rejectAllowInvalid";
+}
+
+export function parseCanonicalApprovalPreview(request: HumanRequest): CanonicalApprovalPreviewV1 | null {
+  return canonicalApprovalPreviewFromRequest(request);
+}
+
+function ExternalApprovalPreview({
+  preview,
+  previewSha256
+}: {
+  preview: CanonicalApprovalPreviewV1;
+  previewSha256: string;
+}) {
+  const { formatTime, t } = useI18n();
+  const argument = preview.argument_projection;
+  const argumentRows: Array<{ key: TranslationKey; value: string; code?: boolean }> = [
+    { key: "human.externalArgumentOperation", value: argument.operation, code: true }
+  ];
+  if (argument.kind === "filesystem") {
+    argumentRows.push({ key: "human.externalPathDigest", value: argument.path_sha256 as string, code: true });
+    if (argument.content_sha256 !== null) {
+      argumentRows.push({ key: "human.externalContentDigest", value: argument.content_sha256, code: true });
+      argumentRows.push({ key: "human.externalContentBytes", value: String(argument.content_bytes) });
+    }
+    if (argument.read_max_bytes !== null) {
+      argumentRows.push({ key: "human.externalReadMaxBytes", value: String(argument.read_max_bytes) });
+    }
+    if (argument.entry_limit !== null) argumentRows.push({ key: "human.externalEntryLimit", value: String(argument.entry_limit) });
+    if (argument.text_encoding !== null) argumentRows.push({ key: "human.externalEncoding", value: argument.text_encoding, code: true });
+    if (argument.expected_content_sha256 !== null) {
+      argumentRows.push({ key: "human.externalExpectedContent", value: argument.expected_content_sha256, code: true });
+    }
+    for (const [key, value] of [
+      ["human.externalOverwrite", argument.overwrite],
+      ["human.externalParents", argument.parents],
+      ["human.externalExistOk", argument.exist_ok],
+      ["human.externalRecursive", argument.recursive],
+      ["human.externalMissingOk", argument.missing_ok]
+    ] as const) {
+      if (value !== null) argumentRows.push({ key, value: String(value) });
+    }
+  } else if (argument.kind === "shell") {
+    const argv = `[${argument.display_argv.map((item) => JSON.stringify(item)).join(", ")}]${argument.argv_truncated ? " …" : ""}`;
+    argumentRows.push({ key: "human.externalArgv", value: argv, code: true });
+    argumentRows.push({ key: "human.externalArgvCount", value: String(argument.argv_count) });
+    argumentRows.push({ key: "human.externalArgvDigest", value: argument.argv_sha256 as string, code: true });
+    argumentRows.push({ key: "human.externalCwd", value: argument.safe_cwd ?? t("human.externalRedacted"), code: argument.safe_cwd !== null });
+    argumentRows.push({ key: "human.externalCwdDigest", value: argument.cwd_sha256 as string, code: true });
+    if (argument.timeout_seconds !== null) argumentRows.push({ key: "human.externalTimeout", value: argument.timeout_seconds });
+    if (argument.continuous_session !== null) {
+      argumentRows.push({ key: "human.externalContinuousSession", value: String(argument.continuous_session) });
+    }
+    if (argument.network_access !== null) argumentRows.push({ key: "human.externalNetworkAccess", value: String(argument.network_access) });
+  } else if (argument.kind === "jsonrpc") {
+    argumentRows.push({ key: "human.externalEndpoint", value: argument.endpoint_id as string, code: true });
+    argumentRows.push({ key: "human.externalEndpointDigest", value: argument.endpoint_id_sha256 as string, code: true });
+    argumentRows.push({ key: "human.externalMethod", value: argument.method_id as string, code: true });
+    argumentRows.push({ key: "human.externalMethodDigest", value: argument.method_id_sha256 as string, code: true });
+    argumentRows.push({ key: "human.externalPayloadDigest", value: argument.payload_sha256 as string, code: true });
+    if (argument.registry_spec_sha256 !== null) {
+      argumentRows.push({ key: "human.externalRegistrySpecDigest", value: argument.registry_spec_sha256, code: true });
+      argumentRows.push({ key: "human.externalRegistryGeneration", value: String(argument.registry_generation) });
+    }
+  } else if (argument.kind === "mcp") {
+    argumentRows.push({ key: "human.externalServer", value: argument.server_id as string, code: true });
+    argumentRows.push({ key: "human.externalServerDigest", value: argument.server_id_sha256 as string, code: true });
+    argumentRows.push({ key: "human.externalTool", value: argument.tool_id as string, code: true });
+    argumentRows.push({ key: "human.externalToolDigest", value: argument.tool_id_sha256 as string, code: true });
+    argumentRows.push({ key: "human.externalPayloadDigest", value: argument.payload_sha256 as string, code: true });
+    if (argument.registry_spec_sha256 !== null) {
+      argumentRows.push({ key: "human.externalRegistrySpecDigest", value: argument.registry_spec_sha256, code: true });
+      argumentRows.push({ key: "human.externalRegistryGeneration", value: String(argument.registry_generation) });
+    }
+  } else if (argument.kind === "git") {
+    if (argument.worktree_id !== null) argumentRows.push({ key: "human.externalWorktree", value: argument.worktree_id, code: true });
+    if (argument.worktree_id_sha256 !== null) {
+      argumentRows.push({ key: "human.externalWorktreeDigest", value: argument.worktree_id_sha256, code: true });
+    }
+    if (argument.path_sha256 !== null) argumentRows.push({ key: "human.externalPathDigest", value: argument.path_sha256, code: true });
+    if (argument.repository_state_sha256 !== null) {
+      argumentRows.push({ key: "human.externalRepositoryStateDigest", value: argument.repository_state_sha256, code: true });
+    }
+    if (argument.source_args_sha256 !== null) {
+      argumentRows.push({ key: "human.externalSourceArgsDigest", value: argument.source_args_sha256, code: true });
+    }
+    for (const reference of argument.git_references) {
+      argumentRows.push({
+        key: "human.externalGitReference",
+        value: `${reference.role}: ${reference.display} (sha256=${reference.sha256})`,
+        code: true
+      });
+    }
+    if (argument.git_fact_tokens.length > 0) {
+      argumentRows.push({ key: "human.externalGitFacts", value: argument.git_fact_tokens.join(", "), code: true });
+    }
+  }
+  const rows: Array<{ key: TranslationKey; value: string; code?: boolean }> = [
+    { key: "human.externalAction", value: preview.action_id, code: true },
+    { key: "human.externalResource", value: preview.resource_display, code: true },
+    { key: "human.externalResourceDigest", value: preview.resource_sha256, code: true },
+    { key: "human.externalRight", value: preview.rights.join(", "), code: true },
+    { key: "human.externalRisk", value: preview.risk },
+    { key: "human.externalEffect", value: preview.effect_id, code: true },
+    ...argumentRows,
+    { key: "human.externalArgsDigest", value: preview.canonical_args_sha256, code: true },
+    ...(preview.target_state_sha256
+      ? [{ key: "human.externalStateDigest" as const, value: preview.target_state_sha256, code: true }]
+      : []),
+    { key: "human.externalSensitivity", value: preview.source_labels.sensitivity },
+    { key: "human.externalIntegrity", value: preview.source_labels.integrity },
+    { key: "human.externalTrust", value: preview.source_labels.trust_level },
+    { key: "human.externalIdentity", value: preview.source_labels.identity_mixed
+      ? t("human.externalIdentityMixed")
+      : preview.source_labels.identity_present
+        ? t("human.externalIdentityPresent")
+        : t("human.externalIdentityAbsent") },
+    { key: "human.externalExpires", value: preview.expires_at === null ? t("semantic.none") : formatTime(preview.expires_at) },
+    { key: "human.externalPreviewDigest", value: previewSha256, code: true }
+  ];
+  return (
+    <section className="humanApprovalContext canonicalApprovalPreview" aria-label={t("human.externalPreviewLabel")}>
+      <strong>{t("human.externalPreviewLabel")}</strong>
+      <p>{t("human.externalPreviewHint")}</p>
+      <dl className="humanReleaseMetadata">
+        {rows.map((row) => (
+          <div className="humanReleaseMetadataRow" key={row.key}>
+            <dt>{t(row.key)}</dt>
+            <dd>{row.code ? <code><bdi>{row.value}</bdi></code> : <bdi>{row.value}</bdi>}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+  );
 }
 
 export function parseDataReleaseApprovalContext(
@@ -335,11 +498,11 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function isSha256(value: unknown): value is string {
-  return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value);
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
 function isNullableString(value: unknown): value is string | null | undefined {

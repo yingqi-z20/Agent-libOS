@@ -4,7 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from agent_libos.capability.admission import (
     CapabilityAdmissionPort,
@@ -12,6 +12,8 @@ from agent_libos.capability.admission import (
 )
 from agent_libos.capability.effect_binding import (
     APPROVAL_BINDING_KEY as APPROVAL_BINDING_CONSTRAINT_KEY,
+    approval_binding_sha256,
+    is_semantic_approval_binding,
     normalize_approval_binding,
 )
 from agent_libos.capability.evaluator import (
@@ -41,7 +43,16 @@ from agent_libos.models import (
     ResourcePattern,
     SandboxProfile,
 )
-from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    NotFound,
+    SemanticAuthorityTripDeferred,
+    ValidationError,
+)
+from agent_libos.models.semantic import (
+    SEMANTIC_ACTION_CATALOG_V1,
+    SemanticTripCode,
+)
 from agent_libos.ports import AuditPort, CapabilityStorePort, EventPort, OperationPort
 
 
@@ -107,9 +118,14 @@ CAPABILITY_MANAGER_READ_ONLY_PUBLIC_METHODS = frozenset(
         "project_read",
         "resources_overlap",
         "sandbox_profile_for_decision",
+        "is_semantic_approval_decision",
+        "require_semantic_approval_current",
+        "semantic_approval_lifecycle_evidence",
+        "report_semantic_authority_safety_trip",
         "spec",
         "spec_covers",
         "tool_execute",
+        "trip_semantic_authority_locally",
         "validate_delegation",
     }
 )
@@ -126,6 +142,13 @@ class _CapabilityPresentationPage:
     capabilities: list[dict[str, Any]]
     has_more: bool
     next_cursor: str | None
+
+
+def _raw_semantic_action_is_high_risk(value: Any) -> bool:
+    if not isinstance(value, Mapping) or value.get("schema_version") != 2:
+        return False
+    action = value.get("authority_operation")
+    return isinstance(action, str) and action not in SEMANTIC_ACTION_CATALOG_V1
 
 
 class CapabilityManager:
@@ -150,6 +173,8 @@ class CapabilityManager:
         *,
         operations: OperationPort,
         admission: CapabilityAdmissionPort | None = None,
+        semantic_approval_validator: Callable[..., None] | None = None,
+        semantic_authority_trip: Callable[..., None] | None = None,
     ) -> None:
         self.config = config or DEFAULT_CONFIG
         self.store = store
@@ -161,6 +186,26 @@ class CapabilityManager:
         self.profiles = SandboxProfileBuilder()
         self.evaluator = CapabilityEvaluator(self.rule_codec, config=self.config)
         self._admission = admission
+        if semantic_approval_validator is not None and not callable(
+            semantic_approval_validator
+        ):
+            raise TypeError("semantic approval validator must be callable")
+        # This callback is supplied only by the Runtime composition root.  A
+        # persisted BindingV2 is deliberately unusable when it is absent: a
+        # database row must never become machine authority merely because a
+        # newer Runtime understands its shape.
+        self._semantic_approval_validator = semantic_approval_validator
+        if semantic_authority_trip is not None and not callable(
+            semantic_authority_trip
+        ):
+            raise TypeError("semantic authority trip observer must be callable")
+        self._semantic_authority_trip = semantic_authority_trip
+        # Monotonic process-local emergency latch.  ProtectedOperation flips
+        # it before reporting an ambiguous semantic-authorized provider
+        # outcome. Durable control-state trip is performed by the Host
+        # observer, but a failed evidence write must not leave this Runtime
+        # able to issue or dispatch another machine grant.
+        self._semantic_authority_locally_tripped = False
         self.leases = CapabilityLeaseService(
             store,
             audit,
@@ -716,9 +761,33 @@ class CapabilityManager:
         *,
         audit: bool = False,
     ) -> CapabilityDecision:
+        return self._authorize_for_semantic_phase(
+            subject=subject,
+            resource=resource,
+            right=right,
+            context=context,
+            audit=audit,
+            semantic_phase="authorize",
+        )
+
+    def _authorize_for_semantic_phase(
+        self,
+        *,
+        subject: str,
+        resource: str,
+        right: str | CapabilityRight,
+        context: OperationContext | dict[str, Any] | None,
+        audit: bool,
+        semantic_phase: str,
+    ) -> CapabilityDecision:
         requested_right = str(right)
         selected_context = self._context_dict(context)
-        matches = self._matching_capabilities(subject, resource, requested_right, include_ask=True)
+        matches = self._matching_capabilities(
+            subject,
+            resource,
+            requested_right,
+            include_ask=True,
+        )
         return self._decision_from_matches(
             subject=subject,
             resource=resource,
@@ -726,6 +795,7 @@ class CapabilityManager:
             matches=matches,
             selected_context=selected_context,
             audit=audit,
+            semantic_phase=semantic_phase,
         )
 
     def authorize_matching_capabilities(
@@ -758,6 +828,7 @@ class CapabilityManager:
             matches=matches,
             selected_context=selected_context,
             audit=audit,
+            semantic_phase="authorize",
         )
 
     def _decision_from_matches(
@@ -769,18 +840,44 @@ class CapabilityManager:
         matches: list[Capability],
         selected_context: dict[str, Any],
         audit: bool,
+        semantic_phase: str,
     ) -> CapabilityDecision:
-        evaluation_matches = [
-            (
+        evaluation_matches: list[Capability] = []
+        for capability in matches:
+            if (
+                self._is_semantic_machine_capability(capability)
+                and semantic_phase == "authorize"
+                and selected_context.get("semantic_exact_operation_context")
+                is not True
+            ):
+                # Primitives may perform a coarse permission-policy probe
+                # before constructing the exact operation context.  A
+                # BindingV2 grant is invisible to that probe; mismatching a
+                # deliberately incomplete context is not a safety trip.
+                constraint_error = (
+                    "BindingV2 requires an exact Host operation context"
+                )
+            else:
+                constraint_error = self._semantic_approval_constraint_error(
+                    capability,
+                    subject=subject,
+                    resource=resource,
+                    right=requested_right,
+                    context=selected_context,
+                    phase=semantic_phase,
+                    effect_id=None,
+                    allow_reserved=False,
+                )
+            if constraint_error is None:
+                constraint_error = self._authority_chain_constraint_error(capability)
+            evaluation_matches.append(
                 replace(
                     capability,
                     constraints={"invalid_persisted_constraint": True},
                 )
-                if self._authority_chain_constraint_error(capability) is not None
+                if constraint_error is not None
                 else capability
             )
-            for capability in matches
-        ]
         decision = self.evaluator.decide(
             subject=subject,
             resource=resource,
@@ -815,6 +912,7 @@ class CapabilityManager:
             matches=matches,
             selected_context=selected_context,
             audit=audit,
+            semantic_phase="authorize",
         )
 
     def require(
@@ -861,12 +959,13 @@ class CapabilityManager:
         the same semantics as the original authorization.
         """
 
-        current = self.authorize(
-            decision.subject,
-            decision.resource,
-            decision.right,
-            dict(decision.context),
+        current = self._authorize_for_semantic_phase(
+            subject=decision.subject,
+            resource=decision.resource,
+            right=decision.right,
+            context=dict(decision.context),
             audit=audit,
+            semantic_phase="prepare",
         )
         if not current.allowed:
             raise CapabilityDenied(
@@ -902,12 +1001,13 @@ class CapabilityManager:
                 "cached finite-use decision is not bound to its selected capability"
             )
 
-        global_decision = self.authorize(
-            decision.subject,
-            decision.resource,
-            decision.right,
-            dict(decision.context),
+        global_decision = self._authorize_for_semantic_phase(
+            subject=decision.subject,
+            resource=decision.resource,
+            right=decision.right,
+            context=dict(decision.context),
             audit=audit,
+            semantic_phase="prepare",
         )
         if not global_decision.allowed:
             raise CapabilityDenied(
@@ -920,6 +1020,24 @@ class CapabilityManager:
             raise CapabilityDenied(
                 "selected capability no longer exists before protected dispatch"
             )
+        # `_decision_from_matches` intentionally evaluates a preselected set
+        # and therefore assumes its caller already removed stale grants (the
+        # ordinary `authorize_matching_capabilities` path does that filtering).
+        # Selected-authority revalidation bypasses that helper so it can retain
+        # the prepare-phase semantic context.  Re-establish the live-grant
+        # predicates explicitly before an unrelated broad grant can launder a
+        # revoked, expired, reparented, or otherwise drifted named authority.
+        if (
+            selected.subject != decision.subject
+            or not selected.active
+            or self._is_expired(selected)
+            or not self._parent_chain_active(selected)
+            or not self._resource_matches(selected.resource, decision.resource)
+            or str(decision.right) not in selected.rights
+        ):
+            raise CapabilityDenied(
+                "selected capability authority changed before protected dispatch"
+            )
         if (
             selected.metadata.get("object_handle") is True
             and selected.resource != decision.resource
@@ -927,13 +1045,14 @@ class CapabilityManager:
             raise CapabilityDenied(
                 "named object capability no longer matches its exact resource"
             )
-        current = self.authorize_matching_capabilities(
-            decision.subject,
-            decision.resource,
-            decision.right,
-            [selected],
-            dict(decision.context),
+        current = self._decision_from_matches(
+            subject=decision.subject,
+            resource=decision.resource,
+            requested_right=str(decision.right),
+            matches=[selected],
+            selected_context=self._context_dict(dict(decision.context)),
             audit=audit,
+            semantic_phase="prepare",
         )
         if not current.allowed or current.selected_capability_id != selected_capability_id:
             raise CapabilityDenied(
@@ -1000,6 +1119,7 @@ class CapabilityManager:
         issued_by: str | None = None,
         constraints: dict | None = None,
         expires_at: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> Capability:
         return self.issue_trusted(
             subject=subject,
@@ -1010,6 +1130,7 @@ class CapabilityManager:
             constraints=constraints,
             expires_at=expires_at,
             uses_remaining=1,
+            metadata=metadata,
         )
 
     def consume_use(self, cap_id: str, *, used_by: str, reason: str = "capability use consumed", count: int = 1) -> Capability:
@@ -1537,6 +1658,481 @@ class CapabilityManager:
             all(bool(item.get("ok")) for item in results.values())
             and self.evaluator.constraint_effect(results) != CapabilityEffect.DENY
         )
+
+    def is_semantic_approval_decision(
+        self,
+        decision: CapabilityDecision,
+    ) -> bool:
+        """Return whether the selected grant carries a machine BindingV2.
+
+        This is intentionally an internal composition-boundary helper.  It is
+        used by ProtectedOperation to retain the exact selected grant across
+        prepare and dispatch; it is not an authority decision by itself.
+        """
+
+        cap_id = decision.selected_capability_id
+        if cap_id is None:
+            return False
+        capability = self.store.get_capability(str(cap_id))
+        if capability is None:
+            return False
+        return self._is_semantic_machine_capability(capability)
+
+    def require_semantic_approval_current(
+        self,
+        decision: CapabilityDecision,
+        *,
+        phase: str,
+        effect_id: str | None,
+        allow_reserved: bool,
+    ) -> None:
+        """Fail closed when a selected machine grant is no longer current."""
+
+        cap_id = decision.selected_capability_id
+        if cap_id is None:
+            return
+        capability = self.store.get_capability(str(cap_id))
+        if capability is None:
+            raise CapabilityDenied(
+                "semantic approval capability disappeared before protected dispatch"
+            )
+        if not self._is_semantic_machine_capability(capability):
+            return
+        error = self._semantic_approval_constraint_error(
+            capability,
+            subject=decision.subject,
+            resource=decision.resource,
+            right=decision.right,
+            context=dict(decision.context),
+            phase=phase,
+            effect_id=effect_id,
+            allow_reserved=allow_reserved,
+        )
+        if error is not None:
+            raise CapabilityDenied(
+                "semantic one-shot authority is no longer current: " + error
+            )
+
+    def trip_semantic_authority_locally(self) -> None:
+        """Monotonically disable BindingV2 authority for this Runtime."""
+
+        self._semantic_authority_locally_tripped = True
+
+    def report_semantic_authority_safety_trip(
+        self,
+        *,
+        trip_code: str,
+        evidence_sha256: str,
+        tenant_bucket_sha256: str | None,
+    ) -> bool:
+        """Persist a deferred Host trip after the protected UoW unwinds.
+
+        This narrow runtime-internal port is intentionally admission-agnostic:
+        emergency authority narrowing must remain available while normal
+        mutations are draining.  The process-local latch is always set before
+        attempting the durable callback.
+        """
+
+        self.trip_semantic_authority_locally()
+        try:
+            selected_code = SemanticTripCode(trip_code)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("semantic safety trip code is invalid") from exc
+        for label, digest, optional in (
+            ("evidence", evidence_sha256, False),
+            ("tenant bucket", tenant_bucket_sha256, True),
+        ):
+            if optional and digest is None:
+                continue
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValidationError(
+                    f"semantic safety trip {label} digest is invalid"
+                )
+        observer = self._semantic_authority_trip
+        if observer is None:
+            return False
+        try:
+            observer(
+                trip_code=selected_code,
+                evidence_sha256=evidence_sha256,
+                tenant_bucket_sha256=tenant_bucket_sha256,
+            )
+        except Exception:
+            # Authority remains stopped locally. The caller preserves the
+            # original denial while startup recovery diagnoses a Store outage.
+            return False
+        return True
+
+    def semantic_approval_lifecycle_evidence(
+        self,
+        decision: CapabilityDecision,
+    ) -> dict[str, Any] | None:
+        """Return payload-free epoch evidence for an emergency control trip."""
+
+        cap_id = decision.selected_capability_id
+        if cap_id is None:
+            return None
+        capability = self.store.get_capability(str(cap_id))
+        if capability is None:
+            return None
+        raw = capability.constraints.get(self.APPROVAL_BINDING_KEY)
+        if not self._is_semantic_machine_capability(capability):
+            return None
+        evidence: dict[str, Any] = {"capability_id": capability.cap_id}
+        try:
+            binding = normalize_approval_binding(raw)
+        except (TypeError, ValueError, ValidationError):
+            evidence["binding_malformed"] = True
+            return evidence
+        evidence.update(
+            {
+                "binding_sha256": approval_binding_sha256(binding),
+                "policy_epoch_id": binding["policy_epoch_id"],
+                "policy_epoch_sha256": binding["policy_epoch_sha256"],
+                "tenant_bucket_sha256": binding["tenant_bucket_sha256"],
+                "assessment_id": binding["assessment_id"],
+                "issued_at": binding["issued_at"],
+                "expires_at": binding["expires_at"],
+            }
+        )
+        metadata = capability.metadata.get("semantic_auto_approval")
+        if isinstance(metadata, Mapping):
+            for field in (
+                "settlement_id",
+                "budget_bucket_id",
+                "matched_rule_id",
+            ):
+                value = metadata.get(field)
+                if isinstance(value, str) and value:
+                    evidence[field] = value
+        return evidence
+
+    @staticmethod
+    def _is_semantic_machine_capability(capability: Capability) -> bool:
+        raw = capability.constraints.get(APPROVAL_BINDING_CONSTRAINT_KEY)
+        return bool(
+            is_semantic_approval_binding(raw)
+            or capability.issued_by.startswith("policy:semantic:")
+            or "semantic_auto_approval" in capability.metadata
+        )
+
+    def _semantic_approval_constraint_error(
+        self,
+        capability: Capability,
+        *,
+        subject: str,
+        resource: str,
+        right: str,
+        context: Mapping[str, Any],
+        phase: str,
+        effect_id: str | None,
+        allow_reserved: bool,
+    ) -> str | None:
+        raw_binding = capability.constraints.get(self.APPROVAL_BINDING_KEY)
+        if not self._is_semantic_machine_capability(capability):
+            return None
+        if self._semantic_authority_locally_tripped:
+            return "Runtime semantic authority emergency latch is tripped"
+        if not is_semantic_approval_binding(raw_binding):
+            self._trip_semantic_binding_violation(
+                SemanticTripCode.CRITICAL_HIGH_GRANT
+                if _raw_semantic_action_is_high_risk(raw_binding)
+                else SemanticTripCode.BINDING_MISMATCH,
+                capability=capability,
+                binding=None,
+                phase=phase,
+            )
+            return "BindingV2 schema marker is missing or malformed"
+        try:
+            binding = normalize_approval_binding(raw_binding)
+        except (TypeError, ValueError, ValidationError):
+            self._trip_semantic_binding_violation(
+                SemanticTripCode.CRITICAL_HIGH_GRANT
+                if _raw_semantic_action_is_high_risk(raw_binding)
+                else SemanticTripCode.BINDING_MISMATCH,
+                capability=capability,
+                binding=None,
+                phase=phase,
+            )
+            return "BindingV2 is malformed"
+        structural_error = self._semantic_binding_capability_error(
+            capability,
+            binding=binding,
+            subject=subject,
+            resource=resource,
+            right=right,
+            effect_id=effect_id,
+            allow_reserved=allow_reserved,
+        )
+        if structural_error is not None:
+            trip_code = self._semantic_structural_trip_code(
+                capability,
+                binding=binding,
+                error=structural_error,
+            )
+            self._trip_semantic_binding_violation(
+                trip_code,
+                capability=capability,
+                binding=binding,
+                phase=phase,
+            )
+            return structural_error
+        metadata_error = self._semantic_binding_metadata_error(
+            capability,
+            binding=binding,
+        )
+        if metadata_error is not None:
+            self._trip_semantic_binding_violation(
+                SemanticTripCode.BINDING_MISMATCH,
+                capability=capability,
+                binding=binding,
+                phase=phase,
+            )
+            return metadata_error
+        return self._semantic_binding_host_validation_error(
+            capability,
+            binding=binding,
+            context=context,
+            phase=phase,
+            effect_id=effect_id,
+        )
+
+    @staticmethod
+    def _semantic_structural_trip_code(
+        capability: Capability,
+        *,
+        binding: Mapping[str, Any],
+        error: str,
+    ) -> SemanticTripCode:
+        if error in {
+            "BindingV2 capability was not reserved exactly once",
+            "BindingV2 capability is not available exactly once",
+        }:
+            return SemanticTripCode.REPLAY_DETECTED
+        catalog_rights = SEMANTIC_ACTION_CATALOG_V1.get(
+            str(binding.get("authority_operation") or "")
+        )
+        if (
+            capability.delegable
+            or not capability.revocable
+            or capability.parent_cap_id is not None
+            or capability.delegation_depth != 0
+            or catalog_rights is None
+            or not capability.rights.issubset(catalog_rights)
+        ):
+            return SemanticTripCode.CRITICAL_HIGH_GRANT
+        if error in {
+            "BindingV2 resource changed",
+            "BindingV2 right changed",
+            "BindingV2 effect changed",
+        }:
+            return SemanticTripCode.UNAUTHORIZED_EFFECT
+        return SemanticTripCode.BINDING_MISMATCH
+
+    def _trip_semantic_binding_violation(
+        self,
+        trip_code: SemanticTripCode,
+        *,
+        capability: Capability,
+        binding: Mapping[str, Any] | None,
+        phase: str,
+    ) -> None:
+        self.trip_semantic_authority_locally()
+        projection = {
+            "schema_version": 1,
+            "trip_code": trip_code.value,
+            "phase": phase,
+            "capability_id": capability.cap_id,
+            "binding_sha256": (
+                approval_binding_sha256(binding)
+                if binding is not None
+                else None
+            ),
+            "policy_epoch_id": (
+                binding.get("policy_epoch_id") if binding is not None else None
+            ),
+            "policy_epoch_sha256": (
+                binding.get("policy_epoch_sha256") if binding is not None else None
+            ),
+        }
+        evidence_sha256 = hashlib.sha256(
+            json.dumps(
+                projection,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if phase != "authorize":
+            raise SemanticAuthorityTripDeferred(
+                "semantic BindingV2 violation requires a durable safety trip",
+                trip_code=trip_code.value,
+                evidence_sha256=evidence_sha256,
+                tenant_bucket_sha256=(
+                    binding.get("tenant_bucket_sha256")
+                    if binding is not None
+                    else None
+                ),
+            )
+        observer = self._semantic_authority_trip
+        if observer is None:
+            return
+        try:
+            observer(
+                trip_code=trip_code,
+                evidence_sha256=evidence_sha256,
+                tenant_bucket_sha256=(
+                    binding.get("tenant_bucket_sha256")
+                    if binding is not None
+                    else None
+                ),
+            )
+        except Exception:
+            # The local latch above is monotonic.  Store/control outages may
+            # suppress durable diagnostics but can never preserve authority.
+            return
+
+    def _semantic_binding_capability_error(
+        self,
+        capability: Capability,
+        *,
+        binding: Mapping[str, Any],
+        subject: str,
+        resource: str,
+        right: str,
+        effect_id: str | None,
+        allow_reserved: bool,
+    ) -> str | None:
+        identity_error = self._semantic_binding_identity_error(
+            capability,
+            binding=binding,
+            subject=subject,
+            resource=resource,
+        )
+        if identity_error is not None:
+            return identity_error
+        return self._semantic_binding_use_error(
+            capability,
+            binding=binding,
+            right=right,
+            effect_id=effect_id,
+            allow_reserved=allow_reserved,
+        )
+
+    def _semantic_binding_identity_error(
+        self,
+        capability: Capability,
+        *,
+        binding: Mapping[str, Any],
+        subject: str,
+        resource: str,
+    ) -> str | None:
+        if capability.effect is not CapabilityEffect.ALLOW:
+            return "BindingV2 capability is not an allow grant"
+        if capability.delegable or not capability.revocable:
+            return "BindingV2 capability must be nondelegable and revocable"
+        if capability.parent_cap_id is not None or capability.delegation_depth != 0:
+            return "BindingV2 capability must not be delegated"
+        if capability.issued_by != f"policy:semantic:{binding['policy_epoch_id']}":
+            return "BindingV2 capability issuer is not its Host policy epoch"
+        if capability.subject != subject or binding["pid"] != subject:
+            return "BindingV2 subject changed"
+        if capability.resource != resource or binding["resource"] != resource:
+            return "BindingV2 resource changed"
+        try:
+            if self.parse_resource_pattern(capability.resource).scope.value != "exact":
+                return "BindingV2 resource is not exact"
+        except (TypeError, ValueError, ValidationError):
+            return "BindingV2 resource is malformed"
+        return None
+
+    @staticmethod
+    def _semantic_binding_use_error(
+        capability: Capability,
+        *,
+        binding: Mapping[str, Any],
+        right: str,
+        effect_id: str | None,
+        allow_reserved: bool,
+    ) -> str | None:
+        if capability.rights != {right} or binding["right"] != right:
+            return "BindingV2 right changed"
+        if capability.expires_at is None or capability.expires_at != binding["expires_at"]:
+            return "BindingV2 expiry changed"
+        if allow_reserved:
+            if capability.uses_remaining != 0:
+                return "BindingV2 capability was not reserved exactly once"
+        elif capability.uses_remaining != 1:
+            return "BindingV2 capability is not available exactly once"
+        if effect_id is not None and binding["effect_id"] != effect_id:
+            return "BindingV2 effect changed"
+        return None
+
+    @staticmethod
+    def _semantic_binding_metadata_error(
+        capability: Capability,
+        *,
+        binding: Mapping[str, Any],
+    ) -> str | None:
+        metadata = capability.metadata.get("semantic_auto_approval")
+        if not isinstance(metadata, Mapping):
+            return "BindingV2 capability has no machine issuance provenance"
+        expected_metadata = {
+            "schema_version": 1,
+            "binding_sha256": approval_binding_sha256(binding),
+            "request_id": binding["request_id"],
+            "assessment_id": binding["assessment_id"],
+            "policy_epoch_id": binding["policy_epoch_id"],
+        }
+        provenance_fields = {
+            "settlement_id",
+            "budget_bucket_id",
+            "matched_rule_id",
+        }
+        if set(metadata) != set(expected_metadata) | provenance_fields:
+            return "BindingV2 machine issuance provenance changed"
+        if any(
+            not isinstance(metadata.get(field), str) or not metadata[field]
+            for field in provenance_fields
+        ):
+            return "BindingV2 machine issuance provenance changed"
+        if any(metadata.get(key) != value for key, value in expected_metadata.items()):
+            return "BindingV2 machine issuance provenance changed"
+        return None
+
+    def _semantic_binding_host_validation_error(
+        self,
+        capability: Capability,
+        *,
+        binding: Mapping[str, Any],
+        context: Mapping[str, Any],
+        phase: str,
+        effect_id: str | None,
+    ) -> str | None:
+        validator = self._semantic_approval_validator
+        if validator is None:
+            return "Host semantic authority validator is not configured"
+        try:
+            validator(
+                binding=dict(binding),
+                phase=phase,
+                capability=capability,
+                context=dict(context),
+                effect_id=effect_id,
+            )
+        except SemanticAuthorityTripDeferred:
+            raise
+        except Exception:
+            # Control-store outages, malformed resolver output, revoked epochs,
+            # and the global kill switch all have the same authority result.
+            # The caller may record bounded health evidence separately.
+            return "Host semantic control rejected the BindingV2 grant"
+        return None
 
     def spec(
         self,
@@ -2398,25 +2994,6 @@ class CapabilityManager:
         binding = constraints[self.APPROVAL_BINDING_KEY]
         if type(binding) is not dict:
             return "approval binding must be an object"
-        unknown_binding_fields = sorted(
-            set(binding)
-            - {"effect_id", "canonical_args_hash", "target_state_version"}
-        )
-        if unknown_binding_fields:
-            return (
-                "approval binding contains unknown fields: "
-                + ", ".join(unknown_binding_fields)
-            )
-        if type(binding.get("effect_id")) is not str:
-            return "approval binding effect_id must be a string"
-        if type(binding.get("canonical_args_hash")) is not str:
-            return "approval binding canonical_args_hash must be a string"
-        target_state_version = binding.get("target_state_version")
-        if target_state_version is not None and (
-            isinstance(target_state_version, bool)
-            or not isinstance(target_state_version, (str, int))
-        ):
-            return "approval binding target_state_version must be a string, integer, or null"
         try:
             normalize_approval_binding(binding)
         except ValidationError as exc:

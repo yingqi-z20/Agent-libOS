@@ -4506,6 +4506,7 @@ class SemanticAssessmentRepository(_RepositoryFacade):
         {
             "enqueue_semantic_assessment_job",
             "get_semantic_assessment_job",
+            "get_semantic_assessment_job_for_request",
             "claim_next_semantic_assessment_job",
             "query_expired_semantic_assessment_jobs",
             "query_semantic_assessment_jobs",
@@ -4513,6 +4514,42 @@ class SemanticAssessmentRepository(_RepositoryFacade):
             "append_semantic_assessment",
             "get_semantic_assessment",
             "query_semantic_assessments",
+            "append_semantic_flow_bundle",
+            "get_semantic_flow_entity",
+            "get_semantic_flow_activity",
+            "query_semantic_flow_entities",
+            "query_semantic_flow_activities",
+            "query_semantic_flow_edges",
+            "query_semantic_flow_label_assertions",
+            "semantic_flow_status_aggregate",
+            "get_semantic_legacy_coverage",
+            "append_semantic_policy_epoch",
+            "get_semantic_policy_epoch",
+            "query_semantic_policy_epochs",
+            "get_semantic_control_state",
+            "fence_semantic_control_state",
+            "query_semantic_control_history",
+            "append_semantic_machine_settlement",
+            "query_semantic_machine_settlements",
+            "query_unresolved_semantic_machine_settlements",
+            "get_semantic_machine_settlement",
+            "append_semantic_review_label",
+            "query_semantic_review_labels",
+            "append_semantic_health_event",
+            "query_semantic_health_events",
+            "append_semantic_human_outcome_link",
+            "get_semantic_human_outcome_link_for_request",
+            "query_semantic_human_outcome_links",
+            "semantic_human_outcome_links_for_assessments",
+            "semantic_human_outcome_links_for_settlements",
+            "semantic_human_outcome_link_counts",
+            "append_semantic_machine_outcome",
+            "query_semantic_machine_outcomes",
+            "semantic_machine_outcome_counts",
+            "semantic_metrics",
+            "semantic_rollout_review_evidence",
+            "semantic_unsafe_review_count",
+            "get_semantic_rate_budget",
         }
     )
 
@@ -4535,6 +4572,36 @@ class SemanticAssessmentRepository(_RepositoryFacade):
                 assessment,
             ),
             operation="terminalize semantic assessment job",
+        )
+
+    def compare_and_set_semantic_control_state(self, expected: Any, target: Any) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._semantic_backend,
+            self.transaction,
+            lambda: self._semantic_backend.compare_and_set_semantic_control_state(
+                expected, target
+            ),
+            operation="compare and set semantic control state",
+        )
+
+    def compare_and_set_semantic_rate_budget(self, expected: Any, target: Any) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._semantic_backend,
+            self.transaction,
+            lambda: self._semantic_backend.compare_and_set_semantic_rate_budget(
+                expected, target
+            ),
+            operation="compare and set semantic rate budget",
+        )
+
+    def append_semantic_machine_outcome_if_absent(self, record: Any) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._semantic_backend,
+            self.transaction,
+            lambda: self._semantic_backend.append_semantic_machine_outcome_if_absent(
+                record
+            ),
+            operation="append semantic machine outcome if absent",
         )
 
 

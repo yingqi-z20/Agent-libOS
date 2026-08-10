@@ -1,5 +1,6 @@
 from agent_libos.sdk.protected_operations import (
     AuthorityMode,
+    PostCommitResultObservation,
     PostProviderFailureMode,
     ProviderRegistryBinding,
     ProtectedOperation,
@@ -16,6 +17,7 @@ from agent_libos.sdk.protected_operations import (
 
 __all__ = [
     "AuthorityMode",
+    "PostCommitResultObservation",
     "PostProviderFailureMode",
     "ProviderRegistryBinding",
     "ProtectedOperation",

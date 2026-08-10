@@ -254,7 +254,7 @@ same change.
 | `modules` | `schema_version`, `manifest_paths`, `trusted_modules`, `trusted_sha256`, `manifest_max_bytes`, `manifest_hard_limit_bytes`, `source_max_bytes`, `package_max_bytes`, `max_package_files`, `load_policy`, `discover_limit`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `entrypoint_max_chars`, `max_declared_tools`, `max_declared_images`, `max_declared_syscalls`, `max_declared_provider_hooks`, `max_declared_startup_hooks` |
 | `launcher` | `permission_presets`, `default_permission_preset`, `read_only_preset`, `edit_preset`, `full_preset` |
 | `scripts` | `ask_file_max_bytes`, `ask_file_max_quanta`, `document_summary_max_bytes`, `document_summary_max_read_bytes`, `document_summary_max_quanta`, `document_context_min_tokens`, `document_context_slack_tokens`, `document_context_max_tokens`, `object_copy_max_quanta`, `llm_write_smoke_max_quanta`, `clock_demo_iterations`, `clock_demo_interval_s`, `clock_demo_timezone`, `chat_max_turns`, `chat_context_tokens`, `chat_quanta_per_turn`, `chat_quanta_overhead` |
-| `semantic` | `mode`, `adapter`, `external_profile_id`, `max_concurrency`, `assessment_timeout_s`, `job_lease_s`, `shutdown_join_timeout_s`, `projection_ttl_s`, `recovery_batch_limit`, `intent_max_chars`, `projection_max_bytes`, `assessment_list_limit`, `assessment_list_hard_limit` |
+| `semantic` | `mode`, `adapter`, `external_profile_id`, `policy_epoch`, `max_concurrency`, `assessment_timeout_s`, `job_lease_s`, `shutdown_join_timeout_s`, `projection_ttl_s`, `recovery_batch_limit`, `intent_max_chars`, `projection_max_bytes`, `assessment_list_limit`, `assessment_list_hard_limit`, `flow_query_limit`, `flow_query_hard_limit`, `settlement_list_limit`, `settlement_list_hard_limit` |
 
 Three fields remain accepted only so existing 1.x configuration files keep
 loading: `runtime.runtime_db_filename`, `tools.sandbox_timeout_s`, and
@@ -300,7 +300,7 @@ in the live dump and typed source. Optional Runtime
 Modules may also own module-local settings that are not fields of
 `AgentLibOSConfig`.
 
-### Semantic Shadow configuration
+### Semantic Phase 2–4 configuration
 
 Semantic assessment is disabled by default:
 
@@ -309,6 +309,7 @@ semantic:
   mode: off
   adapter: deterministic
   external_profile_id: null
+  policy_epoch: null
   max_concurrency: 2
   assessment_timeout_s: 30.0
   job_lease_s: 60.0
@@ -319,16 +320,25 @@ semantic:
   projection_max_bytes: 16384
   assessment_list_limit: 100
   assessment_list_hard_limit: 1000
+  flow_query_limit: 100
+  flow_query_hard_limit: 1000
+  settlement_list_limit: 100
+  settlement_list_hard_limit: 1000
 ```
 
-`mode` is exactly `off` or `shadow`; off performs no capture writes and claims
-no jobs. `adapter` is `deterministic`, `scripted`, or `external`. Scripted is
+`mode` is exactly `off`, `shadow`, `enforce_deny`, or `canary_auto`; off
+performs no capture writes, claims no jobs, and is the global kill switch.
+`enforce_deny` and `canary_auto` require an immutable static `policy_epoch`;
+the latter also requires at least one auto-approval rule and the `external`
+adapter. `adapter` is
+`deterministic`, `scripted`, or `external`. Scripted is
 for deterministic development/test fixtures. An `external_profile_id` is
 forbidden for the other adapters. `max_concurrency` is positive and at most 32;
 assessment, lease, and shutdown-join timeouts are positive, and the lease must
 be at least as long as both timeout values.
-Projection TTL and list limits are positive; the selected list limit cannot
-exceed its hard limit. Recovery/cleanup pages use the positive
+Projection TTL and list limits are positive; each assessment, flow, and
+settlement selected limit cannot exceed its hard limit, and the new flow and
+settlement hard limits cannot exceed 1,000. Recovery/cleanup pages use the positive
 `recovery_batch_limit`, capped at 500. The intent bound cannot exceed 2,000
 characters and the encoded projection bound must be from 512 through 16,384
 bytes.
@@ -347,7 +357,7 @@ that root-goal bound but cannot exceed 2,000 characters; it is not a switch
 that enables approval or provider payload export.
 
 An external adapter can be staged while mode is off without resolving a
-profile. Enabling external Shadow requires a configured named profile other
+profile. Enabling any external semantic mode requires a configured named profile other
 than `llm.default_profile_id`, with an explicit model, `store: false`,
 `max_retries: 0`, no prompt-cache key/retention, no previous-response chaining,
 and a finite timeout compatible with `semantic.assessment_timeout_s`. The
@@ -363,7 +373,28 @@ Tenant bucketing is intentionally not a YAML setting. The default is no
 bucketer and persisted `tenant_bucket_sha256` remains `null`. An embedded Host
 may inject `semantic_tenant_bucketer=` at Runtime construction and should back
 it with a deployment-keyed HMAC; no CLI, HTTP, GUI, model, Skill, JIT, or Module
-surface can install or replace it.
+surface can install or replace it. `canary_auto` additionally requires the
+policy epoch to pin that exact profile id and a non-null classifier model
+digest.
+
+`SemanticPolicyEpochV1` is a closed static Host object. It contains
+`schema_version`, `catalog_version`, `epoch_id`, positive `generation`,
+`expected_previous_sha256`, exact `tenant_bucket_sha256s`, closed
+`auto_approval_rules` and `hard_deny_rules`, optional paired classifier
+profile/model identity, `minimum_confidence_bps`,
+`required_calibration_bucket`, Capability TTL, rate/day/inflight ceilings, and
+`created_at`. It requires at least one rule; auto rules require at least one
+exact tenant digest. Rule ids are unique across both arrays. Catalog v1 permits
+automatic candidates only for `filesystem.read`, `git.read`, and `git.diff`
+with their exact single read-like right.
+
+The confidence floor cannot be below 9,900 basis points, calibration is fixed
+to `very_high`, Capability TTL cannot exceed 300 seconds, and the respective
+rate ceilings cannot exceed 10/minute, 100/day, or 2 inflight. Static
+configuration can only narrow those values. Activation compares the expected
+previous policy digest and durable generation; conflicts fail assembly. There
+is no CLI, HTTP, GUI, model, Skill, JIT, or Module policy activation/revocation
+surface.
 
 Checkpoint snapshot format versions are owned by the runtime codec and are not
 configurable. A runtime release emits only the snapshot version it can decode.

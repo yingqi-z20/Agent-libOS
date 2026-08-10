@@ -8,12 +8,12 @@ configuration at call time. They pass only:
 - `tool_id`
 - `arguments`, as a JSON object; `null` is normalized to `{}` by the primitive
 
-Agent libOS 1.4.0 uses the Python MCP SDK v2. “SDK v2” is not a wire-protocol
+Agent libOS 1.4.1 uses the Python MCP SDK v2. “SDK v2” is not a wire-protocol
 version: MCP protocol revisions are date strings. This release pins its modern
 wire contract to `2026-07-28` and also supports legacy initialize-based
 revisions. Manifest schema, SDK major, protocol revision, Agent libOS product
 version, and RuntimeStore schema are independent identifiers; the Store uses
-schema v5.
+schema v6.
 
 The supported product surface is deliberately narrower than the upstream SDK:
 Tools list/call and modern `server/discover` only. Resources, Prompts, Tasks,

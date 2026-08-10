@@ -265,6 +265,7 @@ function userPageSnapshot(): RuntimeSnapshot {
         status: "delivered",
         decision: { delivered: true },
         blocking: false,
+        revision: 1,
         created_at: "2026-06-19T01:00:01.000Z",
         updated_at: "2026-06-19T01:00:01.000Z"
       }

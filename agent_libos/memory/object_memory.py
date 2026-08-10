@@ -168,6 +168,7 @@ class ObjectMemoryManager:
         config: AgentLibOSConfig | None = None,
         resources: Any | None = None,
         operations: OperationPort | None = None,
+        host_semantic_flow_observer: Callable[..., None] | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.store = unit_of_work.objects
@@ -179,6 +180,11 @@ class ObjectMemoryManager:
         self.operations = operations
         self._object_pin_checker: Callable[[str], bool] | None = None
         self._object_change_notifier: Callable[[str, dict[str, Any], str], None] | None = None
+        if host_semantic_flow_observer is not None and not callable(
+            host_semantic_flow_observer
+        ):
+            raise TypeError("semantic FlowGraph observer must be callable")
+        self._host_semantic_flow_observer = host_semantic_flow_observer
         self._object_release_finalizers: list[Callable[[AgentObject, str, str], None]] = []
         self._durable_object_release_finalizers: dict[
             str,
@@ -200,6 +206,31 @@ class ObjectMemoryManager:
 
     def bind_object_change_notifier(self, notifier: Callable[[str, dict[str, Any], str], None] | None) -> None:
         self._object_change_notifier = notifier
+
+    def bind_host_semantic_flow_observer(
+        self,
+        observer: Callable[..., None],
+    ) -> None:
+        """Install the one-shot Host observer for payload-free FlowGraph evidence."""
+
+        if not callable(observer):
+            raise TypeError("semantic FlowGraph observer must be callable")
+        if self._host_semantic_flow_observer is not None:
+            raise RuntimeError("semantic FlowGraph observer is already bound")
+        self._host_semantic_flow_observer = observer
+
+    def _observe_host_semantic_flow(self, kind: str, **facts: Any) -> None:
+        observer = self._host_semantic_flow_observer
+        if observer is None:
+            return
+        try:
+            result = observer(kind, **facts)
+            if result is not None:
+                raise TypeError("semantic FlowGraph observer must be synchronous")
+        except Exception:
+            # FlowGraph is observational. Capture failures must not change the
+            # Object transaction, materialization, or caller-visible result.
+            return
 
     def bind_object_release_finalizer(self, finalizer: Callable[[AgentObject, str, str], None]) -> None:
         self._object_release_finalizers.append(finalizer)
@@ -722,6 +753,12 @@ class ObjectMemoryManager:
                     capability_refs=[handle.capability_id],
                     decision={"namespace": obj.namespace, "name": obj.name, "type": obj.type.value},
                 )
+        self._observe_host_semantic_flow(
+            "object_version",
+            pid=pid,
+            operation="create",
+            value=obj,
+        )
         return handle
 
     def process_namespace(self, pid: str) -> str:
@@ -1190,6 +1227,12 @@ class ObjectMemoryManager:
             },
             pid,
         )
+        self._observe_host_semantic_flow(
+            "object_version",
+            pid=pid,
+            operation="update",
+            value=updated,
+        )
         return handle
 
     def append_object_by_name(
@@ -1303,6 +1346,12 @@ class ObjectMemoryManager:
                 },
             },
             pid,
+        )
+        self._observe_host_semantic_flow(
+            "object_version",
+            pid=pid,
+            operation="append",
+            value=updated,
         )
         return updated, output_list_field, length
 
@@ -2390,6 +2439,11 @@ class ObjectMemoryManager:
                 allow_overage=False,
                 kill_on_exceed=False,
             )
+        self._observe_host_semantic_flow(
+            "materialization",
+            pid=pid,
+            value=context,
+        )
         return context
 
     @staticmethod

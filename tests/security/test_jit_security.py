@@ -588,6 +588,7 @@ class TestJitSecurity:
         }
 
     @pytest.mark.real_deno
+    @pytest.mark.deno_resource_monitor
     def test_failed_live_deno_call_charges_retained_subprocess_metrics(self) -> None:
         pid = self.runtime.process.spawn(
             image='toolmaker-agent:v0',

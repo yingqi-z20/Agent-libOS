@@ -1,8 +1,13 @@
 from __future__ import annotations
+import hashlib
 import pytest
 from uuid import uuid4
 from agent_libos import Runtime
 from agent_libos.api.cli import DEMO_PATCH_PREVIEW_CONTENT, DEMO_PATCH_PREVIEW_PATH, run_demo
+from agent_libos.capability.effect_binding import (
+    APPROVAL_BINDING_KEY,
+    canonical_effect_hash,
+)
 from tests.support.public_errors import assert_public_error_message
 
 class TestDemoContract:
@@ -32,6 +37,44 @@ class TestDemoContract:
         assert result['write_result']['payload']['path'] == DEMO_PATCH_PREVIEW_PATH
         assert result['target_file_exists']
         assert result['target_file_content_matches']
+        request = self.runtime.human.get(result['approval_request'])
+        context = request.payload['context']
+        content = DEMO_PATCH_PREVIEW_CONTENT.encode('utf-8')
+        assert context['content_bytes'] == len(content)
+        assert context['content_sha256'] == hashlib.sha256(content).hexdigest()
+        assert request.payload['effect_binding']['canonical_args_hash'] == (
+            canonical_effect_hash(context)
+        )
+        preview = self.runtime.human.canonical_approval_preview(request)
+        assert preview.argument_projection.content_bytes == len(content)
+        assert preview.argument_projection.content_sha256 == hashlib.sha256(
+            content
+        ).hexdigest()
+        resource = self.runtime.filesystem.resource_for(DEMO_PATCH_PREVIEW_PATH)
+        approval_capabilities = [
+            capability
+            for capability in self.runtime.store.list_capabilities(
+                subject=result['root']
+            )
+            if capability.resource == resource
+            and APPROVAL_BINDING_KEY in capability.constraints
+        ]
+        assert len(approval_capabilities) == 1
+        assert approval_capabilities[0].uses_remaining == 0
+        assert approval_capabilities[0].constraints[APPROVAL_BINDING_KEY] == (
+            request.payload['effect_binding']
+        )
+        write_effects = [
+            effect
+            for effect in self.runtime.store.list_external_effects(
+                pid=result['root']
+            )
+            if effect.provider == 'filesystem'
+            and effect.operation == 'write_text'
+            and effect.target == resource
+        ]
+        assert len(write_effects) == 1
+        assert self.runtime.human.pending() == []
         target = self.runtime.workspace_root / DEMO_PATCH_PREVIEW_PATH
         assert target.read_text(encoding='utf-8') == DEMO_PATCH_PREVIEW_CONTENT
         tool_names = [entry['tool'] for entry in result['tool_sequence']]
@@ -54,6 +97,7 @@ class TestDemoContract:
         audit_actions = [record.action for record in self.runtime.audit.trace()]
         for action in ['checkpoint.create', 'human.query', 'human.response', 'primitive.filesystem.write_text', 'tool.call', 'process.exit']:
             assert action in audit_actions
+        assert audit_actions.count('primitive.filesystem.write_text') == 1
         event_types = [event.type.value for event in self.runtime.events.list()]
         assert 'external_write' in event_types
         assert 'human_query' in event_types

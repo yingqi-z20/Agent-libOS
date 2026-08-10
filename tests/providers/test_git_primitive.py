@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import importlib
 import inspect
+import json
 import os
 import stat
 import subprocess
@@ -2458,6 +2459,107 @@ def test_git_commit_lineage_blocks_cross_process_secret_push(tmp_path: Path) -> 
         runtime.close()
 
 
+@pytest.mark.parametrize("changed_fact", ("message", "state"))
+def test_commit_flow_snapshot_approval_cannot_rebind_outer_args_after_reopen(
+    tmp_path: Path,
+    changed_fact: str,
+) -> None:
+    root = tmp_path / "repo"
+    database = tmp_path / "runtime.sqlite3"
+    _init_repository(root)
+    (root / "pending.txt").write_text("pending\n", encoding="utf-8")
+    _git(root, "add", "--", "pending.txt")
+
+    def open_runtime() -> Runtime:
+        return Runtime.open(
+            str(database),
+            config=_runtime_config(),
+            substrate=LocalResourceProviderSubstrate(root),
+            module_manifests=(),
+        )
+
+    runtime = open_runtime()
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="approve one exact commit snapshot",
+        )
+        runtime.capability.issue_trusted(
+            pid,
+            "git:workspace",
+            [CapabilityRight.WRITE],
+            issued_by="git-provider-test",
+        )
+        runtime.capability.issue_trusted(
+            pid,
+            "git:workspace",
+            [CapabilityRight.READ],
+            effect="ask",
+            issued_by="git-provider-test",
+        )
+        state = runtime.git._state_token(runtime.git.provider.repository_state()).token
+
+        with pytest.raises(HumanApprovalRequired):
+            runtime.git.commit(pid, "approved snapshot message", state)
+        first_request = runtime.human.pending()[0]
+        assert first_request.payload["context"]["operation"] == "commit_flow_snapshot"
+        assert "approved snapshot message" not in json.dumps(
+            first_request.payload["context"],
+            sort_keys=True,
+        )
+        first_preview = runtime.human.canonical_approval_preview(first_request)
+        assert first_preview.argument_projection.source_args_sha256 == (
+            first_request.payload["context"]["source_args_sha256"]
+        )
+        assert "scope_count=0" in first_preview.argument_projection.git_fact_tokens
+        assert first_preview.argument_projection.repository_state_sha256 == hashlib.sha256(
+            json.dumps(state, sort_keys=True).encode("ascii")
+        ).hexdigest()
+        assert runtime.human.drain_terminal_queue(auto_approve=True)
+    finally:
+        runtime.close()
+
+    reopened = open_runtime()
+    try:
+        before_oid = _git(root, "rev-parse", "HEAD").strip()
+        retry_message = "approved snapshot message"
+        retry_state = state
+        if changed_fact == "message":
+            retry_message = "materially different message"
+        else:
+            (root / "pending.txt").write_text(
+                "materially different staged bytes\n",
+                encoding="utf-8",
+            )
+            _git(root, "add", "--", "pending.txt")
+            retry_state = reopened.git._state_token(
+                reopened.git.provider.repository_state()
+            ).token
+            assert retry_state != state
+        with pytest.raises(HumanApprovalRequired):
+            reopened.git.commit(pid, retry_message, retry_state)
+        assert _git(root, "rev-parse", "HEAD").strip() == before_oid
+
+        second_request = reopened.human.pending()[0]
+        assert second_request.request_id != first_request.request_id
+        first_context = first_request.payload["context"]
+        second_context = second_request.payload["context"]
+        assert first_context["source_args_sha256"] != second_context["source_args_sha256"]
+        assert second_context["target_state_version"] == retry_state
+        second_preview = reopened.human.canonical_approval_preview(second_request)
+        assert second_preview.argument_projection.source_args_sha256 == (
+            second_context["source_args_sha256"]
+        )
+        assert second_preview.canonical_sha256() != first_preview.canonical_sha256()
+
+        assert reopened.human.drain_terminal_queue(auto_approve=True)
+        committed = reopened.git.commit(pid, retry_message, retry_state)
+        assert committed.created_oid == _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+        assert _git(root, "rev-list", "--count", "HEAD").strip() == b"2"
+    finally:
+        reopened.close()
+
+
 def test_git_reads_and_patch_artifacts_recover_commit_and_index_lineage(
     tmp_path: Path,
 ) -> None:
@@ -4024,6 +4126,96 @@ def test_push_rejects_all_zero_force_with_lease_before_remote_preflight(
         runtime.close()
 
 
+def test_push_flow_snapshot_binds_normal_delete_and_ref_source_args(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    _init_repository(root)
+    remote.mkdir()
+    _git(remote, "init", "--bare", "-q")
+    _git(root, "remote", "add", "origin", remote.as_uri())
+    remote_oid = _git(root, "rev-parse", "HEAD").strip().decode("ascii")
+    _git(root, "push", "-q", "origin", "refs/heads/main:refs/heads/main")
+    git_config = replace(DEFAULT_CONFIG.git, allow_file_remotes=True)
+    runtime = _open_runtime(root, git=git_config)
+
+    class SnapshotCaptured(Exception):
+        pass
+
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="bind exact push flow snapshots",
+        )
+        _grant_git_authority(runtime, pid, remote="origin")
+        state = runtime.git.status(pid).state.token
+        original_read = runtime.git._read
+        captured: list[dict[str, Any]] = []
+
+        def capture_snapshot_read(
+            selected_pid: str,
+            operation: str,
+            callback: Callable[[], tuple[Any, dict[str, Any]]],
+            **kwargs: Any,
+        ) -> Any:
+            if operation == "push_flow_snapshot":
+                captured.append(dict(kwargs["extra"]))
+                raise SnapshotCaptured
+            return original_read(selected_pid, operation, callback, **kwargs)
+
+        monkeypatch.setattr(runtime.git, "_read", capture_snapshot_read)
+
+        with pytest.raises(SnapshotCaptured):
+            runtime.git.push(
+                pid,
+                "origin",
+                "refs/heads/main",
+                state,
+                local_ref="refs/heads/main",
+            )
+        with pytest.raises(SnapshotCaptured):
+            runtime.git.push(
+                pid,
+                "origin",
+                "refs/heads/review",
+                state,
+                local_ref="refs/heads/main",
+            )
+
+        with pytest.raises(HumanApprovalRequired):
+            runtime.git.push(
+                pid,
+                "origin",
+                "refs/heads/main",
+                state,
+                delete=True,
+                force_with_lease_oid=remote_oid,
+            )
+        assert runtime.human.drain_terminal_queue(auto_approve=True)
+        with pytest.raises(SnapshotCaptured):
+            runtime.git.push(
+                pid,
+                "origin",
+                "refs/heads/main",
+                state,
+                delete=True,
+                force_with_lease_oid=remote_oid,
+            )
+
+        assert len(captured) == 3
+        assert {item["source_operation"] for item in captured} == {"push"}
+        assert {item["target_state_version"] for item in captured} == {state}
+        assert {item["scope_count"] for item in captured} == {0}
+        assert len({item["source_args_sha256"] for item in captured}) == 3
+        assert _git(remote, "rev-parse", "refs/heads/main").strip() == remote_oid.encode(
+            "ascii"
+        )
+    finally:
+        runtime.close()
+
+
 def test_file_remote_push_and_fetch_use_only_configured_remote(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     remote = tmp_path / "remote.git"
@@ -5073,6 +5265,99 @@ def test_simulated_pull_request_create_review_close_and_merge_requires_approval(
             reviewed["operation"].after.token,
         )
         assert closed["pull_request"].status is GitPullRequestStatus.CLOSED
+    finally:
+        runtime.close()
+
+
+def test_pull_request_flow_snapshot_approval_cannot_change_review_decision(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "feature")
+    (root / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(root, "add", "--", "feature.txt")
+    _git(root, "commit", "-q", "-m", "feature")
+    _git(root, "switch", "-q", "main")
+
+    runtime = _open_runtime(root)
+    try:
+        creator = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="create a pull request fixture",
+        )
+        _grant_git_authority(runtime, creator)
+        state = runtime.git.status(creator).state.token
+        created = runtime.git.create_pull_request(
+            creator,
+            "Feature",
+            "Adds feature.txt",
+            "main",
+            "feature",
+            state,
+        )
+        pull_request = created["pull_request"]
+
+        reviewer = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="approve one exact pull request snapshot",
+        )
+        runtime.capability.issue_trusted(
+            reviewer,
+            "git:workspace",
+            [CapabilityRight.READ],
+            effect="ask",
+            issued_by="git-provider-test",
+        )
+        runtime.capability.issue_trusted(
+            reviewer,
+            "git_pr:workspace:*",
+            [CapabilityRight.WRITE, CapabilityRight.APPROVE],
+            issued_by="git-provider-test",
+        )
+        expected = created["operation"].after.token
+
+        with pytest.raises(HumanApprovalRequired):
+            runtime.git.review_pull_request(
+                reviewer,
+                pull_request.pr_id,
+                "comment",
+                "approved snapshot body",
+                expected,
+            )
+        first_request = runtime.human.pending()[0]
+        assert first_request.payload["context"]["operation"] == (
+            "review_pull_request_flow_snapshot"
+        )
+        assert runtime.human.drain_terminal_queue(auto_approve=True)
+
+        with pytest.raises(HumanApprovalRequired):
+            runtime.git.review_pull_request(
+                reviewer,
+                pull_request.pr_id,
+                "request_changes",
+                "materially different body",
+                expected,
+            )
+        second_request = runtime.human.pending()[0]
+        assert second_request.request_id != first_request.request_id
+        assert (
+            first_request.payload["context"]["source_args_sha256"]
+            != second_request.payload["context"]["source_args_sha256"]
+        )
+        assert runtime.git.inspect_pull_request(creator, pull_request.pr_id).reviews == []
+
+        assert runtime.human.drain_terminal_queue(auto_approve=True)
+        reviewed = runtime.git.review_pull_request(
+            reviewer,
+            pull_request.pr_id,
+            "request_changes",
+            "materially different body",
+            expected,
+        )
+        assert [item.decision.value for item in reviewed["pull_request"].reviews] == [
+            "request_changes"
+        ]
     finally:
         runtime.close()
 

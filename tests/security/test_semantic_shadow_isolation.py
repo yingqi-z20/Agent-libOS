@@ -268,7 +268,7 @@ def test_default_off_has_zero_semantic_capture_and_preserves_human_authority() -
             runtime.close()
 
 
-def test_shadow_and_off_have_identical_authority_business_and_label_outcomes() -> None:
+def test_off_and_shadow_have_zero_machine_authority_delta() -> None:
     off_config = AgentLibOSConfig(
         semantic=SemanticDefaults(mode="off", adapter="deterministic")
     )
@@ -774,7 +774,7 @@ def test_late_exact_read_never_falls_back_to_frozen_manifest_candidate(
             runtime.close()
 
 
-def test_semantic_surface_has_no_machine_settlement_or_mutation_entrypoint() -> None:
+def test_shadow_surface_has_no_public_machine_mutation_entrypoint() -> None:
     config = AgentLibOSConfig(
         semantic=SemanticDefaults(mode="shadow", adapter="deterministic")
     )
@@ -873,6 +873,8 @@ def test_semantic_surface_has_no_machine_settlement_or_mutation_entrypoint() -> 
             assert decision.outcome is ShadowPolicyOutcome.WOULD_ISSUE_EXACT_ONCE
             assert tuple(runtime.capability.list_subject(pid)) == before_capabilities
             assert runtime.human.requests.get(pending[0].request_id).status is HumanRequestStatus.PENDING
+            # Phase 4 may inject a Host-owned private settlement port, but the
+            # Runtime/model-facing semantic facade must remain evidence-only.
             semantic = runtime.semantic
             for forbidden_name in (
                 "approve",

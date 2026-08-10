@@ -3311,32 +3311,65 @@ class SkillManager:
 
     def _require_skill_rights(self, actor: str, skill_id: str, rights: Iterable[CapabilityRight]) -> list[CapabilityDecision]:
         resource = self.resource_for(skill_id)
-        missing: list[str] = []
+        missing: list[tuple[str, dict[str, Any]]] = []
         decisions: list[CapabilityDecision] = []
         for right in rights:
-            decision = self.capabilities.authorize(actor, resource, right)
+            requested_right = right.value
+            context = {
+                "adapter": "skill",
+                "authority_operation": "skill.use",
+                "primitive": "runtime.skills.activate",
+                "operation": "use",
+                "pid": actor,
+                "resource": resource,
+                "right": requested_right,
+                "skill_id": skill_id,
+                "target_state_version": None,
+            }
+            # A Host Human one-shot carries an approval binding over this exact
+            # context.  Reuse the same deterministic context on the resumed
+            # authorization pass; omitting it would make the approved grant
+            # permanently unusable and repeatedly prompt for the first right.
+            decision = self.capabilities.authorize(
+                actor,
+                resource,
+                right,
+                context,
+            )
             if decision.allowed:
                 decisions.append(decision)
                 continue
-            missing.append(str(right))
+            missing.append((requested_right, context))
         if not missing:
             return decisions
         if self.human is None:
-            raise CapabilityDenied(f"{actor} lacks {missing} on {resource}")
-        request_id = self.human.query(
+            raise CapabilityDenied(
+                f"{actor} lacks {[right for right, _context in missing]} on {resource}"
+            )
+        # Each Human decision is bound to one exact right.  If an operation
+        # needs several rights, the resumed authorization pass requests the
+        # next missing right rather than hiding a bundled grant in a generic
+        # permission payload.
+        requested_right, approval_context = missing[0]
+        request_id = self.human.query_authority_request(
             pid=actor,
             human=self.config.runtime.default_human,
             request={
-                "type": "permission_request",
-                "question": f"Allow process {actor} to use skill {skill_id} rights={missing} once?",
+                "type": "external_operation_approval",
+                "question": (
+                    f"Allow process {actor} to use skill {skill_id} "
+                    f"right={requested_right} once?"
+                ),
                 "requested_once_capability": {
                     "subject": actor,
                     "resource": resource,
-                    "rights": missing,
+                    "rights": [requested_right],
+                    "constraints": {},
                 },
-                "context": {"primitive": "skill", "skill_id": skill_id},
+                "context": approval_context,
             },
             blocking=True,
+            authority_origin="external_operation",
         )
         raise HumanApprovalRequired(request_id, f"human approval required for skill {skill_id}")
 

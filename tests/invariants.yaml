@@ -373,7 +373,7 @@
         "tests/security/test_human_atomicity.py::test_human_decision_limits_reject_before_request_or_capability_side_effects[tool_overrides0-decision0-exceeds 64 bytes]",
         "tests/security/test_human_atomicity.py::test_human_decision_limits_reject_before_request_or_capability_side_effects[tool_overrides1-decision1-maximum JSON depth=2]",
         "tests/security/test_human_atomicity.py::test_human_decision_limits_reject_before_request_or_capability_side_effects[tool_overrides2-decision2-maximum JSON nodes=5]",
-        "tests/security/test_human_atomicity.py::test_bounded_human_decision_control_still_applies_approved_side_effects",
+        "tests/security/test_human_atomicity.py::test_bounded_human_decision_control_approves_without_authority_side_effects",
         "tests/security/test_human_atomicity.py::test_oversized_terminal_provider_answer_is_rejected_without_approval"
       ],
       "benchmark_attack_classes": []
@@ -814,13 +814,13 @@
       "benchmark_attack_classes": []
     },
     {
-      "id": "v5-persisted-state-is-strict-and-versioned",
-      "title": "Runtime startup accepts only the complete v5 schema and canonical security carriers; canonical v4 migration is explicit and older or malformed state is rejected without mutation.",
+      "id": "v6-persisted-state-is-strict-and-versioned",
+      "title": "Runtime startup accepts only the complete v6 schema and canonical security carriers; ordered canonical v4-to-v5 and v5-to-v6 migrations are explicit and older or malformed state is rejected without mutation.",
       "lane": "runtime",
       "node_ids": [
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_schema_v3_is_zero_write_rejected_with_101_archive_hint",
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_wrong_schema_marker_is_rejected_without_mutation",
-        "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_v5_schema_manifest_matches_fresh_store",
+        "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_v6_schema_manifest_matches_fresh_store",
         "tests/unit/test_v5_storage_schema_contract.py::test_tampered_v5_sqlite_human_primary_key_is_rejected_on_reopen",
         "tests/unit/test_v5_storage_schema_contract.py::test_tampered_v5_sqlite_action_tenant_index_is_rejected_on_reopen",
         "tests/unit/test_v5_storage_schema_contract.py::test_v4_migration_plan_rejects_missing_human_primary_key",
@@ -832,6 +832,13 @@
         "tests/unit/test_semantic_v5_migration.py::test_v5_plan_rejects_noncanonical_v4_without_writes",
         "tests/unit/test_semantic_v5_migration.py::test_v5_apply_requires_owner_only_self_contained_backup",
         "tests/runtime/test_semantic_v5_postgres_migration.py::test_postgres_v4_to_v5_migration_round_trip",
+        "tests/unit/test_semantic_v6_migration.py::test_v5_to_v6_dry_run_is_zero_write_and_apply_requires_digest",
+        "tests/unit/test_semantic_v6_migration.py::test_v6_plan_requires_and_validates_independent_backup",
+        "tests/unit/test_semantic_v6_migration.py::test_runtime_refuses_v5_without_automatic_migration",
+        "tests/unit/test_semantic_v6_migration.py::test_v5_to_v6_failure_rolls_back_ddl_and_marker",
+        "tests/runtime/test_semantic_v6_postgres_migration.py::test_postgres_v5_to_v6_migration_round_trip",
+        "tests/runtime/test_semantic_v6_postgres_migration.py::test_postgres_v5_to_v6_failure_rolls_back",
+        "tests/runtime/test_semantic_v6_postgres_migration.py::test_postgres_v6_apply_requires_snapshot_and_exclusive_advisory_lock",
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_fresh_schema_rejects_a_second_schema_marker",
         "tests/runtime/test_postgres_store.py::TestPostgresStore::test_fresh_schema_rejects_a_second_schema_marker",
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_incomplete_v4_schema_is_rejected_without_mutation",
@@ -4213,7 +4220,11 @@
         "tests/providers/test_git_primitive.py::test_pull_request_metadata_failure_after_write_is_retained_as_unknown",
         "tests/providers/test_git_primitive.py::test_git_model_tools_are_visible_but_still_require_capability",
         "tests/providers/test_git_primitive.py::test_simulated_pull_request_create_review_close_and_merge_requires_approval",
-        "tests/providers/test_git_primitive.py::test_pull_request_create_reuses_generated_id_after_human_approval"
+        "tests/providers/test_git_primitive.py::test_pull_request_create_reuses_generated_id_after_human_approval",
+        "tests/providers/test_git_primitive.py::test_commit_flow_snapshot_approval_cannot_rebind_outer_args_after_reopen[message]",
+        "tests/providers/test_git_primitive.py::test_commit_flow_snapshot_approval_cannot_rebind_outer_args_after_reopen[state]",
+        "tests/providers/test_git_primitive.py::test_push_flow_snapshot_binds_normal_delete_and_ref_source_args",
+        "tests/providers/test_git_primitive.py::test_pull_request_flow_snapshot_approval_cannot_change_review_decision"
       ],
       "benchmark_attack_classes": ["git_remote_authority_bypass"]
     },
@@ -4652,17 +4663,118 @@
       "benchmark_attack_classes": []
     },
     {
-      "id": "semantic-shadow-has-no-machine-mutation-entry",
-      "title": "Semantic Shadow exposes evidence only and has no reachable machine settlement, Capability issuance, label/release mutation, or semantic HTTP write path.",
+      "id": "semantic-machine-mutation-is-host-private-and-closed",
+      "title": "Semantic enforcement is reachable only through the Runtime-composed private Host settlement port; public/model surfaces cannot settle requests, issue authority, mutate labels/release, or control policy.",
       "lane": "security",
       "node_ids": [
-        "tests/security/test_semantic_shadow_isolation.py::test_semantic_surface_has_no_machine_settlement_or_mutation_entrypoint",
+        "tests/security/test_semantic_shadow_isolation.py::test_shadow_surface_has_no_public_machine_mutation_entrypoint",
         "tests/runtime/test_semantic_authority_ceiling.py::test_semantic_auto_approval_candidate_is_read_only_host_ceiling_evidence",
-        "tests/runtime/test_semantic_runtime_wiring.py::test_semantic_protected_port_never_creates_data_release_request",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_semantic_protected_port_never_creates_data_release_request"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-model-never-supplies-allow-predicate",
+      "title": "Classifier output is closed veto/escalation evidence and cannot provide an allow predicate, terminal decision, policy rule, or Capability authority.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_enforcement.py::test_model_findings_ood_and_errors_cannot_terminalize_or_issue_authority[model-finding]",
+        "tests/security/test_semantic_enforcement.py::test_model_findings_ood_and_errors_cannot_terminalize_or_issue_authority[ood]",
+        "tests/security/test_semantic_enforcement.py::test_model_findings_ood_and_errors_cannot_terminalize_or_issue_authority[provider-error]",
+        "tests/security/test_semantic_enforcement.py::test_model_findings_ood_and_errors_cannot_terminalize_or_issue_authority[invalid-schema]",
+        "tests/security/test_semantic_enforcement.py::test_model_findings_ood_and_errors_cannot_terminalize_or_issue_authority[timeout]",
         "tests/unit/test_semantic_core.py::test_shadow_broker_requires_host_predicates_and_never_returns_a_permit",
-        "tests/providers/test_semantic_gui_api.py::test_semantic_status_rejects_nonzero_actual_auto_approval_metrics"
+        "tests/runtime/test_semantic_storage.py::test_successful_classifier_cannot_add_frozen_data_flow_allow_predicate"
       ],
       "benchmark_attack_classes": ["semantic_classifier_authority_injection"]
+    },
+    {
+      "id": "semantic-hard-deny-set-is-closed",
+      "title": "Real machine denial is limited to the closed deterministic Host reason set; model, uncertain, unsupported, and high-risk evidence remains Human-gated.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_enforcement.py::test_deterministic_machine_deny_reasons_are_a_closed_non_model_set"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-machine-terminalization-is-cas-atomic",
+      "title": "Human, cancel, machine deny, and canary approval share one revision/status CAS and one transactional terminal kernel with a single authority/evidence winner.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_enforcement.py::test_human_and_machine_terminalization_share_single_cas_winner"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-exact-once-authority-is-binding-and-epoch-fenced",
+      "title": "Machine authority is exact, short-lived, nondelegable, one-use, and revalidates its complete binding plus active durable policy epoch through dispatch.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_enforcement.py::test_epoch_revoke_and_binding_drift_block_unconsumed_machine_authority",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_approval_binding_tamper_is_fail_closed_without_authority_delta",
+        "tests/runtime/test_semantic_storage.py::test_reopened_worker_refuses_classifier_artifact_drift_before_call[profile-drift]",
+        "tests/runtime/test_semantic_storage.py::test_reopened_worker_refuses_classifier_artifact_drift_before_call[model-drift]",
+        "tests/unit/test_semantic_flow.py::test_root_goal_object_binding_is_exact_idempotent_and_rejects_ambiguity",
+        "tests/unit/test_semantic_v6_storage.py::test_v6_control_cas_outcome_idempotence_and_metrics",
+        "tests/runtime/test_semantic_v6_postgres_migration.py::test_postgres_control_fence_serializes_concurrent_rotation"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-canary-expansion-is-review-gated",
+      "title": "Canary cohort, rule, hard-deny weakening, classifier drift, or allow-parameter expansion requires seven days plus 1000 complete safe reviews per affected action; deny/threshold/budget narrowing remains immediate and any old-epoch unsafe review persists across off and trips current active authority.",
+      "lane": "unit",
+      "node_ids": [
+        "tests/unit/test_semantic_control_rollout.py::test_rollout_expansion_uses_real_sqlite_immutable_evidence",
+        "tests/unit/test_semantic_control_rollout.py::test_rollout_hard_deny_weakening_is_review_gated_after_sqlite_reopen[deleted]",
+        "tests/unit/test_semantic_control_rollout.py::test_rollout_allow_shaping_relaxation_is_review_gated_after_sqlite_reopen[confidence]",
+        "tests/unit/test_semantic_control_rollout.py::test_rollout_allow_shaping_tightening_and_new_wider_deny_are_immediate",
+        "tests/unit/test_semantic_review_import_control.py::test_off_imported_old_epoch_unsafe_evidence_blocks_rollout_expansion",
+        "tests/unit/test_semantic_review_import_control.py::test_old_epoch_unsafe_import_trips_new_active_epoch_and_retains_evidence"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-canary-budget-is-stable-and-cas",
+      "title": "Canary rate budgets are stable per tenant and logical rule across epoch rotation and reopen; origin epoch is provenance only, inflight release and reservation share revision CAS, and rollback cannot mint budget.",
+      "lane": "unit",
+      "node_ids": [
+        "tests/unit/test_semantic_authority_gate.py::test_host_rate_budget_cannot_reset_through_epoch_rotation_after_reopen",
+        "tests/unit/test_semantic_authority_gate.py::test_rotated_rate_budget_reservation_rolls_back_and_has_one_cas_winner",
+        "tests/unit/test_semantic_authority_gate.py::test_cross_epoch_inflight_is_released_before_one_new_reservation",
+        "tests/unit/test_semantic_v6_storage.py::test_v6_rate_budget_scope_is_unique_across_origin_epochs"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-unknown-flow-blocks-auto-authority",
+      "title": "Only complete current single-tenant FlowGraph coverage can satisfy auto approval; missing, partial, unknown, conflicting, stale, or mixed evidence fails closed to Human review.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_enforcement.py::test_unknown_flow_coverage_blocks_machine_authority_after_sqlite_reopen",
+        "tests/security/test_semantic_enforcement.py::test_flow_graph_never_persists_secret_payload_and_is_tenant_isolated",
+        "tests/unit/test_semantic_flow.py::test_unbucketed_identity_is_unknown_and_blocks_memory_influence",
+        "tests/unit/test_semantic_flow.py::test_effective_labels_fail_closed_when_assertion_page_is_truncated",
+        "tests/runtime/test_semantic_flow_graph.py::test_sqlite_derived_lineage_and_memory_gate_are_bounded",
+        "tests/runtime/test_semantic_flow_graph.py::test_real_llm_provider_result_links_to_model_output_and_tightens_labels"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-high-risk-and-cross-tenant-authority-is-unreachable",
+      "title": "Only catalog-v1 exact reads for an explicitly allowlisted tenant can receive machine authority; high-risk, management, release, wildcard, and cross-tenant paths are structurally unreachable.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_enforcement.py::test_high_risk_actions_are_structurally_unreachable_from_machine_settlement[filesystem.write-write]",
+        "tests/security/test_semantic_enforcement.py::test_high_risk_actions_are_structurally_unreachable_from_machine_settlement[filesystem.delete-delete]",
+        "tests/security/test_semantic_enforcement.py::test_high_risk_actions_are_structurally_unreachable_from_machine_settlement[shell.run-execute]",
+        "tests/security/test_semantic_enforcement.py::test_high_risk_actions_are_structurally_unreachable_from_machine_settlement[jsonrpc.call-execute]",
+        "tests/security/test_semantic_enforcement.py::test_high_risk_actions_are_structurally_unreachable_from_machine_settlement[mcp.call-execute]",
+        "tests/security/test_semantic_enforcement.py::test_flow_graph_never_persists_secret_payload_and_is_tenant_isolated",
+        "tests/unit/test_semantic_flow.py::test_root_goal_object_binding_rejects_cross_tenant_target"
+      ],
+      "benchmark_attack_classes": []
     },
     {
       "id": "semantic-candidates-are-exact-and-attenuated",
@@ -4675,7 +4787,8 @@
         "tests/runtime/test_semantic_authority_ceiling.py::test_child_cannot_create_semantic_ceiling_from_ordinary_capability",
         "tests/runtime/test_semantic_authority_ceiling.py::test_checkpoint_fork_preserves_but_does_not_widen_semantic_ceiling",
         "tests/runtime/test_semantic_authority_ceiling.py::test_semantic_ceiling_and_legacy_manifest_hashes_survive_reopen",
-        "tests/runtime/test_semantic_runtime_wiring.py::test_approval_binding_tamper_is_fail_closed_without_authority_delta"
+        "tests/runtime/test_semantic_runtime_wiring.py::test_approval_binding_tamper_is_fail_closed_without_authority_delta",
+        "tests/unit/test_semantic_v6_storage.py::test_v6_git_diff_epoch_rollout_scope_is_digest_only_and_round_trips"
       ],
       "benchmark_attack_classes": []
     },
@@ -4685,7 +4798,7 @@
       "lane": "security",
       "node_ids": [
         "tests/security/test_semantic_shadow_isolation.py::test_default_off_has_zero_semantic_capture_and_preserves_human_authority",
-        "tests/security/test_semantic_shadow_isolation.py::test_shadow_and_off_have_identical_authority_business_and_label_outcomes",
+        "tests/security/test_semantic_shadow_isolation.py::test_off_and_shadow_have_zero_machine_authority_delta",
         "tests/security/test_semantic_shadow_isolation.py::test_classifier_failure_and_capture_failure_have_zero_authority_delta",
         "tests/security/test_semantic_shadow_isolation.py::test_mode_off_scrubs_legacy_unclaimed_projection_without_claiming",
         "tests/security/test_semantic_shadow_isolation.py::test_late_assessment_records_but_never_overwrites_human_outcome",
@@ -4703,6 +4816,11 @@
       "lane": "unit",
       "node_ids": [
         "tests/unit/test_semantic_core.py::test_data_finding_suggestion_is_monotonic_and_does_not_mutate_input",
+        "tests/unit/test_semantic_flow.py::test_flow_label_vector_is_identity_safe_and_tightens_monotonically",
+        "tests/unit/test_semantic_flow.py::test_effective_labels_marks_declassification_or_endorsement_conflict",
+        "tests/unit/test_semantic_flow.py::test_append_assessment_findings_is_monotonic_and_bounded",
+        "tests/unit/test_semantic_flow.py::test_effective_labels_fail_closed_when_assertion_page_is_truncated",
+        "tests/runtime/test_semantic_flow_graph.py::test_sqlite_flow_assertion_tightens_labels_after_reopen",
         "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_rejects_authority_or_label_upgrade_output[declassify]",
         "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_rejects_authority_or_label_upgrade_output[endorse-integrity]",
         "tests/providers/test_semantic_privacy.py::test_root_goal_and_provider_ingress_are_digest_bound_without_label_writeback",
@@ -4724,13 +4842,26 @@
       "lane": "providers",
       "node_ids": [
         "tests/unit/test_semantic_core.py::test_semantic_models_are_strict_payload_free_and_round_trip",
+        "tests/unit/test_semantic_flow.py::test_json_and_text_locators_persist_only_digests_and_coordinates",
+        "tests/unit/test_semantic_flow.py::test_root_and_provider_capture_are_payload_free_idempotent_bundles",
+        "tests/runtime/test_semantic_flow_graph.py::test_sqlite_flow_graph_reopens_without_raw_identity_or_payload",
+        "tests/runtime/test_semantic_flow_graph.py::test_real_llm_provider_result_links_to_model_output_and_tightens_labels",
         "tests/unit/test_semantic_core.py::test_external_projection_redacts_or_drops_sensitive_intent_and_raw_ids",
         "tests/runtime/test_semantic_storage.py::test_semantic_projection_rejects_content_fields_and_requires_terminal_hash_only",
         "tests/security/test_semantic_shadow_isolation.py::test_mode_off_scrubs_legacy_unclaimed_projection_without_claiming",
         "tests/runtime/test_semantic_runtime_wiring.py::test_semantic_protected_port_records_only_digests_and_suppresses_recursion",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_semantic_contract_rejects_caller_override_of_source_ref_redaction",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_semantic_classifier_stale_source_ref_blocks_before_provider_and_stays_redacted",
+        "tests/runtime/test_semantic_storage.py::test_external_worker_without_same_process_transient_flow_is_egress_blocked[missing]",
+        "tests/runtime/test_semantic_storage.py::test_external_worker_without_same_process_transient_flow_is_egress_blocked[reopen]",
         "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_uses_safe_projection_and_protected_single_dispatch",
+        "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_never_sends_generic_secret_markers_for_any_capture_kind[root_goal]",
+        "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_never_sends_generic_secret_markers_for_any_capture_kind[provider_ingress]",
+        "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_never_sends_generic_secret_markers_for_any_capture_kind[approval]",
+        "tests/providers/test_semantic_assessment_provider.py::test_external_source_refs_require_nonserializable_host_invocation",
         "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_sanitizes_provider_exception_and_context",
         "tests/providers/test_semantic_privacy.py::test_terminal_semantic_evidence_never_persists_secret_sentinel",
+        "tests/providers/test_semantic_privacy.py::test_external_approval_identifier_is_absent_from_public_terminal_and_gui_evidence",
         "tests/providers/test_semantic_gui_api.py::test_semantic_assessment_detail_is_typed_and_payload_free",
         "tests/providers/test_semantic_gui_api.py::test_semantic_assessment_projection_rejects_nested_payload_in_scalar_field",
         "tests/runtime/test_semantic_runtime_wiring.py::test_host_tenant_bucketer_is_keyed_optional_and_failure_isolated",
@@ -4767,6 +4898,55 @@
       "benchmark_attack_classes": []
     },
     {
+      "id": "human-approval-preview-is-host-bound-and-safe",
+      "title": "External-operation Human approvals use one Host-derived, digest-bound typed preview; requester risk/prose cannot shape authority presentation, sensitive values are redacted, terminal controls are encoded, and material operation arguments remain distinguishable.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_approval_preview_trust.py::test_preview_risk_uses_only_host_action_ontology_and_rights",
+        "tests/security/test_semantic_approval_preview_trust.py::test_resource_projection_keeps_safe_workspace_identity_and_redacts_secrets",
+        "tests/security/test_semantic_approval_preview_trust.py::test_filesystem_projection_rejects_stale_path_digest_and_normalizes_codec_alias",
+        "tests/security/test_semantic_approval_preview_trust.py::test_shell_projection_distinguishes_host_catalog_subcommands_without_values[status]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_shell_projection_distinguishes_host_catalog_subcommands_without_values[push]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_shell_projection_distinguishes_host_catalog_subcommands_without_values[reset]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_shell_projection_distinguishes_host_catalog_subcommands_without_values[clean]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_pty_projection_accepts_zero_startup_timeout",
+        "tests/security/test_semantic_approval_preview_trust.py::test_remote_git_and_unknown_projection_variants_are_closed",
+        "tests/security/test_semantic_approval_preview_trust.py::test_git_projection_exposes_material_enums_flags_counts_and_bound_digests",
+        "tests/security/test_semantic_approval_preview_trust.py::test_git_reference_projection_is_role_bound_readable_or_redacted",
+        "tests/security/test_semantic_approval_preview_trust.py::test_projection_from_dict_rejects_cross_variant_pollution[pollution0]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_projection_from_dict_rejects_cross_variant_pollution[pollution1]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_projection_from_dict_rejects_cross_variant_pollution[pollution2]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_projection_from_dict_rejects_cross_variant_pollution[pollution3]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_preview_rejects_action_projection_substitution_and_line_controls",
+        "tests/security/test_human_terminal_safe_encoding.py::test_external_preview_and_host_evidence_use_the_same_safe_encoding",
+        "tests/security/test_human_terminal_safe_encoding.py::test_git_reference_terminal_rows_are_role_bound_and_do_not_echo_secret_refs",
+        "tests/security/test_human_terminal_safe_encoding.py::test_every_unicode_format_control_is_encoded",
+        "tests/providers/test_semantic_privacy.py::test_low_sensitivity_filesystem_approval_identity_remains_human_readable",
+        "tests/providers/test_semantic_privacy.py::test_remote_approval_identifiers_are_redacted_but_exactly_digest_bound",
+        "tests/providers/test_semantic_privacy.py::test_high_sensitivity_approval_resource_is_redacted_and_digest_bound",
+        "tests/providers/test_semantic_privacy.py::test_long_exact_resource_keeps_active_human_preview_fence_reachable"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "human-authority-request-shape-is-host-bound",
+      "title": "Generic Human queries cannot smuggle authority fields; only Host-typed and effect-bound requests may reach capability side effects, scoped grants remain Human-only, and malformed durable or reopened rows fail closed across every response surface.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_human_authority_request_shape.py::test_generic_human_question_rejects_smuggled_authority_at_admission",
+        "tests/security/test_human_authority_request_shape.py::test_generic_query_cannot_forge_host_authority_origin",
+        "tests/security/test_human_authority_request_shape.py::test_query_admission_uses_one_mapping_snapshot",
+        "tests/security/test_human_authority_request_shape.py::test_reentrant_capture_cannot_inherit_host_authority_origin",
+        "tests/security/test_human_authority_request_shape.py::test_forged_durable_question_never_applies_authority[direct]",
+        "tests/security/test_human_authority_request_shape.py::test_forged_durable_question_never_applies_authority[presentation]",
+        "tests/security/test_human_authority_request_shape.py::test_forged_durable_question_never_applies_authority[terminal]",
+        "tests/security/test_human_authority_request_shape.py::test_reopened_forged_durable_question_never_applies_authority",
+        "tests/security/test_human_authority_request_shape.py::test_exact_external_approval_remains_revision_and_preview_fenced",
+        "tests/security/test_human_authority_request_shape.py::test_active_scoped_approval_is_human_fenced_and_not_machine_denied"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "rating-mutations-are-audit-atomic",
       "title": "Rating updates and their required audit records commit or roll back in one transaction.",
       "lane": "runtime",
@@ -4795,6 +4975,6 @@
     "git_remote_authority_bypass": "git-mutations-require-authority-state-and-evidence",
     "git_patch_lineage": "git-patches-remotes-and-prs-preserve-cas-lineage",
     "prompt_injection_write": "protected-egress-enforces-minimum-integrity",
-    "semantic_classifier_authority_injection": "semantic-shadow-has-no-machine-mutation-entry"
+    "semantic_classifier_authority_injection": "semantic-model-never-supplies-allow-predicate"
   }
 }

@@ -187,6 +187,35 @@ describe("LibOSClient", () => {
     );
   });
 
+  it("binds external-operation responses to the canonical preview revision and digest", async () => {
+    const fetchMock = mockFetch({});
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.respondHumanRequest(
+      "request_external",
+      {
+        kind: "external_approval",
+        approved: true,
+        expected_revision: 7,
+        preview_sha256: "a".repeat(64)
+      },
+      false,
+      null
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/human-requests/request_external/respond",
+      expect.objectContaining({
+        body: JSON.stringify({
+          approved: true,
+          expected_revision: 7,
+          preview_sha256: "a".repeat(64),
+          auto_run: false
+        })
+      })
+    );
+  });
+
   it("submits agent ratings for the selected process", async () => {
     const fetchMock = mockFetch({});
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
@@ -682,6 +711,7 @@ describe("LibOSClient", () => {
           status: "pending",
           decision: null,
           blocking: true,
+          revision: 0,
           created_at: "2030-01-01T00:00:00Z",
           updated_at: "2030-01-01T00:00:00Z"
         }],
@@ -697,6 +727,7 @@ describe("LibOSClient", () => {
         status: "pending",
         decision: null,
         blocking: true,
+        revision: 0,
         created_at: "2030-01-01T00:00:00Z",
         updated_at: "2030-01-01T00:00:00Z"
       }));
@@ -723,6 +754,7 @@ describe("LibOSClient", () => {
       status: "pending",
       decision: null,
       blocking: true,
+      revision: 0,
       created_at: "2030-01-01T00:00:00Z",
       updated_at: "2030-01-01T00:00:00Z"
     })));
@@ -775,6 +807,92 @@ describe("LibOSClient", () => {
     await expect(client.getSemanticAssessment("assessment/1")).rejects.toThrow(/identity does not match/);
   });
 
+  it("uses only bounded GET surfaces for Flow, settlement, epoch, control, health, and canary evidence", async () => {
+    const flow = semanticStatusFixture().flow;
+    const control = {
+      schema_version: 1,
+      revision: 0,
+      generation: 0,
+      mode: "off",
+      active_epoch_id: null,
+      active_policy_sha256: null,
+      tripped: false,
+      trip_code: null,
+      updated_at: "2030-01-01T00:00:00Z"
+    };
+    const metrics = {
+      schema_version: 1,
+      window: "7d",
+      action_id: "filesystem.read",
+      tenant_bucket_sha256: "6".repeat(64),
+      epoch_id: "epoch_1",
+      risk: "low",
+      machine: { ...semanticStatusFixture().machine, eligible: 2, issued: 1 },
+      actual_auto_approval: { numerator: 1, denominator: 2, rate: 0.5 },
+      review_metrics: {
+        reviewed: 2,
+        safe: 2,
+        unsafe: 0,
+        unsafe_rate: 0,
+        issued_reviewed: 0,
+        issued_review_rate: 0
+      }
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(flow))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [], next_cursor: null }))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [], next_cursor: null }))
+      .mockResolvedValueOnce(jsonResponse({
+        schema_version: 1,
+        root_node_id: "entity_1",
+        direction: "upstream",
+        items: [],
+        effective_labels: null,
+        coverage: "unknown",
+        next_cursor: null,
+        truncated: false
+      }))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [], next_cursor: null }))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [], next_cursor: null }))
+      .mockResolvedValueOnce(jsonResponse(control))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [control], next_cursor: null }))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [], next_cursor: null }))
+      .mockResolvedValueOnce(jsonResponse(metrics));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.getSemanticFlowStatus();
+    await client.listSemanticFlowEntities({ pid: "pid_1" }, 25, "entity_cursor");
+    await client.listSemanticFlowEdges({ pid: "pid_1" }, 25, "edge_cursor");
+    await client.getSemanticFlowLineage("entity_1", "upstream", 25, "lineage_cursor");
+    await client.listSemanticSettlements({ pid: "pid_1", outcome: "issued" }, 25, "settlement_cursor");
+    await client.listSemanticPolicyEpochs(25, "epoch_cursor");
+    await client.getSemanticControl();
+    await client.listSemanticControlHistory(25, "control_cursor");
+    await client.listSemanticHealthEvents(25, "health_cursor");
+    await client.getSemanticMetrics({
+      window: "7d",
+      actionId: "filesystem.read",
+      tenantBucketSha256: "6".repeat(64),
+      epochId: "epoch_1",
+      risk: "low"
+    });
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "http://127.0.0.1:1/api/semantic/flow/status",
+      "http://127.0.0.1:1/api/semantic/flow/entities?limit=25&after=entity_cursor&pid=pid_1",
+      "http://127.0.0.1:1/api/semantic/flow/edges?limit=25&after=edge_cursor&pid=pid_1",
+      "http://127.0.0.1:1/api/semantic/flow/lineage/entity_1?limit=25&after=lineage_cursor&direction=upstream",
+      "http://127.0.0.1:1/api/semantic/settlements?limit=25&after=settlement_cursor&pid=pid_1&outcome=issued",
+      "http://127.0.0.1:1/api/semantic/policy/epochs?limit=25&after=epoch_cursor",
+      "http://127.0.0.1:1/api/semantic/control",
+      "http://127.0.0.1:1/api/semantic/control/history?limit=25&after=control_cursor",
+      "http://127.0.0.1:1/api/semantic/health?limit=25&after=health_cursor",
+      `http://127.0.0.1:1/api/semantic/metrics?action_id=filesystem.read&tenant_bucket_sha256=${"6".repeat(64)}&epoch_id=epoch_1&risk=low&window=7d`
+    ]);
+    expect(fetchMock.mock.calls.every(([, init]) => init.method === "GET")).toBe(true);
+  });
+
   it("rejects unbounded Semantic pagination before issuing a request", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
@@ -788,6 +906,8 @@ describe("LibOSClient", () => {
     await expect(client.listSemanticAssessments({ tenantBucketSha256: "A".repeat(64) })).rejects.toThrow(/tenant_bucket_sha256/);
     await expect(client.listSemanticAssessments({}, 50, "x".repeat(2_049))).rejects.toThrow(/after/);
     await expect(client.getSemanticAssessment(" ")).rejects.toThrow(/assessment_id/);
+    await expect(client.getSemanticMetrics({ risk: "unknown" as never })).rejects.toThrow(/risk/);
+    await expect(client.getSemanticFlowLineage("node with spaces", "upstream")).rejects.toThrow(/node_id/);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
@@ -841,7 +961,7 @@ function taskRunSummary() {
 
 function semanticStatusFixture() {
   return {
-    schema_version: 2,
+    schema_version: 3,
     mode: "shadow",
     adapter: "deterministic",
     profile_id: null,
@@ -876,7 +996,50 @@ function semanticStatusFixture() {
         unknown: 0
       }
     },
-    actual_auto_approval: { numerator: 0, denominator: 0, rate: null }
+    control: {
+      catalog_version: null,
+      active_epoch_id: null,
+      active_epoch_sha256: null,
+      generation: 0,
+      state: "inactive",
+      trip_reason_code: null
+    },
+    flow: {
+      schema_version: 1,
+      available: false,
+      counts: { entities: 0, activities: 0, edges: 0, label_assertions: 0 },
+      coverage: { complete: 0, partial: 0, unknown: 0, conflict: 0, stale: 0 },
+      capture_failures: 0,
+      legacy_history: {
+        present: false,
+        source_schema_version: null,
+        assessment_count: 0,
+        coverage: null,
+        evidence_sha256: null,
+        created_at: null
+      }
+    },
+    machine: {
+      eligible: 0,
+      issued: 0,
+      consumed: 0,
+      succeeded: 0,
+      failed: 0,
+      unknown: 0,
+      expired: 0,
+      revoked: 0,
+      race_lost: 0,
+      denied: 0
+    },
+    actual_auto_approval: { numerator: 0, denominator: 0, rate: null },
+    review_metrics: {
+      reviewed: 0,
+      safe: 0,
+      unsafe: 0,
+      unsafe_rate: null,
+      issued_reviewed: 0,
+      issued_review_rate: null
+    }
   };
 }
 

@@ -365,15 +365,17 @@ Capability and Sink configuration should be reviewed as security policy, and
 Human approval UI must not be treated as protection against a compromised
 operator.
 
-### Semantic classifier and Shadow evidence
+### Semantic classifier, FlowGraph, and machine policy
 
 The semantic model, scripted adapter input, goal/provider content, and every
 classifier response are untrusted. Relevant attacks include prompt injection,
 fabricated confidence, malformed or duplicate-key JSON, model/profile/Sink
 drift, OOD evasion, sensitive projection exfiltration, lease replay, forged
-provenance, and attempts to turn a `would_*` record into real authority.
+provenance, omitted/malformed lineage, cross-tenant graph confusion, stale
+policy epochs, one-shot replay, and attempts to turn a `would_*` record into
+real authority.
 
-Phase 0+1 contains these attacks structurally. Approval and provider ingress
+Approval and provider ingress
 are metadata-only. Root-goal redacted intent is allowed only for bounded
 `public`/`normal`, non-mixed-identity text after local secret and path detection;
 the external projection is then DataFlow-gated, and conditional egress cannot
@@ -381,9 +383,8 @@ open a recursive release request. External startup freezes profile identity and
 model; assessment and dispatch revalidate profile resolution, client, and Sink
 identity. The provider schema is closed and the model supplies findings only.
 The deterministic broker requires Host-derived positive predicates and a
-strictly attenuated Task Authority ceiling. Human settlement, Capability
-issuance, permission policy, DataLabel/release mutation, and business provider
-dispatch have no semantic mutation entrypoint. The Host provider-result
+strictly attenuated Task Authority ceiling. The model has no terminal decision
+or authority field and cannot fill a missing Host predicate. The Host provider-result
 observer is one-shot bound, invocation observers are additive, and only a
 bounded canonical Host digest can create ingress evidence. The generic digest
 has a 4,096-node/256 KiB ceiling; the five core provider domains and Host-bound
@@ -394,7 +395,27 @@ structures persists only closed finding codes/digests, never scanned text.
 Observer failure cannot change the original result, and an ambiguous external
 classifier request is never automatically replayed.
 
-Semantic assessment rows are append-only through the Runtime API and carry
+FlowGraph evidence is payload-free and append-only. Missing historical v5
+edges, capture failure, partial/conflicting/stale coverage, mixed identity, and
+unknown action provenance block auto approval rather than being interpreted as
+absence of risk. Model label assertions can only raise sensitivity or lower
+integrity/trust; they cannot remove Host edges, declassify, endorse, write
+ambient labels, or relax a Sink decision.
+
+`enforce_deny` reaches only the closed Host hard-deny set. `canary_auto` reaches
+only catalog-v1 exact reads under an immutable static Host epoch and exact
+tenant bucket. The private settlement port shares Human request revision/status
+CAS, rechecks all live Host facts, and can issue only a short-lived,
+nondelegable, revocable, one-use Capability. Protected Operation checks the
+versioned binding and durable control generation through dispatch. There is no
+Runtime/model/CLI/HTTP/GUI policy or settlement entrypoint, and no machine path
+to `always_allow`, data release, permission administration, writes, network,
+Shell, JSON-RPC, or MCP. `off`, revoke, or safety trip blocks every unconsumed
+or undispatched semantic grant; already dispatched external effects are
+evidence, not rollback claims.
+
+Semantic assessment, FlowGraph history, policy epoch, machine settlement,
+health, and review rows are append-only through the Runtime API and carry
 Host provenance digests, but they are not cryptographically tamper-proof
 against the database administrator. Hashes bind identity/content for comparison;
 they are not signatures or proof that a classifier was truthful. Real-provider
@@ -410,7 +431,9 @@ Tenant grouping is absent by default. A deployment that injects the Host-only
 semantic tenant bucketer adds that callback and its secret key to the TCB; it
 should return a keyed HMAC digest rather than an unsalted hash of a low-entropy
 tenant name. The raw tenant is not a semantic-table field, and no model- or
-HTTP-facing path can install the callback.
+HTTP-facing path can install the callback. `canary_auto` additionally requires
+an exact non-empty static Host tenant-bucket allowlist; a null bucket cannot
+receive machine authority.
 
 ### Data exfiltration and cross-domain flow
 

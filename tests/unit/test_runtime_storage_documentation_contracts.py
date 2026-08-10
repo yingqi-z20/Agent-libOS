@@ -44,21 +44,28 @@ def test_runtime_safety_task_count_is_consistent_across_current_docs() -> None:
         assert expected_phrase in _words(_read(path))
 
 
-def test_semantic_shadow_docs_keep_evidence_only_privacy_and_read_contract() -> None:
+def test_semantic_phase2_to_4_docs_keep_authority_privacy_and_control_contract() -> None:
     semantic = _words(_read("docs/semantic_shadow.md"))
     cli = _words(_read("docs/cli.md"))
     gui = _words(_read("docs/gui.md"))
     storage = _words(_read("docs/storage.md"))
 
     for required in (
-        "This release is **Shadow-only**",
+        "The default remains `semantic.mode: off`",
+        "The classifier remains evidence, not authority",
         "`mode: off` is the global kill switch and the default",
         "There is no semantic `POST`, `PUT`, `PATCH`, or `DELETE` route",
         "`action_id`, and `tenant_bucket_sha256` filters",
-        "does not itself publish a risk/tenant cube or an aggregate accuracy metric",
-        "The status response is schema v2",
+        "No aggregate accuracy value is treated as a safety conclusion",
+        "The status response is schema v3",
         "complete, exact-key `by_status` counters",
-        "strictly `0 / 0 / null`",
+        "A rate whose denominator is zero is `null`",
+        "Model findings may prevent a positive Shadow outcome",
+        "cannot supply a missing allow predicate",
+        "A real hard denial is limited to",
+        "Only `complete` coverage for one non-mixed tenant identity",
+        "The machine path never installs `always_allow`",
+        "There is no wildcard tenant, implicit epoch, auto-activation",
         "Approval and provider-ingress capture are metadata-only",
         "Root-goal capture may temporarily include a deterministic `redacted_intent`",
         "the goal sensitivity is `public` or `normal`",
@@ -91,7 +98,11 @@ def test_semantic_shadow_docs_keep_evidence_only_privacy_and_read_contract() -> 
         assert required in semantic
 
     for required in (
-        "The `semantic` group is read-only",
+        "All runtime and policy surfaces are read-only",
+        "`semantic review import` is the sole write",
+        "semantic flow lineage <node_id>",
+        "semantic settlements --limit 50",
+        "semantic control history --limit 50",
         "--action-id filesystem.read",
         "--tenant-bucket-sha256 <lowercase_sha256>",
         "raw Human or classifier response",
@@ -105,7 +116,7 @@ def test_semantic_shadow_docs_keep_evidence_only_privacy_and_read_contract() -> 
         "`action_id`, `tenant_bucket_sha256`, `after`, and `limit`",
         "There are no semantic write routes",
         "reserved nullable input/output token and cost fields",
-        "status schema v2 with complete exact-key `by_status` and `by_domain` maps",
+        "status schema v3 with complete exact-key `by_status` and `by_domain` maps",
         "never token aliases, unknown provider usage keys, or the raw usage object",
     ):
         assert required in gui
@@ -284,15 +295,22 @@ def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() 
     documentation = _words(_read("docs/storage.md"))
     readme = _words(_read("README.md"))
 
-    assert "Agent libOS 1.4.0 stores durable runtime state" in documentation
-    assert "## Strict store schema v5" in documentation
+    assert "Agent libOS 1.4.1 stores durable runtime state" in documentation
+    assert "## Strict store schema v6" in documentation
     assert "Product version and store schema version are independent" in documentation
-    assert "The only supported migration is the explicit, offline, operator-invoked canonical v4-to-v5 procedure" in documentation
+    assert "The only supported migrations are the explicit, offline, operator-invoked canonical v4-to-v5 and v5-to-v6 procedures" in documentation
     assert "There are no automatic migrations, backfills, read-only compatibility modes, or dual runtime schema paths" in documentation
     assert "must be opened with Agent libOS 1.0.1" in documentation
-    assert "creates and opens only RuntimeStore schema v5" in readme
-    assert "offline, digest-bound v4-to-v5 migration" in readme
+    assert "creates and opens only RuntimeStore schema v6" in readme
+    assert "offline, digest-bound v5-to-v6 migration" in readme
     for required in (
+        "## Offline v5 to v6 migration",
+        "`semantic_flow_entities`, `semantic_flow_activities`, `semantic_flow_edges`, and `semantic_flow_label_assertions`",
+        "`semantic_policy_epochs` is immutable",
+        "`semantic_machine_settlements`, `semantic_machine_outcomes`, `semantic_review_labels`, and `semantic_health_events`",
+        "singleton marker CAS `5 -> 6`",
+        "complete canonical v6 table/column/check/index/collation manifest",
+        "A v4 store is not accepted by `--to 6`",
         "## Offline v4 to v5 migration",
         "performs zero source/lease/sidecar writes",
         "`--expected-plan-sha256`",

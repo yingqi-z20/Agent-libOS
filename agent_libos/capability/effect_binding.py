@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any
 
 from agent_libos.models.exceptions import ValidationError
@@ -9,6 +10,12 @@ from agent_libos.utils.serde import dumps, to_jsonable
 
 
 APPROVAL_BINDING_KEY = "approval_binding"
+APPROVAL_BINDING_SCHEMA_VERSION = 1
+SEMANTIC_APPROVAL_BINDING_SCHEMA_VERSION = 2
+
+_LEGACY_BINDING_FIELDS = frozenset(
+    {"effect_id", "canonical_args_hash", "target_state_version"}
+)
 
 _TRANSIENT_KEYS = frozenset(
     {
@@ -55,6 +62,41 @@ def canonical_effect_hash(context: dict[str, Any]) -> str:
 def normalize_approval_binding(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValidationError("approval binding must be an object")
+    if is_semantic_approval_binding(value):
+        # Keep the capability package independent of semantic policy
+        # implementation details while sharing its strict public wire model.
+        # The lazy import also avoids making the basic legacy Human binding
+        # depend on semantic runtime construction.
+        from agent_libos.models.semantic import SemanticApprovalBindingV2
+
+        try:
+            return SemanticApprovalBindingV2.from_dict(value).to_dict()
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(str(exc)) from exc
+    unknown = sorted(set(value) - _LEGACY_BINDING_FIELDS)
+    missing = sorted(_LEGACY_BINDING_FIELDS - set(value))
+    if missing:
+        raise ValidationError(
+            "approval binding is missing fields: " + ", ".join(missing)
+        )
+    if unknown:
+        raise ValidationError(
+            "approval binding contains unknown fields: " + ", ".join(unknown)
+        )
+    if type(value.get("effect_id")) is not str:
+        raise ValidationError("approval binding effect_id must be a string")
+    if type(value.get("canonical_args_hash")) is not str:
+        raise ValidationError(
+            "approval binding canonical_args_hash must be a string"
+        )
+    target_state_version = value.get("target_state_version")
+    if target_state_version is not None and (
+        isinstance(target_state_version, bool)
+        or not isinstance(target_state_version, (str, int))
+    ):
+        raise ValidationError(
+            "approval binding target_state_version must be a string, integer, or null"
+        )
     effect_id = str(value.get("effect_id") or "").strip()
     args_hash = str(value.get("canonical_args_hash") or "").strip().lower()
     if not effect_id.startswith("eff_"):
@@ -66,6 +108,30 @@ def normalize_approval_binding(value: Any) -> dict[str, Any]:
         "canonical_args_hash": args_hash,
         "target_state_version": value.get("target_state_version"),
     }
+
+
+def is_semantic_approval_binding(value: Any) -> bool:
+    """Identify BindingV2 without accepting lookalike or boolean versions."""
+
+    return (
+        isinstance(value, dict)
+        and type(value.get("schema_version")) is int
+        and value.get("schema_version") == SEMANTIC_APPROVAL_BINDING_SCHEMA_VERSION
+    )
+
+
+def approval_binding_sha256(value: Any) -> str:
+    """Digest the canonical strict binding without retaining effect payloads."""
+
+    return hashlib.sha256(
+        json.dumps(
+            normalize_approval_binding(value),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def current_approval_effect_binding(
@@ -94,6 +160,11 @@ def current_approval_effect_binding(
             if raw_binding is None:
                 continue
             binding = normalize_approval_binding(raw_binding)
+            existing = bindings.get(binding["effect_id"])
+            if existing is not None and existing != binding:
+                raise ValidationError(
+                    "external effect dispatch has conflicting approval bindings"
+                )
             bindings[binding["effect_id"]] = binding
         operation = store.get_operation(operation_id)
         operation_id = operation.parent_operation_id if operation is not None else None

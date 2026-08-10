@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ArrowDown, Bot, CheckCircle2, MessageSquare, Radio, UserRound } from "lucide-react";
 import type { AuditRecord, HumanRequest, LlmCall, ProcessMessage, RuntimeEvent } from "../api/types";
+import { canonicalApprovalPreviewFromRequest } from "../api/types";
 import { useI18n, type TranslationKey } from "../i18n";
 import { CollapsibleJson } from "./CollapsibleJson";
-import { isHumanOutput } from "../userConversation";
+import { humanRequestPrompt, isExternalOperationApproval, isHumanOutput } from "../userConversation";
 
 export type TimelineItemKind = "message" | "human" | "llm" | "event" | "audit";
 export type TimelineFilter = "activity" | "all" | TimelineItemKind;
@@ -171,7 +172,7 @@ export function Timeline({
                   </button>
                 ) : null}
                 <div className="timelineJsonOperation" role="group" aria-live="off">
-                  <CollapsibleJson value={entry.item} />
+                  <CollapsibleJson value={timelineJsonValue(entry)} />
                 </div>
               </div>
             </article>
@@ -295,8 +296,28 @@ function title(entry: TimelineItem, t: (key: TranslationKey, vars?: Record<strin
 function summary(entry: TimelineItem, t: (key: TranslationKey) => string) {
   if (entry.kind === "message") return entry.item.subject || entry.item.body || t("timeline.emptyMessage");
   if (entry.kind === "human" && isHumanOutput(entry.item)) return String(entry.item.payload.message ?? t("timeline.emptyOutput"));
-  if (entry.kind === "human") return String(entry.item.payload?.question ?? entry.item.payload?.type ?? t("timeline.humanInteraction"));
+  if (entry.kind === "human") {
+    return isExternalOperationApproval(entry.item)
+      ? humanRequestPrompt(entry.item, t("human.externalApprovalTitle"))
+      : String(entry.item.payload?.question ?? entry.item.payload?.type ?? t("timeline.humanInteraction"));
+  }
   if (entry.kind === "llm") return entry.item.error ?? entry.item.purpose;
   if (entry.kind === "audit") return entry.item.target ?? t("timeline.auditRecord");
   return entry.item.target ?? entry.item.source;
+}
+
+function timelineJsonValue(entry: TimelineItem): unknown {
+  if (entry.kind !== "human" || !isExternalOperationApproval(entry.item)) return entry.item;
+  const preview = canonicalApprovalPreviewFromRequest(entry.item);
+  return {
+    approval_preview_valid: preview !== null,
+    request_id: entry.item.request_id,
+    pid: entry.item.pid,
+    status: entry.item.status,
+    blocking: entry.item.blocking,
+    revision: entry.item.revision,
+    created_at: entry.item.created_at,
+    updated_at: entry.item.updated_at,
+    ...(preview === null ? {} : { approval_preview: preview, preview_sha256: entry.item.preview_sha256 })
+  };
 }

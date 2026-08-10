@@ -36,7 +36,7 @@ skills/review-helper/
 name: review-helper
 description: Focused code-review workflow helpers.
 license: Apache-2.0
-compatibility: agent-libos==1.4.0
+compatibility: agent-libos==1.4.1
 allowed-tools: read_text_file read_directory
 metadata:
   agent-libos.version: v0
@@ -480,7 +480,7 @@ are rejected before a result set can become unbounded.
 The workspace includes `skills/swe-agent`, named and registerable as
 `swe-agent`. It reproduces the useful SWE-Agent Agent Computer Interface shape
 inside Agent libOS. The shipped package pins `compatibility` to
-`agent-libos==1.4.0`: its JIT manifest uses extension fields from this release,
+`agent-libos==1.4.1`: its JIT manifest uses extension fields from this release,
 so older parsers must not be promised compatibility merely because the
 frontmatter itself can be read. This exact pin is a publisher/Host-facing
 declaration, not a Runtime-enforced version gate.

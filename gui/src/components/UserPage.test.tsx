@@ -240,6 +240,7 @@ function runHumanRequest(): HumanRequest {
     status: "pending",
     decision: null,
     blocking: true,
+    revision: 0,
     created_at: "2030-01-01T00:00:00Z",
     updated_at: "2030-01-01T00:00:00Z"
   };

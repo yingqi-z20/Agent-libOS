@@ -15,6 +15,7 @@ from agent_libos.storage.semantic_v5_migration import (
     apply_store_v5_migration,
     plan_store_v5_migration,
 )
+from agent_libos.storage.v6_schema_contract import V6_TABLES
 
 
 def _make_v4_store(path: Path) -> None:
@@ -28,6 +29,8 @@ def _make_v4_store(path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
+        for table in sorted(V6_TABLES & tables):
+            connection.execute(f'DROP TABLE "{table}"')
         if "semantic_assessments" in tables:
             connection.execute("DROP TABLE semantic_assessments")
         if "semantic_assessment_jobs" in tables:

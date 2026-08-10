@@ -33,7 +33,11 @@ from agent_libos.models import (
     OperationKind,
     ResourceUsage,
 )
-from agent_libos.models.exceptions import CapabilityDenied, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    SemanticAuthorityTripDeferred,
+    ValidationError,
+)
 from agent_libos.evidence.external_effects import (
     abandon_external_effect_intent,
     classify_external_effect,
@@ -285,6 +289,9 @@ AuthorityRevalidator = Callable[[], Iterable[CapabilityDecision]]
 DataSinkRevalidator = Callable[[], DataSink]
 TargetStateVersionResolver = Callable[[], str | int | None]
 _DATA_FLOW_PAYLOAD_UNSET = object()
+_SOURCE_REF_REDACTED_EVIDENCE_CONTRACTS = frozenset(
+    {"semantic.llm.assess"}
+)
 _RESULT_DIGEST_MAX_BYTES = 256 * 1024
 _RESULT_DIGEST_MAX_NODES = 4_096
 _HOST_RESULT_DIGEST_MAX_BYTES = 64 * 1024 * 1024
@@ -296,6 +303,7 @@ _HOST_RESULT_CONTRACT_PREFIXES = (
     "primitive.git.",
     "primitive.jsonrpc.",
     "primitive.mcp.",
+    "primitive.llm.",
 )
 _TRUSTED_RESULT_DATACLASSES = frozenset(
     {
@@ -340,6 +348,7 @@ _TRUSTED_RESULT_DATACLASSES = frozenset(
         "agent_libos.models.mcp.McpProviderDiscoveryResult",
         "agent_libos.models.mcp.McpProviderTool",
         "agent_libos.models.mcp.McpToolListResult",
+        "agent_libos.llm.client.LLMCompletion",
     }
 )
 _HOST_RESULT_IGNORED_FIELDS = {
@@ -347,6 +356,19 @@ _HOST_RESULT_IGNORED_FIELDS = {
         {"state_version_resolver"}
     ),
     "agent_libos.primitives.git._GitReadFlowSnapshot": frozenset({"refresh"}),
+    # Provider SDK payloads and hidden reasoning can contain arbitrary objects
+    # with executable hooks.  The protected LLM result identity is limited to
+    # the bounded, normalized completion fields consumed by the Runtime.
+    "agent_libos.llm.client.LLMCompletion": frozenset(
+        {
+            "raw",
+            "reasoning",
+            "provider_request_options",
+            "compatibility_removed_options",
+            "provider_trace",
+            "_provider_attempt_sequence",
+        }
+    ),
 }
 _SAFE_BUILTIN_RESULT_TYPES = (
     (type(None), "builtins.NoneType"),
@@ -960,7 +982,10 @@ def _trusted_result_dataclass(
     instance_values = object.__getattribute__(value, "__dict__")
     if type(dataclass_fields) is not dict or type(instance_values) is not dict:
         raise TypeError("provider result dataclass storage is not safe")
-    field_names = tuple(dataclass_fields)
+    ignored = _HOST_RESULT_IGNORED_FIELDS.get(identity_name, frozenset())
+    field_names = tuple(
+        name for name in dataclass_fields if name not in ignored
+    )
     if any(type(name) is not str or name not in instance_values for name in field_names):
         raise TypeError("provider result dataclass fields are incomplete")
     _consume_result_bytes(budget, len(field_names) + 2)
@@ -1023,6 +1048,14 @@ class PostCommitResultObservation:
     provider_spec_sha256: str | None = None
     tool_schema_sha256: str | None = None
     data_flow_direction: str | None = None
+    # Runtime-internal only.  It is deliberately omitted from all persisted
+    # observation/evidence projections and carries exact source refs to the
+    # semantic classifier preflight in this process.
+    data_flow_context: DataFlowContext | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         for name in (
@@ -1040,6 +1073,22 @@ class PostCommitResultObservation:
                 raise ValueError(f"post-commit observation {name} is invalid")
         if not isinstance(self.result_descriptor, Mapping):
             raise TypeError("post-commit result descriptor must be a mapping")
+        if self.data_flow_context is not None:
+            if not isinstance(self.data_flow_context, DataFlowContext):
+                raise TypeError(
+                    "post-commit observation DataFlow context is invalid"
+                )
+            if (
+                self.data_labels is None
+                or self.data_flow_context.labels.to_dict()
+                != self.data_labels.to_dict()
+                or self.source_refs_sha256 is None
+                or self.data_flow_context.source_refs_hash()
+                != self.source_refs_sha256
+            ):
+                raise ValueError(
+                    "post-commit observation DataFlow provenance is inconsistent"
+                )
         descriptor = dict(self.result_descriptor)
         if set(descriptor) - {
             "schema_version",
@@ -1080,6 +1129,7 @@ class PostCommitObserverFailure:
 
 PostCommitResultObserver = Callable[[Any, PostCommitResultObservation], None]
 PostCommitObserverFailureHandler = Callable[[PostCommitObserverFailure], None]
+SemanticAuthorityLifecycleObserver = Callable[[Mapping[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -1144,14 +1194,18 @@ class ProtectedOperationInvocation:
     failure_settlement: FailureSettlementHandler | None = None
     data_sink: DataSink | None = None
     data_sink_revalidator: DataSinkRevalidator | None = None
-    data_flow_context: DataFlowContext | None = None
-    data_flow_ingress_context: DataFlowContext | None = None
+    data_flow_context: DataFlowContext | None = field(default=None, repr=False)
+    data_flow_ingress_context: DataFlowContext | None = field(
+        default=None,
+        repr=False,
+    )
     data_flow_payload: Any = field(default=_DATA_FLOW_PAYLOAD_UNSET, repr=False)
     data_flow_operation: str | None = None
     data_flow_target_state_version: str | int | None = None
     data_flow_target_state_version_resolver: TargetStateVersionResolver | None = None
     data_flow_allow_recovered_source_snapshots: bool = False
     data_flow_request_release: bool = True
+    data_flow_redact_source_refs_evidence: bool = False
     additional_data_sinks: tuple[DataSink, ...] = ()
     post_commit_result_observer: PostCommitResultObserver | None = None
     post_commit_observer_failure: PostCommitObserverFailureHandler | None = None
@@ -1162,6 +1216,7 @@ class ProtectedOperationInvocation:
             (
                 "data_flow_allow_recovered_source_snapshots",
                 "data_flow_request_release",
+                "data_flow_redact_source_refs_evidence",
             ),
         )
 
@@ -1237,6 +1292,7 @@ class ProtectedOperationSDK:
         data_flow: Any | None = None,
         post_commit_result_observer: PostCommitResultObserver | None = None,
         post_commit_observer_failure: PostCommitObserverFailureHandler | None = None,
+        semantic_authority_lifecycle_observer: SemanticAuthorityLifecycleObserver | None = None,
     ) -> None:
         self.effects = effects
         self.authority_policy = authority_policy
@@ -1251,11 +1307,18 @@ class ProtectedOperationSDK:
         self._prepared_recovery_handlers: dict[str, PreparedRecoveryHandler] = {}
         self._post_commit_result_observer = post_commit_result_observer
         self._post_commit_observer_failure = post_commit_observer_failure
+        self._semantic_authority_lifecycle_observer = (
+            semantic_authority_lifecycle_observer
+        )
         self._identity = id(self)
 
         for label, callback in (
             ("post-commit result observer", post_commit_result_observer),
             ("post-commit observer failure handler", post_commit_observer_failure),
+            (
+                "semantic authority lifecycle observer",
+                semantic_authority_lifecycle_observer,
+            ),
         ):
             if callback is not None and not callable(callback):
                 raise TypeError(f"protected operation {label} must be callable")
@@ -1287,6 +1350,27 @@ class ProtectedOperationSDK:
             )
         self._post_commit_result_observer = observer
         self._post_commit_observer_failure = failure
+
+    def report_semantic_authority_lifecycle(
+        self,
+        event: Mapping[str, Any],
+    ) -> bool:
+        """Deliver one payload-free Host lifecycle notification.
+
+        ``False`` means no durable observer was installed.  Callers must then
+        trip their local semantic authority latch; this method never falls
+        back to a model-, Skill-, or invocation-provided callback.
+        """
+
+        observer = self._semantic_authority_lifecycle_observer
+        if observer is None:
+            return False
+        _call_synchronous_hook(
+            "semantic authority lifecycle observer",
+            observer,
+            dict(event),
+        )
+        return True
 
     def select_post_commit_result_observers(
         self,
@@ -1654,6 +1738,14 @@ class ProtectedOperationSDK:
             raise ValidationError(f"protected operation contract is not registered: {name}")
         if not isinstance(contract, str) and registered != contract:
             raise ValidationError(f"protected operation contract does not match registry: {name}")
+        if (
+            name in _SOURCE_REF_REDACTED_EVIDENCE_CONTRACTS
+            and not invocation.data_flow_redact_source_refs_evidence
+        ):
+            raise ValidationError(
+                "protected semantic classifier source-reference evidence "
+                "redaction is Host-mandated"
+            )
         recovery_name = registered.prepared_recovery
         if (
             recovery_name is not None
@@ -1703,6 +1795,9 @@ class ProtectedOperation:
         self._resource_reservation_id: str | None = None
         self._post_commit_observer_ran = False
         self._post_commit_observer_failure: PostCommitObserverFailure | None = None
+        self._semantic_unknown_trip_reported = False
+        self._semantic_consumed_reported = False
+        self._semantic_terminal_outcome_reported = False
 
     @property
     def terminal(self) -> bool:
@@ -1943,12 +2038,26 @@ class ProtectedOperation:
                     )
             except BaseException as settlement_error:
                 self._terminal = True
+                self._report_semantic_authority_lifecycle(
+                    "provider_outcome_unknown",
+                    phase="completion_settlement",
+                    error_type=type(settlement_error).__name__,
+                )
                 raise settlement_error from error
             self._terminal = True
+            self._report_semantic_authority_lifecycle(
+                "provider_outcome_unknown",
+                phase="completion_settlement",
+                error_type=type(error).__name__,
+            )
             if self.contract.post_provider_failure_mode == PostProviderFailureMode.PRESERVE_RESULT:
                 return result
             raise
 
+        self._report_semantic_authority_lifecycle(
+            "succeeded",
+            phase="completion",
+        )
         self._run_post_commit_result_observer(result)
         self._charge_resource(resource)
         return result
@@ -2001,6 +2110,7 @@ class ProtectedOperation:
                 provider_spec_sha256=provider_spec_sha256,
                 tool_schema_sha256=tool_schema_sha256,
                 data_flow_direction=self.contract.data_flow_direction.value,
+                data_flow_context=flow,
             )
         except BaseException as error:
             for _observer, handler in observers:
@@ -2147,7 +2257,15 @@ class ProtectedOperation:
                         self.invocation.prepare,
                     )
                 self._revalidate_authority()
+                self._revalidate_semantic_authority(
+                    phase="prepare",
+                    allow_reserved=False,
+                )
                 self._revalidate_data_flow()
+                self._revalidate_semantic_authority(
+                    phase="reserve",
+                    allow_reserved=False,
+                )
                 self._reserve_decisions()
                 effect = prepare_external_effect_intent(
                     self.sdk.effects,
@@ -2179,6 +2297,7 @@ class ProtectedOperation:
                         reserved_by=effect.effect_id,
                     )
         except BaseException as error:
+            self._persist_deferred_semantic_safety_trip(error)
             self._persist_rolled_back_data_flow_denial(error)
             raise
 
@@ -2265,7 +2384,13 @@ class ProtectedOperation:
             return
         if self.invocation.authority_revalidator is None:
             current = tuple(
-                self.sdk.capabilities.reauthorize_decision(decision)
+                (
+                    self.sdk.capabilities.reauthorize_selected_decision(decision)
+                    if self.sdk.capabilities.is_semantic_approval_decision(
+                        decision
+                    )
+                    else self.sdk.capabilities.reauthorize_decision(decision)
+                )
                 for decision in self.invocation.decisions
             )
         else:
@@ -2323,6 +2448,31 @@ class ProtectedOperation:
             self._validate_reauthorized_decision(prepared, decision)
             current.append(decision)
         self._authority_decisions = tuple(current)
+
+    def _revalidate_semantic_authority(
+        self,
+        *,
+        phase: str,
+        allow_reserved: bool,
+    ) -> None:
+        """Recheck Host control for every selected machine one-shot grant.
+
+        A finite grant cannot be generally reauthorized after reservation
+        because its available-use count is already zero.  This independent
+        check keeps the durable policy epoch, control generation, and global
+        kill switch live through the last transaction before each provider
+        dispatch.
+        """
+
+        if self.contract.authority_mode == AuthorityMode.RUNTIME_INTERNAL:
+            return
+        for decision in self._authority_decisions:
+            self.sdk.capabilities.require_semantic_approval_current(
+                decision,
+                phase=phase,
+                effect_id=self.effect_id,
+                allow_reserved=allow_reserved,
+            )
 
     def _validate_provider_registry_binding_contract(self) -> None:
         captured = self.invocation.provider_registry_binding
@@ -2395,6 +2545,13 @@ class ProtectedOperation:
             raise CapabilityDenied(
                 "protected operation revalidated capability subject does not match the acting process"
             )
+        if self.sdk.capabilities.is_semantic_approval_decision(original) and (
+            decision.selected_capability_id != original.selected_capability_id
+            or decision.consume_capability_id != original.consume_capability_id
+        ):
+            raise CapabilityDenied(
+                "semantic one-shot authority revalidation changed the exact selected grant"
+            )
 
     def _persist_rolled_back_data_flow_denial(self, error: BaseException) -> None:
         decision = getattr(error, "data_flow_decision", None)
@@ -2406,7 +2563,15 @@ class ProtectedOperation:
             or not isinstance(sink, DataSink)
         ):
             return
-        manager.persist_denied_decision(decision=decision, sink=sink)
+        manager.persist_denied_decision(
+            decision=decision,
+            sink=sink,
+            redacted_evidence=getattr(
+                error,
+                "data_flow_redacted_evidence",
+                None,
+            ),
+        )
 
     def _preflight_data_flow(self) -> None:
         direction = self.contract.data_flow_direction
@@ -2501,6 +2666,9 @@ class ProtectedOperation:
                 "allow_recovered_source_snapshots": (
                     self.invocation.data_flow_allow_recovered_source_snapshots
                 ),
+                "redact_source_refs_evidence": (
+                    self.invocation.data_flow_redact_source_refs_evidence
+                ),
             }
             if registry_generation is not None:
                 authorization["expected_registry_generation"] = registry_generation
@@ -2553,6 +2721,9 @@ class ProtectedOperation:
                     "Sink identity could not be revalidated before provider dispatch "
                     f"({type(error).__name__})"
                 ),
+                redact_source_refs_evidence=(
+                    self.invocation.data_flow_redact_source_refs_evidence
+                ),
             )
             raise AssertionError("data-flow Sink rejection must raise") from error
         if not isinstance(current, DataSink):
@@ -2566,6 +2737,9 @@ class ProtectedOperation:
             sink=current,
             context=context,
             payload=payload,
+            redact_source_refs_evidence=(
+                self.invocation.data_flow_redact_source_refs_evidence
+            ),
         )
         raise AssertionError("data-flow Sink rejection must raise")
 
@@ -2594,6 +2768,9 @@ class ProtectedOperation:
             "expected_registry_generation": self._data_flow_registry_generation,
             "allow_recovered_source_snapshots": (
                 self.invocation.data_flow_allow_recovered_source_snapshots
+            ),
+            "redact_source_refs_evidence": (
+                self.invocation.data_flow_redact_source_refs_evidence
             ),
         }
         resolver = self.invocation.data_flow_target_state_version_resolver
@@ -2681,7 +2858,32 @@ class ProtectedOperation:
         decision: DataFlowDecision,
         sink: DataSink,
     ) -> dict[str, Any]:
-        return {
+        redact = (
+            self.contract.name in _SOURCE_REF_REDACTED_EVIDENCE_CONTRACTS
+            or self.invocation.data_flow_redact_source_refs_evidence
+        )
+        if redact:
+            context = self.invocation.data_flow_context
+            manager = self.sdk.data_flow
+            if not isinstance(context, DataFlowContext) or manager is None:
+                raise ProtectedOperationProtocolError(
+                    "redacted DataFlow evidence lost its live Host context"
+                )
+            labels_evidence = manager.identity_safe_evidence_labels(context.labels)
+            labels_sha256 = manager.identity_safe_evidence_labels_sha256(
+                context.labels
+            )
+            source_refs_sha256 = context.source_refs_hash()
+            source_ref_count = len(context.source_refs)
+        else:
+            labels_evidence = decision.labels.to_dict()
+            labels_sha256 = decision.labels.labels_hash()
+            source_refs_sha256 = DataFlowContext(
+                labels=decision.labels,
+                source_refs=decision.source_refs,
+            ).source_refs_hash()
+            source_ref_count = len(decision.source_refs)
+        evidence = {
             "decision_id": decision.decision_id,
             "sink": decision.sink,
             "sink_identity_sha256": sink.identity_sha256,
@@ -2690,13 +2892,9 @@ class ProtectedOperation:
             "direction": decision.direction.value,
             "outcome": decision.outcome.value,
             "reason": decision.reason,
-            "labels": decision.labels.to_dict(),
-            "labels_sha256": decision.labels.labels_hash(),
-            "source_refs": [item.to_dict() for item in decision.source_refs],
-            "source_refs_sha256": DataFlowContext(
-                labels=decision.labels,
-                source_refs=decision.source_refs,
-            ).source_refs_hash(),
+            "labels": labels_evidence,
+            "labels_sha256": labels_sha256,
+            "source_refs_sha256": source_refs_sha256,
             "payload_sha256": decision.payload_hash,
             "trust_id": decision.trust_id,
             "trust_sha256": decision.trust_hash,
@@ -2706,6 +2904,13 @@ class ProtectedOperation:
                 self.contract.minimum_egress_integrity.value
             ),
         }
+        if redact:
+            evidence["source_ref_count"] = source_ref_count
+        else:
+            evidence["source_refs"] = [
+                item.to_dict() for item in decision.source_refs
+            ]
+        return evidence
 
     def _dispatch(self, phase: ProviderPhase) -> None:
         if self.effect_id is None:
@@ -2713,6 +2918,10 @@ class ProtectedOperation:
         try:
             with self.sdk.effects.transaction():
                 self._revalidate_dispatch_authority()
+                self._revalidate_semantic_authority(
+                    phase="dispatch",
+                    allow_reserved=True,
+                )
                 self._revalidate_provider_registry_binding()
                 self._revalidate_data_sink_identity()
                 self._revalidate_data_flow(use_reserved_release=True)
@@ -2747,6 +2956,7 @@ class ProtectedOperation:
                         f"{self.contract.name}:{phase.name}"
                     )
         except BaseException as error:
+            self._persist_deferred_semantic_safety_trip(error)
             self._persist_rolled_back_data_flow_denial(error)
             raise
         self._dispatched = True
@@ -2765,6 +2975,20 @@ class ProtectedOperation:
                     "provider_dispatch_rejected_after_non_effectful_phases"
                 )
             raise
+
+    def _persist_deferred_semantic_safety_trip(
+        self,
+        error: BaseException,
+    ) -> None:
+        """Persist a Host trip only after the enclosing effect UoW rolled back."""
+
+        if not isinstance(error, SemanticAuthorityTripDeferred):
+            return
+        self.sdk.capabilities.report_semantic_authority_safety_trip(
+            trip_code=error.trip_code,
+            evidence_sha256=error.evidence_sha256,
+            tenant_bucket_sha256=error.tenant_bucket_sha256,
+        )
 
     def _record_completed_phase(self, phase: ProviderPhase) -> None:
         if self.effect_id is None:
@@ -2825,6 +3049,124 @@ class ProtectedOperation:
                     reason=f"protected operation crossed provider boundary: {self.contract.name}",
                 )
         self._reservations_committed = True
+        self._report_semantic_authority_lifecycle(
+            "consumed",
+            phase="capability_commit",
+        )
+
+    def _semantic_authority_lifecycle_evidence(
+        self,
+    ) -> tuple[dict[str, Any], ...]:
+        selected: list[dict[str, Any]] = []
+        for decision in self._authority_decisions:
+            evidence = self.sdk.capabilities.semantic_approval_lifecycle_evidence(
+                decision
+            )
+            if evidence is not None:
+                selected.append(evidence)
+        return tuple(selected)
+
+    def _report_semantic_authority_lifecycle(
+        self,
+        outcome: str,
+        *,
+        phase: str,
+        error_type: str | None = None,
+    ) -> None:
+        if outcome == "consumed":
+            if self._semantic_consumed_reported:
+                return
+        elif self._semantic_terminal_outcome_reported:
+            return
+        authority = self._semantic_authority_lifecycle_evidence()
+        if not authority:
+            return
+        authority = tuple(
+            sorted(
+                authority,
+                key=lambda item: (
+                    str(item.get("settlement_id", "")),
+                    str(item.get("capability_id", "")),
+                    str(item.get("binding_sha256", "")),
+                ),
+            )
+        )
+        authority_with_outcome_ids: list[dict[str, Any]] = []
+        for item in authority:
+            # All terminal conclusions intentionally share one identity.  A
+            # contradictory succeeded/failed/unknown notification therefore
+            # conflicts with the append-only record instead of winning a
+            # second budget release.
+            identity_kind = "consumed" if outcome == "consumed" else "terminal"
+            outcome_projection = {
+                "schema_version": 1,
+                "lifecycle_slot": identity_kind,
+                "effect_id": self.effect_id,
+                "settlement_id": item.get("settlement_id"),
+                "capability_id": item.get("capability_id"),
+                "binding_sha256": item.get("binding_sha256"),
+            }
+            outcome_encoded = json.dumps(
+                outcome_projection,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            authority_with_outcome_ids.append(
+                {
+                    **item,
+                    "outcome_id": (
+                        "semantic-outcome:"
+                        + hashlib.sha256(outcome_encoded).hexdigest()
+                    ),
+                }
+            )
+        if outcome == "consumed":
+            self._semantic_consumed_reported = True
+        else:
+            self._semantic_terminal_outcome_reported = True
+        must_trip = outcome == "provider_outcome_unknown"
+        if must_trip:
+            self._semantic_unknown_trip_reported = True
+            self.sdk.capabilities.trip_semantic_authority_locally()
+        identity_projection = {
+            "schema_version": 1,
+            "outcome": outcome,
+            "effect_id": self.effect_id,
+            "authority": authority_with_outcome_ids,
+        }
+        encoded_identity = json.dumps(
+            identity_projection,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        event = {
+            **identity_projection,
+            "notification_id": (
+                "semantic-lifecycle:"
+                + hashlib.sha256(encoded_identity).hexdigest()
+            ),
+            "pid": self.invocation.pid,
+            "contract_name": self.contract.name,
+            "phase": phase,
+            "error_type": error_type,
+        }
+        try:
+            delivered = self.sdk.report_semantic_authority_lifecycle(event)
+            if not delivered:
+                # A canary Runtime must install the durable ledger/budget
+                # bridge.  Missing it cannot reactivate authority; the local
+                # latch makes this instance fail closed while startup
+                # validation/recovery owns the persistent diagnostic.
+                self.sdk.capabilities.trip_semantic_authority_locally()
+        except Exception:
+            # Provider execution has already crossed (or attempted to cross)
+            # the external boundary. Never hide/replace its result, but stop
+            # every subsequent machine grant in this Runtime.
+            self.sdk.capabilities.trip_semantic_authority_locally()
 
     def _expect_settlement_evidence(self) -> None:
         self.sdk.operations.expect("audit", "event")
@@ -2984,6 +3326,17 @@ class ProtectedOperation:
                 self._settle_resource_reservation_unknown(error=error, phase=phase)
             else:
                 self._charge_resource(failure_resource)
+        semantic_outcome = (
+            "provider_outcome_unknown"
+            if classification.rollback_status
+            is ExternalEffectRollbackStatus.UNKNOWN
+            else "failed"
+        )
+        self._report_semantic_authority_lifecycle(
+            semantic_outcome,
+            phase=phase,
+            error_type=type(error).__name__,
+        )
         if settlement_error is not None:
             raise settlement_error from error
 

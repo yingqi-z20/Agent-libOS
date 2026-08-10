@@ -896,6 +896,17 @@ class TestSkillPackageLoading:
                 runtime.filesystem.grant_directory(pid, 'workspace-skill/references', [CapabilityRight.READ], issued_by='test')
                 with pytest.raises(HumanApprovalRequired) as raised:
                     runtime.skills.activate_skill_from_workspace_path(pid, 'workspace-skill')
+                first = runtime.human.get(raised.value.request_id)
+                assert first.payload['requested_once_capability']['rights'] == [
+                    CapabilityRight.WRITE.value
+                ]
+                runtime.human.approve(raised.value.request_id)
+                with pytest.raises(HumanApprovalRequired) as raised:
+                    runtime.skills.activate_skill_from_workspace_path(pid, 'workspace-skill')
+                second = runtime.human.get(raised.value.request_id)
+                assert second.payload['requested_once_capability']['rights'] == [
+                    CapabilityRight.EXECUTE.value
+                ]
                 runtime.human.approve(raised.value.request_id)
                 loaded = runtime.skills.activate_skill_from_workspace_path(pid, 'workspace-skill')
                 assert loaded['skill_id'] == 'workspace-skill'

@@ -1,5 +1,28 @@
 import { describe, expect, it } from "vitest";
-import { allowedTaskRunActions, assertLlmCallDetail, assertLlmCallPage, assertLlmTraceContentChunk, assertMcpDiscoveryResult, assertRuntimeSnapshot, assertSemanticAssessmentDetailResponse, assertSemanticAssessmentPage, assertSemanticStatus, assertTaskRunDetail, runtimeSnapshotFromSseData, taskRunSummaryFromSseData, upsertTaskRunSummary } from "./types";
+import {
+  allowedTaskRunActions,
+  assertLlmCallDetail,
+  assertLlmCallPage,
+  assertLlmTraceContentChunk,
+  assertMcpDiscoveryResult,
+  assertRuntimeSnapshot,
+  assertSemanticAssessmentDetailResponse,
+  assertSemanticAssessmentPage,
+  assertSemanticControlHistoryPage,
+  assertSemanticControlState,
+  assertSemanticFlowEdgePage,
+  assertSemanticFlowEntityPage,
+  assertSemanticFlowLineage,
+  assertSemanticHealthEventPage,
+  assertSemanticMachineSettlementPage,
+  assertSemanticMetrics,
+  assertSemanticPolicyEpochPage,
+  assertSemanticStatus,
+  assertTaskRunDetail,
+  runtimeSnapshotFromSseData,
+  taskRunSummaryFromSseData,
+  upsertTaskRunSummary
+} from "./types";
 
 describe("assertRuntimeSnapshot", () => {
   it("accepts the minimum same-build snapshot shape", () => {
@@ -205,7 +228,7 @@ describe("Semantic observability API projection", () => {
     })).toThrow(/finding/);
   });
 
-  it("rejects invalid digests, confidence, spans, and Shadow auto-approval rates", () => {
+  it("rejects invalid digests, confidence, spans, and inconsistent auto-approval rates", () => {
     expect(() => assertSemanticAssessmentPage({
       schema_version: 1,
       items: [{ ...semanticSummary(), confidence_bps: 10_001 }],
@@ -299,7 +322,7 @@ describe("Semantic observability API projection", () => {
     })).not.toThrow();
     expect(() => assertSemanticStatus({
       ...semanticStatus(),
-      actual_auto_approval: { numerator: 0, denominator: 1, rate: 0 }
+      actual_auto_approval: { numerator: 0, denominator: 1, rate: 0.5 }
     })).toThrow(/malformed/);
   });
 
@@ -345,6 +368,163 @@ describe("Semantic observability API projection", () => {
       ...value,
       assessments: { ...value.assessments, ood: 1 }
     })).toThrow(/malformed/);
+    expect(() => assertSemanticStatus({
+      ...value,
+      review_metrics: { ...value.review_metrics, issued_reviewed: 1, issued_review_rate: null }
+    })).toThrow(/malformed/);
+    expect(() => assertSemanticStatus({
+      ...value,
+      actual_auto_approval: { numerator: 0, denominator: 1, rate: 0 }
+    })).toThrow(/malformed/);
+  });
+
+  it("does not echo rejected Semantic enum or private-field values", () => {
+    const sentinel = "SEMANTIC_SECRET_SENTINEL_DO_NOT_ECHO";
+    for (const candidate of [
+      { ...semanticStatus(), [sentinel]: true },
+      {
+        schema_version: 1,
+        items: [{ ...semanticSummary(), reason_codes: [sentinel] }],
+        next_cursor: null
+      }
+    ]) {
+      let message = "";
+      try {
+        if ("mode" in candidate) assertSemanticStatus(candidate);
+        else assertSemanticAssessmentPage(candidate);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).not.toBe("");
+      expect(message).not.toContain(sentinel);
+    }
+  });
+});
+
+describe("Semantic Phase 2-4 read-only evidence decoders", () => {
+  it("accepts exact payload-free Flow, settlement, epoch, control, health, and metrics projections", () => {
+    const value = semanticPhase24Fixtures();
+    expect(() => assertSemanticFlowEntityPage({ schema_version: 1, items: [value.entity], next_cursor: null })).not.toThrow();
+    expect(() => assertSemanticFlowLineage(value.lineage)).not.toThrow();
+    expect(() => assertSemanticMachineSettlementPage({ schema_version: 1, items: [value.settlement], next_cursor: null })).not.toThrow();
+    expect(() => assertSemanticPolicyEpochPage({ schema_version: 1, items: [value.epoch], next_cursor: null })).not.toThrow();
+    expect(() => assertSemanticControlState(value.control)).not.toThrow();
+    expect(() => assertSemanticControlHistoryPage({ schema_version: 1, items: [value.control], next_cursor: null })).not.toThrow();
+    expect(() => assertSemanticHealthEventPage({ schema_version: 1, items: [value.health], next_cursor: null })).not.toThrow();
+    expect(() => assertSemanticMetrics(value.metrics)).not.toThrow();
+    expect(() => assertSemanticControlState({
+      ...value.control,
+      mode: "off",
+      tripped: false,
+      trip_code: null
+    })).toThrow(/control/);
+  });
+
+  it("rejects private fields, invalid lineage identities, and inconsistent safety metrics", () => {
+    const value = semanticPhase24Fixtures();
+    expect(() => assertSemanticFlowEntityPage({
+      schema_version: 1,
+      items: [{ ...value.entity, raw_content: "SECRET_MUST_NOT_RENDER" }],
+      next_cursor: null
+    })).toThrow(/entity/);
+    expect(() => assertSemanticFlowEntityPage({
+      schema_version: 1,
+      items: [{ ...value.entity, entity_id: "entity with spaces" }],
+      next_cursor: null
+    })).toThrow(/entity/);
+    expect(() => assertSemanticFlowEntityPage({
+      schema_version: 1,
+      items: [{ ...value.entity, identity_present: false, identity_mixed: true }],
+      next_cursor: null
+    })).toThrow(/entity/);
+    expect(() => assertSemanticFlowEdgePage({
+      schema_version: 1,
+      items: [{
+        ...value.edge,
+        source_node_id: "entity_1",
+        source_node_type: "entity",
+        target_node_id: "entity_1",
+        target_node_type: "entity"
+      }],
+      next_cursor: null
+    })).toThrow(/edge/);
+    expect(() => assertSemanticFlowEntityPage({
+      schema_version: 1,
+      items: [{ ...value.entity, created_at: "2030-01-01T00:00:00" }],
+      next_cursor: null
+    })).toThrow(/entity/);
+    expect(() => assertSemanticFlowLineage({
+      ...value.lineage,
+      items: [{ ...value.lineage.items[0], node_type: "entity", node: value.activity }]
+    })).toThrow(/entity/);
+    expect(() => assertSemanticFlowLineage({
+      ...value.lineage,
+      items: [{
+        ...value.lineage.items[0],
+        node: { ...value.activity, activity_id: "unrelated_activity" }
+      }]
+    })).toThrow(/edge endpoint/);
+    expect(() => assertSemanticMachineSettlementPage({
+      schema_version: 1,
+      items: [{ ...value.settlement, reasoning: "hidden" }],
+      next_cursor: null
+    })).toThrow(/settlement/);
+    expect(() => assertSemanticMachineSettlementPage({
+      schema_version: 1,
+      items: [{ ...value.settlement, capability_id: null }],
+      next_cursor: null
+    })).toThrow(/settlement/);
+    expect(() => assertSemanticMachineSettlementPage({
+      schema_version: 1,
+      items: [{
+        ...value.settlement,
+        outcome: "denied",
+        capability_id: null,
+        matched_rule_id: null,
+        reason_codes: ["risk_detected"]
+      }],
+      next_cursor: null
+    })).toThrow(/settlement/);
+    expect(() => assertSemanticHealthEventPage({
+      schema_version: 1,
+      items: [{ ...value.health, severity: "error" }],
+      next_cursor: null
+    })).toThrow(/health/);
+    expect(() => assertSemanticMetrics({
+      ...value.metrics,
+      review_metrics: {
+        ...value.metrics.review_metrics,
+        reviewed: 2,
+        safe: 1,
+        unsafe: 1,
+        unsafe_rate: 0.25
+      }
+    })).toThrow(/metrics/);
+    expect(() => assertSemanticMetrics({ ...value.metrics, risk: "unknown" })).toThrow(/metrics/);
+    expect(() => assertSemanticMetrics({
+      ...value.metrics,
+      review_metrics: {
+        reviewed: 12,
+        safe: 12,
+        unsafe: 0,
+        unsafe_rate: 0,
+        issued_reviewed: 0,
+        issued_review_rate: 0
+      }
+    })).not.toThrow();
+    expect(() => assertSemanticMetrics({
+      ...value.metrics,
+      review_metrics: { ...value.metrics.review_metrics, issued_reviewed: 3, issued_review_rate: 1 }
+    })).toThrow(/metrics/);
+    expect(() => assertSemanticMetrics({
+      ...value.metrics,
+      actual_auto_approval: { numerator: 1, denominator: 2, rate: 0.5 }
+    })).toThrow(/metrics/);
+    expect(() => assertSemanticHealthEventPage({
+      schema_version: 1,
+      items: [{ ...value.health, event_kind: "SEMANTIC_SECRET_SENTINEL_DO_NOT_ECHO" }],
+      next_cursor: null
+    })).toThrow(/health/);
   });
 });
 
@@ -543,7 +723,7 @@ function mcpDiscovery() {
 
 function semanticStatus() {
   return {
-    schema_version: 2,
+    schema_version: 3,
     mode: "shadow",
     adapter: "deterministic",
     profile_id: null,
@@ -578,8 +758,197 @@ function semanticStatus() {
         unknown: 0
       }
     },
-    actual_auto_approval: { numerator: 0, denominator: 0, rate: null }
+    control: {
+      catalog_version: null,
+      active_epoch_id: null,
+      active_epoch_sha256: null,
+      generation: 0,
+      state: "inactive",
+      trip_reason_code: null
+    },
+    flow: {
+      schema_version: 1,
+      available: false,
+      counts: { entities: 0, activities: 0, edges: 0, label_assertions: 0 },
+      coverage: { complete: 0, partial: 0, unknown: 0, conflict: 0, stale: 0 },
+      capture_failures: 0,
+      legacy_history: {
+        present: false,
+        source_schema_version: null,
+        assessment_count: 0,
+        coverage: null,
+        evidence_sha256: null,
+        created_at: null
+      }
+    },
+    machine: {
+      eligible: 0,
+      issued: 0,
+      consumed: 0,
+      succeeded: 0,
+      failed: 0,
+      unknown: 0,
+      expired: 0,
+      revoked: 0,
+      race_lost: 0,
+      denied: 0
+    },
+    actual_auto_approval: { numerator: 0, denominator: 0, rate: null },
+    review_metrics: {
+      reviewed: 0,
+      safe: 0,
+      unsafe: 0,
+      unsafe_rate: null,
+      issued_reviewed: 0,
+      issued_review_rate: null
+    }
   };
+}
+
+function semanticPhase24Fixtures() {
+  const labels = {
+    sensitivity: "normal",
+    trust_level: "verified",
+    integrity: "checked"
+  };
+  const entity = {
+    schema_version: 1,
+    entity_id: "entity_1",
+    kind: "provider_result",
+    pid: "pid_1",
+    tenant_bucket_sha256: "1".repeat(64),
+    content_sha256: "2".repeat(64),
+    version_sha256: "3".repeat(64),
+    provenance_sha256: "4".repeat(64),
+    baseline_labels: labels,
+    coverage: "complete",
+    identity_present: true,
+    identity_mixed: false,
+    created_at: "2030-01-01T00:00:00Z"
+  };
+  const activity = {
+    schema_version: 1,
+    activity_id: "activity_1",
+    kind: "provider_call",
+    pid: "pid_1",
+    action_id: "filesystem.read",
+    effect_id: "effect_1",
+    state_sha256: "5".repeat(64),
+    provider_spec_sha256: "6".repeat(64),
+    tool_schema_sha256: null,
+    model_artifact_sha256: null,
+    tenant_bucket_sha256: "1".repeat(64),
+    created_at: "2030-01-01T00:00:01Z"
+  };
+  const edge = {
+    schema_version: 1,
+    edge_id: "edge_1",
+    relation: "direct",
+    source_node_id: "activity_1",
+    source_node_type: "activity",
+    target_node_id: "entity_1",
+    target_node_type: "entity",
+    pid: "pid_1",
+    provenance_sha256: "7".repeat(64),
+    created_at: "2030-01-01T00:00:02Z"
+  };
+  const lineage = {
+    schema_version: 1,
+    root_node_id: "entity_1",
+    direction: "upstream",
+    items: [{ depth: 1, edge, node_type: "activity", node: activity }],
+    effective_labels: labels,
+    coverage: "complete",
+    next_cursor: null,
+    truncated: false
+  };
+  const settlement = {
+    schema_version: 1,
+    settlement_id: "settlement_1",
+    assessment_id: "assessment_1",
+    job_id: "job_1",
+    request_id: "request_1",
+    request_revision: 2,
+    pid: "pid_1",
+    operation_id: "operation_1",
+    effect_id: "effect_1",
+    epoch_id: "epoch_1",
+    policy_sha256: "8".repeat(64),
+    tenant_bucket_sha256: "1".repeat(64),
+    action_id: "filesystem.read",
+    outcome: "issued",
+    capability_id: "capability_1",
+    binding_sha256: "9".repeat(64),
+    decision_sha256: "a".repeat(64),
+    matched_rule_id: "read_reports",
+    reason_codes: ["policy_match"],
+    created_at: "2030-01-01T00:00:03Z",
+    human_outcome: null,
+    human_outcome_source: null,
+    human_outcome_request_revision: null,
+    human_outcome_decision_sha256: null,
+    human_outcome_created_at: null
+  };
+  const epoch = {
+    schema_version: 1,
+    epoch_id: "epoch_1",
+    generation: 1,
+    catalog_version: 1,
+    policy_sha256: "8".repeat(64),
+    expected_previous_sha256: null,
+    created_at: "2030-01-01T00:00:04Z"
+  };
+  const control = {
+    schema_version: 1,
+    revision: 1,
+    generation: 1,
+    mode: "canary_auto",
+    active_epoch_id: "epoch_1",
+    active_policy_sha256: "8".repeat(64),
+    tripped: false,
+    trip_code: null,
+    updated_at: "2030-01-01T00:00:05Z"
+  };
+  const health = {
+    schema_version: 1,
+    event_id: "health_1",
+    event_kind: "semantic_policy_activated",
+    severity: "info",
+    epoch_id: "epoch_1",
+    tenant_bucket_sha256: "1".repeat(64),
+    evidence_sha256: "b".repeat(64),
+    created_at: "2030-01-01T00:00:06Z"
+  };
+  const metrics = {
+    schema_version: 1,
+    window: "7d",
+    action_id: "filesystem.read",
+    tenant_bucket_sha256: "1".repeat(64),
+    epoch_id: "epoch_1",
+    risk: "low",
+    machine: {
+      eligible: 2,
+      issued: 2,
+      consumed: 1,
+      succeeded: 1,
+      failed: 0,
+      unknown: 0,
+      expired: 0,
+      revoked: 0,
+      race_lost: 0,
+      denied: 0
+    },
+    actual_auto_approval: { numerator: 2, denominator: 2, rate: 1 },
+    review_metrics: {
+      reviewed: 2,
+      safe: 2,
+      unsafe: 0,
+      unsafe_rate: 0,
+      issued_reviewed: 2,
+      issued_review_rate: 1
+    }
+  };
+  return { entity, activity, edge, lineage, settlement, epoch, control, health, metrics };
 }
 
 function semanticSummary() {

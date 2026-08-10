@@ -348,6 +348,94 @@ export type HumanRequestPayload = Record<string, unknown> & {
   release_request_id?: string | null;
 };
 
+export type SemanticRisk = "low" | "medium" | "high" | "critical";
+export type SemanticApprovalArgumentKind = "filesystem" | "shell" | "git" | "jsonrpc" | "mcp" | "other";
+export type SemanticApprovalGitReferenceRole =
+  | "base" | "base_oid" | "base_ref" | "branch" | "expected_remote_oid" | "git_old_oid" | "git_remote"
+  | "git_remote_ref" | "head" | "head_oid" | "head_ref" | "index_oid" | "local_ref" | "managed_worktree_id"
+  | "new_branch" | "new_name" | "patch_oid" | "pr_id" | "ref" | "remote" | "remote_ref" | "source"
+  | "start" | "tag" | "target";
+export type SemanticApprovalGitReferenceV1 = {
+  role: SemanticApprovalGitReferenceRole;
+  display: string;
+  sha256: string;
+};
+export type SemanticApprovalArgumentProjectionV1 = {
+  kind: SemanticApprovalArgumentKind;
+  operation: string;
+  display_argv: string[];
+  argv_count: number | null;
+  argv_truncated: boolean;
+  argv_sha256: string | null;
+  safe_cwd: string | null;
+  cwd_sha256: string | null;
+  endpoint_id: string | null;
+  endpoint_id_sha256: string | null;
+  method_id: string | null;
+  method_id_sha256: string | null;
+  server_id: string | null;
+  server_id_sha256: string | null;
+  tool_id: string | null;
+  tool_id_sha256: string | null;
+  registry_spec_sha256: string | null;
+  registry_generation: number | null;
+  payload_sha256: string | null;
+  path_sha256: string | null;
+  content_sha256: string | null;
+  content_bytes: number | null;
+  read_max_bytes: number | null;
+  entry_limit: number | null;
+  text_encoding: string | null;
+  expected_content_sha256: string | null;
+  overwrite: boolean | null;
+  parents: boolean | null;
+  exist_ok: boolean | null;
+  recursive: boolean | null;
+  missing_ok: boolean | null;
+  timeout_seconds: string | null;
+  continuous_session: boolean | null;
+  network_access: boolean | null;
+  worktree_id: string | null;
+  worktree_id_sha256: string | null;
+  repository_state_sha256: string | null;
+  source_args_sha256: string | null;
+  git_references: SemanticApprovalGitReferenceV1[];
+  git_fact_tokens: string[];
+};
+export type SemanticTripCode =
+  | "unsafe_review"
+  | "critical_high_grant"
+  | "cross_tenant"
+  | "secret_egress"
+  | "replay_detected"
+  | "binding_mismatch"
+  | "unauthorized_effect"
+  | "provider_outcome_unknown";
+
+export type CanonicalApprovalPreviewV1 = {
+  schema_version: 1;
+  request_id: string;
+  revision: number;
+  pid: string;
+  action_id: string;
+  resource_display: string;
+  resource_sha256: string;
+  rights: string[];
+  effect_id: string;
+  canonical_args_sha256: string;
+  argument_projection: SemanticApprovalArgumentProjectionV1;
+  target_state_sha256: string | null;
+  risk: SemanticRisk;
+  source_labels: {
+    sensitivity: "public" | "normal" | "confidential" | "restricted" | "secret";
+    integrity: "untrusted" | "unknown" | "checked" | "verified";
+    trust_level: "untrusted" | "unknown" | "user_asserted" | "verified" | "trusted";
+    identity_present: boolean;
+    identity_mixed: boolean;
+  };
+  expires_at: string | null;
+};
+
 export type DataReleaseApprovalContext = Record<string, unknown> & {
   sink: string;
   sensitivity: string;
@@ -367,11 +455,346 @@ export type HumanRequest = {
   status: string;
   decision: Record<string, unknown> | null;
   blocking: boolean;
+  revision: number;
   created_at: string;
   updated_at: string;
+  approval_preview?: CanonicalApprovalPreviewV1;
+  preview_sha256?: string;
   release_request_id?: string;
   release_for_request_id?: string;
 };
+
+const canonicalApprovalPreviewKeys = new Set([
+  "schema_version", "request_id", "revision", "pid", "action_id", "resource_display", "resource_sha256", "rights", "effect_id",
+  "canonical_args_sha256", "argument_projection", "target_state_sha256", "risk", "source_labels", "expires_at"
+]);
+const canonicalArgumentProjectionKeys = new Set([
+  "kind", "operation", "display_argv", "argv_count", "argv_truncated", "argv_sha256", "safe_cwd", "cwd_sha256",
+  "endpoint_id", "endpoint_id_sha256", "method_id", "method_id_sha256", "server_id", "server_id_sha256",
+  "tool_id", "tool_id_sha256", "registry_spec_sha256", "registry_generation", "payload_sha256", "path_sha256", "content_sha256",
+  "content_bytes", "read_max_bytes", "entry_limit", "text_encoding", "expected_content_sha256", "overwrite", "parents",
+  "exist_ok", "recursive", "missing_ok", "timeout_seconds", "continuous_session", "network_access", "worktree_id",
+  "worktree_id_sha256", "repository_state_sha256", "source_args_sha256", "git_references", "git_fact_tokens"
+]);
+const canonicalSourceLabelKeys = new Set([
+  "sensitivity", "integrity", "trust_level", "identity_present", "identity_mixed"
+]);
+const canonicalApprovalRisks = new Set(["low", "medium", "high", "critical"]);
+const canonicalApprovalSensitivity = new Set(["public", "normal", "confidential", "restricted", "secret"]);
+const canonicalApprovalIntegrity = new Set(["untrusted", "unknown", "checked", "verified"]);
+const canonicalApprovalTrust = new Set(["untrusted", "unknown", "user_asserted", "verified", "trusted"]);
+const canonicalApprovalRights = new Set([
+  "read", "write", "execute", "link", "diff", "materialize", "delete", "grant", "revoke", "approve", "admin"
+]);
+const canonicalApprovalAction = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/;
+const canonicalApprovalOperation = /^[a-z][a-z0-9_]{0,127}$/;
+const canonicalApprovalIdentity = /^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,255}$/;
+const canonicalApprovalResource = /^[A-Za-z0-9][A-Za-z0-9_.:@+/*=-]{0,511}$/;
+const canonicalApprovalGitFact = /^[a-z][a-z0-9_]{0,31}=(?:true|false|[a-z][a-z0-9_]{0,31}|[0-9]{1,16}|[0-9a-f]{64})$/;
+
+function canonicalApprovalArgumentKind(actionId: string): SemanticApprovalArgumentKind {
+  if (actionId === "pty.spawn") return "shell";
+  const prefix = actionId.split(".", 1)[0];
+  return prefix === "filesystem" || prefix === "shell" || prefix === "git"
+    || prefix === "jsonrpc" || prefix === "mcp"
+    ? prefix
+    : "other";
+}
+
+function isCanonicalIdentityPair(display: unknown, digest: unknown): boolean {
+  if (display === null && digest === null) return true;
+  if (typeof display !== "string" || !isSha256(digest)) return false;
+  if (!isApprovalProjectionText(display, 256)) return false;
+  if (display === "<redacted>") return true;
+  return canonicalApprovalIdentity.test(display) && sha256Utf8(display) === digest;
+}
+
+function isCanonicalResourceDisplay(display: string, digest: string): boolean {
+  if (display === "<redacted>") return true;
+  return canonicalApprovalResource.test(display) && sha256Utf8(display) === digest;
+}
+
+/** Validate the exact Host projection used as the only external-operation decision basis. */
+export function canonicalApprovalPreviewFromRequest(request: HumanRequest): CanonicalApprovalPreviewV1 | null {
+  const preview = request.approval_preview;
+  if (request.payload.type !== "external_operation_approval"
+      || !isRecord(preview)
+      || Object.keys(preview).length !== canonicalApprovalPreviewKeys.size
+      || Object.keys(preview).some((key) => !canonicalApprovalPreviewKeys.has(key))
+      || preview.schema_version !== 1
+      || !isApprovalProjectionText(preview.request_id, 512)
+      || preview.request_id !== request.request_id
+      || !isApprovalProjectionText(preview.pid, 512)
+      || preview.pid !== request.pid
+      || !isNonNegativeSafeInteger(preview.revision)
+      || preview.revision !== request.revision
+      || !isSemanticPublicText(preview.action_id, 128) || !canonicalApprovalAction.test(preview.action_id)
+      || !isApprovalProjectionText(preview.resource_display, 512)
+      || !isSha256(preview.resource_sha256)
+      || !isCanonicalResourceDisplay(preview.resource_display, preview.resource_sha256)
+      || !Array.isArray(preview.rights) || preview.rights.length < 1 || preview.rights.length > canonicalApprovalRights.size
+      || !preview.rights.every((right) => typeof right === "string" && canonicalApprovalRights.has(right))
+      || new Set(preview.rights).size !== preview.rights.length
+      || !isApprovalProjectionText(preview.effect_id, 512)
+      || !isSha256(preview.canonical_args_sha256)
+      || !isCanonicalApprovalArgumentProjection(preview.argument_projection)
+      || !(preview.target_state_sha256 === null || isSha256(preview.target_state_sha256))
+      || typeof preview.risk !== "string" || !canonicalApprovalRisks.has(preview.risk)
+      || !isRecord(preview.source_labels)
+      || Object.keys(preview.source_labels).length !== canonicalSourceLabelKeys.size
+      || Object.keys(preview.source_labels).some((key) => !canonicalSourceLabelKeys.has(key))
+      || typeof preview.source_labels.sensitivity !== "string" || !canonicalApprovalSensitivity.has(preview.source_labels.sensitivity)
+      || typeof preview.source_labels.integrity !== "string" || !canonicalApprovalIntegrity.has(preview.source_labels.integrity)
+      || typeof preview.source_labels.trust_level !== "string" || !canonicalApprovalTrust.has(preview.source_labels.trust_level)
+      || typeof preview.source_labels.identity_present !== "boolean"
+      || typeof preview.source_labels.identity_mixed !== "boolean"
+      || (preview.source_labels.identity_mixed && !preview.source_labels.identity_present)
+      || !(preview.expires_at === null || isSemanticTimestamp(preview.expires_at, 128))
+      || !isSha256(request.preview_sha256)) {
+    return null;
+  }
+  const selected = preview as CanonicalApprovalPreviewV1;
+  if (selected.argument_projection.kind !== canonicalApprovalArgumentKind(selected.action_id)) return null;
+  if (canonicalApprovalPreviewSha256(selected) !== request.preview_sha256) return null;
+  return selected;
+}
+
+function isCanonicalApprovalArgumentProjection(value: unknown): value is SemanticApprovalArgumentProjectionV1 {
+  if (!isRecord(value)
+      || Object.keys(value).length !== canonicalArgumentProjectionKeys.size
+      || Object.keys(value).some((key) => !canonicalArgumentProjectionKeys.has(key))
+      || !new Set(["filesystem", "shell", "git", "jsonrpc", "mcp", "other"]).has(value.kind as string)
+      || !isApprovalProjectionText(value.operation, 128) || !canonicalApprovalOperation.test(value.operation)
+      || !Array.isArray(value.display_argv) || value.display_argv.length > 16
+      || !value.display_argv.every((item) => isApprovalProjectionText(item, 128))
+      || value.display_argv.reduce((total, item) => total + item.length, 0) > 1024
+      || !(value.argv_count === null || isNonNegativeSafeInteger(value.argv_count))
+      || typeof value.argv_truncated !== "boolean"
+      || !(value.argv_sha256 === null || isSha256(value.argv_sha256))
+      || !(value.safe_cwd === null || isApprovalProjectionText(value.safe_cwd, 512))
+      || !(value.cwd_sha256 === null || isSha256(value.cwd_sha256))
+      || !isCanonicalIdentityPair(value.endpoint_id, value.endpoint_id_sha256)
+      || !isCanonicalIdentityPair(value.method_id, value.method_id_sha256)
+      || !isCanonicalIdentityPair(value.server_id, value.server_id_sha256)
+      || !isCanonicalIdentityPair(value.tool_id, value.tool_id_sha256)
+      || !(value.registry_spec_sha256 === null || isSha256(value.registry_spec_sha256))
+      || !(value.registry_generation === null || isNonNegativeSafeInteger(value.registry_generation))
+      || ((value.registry_spec_sha256 === null) !== (value.registry_generation === null))
+      || !(value.payload_sha256 === null || isSha256(value.payload_sha256))
+      || !(value.path_sha256 === null || isSha256(value.path_sha256))
+      || !(value.content_sha256 === null || isSha256(value.content_sha256))
+      || !(value.content_bytes === null || isNonNegativeSafeInteger(value.content_bytes))
+      || !(value.read_max_bytes === null || isNonNegativeSafeInteger(value.read_max_bytes))
+      || !(value.entry_limit === null || isNonNegativeSafeInteger(value.entry_limit))
+      || !(value.text_encoding === null || isApprovalProjectionText(value.text_encoding, 64))
+      || !(value.expected_content_sha256 === null || value.expected_content_sha256 === "missing" || isSha256(value.expected_content_sha256))
+      || !(value.overwrite === null || typeof value.overwrite === "boolean")
+      || !(value.parents === null || typeof value.parents === "boolean")
+      || !(value.exist_ok === null || typeof value.exist_ok === "boolean")
+      || !(value.recursive === null || typeof value.recursive === "boolean")
+      || !(value.missing_ok === null || typeof value.missing_ok === "boolean")
+      || !(value.timeout_seconds === null || (typeof value.timeout_seconds === "string" && /^(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?$/.test(value.timeout_seconds)))
+      || !(value.continuous_session === null || typeof value.continuous_session === "boolean")
+      || !(value.network_access === null || typeof value.network_access === "boolean")
+      || !isCanonicalIdentityPair(value.worktree_id, value.worktree_id_sha256)
+      || !(value.repository_state_sha256 === null || isSha256(value.repository_state_sha256))
+      || !(value.source_args_sha256 === null || isSha256(value.source_args_sha256))
+      || !Array.isArray(value.git_references) || value.git_references.length > 16
+      || !value.git_references.every(isCanonicalGitReference)
+      || new Set(value.git_references.map((item) => item.role)).size !== value.git_references.length
+      || (value.git_references as SemanticApprovalGitReferenceV1[]).some(
+        (item, index, values) => index > 0 && (values[index - 1] as SemanticApprovalGitReferenceV1).role >= item.role
+      )
+      || !Array.isArray(value.git_fact_tokens) || value.git_fact_tokens.length > 32
+      || !value.git_fact_tokens.every((item) => typeof item === "string" && canonicalApprovalGitFact.test(item))
+      || new Set(value.git_fact_tokens).size !== value.git_fact_tokens.length
+      || (value.git_fact_tokens as string[]).some(
+        (item, index, values) => index > 0 && (values[index - 1] as string) >= item
+      )) {
+    return false;
+  }
+  const projection = value as SemanticApprovalArgumentProjectionV1;
+  const hasShell = projection.display_argv.length > 0 || projection.argv_count !== null || projection.argv_truncated
+    || projection.argv_sha256 !== null || projection.safe_cwd !== null || projection.cwd_sha256 !== null
+    || projection.timeout_seconds !== null || projection.continuous_session !== null || projection.network_access !== null;
+  const hasRemote = projection.endpoint_id !== null || projection.endpoint_id_sha256 !== null
+    || projection.method_id !== null || projection.method_id_sha256 !== null
+    || projection.server_id !== null || projection.server_id_sha256 !== null
+    || projection.tool_id !== null || projection.tool_id_sha256 !== null
+    || projection.registry_spec_sha256 !== null || projection.registry_generation !== null;
+  const hasFilesystemOnly = projection.content_sha256 !== null || projection.content_bytes !== null
+    || projection.read_max_bytes !== null || projection.entry_limit !== null || projection.text_encoding !== null
+    || projection.expected_content_sha256 !== null || projection.overwrite !== null || projection.parents !== null
+    || projection.exist_ok !== null || projection.recursive !== null || projection.missing_ok !== null;
+  const hasFile = projection.path_sha256 !== null || hasFilesystemOnly;
+  const hasGit = projection.worktree_id !== null || projection.worktree_id_sha256 !== null
+    || projection.repository_state_sha256 !== null || projection.source_args_sha256 !== null
+    || projection.git_references.length > 0
+    || projection.git_fact_tokens.length > 0;
+  if (projection.kind === "filesystem") {
+    return projection.path_sha256 !== null && projection.payload_sha256 === null && !hasShell && !hasRemote && !hasGit
+      && ((projection.content_sha256 === null) === (projection.content_bytes === null));
+  }
+  if (projection.kind === "shell") {
+    return projection.argv_count !== null && projection.argv_count > 0
+      && projection.argv_sha256 !== null && projection.cwd_sha256 !== null
+      && projection.argv_truncated === (projection.argv_count > projection.display_argv.length)
+      && !hasRemote && !hasFile && !hasGit && projection.payload_sha256 === null;
+  }
+  if (projection.kind === "jsonrpc") {
+    return projection.endpoint_id !== null && projection.endpoint_id_sha256 !== null
+      && projection.method_id !== null && projection.method_id_sha256 !== null && projection.payload_sha256 !== null
+      && projection.registry_spec_sha256 !== null && projection.registry_generation !== null
+      && projection.server_id === null && projection.server_id_sha256 === null
+      && projection.tool_id === null && projection.tool_id_sha256 === null && !hasShell && !hasFile && !hasGit;
+  }
+  if (projection.kind === "mcp") {
+    return projection.server_id !== null && projection.server_id_sha256 !== null
+      && projection.tool_id !== null && projection.tool_id_sha256 !== null && projection.payload_sha256 !== null
+      && projection.registry_spec_sha256 !== null && projection.registry_generation !== null
+      && projection.endpoint_id === null && projection.endpoint_id_sha256 === null
+      && projection.method_id === null && projection.method_id_sha256 === null && !hasShell && !hasFile && !hasGit;
+  }
+  if (projection.kind === "git") {
+    return projection.worktree_id !== null && projection.worktree_id_sha256 !== null
+      && !hasShell && !hasRemote && !hasFilesystemOnly && projection.payload_sha256 === null;
+  }
+  return !hasShell && !hasRemote && !hasFile && !hasGit && projection.payload_sha256 === null;
+}
+
+const canonicalGitReferenceRoles = new Set<SemanticApprovalGitReferenceRole>([
+  "base", "base_oid", "base_ref", "branch", "expected_remote_oid", "git_old_oid", "git_remote",
+  "git_remote_ref", "head", "head_oid", "head_ref", "index_oid", "local_ref", "managed_worktree_id",
+  "new_branch", "new_name", "patch_oid", "pr_id", "ref", "remote", "remote_ref", "source", "start",
+  "tag", "target"
+]);
+const canonicalGitReferenceDisplay = /^[A-Za-z0-9][A-Za-z0-9._/@:+~^{}-]{0,255}$/;
+
+function isCanonicalGitReference(value: unknown): value is SemanticApprovalGitReferenceV1 {
+  if (!isRecord(value)
+      || Object.keys(value).length !== 3
+      || Object.keys(value).some((key) => !new Set(["role", "display", "sha256"]).has(key))
+      || typeof value.role !== "string" || !canonicalGitReferenceRoles.has(value.role as SemanticApprovalGitReferenceRole)
+      || !isApprovalProjectionText(value.display, 256)
+      || !isSha256(value.sha256)) {
+    return false;
+  }
+  return value.display === "<redacted>"
+    || (canonicalGitReferenceDisplay.test(value.display) && sha256Utf8(value.display) === value.sha256);
+}
+
+/** Match Semantic Host compact sorted-key UTF-8 canonical JSON byte-for-byte. */
+export function canonicalApprovalPreviewSha256(preview: CanonicalApprovalPreviewV1): string {
+  return sha256Utf8(hostCanonicalJson(preview));
+}
+
+function hostCanonicalJson(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(hostCanonicalJson).join(",")}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+      .map((key) => `${JSON.stringify(key)}:${hostCanonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  throw new Error("Canonical approval preview contains an unsupported JSON value.");
+}
+
+const sha256RoundConstants = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+]);
+
+function rotateRight(value: number, bits: number): number {
+  return (value >>> bits) | (value << (32 - bits));
+}
+
+function sha256Utf8(value: string): string {
+  const input = new TextEncoder().encode(value);
+  const byteLength = Math.ceil((input.length + 9) / 64) * 64;
+  const padded = new Uint8Array(byteLength);
+  padded.set(input);
+  padded[input.length] = 0x80;
+  const bitLength = input.length * 8;
+  const view = new DataView(padded.buffer);
+  view.setUint32(byteLength - 8, Math.floor(bitLength / 0x100000000), false);
+  view.setUint32(byteLength - 4, bitLength >>> 0, false);
+  const hash = new Uint32Array([
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+  ]);
+  const words = new Uint32Array(64);
+  for (let offset = 0; offset < byteLength; offset += 64) {
+    for (let index = 0; index < 16; index += 1) words[index] = view.getUint32(offset + index * 4, false);
+    for (let index = 16; index < 64; index += 1) {
+      const previous15 = words[index - 15] as number;
+      const previous2 = words[index - 2] as number;
+      const sigma0 = rotateRight(previous15, 7) ^ rotateRight(previous15, 18) ^ (previous15 >>> 3);
+      const sigma1 = rotateRight(previous2, 17) ^ rotateRight(previous2, 19) ^ (previous2 >>> 10);
+      words[index] = ((words[index - 16] as number) + sigma0 + (words[index - 7] as number) + sigma1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, h] = hash;
+    for (let index = 0; index < 64; index += 1) {
+      const sum1 = rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25);
+      const choose = (e & f) ^ (~e & g);
+      const temporary1 = (h + sum1 + choose + (sha256RoundConstants[index] as number) + (words[index] as number)) >>> 0;
+      const sum0 = rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22);
+      const majority = (a & b) ^ (a & c) ^ (b & c);
+      const temporary2 = (sum0 + majority) >>> 0;
+      h = g;
+      g = f;
+      f = e;
+      e = (d + temporary1) >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (temporary1 + temporary2) >>> 0;
+    }
+    hash[0] = ((hash[0] as number) + a) >>> 0;
+    hash[1] = ((hash[1] as number) + b) >>> 0;
+    hash[2] = ((hash[2] as number) + c) >>> 0;
+    hash[3] = ((hash[3] as number) + d) >>> 0;
+    hash[4] = ((hash[4] as number) + e) >>> 0;
+    hash[5] = ((hash[5] as number) + f) >>> 0;
+    hash[6] = ((hash[6] as number) + g) >>> 0;
+    hash[7] = ((hash[7] as number) + h) >>> 0;
+  }
+  return [...hash].map((word) => word.toString(16).padStart(8, "0")).join("");
+}
+
+export function assertHumanRequest(value: unknown): asserts value is HumanRequest {
+  if (!isRecord(value)
+      || !isBoundedString(value.request_id, 1024)
+      || !isBoundedString(value.pid, 1024)
+      || !isBoundedString(value.human, 512)
+      || !isRecord(value.payload)
+      || !isBoundedString(value.status, 128)
+      || !(value.decision === null || isRecord(value.decision))
+      || typeof value.blocking !== "boolean"
+      || !isNonNegativeSafeInteger(value.revision)
+      || !isBoundedString(value.created_at, 128)
+      || !isBoundedString(value.updated_at, 128)
+      || !(value.release_request_id === undefined || isBoundedString(value.release_request_id, 1024))
+      || !(value.release_for_request_id === undefined || isBoundedString(value.release_for_request_id, 1024))
+      || !(value.approval_preview === undefined || isRecord(value.approval_preview))
+      || !(value.preview_sha256 === undefined || isSha256(value.preview_sha256))) {
+    throw new Error("GUI human request response is malformed.");
+  }
+  const request = value as HumanRequest;
+  const hasPreview = request.approval_preview !== undefined || request.preview_sha256 !== undefined;
+  if (hasPreview && canonicalApprovalPreviewFromRequest(request) === null) {
+    throw new Error("GUI human request canonical approval preview is malformed.");
+  }
+}
 
 export const taskRunStatuses = [
   "queued",
@@ -581,6 +1004,12 @@ export type HumanResponseInput =
     }
   | { kind: "question"; approved: true; answer: string }
   | { kind: "question"; approved: false }
+  | {
+      kind: "external_approval";
+      approved: boolean;
+      expected_revision: number;
+      preview_sha256: string;
+    }
   | { kind: "approval"; approved: boolean };
 
 export type AuditRecord = {
@@ -937,7 +1366,7 @@ export type ExplainOperationResponse = {
   next_cursor: string | null;
 };
 
-export type SemanticMode = "off" | "shadow";
+export type SemanticMode = "off" | "shadow" | "enforce_deny" | "canary_auto";
 export type SemanticAdapter = "deterministic" | "external" | "scripted";
 export type SemanticAssessmentKind = "approval" | "root_goal" | "provider_ingress";
 export type SemanticAssessmentStatus =
@@ -994,7 +1423,20 @@ export type SemanticReasonCode =
   | "credential_material"
   | "prompt_injection"
   | "mixed_identity"
-  | "low_integrity";
+  | "low_integrity"
+  | "data_flow_denied"
+  | "flow_coverage_incomplete"
+  | "policy_hard_deny"
+  | "tenant_not_allowed"
+  | "budget_exhausted"
+  | "control_disabled"
+  | "control_tripped"
+  | "confidence_too_low"
+  | "calibration_too_low"
+  | "digest_drift"
+  | "revision_race_lost"
+  | "capability_expired"
+  | "capability_revoked";
 export type SemanticDataCategory =
   | "credential"
   | "personal"
@@ -1027,7 +1469,7 @@ export type SemanticPredicate =
   | "profile_pinned";
 
 export type SemanticStatus = {
-  schema_version: 2;
+  schema_version: 3;
   mode: SemanticMode;
   adapter: SemanticAdapter;
   profile_id: string | null;
@@ -1050,12 +1492,252 @@ export type SemanticStatus = {
     by_status: Record<SemanticAssessmentStatus, number>;
     by_domain: Record<SemanticAssessmentDomain, number>;
   };
+  control: {
+    catalog_version: 1 | null;
+    active_epoch_id: string | null;
+    active_epoch_sha256: string | null;
+    generation: number;
+    state: "inactive" | "active" | "tripped" | "revoked";
+    trip_reason_code: SemanticTripCode | null;
+  };
+  flow: SemanticFlowStatus;
+  machine: {
+    eligible: number;
+    issued: number;
+    consumed: number;
+    succeeded: number;
+    failed: number;
+    unknown: number;
+    expired: number;
+    revoked: number;
+    race_lost: number;
+    denied: number;
+  };
   actual_auto_approval: {
-    numerator: 0;
-    denominator: 0;
-    rate: null;
+    numerator: number;
+    denominator: number;
+    rate: number | null;
+  };
+  review_metrics: {
+    reviewed: number;
+    safe: number;
+    unsafe: number;
+    unsafe_rate: number | null;
+    issued_reviewed: number;
+    issued_review_rate: number | null;
   };
 };
+
+export type SemanticFlowCoverage = "complete" | "partial" | "unknown" | "conflict" | "stale";
+
+export type SemanticLegacyFlowHistory = {
+  present: boolean;
+  source_schema_version: 5 | null;
+  assessment_count: number;
+  coverage: "unknown" | null;
+  evidence_sha256: string | null;
+  created_at: string | null;
+};
+
+export type SemanticFlowStatus = {
+  schema_version: 1;
+  available: boolean;
+  counts: {
+    entities: number;
+    activities: number;
+    edges: number;
+    label_assertions: number;
+  };
+  coverage: Record<SemanticFlowCoverage, number>;
+  capture_failures: number;
+  legacy_history: SemanticLegacyFlowHistory;
+};
+
+export type SemanticFlowLabels = {
+  sensitivity: SemanticSensitivity;
+  trust_level: SemanticTrust;
+  integrity: SemanticIntegrity;
+};
+
+export type SemanticFlowEntity = {
+  schema_version: 1;
+  entity_id: string;
+  kind: "root_goal" | "object_version" | "file_binding_version" | "provider_result" | "tool_result" | "materialization" | "model_output";
+  pid: string | null;
+  tenant_bucket_sha256: string;
+  content_sha256: string;
+  version_sha256: string;
+  provenance_sha256: string;
+  baseline_labels: SemanticFlowLabels;
+  coverage: SemanticFlowCoverage;
+  identity_present: boolean;
+  identity_mixed: boolean;
+  created_at: string;
+};
+
+export type SemanticFlowActivity = {
+  schema_version: 1;
+  activity_id: string;
+  kind: "process_spawn" | "provider_call" | "tool_call" | "llm_call" | "object_create" | "object_update" | "object_append" | "object_materialize" | "object_read" | "file_read" | "file_write" | "transformation" | "aggregation" | "conditional" | "tool_selection" | "memory_retrieval";
+  pid: string;
+  action_id: string | null;
+  effect_id: string | null;
+  state_sha256: string;
+  provider_spec_sha256: string | null;
+  tool_schema_sha256: string | null;
+  model_artifact_sha256: string | null;
+  tenant_bucket_sha256: string;
+  created_at: string;
+};
+
+export type SemanticFlowNodeType = "entity" | "activity";
+export type SemanticFlowDirection = "upstream" | "downstream";
+
+export type SemanticFlowEdge = {
+  schema_version: 1;
+  edge_id: string;
+  relation: "direct" | "indirect" | "control";
+  source_node_id: string;
+  source_node_type: SemanticFlowNodeType;
+  target_node_id: string;
+  target_node_type: SemanticFlowNodeType;
+  pid: string;
+  provenance_sha256: string;
+  created_at: string;
+};
+
+export type SemanticFlowEntityPage = SemanticReadOnlyPage<SemanticFlowEntity>;
+export type SemanticFlowEdgePage = SemanticReadOnlyPage<SemanticFlowEdge>;
+
+export type SemanticFlowLineageItem = {
+  depth: number;
+  edge: SemanticFlowEdge;
+  node_type: SemanticFlowNodeType;
+  node: SemanticFlowEntity | SemanticFlowActivity;
+};
+
+export type SemanticFlowLineage = {
+  schema_version: 1;
+  root_node_id: string;
+  direction: SemanticFlowDirection;
+  items: SemanticFlowLineageItem[];
+  effective_labels: SemanticFlowLabels | null;
+  coverage: SemanticFlowCoverage;
+  next_cursor: string | null;
+  truncated: boolean;
+};
+
+export type SemanticSettlementOutcome =
+  | "issued"
+  | "denied"
+  | "require_human"
+  | "race_lost"
+  | "stale"
+  | "budget_exhausted"
+  | "revoked"
+  | "expired"
+  | "failed";
+
+export type SemanticMachineSettlement = {
+  schema_version: 1;
+  settlement_id: string;
+  assessment_id: string | null;
+  job_id: string | null;
+  request_id: string;
+  request_revision: number;
+  pid: string;
+  operation_id: string | null;
+  effect_id: string;
+  epoch_id: string;
+  policy_sha256: string;
+  tenant_bucket_sha256: string;
+  action_id: string;
+  outcome: SemanticSettlementOutcome;
+  capability_id: string | null;
+  binding_sha256: string;
+  decision_sha256: string;
+  matched_rule_id: string | null;
+  reason_codes: SemanticReasonCode[];
+  created_at: string;
+  human_outcome: "approved" | "rejected" | "cancelled" | null;
+  human_outcome_source: "human" | "machine_policy" | "cancel" | null;
+  human_outcome_request_revision: number | null;
+  human_outcome_decision_sha256: string | null;
+  human_outcome_created_at: string | null;
+};
+
+export type SemanticPolicyEpochSummary = {
+  schema_version: 1;
+  epoch_id: string;
+  generation: number;
+  catalog_version: 1;
+  policy_sha256: string;
+  expected_previous_sha256: string | null;
+  created_at: string;
+};
+
+export type SemanticControlState = {
+  schema_version: 1;
+  revision: number;
+  generation: number;
+  mode: SemanticMode;
+  active_epoch_id: string | null;
+  active_policy_sha256: string | null;
+  tripped: boolean;
+  trip_code: SemanticTripCode | null;
+  updated_at: string;
+};
+
+export type SemanticHealthSeverity = "info" | "warning" | "critical";
+export type SemanticHealthEventKind =
+  | "semantic_control_disable_conflict"
+  | "semantic_control_authority_cleared"
+  | "semantic_policy_activated"
+  | "semantic_policy_rotated"
+  | "semantic_control_startup_conflict"
+  | "capture_failed"
+  | "semantic_unsafe_review_control_unsettled"
+  | "semantic_unsafe_review_fallback_trip"
+  | `semantic_safety_trip:${SemanticTripCode}`;
+
+export type SemanticHealthEvent = {
+  schema_version: 1;
+  event_id: string;
+  event_kind: SemanticHealthEventKind;
+  severity: SemanticHealthSeverity;
+  epoch_id: string | null;
+  tenant_bucket_sha256: string | null;
+  evidence_sha256: string;
+  created_at: string;
+};
+
+export type SemanticMachineCounters = SemanticStatus["machine"];
+export type SemanticActualApprovalMetrics = SemanticStatus["actual_auto_approval"];
+export type SemanticReviewMetrics = SemanticStatus["review_metrics"];
+export type SemanticCanaryReviewMetrics = SemanticReviewMetrics;
+
+export type SemanticMetrics = {
+  schema_version: 1;
+  window: string | null;
+  action_id: string | null;
+  tenant_bucket_sha256: string | null;
+  epoch_id: string | null;
+  risk: SemanticRisk | null;
+  machine: SemanticMachineCounters;
+  actual_auto_approval: SemanticActualApprovalMetrics;
+  review_metrics: SemanticCanaryReviewMetrics;
+};
+
+export type SemanticReadOnlyPage<T> = {
+  schema_version: 1;
+  items: T[];
+  next_cursor: string | null;
+};
+
+export type SemanticMachineSettlementPage = SemanticReadOnlyPage<SemanticMachineSettlement>;
+export type SemanticPolicyEpochPage = SemanticReadOnlyPage<SemanticPolicyEpochSummary>;
+export type SemanticControlHistoryPage = SemanticReadOnlyPage<SemanticControlState>;
+export type SemanticHealthEventPage = SemanticReadOnlyPage<SemanticHealthEvent>;
 
 export type SemanticAssessmentSummary = {
   assessment_id: string;
@@ -1140,7 +1822,7 @@ export type SemanticAssessmentDetailResponse = {
   assessment: SemanticAssessmentDetail;
 };
 
-const semanticModeValues = new Set(["off", "shadow"]);
+const semanticModeValues = new Set(["off", "shadow", "enforce_deny", "canary_auto"]);
 const semanticAdapterValues = new Set(["deterministic", "external", "scripted"]);
 const semanticKindValues = new Set(["approval", "root_goal", "provider_ingress"]);
 const semanticStatusValues = new Set([
@@ -1160,7 +1842,10 @@ const semanticReasonCodeValues = new Set([
   "unsupported_action", "high_risk_action", "control_right", "data_release", "ceiling_miss",
   "missing_authoritative_predicate", "schema_invalid", "provider_error", "provider_outcome_unknown", "timeout",
   "egress_blocked", "out_of_distribution", "abstained", "risk_detected", "sensitive_data", "credential_material",
-  "prompt_injection", "mixed_identity", "low_integrity"
+  "prompt_injection", "mixed_identity", "low_integrity", "data_flow_denied", "flow_coverage_incomplete",
+  "policy_hard_deny", "tenant_not_allowed", "budget_exhausted", "control_disabled", "control_tripped",
+  "confidence_too_low", "calibration_too_low", "digest_drift", "revision_race_lost", "capability_expired",
+  "capability_revoked"
 ]);
 const semanticDataCategoryValues = new Set([
   "credential", "personal", "financial", "health", "legal", "source_code", "business_secret",
@@ -1179,13 +1864,107 @@ const semanticPredicateValues = new Set([
   "action_auto_eligible", "low_risk", "resource_exact", "single_non_control_right", "ceiling_matched",
   "data_flow_allowed", "profile_pinned"
 ]);
-const semanticStatusKeys = new Set(["schema_version", "mode", "adapter", "profile_id", "queue", "assessments", "actual_auto_approval"]);
+const semanticStatusKeys = new Set([
+  "schema_version", "mode", "adapter", "profile_id", "control", "queue", "assessments", "flow", "machine",
+  "actual_auto_approval", "review_metrics"
+]);
 const semanticQueueKeys = new Set(["queued", "leased", "succeeded", "failed", "cancelled", "capture_failures"]);
 const semanticCountKeys = new Set([
   "total", "success", "error", "ood", "would_issue_exact_once", "would_deny", "require_human", "by_status", "by_domain"
 ]);
 const semanticScalarCountKeys = new Set(["total", "success", "error", "ood", "would_issue_exact_once", "would_deny", "require_human"]);
 const semanticActualApprovalKeys = new Set(["numerator", "denominator", "rate"]);
+const semanticStatusControlKeys = new Set([
+  "catalog_version", "active_epoch_id", "active_epoch_sha256", "generation", "state", "trip_reason_code"
+]);
+const semanticStatusControlStates = new Set(["inactive", "active", "tripped", "revoked"]);
+const semanticTripCodes = new Set([
+  "unsafe_review", "critical_high_grant", "cross_tenant", "secret_egress", "replay_detected",
+  "binding_mismatch", "unauthorized_effect", "provider_outcome_unknown"
+]);
+const semanticMachineKeys = new Set([
+  "eligible", "issued", "consumed", "succeeded", "failed", "unknown", "expired", "revoked", "race_lost", "denied"
+]);
+const semanticReviewMetricKeys = new Set([
+  "reviewed", "safe", "unsafe", "unsafe_rate", "issued_reviewed", "issued_review_rate"
+]);
+const semanticFlowStatusKeys = new Set([
+  "schema_version", "available", "counts", "coverage", "capture_failures", "legacy_history"
+]);
+const semanticLegacyFlowHistoryKeys = new Set([
+  "present", "source_schema_version", "assessment_count", "coverage", "evidence_sha256", "created_at"
+]);
+const semanticFlowCountKeys = new Set(["entities", "activities", "edges", "label_assertions"]);
+const semanticFlowCoverages = new Set(["complete", "partial", "unknown", "conflict", "stale"]);
+const semanticFlowLabelsKeys = new Set(["sensitivity", "trust_level", "integrity"]);
+const semanticFlowEntityKeys = new Set([
+  "schema_version", "entity_id", "kind", "pid", "tenant_bucket_sha256", "content_sha256", "version_sha256",
+  "provenance_sha256", "baseline_labels", "coverage", "identity_present", "identity_mixed", "created_at"
+]);
+const semanticFlowActivityKeys = new Set([
+  "schema_version", "activity_id", "kind", "pid", "action_id", "effect_id", "state_sha256",
+  "provider_spec_sha256", "tool_schema_sha256", "model_artifact_sha256", "tenant_bucket_sha256", "created_at"
+]);
+const semanticFlowEdgeKeys = new Set([
+  "schema_version", "edge_id", "relation", "source_node_id", "source_node_type", "target_node_id",
+  "target_node_type", "pid", "provenance_sha256", "created_at"
+]);
+const semanticPageV1Keys = new Set(["schema_version", "items", "next_cursor"]);
+const semanticFlowLineageKeys = new Set([
+  "schema_version", "root_node_id", "direction", "items", "effective_labels", "coverage", "next_cursor", "truncated"
+]);
+const semanticFlowLineageItemKeys = new Set(["depth", "edge", "node_type", "node"]);
+const semanticFlowNodeTypes = new Set(["entity", "activity"]);
+const semanticFlowDirections = new Set(["upstream", "downstream"]);
+const semanticFlowEntityKinds = new Set([
+  "root_goal", "object_version", "file_binding_version", "provider_result", "tool_result", "materialization", "model_output"
+]);
+const semanticFlowActivityKinds = new Set([
+  "process_spawn", "provider_call", "tool_call", "llm_call", "object_create", "object_update", "object_append",
+  "object_materialize", "object_read", "file_read", "file_write", "transformation", "aggregation", "conditional",
+  "tool_selection", "memory_retrieval"
+]);
+const semanticFlowRelations = new Set(["direct", "indirect", "control"]);
+const semanticSettlementKeys = new Set([
+  "schema_version", "settlement_id", "assessment_id", "job_id", "request_id", "request_revision", "pid",
+  "operation_id", "effect_id", "epoch_id", "policy_sha256", "tenant_bucket_sha256", "action_id", "outcome",
+  "capability_id", "binding_sha256", "decision_sha256", "matched_rule_id", "reason_codes", "created_at",
+  "human_outcome", "human_outcome_source", "human_outcome_request_revision", "human_outcome_decision_sha256",
+  "human_outcome_created_at"
+]);
+const semanticSettlementOutcomes = new Set([
+  "issued", "denied", "require_human", "race_lost", "stale", "budget_exhausted", "revoked", "expired", "failed"
+]);
+const semanticExecutableDenyReasons = new Set([
+  "hard_policy_violation", "malformed_request", "stale_binding", "stale_manifest", "stale_policy",
+  "data_flow_denied", "policy_hard_deny", "digest_drift"
+]);
+const semanticPolicyEpochKeys = new Set([
+  "schema_version", "epoch_id", "generation", "catalog_version", "policy_sha256", "expected_previous_sha256", "created_at"
+]);
+const semanticControlStateKeys = new Set([
+  "schema_version", "revision", "generation", "mode", "active_epoch_id", "active_policy_sha256", "tripped",
+  "trip_code", "updated_at"
+]);
+const semanticHealthEventKeys = new Set([
+  "schema_version", "event_id", "event_kind", "severity", "epoch_id", "tenant_bucket_sha256", "evidence_sha256", "created_at"
+]);
+const semanticHealthSeverities = new Set(["info", "warning", "critical"]);
+const semanticHealthEventKinds = new Set<SemanticHealthEventKind>([
+  "semantic_control_disable_conflict",
+  "semantic_control_authority_cleared",
+  "semantic_policy_activated",
+  "semantic_policy_rotated",
+  "semantic_control_startup_conflict",
+  "capture_failed",
+  "semantic_unsafe_review_control_unsettled",
+  "semantic_unsafe_review_fallback_trip",
+  ...[...semanticTripCodes].map((code) => `semantic_safety_trip:${code}` as SemanticHealthEventKind)
+]);
+const semanticMetricsKeys = new Set([
+  "schema_version", "window", "action_id", "tenant_bucket_sha256", "epoch_id", "risk", "machine", "actual_auto_approval",
+  "review_metrics"
+]);
 const semanticSummaryKeys = new Set([
   "assessment_id", "job_id", "kind", "status", "domain", "action_id", "pid", "request_id", "operation_id", "effect_id",
   "shadow_outcome", "reason_codes", "ood", "abstain", "confidence_bps", "calibration_bucket", "input_tokens",
@@ -1206,12 +1985,13 @@ const semanticDataFindingKeys = new Set([
 const semanticPageKeys = new Set(["schema_version", "items", "next_cursor"]);
 const semanticDetailResponseKeys = new Set(["schema_version", "assessment"]);
 const semanticIdentifierPattern = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+const semanticPublicIdentifierPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/;
 const semanticRedactedIntentMaxChars = 2_000;
 const semanticActionPattern = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/;
 
 /** Reject malformed, unbounded, or private Semantic status fields before rendering. */
 export function assertSemanticStatus(value: unknown): asserts value is SemanticStatus {
-  if (!isRecord(value) || !hasOnlyKeys(value, semanticStatusKeys) || value.schema_version !== 2
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticStatusKeys) || value.schema_version !== 3
       || typeof value.mode !== "string" || !semanticModeValues.has(value.mode)
       || typeof value.adapter !== "string" || !semanticAdapterValues.has(value.adapter)
       || !(value.profile_id === null || isSemanticIdentifier(value.profile_id))
@@ -1228,13 +2008,359 @@ export function assertSemanticStatus(value: unknown): asserts value is SemanticS
       || Number(value.assessments.would_issue_exact_once) + Number(value.assessments.would_deny)
         + Number(value.assessments.require_human) !== Number(value.assessments.total)
       || value.assessments.ood !== value.assessments.by_status.ood
+      || !isSemanticStatusControl(value.control)
+      || !isSemanticFlowStatus(value.flow)
+      || !isExactNonNegativeCounterRecord(value.machine, semanticMachineKeys)
       || !isRecord(value.actual_auto_approval)
       || !hasOnlyKeys(value.actual_auto_approval, semanticActualApprovalKeys)
-      || value.actual_auto_approval.numerator !== 0
-      || value.actual_auto_approval.denominator !== 0
-      || value.actual_auto_approval.rate !== null) {
+      || !isConsistentRate(value.actual_auto_approval, "numerator", "denominator", "rate")
+      || value.actual_auto_approval.numerator !== (value.machine as Record<string, unknown>).issued
+      || value.actual_auto_approval.denominator !== (value.machine as Record<string, unknown>).eligible
+      || !isSemanticReviewMetrics(value.review_metrics, value.machine)) {
     throw new Error("GUI Semantic status is malformed.");
   }
+}
+
+function isSemanticStatusControl(value: unknown): boolean {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticStatusControlKeys)
+      || !(value.catalog_version === null || value.catalog_version === 1)
+      || !isNullableSemanticPublicText(value.active_epoch_id, 512)
+      || !isNullableSha256(value.active_epoch_sha256)
+      || ((value.active_epoch_id === null) !== (value.active_epoch_sha256 === null))
+      || !isNonNegativeSafeInteger(value.generation)
+      || typeof value.state !== "string" || !semanticStatusControlStates.has(value.state)
+      || !(value.trip_reason_code === null
+        || (typeof value.trip_reason_code === "string" && semanticTripCodes.has(value.trip_reason_code)))) return false;
+  if (value.state === "inactive") {
+    return value.catalog_version === null && value.active_epoch_id === null && value.trip_reason_code === null;
+  }
+  if (value.catalog_version !== 1 || value.active_epoch_id === null) return false;
+  return (value.state === "tripped") === (value.trip_reason_code !== null);
+}
+
+export function assertSemanticFlowStatus(value: unknown): asserts value is SemanticFlowStatus {
+  if (!isSemanticFlowStatus(value)) throw new Error("GUI Semantic flow status is malformed.");
+}
+
+function isSemanticFlowStatus(value: unknown): boolean {
+  return isRecord(value)
+    && hasOnlyKeys(value, semanticFlowStatusKeys)
+    && value.schema_version === 1
+    && typeof value.available === "boolean"
+    && isExactNonNegativeCounterRecord(value.counts, semanticFlowCountKeys)
+    && isNonNegativeSafeInteger(value.capture_failures)
+    && isExactNonNegativeCounterRecord(value.coverage, semanticFlowCoverages)
+    && isSemanticLegacyFlowHistory(value.legacy_history);
+}
+
+function isSemanticLegacyFlowHistory(value: unknown): boolean {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticLegacyFlowHistoryKeys)
+      || typeof value.present !== "boolean"
+      || !isNonNegativeSafeInteger(value.assessment_count)) return false;
+  if (!value.present) {
+    return value.source_schema_version === null
+      && value.assessment_count === 0
+      && value.coverage === null
+      && value.evidence_sha256 === null
+      && value.created_at === null;
+  }
+  return value.source_schema_version === 5
+    && value.coverage === "unknown"
+    && isSha256(value.evidence_sha256)
+    && isSemanticTimestamp(value.created_at, 64);
+}
+
+function isConsistentRate(
+  value: Record<string, unknown>,
+  numeratorKey: string,
+  denominatorKey: string,
+  rateKey: string
+): boolean {
+  const numerator = value[numeratorKey];
+  const denominator = value[denominatorKey];
+  const rate = value[rateKey];
+  if (!isNonNegativeSafeInteger(numerator) || !isNonNegativeSafeInteger(denominator)
+      || Number(numerator) > Number(denominator)) return false;
+  if (denominator === 0) return rate === null;
+  return typeof rate === "number" && Number.isFinite(rate) && rate >= 0 && rate <= 1
+    && Math.abs(rate - Number(numerator) / Number(denominator)) <= 1e-12;
+}
+
+export function assertSemanticFlowEntityPage(value: unknown): asserts value is SemanticFlowEntityPage {
+  assertSemanticReadOnlyPage(value, assertSemanticFlowEntity, "flow entity");
+}
+
+export function assertSemanticFlowEdgePage(value: unknown): asserts value is SemanticFlowEdgePage {
+  assertSemanticReadOnlyPage(value, assertSemanticFlowEdge, "flow edge");
+}
+
+export function assertSemanticFlowLineage(value: unknown): asserts value is SemanticFlowLineage {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticFlowLineageKeys) || value.schema_version !== 1
+      || !isSemanticPublicIdentifier(value.root_node_id)
+      || typeof value.direction !== "string" || !semanticFlowDirections.has(value.direction)
+      || !Array.isArray(value.items) || value.items.length > 100
+      || !(value.effective_labels === null || isSemanticFlowLabels(value.effective_labels))
+      || typeof value.coverage !== "string" || !semanticFlowCoverages.has(value.coverage)
+      || !isNullableBoundedString(value.next_cursor, 2048)
+      || typeof value.truncated !== "boolean") {
+    throw new Error("GUI Semantic flow lineage is malformed.");
+  }
+  for (const item of value.items) {
+    if (!isRecord(item) || !hasOnlyKeys(item, semanticFlowLineageItemKeys)
+        || !isNonNegativeSafeInteger(item.depth) || Number(item.depth) > 16
+        || typeof item.node_type !== "string" || !semanticFlowNodeTypes.has(item.node_type)) {
+      throw new Error("GUI Semantic flow lineage item is malformed.");
+    }
+    assertSemanticFlowEdge(item.edge);
+    if (item.node_type === "entity") assertSemanticFlowEntity(item.node);
+    else assertSemanticFlowActivity(item.node);
+    const expectedNodeId = value.direction === "upstream" ? item.edge.source_node_id : item.edge.target_node_id;
+    const expectedNodeType = value.direction === "upstream" ? item.edge.source_node_type : item.edge.target_node_type;
+    const actualNodeId = "entity_id" in item.node ? item.node.entity_id : item.node.activity_id;
+    if (item.node_type !== expectedNodeType || actualNodeId !== expectedNodeId) {
+      throw new Error("GUI Semantic flow lineage node is not bound to its edge endpoint.");
+    }
+  }
+}
+
+export function assertSemanticMachineSettlementPage(value: unknown): asserts value is SemanticMachineSettlementPage {
+  assertSemanticReadOnlyPage(value, assertSemanticMachineSettlement, "machine settlement");
+}
+
+export function assertSemanticPolicyEpochPage(value: unknown): asserts value is SemanticPolicyEpochPage {
+  assertSemanticReadOnlyPage(value, assertSemanticPolicyEpochSummary, "policy epoch");
+}
+
+export function assertSemanticControlState(value: unknown): asserts value is SemanticControlState {
+  if (!isSemanticControlStateValue(value)) {
+    throw new Error("GUI Semantic control state is malformed.");
+  }
+}
+
+function isSemanticControlStateValue(value: unknown): value is SemanticControlState {
+  return isRecord(value) && hasOnlyKeys(value, semanticControlStateKeys) && value.schema_version === 1
+    && isNonNegativeSafeInteger(value.revision) && isNonNegativeSafeInteger(value.generation)
+    && typeof value.mode === "string" && semanticModeValues.has(value.mode)
+    && isNullableSemanticPublicText(value.active_epoch_id, 512)
+    && isNullableSha256(value.active_policy_sha256)
+    && typeof value.tripped === "boolean"
+    && (value.trip_code === null || (typeof value.trip_code === "string" && semanticTripCodes.has(value.trip_code)))
+    && isSemanticTimestamp(value.updated_at, 64)
+    && ((value.active_epoch_id === null) === (value.active_policy_sha256 === null))
+    && (value.tripped === (value.trip_code !== null))
+    && (["enforce_deny", "canary_auto"].includes(value.mode)
+      ? value.active_epoch_id !== null
+      : value.active_epoch_id === null && !value.tripped);
+}
+
+export function assertSemanticControlHistoryPage(value: unknown): asserts value is SemanticControlHistoryPage {
+  assertSemanticReadOnlyPage(value, assertSemanticControlState, "control history");
+}
+
+export function assertSemanticHealthEventPage(value: unknown): asserts value is SemanticHealthEventPage {
+  assertSemanticReadOnlyPage(value, assertSemanticHealthEvent, "health event");
+}
+
+export function assertSemanticMetrics(value: unknown): asserts value is SemanticMetrics {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticMetricsKeys) || value.schema_version !== 1
+      || !isNullableSemanticPublicText(value.window, 512)
+      || !(value.action_id === null || isSemanticAction(value.action_id))
+      || !isNullableSha256(value.tenant_bucket_sha256)
+      || !isNullableSemanticPublicText(value.epoch_id, 512)
+      || !(value.risk === null || (typeof value.risk === "string" && canonicalApprovalRisks.has(value.risk)))
+      || !isExactNonNegativeCounterRecord(value.machine, semanticMachineKeys)
+      || !isRecord(value.actual_auto_approval)
+      || !hasOnlyKeys(value.actual_auto_approval, semanticActualApprovalKeys)
+      || !isConsistentRate(value.actual_auto_approval, "numerator", "denominator", "rate")
+      || value.actual_auto_approval.numerator !== (value.machine as Record<string, unknown>).issued
+      || value.actual_auto_approval.denominator !== (value.machine as Record<string, unknown>).eligible
+      || !isSemanticReviewMetrics(value.review_metrics, value.machine)) {
+    throw new Error("GUI Semantic metrics are malformed.");
+  }
+}
+
+function assertSemanticFlowEntity(value: unknown): asserts value is SemanticFlowEntity {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticFlowEntityKeys) || value.schema_version !== 1
+      || !isSemanticPublicIdentifier(value.entity_id)
+      || typeof value.kind !== "string" || !semanticFlowEntityKinds.has(value.kind)
+      || !isNullableSemanticPublicIdentifier(value.pid)
+      || !isSha256(value.tenant_bucket_sha256) || !isSha256(value.content_sha256)
+      || !isSha256(value.version_sha256) || !isSha256(value.provenance_sha256)
+      || !isSemanticFlowLabels(value.baseline_labels)
+      || typeof value.coverage !== "string" || !semanticFlowCoverages.has(value.coverage)
+      || typeof value.identity_present !== "boolean" || typeof value.identity_mixed !== "boolean"
+      || (value.identity_mixed && !value.identity_present)
+      || !isSemanticTimestamp(value.created_at, 64)) {
+    throw new Error("GUI Semantic flow entity is malformed.");
+  }
+}
+
+function assertSemanticFlowActivity(value: unknown): asserts value is SemanticFlowActivity {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticFlowActivityKeys) || value.schema_version !== 1
+      || !isSemanticPublicIdentifier(value.activity_id)
+      || typeof value.kind !== "string" || !semanticFlowActivityKinds.has(value.kind)
+      || !isSemanticPublicIdentifier(value.pid)
+      || !(value.action_id === null || isSemanticAction(value.action_id))
+      || !isNullableSemanticPublicIdentifier(value.effect_id)
+      || !isSha256(value.state_sha256) || !isNullableSha256(value.provider_spec_sha256)
+      || !isNullableSha256(value.tool_schema_sha256) || !isNullableSha256(value.model_artifact_sha256)
+      || !isSha256(value.tenant_bucket_sha256) || !isSemanticTimestamp(value.created_at, 64)) {
+    throw new Error("GUI Semantic flow activity is malformed.");
+  }
+}
+
+function assertSemanticFlowEdge(value: unknown): asserts value is SemanticFlowEdge {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticFlowEdgeKeys) || value.schema_version !== 1
+      || !isSemanticPublicIdentifier(value.edge_id)
+      || typeof value.relation !== "string" || !semanticFlowRelations.has(value.relation)
+      || !isSemanticPublicIdentifier(value.source_node_id)
+      || typeof value.source_node_type !== "string" || !semanticFlowNodeTypes.has(value.source_node_type)
+      || !isSemanticPublicIdentifier(value.target_node_id)
+      || typeof value.target_node_type !== "string" || !semanticFlowNodeTypes.has(value.target_node_type)
+      || (value.source_node_id === value.target_node_id && value.source_node_type === value.target_node_type)
+      || !isSemanticPublicIdentifier(value.pid) || !isSha256(value.provenance_sha256)
+      || !isSemanticTimestamp(value.created_at, 64)) {
+    throw new Error("GUI Semantic flow edge is malformed.");
+  }
+}
+
+function assertSemanticMachineSettlement(value: unknown): asserts value is SemanticMachineSettlement {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticSettlementKeys) || value.schema_version !== 1
+      || !isSemanticPublicText(value.settlement_id, 512)
+      || !isNullableSemanticPublicText(value.assessment_id, 512)
+      || !isNullableSemanticPublicText(value.job_id, 512)
+      || !isSemanticPublicText(value.request_id, 512) || !isNonNegativeSafeInteger(value.request_revision)
+      || !isSemanticPublicText(value.pid, 512) || !isNullableSemanticPublicText(value.operation_id, 512)
+      || !isSemanticPublicText(value.effect_id, 512) || !isSemanticPublicText(value.epoch_id, 512)
+      || !isSha256(value.policy_sha256) || !isSha256(value.tenant_bucket_sha256)
+      || !isSemanticAction(value.action_id)
+      || typeof value.outcome !== "string" || !semanticSettlementOutcomes.has(value.outcome)
+      || !isNullableSemanticPublicText(value.capability_id, 512)
+      || !isSha256(value.binding_sha256) || !isSha256(value.decision_sha256)
+      || !isNullableSemanticPublicText(value.matched_rule_id, 128)
+      || !isSemanticEnumList(value.reason_codes, 128, semanticReasonCodeValues)
+      || !isSemanticSettlementInvariant(value)
+      || !isSemanticSettlementHumanOutcome(value)
+      || !isSemanticTimestamp(value.created_at, 64)) {
+    throw new Error("GUI Semantic machine settlement is malformed.");
+  }
+}
+
+function isSemanticSettlementHumanOutcome(value: Record<string, unknown>): boolean {
+  const fields = [
+    value.human_outcome,
+    value.human_outcome_source,
+    value.human_outcome_request_revision,
+    value.human_outcome_decision_sha256,
+    value.human_outcome_created_at
+  ];
+  if (fields.every((item) => item === null)) return true;
+  if (fields.some((item) => item === null)) return false;
+  if (typeof value.human_outcome !== "string"
+      || !new Set(["approved", "rejected", "cancelled"]).has(value.human_outcome)
+      || typeof value.human_outcome_source !== "string"
+      || !new Set(["human", "machine_policy", "cancel"]).has(value.human_outcome_source)
+      || !isNonNegativeSafeInteger(value.human_outcome_request_revision)
+      || !isSha256(value.human_outcome_decision_sha256)
+      || !isSemanticTimestamp(value.human_outcome_created_at, 64)) return false;
+  return (value.human_outcome === "cancelled") === (value.human_outcome_source === "cancel");
+}
+
+function isSemanticSettlementInvariant(value: Record<string, unknown>): boolean {
+  const issued = value.outcome === "issued";
+  if (issued !== (value.capability_id !== null)) return false;
+  if (issued && value.matched_rule_id === null) return false;
+  if (value.outcome !== "denied") return true;
+  return Array.isArray(value.reason_codes) && value.reason_codes.length > 0
+    && value.reason_codes.every((reason) => typeof reason === "string" && semanticExecutableDenyReasons.has(reason));
+}
+
+function assertSemanticPolicyEpochSummary(value: unknown): asserts value is SemanticPolicyEpochSummary {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticPolicyEpochKeys) || value.schema_version !== 1
+      || !isSemanticPublicText(value.epoch_id, 512)
+      || !isNonNegativeSafeInteger(value.generation) || Number(value.generation) < 1
+      || value.catalog_version !== 1 || !isSha256(value.policy_sha256)
+      || !isNullableSha256(value.expected_previous_sha256)
+      || !isSemanticTimestamp(value.created_at, 64)) {
+    throw new Error("GUI Semantic policy epoch is malformed.");
+  }
+}
+
+function assertSemanticHealthEvent(value: unknown): asserts value is SemanticHealthEvent {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticHealthEventKeys) || value.schema_version !== 1
+      || !isSemanticPublicText(value.event_id, 512)
+      || typeof value.event_kind !== "string" || !semanticHealthEventKinds.has(value.event_kind as SemanticHealthEventKind)
+      || typeof value.severity !== "string" || !semanticHealthSeverities.has(value.severity)
+      || !isNullableSemanticPublicText(value.epoch_id, 512)
+      || !isNullableSha256(value.tenant_bucket_sha256) || !isSha256(value.evidence_sha256)
+      || !isSemanticTimestamp(value.created_at, 64)) {
+    throw new Error("GUI Semantic health event is malformed.");
+  }
+}
+
+function isSemanticFlowLabels(value: unknown): value is SemanticFlowLabels {
+  return isRecord(value) && hasOnlyKeys(value, semanticFlowLabelsKeys)
+    && typeof value.sensitivity === "string" && semanticSensitivityValues.has(value.sensitivity)
+    && typeof value.trust_level === "string" && semanticTrustValues.has(value.trust_level)
+    && typeof value.integrity === "string" && semanticIntegrityValues.has(value.integrity);
+}
+
+function isSemanticReviewMetrics(value: unknown, machine: unknown): value is SemanticReviewMetrics {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticReviewMetricKeys)
+      || !isNonNegativeSafeInteger(value.reviewed) || !isNonNegativeSafeInteger(value.safe)
+      || !isNonNegativeSafeInteger(value.unsafe)
+      || Number(value.safe) + Number(value.unsafe) > Number(value.reviewed)
+      || !isConsistentRate(value, "unsafe", "reviewed", "unsafe_rate")
+      || !isNonNegativeSafeInteger(value.issued_reviewed)
+      || Number(value.issued_reviewed) > Number(value.reviewed)
+      || !isRecord(machine) || !isNonNegativeSafeInteger(machine.issued)
+      || Number(value.issued_reviewed) > Number(machine.issued)) return false;
+  return isConsistentRate({
+    numerator: value.issued_reviewed,
+    denominator: machine.issued,
+    rate: value.issued_review_rate
+  }, "numerator", "denominator", "rate");
+}
+
+function assertSemanticReadOnlyPage(
+  value: unknown,
+  assertItem: (item: unknown) => void,
+  label: string
+): void {
+  if (!isRecord(value) || !hasOnlyKeys(value, semanticPageV1Keys) || value.schema_version !== 1
+      || !Array.isArray(value.items) || value.items.length > 100
+      || !isNullableBoundedString(value.next_cursor, 2048)) {
+    throw new Error(`GUI Semantic ${label} page is malformed.`);
+  }
+  for (const item of value.items) assertItem(item);
+}
+
+function isSemanticPublicText(value: unknown, maximum: number): value is string {
+  return isBoundedString(value, maximum) && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+}
+
+function isApprovalProjectionText(value: unknown, maximum: number): value is string {
+  return isBoundedString(value, maximum)
+    && value.trim() === value
+    && !/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(value);
+}
+
+function isNullableSemanticPublicText(value: unknown, maximum: number): value is string | null {
+  return value === null || isSemanticPublicText(value, maximum);
+}
+
+function isSemanticPublicIdentifier(value: unknown): value is string {
+  return typeof value === "string" && semanticPublicIdentifierPattern.test(value);
+}
+
+function isNullableSemanticPublicIdentifier(value: unknown): value is string | null {
+  return value === null || isSemanticPublicIdentifier(value);
+}
+
+function isSemanticTimestamp(value: unknown, maximum: number): value is string {
+  return isSemanticPublicText(value, maximum)
+    && /(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+    && Number.isFinite(Date.parse(value));
 }
 
 /** Reject unknown fields so prompt, raw content, and reasoning can never reach React. */
@@ -1262,7 +2388,7 @@ export function assertSemanticAssessmentSummary(value: unknown): asserts value i
       || !isBoundedString(value.classifier_id, 512) || !isBoundedString(value.classifier_version, 512)
       || !isNullableSha256(value.artifact_sha256) || !isNullableSha256(value.input_sha256)
       || !isNullableSha256(value.feature_snapshot_sha256) || !isNullableSha256(value.policy_sha256)
-      || !isBoundedString(value.created_at, 128) || !isBoundedString(value.completed_at, 128)
+      || !isSemanticTimestamp(value.created_at, 128) || !isSemanticTimestamp(value.completed_at, 128)
       || !(value.latency_ms === null || isNonNegativeSafeInteger(value.latency_ms))
       || !(value.human_outcome === null || (typeof value.human_outcome === "string" && semanticHumanOutcomeValues.has(value.human_outcome)))
       || !isNullableSha256(value.tenant_bucket_sha256)) {
@@ -1665,6 +2791,7 @@ export function assertRuntimeSnapshot(value: unknown): asserts value is RuntimeS
     }
   }
   for (const run of value.task_runs as unknown[]) assertTaskRunSummary(run);
+  for (const request of value.human_requests as unknown[]) assertHumanRequest(request);
   for (const call of value.llm_calls as unknown[]) assertLlmCallSummary(call);
   for (const server of value.mcp_servers as unknown[]) assertMcpServerSummary(server);
 }

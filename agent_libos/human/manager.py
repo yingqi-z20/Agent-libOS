@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import math
 import threading
+import unicodedata
 from contextvars import ContextVar
 from typing import Any, Callable, Iterable, Mapping
 
@@ -54,7 +55,9 @@ from agent_libos.models import (
 )
 from agent_libos.process_transition import ProcessTransitionService
 from agent_libos.process_execution import trusted_process_execution_takeover
-from agent_libos.capability.effect_binding import canonical_effect_hash
+from agent_libos.capability.effect_binding import (
+    canonical_effect_hash,
+)
 from agent_libos.storage import AuthorityRepository, ProcessRepository
 from agent_libos.substrate import HumanProvider, ProviderEffectNotStarted
 from agent_libos.sdk import (
@@ -95,7 +98,75 @@ _DATA_RELEASE_TERMINAL_COMMITTED_KEY = (
     "_agent_libos_data_release_terminal_committed_request_id"
 )
 _OUTPUT_SNAPSHOT_SHA256_KEY = "_agent_libos_output_snapshot_sha256"
+_AUTHORITY_REQUEST_ORIGIN_KEY = "_agent_libos_authority_request_origin"
+_AUTHORITY_REQUEST_FIELDS = frozenset(
+    {
+        "effect_binding",
+        "requested_capability",
+        "requested_once_capability",
+        "requested_permission",
+    }
+)
+_AUTHORITY_REQUEST_SHAPES: dict[str, tuple[str, frozenset[str]]] = {
+    "data_flow": (
+        "data_release_approval",
+        frozenset({"requested_once_capability"}),
+    ),
+    "external_operation": (
+        "external_operation_approval",
+        frozenset({"effect_binding", "requested_once_capability"}),
+    ),
+    "permission_policy": (
+        "permission_request",
+        frozenset({"requested_permission"}),
+    ),
+}
 _PRESENTATION_RECEIPT_PER_REQUEST_MULTIPLIER = 4
+_TERMINAL_NAMED_CONTROL_ESCAPES = {
+    "\a": r"\a",
+    "\b": r"\b",
+    "\t": r"\t",
+    "\n": r"\n",
+    "\v": r"\v",
+    "\f": r"\f",
+    "\r": r"\r",
+}
+_TERMINAL_NONPRINTING_CATEGORIES = frozenset(
+    {"Cc", "Cf", "Cs", "Zl", "Zp"}
+)
+
+
+def _terminal_safe_text(value: Any) -> str:
+    """Encode one untrusted terminal field without altering Host layout.
+
+    Callers apply this helper only to dynamic fragments.  Newlines inserted by
+    the Host's presentation templates therefore remain real layout, while C0,
+    DEL/C1, Unicode line separators, every Unicode format control, and lone
+    surrogate code points from a request become visible ASCII escape
+    sequences.  Escaping ESC and the C1 CSI/OSC bytes prevents ANSI/ECMA-48
+    control sequence injection; encoding all ``Cf`` characters covers bidi
+    controls and visually hidden format characters; encoding ``Cs`` prevents
+    an invalid UTF-8 surrogate from crashing the provider boundary.
+    """
+
+    raw = value if isinstance(value, str) else str(value)
+    encoded: list[str] = []
+    for character in raw:
+        named = _TERMINAL_NAMED_CONTROL_ESCAPES.get(character)
+        if named is not None:
+            encoded.append(named)
+            continue
+        codepoint = ord(character)
+        category = unicodedata.category(character)
+        if category == "Cc" and codepoint <= 0xFF:
+            encoded.append(f"\\x{codepoint:02x}")
+        elif category in _TERMINAL_NONPRINTING_CATEGORIES and codepoint <= 0xFFFF:
+            encoded.append(f"\\u{codepoint:04x}")
+        elif category in _TERMINAL_NONPRINTING_CATEGORIES:
+            encoded.append(f"\\U{codepoint:08x}")
+        else:
+            encoded.append(character)
+    return "".join(encoded)
 
 
 def _json_size_bytes(value: Any) -> int:
@@ -268,6 +339,61 @@ def _redact_human_value(value: Any) -> Any:
     return value
 
 
+class HostSemanticMachineSettlementPort:
+    """Narrow composition-only port for semantic machine terminalization.
+
+    The port is never registered as a Runtime syscall, model tool, GUI/API
+    method, or CLI mutation.  It only conveys the Human manager's shared
+    terminal lock/UoW kernel to Host-owned semantic services.
+    """
+
+    __slots__ = ("__terminalize", "__transaction")
+
+    def __init__(
+        self,
+        terminalize: Callable[..., tuple[HumanRequest, dict[str, Any]]],
+        transaction: Callable[[], contextlib.AbstractContextManager[Any]],
+    ) -> None:
+        if not callable(terminalize) or not callable(transaction):
+            raise TypeError(
+                "Host semantic machine terminalizer and transaction must be callable"
+            )
+        self.__terminalize = terminalize
+        self.__transaction = transaction
+
+    def transaction(self) -> contextlib.AbstractContextManager[Any]:
+        """Enter the only safe machine terminal UoW lock order.
+
+        Human response/cancel paths acquire the terminal lock before the Store.
+        Machine settlement must use this same order; exposing the composition
+        context here prevents semantic services from opening a Store-first
+        transaction and then deadlocking on Human terminalization.
+        """
+
+        return self.__transaction()
+
+    def terminalize(
+        self,
+        request_id: str,
+        *,
+        expected_revision: int,
+        status: HumanRequestStatus,
+        decision: Mapping[str, Any],
+        responder: str,
+        authority_applier: Callable[[HumanRequest], Mapping[str, Any]] | None = None,
+        audit_action: str,
+    ) -> tuple[HumanRequest, dict[str, Any]]:
+        return self.__terminalize(
+            request_id,
+            expected_revision=expected_revision,
+            status=status,
+            decision=decision,
+            responder=responder,
+            authority_applier=authority_applier,
+            audit_action=audit_action,
+        )
+
+
 class HumanObjectManager:
     """HumanObject primitive: terminal queue, approvals, questions, and output."""
 
@@ -292,6 +418,10 @@ class HumanObjectManager:
         transitions: ProcessTransitionService | None = None,
         process_terminal_cleanup: Callable[[str], Any] | None = None,
         request_capture: Callable[[HumanRequest], Any] | None = None,
+        host_semantic_policy_preflight: Callable[[HumanRequest], Any] | None = None,
+        host_semantic_mode_reader: Callable[[], str] | None = None,
+        host_semantic_settlement_recorder: Callable[..., Mapping[str, Any]] | None = None,
+        host_semantic_outcome_linker: Callable[..., Any] | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.processes = processes
@@ -309,6 +439,22 @@ class HumanObjectManager:
         self._process_terminal_cleanup = process_terminal_cleanup
         self._request_capture = request_capture
         self._host_request_capture: Callable[[HumanRequest], Any] | None = None
+        self._validate_host_semantic_dependencies(
+            host_semantic_policy_preflight,
+            host_semantic_mode_reader,
+            host_semantic_settlement_recorder,
+            host_semantic_outcome_linker,
+        )
+        self._host_semantic_policy_preflight = host_semantic_policy_preflight
+        self._host_semantic_mode_reader = host_semantic_mode_reader
+        self._host_semantic_settlement_recorder = host_semantic_settlement_recorder
+        self._host_semantic_outcome_linker = host_semantic_outcome_linker
+        self.__host_semantic_machine_settlement_port = (
+            HostSemanticMachineSettlementPort(
+                self._terminalize_machine_policy,
+                self._semantic_machine_settlement_transaction,
+            )
+        )
         self.requests = HumanRequestService(requests)
         self.delivery = HumanDeliveryService(provider)
         self.presentation = HumanPresentationService(
@@ -337,6 +483,44 @@ class HumanObjectManager:
             f"agent_libos_human_release_presentation_{id(self)}",
             default=None,
         )
+        # Authority-bearing Human requests are composed only by Host-owned
+        # runtime paths.  The generic ``query`` boundary remains available to
+        # agents for ordinary questions/approvals, but payload data can never
+        # manufacture this origin context.
+        self._authority_request_origin: ContextVar[str | None] = ContextVar(
+            f"agent_libos_human_authority_origin_{id(self)}",
+            default=None,
+        )
+
+    @staticmethod
+    def _validate_host_semantic_dependencies(
+        preflight: Callable[[HumanRequest], Any] | None,
+        mode_reader: Callable[[], str] | None,
+        settlement_recorder: Callable[..., Mapping[str, Any]] | None,
+        outcome_linker: Callable[..., Any] | None,
+    ) -> None:
+        supplied = (preflight, mode_reader, settlement_recorder, outcome_linker)
+        if all(item is None for item in supplied):
+            return
+        if any(not callable(item) for item in supplied):
+            raise TypeError(
+                "Host semantic policy dependencies must be supplied together"
+            )
+
+    def _issue_host_semantic_machine_settlement_port(
+        self,
+    ) -> HostSemanticMachineSettlementPort:
+        """Issue the Host composition port; never exposed through agent APIs."""
+
+        return self.__host_semantic_machine_settlement_port
+
+    @contextlib.contextmanager
+    def _semantic_machine_settlement_transaction(self) -> Iterable[None]:
+        """Serialize machine settlement using Human's terminal->Store order."""
+
+        with self._terminal_lock:
+            with self.requests.transaction():
+                yield
 
     def set_request_capture(
         self,
@@ -383,6 +567,95 @@ class HumanObjectManager:
                 # nor suppress another independently registered observer.
                 continue
 
+    def query_authority_request(
+        self,
+        pid: str,
+        human: str,
+        request: dict[str, Any],
+        blocking: bool = True,
+        *,
+        authority_origin: str,
+        _trusted_data_release: bool = False,
+        source_oids: Iterable[str] | None = None,
+    ) -> str:
+        """Publish one Host-composed, exactly typed authority request.
+
+        This Host control entry is intentionally absent from Runtime
+        boundary descriptors, model tools, GUI/HTTP, and CLI mutation APIs.
+        It enters the ordinary wrapped ``human.query`` operation so request,
+        process, event, and audit evidence retain their existing transaction
+        and causal operation semantics.
+        """
+
+        if authority_origin not in _AUTHORITY_REQUEST_SHAPES:
+            raise ValidationError("unknown Host Human authority request origin")
+        token = self._authority_request_origin.set(authority_origin)
+        try:
+            return self.query(
+                pid=pid,
+                human=human,
+                request=request,
+                blocking=blocking,
+                _trusted_data_release=_trusted_data_release,
+                source_oids=source_oids,
+            )
+        finally:
+            self._authority_request_origin.reset(token)
+
+    @staticmethod
+    def _validate_authority_request_admission(
+        request: Mapping[str, Any],
+        authority_origin: str | None,
+    ) -> None:
+        supplied = _AUTHORITY_REQUEST_FIELDS.intersection(request)
+        if _AUTHORITY_REQUEST_ORIGIN_KEY in request:
+            raise ValidationError(
+                "Human request cannot supply Host authority origin provenance"
+            )
+        if authority_origin is None:
+            if supplied:
+                raise ValidationError(
+                    "generic human query cannot contain authority-shaping fields"
+                )
+            return
+        expected = _AUTHORITY_REQUEST_SHAPES.get(authority_origin)
+        if expected is None:
+            raise ValidationError("unknown Host Human authority request origin")
+        expected_type, expected_fields = expected
+        # The external effect binding is minted by ``_bind_external_operation_approval``
+        # after this admission check and is therefore never accepted from a
+        # request payload, even on a trusted composition call.
+        admitted_fields = (
+            expected_fields - {"effect_binding"}
+            if authority_origin == "external_operation"
+            else expected_fields
+        )
+        if request.get("type") != expected_type or supplied != admitted_fields:
+            raise ValidationError(
+                "Host Human authority request type, origin, and fields do not match"
+            )
+
+    @staticmethod
+    def _validate_persisted_authority_request_shape(
+        payload: Mapping[str, Any],
+    ) -> None:
+        supplied = _AUTHORITY_REQUEST_FIELDS.intersection(payload)
+        raw_origin = payload.get(_AUTHORITY_REQUEST_ORIGIN_KEY)
+        if not supplied and raw_origin is None:
+            return
+        if type(raw_origin) is not str:
+            raise ValidationError(
+                "Human authority request is missing Host origin provenance"
+            )
+        expected = _AUTHORITY_REQUEST_SHAPES.get(raw_origin)
+        if expected is None:
+            raise ValidationError("Human authority request origin is invalid")
+        expected_type, expected_fields = expected
+        if payload.get("type") != expected_type or supplied != expected_fields:
+            raise ValidationError(
+                "Human authority request type, origin, and fields do not match"
+            )
+
     def query(
         self,
         pid: str,
@@ -393,19 +666,10 @@ class HumanObjectManager:
         _trusted_data_release: bool = False,
         source_oids: Iterable[str] | None = None,
     ) -> str:
-        if request.get("type") == "data_release_approval" and not _trusted_data_release:
-            raise ValidationError(
-                "data release approvals can only be created by the Host data-flow gate"
-            )
-        request = dict(request)
-        if not _trusted_data_release:
-            request.pop(_DATA_RELEASE_FOR_REQUEST_KEY, None)
-            request.pop(_DATA_RELEASE_REQUEST_KEY, None)
-            request.pop(_DATA_RELEASE_REQUESTS_KEY, None)
-            request.pop(_DATA_RELEASE_PRESENTATION_KEY, None)
-            request.pop(_DATA_RELEASE_VISIBLE_KEY, None)
-            request.pop(_DATA_RELEASE_TERMINAL_COMMITTED_KEY, None)
-        request = self._bind_external_operation_approval(request)
+        request = self._admit_query_payload(
+            request,
+            trusted_data_release=_trusted_data_release,
+        )
         request.pop(_DATA_FLOW_CONTEXT_KEY, None)
         flow = self._request_source_context(
             pid,
@@ -433,6 +697,7 @@ class HumanObjectManager:
             created_at=now,
             updated_at=now,
         )
+        self._validate_new_authority_request(human_request)
         request_observation = _sanitize_human_observability(
             self.public_request_payload(human_request),
             metadata_only=(
@@ -553,6 +818,59 @@ class HumanObjectManager:
         self._capture_persisted_request(human_request.request_id)
         return human_request.request_id
 
+    def _admit_query_payload(
+        self,
+        request: Mapping[str, Any],
+        *,
+        trusted_data_release: bool,
+    ) -> dict[str, Any]:
+        authority_origin = self._authority_request_origin.get()
+        # Consume the composition signal before validation, egress checks,
+        # persistence, capture observers, or provider callbacks.  Re-entrant
+        # generic queries therefore see no inherited Host authority origin.
+        if authority_origin is not None:
+            self._authority_request_origin.set(None)
+        try:
+            selected = dict(request)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("Human request must be a JSON object") from exc
+        if any(type(key) is not str for key in selected):
+            raise ValidationError("Human request fields must be strings")
+        # Validate and bind only the single immutable snapshot.  A custom or
+        # concurrently mutated Mapping must not pass an origin/shape check and
+        # then supply different authority fields during the following copy.
+        self._validate_authority_request_admission(selected, authority_origin)
+        if selected.get("type") == "data_release_approval" and not trusted_data_release:
+            raise ValidationError(
+                "data release approvals can only be created by the Host data-flow gate"
+            )
+        if authority_origin is not None:
+            selected[_AUTHORITY_REQUEST_ORIGIN_KEY] = authority_origin
+        if not trusted_data_release:
+            selected.pop(_DATA_RELEASE_FOR_REQUEST_KEY, None)
+            selected.pop(_DATA_RELEASE_REQUEST_KEY, None)
+            selected.pop(_DATA_RELEASE_REQUESTS_KEY, None)
+            selected.pop(_DATA_RELEASE_PRESENTATION_KEY, None)
+            selected.pop(_DATA_RELEASE_VISIBLE_KEY, None)
+            selected.pop(_DATA_RELEASE_TERMINAL_COMMITTED_KEY, None)
+        selected = self._bind_external_operation_approval(selected)
+        self._validate_persisted_authority_request_shape(selected)
+        return selected
+
+    def _validate_new_authority_request(self, request: HumanRequest) -> None:
+        """Require every newly admitted external grant to have a real preview."""
+
+        if (
+            request.payload.get(_AUTHORITY_REQUEST_ORIGIN_KEY)
+            == "external_operation"
+        ):
+            # Human requests may carry a bounded scope such as one directory
+            # subtree.  Preview validation proves Host provenance, typed
+            # operation identity, effect binding, and safe presentation; the
+            # independent Phase 4 exact decoder still excludes scoped grants
+            # from machine settlement.
+            self.canonical_approval_preview(request)
+
     def request_data_release(
         self,
         *,
@@ -627,11 +945,12 @@ class HumanObjectManager:
             request[_DATA_RELEASE_FOR_REQUEST_KEY] = parent_request_id
             if isinstance(presentation, str) and presentation:
                 request[_DATA_RELEASE_PRESENTATION_KEY] = presentation
-        return self.query(
+        return self.query_authority_request(
             pid=pid,
             human=human,
             request=request,
             blocking=blocking and not presentation_release,
+            authority_origin="data_flow",
             _trusted_data_release=True,
         )
 
@@ -671,11 +990,12 @@ class HumanObjectManager:
         # the exact authority and leaves no observable request behind.
         with self.requests.transaction():
             reservation_id = self._reserve_one_time_decision(decision, used_by="human")
-            request_id = self.query(
+            request_id = self.query_authority_request(
                 pid=pid,
                 human=selected_human,
                 request=request,
                 blocking=blocking,
+                authority_origin="permission_policy",
                 source_oids=source_oids,
             )
             self._require_one_time_decision_commit(reservation_id)
@@ -695,12 +1015,24 @@ class HumanObjectManager:
         }
         selected["effect_binding"] = binding
         once = selected.get("requested_once_capability")
-        if isinstance(once, dict):
-            constrained = dict(once)
-            constraints = dict(constrained.get("constraints") or {})
-            constraints[CapabilityManager.APPROVAL_BINDING_KEY] = binding
-            constrained["constraints"] = constraints
-            selected["requested_once_capability"] = constrained
+        if not isinstance(once, dict):
+            raise ValidationError(
+                "external operation approval requires a one-time capability object"
+            )
+        raw_constraints = once.get("constraints")
+        if not isinstance(raw_constraints, dict):
+            raise ValidationError(
+                "external operation approval constraints must be an object"
+            )
+        if CapabilityManager.APPROVAL_BINDING_KEY in raw_constraints:
+            raise ValidationError(
+                "external operation approval binding must be minted by the Host"
+            )
+        constrained = dict(once)
+        constraints = dict(raw_constraints)
+        constraints[CapabilityManager.APPROVAL_BINDING_KEY] = binding
+        constrained["constraints"] = constraints
+        selected["requested_once_capability"] = constrained
         return selected
 
     def _permission_request_payload(
@@ -929,6 +1261,9 @@ class HumanObjectManager:
         request_id: str,
         decision: dict[str, Any] | None = None,
         responder: str | None = None,
+        *,
+        expected_revision: int | None = None,
+        preview_sha256: str | None = None,
     ) -> HumanRequest:
         selected_decision: Any = {"approved": True} if decision is None else decision
         if not isinstance(selected_decision, dict):
@@ -938,6 +1273,8 @@ class HumanObjectManager:
             HumanRequestStatus.APPROVED,
             selected_decision,
             responder or self.config.runtime.default_human_actor,
+            expected_revision=expected_revision,
+            preview_sha256=preview_sha256,
         )
 
     def approve_for_presentation(
@@ -947,6 +1284,8 @@ class HumanObjectManager:
         presentation: str,
         decision: dict[str, Any] | None = None,
         responder: str | None = None,
+        expected_revision: int | None = None,
+        preview_sha256: str | None = None,
     ) -> HumanRequest:
         """Approve only if the request is currently visible on a Host surface."""
 
@@ -959,6 +1298,8 @@ class HumanObjectManager:
             selected_decision,
             responder or self.config.runtime.default_human_actor,
             required_presentation=presentation,
+            expected_revision=expected_revision,
+            preview_sha256=preview_sha256,
         )
 
     def reject(
@@ -966,6 +1307,9 @@ class HumanObjectManager:
         request_id: str,
         decision: dict[str, Any] | None = None,
         responder: str | None = None,
+        *,
+        expected_revision: int | None = None,
+        preview_sha256: str | None = None,
     ) -> HumanRequest:
         selected_decision: Any = {"approved": False} if decision is None else decision
         if not isinstance(selected_decision, dict):
@@ -975,6 +1319,8 @@ class HumanObjectManager:
             HumanRequestStatus.REJECTED,
             selected_decision,
             responder or self.config.runtime.default_human_actor,
+            expected_revision=expected_revision,
+            preview_sha256=preview_sha256,
         )
 
     def reject_for_presentation(
@@ -984,6 +1330,8 @@ class HumanObjectManager:
         presentation: str,
         decision: dict[str, Any] | None = None,
         responder: str | None = None,
+        expected_revision: int | None = None,
+        preview_sha256: str | None = None,
     ) -> HumanRequest:
         """Reject only if the request is currently visible on a Host surface."""
 
@@ -996,6 +1344,8 @@ class HumanObjectManager:
             selected_decision,
             responder or self.config.runtime.default_human_actor,
             required_presentation=presentation,
+            expected_revision=expected_revision,
+            preview_sha256=preview_sha256,
         )
 
     def interrupt(self, pid: str, signal: ProcessSignal | str, payload: dict[str, Any] | None = None) -> str:
@@ -1267,6 +1617,11 @@ class HumanObjectManager:
         """Return the caller-visible request payload without Host provenance."""
 
         payload = dict(request.payload)
+        if payload.get("type") == "external_operation_approval":
+            # CanonicalApprovalPreviewV1 is the only public authority surface
+            # for an external operation.  Raw rationale, capability, argv,
+            # paths, provider identifiers, and binding internals stay private.
+            return {"type": "external_operation_approval"}
         payload.pop(_DATA_FLOW_CONTEXT_KEY, None)
         payload.pop(_DATA_RELEASE_FOR_REQUEST_KEY, None)
         payload.pop(_DATA_RELEASE_REQUEST_KEY, None)
@@ -1275,6 +1630,7 @@ class HumanObjectManager:
         payload.pop(_DATA_RELEASE_VISIBLE_KEY, None)
         payload.pop(_DATA_RELEASE_TERMINAL_COMMITTED_KEY, None)
         payload.pop(_OUTPUT_SNAPSHOT_SHA256_KEY, None)
+        payload.pop(_AUTHORITY_REQUEST_ORIGIN_KEY, None)
         return payload
 
     def list_for_presentation(
@@ -1452,6 +1808,11 @@ class HumanObjectManager:
                 # pre-delivery row currently in the Store.
                 settled_raw = dict(raw)
                 settled_raw["revision"] = fresh.revision + 1
+                self._attach_canonical_approval_preview(
+                    settled_raw,
+                    fresh,
+                    revision=fresh.revision + 1,
+                )
                 settled_sha256 = hashlib.sha256(
                     dumps(to_jsonable(settled_raw)).encode("utf-8")
                 ).hexdigest()
@@ -1474,6 +1835,11 @@ class HumanObjectManager:
                     # polling creates an endless chain of replacement releases.
                     raw = dict(raw)
                     raw["revision"] = fresh.revision + 2
+                    self._attach_canonical_approval_preview(
+                        raw,
+                        fresh,
+                        revision=fresh.revision + 2,
+                    )
                     view_sha256 = hashlib.sha256(
                         dumps(to_jsonable(raw)).encode("utf-8")
                     ).hexdigest()
@@ -1549,7 +1915,7 @@ class HumanObjectManager:
         # GUI provider.  Withheld projections expose the current release ID so
         # a client can approve it; the released view is independent of that
         # internal link and can therefore be bound without a circular hash.
-        return selected
+        return self._attach_canonical_approval_preview(selected, request)
 
     def _presentation_sink(self, request: HumanRequest, presentation: str) -> DataSink:
         trust_identity = (
@@ -1787,6 +2153,11 @@ class HumanObjectManager:
             # provider payload and release binding are for that durable target
             # view, not the transient pre-receipt row.
             latest_view["revision"] = latest.revision + 1
+            self._attach_canonical_approval_preview(
+                latest_view,
+                latest,
+                revision=latest.revision + 1,
+            )
             latest_sha256 = hashlib.sha256(
                 dumps(to_jsonable(latest_view)).encode("utf-8")
             ).hexdigest()
@@ -1887,7 +2258,7 @@ class HumanObjectManager:
             selected["release_request_id"] = release_request_id
         if not force_withhold and not self._withhold_request_payload_from_observers(request):
             selected["payload"] = payload
-            return selected
+            return self._attach_canonical_approval_preview(selected, request)
 
         request_type = payload.get("type")
         selected["payload"] = {
@@ -1986,6 +2357,11 @@ class HumanObjectManager:
             raise NotFound(f"human request not found: {request_id}")
         release_request_id = latest.payload.get(_DATA_RELEASE_REQUEST_KEY)
         if not isinstance(release_request_id, str) or not release_request_id:
+            return
+        if (
+            latest.payload.get(_DATA_RELEASE_TERMINAL_COMMITTED_KEY)
+            == release_request_id
+        ):
             return
         release = self.requests.get(release_request_id)
         if (
@@ -2262,14 +2638,23 @@ class HumanObjectManager:
                 return self.reject(request.request_id, {"approved": False, **decision})
             return self.approve(request.request_id, {"approved": True, **decision})
 
+        response_fence = self._semantic_response_fence_args(request)
         approved = self._select_boolean_approval(
             request=request,
             question=question,
             auto_approve=auto_approve,
         )
         if approved:
-            return self.approve(request.request_id, {"approved": True, "source": "terminal_queue"})
-        return self.reject(request.request_id, {"approved": False, "source": "terminal_queue"})
+            return self.approve(
+                request.request_id,
+                {"approved": True, "source": "terminal_queue"},
+                **response_fence,
+            )
+        return self.reject(
+            request.request_id,
+            {"approved": False, "source": "terminal_queue"},
+            **response_fence,
+        )
 
     async def aprocess_next_terminal(
         self,
@@ -2341,6 +2726,8 @@ class HumanObjectManager:
         responder: str,
         *,
         required_presentation: str | None = None,
+        expected_revision: int | None = None,
+        preview_sha256: str | None = None,
     ) -> HumanRequest:
         # GUI/CLI/provider decisions are untrusted ingress.  Bound their full
         # structure before permission grants, request transitions, events, or
@@ -2356,6 +2743,8 @@ class HumanObjectManager:
                     selected_decision,
                     responder,
                     required_presentation=required_presentation,
+                    expected_revision=expected_revision,
+                    preview_sha256=preview_sha256,
                 )
         return self._decide_impl(
             request_id,
@@ -2363,6 +2752,8 @@ class HumanObjectManager:
             selected_decision,
             responder,
             required_presentation=required_presentation,
+            expected_revision=expected_revision,
+            preview_sha256=preview_sha256,
         )
 
     def _decide_impl(
@@ -2373,6 +2764,8 @@ class HumanObjectManager:
         responder: str,
         *,
         required_presentation: str | None = None,
+        expected_revision: int | None = None,
+        preview_sha256: str | None = None,
     ) -> HumanRequest:
         with self._terminal_lock:
             with self.requests.transaction():
@@ -2407,6 +2800,44 @@ class HumanObjectManager:
                         "human request payload has not been released for "
                         f"{required_presentation} presentation",
                     )
+                hard_deny = (
+                    self._semantic_hard_deny(request)
+                    if status == HumanRequestStatus.APPROVED
+                    else None
+                )
+                if hard_deny is not None:
+                    try:
+                        preview_receipt = self._require_semantic_response_fence(
+                            request,
+                            expected_revision=expected_revision,
+                            preview_sha256=preview_sha256,
+                        )
+                    except ValidationError:
+                        # A deterministic Host denial does not depend on an
+                        # untrusted Human response fence.  Persist it even when
+                        # the request is too malformed to render or the client
+                        # raced an older view.
+                        preview_receipt = None
+                    request, _release_parent = self._terminalize_hard_deny(
+                        request,
+                        hard_deny,
+                        response_receipt=preview_receipt,
+                    )
+                    return request
+                preview_receipt = self._require_semantic_response_fence(
+                    request,
+                    expected_revision=expected_revision,
+                    preview_sha256=preview_sha256,
+                )
+                if preview_receipt is not None:
+                    decision = {
+                        **decision,
+                        "approval_preview_receipt": preview_receipt,
+                    }
+                    self._validate_human_response(
+                        decision,
+                        label="human decision with approval preview receipt",
+                    )
                 request, _release_parent = self._terminalize_pending_request(
                     request,
                     status=status,
@@ -2417,6 +2848,566 @@ class HumanObjectManager:
                     cancel_linked_release=status != HumanRequestStatus.APPROVED,
                 )
         return request
+
+    def _semantic_runtime_mode(self) -> str:
+        reader = self._host_semantic_mode_reader
+        if reader is None:
+            return "off"
+        try:
+            mode = reader()
+        except Exception as exc:
+            raise ValidationError("Host semantic mode could not be read") from exc
+        if mode not in {"off", "shadow", "enforce_deny", "canary_auto"}:
+            raise ValidationError("Host semantic mode is invalid")
+        return mode
+
+    def _semantic_enforcement_active(self) -> bool:
+        return self._semantic_runtime_mode() in {"enforce_deny", "canary_auto"}
+
+    def _require_semantic_response_fence(
+        self,
+        request: HumanRequest,
+        *,
+        expected_revision: int | None,
+        preview_sha256: str | None,
+    ) -> dict[str, Any] | None:
+        if request.payload.get("type") != "external_operation_approval":
+            return None
+        enforcement_active = self._semantic_enforcement_active()
+        supplied = expected_revision is not None or preview_sha256 is not None
+        if not enforcement_active and not supplied:
+            return None
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ValidationError(
+                "external operation response requires a non-negative expected_revision"
+            )
+        if expected_revision != request.revision:
+            raise ValidationError(
+                "human request revision conflict: "
+                f"expected {expected_revision}, found {request.revision}"
+            )
+        preview = self.canonical_approval_preview(request)
+        expected_sha256 = preview.canonical_sha256()
+        if (
+            not isinstance(preview_sha256, str)
+            or len(preview_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in preview_sha256)
+        ):
+            raise ValidationError(
+                "external operation response requires preview_sha256"
+            )
+        if not hmac.compare_digest(preview_sha256, expected_sha256):
+            raise ValidationError("external operation approval preview changed")
+        return (
+            {
+                "request_revision": request.revision,
+                "preview_sha256": expected_sha256,
+            }
+            if enforcement_active
+            else None
+        )
+
+    def _semantic_response_fence_args(
+        self,
+        request: HumanRequest,
+    ) -> dict[str, Any]:
+        if request.payload.get("type") != "external_operation_approval":
+            return {}
+        try:
+            preview = self.canonical_approval_preview(request)
+        except ValidationError:
+            return {}
+        return {
+            "expected_revision": request.revision,
+            "preview_sha256": preview.canonical_sha256(),
+        }
+
+    def canonical_approval_preview(self, request: HumanRequest) -> Any:
+        """Build the current Host projection without mutating the request.
+
+        This method intentionally derives the preview on every read.  Hidden
+        presentation-release CAS transitions advance ``revision``; persisting
+        a preview in the request payload would therefore both break Shadow
+        isolation and create a stale self-reference.
+        """
+
+        from agent_libos.models.semantic import (
+            CanonicalApprovalPreviewV1,
+            SemanticPreviewLabelsV1,
+        )
+        from agent_libos.semantic.preview import (
+            build_host_argument_projection,
+            build_host_resource_projection,
+            host_preview_risk,
+        )
+
+        (
+            context,
+            capability,
+            action_id,
+            resource,
+            rights,
+            binding,
+        ) = self._canonical_preview_request_facts(request)
+        source = self._request_data_flow_context(request)
+        labels = SemanticPreviewLabelsV1.from_data_labels(source.labels)
+        resource_display, resource_sha256 = build_host_resource_projection(
+            resource=resource,
+            action_id=action_id,
+            sensitivity=labels.sensitivity.value,
+        )
+        target_state_sha256 = self._canonical_preview_target_state_sha256(binding)
+        expires_at = self._canonical_preview_expiry(capability)
+        try:
+            return CanonicalApprovalPreviewV1(
+                request_id=request.request_id,
+                revision=request.revision,
+                pid=request.pid,
+                action_id=action_id,
+                resource_display=resource_display,
+                resource_sha256=resource_sha256,
+                rights=tuple(rights),
+                effect_id=binding["effect_id"],
+                canonical_args_sha256=binding["canonical_args_hash"],
+                argument_projection=build_host_argument_projection(
+                    action_id=action_id,
+                    resource=resource,
+                    context=context,
+                ),
+                target_state_sha256=target_state_sha256,
+                risk=host_preview_risk(action_id, rights),
+                source_labels=labels,
+                expires_at=expires_at,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("external operation approval preview is malformed") from exc
+
+    @staticmethod
+    def _canonical_preview_request_facts(
+        request: HumanRequest,
+    ) -> tuple[
+        Mapping[str, Any],
+        Mapping[str, Any],
+        str,
+        str,
+        list[Any],
+        dict[str, Any],
+    ]:
+        from agent_libos.semantic.exact_request import (
+            decode_host_human_approval_request,
+        )
+
+        exact = decode_host_human_approval_request(request)
+        return (
+            exact.context,
+            exact.capability,
+            exact.action_id,
+            exact.resource,
+            list(exact.rights),
+            exact.binding,
+        )
+
+    @staticmethod
+    def _canonical_preview_target_state_sha256(
+        binding: Mapping[str, Any],
+    ) -> str | None:
+        target_state = binding.get("target_state_version")
+        return (
+            hashlib.sha256(
+                dumps(to_jsonable(target_state)).encode("utf-8")
+            ).hexdigest()
+            if target_state is not None
+            else None
+        )
+
+    @staticmethod
+    def _canonical_preview_expiry(capability: Mapping[str, Any]) -> str | None:
+        expires_at = capability.get("expires_at")
+        if not isinstance(expires_at, str) or not expires_at.strip():
+            return None
+        return expires_at
+
+    def _attach_canonical_approval_preview(
+        self,
+        view: dict[str, Any],
+        request: HumanRequest,
+        *,
+        revision: int | None = None,
+    ) -> dict[str, Any]:
+        if request.payload.get("type") != "external_operation_approval":
+            return view
+        selected_request = request
+        if revision is not None and revision != request.revision:
+            from dataclasses import replace
+
+            selected_request = replace(request, revision=revision)
+        try:
+            preview = self.canonical_approval_preview(selected_request)
+        except ValidationError:
+            # Malformed requests remain visible for deterministic rejection,
+            # but cannot acquire a response fence or authority.
+            view.pop("approval_preview", None)
+            view.pop("preview_sha256", None)
+            return view
+        view["approval_preview"] = preview.to_dict()
+        view["preview_sha256"] = preview.canonical_sha256()
+        return view
+
+    def _semantic_hard_deny(self, request: HumanRequest) -> Any | None:
+        if not self._semantic_enforcement_active():
+            return None
+        callback = self._host_semantic_policy_preflight
+        if callback is None:
+            raise ValidationError("Host semantic policy preflight is not bound")
+        try:
+            result = callback(request)
+        except Exception as exc:
+            raise ValidationError("Host semantic policy preflight failed") from exc
+        if result is None:
+            return None
+        from agent_libos.models.semantic import DeterministicDenyDecision
+
+        if not isinstance(result, DeterministicDenyDecision):
+            raise ValidationError("Host semantic preflight returned an invalid result")
+        self._validate_hard_deny_binding(request, result)
+        return result
+
+    @staticmethod
+    def _validate_hard_deny_binding(request: HumanRequest, decision: Any) -> None:
+        effect_id = HumanObjectManager._semantic_effect_identity(request)
+        if (
+            decision.request_id != request.request_id
+            or decision.request_revision != request.revision
+            or decision.pid != request.pid
+            or decision.effect_id != effect_id
+        ):
+            raise ValidationError("deterministic deny is not bound to the current request")
+
+    @staticmethod
+    def _semantic_effect_identity(request: HumanRequest) -> str:
+        """Return an exact denial identity even for a malformed binding."""
+
+        from agent_libos.semantic.exact_request import semantic_effect_identity
+
+        return semantic_effect_identity(request)
+
+    def _terminalize_hard_deny(
+        self,
+        request: HumanRequest,
+        hard_deny: Any,
+        *,
+        response_receipt: Mapping[str, Any] | None = None,
+    ) -> tuple[HumanRequest, HumanRequest | None]:
+        if not self._semantic_enforcement_active():
+            raise ValidationError("semantic enforcement was disabled before settlement")
+        deny_evidence = hard_deny.to_dict()
+        decision = {
+            "approved": False,
+            "source": "machine_policy",
+            "deterministic_deny": deny_evidence,
+        }
+        if response_receipt is not None:
+            decision["approval_preview_receipt"] = dict(response_receipt)
+        settlement_receipt = self._record_semantic_machine_settlement(
+            request,
+            status=HumanRequestStatus.REJECTED,
+            decision=decision,
+            authority_evidence=deny_evidence,
+            responder="policy:semantic:hard-deny",
+        )
+        decision["settlement_receipt"] = settlement_receipt
+        self._validate_human_response(
+            decision,
+            label="machine policy decision",
+        )
+        event_payload = {
+            "request_id": request.request_id,
+            "status": HumanRequestStatus.REJECTED.value,
+            "source": "machine_policy",
+            "reason_codes": [reason.value for reason in hard_deny.reason_codes],
+            "policy_sha256": hard_deny.policy_sha256,
+            "evidence_sha256": hard_deny.evidence_sha256,
+            "settlement_receipt": settlement_receipt,
+        }
+        return self._terminalize_pending_request(
+            request,
+            status=HumanRequestStatus.REJECTED,
+            decision=decision,
+            responder="policy:semantic:hard-deny",
+            validate_and_apply_authority=False,
+            transition_process=True,
+            cancel_linked_release=True,
+            event_payload=event_payload,
+            event_source="policy:semantic:hard-deny",
+            event_type=EventType.SEMANTIC_POLICY_RESPONSE,
+            audit_action="semantic.policy.deny",
+            audit_decision=event_payload,
+        )
+
+    def _record_semantic_machine_settlement(
+        self,
+        request: HumanRequest,
+        *,
+        status: HumanRequestStatus,
+        decision: Mapping[str, Any],
+        authority_evidence: Mapping[str, Any],
+        responder: str,
+    ) -> dict[str, Any]:
+        recorder = self._host_semantic_settlement_recorder
+        if recorder is None:
+            raise ValidationError("Host semantic settlement recorder is not bound")
+        try:
+            receipt = recorder(
+                request,
+                status=status,
+                decision=dict(decision),
+                authority_evidence=dict(authority_evidence),
+                responder=responder,
+            )
+        except Exception as exc:
+            raise ValidationError("Host semantic settlement recording failed") from exc
+        if not isinstance(receipt, Mapping):
+            raise ValidationError("Host semantic settlement recorder returned invalid evidence")
+        selected = dict(receipt)
+        self._validate_human_response(
+            selected,
+            label="semantic settlement receipt",
+        )
+        return selected
+
+    def _terminalize_machine_policy(
+        self,
+        request_id: str,
+        *,
+        expected_revision: int,
+        status: HumanRequestStatus,
+        decision: Mapping[str, Any],
+        responder: str,
+        authority_applier: Callable[[HumanRequest], Mapping[str, Any]] | None = None,
+        audit_action: str,
+    ) -> tuple[HumanRequest, dict[str, Any]]:
+        """Host-internal machine settlement sharing Human's CAS/UoW kernel.
+
+        Callers may already own the Store transaction (for example to bind a
+        semantic job terminalization). Nested repository transactions join
+        that unit, so request/process/evidence and any authority callback roll
+        back together.
+        """
+
+        selected_status = self._validate_machine_policy_invocation(
+            expected_revision=expected_revision,
+            status=status,
+            decision=decision,
+            responder=responder,
+            authority_applier=authority_applier,
+            audit_action=audit_action,
+        )
+        with self._terminal_lock:
+            with self.requests.transaction():
+                request = self._machine_policy_pending_request(
+                    request_id,
+                    expected_revision=expected_revision,
+                    status=selected_status,
+                )
+                selected_decision, authority_evidence = (
+                    self._machine_policy_authority_decision(
+                        request,
+                        status=selected_status,
+                        decision=decision,
+                        authority_applier=authority_applier,
+                    )
+                )
+                return self._commit_machine_policy_terminal(
+                    request,
+                    status=selected_status,
+                    decision=selected_decision,
+                    authority_evidence=authority_evidence,
+                    responder=responder,
+                    audit_action=audit_action,
+                )
+
+    @staticmethod
+    def _validate_machine_policy_invocation(
+        *,
+        expected_revision: int,
+        status: HumanRequestStatus,
+        decision: Mapping[str, Any],
+        responder: str,
+        authority_applier: Callable[[HumanRequest], Mapping[str, Any]] | None,
+        audit_action: str,
+    ) -> HumanRequestStatus:
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ValidationError("machine settlement expected_revision is invalid")
+        try:
+            selected_status = HumanRequestStatus(status)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("machine settlement status is invalid") from exc
+        if selected_status not in {
+            HumanRequestStatus.APPROVED,
+            HumanRequestStatus.REJECTED,
+        }:
+            raise ValidationError("machine settlement must approve or reject")
+        if not isinstance(responder, str) or not responder.startswith("policy:semantic:"):
+            raise ValidationError("machine settlement responder is not Host semantic policy")
+        expected_audit = (
+            "semantic.policy.auto_approve"
+            if selected_status == HumanRequestStatus.APPROVED
+            else "semantic.policy.deny"
+        )
+        if audit_action != expected_audit:
+            raise ValidationError("machine settlement audit action conflicts with status")
+        if selected_status == HumanRequestStatus.REJECTED and authority_applier is not None:
+            raise ValidationError("machine rejection cannot apply authority")
+        if selected_status == HumanRequestStatus.APPROVED and authority_applier is None:
+            raise ValidationError("machine approval requires an exact authority applier")
+        if not isinstance(decision, Mapping):
+            raise ValidationError("machine policy decision must be a JSON object")
+        return selected_status
+
+    def _machine_policy_pending_request(
+        self,
+        request_id: str,
+        *,
+        expected_revision: int,
+        status: HumanRequestStatus,
+    ) -> HumanRequest:
+        request = self.requests.get(request_id)
+        if request is None:
+            raise NotFound(f"human request not found: {request_id}")
+        if request.status != HumanRequestStatus.PENDING:
+            raise ValidationError(
+                "human request is not pending: "
+                f"{request_id} status={request.status.value}"
+            )
+        if request.revision != expected_revision:
+            raise ValidationError(
+                "human request revision conflict: "
+                f"expected {expected_revision}, found {request.revision}"
+            )
+        if request.payload.get("type") != "external_operation_approval":
+            raise ValidationError(
+                "machine policy can only settle external operation approvals"
+            )
+        if (
+            request.payload.get(_AUTHORITY_REQUEST_ORIGIN_KEY)
+            != "external_operation"
+        ):
+            raise ValidationError(
+                "machine policy request is missing Host external-operation origin"
+            )
+        if status == HumanRequestStatus.APPROVED:
+            self._validate_persisted_authority_request_shape(request.payload)
+        self._require_machine_policy_mode(status)
+        if (
+            self._has_terminal_retry_fence_marker(request)
+            or request.request_id in self._terminal_retry_fences
+        ):
+            raise ValidationError(
+                "human request has an ambiguous provider outcome and "
+                f"requires Host reconciliation: {request_id}"
+            )
+        process = self.processes.get_process(request.pid)
+        if process is not None and process.status in self.TERMINAL_PROCESS_STATUSES:
+            raise ValidationError(
+                "terminal process cannot receive a machine policy decision: "
+                f"{request.pid} status={process.status.value}"
+            )
+        return request
+
+    def _require_machine_policy_mode(self, status: HumanRequestStatus) -> None:
+        runtime_mode = self._semantic_runtime_mode()
+        if status == HumanRequestStatus.APPROVED and runtime_mode != "canary_auto":
+            raise ValidationError("machine approval requires semantic canary_auto mode")
+        if (
+            status == HumanRequestStatus.REJECTED
+            and runtime_mode not in {"enforce_deny", "canary_auto"}
+        ):
+            raise ValidationError(
+                "machine rejection requires active semantic enforcement"
+            )
+
+    def _machine_policy_authority_decision(
+        self,
+        request: HumanRequest,
+        *,
+        status: HumanRequestStatus,
+        decision: Mapping[str, Any],
+        authority_applier: Callable[[HumanRequest], Mapping[str, Any]] | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        hard_deny = self._semantic_hard_deny(request)
+        selected_decision = {
+            **dict(decision),
+            "approved": status == HumanRequestStatus.APPROVED,
+            "source": "machine_policy",
+        }
+        if status == HumanRequestStatus.REJECTED:
+            if hard_deny is None:
+                raise ValidationError(
+                    "machine rejection requires a current deterministic hard deny"
+                )
+            authority_evidence = hard_deny.to_dict()
+            selected_decision["deterministic_deny"] = authority_evidence
+            return selected_decision, authority_evidence
+        if hard_deny is not None:
+            raise ValidationError("machine approval is blocked by deterministic policy")
+        self._require_machine_policy_mode(HumanRequestStatus.APPROVED)
+        assert authority_applier is not None
+        applied = authority_applier(request)
+        if not isinstance(applied, Mapping):
+            raise ValidationError("machine authority applier returned invalid evidence")
+        authority_evidence = dict(applied)
+        selected_decision["authority"] = authority_evidence
+        return selected_decision, authority_evidence
+
+    def _commit_machine_policy_terminal(
+        self,
+        request: HumanRequest,
+        *,
+        status: HumanRequestStatus,
+        decision: dict[str, Any],
+        authority_evidence: dict[str, Any],
+        responder: str,
+        audit_action: str,
+    ) -> tuple[HumanRequest, dict[str, Any]]:
+        settlement_receipt = self._record_semantic_machine_settlement(
+            request,
+            status=status,
+            decision=decision,
+            authority_evidence=authority_evidence,
+            responder=responder,
+        )
+        decision["settlement_receipt"] = settlement_receipt
+        self._validate_human_response(decision, label="machine policy decision")
+        event_payload = {
+            "request_id": request.request_id,
+            "status": status.value,
+            "source": "machine_policy",
+            "policy": _sanitize_human_observability(authority_evidence),
+            "settlement_receipt": settlement_receipt,
+        }
+        settled, _release_parent = self._terminalize_pending_request(
+            request,
+            status=status,
+            decision=decision,
+            responder=responder,
+            validate_and_apply_authority=False,
+            transition_process=True,
+            cancel_linked_release=status != HumanRequestStatus.APPROVED,
+            event_payload=event_payload,
+            event_source=responder,
+            event_type=EventType.SEMANTIC_POLICY_RESPONSE,
+            audit_action=audit_action,
+            audit_decision=event_payload,
+        )
+        return settled, authority_evidence
 
     def _terminalize_pending_request(
         self,
@@ -2431,6 +3422,7 @@ class HumanObjectManager:
         provider_outcome_unknown: bool = False,
         event_payload: dict[str, Any] | None = None,
         event_source: str | None = None,
+        event_type: EventType = EventType.HUMAN_RESPONSE,
         audit_action: str = "human.response",
         audit_decision: dict[str, Any] | None = None,
     ) -> tuple[HumanRequest, HumanRequest | None]:
@@ -2487,6 +3479,15 @@ class HumanObjectManager:
                 release_parent=release_parent,
                 provider_outcome_unknown=provider_outcome_unknown,
             )
+        self._append_semantic_outcome_link(
+            settled,
+            responder=responder,
+        )
+        if release_parent is not None:
+            self._append_semantic_outcome_link(
+                release_parent,
+                responder=responder,
+            )
 
         response_evidence = (
             dict(event_payload)
@@ -2505,7 +3506,7 @@ class HumanObjectManager:
                 }
             )
         self.events.emit(
-            EventType.HUMAN_RESPONSE,
+            event_type,
             source=event_source or responder,
             target=settled.pid,
             payload=response_evidence,
@@ -2521,6 +3522,26 @@ class HumanObjectManager:
             ),
         )
         return settled, release_parent
+
+    def _append_semantic_outcome_link(
+        self,
+        request: HumanRequest,
+        *,
+        responder: str,
+    ) -> None:
+        """Append one Host semantic terminal link inside the shared UoW."""
+
+        if request.payload.get("type") != "external_operation_approval":
+            return
+        callback = self._host_semantic_outcome_linker
+        if callback is None:
+            return
+        try:
+            callback(request, responder=responder)
+        except Exception as exc:
+            raise ValidationError(
+                "Host semantic Human outcome link failed"
+            ) from exc
 
     def _transition_after_human_decision(
         self,
@@ -2652,6 +3673,10 @@ class HumanObjectManager:
         status: HumanRequestStatus,
         decision: dict[str, Any],
     ) -> None:
+        # Revalidate durable state at the last common Human authority boundary.
+        # This catches legacy/corrupt/reopened rows and direct repository
+        # forgeries even when request admission was bypassed.
+        self._validate_persisted_authority_request_shape(request.payload)
         approved = decision.get("approved")
         expected_approved = status == HumanRequestStatus.APPROVED
         if not isinstance(approved, bool):
@@ -2956,8 +3981,14 @@ class HumanObjectManager:
         request: HumanRequest,
         *,
         suffix: str,
-    ) -> None:
-        """Present an interactive request through the protected Human Sink."""
+    ) -> dict[str, Any]:
+        """Present through the Human Sink and return its exact response fence.
+
+        The returned revision/digest is derived from the same durable snapshot
+        used to render the text.  Interactive clients must retain this value;
+        fetching a newer request at response time would bind the Human's answer
+        to a preview they never saw.
+        """
 
         with self._terminal_lock:
             latest = self.requests.get(request.request_id)
@@ -2982,24 +4013,68 @@ class HumanObjectManager:
                 )
             self._terminal_claims.add(latest.request_id)
         try:
-            question = self._terminal_question(latest)
-            text = f"\nHuman request {latest.request_id}: {question}\n{suffix}"
+            displayed = self._terminal_display_snapshot(latest)
+            question = self._terminal_question(displayed)
+            text = (
+                f"\nHuman request {_terminal_safe_text(latest.request_id)}: "
+                f"{question}\n{_terminal_safe_text(suffix)}"
+            )
             self._terminal_provider_io(
                 latest,
                 operation="write",
                 text=text,
                 purpose="interactive_cli_presentation",
             )
+            return self._semantic_response_fence_args(displayed)
         finally:
             with self._terminal_lock:
                 self._terminal_claims.discard(latest.request_id)
 
+    def _terminal_display_snapshot(self, request: HumanRequest) -> HumanRequest:
+        """Project the revision committed by a successful terminal release.
+
+        Protected-operation settlement records the release marker after the
+        provider observes the text.  Render that exact post-settlement
+        revision up front so an external-operation response fence describes
+        the preview the Human actually saw, not the pre-release parent row.
+        """
+
+        release_id = request.payload.get(_DATA_RELEASE_REQUEST_KEY)
+        completed_id = request.payload.get(_DATA_RELEASE_TERMINAL_COMMITTED_KEY)
+        if isinstance(release_id, str):
+            if release_id == completed_id:
+                return request
+            revision_delta = 1
+        else:
+            flow = self._request_data_flow_context(request)
+            sink = DataSink(
+                identity=(
+                    f"human:{request.human}:"
+                    f"{self.config.runtime.terminal_channel}"
+                )
+            )
+            outcome = self.data_flow.classify_egress_snapshot(
+                sink=sink,
+                context=flow,
+                allow_recovered_source_snapshots=True,
+            )
+            if outcome is not DataFlowOutcome.RELEASE_REQUIRED:
+                return request
+            # The Host first persists the release link and, after successful
+            # provider delivery, the terminal-completion marker.
+            revision_delta = 2
+        from dataclasses import replace
+
+        return replace(request, revision=request.revision + revision_delta)
+
     def _terminal_question(self, request: HumanRequest) -> str:
         raw_question = request.payload.get("question")
         question = (
-            str(raw_question)
+            _terminal_safe_text(raw_question)
             if raw_question
-            else dumps(to_jsonable(self.public_request_payload(request)))
+            else _terminal_safe_text(
+                dumps(to_jsonable(self.public_request_payload(request)))
+            )
         )
         if request.payload.get("type") == "permission_request":
             return self._permission_terminal_question(request, question)
@@ -3009,7 +4084,10 @@ class HumanObjectManager:
                 return question
             lines = [question, "Context:"]
             for key in sorted(context):
-                lines.append(f"- {key}: {context[key]!r}")
+                lines.append(
+                    f"- {_terminal_safe_text(key)}: "
+                    f"{_terminal_safe_text(repr(context[key]))}"
+                )
             return "\n".join(lines)
         if request.payload.get("type") == "data_release_approval":
             context = request.payload.get("context")
@@ -3034,73 +4112,147 @@ class HumanObjectManager:
                 ("operation", "operation"),
             ]:
                 if context.get(key) is not None:
-                    lines.append(f"- {label}: {context[key]}")
+                    lines.append(
+                        f"- {label}: {_terminal_safe_text(context[key])}"
+                    )
             lines.append(question)
             return "\n".join(lines)
         if request.payload.get("type") != "external_operation_approval":
             return question
-        context = request.payload.get("context")
-        if not isinstance(context, dict):
-            return question
-        # External-operation prompts show structured facts, not tool prose, so
-        # the human can judge the primitive-level side effect safely.
-        capability = request.payload.get("requested_once_capability")
-        lines = ["Operation details:"]
-        for label, key in [
+        try:
+            preview = self.canonical_approval_preview(request)
+        except ValidationError:
+            return "Operation details unavailable: request is malformed."
+        rendered = preview.to_dict()
+        labels = rendered["source_labels"]
+        lines = ["Canonical operation approval preview:"]
+        for label, key in (
+            ("request revision", "revision"),
             ("process", "pid"),
-            ("primitive", "primitive"),
-            ("operation", "operation"),
-            ("path", "path"),
-            ("absolute path", "absolute_path"),
-            ("resource", "resource"),
-            ("grant scope", "grant_scope"),
-            ("encoding", "encoding"),
-            ("overwrite flag", "overwrite"),
-            ("parents flag", "parents"),
-            ("exist ok", "exist_ok"),
-            ("recursive", "recursive"),
-            ("missing ok", "missing_ok"),
-            ("will create", "will_create"),
-            ("will overwrite", "will_overwrite"),
-            ("content bytes", "content_bytes"),
-            ("content sha256", "content_sha256"),
-            ("working directory", "working_directory"),
-            ("argv", "argv"),
-            ("command", "command"),
-            ("timeout seconds", "timeout_s"),
-            ("policy level", "policy_level"),
-            ("policy reason", "policy_reason"),
-            ("matched rule", "matched_rule"),
-            ("high risk", "high_risk"),
+            ("action", "action_id"),
+            ("resource", "resource_display"),
+            ("resource sha256", "resource_sha256"),
+            ("rights", "rights"),
             ("risk", "risk"),
-            ("rule id", "rule_id"),
-            ("rule effect", "rule_effect"),
-        ]:
-            if key in context:
-                lines.append(f"- {label}: {context[key]}")
-        profile = context.get("sandbox_profile")
-        if isinstance(profile, dict):
-            lines.append("- sandbox profile:")
-            for key in ["operation", "resource", "effect", "risk", "rule_id"]:
-                if key in profile:
-                    lines.append(f"  - {key}: {profile[key]}")
-        target = context.get("target")
-        if isinstance(target, dict):
-            lines.append("- target:")
-            for key in ["exists", "kind", "size_bytes", "modified_at"]:
-                if key in target:
-                    lines.append(f"  - {key}: {target[key]}")
-        if isinstance(capability, dict):
-            lines.append("- one-time capability:")
-            lines.append(f"  - resource: {capability.get('resource')}")
-            lines.append(f"  - rights: {capability.get('rights')}")
-        preview = context.get("content_preview")
-        if isinstance(preview, str):
-            truncated = bool(context.get("content_preview_truncated"))
-            lines.append(f"- content preview{' (truncated)' if truncated else ''}:")
-            lines.append(self._indent_block(preview))
-        lines.append(question)
+            ("effect", "effect_id"),
+            ("arguments sha256", "canonical_args_sha256"),
+            ("target state sha256", "target_state_sha256"),
+            ("expires at", "expires_at"),
+        ):
+            if rendered.get(key) is not None:
+                lines.append(
+                    f"- {label}: {_terminal_safe_text(rendered[key])}"
+                )
+        lines.append(
+            "- source labels: "
+            f"sensitivity={_terminal_safe_text(labels['sensitivity'])} "
+            f"integrity={_terminal_safe_text(labels['integrity'])} "
+            f"trust={_terminal_safe_text(labels['trust_level'])} "
+            f"identity_present={_terminal_safe_text(labels['identity_present'])} "
+            f"identity_mixed={_terminal_safe_text(labels['identity_mixed'])}"
+        )
+        lines.append(
+            f"- preview sha256: {_terminal_safe_text(preview.canonical_sha256())}"
+        )
+        self._append_terminal_argument_projection(
+            lines,
+            rendered.get("argument_projection"),
+        )
         return "\n".join(lines)
+
+    def _append_terminal_argument_projection(
+        self,
+        lines: list[str],
+        projection: Any,
+    ) -> None:
+        """Render only the typed, digest-bound Host argument projection.
+
+        ``CanonicalApprovalPreviewV1`` owns and validates this exact-shape
+        projection before it reaches the terminal.  In particular, the
+        requester's legacy ``payload.context`` is never read here: arbitrary
+        policy prose, matched-rule claims, commands, paths, or content previews
+        therefore cannot be presented as Host-authored evidence.
+        """
+
+        if not isinstance(projection, Mapping):
+            return
+        kind = projection.get("kind")
+        fields_by_kind: dict[str, tuple[tuple[str, str], ...]] = {
+            "filesystem": (
+                ("path sha256", "path_sha256"),
+                ("content sha256", "content_sha256"),
+                ("content bytes", "content_bytes"),
+                ("read max bytes", "read_max_bytes"),
+                ("entry limit", "entry_limit"),
+                ("text encoding", "text_encoding"),
+                ("expected content sha256", "expected_content_sha256"),
+                ("overwrite", "overwrite"),
+                ("parents", "parents"),
+                ("exist ok", "exist_ok"),
+                ("recursive", "recursive"),
+                ("missing ok", "missing_ok"),
+            ),
+            "shell": (
+                ("display argv", "display_argv"),
+                ("argv count", "argv_count"),
+                ("argv truncated", "argv_truncated"),
+                ("argv sha256", "argv_sha256"),
+                ("safe cwd", "safe_cwd"),
+                ("cwd sha256", "cwd_sha256"),
+                ("timeout seconds", "timeout_seconds"),
+                ("continuous session", "continuous_session"),
+                ("network access", "network_access"),
+            ),
+            "git": (
+                ("path sha256", "path_sha256"),
+                ("worktree id", "worktree_id"),
+                ("worktree id sha256", "worktree_id_sha256"),
+                ("repository state sha256", "repository_state_sha256"),
+                ("source args sha256", "source_args_sha256"),
+                ("material facts", "git_fact_tokens"),
+            ),
+            "jsonrpc": (
+                ("endpoint id", "endpoint_id"),
+                ("endpoint id sha256", "endpoint_id_sha256"),
+                ("method id", "method_id"),
+                ("method id sha256", "method_id_sha256"),
+                ("registry spec sha256", "registry_spec_sha256"),
+                ("registry generation", "registry_generation"),
+                ("payload sha256", "payload_sha256"),
+            ),
+            "mcp": (
+                ("server id", "server_id"),
+                ("server id sha256", "server_id_sha256"),
+                ("tool id", "tool_id"),
+                ("tool id sha256", "tool_id_sha256"),
+                ("registry spec sha256", "registry_spec_sha256"),
+                ("registry generation", "registry_generation"),
+                ("payload sha256", "payload_sha256"),
+            ),
+        }
+        lines.append("Host-bound canonical argument projection:")
+        for label, value in (
+            ("kind", kind),
+            ("operation", projection.get("operation")),
+        ):
+            if value is not None:
+                lines.append(f"- {label}: {_terminal_safe_text(value)}")
+        selected_fields = fields_by_kind.get(str(kind), ())
+        for label, key in selected_fields:
+            value = projection.get(key)
+            if value is None or value == [] or value == ():
+                continue
+            lines.append(f"- {label}: {_terminal_safe_text(value)}")
+        if kind == "git":
+            references = projection.get("git_references")
+            if isinstance(references, list):
+                for reference in references:
+                    if not isinstance(reference, Mapping):
+                        continue
+                    role = _terminal_safe_text(reference.get("role"))
+                    display = _terminal_safe_text(reference.get("display"))
+                    digest = _terminal_safe_text(reference.get("sha256"))
+                    lines.append(f"- Git reference {role}: {display} (sha256={digest})")
 
     def _permission_terminal_question(self, request: HumanRequest, question: str) -> str:
         context = request.payload.get("context")
@@ -3122,13 +4274,15 @@ class HumanObjectManager:
         ]:
             value = request.pid if key == "pid" else context.get(key)
             if value is not None:
-                lines.append(f"- {label}: {value}")
+                lines.append(f"- {label}: {_terminal_safe_text(value)}")
         lease = context.get("lease")
         if isinstance(lease, dict):
             lines.append("- lease:")
             for key in ["type", "choices", "default_if_unanswered", "expires_at", "uses_remaining"]:
                 if key in lease:
-                    lines.append(f"  - {key}: {lease[key]}")
+                    lines.append(
+                        f"  - {key}: {_terminal_safe_text(lease[key])}"
+                    )
         constraints = context.get("constraints")
         if isinstance(constraints, dict):
             lines.append("- constraints:")
@@ -3138,29 +4292,34 @@ class HumanObjectManager:
                 for rule in rules:
                     if not isinstance(rule, dict):
                         continue
-                    lines.append(
-                        "    - "
+                    rule_summary = (
                         f"{rule.get('rule_id')} "
                         f"effect={rule.get('effect')} "
                         f"risk={rule.get('risk')} "
                         f"conditions={rule.get('conditions')}"
                     )
+                    lines.append(
+                        f"    - {_terminal_safe_text(rule_summary)}"
+                    )
             elif constraints:
                 for key in sorted(constraints):
-                    lines.append(f"  - {key}: {constraints[key]}")
+                    lines.append(
+                        f"  - {_terminal_safe_text(key)}: "
+                        f"{_terminal_safe_text(constraints[key])}"
+                    )
             else:
                 lines.append("  - <none>")
         if isinstance(permission, dict):
             lines.append("- requested policy target:")
-            lines.append(f"  - resource: {permission.get('resource')}")
-            lines.append(f"  - rights: {permission.get('rights')}")
+            lines.append(
+                "  - resource: "
+                f"{_terminal_safe_text(permission.get('resource'))}"
+            )
+            lines.append(
+                f"  - rights: {_terminal_safe_text(permission.get('rights'))}"
+            )
         lines.append(question)
         return "\n".join(lines)
-
-    def _indent_block(self, text: str) -> str:
-        if not text:
-            return "  <empty>"
-        return "\n".join(f"  {line}" for line in text.splitlines() or [text])
 
     def _terminal_provider_io(
         self,
@@ -3666,7 +4825,10 @@ class HumanObjectManager:
             self._terminal_provider_io(
                 request,
                 operation="write",
-                text=f"{question} [answer={auto_answer!r}]",
+                text=(
+                    f"{question} "
+                    f"[answer={_terminal_safe_text(repr(auto_answer))}]"
+                ),
                 purpose="text_answer_auto",
             )
             return auto_answer

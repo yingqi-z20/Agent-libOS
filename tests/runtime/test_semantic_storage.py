@@ -9,7 +9,7 @@ import time
 import pytest
 
 from agent_libos.config import SemanticDefaults
-from agent_libos.models import DataLabels
+from agent_libos.models import DataFlowContext, DataLabels, DataSourceRef
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.models.semantic import (
     AuthoritativeApprovalFacts,
@@ -19,7 +19,12 @@ from agent_libos.models.semantic import (
     SemanticAssessmentStatus,
     SemanticDomain,
 )
-from agent_libos.semantic.service import SemanticManager
+from agent_libos.semantic.service import (
+    SemanticManager,
+    _identity_safe_labels_sha256,
+    _sha256,
+)
+from agent_libos.semantic.external import HostSemanticAssessmentInvocation
 from agent_libos.storage import (
     SQLiteStore,
     SemanticAssessmentCursor,
@@ -129,6 +134,62 @@ def _assessment(
     )
 
 
+def _job_with_request_revision(
+    job_id: str,
+    *,
+    request_id: str,
+    request_revision: int,
+) -> SemanticAssessmentJobRecord:
+    job = _job(job_id)
+    projection = {**job.projection, "request_revision": request_revision}
+    projection_sha256 = hashlib.sha256(
+        json.dumps(
+            projection,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return replace(
+        job,
+        request_id=request_id,
+        projection=projection,
+        projection_sha256=projection_sha256,
+    )
+
+
+def test_semantic_job_exact_request_revision_lookup_is_bounded_and_ambiguous_fails_closed() -> None:
+    store = SQLiteStore(":memory:")
+    unit = UnitOfWork(store)
+    try:
+        captured = _job_with_request_revision(
+            "exact-request-job",
+            request_id="exact-request",
+            request_revision=7,
+        )
+        unit.semantic.enqueue_semantic_assessment_job(captured)
+
+        assert unit.semantic.get_semantic_assessment_job_for_request(
+            "exact-request", 7
+        ) == captured
+        assert unit.semantic.get_semantic_assessment_job_for_request(
+            "exact-request", 8
+        ) is None
+
+        duplicate = _job_with_request_revision(
+            "duplicate-request-job",
+            request_id="exact-request",
+            request_revision=7,
+        )
+        unit.semantic.enqueue_semantic_assessment_job(duplicate)
+        with pytest.raises(ValidationError, match="ambiguous"):
+            unit.semantic.get_semantic_assessment_job_for_request(
+                "exact-request", 7
+            )
+    finally:
+        store.close()
+
+
 def _claim(unit: UnitOfWork) -> SemanticAssessmentJobRecord:
     claimed = unit.semantic.claim_next_semantic_assessment_job(
         lease_owner_id="worker-1",
@@ -216,7 +277,10 @@ def test_worker_merges_frozen_host_dlp_findings_for_every_adapter_terminal_path(
     seen_requests: list[SemanticAssessmentRequest] = []
 
     class Assessor:
-        def assess(self, request: SemanticAssessmentRequest) -> SemanticAssessment:
+        def _evaluate(
+            self,
+            request: SemanticAssessmentRequest,
+        ) -> SemanticAssessment:
             seen_requests.append(request)
             if assessor_outcome == "success":
                 return SemanticAssessment(status=SemanticAssessmentStatus.SUCCESS)
@@ -224,10 +288,20 @@ def test_worker_merges_frozen_host_dlp_findings_for_every_adapter_terminal_path(
                 raise CapabilityDenied("blocked without retaining provider payload")
             raise RuntimeError("provider failed without returning a payload")
 
+        def assess(self, request: SemanticAssessmentRequest) -> SemanticAssessment:
+            return self._evaluate(request)
+
+        def assess_host(
+            self,
+            invocation: HostSemanticAssessmentInvocation,
+        ) -> SemanticAssessment:
+            return self._evaluate(invocation.request)
+
     store = SQLiteStore(":memory:")
     try:
         unit = UnitOfWork(store)
-        labels = DataLabels()
+        labels = DataLabels(sensitivity="normal", origin="external:root-test")
+        flow = DataFlowContext(labels=labels)
         manager = SemanticManager(
             unit.semantic,
             config=SemanticDefaults(
@@ -254,11 +328,14 @@ def test_worker_merges_frozen_host_dlp_findings_for_every_adapter_terminal_path(
             redacted_intent=f"Use {sentinel} for the classifier",
             pid=f"pid-{adapter}-{assessor_outcome}",
             policy_sha256=_DIGEST,
+            source_refs_sha256=flow.source_refs_hash(),
+            data_labels_sha256=_identity_safe_labels_sha256(labels),
         )
         queued = manager._enqueue(  # noqa: SLF001 - exercise the worker contract
             request,
             candidate=None,
             hard_violations=(),
+            data_flow_context=flow if adapter == "external" else None,
         )
 
         assert queued.projection["projection_mode"] == "metadata_only"
@@ -304,6 +381,499 @@ def test_worker_merges_frozen_host_dlp_findings_for_every_adapter_terminal_path(
         assert request.data_labels == labels
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("reopen", (False, True), ids=("missing", "reopen"))
+def test_external_worker_without_same_process_transient_flow_is_egress_blocked(
+    tmp_path: Path,
+    reopen: bool,
+) -> None:
+    provider_calls: list[str] = []
+
+    class Assessor:
+        def assess_host(
+            self,
+            invocation: HostSemanticAssessmentInvocation,
+        ) -> SemanticAssessment:
+            provider_calls.append(invocation.request.action_id)
+            return SemanticAssessment(status=SemanticAssessmentStatus.SUCCESS)
+
+    config = SemanticDefaults(
+        mode="shadow",
+        adapter="external",
+        external_profile_id="classifier",
+    )
+
+    def manager_for(selected_store: SQLiteStore) -> SemanticManager:
+        return SemanticManager(
+            UnitOfWork(selected_store).semantic,
+            config=config,
+            assessor=Assessor(),
+            request_capture_registrar=lambda _callback: None,
+            spawn_observer_registrar=lambda _callback: None,
+            result_observer_registrar=lambda _callback: None,
+            request_capture=lambda _request: None,
+            spawn_observer=lambda *_args, **_kwargs: None,
+            result_observer=lambda *_args, **_kwargs: None,
+        )
+
+    database = str(tmp_path / "semantic-transient.sqlite") if reopen else ":memory:"
+    store = SQLiteStore(database)
+    manager = manager_for(store)
+    labels = DataLabels(origin="derived")
+    flow = DataFlowContext(labels=labels)
+    request = SemanticAssessmentRequest(
+        kind=SemanticAssessmentKind.ROOT_GOAL,
+        domain=SemanticDomain.RUNTIME,
+        action_id="runtime.root_goal",
+        input_sha256=_DIGEST,
+        deadline_at="2099-01-01T00:00:00+00:00",
+        data_labels=labels,
+        features=AuthoritativeApprovalFacts(schema_valid=True),
+        redacted_intent="review the quarterly report",
+        pid="pid-transient-reopen" if reopen else "pid-transient-missing",
+        policy_sha256=_DIGEST,
+        source_refs_sha256=flow.source_refs_hash(),
+        data_labels_sha256=_identity_safe_labels_sha256(labels),
+    )
+    queued = manager._enqueue(  # noqa: SLF001 - exact worker privacy contract
+        request,
+        candidate=None,
+        hard_violations=(),
+        data_flow_context=flow if reopen else None,
+    )
+    if reopen:
+        store.close()
+        store = SQLiteStore(database)
+        manager = manager_for(store)
+    try:
+        assert manager.process_one()
+        persisted = store.get_semantic_assessment_job(queued.job_id)
+        assert persisted is not None and persisted.assessment_id is not None
+        terminal = manager.get_assessment(persisted.assessment_id)
+        assert terminal is not None
+        assert terminal["status"] == "egress_blocked"
+        assert provider_calls == []
+        assert persisted.projection == {}
+        assert persisted.projection_retention is SemanticProjectionRetention.HASH_ONLY
+    finally:
+        store.close()
+
+
+def _test_tenant_bucket(value: str) -> str:
+    return hashlib.sha256(f"semantic-test-key\0{value}".encode("utf-8")).hexdigest()
+
+
+def test_external_provider_worker_uses_verified_live_identity_and_origin() -> None:
+    invocations: list[HostSemanticAssessmentInvocation] = []
+
+    class Assessor:
+        def assess_host(
+            self,
+            invocation: HostSemanticAssessmentInvocation,
+        ) -> SemanticAssessment:
+            invocations.append(invocation)
+            return SemanticAssessment(status=SemanticAssessmentStatus.SUCCESS)
+
+    store = SQLiteStore(":memory:")
+    try:
+        unit = UnitOfWork(store)
+        labels = DataLabels(
+            sensitivity="normal",
+            integrity="verified",
+            trust_level="trusted",
+            origin="external:provider-fixture",
+            tenant="tenant-fixture",
+            principal="principal-fixture",
+            declassification_authority="host-release-fixture",
+        )
+        source = DataSourceRef(
+            oid="obj-provider-source",
+            version=1,
+            content_sha256="2" * 64,
+        )
+        flow = DataFlowContext(labels=labels, source_refs=(source,))
+        manager = SemanticManager(
+            unit.semantic,
+            config=SemanticDefaults(
+                mode="shadow",
+                adapter="external",
+                external_profile_id="classifier",
+            ),
+            assessor=Assessor(),
+            tenant_bucketer=_test_tenant_bucket,
+            request_capture_registrar=lambda _callback: None,
+            spawn_observer_registrar=lambda _callback: None,
+            result_observer_registrar=lambda _callback: None,
+            request_capture=lambda _request: None,
+            spawn_observer=lambda *_args, **_kwargs: None,
+            result_observer=lambda *_args, **_kwargs: None,
+        )
+        request = SemanticAssessmentRequest(
+            kind=SemanticAssessmentKind.PROVIDER_INGRESS,
+            domain=SemanticDomain.JSONRPC,
+            action_id="jsonrpc.provider_ingress",
+            input_sha256=_DIGEST,
+            deadline_at="2099-01-01T00:00:00+00:00",
+            data_labels=labels,
+            features=AuthoritativeApprovalFacts(schema_valid=True),
+            pid="pid-provider-live-labels",
+            effect_id="effect-provider-live-labels",
+            policy_sha256=_DIGEST,
+            source_refs_sha256=flow.source_refs_hash(),
+            data_labels_sha256=_identity_safe_labels_sha256(labels),
+        )
+        manager._enqueue(  # noqa: SLF001 - exact transient envelope contract
+            request,
+            candidate=None,
+            hard_violations=(),
+            data_flow_context=flow,
+        )
+
+        assert manager.process_one()
+        assert len(invocations) == 1
+        effective = invocations[0].request.data_labels
+        assert effective.origin == labels.origin
+        assert effective.tenant == labels.tenant
+        assert effective.principal == labels.principal
+        assert effective.declassification_authority is None
+        assert invocations[0].data_flow_context.labels == effective
+        records = unit.semantic.query_semantic_assessments(
+            after=None,
+            limit=2,
+            pid=request.pid,
+        ).records
+        assert len(records) == 1 and records[0].status == "success"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ("normal", "persisted-double-null", "live-null", "bucketer-failure"),
+)
+def test_external_tenant_bucket_requires_exact_three_way_binding(
+    scenario: str,
+) -> None:
+    provider_calls: list[str] = []
+    bucket_calls = 0
+
+    class Assessor:
+        def assess_host(
+            self,
+            invocation: HostSemanticAssessmentInvocation,
+        ) -> SemanticAssessment:
+            provider_calls.append(invocation.request.action_id)
+            return SemanticAssessment(status=SemanticAssessmentStatus.SUCCESS)
+
+    def bucketer(value: str) -> str:
+        nonlocal bucket_calls
+        bucket_calls += 1
+        if scenario == "bucketer-failure" and bucket_calls > 1:
+            raise RuntimeError("Host tenant bucketer unavailable")
+        return _test_tenant_bucket(value)
+
+    store = SQLiteStore(":memory:")
+    try:
+        unit = UnitOfWork(store)
+        labels = DataLabels(
+            origin="external:tenant-binding-fixture",
+            tenant="tenant-exact",
+            principal="principal-exact",
+        )
+        source = DataSourceRef(
+            oid="obj-tenant-binding-source",
+            version=1,
+            content_sha256="5" * 64,
+        )
+        flow = DataFlowContext(labels=labels, source_refs=(source,))
+        manager = SemanticManager(
+            unit.semantic,
+            config=SemanticDefaults(
+                mode="shadow",
+                adapter="external",
+                external_profile_id="classifier",
+            ),
+            assessor=Assessor(),
+            tenant_bucketer=bucketer,
+            request_capture_registrar=lambda _callback: None,
+            spawn_observer_registrar=lambda _callback: None,
+            result_observer_registrar=lambda _callback: None,
+            request_capture=lambda _request: None,
+            spawn_observer=lambda *_args, **_kwargs: None,
+            result_observer=lambda *_args, **_kwargs: None,
+        )
+        request = SemanticAssessmentRequest(
+            kind=SemanticAssessmentKind.ROOT_GOAL,
+            domain=SemanticDomain.RUNTIME,
+            action_id="runtime.root_goal",
+            input_sha256=_DIGEST,
+            deadline_at="2099-01-01T00:00:00+00:00",
+            data_labels=labels,
+            features=AuthoritativeApprovalFacts(schema_valid=True),
+            pid=f"pid-tenant-binding-{scenario}",
+            policy_sha256=_DIGEST,
+            source_refs_sha256=flow.source_refs_hash(),
+            data_labels_sha256=_identity_safe_labels_sha256(labels),
+        )
+        queued = manager._enqueue(  # noqa: SLF001 - adversarial binding matrix
+            request,
+            candidate=None,
+            hard_violations=(),
+            data_flow_context=flow,
+        )
+        if scenario == "persisted-double-null":
+            projection = dict(queued.projection)
+            projection["tenant_bucket_sha256"] = None
+            bindings = dict(queued.bindings)
+            bindings["tenant_bucket_sha256"] = None
+            store.conn.execute(
+                "UPDATE semantic_assessment_jobs "
+                "SET projection_json = ?, bindings_json = ?, "
+                "projection_sha256 = ? WHERE job_id = ?",
+                (
+                    json.dumps(
+                        projection,
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        bindings,
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        sort_keys=True,
+                    ),
+                    _sha256(projection),
+                    queued.job_id,
+                ),
+            )
+            store.conn.commit()
+        elif scenario == "live-null":
+            snapshot = manager._transient_contexts[queued.job_id]  # noqa: SLF001
+            changed_flow = replace(
+                flow,
+                labels=replace(labels, tenant=None),
+            )
+            manager._transient_contexts[queued.job_id] = replace(  # noqa: SLF001
+                snapshot,
+                context=changed_flow,
+                exact_labels_sha256=_sha256(changed_flow.labels.to_dict()),
+            )
+
+        assert manager.process_one()
+        records = unit.semantic.query_semantic_assessments(
+            after=None,
+            limit=2,
+            pid=request.pid,
+        ).records
+        assert len(records) == 1
+        if scenario == "normal":
+            assert records[0].status == "success"
+            assert provider_calls == ["runtime.root_goal"]
+        else:
+            assert records[0].status == "egress_blocked"
+            assert provider_calls == []
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("drift", ("tenant", "principal", "source_ref"))
+def test_external_worker_rejects_transient_identity_or_source_drift(
+    drift: str,
+) -> None:
+    provider_calls: list[str] = []
+
+    class Assessor:
+        def assess_host(
+            self,
+            invocation: HostSemanticAssessmentInvocation,
+        ) -> SemanticAssessment:
+            provider_calls.append(invocation.request.action_id)
+            return SemanticAssessment(status=SemanticAssessmentStatus.SUCCESS)
+
+    store = SQLiteStore(":memory:")
+    try:
+        unit = UnitOfWork(store)
+        labels = DataLabels(
+            origin="external:drift-fixture",
+            tenant="tenant-original",
+            principal="principal-original",
+        )
+        source = DataSourceRef(
+            oid="obj-original-source",
+            version=1,
+            content_sha256="3" * 64,
+        )
+        flow = DataFlowContext(labels=labels, source_refs=(source,))
+        manager = SemanticManager(
+            unit.semantic,
+            config=SemanticDefaults(
+                mode="shadow",
+                adapter="external",
+                external_profile_id="classifier",
+            ),
+            assessor=Assessor(),
+            tenant_bucketer=_test_tenant_bucket,
+            request_capture_registrar=lambda _callback: None,
+            spawn_observer_registrar=lambda _callback: None,
+            result_observer_registrar=lambda _callback: None,
+            request_capture=lambda _request: None,
+            spawn_observer=lambda *_args, **_kwargs: None,
+            result_observer=lambda *_args, **_kwargs: None,
+        )
+        request = SemanticAssessmentRequest(
+            kind=SemanticAssessmentKind.ROOT_GOAL,
+            domain=SemanticDomain.RUNTIME,
+            action_id="runtime.root_goal",
+            input_sha256=_DIGEST,
+            deadline_at="2099-01-01T00:00:00+00:00",
+            data_labels=labels,
+            features=AuthoritativeApprovalFacts(schema_valid=True),
+            pid=f"pid-transient-{drift}",
+            policy_sha256=_DIGEST,
+            source_refs_sha256=flow.source_refs_hash(),
+            data_labels_sha256=_identity_safe_labels_sha256(labels),
+        )
+        queued = manager._enqueue(  # noqa: SLF001 - adversarial transient drift
+            request,
+            candidate=None,
+            hard_violations=(),
+            data_flow_context=flow,
+        )
+        snapshot = manager._transient_contexts[queued.job_id]  # noqa: SLF001
+        if drift == "tenant":
+            changed = replace(flow, labels=replace(labels, tenant="tenant-drifted"))
+        elif drift == "principal":
+            changed = replace(
+                flow,
+                labels=replace(labels, principal="principal-drifted"),
+            )
+        else:
+            changed = replace(
+                flow,
+                source_refs=(
+                    DataSourceRef(
+                        oid="obj-drifted-source",
+                        version=1,
+                        content_sha256="4" * 64,
+                    ),
+                ),
+            )
+        manager._transient_contexts[queued.job_id] = replace(  # noqa: SLF001
+            snapshot,
+            context=changed,
+        )
+
+        assert manager.process_one()
+        assert provider_calls == []
+        records = unit.semantic.query_semantic_assessments(
+            after=None,
+            limit=2,
+            pid=request.pid,
+        ).records
+        assert len(records) == 1
+        assert records[0].status == "egress_blocked"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "live_artifact_sha256",
+    ("2" * 64, "3" * 64),
+    ids=("profile-drift", "model-drift"),
+)
+def test_reopened_worker_refuses_classifier_artifact_drift_before_call(
+    tmp_path: Path,
+    live_artifact_sha256: str,
+) -> None:
+    """A persisted projection cannot be reassigned to a new profile/model."""
+
+    database = str(tmp_path / f"semantic-{live_artifact_sha256[0]}-drift.sqlite")
+    config = SemanticDefaults(
+        mode="shadow",
+        adapter="external",
+        external_profile_id="classifier",
+    )
+
+    class Assessor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def assess_host(
+            self,
+            _invocation: HostSemanticAssessmentInvocation,
+        ) -> SemanticAssessment:
+            self.calls += 1
+            return SemanticAssessment(status=SemanticAssessmentStatus.SUCCESS)
+
+    def manager_for(
+        selected_store: SQLiteStore,
+        *,
+        assessor: Assessor,
+        artifact_sha256: str,
+    ) -> SemanticManager:
+        return SemanticManager(
+            UnitOfWork(selected_store).semantic,
+            config=config,
+            assessor=assessor,
+            artifact_sha256=artifact_sha256,
+            request_capture_registrar=lambda _callback: None,
+            spawn_observer_registrar=lambda _callback: None,
+            result_observer_registrar=lambda _callback: None,
+            request_capture=lambda _request: None,
+            spawn_observer=lambda *_args, **_kwargs: None,
+            result_observer=lambda *_args, **_kwargs: None,
+        )
+
+    captured_store = SQLiteStore(database)
+    captured_assessor = Assessor()
+    captured_manager = manager_for(
+        captured_store,
+        assessor=captured_assessor,
+        artifact_sha256=_DIGEST,
+    )
+    labels = DataLabels(origin="derived")
+    request = SemanticAssessmentRequest(
+        kind=SemanticAssessmentKind.ROOT_GOAL,
+        domain=SemanticDomain.RUNTIME,
+        action_id="runtime.root_goal",
+        input_sha256=_DIGEST,
+        deadline_at="2099-01-01T00:00:00+00:00",
+        data_labels=labels,
+        features=AuthoritativeApprovalFacts(schema_valid=True),
+        pid="pid-artifact-drift",
+        policy_sha256=_DIGEST,
+        source_refs_sha256=DataFlowContext(labels=labels).source_refs_hash(),
+    )
+    captured_manager._enqueue(  # noqa: SLF001 - freeze capture provenance
+        request,
+        candidate=None,
+        hard_violations=(),
+    )
+    captured_store.close()
+
+    reopened_store = SQLiteStore(database)
+    live_assessor = Assessor()
+    reopened_manager = manager_for(
+        reopened_store,
+        assessor=live_assessor,
+        artifact_sha256=live_artifact_sha256,
+    )
+    try:
+        assert reopened_manager.process_one() is True
+        assert captured_assessor.calls == 0
+        assert live_assessor.calls == 0
+
+        records = UnitOfWork(
+            reopened_store
+        ).semantic.query_semantic_assessments(after=None, limit=2).records
+        assert len(records) == 1
+        assert records[0].status == SemanticAssessmentStatus.STALE_INPUT.value
+        assert records[0].shadow_outcome == "require_human"
+        assert records[0].artifact_sha256 == _DIGEST
+    finally:
+        reopened_store.close()
 
 
 @pytest.mark.parametrize(
@@ -818,13 +1388,15 @@ def test_semantic_terminal_cas_rejects_transitions_without_claim_provenance() ->
             _target(claimed, skipped),
             status=SemanticAssessmentJobStatus.CANCELLED,
         )
-        with pytest.raises(ValidationError, match="claim/attempt provenance"):
-            unit.semantic.terminalize_semantic_assessment_job(
-                claimed,
-                cancelled,
-                skipped,
-            )
-        assert unit.semantic.get_semantic_assessment_job(claimed.job_id) == claimed
+        cancelled = replace(cancelled, error_code="disabled")
+        assert unit.semantic.terminalize_semantic_assessment_job(
+            claimed,
+            cancelled,
+            skipped,
+        )
+        persisted = unit.semantic.get_semantic_assessment_job(claimed.job_id)
+        assert persisted == cancelled
+        assert persisted.attempt_count == 1
     finally:
         store.close()
 

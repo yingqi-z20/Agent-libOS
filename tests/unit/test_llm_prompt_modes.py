@@ -77,7 +77,7 @@ class _WaitForToolIdentityApproval(_CaptureToolIdentity):
                 pid=ctx.pid,
                 human=ctx.runtime.config.runtime.default_human,
                 request={
-                    "type": "external_operation_approval",
+                    "type": "approval",
                     "question": "Approve the identity resume probe",
                     "context": {"operation": "identity_resume_probe"},
                 },

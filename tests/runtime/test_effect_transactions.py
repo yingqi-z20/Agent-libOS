@@ -195,14 +195,18 @@ def test_approval_binding_rejects_changed_arguments_and_target_version() -> None
             },
         )
         context = {
+            "adapter": "object",
+            "authority_operation": "object.update",
             "primitive": "runtime.jsonrpc.call",
             "operation": "update",
+            "pid": pid,
             "resource": resource,
+            "right": CapabilityRight.WRITE.value,
             "record_id": "customer-1",
             "value": "approved",
             "target_state_version": "7",
         }
-        request_id = runtime.human.query(
+        request_id = runtime.human.query_authority_request(
             pid=pid,
             human="owner",
             request={
@@ -212,10 +216,12 @@ def test_approval_binding_rejects_changed_arguments_and_target_version() -> None
                     "subject": pid,
                     "resource": resource,
                     "rights": [CapabilityRight.WRITE.value],
+                    "constraints": {},
                 },
                 "context": context,
             },
             blocking=True,
+            authority_origin="external_operation",
         )
         runtime.human.drain_terminal_queue(auto_approve=True)
         request = runtime.human.get(request_id)

@@ -5938,7 +5938,7 @@ class TestGuiServer:
         runtime = self.server.service.runtime
         pid = runtime.process.spawn(image='base-agent:v0', goal='typed gui permission')
         resource = runtime.filesystem.resource_for('agent_outputs/typed-gui.txt')
-        request_id = runtime.human.query(
+        request_id = runtime.human.query_authority_request(
             pid=pid,
             human=DEFAULT_CONFIG.runtime.default_human,
             request={
@@ -5952,6 +5952,7 @@ class TestGuiServer:
                 },
             },
             blocking=True,
+            authority_origin='permission_policy',
         )
         presented = self.server.service.human_request_view(
             runtime.human.get(request_id)
@@ -6089,7 +6090,7 @@ class TestGuiServer:
     def test_permission_response_without_approved_uses_explicit_deny_policy(self) -> None:
         runtime = self.server.service.runtime
         pid = runtime.process.spawn(image='base-agent:v0', goal='gui human default reject')
-        request_id = runtime.human.query(
+        request_id = runtime.human.query_authority_request(
             pid=pid,
             human=DEFAULT_CONFIG.runtime.default_human,
             request={
@@ -6102,6 +6103,7 @@ class TestGuiServer:
                 },
             },
             blocking=True,
+            authority_origin='permission_policy',
         )
 
         status, rejected = self.request(

@@ -103,6 +103,7 @@ class SdkProtectedSemanticCallPort(ProtectedSemanticCallPort):
             data_flow_payload=call.egress_payload,
             data_flow_operation=call.operation,
             data_flow_request_release=False,
+            data_flow_redact_source_refs_evidence=True,
             failure_evidence=lambda error, phase: self._failure_evidence(
                 call,
                 error,

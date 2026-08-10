@@ -23,6 +23,7 @@ from agent_libos.storage.sql import (
     SQLRuntimeStore,
     _V4_REQUIRED_COLUMNS,
     _V5_REQUIRED_COLUMNS,
+    _V6_REQUIRED_COLUMNS,
 )
 from benchmarks.external_effect_recovery import (
     BENCHMARK_PROFILES,
@@ -316,11 +317,10 @@ def test_runtime_assembly_select_allowlist_is_exact() -> None:
 
 
 @pytest.mark.parametrize(
-    ("version", "required_columns"),
-    [(4, _V4_REQUIRED_COLUMNS), (5, _V5_REQUIRED_COLUMNS)],
+    "required_columns",
+    [_V4_REQUIRED_COLUMNS, _V5_REQUIRED_COLUMNS, _V6_REQUIRED_COLUMNS],
 )
-def test_startup_manifest_schema_probe_allowlist_is_exact(
-    version: int,
+def test_startup_manifest_schema_probe_allowlist_is_version_independent(
     required_columns: dict[str, frozenset[str]],
 ) -> None:
     manifest_tables = sorted(required_columns)
@@ -335,17 +335,21 @@ def test_startup_manifest_schema_probe_allowlist_is_exact(
     exact_probe = manifest_probe(manifest_tables)
     assert (
         recovery_runner._startup_statement_kind(exact_probe)
-        == f"v{version}_manifest_schema_probe"
+        == "manifest_schema_probe"
+    )
+    additive_probe = manifest_probe(
+        sorted([*manifest_tables, "zz_future_canonical_table"])
+    )
+    assert (
+        recovery_runner._startup_statement_kind(additive_probe)
+        == "manifest_schema_probe"
     )
 
     near_or_arbitrary_probes = (
-        manifest_probe(
-            [name for name in manifest_tables if name != "external_effects"]
-        ),
         manifest_probe(["external_effects"]),
-        manifest_probe([*manifest_tables, "not_a_manifest_table"]),
         manifest_probe(list(reversed(manifest_tables))),
         manifest_probe([name.upper() for name in manifest_tables]),
+        manifest_probe([*manifest_tables, manifest_tables[-1]]),
         exact_probe.replace("SELECT name, type", "SELECT name, type, sql"),
         "SELECT name, type FROM sqlite_master WHERE name = 'external_effects'",
         "SELECT * FROM sqlite_master WHERE sql LIKE '%external_effects%'",
@@ -354,6 +358,20 @@ def test_startup_manifest_schema_probe_allowlist_is_exact(
     assert all(
         recovery_runner._startup_statement_kind(probe) is None
         for probe in near_or_arbitrary_probes
+    )
+
+
+def test_startup_catalog_probe_shape_does_not_review_domain_query_injection() -> None:
+    probes = (
+        "SELECT name, type FROM sqlite_master "
+        "WHERE name IN ('external_effects', 'runtime_schema') "
+        "UNION SELECT effect_id, effect_state FROM external_effects",
+        "SELECT name, type FROM sqlite_master WHERE name IN "
+        "('runtime_schema', (SELECT effect_id FROM external_effects LIMIT 1))",
+    )
+    assert all(
+        recovery_runner._startup_statement_kind(probe) is None
+        for probe in probes
     )
 
 

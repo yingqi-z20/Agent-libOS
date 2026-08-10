@@ -1,6 +1,6 @@
 # Runtime Events
 
-Agent libOS 1.4.0 persists a closed catalog of `EventType` values. Events
+Agent libOS 1.4.1 persists a closed catalog of `EventType` values. Events
 are durable observations for operators, the GUI, context materialization, and
 Explain evidence. They are not an authority source, a task queue, or a
 replacement for the process, operation, capability, Human-request, or external-
@@ -58,6 +58,7 @@ stable discriminator/common fields rather than defining a closed JSON Schema.
 | `object_task_owner_change_undelivered` | `ObjectTaskManager` cannot deliver an owner-watch change | actor PID → owner OID | `task_id`, `runner_pid`, `event`, `error` | `high` |
 | `human_query` | `HumanObjectManager` commits a Human request | PID → `human:<id>` | `request_id`, `request_type`, bounded `request` observation, `blocking` | — |
 | `human_response` | `HumanObjectManager` records a decision or protected terminal read | responder/Human identity → PID or Human resource | decision evidence includes `request_id`, `status`; protected reads include `purpose`, `operation`, `chars`; producer-specific failure diagnostics may include `provider_outcome`, `outcome`, `phase`, or `error_type` | — |
+| `semantic_policy_response` | Host machine policy atomically terminalizes an eligible Human request | `policy:semantic:<epoch>` → PID | `request_id`, expected `revision`, `status`, `settlement_id`, `epoch_id`, `policy_sha256`, exact binding digest, reason code, and optional one-use `capability_id`; never contains Human-authored response content | — |
 | `image_registered` | `ImageRegistry` commits registration/replacement | actor → `image:<id>` | `image_id`, `name`, `version`, `replaced`, `source`, `boot_kind` | — |
 | `image_committed` | `ImageRegistry` commits a checkpoint-derived image | actor → `image:<id>` | `image_id`, `checkpoint_id`, `artifact_id`, `artifact_sha256`, `artifact_bytes` | — |
 | `skill_registered` | `SkillManager` commits a package registration | actor → `skill:<id>` | `skill_id`, `version`, `source_type` | — |

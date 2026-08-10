@@ -5,13 +5,13 @@
 > 适用对象：Agent libOS 的运行时、Capability、Human approval、Protected Operation、Object Memory、provider 与审计子系统<br>
 > 文档性质：技术预研与立项建议，不构成法律或合规意见
 
-> 实施状态（2026-08-05）：本报告仍是调研与后续路线依据。仓库已按其
-> Phase 0+1 建议从干净基线 `4b43cb7` 实现默认关闭的 Shadow thin slice；
-> 当前能力、配置、存储迁移、
-> 隐私边界与明确未实现项以
+> 实施状态（2026-08-07）：本报告仍是调研与后续路线依据。Agent libOS
+> 1.4.1 已在默认关闭的前提下实现 Phase 2–4：payload-free FlowGraph、闭集
+> 确定性拒绝，以及静态 Host epoch 下的低风险 exact-once canary。
+> 当前能力、配置、存储迁移、隐私边界与明确未实现项以
 > [Semantic Approval and Data Identification](semantic_shadow.md) 为准。本文中
-> 关于自动签发、真实拒绝、完整 FlowGraph、长期记忆和生产放量的描述仍是后续
-> 提案，不能理解为当前运行时能力。
+> 关于 Phase 5、长期记忆、Cedar/OPA、高风险自动权限或自动生产放量的描述仍是
+> 后续提案，不能理解为当前运行时能力。
 
 ## 0. 结论先行
 

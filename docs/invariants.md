@@ -318,13 +318,14 @@ longer defines.
   pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
   typed boundaries compute the next state generation, preventing a direct-write
   rewind from reviving a stale token.
-- `v5-persisted-state-is-strict-and-versioned`: ordinary 1.4.0 Runtime startup
-  accepts only the frozen version-5 physical schema (including Durable Task
-  Run, typed process state, Human revision, and semantic job/evidence state)
-  plus canonical security carriers. A canonical v4 source is accepted only by
-  the explicit offline digest-bound migration command; v3, older, incomplete,
-  or malformed state is rejected before Runtime mutation. Recovery operates
-  only on valid schema-v5 state.
+- `v6-persisted-state-is-strict-and-versioned`: ordinary 1.4.1 Runtime startup
+  accepts only the frozen version-6 physical schema (including Durable Task
+  Run, typed process state, Human revision, semantic job/evidence state,
+  FlowGraph, policy epochs, and machine-settlement evidence) plus canonical
+  security carriers. A canonical v5 source is accepted only by the explicit
+  offline digest-bound migration command; v4 must first migrate to v5. Older,
+  incomplete, or malformed state is rejected before Runtime mutation. Recovery
+  operates only on valid schema-v6 state.
 - `durable-task-run-ledger-is-versioned-and-generation-fenced`: mutable Run
   projections advance through revision CAS under the current monotonic Runtime
   epoch. Stable command identities make retries idempotent, while requirements,
@@ -399,6 +400,22 @@ longer defines.
   authority reservations, operation links, events, and audit commit or roll
   back as one unit, so an evidence-sink failure cannot publish a partial Human
   authority transition.
+- `human-approval-preview-is-host-bound-and-safe`: external-operation approval
+  surfaces render only a strict Host-derived, digest-bound argument projection.
+  Requester prose and claimed risk never become Host evidence; safe bounded
+  identities and workspace-relative resources remain readable, while secrets,
+  long or high-sensitivity identities and paths, payloads, and terminal
+  control/format characters are redacted, omitted, or visibly encoded. Git
+  references retain a closed Host role plus safe display-or-redaction and an
+  exact digest. Material filesystem, shell, Git, JSON-RPC, MCP, and PTY facts
+  remain typed and variant-closed across terminal, API, and GUI decoders.
+- `human-authority-request-shape-is-host-bound`: the model-visible generic
+  Human query accepts no authority-shaping field or Host-origin marker. Only a
+  Host control entry can publish an exactly typed permission, data-release, or
+  effect-bound external-operation request; every Human terminalization path
+  revalidates that durable shape before applying side effects. Canonical Human
+  previews may represent bounded scoped resources, while deterministic machine
+  settlement remains restricted to the separate exact-resource decoder.
 - `ambiguous-human-provider-outcomes-require-host-resume`: once a Human
   provider phase may have started but its outcome is unknown, the exact request
   becomes terminal and non-retryable, the effect ledger retains the
@@ -1158,11 +1175,48 @@ longer defines.
   require real tool, provider-state, external-effect, and operation evidence;
   modeled rows stay in a separate denominator.
 
-- `semantic-shadow-has-no-machine-mutation-entry`: every semantic public
-  surface is observation-only. The broker has no permit type, the Task
-  Authority candidate lookup is side-effect-free, and CLI/HTTP/GUI/model/Skill/
-  JIT/Module paths expose no semantic Human-settlement, Capability issuance,
-  permission-policy, DataLabel, release, or provider mutation.
+- `semantic-machine-mutation-is-host-private-and-closed`: semantic enforcement
+  is reachable only through the Runtime-composed private Host settlement port.
+  CLI/HTTP/GUI/model/Skill/JIT/Module paths cannot settle a request, issue a
+  Capability, mutate labels/release, or activate/revoke policy. Host review
+  import can append evidence only.
+- `semantic-model-never-supplies-allow-predicate`: classifier output contains
+  only closed findings, calibration, OOD, and abstention. It can veto or
+  escalate but cannot generate permit/deny, select a rule, fill a missing Host
+  predicate, or act as the safety oracle.
+- `semantic-hard-deny-set-is-closed`: real machine rejection is limited to
+  malformed/incomplete exact requests, binding mismatch, stale state/manifest/
+  epoch, explicit DataFlow denial, and exact Host hard-deny rules. Unsupported,
+  high-risk, uncertain, OOD, and model findings remain Human decisions.
+- `semantic-machine-terminalization-is-cas-atomic`: Human, cancel, terminal,
+  deterministic deny, and canary approval share one request revision/status
+  CAS and transaction. Request, Process, one-use Capability, job/assessment,
+  settlement, budget, event, and audit have one winner or roll back together.
+- `semantic-exact-once-authority-is-binding-and-epoch-fenced`: a machine grant
+  is short-lived, revocable, nondelegable, and has exactly one use. Its binding
+  covers the request/effect/action/resource/right/args/state, manifest, policy,
+  assessment/classifier, tenant/labels, Sink/tool/provider, nonce, and deadline;
+  the active control generation is rechecked through provider dispatch.
+- `semantic-canary-expansion-is-review-gated`: adding a tenant, widening a
+  resource/rule, or otherwise expanding an affected action requires at least
+  seven days of durable activation plus 1,000 complete safe reviews from the
+  preceding immutable epoch. Unsafe review evidence remains attached to its
+  original settlement while authority is off and blocks later expansion; if
+  any epoch is active when the unsafe review arrives, the current epoch trips.
+- `semantic-canary-budget-is-stable-and-cas`: minute, day, and inflight canary
+  budgets are keyed by tenant and logical rule across epoch rotation and Store
+  reopen. The stored epoch is origin provenance only; old-epoch outcome release
+  and new-epoch reservation share revision CAS, and transaction rollback cannot
+  mint additional budget.
+- `semantic-unknown-flow-blocks-auto-authority`: only complete, current,
+  single-tenant FlowGraph coverage can satisfy auto approval. Missing historical
+  v5 edges, partial/unknown/conflict/stale capture, or mixed identity fail closed
+  to Human review.
+- `semantic-high-risk-and-cross-tenant-authority-is-unreachable`: only catalog
+  v1 exact reads for an explicitly allowlisted tenant can receive machine
+  authority. Shell, JSON-RPC, MCP, network, writes/deletes, release,
+  permission/control administration, wildcards, and cross-tenant flows have no
+  machine issuance path.
 - `semantic-candidates-are-exact-and-attenuated`: absent, null, or empty
   `semantic_auto_approval` is deny-all. Parent and child must declare the
   closed versioned ceiling independently; the child can only preserve an exact
@@ -1180,7 +1234,7 @@ longer defines.
   only a higher sensitivity floor or lower integrity/trust ceiling. Projection
   and service code do not mutate the input labels, ambient `DataFlowContext`,
   Object/file labels, endorsement/declassification, Sink clearance, or release
-  state in Phase 0+1. Local Host DLP freezes only allowlisted category/reason/
+  state in Phase 2–4. Local Host DLP freezes only allowlisted category/reason/
   digest evidence and merges monotonic Host findings into every terminal path;
   it never persists matched text or turns a finding into authority.
 - `semantic-evidence-is-plaintext-free`: approval/provider projections are
@@ -1242,11 +1296,12 @@ longer defines.
 - Real LLM credentials and token-spending paths are opt-in. The default matrix
   covers mock/action-selection behavior, not a live request for every supported
   profile or provider deployment.
-- Semantic Shadow safety tests use deterministic/scripted classifiers and
-  adversarial fake-provider responses. A real classifier smoke is opt-in and
-  cannot establish production calibration, OOD coverage, provider retention,
-  tenant rollout safety, or a future machine-settlement policy. Phase 0+1 has
-  no such settlement path.
+- Semantic safety tests use deterministic/scripted classifiers and adversarial
+  fake-provider responses. A real classifier smoke is opt-in and cannot
+  establish production calibration, OOD coverage, provider retention, or
+  tenant rollout safety; models are not a safety oracle. Production
+  `canary_auto` still requires static Host epochs, explicit tenants, review
+  coverage, operational trip monitoring, and environment-specific evidence.
 - GUI CI covers React tests, TypeScript typechecking, production build, and the
   Python HTTP/SSE server on Ubuntu. Accessibility/usability studies, native
   Electron lifecycle, and the production-build custom-protocol BrowserWindow

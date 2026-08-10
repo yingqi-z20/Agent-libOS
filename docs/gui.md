@@ -3,7 +3,7 @@
 Agent libOS includes a local desktop management console for supervising
 Durable Task Runs, processes, messages, human approvals, AgentImage selection/registration/commit,
 checkpoints, capabilities, Skills, JSON-RPC endpoints, MCP servers, audit
-records, persisted LLM calls, semantic Shadow assessments, and human Agent
+records, persisted LLM calls, semantic assessment/FlowGraph/policy evidence, and human Agent
 ratings.
 
 The GUI is a local-only Electron app. Electron starts
@@ -488,9 +488,11 @@ transcript is unavailable; they fail before provider dispatch.
 
 GUI background auto-run deliberately sets `process_human_queue=false`. It may
 advance runnable model work, but it never auto-approves, auto-denies, or invents
-an answer for a pending human request. A human must decide through a request
-card (or another explicit host terminal surface), after which normal runtime
-wakeup/resume semantics apply.
+an answer for a pending Human request. An ordinary/uncertain request remains for
+a Human request card or another explicit Host terminal surface. Independently,
+the Host semantic worker may win the shared CAS for a closed hard denial or an
+eligible canary one-use grant; the GUI scheduler itself never initiates either.
+Normal runtime wakeup/resume semantics follow the single terminal winner.
 
 GUI request serialization is itself a protected Human information-flow exit.
 For a conditional high-sensitivity request, the first snapshot/list response
@@ -565,7 +567,7 @@ Either kind of lookahead becomes a `source_limited` lower-bound entry in
 Event and audit rows persist a derived `gui_snapshot_visible` flag. Snapshot
 queries filter that indexed flag before applying `LIMIT`, preventing internal
 GUI-presentation evidence from displacing causal runtime rows. The flag is
-required by store schema v5; missing or malformed persisted visibility state is
+required by store schema v6; missing or malformed persisted visibility state is
 rejected rather than repaired during open. Bounded event/audit page endpoints
 can still include presentation evidence when requested.
 The process window orders non-terminal processes before the most recently
@@ -580,13 +582,13 @@ process; messages are returned chronologically. Snapshot construction therefore
 does not issue one message, LLM-call, rating, or resource query for every listed
 process.
 
-## Semantic Shadow Panel
+## Semantic Panel
 
 The read-only Semantic tab is available at Host scope and process scope; the
-latter adds the selected `pid` filter. It fetches status and assessment history
-on demand rather than extending the Runtime snapshot. A page contains at most
-50 rows in the bundled UI, and “load more” follows the opaque keyset cursor
-while de-duplicating by `assessment_id`.
+latter adds the selected `pid` filter. It fetches status, assessment, FlowGraph,
+settlement, policy/control history, health, and metric pages on demand rather
+than extending the Runtime snapshot. Bounded “load more” follows opaque keyset
+cursors and de-duplicates by the relevant stable record id.
 
 The panel shows queue health, aggregate success/error/OOD and Shadow outcome
 counts, domain/status history filters, reason codes, normalized observed Human
@@ -597,8 +599,9 @@ provider/projection/tenant digests.
 It does not render a prompt, goal/provider content, raw response, job
 projection, model explanation, or hidden reasoning. Structured strings are
 rendered as inert text. The same-build TypeScript decoder requires status
-schema v2 with complete exact-key `by_status` and `by_domain` maps, consistent
-aggregate totals, and strict real-auto-approval `0 / 0 / null`. Assessment
+schema v3 with complete exact-key `by_status` and `by_domain` maps, consistent
+aggregate totals, control/FlowGraph/machine sections, and denominator-aware
+real-auto-approval and review rates. Assessment
 page/detail envelopes and rows remain schema v1. Their decoders require exact
 keys and enum/digest/confidence/span shapes and reject unknown or private fields
 before React receives them.
@@ -612,10 +615,10 @@ object. Each non-null value is a non-negative JavaScript-safe integer through
 billing or classifier-quality metrics, and the status response does not
 aggregate them.
 
-Because Phase 0+1 cannot auto-approve, the real auto-approval denominator is
-zero and its rate is JSON `null`. The UI displays that value as not applicable,
-not as a misleading 0% rate. All controls are filters or pagination; the panel
-contains no semantic mutation control. See [Semantic Approval and Data
+The UI displays a zero-denominator or unreviewed rate as not applicable, not as
+a misleading 0% unsafe rate. All controls are filters or pagination; the panel
+contains no semantic policy/control, settlement, or review-import mutation.
+See [Semantic Approval and Data
 Identification](semantic_shadow.md#inspection-surfaces).
 
 ## High-Risk Operations
@@ -757,9 +760,10 @@ Important endpoints:
   `GET /api/operations/resolve?kind=...&id=...` for host-only deterministic
   operation explanations. List/detail responses support cursor pagination;
   ambiguous evidence resolution returns `409` with candidate causal roots.
-- `GET /api/semantic/status`, `GET /api/semantic/assessments`, and
-  `GET /api/semantic/assessments/{assessment_id}` expose payload-free Shadow
-  evidence. The list accepts only `pid`, `request_id`, `operation_id`, `kind`,
+- `GET /api/semantic/status`, assessment/detail, FlowGraph status/entity/edge/
+  lineage, settlements, policy epochs, control/history, health, and metrics
+  routes expose payload-free evidence. The assessment list accepts only `pid`,
+  `request_id`, `operation_id`, `kind`,
   `status`, `domain`, `action_id`, `tenant_bucket_sha256`, `after`, and `limit`;
   the action is a dotted lower-case ontology id and the tenant bucket is an
   exact lower-case SHA-256 digest. The default is 50 and the hard HTTP maximum
@@ -778,7 +782,7 @@ Important endpoints:
   Collection, ledger, and Human pages accept opaque `cursor` values and return
   `next_cursor`; clients must not parse or synthesize them. The embedded
   requirements page also returns `next_cursor`. Requirement changes are linked
-  ledger items, and 1.4.0 has no independent Task Run requirements or wait HTTP
+  ledger items, and 1.4.1 has no independent Task Run requirements or wait HTTP
   route.
 - `POST /api/task-runs/{run_id}/run|pause|resume|cancel|follow-ups|recover|rerun`.
   Every existing-Run mutation carries a command id and expected revision.
@@ -859,6 +863,11 @@ Important endpoints:
   `decision.policy` equal to `always_allow`, `always_deny`, or
   `ask_each_time`, consistent with approval/rejection. Approved questions
   require a non-empty string `answer`; other JSON types are not coerced.
+  In `enforce_deny` and `canary_auto`, an external-operation response must also
+  carry the exact top-level `expected_revision` and Host-rendered
+  `preview_sha256` returned with the pending request. Missing, stale, malformed,
+  or mismatched preview evidence is rejected before terminalization; neither
+  field can authorize or weaken a hard-deny preflight.
 - `GET /api/checkpoints`, `POST /api/checkpoints/create`,
   `GET /api/checkpoints/{checkpoint_id}`,
   `GET /api/checkpoints/{checkpoint_id}/diff`, and

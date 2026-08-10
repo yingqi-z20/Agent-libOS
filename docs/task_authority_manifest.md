@@ -139,11 +139,11 @@ version in the one-shot capability. The capability reservation carries that
 same id into the provider intent, so a same-argument call cannot create a
 different approved effect ledger entry.
 
-### Semantic Shadow ceiling
+### Semantic auto-approval ceiling
 
 `approval_policy.semantic_auto_approval` is a separate, strict version-1
-ceiling for the advisory semantic subsystem. It is not an approval policy that
-can settle a request in this release. A canonical example is:
+ceiling. It is candidate evidence in Shadow and one mandatory Host predicate
+for `canary_auto`; it can never authorize by itself. A canonical example is:
 
 ```json
 {
@@ -163,8 +163,8 @@ Missing, `null`, and empty rules are deny-all. Legacy manifests are not
 backfilled, so their canonical hashes remain stable. The nested object and
 each rule are closed: unknown fields, duplicate rule ids, wildcard operations,
 unsupported/high-risk operations, control rights, permission administration,
-and data-release authority fail admission. The current candidate ontology is
-limited to filesystem read, Git read, and Git diff; Shell, JSON-RPC, MCP, data
+and data-release authority fail admission. Action catalog v1 is frozen to
+filesystem read, Git read, and Git diff; Shell, JSON-RPC, MCP, data
 release, writes, deletes, remote Git effects, and administrative actions cannot
 be positive candidates even though Shadow may record an assessment for them.
 
@@ -173,9 +173,12 @@ A child rule must preserve the exact authority operation and narrow the parent
 resource/right set; an ordinary Capability cannot add or widen the ceiling.
 Candidate lookup returns only the exact requested operation/resource/rights and
 Host provenance digests. It creates no Human request, Capability, permission
-policy, operation, event, or audit entry. Phase 0+1 has no machine settlement
-method, so even `would_issue_exact_once` remains evidence and the existing
-Human path remains authoritative. See [Semantic Approval and Data
+policy, operation, event, or audit entry. `would_issue_exact_once` is always
+Shadow evidence. A real one-use grant can be produced only by the private Host
+settlement port after live ceiling, immutable policy epoch, complete FlowGraph,
+tenant, classifier-veto, exact binding/state, DataFlow, and budget checks. It
+never installs `always_allow`, and no CLI/HTTP/GUI/model surface can invoke that
+settlement. See [Semantic Approval and Data
 Identification](semantic_shadow.md).
 
 ## Closed input schema

@@ -2182,7 +2182,7 @@ class FilesystemAdapter:
                 raise CapabilityDenied(
                     f"{pid} requires human approval for read on {resource}"
                 )
-            request_id = self.human.query(
+            request_id = self.human.query_authority_request(
                 pid=pid,
                 human=self.config.runtime.default_human,
                 request={
@@ -2200,6 +2200,7 @@ class FilesystemAdapter:
                     "context": operation_context,
                 },
                 blocking=True,
+                authority_origin="external_operation",
                 source_oids=source_oids,
             )
             raise HumanApprovalRequired(
@@ -2251,7 +2252,7 @@ class FilesystemAdapter:
             # policy, byte count, and preview needed for a safe per-use human
             # decision. Target state is deliberately deferred until after the
             # one-time approval has been issued and reserved.
-            request_id = self.human.query(
+            request_id = self.human.query_authority_request(
                 pid=pid,
                     human=self.config.runtime.default_human,
                 request={
@@ -2268,6 +2269,7 @@ class FilesystemAdapter:
                     },
                 },
                 blocking=True,
+                authority_origin="external_operation",
                 source_oids=source_oids,
             )
             raise HumanApprovalRequired(
@@ -2305,7 +2307,7 @@ class FilesystemAdapter:
         if decision.policy == CapabilityManager.ASK_EACH_TIME:
             if self.human is None:
                 raise CapabilityDenied(f"{pid} requires human approval for delete on {resource}")
-            request_id = self.human.query(
+            request_id = self.human.query_authority_request(
                 pid=pid,
                     human=self.config.runtime.default_human,
                 request={
@@ -2320,6 +2322,7 @@ class FilesystemAdapter:
                     "context": operation_context,
                 },
                 blocking=True,
+                authority_origin="external_operation",
                 source_oids=source_oids,
             )
             raise HumanApprovalRequired(
@@ -2360,6 +2363,7 @@ class FilesystemAdapter:
             "sandbox_profile": self._profile_json(profile),
             "grant_scope": "one_time",
             "target_state_observation": "deferred_until_authorized",
+            "semantic_exact_operation_context": True,
             **extra,
         }
 
@@ -2392,6 +2396,7 @@ class FilesystemAdapter:
             "resource": resource,
             "right": right,
             "sandbox_profile": self._profile_json(profile),
+            "semantic_exact_operation_context": False,
             **(extra or {}),
         }
 

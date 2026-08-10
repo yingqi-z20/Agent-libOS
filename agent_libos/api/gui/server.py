@@ -23,6 +23,21 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from pydantic import ValidationError as PydanticValidationError
 
+from agent_libos.api.semantic_public import (
+    project_assessment_detail,
+    project_assessment_summary,
+    project_control,
+    project_flow_edge,
+    project_flow_entity,
+    project_flow_lineage,
+    project_flow_status,
+    project_health_event,
+    project_machine_settlement,
+    project_metrics,
+    project_page,
+    project_policy_epoch,
+    project_semantic_status,
+)
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, load_config_file, load_config_from_project_root
 from agent_libos.evidence.payload_retention import (
@@ -48,9 +63,6 @@ from agent_libos.models import (
     ProcessMessageKind,
     ProcessSignal,
     ProcessStatus,
-    SEMANTIC_REDACTED_INTENT_MAX_CHARS,
-    SemanticAssessmentKind,
-    SemanticDataLocator,
     TaskRunSpecV1,
     process_state_to_mapping,
 )
@@ -92,9 +104,7 @@ _SEMANTIC_FILTER_MAX_CHARS = 512
 _SEMANTIC_ID_MAX_CHARS = 512
 _SEMANTIC_ACTION_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
 _SEMANTIC_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_SEMANTIC_HUMAN_OUTCOMES = frozenset(
-    {"pending", "approved", "rejected", "edited", "cancelled", "delivered"}
-)
+_SEMANTIC_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$")
 _SEMANTIC_ASSESSMENT_KINDS = (
     "approval",
     "root_goal",
@@ -121,11 +131,6 @@ _SEMANTIC_ASSESSMENT_DOMAINS = (
     "runtime",
     "unknown",
 )
-_SEMANTIC_COARSE_DATA_LOCATOR_BY_KIND = {
-    SemanticAssessmentKind.APPROVAL.value: SemanticDataLocator.APPROVAL_REQUEST.value,
-    SemanticAssessmentKind.ROOT_GOAL.value: SemanticDataLocator.ROOT_GOAL.value,
-    SemanticAssessmentKind.PROVIDER_INGRESS.value: SemanticDataLocator.PROVIDER_RESULT.value,
-}
 _SEMANTIC_ASSESSMENT_QUERY_KEYS = frozenset(
     {
         "pid",
@@ -140,37 +145,35 @@ _SEMANTIC_ASSESSMENT_QUERY_KEYS = frozenset(
         "limit",
     }
 )
-_SEMANTIC_ASSESSMENT_SUMMARY_FIELDS = (
-    "assessment_id",
-    "job_id",
-    "kind",
-    "status",
-    "domain",
-    "action_id",
-    "pid",
-    "request_id",
-    "operation_id",
-    "effect_id",
-    "shadow_outcome",
-    "reason_codes",
-    "ood",
-    "abstain",
-    "confidence_bps",
-    "calibration_bucket",
-    "input_tokens",
-    "output_tokens",
-    "cost_microunits",
-    "classifier_id",
-    "classifier_version",
-    "artifact_sha256",
-    "input_sha256",
-    "feature_snapshot_sha256",
-    "policy_sha256",
-    "tenant_bucket_sha256",
-    "created_at",
-    "completed_at",
-    "latency_ms",
-    "human_outcome",
+_SEMANTIC_FLOW_ENTITY_QUERY_KEYS = frozenset(
+    {"pid", "kind", "tenant_bucket_sha256", "after", "limit"}
+)
+_SEMANTIC_FLOW_EDGE_QUERY_KEYS = frozenset(
+    {"pid", "relation", "node_id", "after", "limit"}
+)
+_SEMANTIC_FLOW_LINEAGE_QUERY_KEYS = frozenset(
+    {"direction", "after", "limit", "max_depth"}
+)
+_SEMANTIC_SETTLEMENT_QUERY_KEYS = frozenset(
+    {
+        "pid",
+        "request_id",
+        "effect_id",
+        "action_id",
+        "tenant_bucket_sha256",
+        "outcome",
+        "epoch_id",
+        "after",
+        "limit",
+    }
+)
+_SEMANTIC_POLICY_QUERY_KEYS = frozenset({"after", "limit"})
+_SEMANTIC_CONTROL_HISTORY_QUERY_KEYS = frozenset({"after", "limit"})
+_SEMANTIC_HEALTH_QUERY_KEYS = frozenset(
+    {"severity", "code", "epoch_id", "after", "limit"}
+)
+_SEMANTIC_METRIC_QUERY_KEYS = frozenset(
+    {"window", "action_id", "tenant_bucket_sha256", "epoch_id", "risk"}
 )
 _GUI_LLM_CONTENT_FIELDS = frozenset(
     {
@@ -479,22 +482,32 @@ def _record_gui_human_response(
     *,
     approved: bool,
     decision: dict[str, Any],
+    expected_revision: int | None,
+    preview_sha256: str | None,
 ) -> Any:
     presentation_decision = {
         "approved": approved,
         "source": "gui",
         **decision,
     }
+    fence: dict[str, Any] = {}
+    if expected_revision is not None or preview_sha256 is not None:
+        fence = {
+            "expected_revision": expected_revision,
+            "preview_sha256": preview_sha256,
+        }
     if approved:
         return human.approve_for_presentation(
             request_id,
             presentation="gui",
             decision=presentation_decision,
+            **fence,
         )
     return human.reject_for_presentation(
         request_id,
         presentation="gui",
         decision=presentation_decision,
+        **fence,
     )
 
 
@@ -3424,7 +3437,270 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 "assessment": _semantic_assessment_detail(assessment),
             }
 
+        if route and route[0] == "flow":
+            return self._dispatch_semantic_flow(semantic, route[1:], query)
+
+        if route == ["settlements"]:
+            return self._dispatch_semantic_settlements(semantic, query)
+
+        if route == ["policy", "epochs"]:
+            _require_semantic_query_contract(
+                query, allowed=_SEMANTIC_POLICY_QUERY_KEYS
+            )
+            limit = _bounded_query_limit(
+                query,
+                "limit",
+                default=_SEMANTIC_ASSESSMENT_PAGE_DEFAULT,
+                maximum=_SEMANTIC_ASSESSMENT_PAGE_MAX,
+            )
+            page = semantic.query_policy_epochs(
+                after=_semantic_query_value(
+                    query, "after", maximum=_SEMANTIC_CURSOR_MAX_CHARS
+                ),
+                limit=limit,
+            )
+            return _semantic_public_projection(
+                project_page,
+                page,
+                item_projector=project_policy_epoch,
+                maximum_items=limit,
+                label="semantic policy epoch page",
+            )
+
+        if route == ["control"]:
+            _require_semantic_query_contract(query, allowed=frozenset())
+            return _semantic_public_projection(
+                project_control,
+                semantic.control_status(),
+            )
+
+        if route == ["control", "history"]:
+            _require_semantic_query_contract(
+                query, allowed=_SEMANTIC_CONTROL_HISTORY_QUERY_KEYS
+            )
+            limit = _bounded_query_limit(
+                query,
+                "limit",
+                default=_SEMANTIC_ASSESSMENT_PAGE_DEFAULT,
+                maximum=_SEMANTIC_ASSESSMENT_PAGE_MAX,
+            )
+            page = semantic.query_control_history(
+                after=_semantic_query_value(
+                    query, "after", maximum=_SEMANTIC_CURSOR_MAX_CHARS
+                ),
+                limit=limit,
+            )
+            return _semantic_public_projection(
+                project_page,
+                page,
+                item_projector=project_control,
+                maximum_items=limit,
+                label="semantic control history page",
+            )
+
+        if route == ["health"]:
+            _require_semantic_query_contract(
+                query, allowed=_SEMANTIC_HEALTH_QUERY_KEYS
+            )
+            limit = _bounded_query_limit(
+                query,
+                "limit",
+                default=_SEMANTIC_ASSESSMENT_PAGE_DEFAULT,
+                maximum=_SEMANTIC_ASSESSMENT_PAGE_MAX,
+            )
+            page = semantic.query_health_events(
+                severity=_semantic_query_enum_value(
+                    query,
+                    "severity",
+                    allowed=("info", "warning", "critical"),
+                ),
+                code=_semantic_query_value(query, "code", maximum=128),
+                epoch_id=_semantic_query_value(query, "epoch_id"),
+                after=_semantic_query_value(
+                    query, "after", maximum=_SEMANTIC_CURSOR_MAX_CHARS
+                ),
+                limit=limit,
+            )
+            return _semantic_public_projection(
+                project_page,
+                page,
+                item_projector=project_health_event,
+                maximum_items=limit,
+                label="semantic health event page",
+            )
+
+        if route == ["metrics"]:
+            _require_semantic_query_contract(
+                query, allowed=_SEMANTIC_METRIC_QUERY_KEYS
+            )
+            return _semantic_public_projection(
+                project_metrics,
+                semantic.metrics(
+                    window=_semantic_query_value(query, "window", maximum=128),
+                    action_id=_semantic_action_id_query_value(query),
+                    tenant_bucket_sha256=_semantic_sha256_query_value(
+                        query, "tenant_bucket_sha256"
+                    ),
+                    epoch_id=_semantic_query_value(query, "epoch_id"),
+                    risk=_semantic_query_enum_value(
+                        query,
+                        "risk",
+                        allowed=("low", "medium", "high", "critical"),
+                    ),
+                ),
+            )
+
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown semantic endpoint")
+
+    def _dispatch_semantic_flow(
+        self,
+        semantic: Any,
+        route: list[str],
+        query: dict[str, list[str]],
+    ) -> Any:
+        if route == ["status"]:
+            _require_semantic_query_contract(query, allowed=frozenset())
+            return _semantic_public_projection(
+                project_flow_status,
+                semantic.flow_status(),
+            )
+        if route == ["entities"]:
+            _require_semantic_query_contract(
+                query, allowed=_SEMANTIC_FLOW_ENTITY_QUERY_KEYS
+            )
+            limit = _semantic_page_limit(query)
+            page = semantic.query_flow_entities(
+                pid=_semantic_query_value(query, "pid"),
+                kind=_semantic_query_enum_value(
+                    query,
+                    "kind",
+                    allowed=(
+                        "root_goal",
+                        "object_version",
+                        "file_binding_version",
+                        "provider_result",
+                        "tool_result",
+                        "materialization",
+                        "model_output",
+                    ),
+                ),
+                tenant_bucket_sha256=_semantic_sha256_query_value(
+                    query, "tenant_bucket_sha256"
+                ),
+                after=_semantic_query_value(
+                    query, "after", maximum=_SEMANTIC_CURSOR_MAX_CHARS
+                ),
+                limit=limit,
+            )
+            return _semantic_public_projection(
+                project_page,
+                page,
+                item_projector=project_flow_entity,
+                maximum_items=limit,
+                label="semantic flow entity page",
+            )
+        if route == ["edges"]:
+            _require_semantic_query_contract(
+                query, allowed=_SEMANTIC_FLOW_EDGE_QUERY_KEYS
+            )
+            limit = _semantic_page_limit(query)
+            page = semantic.query_flow_edges(
+                pid=_semantic_query_value(query, "pid"),
+                relation=_semantic_query_enum_value(
+                    query,
+                    "relation",
+                    allowed=("direct", "indirect", "control"),
+                ),
+                node_id=_semantic_identifier_query_value(query, "node_id"),
+                after=_semantic_query_value(
+                    query, "after", maximum=_SEMANTIC_CURSOR_MAX_CHARS
+                ),
+                limit=limit,
+            )
+            return _semantic_public_projection(
+                project_page,
+                page,
+                item_projector=project_flow_edge,
+                maximum_items=limit,
+                label="semantic flow edge page",
+            )
+        if len(route) == 2 and route[0] == "lineage":
+            _require_semantic_query_contract(
+                query, allowed=_SEMANTIC_FLOW_LINEAGE_QUERY_KEYS
+            )
+            limit = _semantic_page_limit(query)
+            max_depth = _bounded_query_limit(
+                query,
+                "max_depth",
+                default=8,
+                maximum=16,
+            )
+            lineage = semantic.query_flow_lineage(
+                _semantic_path_identifier(route[1], "node_id"),
+                direction=_semantic_query_enum_value(
+                    query,
+                    "direction",
+                    allowed=("upstream", "downstream"),
+                )
+                or "upstream",
+                after=_semantic_query_value(
+                    query, "after", maximum=_SEMANTIC_CURSOR_MAX_CHARS
+                ),
+                limit=limit,
+                max_depth=max_depth,
+            )
+            return _semantic_public_projection(
+                project_flow_lineage,
+                lineage,
+                maximum_items=limit,
+            )
+        raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown semantic endpoint")
+
+    def _dispatch_semantic_settlements(
+        self,
+        semantic: Any,
+        query: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        _require_semantic_query_contract(
+            query, allowed=_SEMANTIC_SETTLEMENT_QUERY_KEYS
+        )
+        limit = _semantic_page_limit(query)
+        page = semantic.query_machine_settlements(
+            pid=_semantic_query_value(query, "pid"),
+            request_id=_semantic_query_value(query, "request_id"),
+            effect_id=_semantic_query_value(query, "effect_id"),
+            action_id=_semantic_action_id_query_value(query),
+            tenant_bucket_sha256=_semantic_sha256_query_value(
+                query, "tenant_bucket_sha256"
+            ),
+            outcome=_semantic_query_enum_value(
+                query,
+                "outcome",
+                allowed=(
+                    "issued",
+                    "denied",
+                    "require_human",
+                    "race_lost",
+                    "stale",
+                    "budget_exhausted",
+                    "revoked",
+                    "expired",
+                    "failed",
+                ),
+            ),
+            epoch_id=_semantic_query_value(query, "epoch_id"),
+            after=_semantic_query_value(
+                query, "after", maximum=_SEMANTIC_CURSOR_MAX_CHARS
+            ),
+            limit=limit,
+        )
+        return _semantic_public_projection(
+            project_page,
+            page,
+            item_projector=project_machine_settlement,
+            maximum_items=limit,
+            label="semantic machine settlement page",
+        )
 
     def _dispatch_operations(
         self,
@@ -4332,21 +4608,59 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 raise GuiServerError(HTTPStatus.BAD_REQUEST, "answer must be a string")
             decision = {**decision, "answer": body["answer"]}
         approved = _json_bool(body, "approved", False)
+        expected_revision = body.get("expected_revision")
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "expected_revision must be a non-negative JSON integer",
+                details={"code": "invalid_human_request_revision"},
+            )
+        preview_sha256 = body.get("preview_sha256")
+        if preview_sha256 is not None and (
+            not isinstance(preview_sha256, str)
+            or _SEMANTIC_SHA256_PATTERN.fullmatch(preview_sha256) is None
+        ):
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "preview_sha256 must be a lowercase SHA-256 digest",
+                details={"code": "invalid_human_request_preview"},
+            )
         _validate_human_response_decision(current.payload.get("type"), approved, decision)
         request = _record_gui_human_response(
             service.runtime.human,
             request_id,
             approved=approved,
             decision=decision,
+            expected_revision=expected_revision,
+            preview_sha256=preview_sha256,
         )
         service.publish_runtime_changes("human.respond")
+        request_view = service.human_request_view(request)
+        request_decision = request.decision if isinstance(request.decision, dict) else {}
         if _json_bool(body, "auto_run", True):
             service.scheduler.maybe_start(
                 max_quanta=max_quanta,
                 reason=f"human:{request_id}",
             )
+        if (
+            approved
+            and request.status.value == "rejected"
+            and request_decision.get("source") == "machine_policy"
+        ):
+            raise GuiServerError(
+                HTTPStatus.CONFLICT,
+                "semantic machine policy rejected the external operation",
+                details={
+                    "code": "semantic_policy_rejected",
+                    "request": request_view,
+                },
+            )
         return {
-            "request": service.human_request_view(request),
+            "request": request_view,
             "scheduler": service.scheduler.status(),
         }
 
@@ -5195,6 +5509,15 @@ def _bounded_query_limit(
     return selected
 
 
+def _semantic_page_limit(query: dict[str, list[str]]) -> int:
+    return _bounded_query_limit(
+        query,
+        "limit",
+        default=_SEMANTIC_ASSESSMENT_PAGE_DEFAULT,
+        maximum=_SEMANTIC_ASSESSMENT_PAGE_MAX,
+    )
+
+
 def _query_str(query: dict[str, list[str]], key: str) -> str | None:
     values = query.get(key)
     return values[0] if values else None
@@ -5289,6 +5612,30 @@ def _semantic_sha256_query_value(
     return value
 
 
+def _semantic_identifier_query_value(
+    query: dict[str, list[str]],
+    key: str,
+) -> str | None:
+    value = _semantic_query_value(query, key, maximum=_SEMANTIC_ID_MAX_CHARS)
+    if value is not None and _SEMANTIC_IDENTIFIER_PATTERN.fullmatch(value) is None:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            f"{key} must be a semantic identifier",
+            details={"code": "invalid_semantic_id", "field": key},
+        )
+    return value
+
+
+def _semantic_path_identifier(value: str, name: str) -> str:
+    if _SEMANTIC_IDENTIFIER_PATTERN.fullmatch(value) is None:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            f"invalid semantic {name}",
+            details={"code": "invalid_semantic_id", "field": name},
+        )
+    return value
+
+
 def _semantic_path_id(value: str, name: str) -> str:
     if (
         not value.strip()
@@ -5314,94 +5661,19 @@ def _semantic_mapping(value: Any) -> dict[str, Any]:
     return projected
 
 
+def _semantic_public_projection(
+    projector: Callable[..., dict[str, Any]],
+    value: Any,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    try:
+        return projector(value, **kwargs)
+    except (TypeError, ValueError) as exc:
+        raise _invalid_semantic_service_response() from exc
+
+
 def _semantic_status_payload(value: Any) -> dict[str, Any]:
-    raw = _semantic_mapping(value)
-    if raw.get("schema_version") != 2:
-        raise GuiServerError(
-            HTTPStatus.INTERNAL_SERVER_ERROR,
-            "invalid semantic service response",
-            details={"code": "invalid_semantic_service_response"},
-        )
-    queue = _semantic_mapping(raw.get("queue", {}))
-    assessments = _semantic_mapping(raw.get("assessments", {}))
-    by_status = _semantic_counter_mapping(
-        assessments.get("by_status"),
-        expected=_SEMANTIC_ASSESSMENT_STATUSES,
-    )
-    by_domain = _semantic_counter_mapping(
-        assessments.get("by_domain"),
-        expected=_SEMANTIC_ASSESSMENT_DOMAINS,
-    )
-    actual = _semantic_mapping(raw.get("actual_auto_approval", {}))
-    actual_numerator = _semantic_counter(actual.get("numerator", 0))
-    actual_denominator = _semantic_counter(actual.get("denominator", 0))
-    actual_rate = actual.get("rate")
-    if actual_numerator != 0 or actual_denominator != 0 or actual_rate is not None:
-        raise GuiServerError(
-            HTTPStatus.INTERNAL_SERVER_ERROR,
-            "invalid semantic service response",
-            details={"code": "invalid_semantic_service_response"},
-        )
-    scalar_assessments = {
-        key: _semantic_counter(assessments.get(key, 0))
-        for key in (
-            "total",
-            "success",
-            "error",
-            "ood",
-            "would_issue_exact_once",
-            "would_deny",
-            "require_human",
-        )
-    }
-    if (
-        sum(by_status.values()) != scalar_assessments["total"]
-        or sum(by_domain.values()) != scalar_assessments["total"]
-        or scalar_assessments["success"] + scalar_assessments["error"]
-        != scalar_assessments["total"]
-        or (
-            scalar_assessments["would_issue_exact_once"]
-            + scalar_assessments["would_deny"]
-            + scalar_assessments["require_human"]
-        )
-        != scalar_assessments["total"]
-        or scalar_assessments["ood"] != by_status["ood"]
-    ):
-        raise GuiServerError(
-            HTTPStatus.INTERNAL_SERVER_ERROR,
-            "invalid semantic service response",
-            details={"code": "invalid_semantic_service_response"},
-        )
-    return {
-        "schema_version": 2,
-        "mode": _semantic_enum(raw.get("mode"), frozenset({"off", "shadow"})),
-        "adapter": _semantic_enum(
-            raw.get("adapter"),
-            frozenset({"deterministic", "external", "scripted"}),
-        ),
-        "profile_id": _semantic_nullable_string(raw.get("profile_id")),
-        "queue": {
-            key: _semantic_counter(queue.get(key, 0))
-            for key in (
-                "queued",
-                "leased",
-                "succeeded",
-                "failed",
-                "cancelled",
-                "capture_failures",
-            )
-        },
-        "assessments": {
-            **scalar_assessments,
-            "by_status": by_status,
-            "by_domain": by_domain,
-        },
-        "actual_auto_approval": {
-            "numerator": actual_numerator,
-            "denominator": actual_denominator,
-            "rate": actual_rate,
-        },
-    }
+    return _semantic_public_projection(project_semantic_status, value)
 
 
 def _semantic_enum(value: Any, allowed: frozenset[str]) -> str:
@@ -5488,82 +5760,11 @@ def _semantic_response_cursor(value: str | None) -> str | None:
 
 
 def _semantic_assessment_summary(value: Any) -> dict[str, Any]:
-    raw = _semantic_mapping(value)
-    return {
-        field: _semantic_assessment_summary_field(raw, field)
-        for field in _SEMANTIC_ASSESSMENT_SUMMARY_FIELDS
-    }
-
-
-def _semantic_assessment_summary_field(
-    raw: dict[str, Any],
-    field: str,
-) -> Any:
-    value = raw.get(field)
-    if field == "reason_codes":
-        return _semantic_string_list(value)
-    if field == "action_id":
-        if isinstance(value, str) and _SEMANTIC_ACTION_ID_PATTERN.fullmatch(value):
-            return value
-        raise _invalid_semantic_service_response()
-    if field == "calibration_bucket":
-        return _semantic_enum(
-            value,
-            frozenset({"unknown", "very_low", "low", "medium", "high", "very_high"}),
-        )
-    if field in {
-        "input_tokens",
-        "output_tokens",
-        "cost_microunits",
-        "latency_ms",
-    }:
-        return _semantic_nullable_counter(value)
-    if field == "tenant_bucket_sha256":
-        return _semantic_nullable_sha256(value)
-    if field == "human_outcome":
-        if value is None:
-            return None
-        return _semantic_enum(value, _SEMANTIC_HUMAN_OUTCOMES)
-    return _semantic_safe_scalar(value)
+    return _semantic_public_projection(project_assessment_summary, value)
 
 
 def _semantic_assessment_detail(value: Any) -> dict[str, Any]:
-    raw = _semantic_mapping(value)
-    summary = _semantic_assessment_summary(raw)
-    return {
-        **summary,
-        "findings": _semantic_finding_list(raw.get("findings")),
-        "data_findings": _semantic_data_finding_list(
-            raw.get("data_findings"),
-            kind=raw.get("kind"),
-        ),
-        "matched_rule_ids": _semantic_string_list(raw.get("matched_rule_ids")),
-        "proven_predicates": _semantic_string_list(raw.get("proven_predicates")),
-        "missing_predicates": _semantic_string_list(raw.get("missing_predicates")),
-        "source_refs_sha256": _semantic_nullable_sha256(raw.get("source_refs_sha256")),
-        "data_labels_sha256": _semantic_nullable_sha256(raw.get("data_labels_sha256")),
-        "sink_identity_sha256": _semantic_nullable_sha256(raw.get("sink_identity_sha256")),
-        "tool_schema_sha256": _semantic_nullable_sha256(raw.get("tool_schema_sha256")),
-        "provider_spec_sha256": _semantic_nullable_sha256(raw.get("provider_spec_sha256")),
-        "manifest_sha256": _semantic_nullable_sha256(raw.get("manifest_sha256")),
-        "action_sha256": _semantic_required_sha256(raw.get("action_sha256")),
-        "resource_sha256": _semantic_nullable_sha256(raw.get("resource_sha256")),
-        "args_sha256": _semantic_nullable_sha256(raw.get("args_sha256")),
-        "state_sha256": _semantic_nullable_sha256(raw.get("state_sha256")),
-        "projection_sha256": _semantic_required_sha256(raw.get("projection_sha256")),
-    }
-
-
-def _semantic_safe_scalar(value: Any) -> str | int | float | bool | None:
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float) and math.isfinite(value):
-        return value
-    raise GuiServerError(
-        HTTPStatus.INTERNAL_SERVER_ERROR,
-        "invalid semantic service response",
-        details={"code": "invalid_semantic_service_response"},
-    )
+    return _semantic_public_projection(project_assessment_detail, value)
 
 
 def _invalid_semantic_service_response() -> GuiServerError:
@@ -5572,120 +5773,6 @@ def _invalid_semantic_service_response() -> GuiServerError:
         "invalid semantic service response",
         details={"code": "invalid_semantic_service_response"},
     )
-
-
-def _semantic_nullable_counter(value: Any) -> int | None:
-    if value is None:
-        return None
-    return _semantic_counter(value)
-
-
-def _semantic_nullable_sha256(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str) and _SEMANTIC_SHA256_PATTERN.fullmatch(value):
-        return value
-    raise _invalid_semantic_service_response()
-
-
-def _semantic_required_sha256(value: Any) -> str:
-    selected = _semantic_nullable_sha256(value)
-    if selected is None:
-        raise _invalid_semantic_service_response()
-    return selected
-
-
-def _semantic_scalar_projection(
-    value: Any,
-    fields: tuple[str, ...],
-) -> dict[str, str | int | float | bool | None]:
-    raw = _semantic_mapping(value)
-    return {field: _semantic_safe_scalar(raw.get(field)) for field in fields}
-
-
-def _semantic_string_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if (
-        not isinstance(value, list)
-        or len(value) > 128
-        or any(not isinstance(item, str) or len(item) > 4_096 for item in value)
-        or len(set(value)) != len(value)
-    ):
-        raise GuiServerError(
-            HTTPStatus.INTERNAL_SERVER_ERROR,
-            "invalid semantic service response",
-            details={"code": "invalid_semantic_service_response"},
-        )
-    return list(value)
-
-
-def _semantic_finding_list(value: Any) -> list[dict[str, Any]]:
-    if value is None:
-        return []
-    if not isinstance(value, list) or len(value) > 128:
-        raise GuiServerError(
-            HTTPStatus.INTERNAL_SERVER_ERROR,
-            "invalid semantic findings",
-            details={"code": "invalid_semantic_service_response"},
-        )
-    fields = (
-        "code",
-        "severity",
-        "confidence_bps",
-        "evidence_sha256",
-        "source",
-    )
-    return [_semantic_scalar_projection(item, fields) for item in value]
-
-
-def _semantic_data_finding_list(
-    value: Any,
-    *,
-    kind: Any,
-) -> list[dict[str, Any]]:
-    if value is None:
-        return []
-    if not isinstance(value, list) or len(value) > 128:
-        raise GuiServerError(
-            HTTPStatus.INTERNAL_SERVER_ERROR,
-            "invalid semantic data findings",
-            details={"code": "invalid_semantic_service_response"},
-        )
-    fields = (
-        "category",
-        "field",
-        "span_start",
-        "span_end",
-        "sensitivity_floor",
-        "integrity_ceiling",
-        "trust_ceiling",
-        "confidence_bps",
-        "evidence_sha256",
-    )
-    coarse_locator = _SEMANTIC_COARSE_DATA_LOCATOR_BY_KIND.get(kind)
-    if coarse_locator is None:
-        raise _invalid_semantic_service_response()
-    selected: list[dict[str, Any]] = []
-    for item in value:
-        finding = _semantic_scalar_projection(item, fields)
-        locator = finding["field"]
-        span_start = finding["span_start"]
-        span_end = finding["span_end"]
-        if locator == SemanticDataLocator.REDACTED_INTENT.value:
-            if (
-                type(span_start) is not int
-                or type(span_end) is not int
-                or not 0
-                <= span_start
-                < span_end
-                <= SEMANTIC_REDACTED_INTENT_MAX_CHARS
-            ):
-                raise _invalid_semantic_service_response()
-        elif locator != coarse_locator or span_start is not None or span_end is not None:
-            raise _invalid_semantic_service_response()
-        selected.append(finding)
-    return selected
 
 
 def _gui_llm_content_request(

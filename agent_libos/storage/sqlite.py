@@ -22,6 +22,8 @@ from agent_libos.storage.sql import (
     _V4_REQUIRED_COLUMNS,
     _V5_KEYSET_TEXT_COLUMNS,
     _V5_REQUIRED_COLUMNS,
+    _V6_KEYSET_TEXT_COLUMNS,
+    _V6_REQUIRED_COLUMNS,
 )
 from agent_libos.storage.v5_schema_contract import (
     HUMAN_REQUEST_INDEX_CONTRACTS,
@@ -31,6 +33,12 @@ from agent_libos.storage.v5_schema_contract import (
     V5_STORAGE_COLUMN_CONTRACTS,
     V5_STORAGE_KEY_CONSTRAINTS,
     V5_STORAGE_SQLITE_CHECKS,
+)
+from agent_libos.storage.v6_schema_contract import (
+    V6_STORAGE_COLUMN_CONTRACTS,
+    V6_STORAGE_KEY_CONSTRAINTS,
+    V6_STORAGE_SQLITE_CHECKS,
+    V6_TABLES,
 )
 from agent_libos.utils.ids import utc_now
 
@@ -297,9 +305,13 @@ _SQLITE_CANONICAL_V4_CATALOG_SHA256 = (
 _SQLITE_CANONICAL_V5_CATALOG_SHA256 = (
     "d92abab9c668bb44f348de0f78e1be1198854bbfec64f61e17af93bb5a0902e6"
 )
+_SQLITE_CANONICAL_V6_CATALOG_SHA256 = (
+    "ac1735257279e943a9eaa4ad75ecb078c58b279e9ad4ba37aad2e2417d35c50d"
+)
 _SQLITE_CANONICAL_CATALOG_SHA256 = {
     4: _SQLITE_CANONICAL_V4_CATALOG_SHA256,
     5: _SQLITE_CANONICAL_V5_CATALOG_SHA256,
+    6: _SQLITE_CANONICAL_V6_CATALOG_SHA256,
 }
 
 
@@ -1135,6 +1147,37 @@ class SQLiteStore(SQLRuntimeStore):
         cls._require_full_schema_catalog(conn, version=5)
 
     @classmethod
+    def _require_v6_schema_shape(cls, conn: Any) -> None:
+        """Require every schema-v6 manifest relation to be a SQLite table."""
+
+        required_tables = sorted(_V6_REQUIRED_COLUMNS)
+        placeholders = ", ".join("?" for _ in required_tables)
+        rows = conn.execute(
+            "SELECT name, type FROM sqlite_master "
+            f"WHERE name IN ({placeholders})",
+            required_tables,
+        )
+        relation_types = {
+            str(row["name"]): str(row["type"]).lower()
+            for row in rows
+        }
+        invalid_relations = {
+            table: relation_types.get(table, "missing")
+            for table in required_tables
+            if relation_types.get(table) != "table"
+        }
+        if invalid_relations:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v6 "
+                "manifest relation types: "
+                f"{invalid_relations}; expected type 'table'"
+            )
+        super()._require_v6_schema_shape(conn)
+        cls._require_v5_storage_contract(conn)
+        cls._require_v6_storage_contract(conn)
+        cls._require_full_schema_catalog(conn, version=6)
+
+    @classmethod
     def _require_full_schema_catalog(cls, conn: Any, *, version: int) -> None:
         """Require every SQLite schema object to match the canonical catalog."""
 
@@ -1156,7 +1199,7 @@ class SQLiteStore(SQLRuntimeStore):
 
     @classmethod
     def _canonical_full_schema_catalog(cls, version: int) -> dict[str, Any]:
-        if version not in {4, 5}:
+        if version not in {4, 5, 6}:
             raise UnsupportedStoreVersion(
                 f"unsupported Agent libOS SQLite schema catalog version: {version}"
             )
@@ -1175,6 +1218,17 @@ class SQLiteStore(SQLRuntimeStore):
                 # is the canonical v5 base with only the explicit 4->5 delta
                 # reversed, matching the supported offline migration source.
                 reference = SQLiteStore(":memory:")
+                if version in {4, 5}:
+                    for table in sorted(V6_TABLES):
+                        reference.conn.execute(f'DROP TABLE "{table}"')
+                    changed = reference.conn.execute(
+                        "UPDATE runtime_schema SET schema_version = 5 "
+                        "WHERE singleton = 1 AND schema_version = 6"
+                    )
+                    if changed.rowcount != 1:
+                        raise UnsupportedStoreVersion(
+                            "unable to construct canonical SQLite schema-v5 catalog"
+                        )
                 if version == 4:
                     reference.conn.execute("DROP TABLE semantic_assessments")
                     reference.conn.execute("DROP TABLE semantic_assessment_jobs")
@@ -1205,6 +1259,28 @@ class SQLiteStore(SQLRuntimeStore):
                     _SQLITE_CANONICAL_CATALOG_BUILD.active = False
             _SQLITE_CANONICAL_CATALOGS[version] = catalog
             return catalog
+
+    @classmethod
+    def _require_v6_storage_contract(cls, conn: Any) -> None:
+        sqlite_keys = dict(V6_STORAGE_KEY_CONSTRAINTS)
+        # SQLite implements an exact INTEGER PRIMARY KEY as the rowid and does
+        # not expose a corresponding PRAGMA index_list row.  The full catalog
+        # comparator still verifies the canonical PRIMARY KEY declaration.
+        sqlite_keys["semantic_control_state"] = ()
+        sqlite_keys["semantic_legacy_coverage"] = ()
+        problems = {
+            **cls._storage_column_problems(conn, V6_STORAGE_COLUMN_CONTRACTS),
+            **cls._storage_check_problems(conn, V6_STORAGE_SQLITE_CHECKS),
+            **cls._storage_key_constraint_problems(
+                conn,
+                sqlite_keys,
+            ),
+        }
+        if problems:
+            raise UnsupportedStoreVersion(
+                "unsupported Agent libOS schema v6 storage contract: "
+                f"{problems}"
+            )
 
     @classmethod
     def _require_v5_storage_contract(cls, conn: Any) -> None:

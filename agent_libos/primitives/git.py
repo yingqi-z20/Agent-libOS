@@ -14,6 +14,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, TypeVar
 
+from agent_libos.capability.effect_binding import canonical_effect_hash
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
@@ -427,7 +428,7 @@ class GitPrimitive:
     ) -> None:
         if self.human is None:
             raise CapabilityDenied(f"{pid} requires human approval for {right.value} on {resource}")
-        request_id = self.human.query(
+        request_id = self.human.query_authority_request(
             pid=pid,
             human=self.config.runtime.default_human,
             request={
@@ -442,6 +443,7 @@ class GitPrimitive:
                 "context": context,
             },
             blocking=True,
+            authority_origin="external_operation",
             source_oids=source_oids,
         )
         raise HumanApprovalRequired(
@@ -502,6 +504,7 @@ class GitPrimitive:
             "resource": resource,
             "right": right.value,
             "worktree_id": worktree_id,
+            "semantic_exact_operation_context": True,
             **dict(extra or {}),
         }
 
@@ -690,6 +693,113 @@ class GitPrimitive:
                         classification_context=observation,
                         classification_result=summary,
                     )
+
+    def _semantic_read_flow_snapshot(
+        self,
+        *,
+        action_id: str,
+        resource: str,
+        context: Mapping[str, Any],
+    ) -> tuple[dict[str, str], DataFlowContext]:
+        """Resolve a stable, conservative Git lineage snapshot for Phase 4.
+
+        This Host-only preflight performs no provider mutation and returns
+        digests plus labels only.  It deliberately covers the whole relevant
+        repository carrier when an approval request retained only path
+        digests, so incomplete or mixed labels remain with Human.
+        """
+
+        if action_id not in {"git.read", "git.diff"}:
+            raise CapabilityDenied("semantic Git action is outside catalog v1")
+        if resource != self.repository_resource:
+            raise CapabilityDenied("semantic Git repository resource changed")
+        worktree_id = context.get("worktree_id", "main")
+        if not isinstance(worktree_id, str) or not worktree_id:
+            raise CapabilityDenied("semantic Git worktree identity is malformed")
+        operation = context.get("operation")
+        if not isinstance(operation, str) or not operation:
+            raise CapabilityDenied("semantic Git operation is malformed")
+        snapshot = self._semantic_read_snapshot(
+            action_id=action_id,
+            operation=operation,
+            context=context,
+            worktree_id=worktree_id,
+        )
+        lock_path = self._normalized_worktree_root(worktree_id) or "."
+        with self.provider.repository_lock(
+            worktree=self._worktree_path(worktree_id)
+        ):
+            with self.filesystem.hold_file_label_io_paths((lock_path,)):
+                refreshed = snapshot.refresh()
+                state = self.provider.repository_state(
+                    worktree=self._worktree_path(worktree_id)
+                )
+        current_token = self._state_token(state).token
+        if (
+            current_token != snapshot.repository_state_token
+            or refreshed.state_version != snapshot.flow.state_version
+        ):
+            raise CapabilityDenied(
+                "semantic Git repository or lineage changed during preflight"
+            )
+        return (
+            {
+                "repository_state_sha256": _sha256(
+                    snapshot.repository_state_token.encode("ascii")
+                ),
+                "flow_state_sha256": snapshot.flow.state_version,
+                "worktree_id_sha256": _sha256(worktree_id.encode("utf-8")),
+                "operation_sha256": _sha256(operation.encode("utf-8")),
+            },
+            snapshot.flow.context,
+        )
+
+    def _semantic_read_snapshot(
+        self,
+        *,
+        action_id: str,
+        operation: str,
+        context: Mapping[str, Any],
+        worktree_id: str,
+    ) -> _GitReadFlowSnapshot:
+        if action_id == "git.diff":
+            if operation != "diff":
+                raise CapabilityDenied("semantic git.diff operation changed")
+            scope = context.get("scope")
+            if scope not in {"worktree", "staged", "range"}:
+                raise CapabilityDenied("semantic Git diff scope is malformed")
+            base = context.get("base")
+            head = context.get("head")
+            if base is not None and not isinstance(base, str):
+                raise CapabilityDenied("semantic Git diff base is malformed")
+            if head is not None and not isinstance(head, str):
+                raise CapabilityDenied("semantic Git diff head is malformed")
+            return self._diff_read_flow_snapshot(
+                scope=scope,
+                base=base,
+                head=head,
+                # Approval context intentionally retains only paths_sha256;
+                # whole-tree coverage is the safe conservative projection.
+                paths=(),
+                worktree_id=worktree_id,
+            )
+        if context.get("right") != CapabilityRight.READ.value:
+            raise CapabilityDenied("semantic Git read right changed")
+        refs = tuple(
+            dict.fromkeys(
+                value
+                for key in ("ref", "base", "head")
+                if isinstance((value := context.get(key)), str) and value
+            )
+        )
+        return self._git_read_lineage_snapshot(
+            worktree_id=worktree_id,
+            refs=refs,
+            include_head=True,
+            include_index=True,
+            include_repository_content=True,
+            include_worktree_tree=True,
+        )
 
     def _subprocess_limits(self, pid: str) -> SubprocessLimits | None:
         if self.resources is None:
@@ -3106,8 +3216,20 @@ class GitPrimitive:
         operation: str,
         worktree_id: str,
         scope_count: int,
+        source_context: dict[str, Any],
         resolver: Callable[[], _GitFlowSnapshot],
     ) -> _GitFlowSnapshot:
+        """Capture mutation lineage under an exact, payload-free source binding."""
+
+        source_target_state = source_context.get("target_state_version")
+        if not isinstance(source_target_state, str) or not _SHA256_RE.fullmatch(
+            source_target_state
+        ):
+            raise ValidationError(
+                "protected Git flow snapshot requires an exact source state"
+            )
+        source_args_sha256 = canonical_effect_hash(source_context)
+
         def read_snapshot() -> tuple[_GitFlowSnapshot, dict[str, Any]]:
             snapshot = resolver()
             return snapshot, {
@@ -3120,6 +3242,12 @@ class GitPrimitive:
             f"{operation}_flow_snapshot",
             read_snapshot,
             worktree_id=worktree_id,
+            extra={
+                "source_operation": operation,
+                "source_args_sha256": source_args_sha256,
+                "scope_count": scope_count,
+                "target_state_version": source_target_state,
+            },
         )
 
     def _complete_mutation(
@@ -3706,6 +3834,7 @@ class GitPrimitive:
                 operation=operation,
                 worktree_id=worktree_id,
                 scope_count=len(filesystem_path_scopes),
+                source_context=context,
                 resolver=resolve_protected_snapshot,
             )
         flow_snapshot = self._aggregate_flow_snapshots(

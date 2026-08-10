@@ -151,6 +151,15 @@ class Runtime:
     data_flow: DataFlowManager
     protected_operations: ProtectedOperationSDK
     semantic: SemanticManager
+    semantic_control: Any
+    semantic_control_fence: Any
+    semantic_flow: Any
+    semantic_runtime_flow: Any
+    semantic_authority_validator: Any
+    semantic_rate_budget: Any
+    semantic_auto_approval: Any
+    semantic_authority_recovery: Any
+    recovered_semantic_authority: Any
     _semantic_assessor_override: Any | None
     _semantic_tenant_bucketer_override: Callable[[str], str] | None
     external_primitive_boundary_names: frozenset[str]

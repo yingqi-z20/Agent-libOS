@@ -208,7 +208,7 @@ jsonrpc       JSON-RPC endpoint and call subcommands
 mcp           MCP server and tool-call subcommands
 modules       startup Runtime Module inspection and verification
 human         process pending human messages manually
-semantic      read-only semantic Shadow status and assessment evidence
+semantic      semantic evidence inspection and Host-only review import
 store         explicit offline Runtime-store administration
 ```
 
@@ -248,9 +248,10 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint --actor-pid <actor_pid> i
 
 ## Persistent Runtime Basics
 
-Agent libOS 1.4.0 opens only store schema v5. A canonical schema-v4 database is
+Agent libOS 1.4.1 opens only store schema v6. A canonical schema-v5 database is
 rejected before `init`, recovery, audit, or any other write until an operator
-uses the explicit offline `store migrate --to 5` workflow below. Older,
+uses the explicit offline `store migrate --to 6` workflow below. A v4 store
+must first use `store migrate --to 5`. Older,
 unversioned, and malformed stores remain unsupported; there is no implicit
 migration or read-only compatibility mode in ordinary Runtime startup.
 
@@ -366,9 +367,13 @@ llm:
       allow_custom_base_url: true
 ```
 
-## Semantic Shadow Inspection
+## Semantic Inspection and Review Evidence
 
-The `semantic` group is read-only and prints schema-versioned JSON:
+The `semantic` group prints schema-versioned JSON. All runtime and policy
+surfaces are read-only; `semantic review import` is the sole write and can only
+append strict Host review evidence. It cannot activate/revoke an epoch, alter
+control state, settle a request, issue a Capability, mutate labels, or call a
+provider.
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite semantic status
@@ -380,6 +385,18 @@ uv run agent-libos --db .agent_libos.sqlite semantic assessments \
 uv run agent-libos --db .agent_libos.sqlite semantic assessments \
   --after <opaque_next_cursor> --limit 50
 uv run agent-libos --db .agent_libos.sqlite semantic show <assessment_id>
+uv run agent-libos --db .agent_libos.sqlite semantic flow status
+uv run agent-libos --db .agent_libos.sqlite semantic flow entities --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic flow edges --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic flow lineage <node_id>
+uv run agent-libos --db .agent_libos.sqlite semantic settlements --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic policy epochs --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic control status
+uv run agent-libos --db .agent_libos.sqlite semantic control history --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic health --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic metrics
+uv run agent-libos --db .agent_libos.sqlite semantic review import \
+  --file <strict-json-review-evidence>
 ```
 
 Every assessment filter is optional. `--limit` defaults to 50 and must be from
@@ -405,23 +422,54 @@ missing, non-exact, and otherwise untrusted telemetry remains `null`. Unknown
 usage keys and the raw usage object are never emitted. Treat populated values
 as provider-reported operational telemetry, not authoritative billing data.
 
-`would_issue_exact_once` is not an approval. Phase 0+1 has no CLI command that
-settles a Human request or issues a Capability from semantic evidence. Status
-uses schema v2 and includes the complete closed-key `by_status` and `by_domain`
+`would_issue_exact_once` remains Shadow evidence, not an approval. Real
+Phase 3/4 settlement is reachable only through the Runtime's Host-bound
+machine-policy port under `enforce_deny` or `canary_auto`; no CLI, HTTP, GUI,
+model Tool, Skill, JIT, or Runtime Module can invoke it. Status uses schema v3
+and includes queue, assessment, control, FlowGraph, machine, real approval, and review
+metrics together with complete closed-key `by_status` and `by_domain`
 maps. Each must sum to the assessment total, and scalar success/error,
 Shadow-outcome, and OOD counters must agree with those maps; malformed or
-inconsistent service output is rejected. The real auto-approval object is
-strictly `{"numerator":0,"denominator":0,"rate":null}`; any other value is
-rejected. See [Semantic Approval and Data
+inconsistent service output is rejected. Real rates and safety-review rates
+are `null` when their respective denominators are zero or unavailable; they
+must never be displayed as “0% unsafe.” See [Semantic Approval and Data
 Identification](semantic_shadow.md).
 
 ## Offline Store Migration
 
 `store migrate` is handled before `Runtime.open()` and is the only supported
-schema-v4 to schema-v5 path. Stop every CLI/GUI/embedded Runtime using the
-target first. Dry-run validates the complete canonical v4 shape against a
-private snapshot, performs zero writes beside the source, and returns a
-deterministic `plan_sha256`:
+schema-v4 to schema-v5 and schema-v5 to schema-v6 path. Migrations are ordered;
+a v4 store must first complete `--to 5` and then independently plan/apply
+`--to 6`. Stop every CLI/GUI/embedded Runtime using the target first. Dry-run
+validates the complete canonical source shape against a private snapshot,
+performs zero writes beside the source, and returns a deterministic
+`plan_sha256`.
+
+For the current v5-to-v6 step:
+
+```bash
+# Create an independent, quiesced, owner-only backup first.
+sqlite3 .agent_libos.sqlite ".backup '.agent_libos.v5.backup.sqlite'"
+chmod 600 .agent_libos.v5.backup.sqlite
+
+uv run agent-libos --db .agent_libos.sqlite store migrate --to 6 \
+  --dry-run --sqlite-backup .agent_libos.v5.backup.sqlite
+uv run agent-libos --db .agent_libos.sqlite store migrate --to 6 \
+  --apply --expected-plan-sha256 <plan_sha256> \
+  --sqlite-backup .agent_libos.v5.backup.sqlite
+```
+
+The PostgreSQL v5-to-v6 form uses the same target and plan digest, plus the
+explicit operator snapshot acknowledgement:
+
+```bash
+uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" store migrate --to 6 --dry-run
+uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" store migrate --to 6 \
+  --apply --expected-plan-sha256 <plan_sha256> \
+  --postgres-snapshot-confirmed
+```
+
+The legacy v4-to-v5 step remains:
 
 ```bash
 # Create an independent, quiesced, owner-only backup first.
@@ -498,7 +546,7 @@ status code 1.
 `task-run` is the Host CLI for a first-class Durable Task Run. It is separate
 from both the one-tool `workflow run` command and Object-bound background
 tasks. A Run supervises a root AgentProcess tree, persists a versioned goal and
-requirements, and exposes safe restart recovery through store schema v5.
+requirements, and exposes safe restart recovery through store schema v6.
 
 ```text
 task-run start
@@ -817,7 +865,10 @@ Interactive slash commands:
   pending request.
 - `/approve` and `/reject`: resolve an ordinary approval or a permission
   request. For a permission request, they map to `always_allow` and
-  `always_deny`.
+  `always_deny`. In `enforce_deny` and `canary_auto`, an external-operation
+  approval first renders the Host canonical preview and submits its exact
+  request revision and `preview_sha256`; a stale preview leaves the request
+  unchanged and must be refreshed.
 - `/allow` and `/ask`: permission requests only; they map to `always_allow` and
   `ask_each_time`. `allow_once` is not a terminal response policy. A command
   that is not valid for the displayed request leaves that request pending.

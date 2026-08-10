@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import threading
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar
 
+from agent_libos.capability.effect_binding import (
+    canonical_effect_hash,
+    normalize_approval_binding,
+)
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.evidence import (
@@ -31,7 +39,27 @@ from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
     CheckpointPayloadDeliveryAttempt,
     CheckpointPayloadDeliveryAttemptState,
+    DataFlowContext,
+    DataIntegrity,
+    DataLabels,
+    DataSink,
+    DataSensitivity,
     EventType,
+    SinkTrustLevel,
+    sensitivity_rank,
+)
+from agent_libos.models.capability import Capability
+from agent_libos.models.exceptions import CapabilityDenied, ValidationError
+from agent_libos.models.human import HumanRequest, HumanRequestStatus
+from agent_libos.models.semantic import (
+    MachinePolicySettlementV1,
+    SemanticApprovalBindingV2,
+    SemanticApprovalCandidate,
+    SemanticAssessment,
+    SemanticMachineSettlementOutcome,
+    SemanticReasonCode,
+    SemanticRuntimeMode,
+    SemanticTripCode,
 )
 from agent_libos.modules import RuntimeModuleRegistry
 from agent_libos.modules.host import ModuleHookServices, ModuleStateRegistry
@@ -75,8 +103,31 @@ from agent_libos.runtime.syscalls import BUILTIN_SYSCALL_NAMES, LibOSSyscallSess
 from agent_libos.runtime.snapshots import ProcessExecStateService
 from agent_libos.runtime.task_runs import TaskRunManager
 from agent_libos.sdk import ProtectedOperationSDK
+from agent_libos.semantic.control import SemanticRuntimeControl
+from agent_libos.semantic.enforcement import (
+    HostSemanticAuthorityValidator,
+    HostSemanticAutoApprovalSettlement,
+    HostSemanticControlFence,
+    HostSemanticRateBudget,
+    SemanticSafetyTripRequired,
+)
 from agent_libos.semantic.external import ExternalLLMSemanticAssessor
+from agent_libos.semantic.exact_request import (
+    decode_exact_semantic_approval_request,
+    semantic_effect_identity,
+)
+from agent_libos.semantic.flow import (
+    FLOW_NO_TENANT_BUCKET_SHA256,
+    FlowCoverageStatus,
+    SemanticFlowProvenanceValidator,
+    SemanticFlowService,
+)
 from agent_libos.semantic.protected import SdkProtectedSemanticCallPort
+from agent_libos.semantic.projection import LocalDlpAccumulator
+from agent_libos.semantic.ontology import DEFAULT_ACTION_ONTOLOGY
+from agent_libos.semantic.recovery import SemanticMachineAuthorityRecovery
+from agent_libos.semantic.runtime_flow import SemanticRuntimeFlowObserver
+from agent_libos.semantic.settlement import HostSemanticDenySettlement
 from agent_libos.semantic.service import (
     DeterministicSemanticAssessor,
     SemanticManager,
@@ -88,6 +139,8 @@ from agent_libos.storage import (
     StoreAssemblyReservation,
     StoreCloseClaimOutcome,
     StoreCloseOutcome,
+    SemanticHealthEventRecord,
+    SemanticMachineOutcomeRecord,
     UnitOfWork,
     open_store,
 )
@@ -100,7 +153,8 @@ from agent_libos.substrate import (
     SdkMcpProvider,
 )
 from agent_libos.tools.broker import ToolBroker
-from agent_libos.utils.ids import new_id
+from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.serde import dumps, to_jsonable
 from agent_libos.utils.public_errors import (
     internal_exception_observation,
     public_error_envelope,
@@ -2554,6 +2608,49 @@ class RuntimeBuilder(Generic[RuntimeT]):
             config=host.config,
             operations=host.operations,
             admission=host.lifecycle,
+            semantic_approval_validator=(
+                lambda **kwargs: RuntimeBuilder._validate_semantic_approval(
+                    host,
+                    **kwargs,
+                )
+            ),
+            semantic_authority_trip=partial(
+                RuntimeBuilder._semantic_safety_trip,
+                host,
+            ),
+        )
+
+    @staticmethod
+    def _validate_semantic_approval(host: Runtime, **facts: Any) -> None:
+        """Resolve the Host-only BindingV2 validator at every use phase."""
+
+        validator = getattr(host, "semantic_authority_validator", None)
+        if not callable(validator):
+            raise CapabilityDenied(
+                "semantic exact-once authority validator is unavailable"
+            )
+        validator(**facts)
+
+    @staticmethod
+    def _semantic_safety_trip(
+        host: Runtime,
+        *,
+        trip_code: SemanticTripCode | str,
+        evidence_sha256: str,
+        tenant_bucket_sha256: str | None = None,
+    ) -> None:
+        """Trip both the process-local latch and durable Host control."""
+
+        host.capability.trip_semantic_authority_locally()
+        control = getattr(host, "semantic_control", None)
+        if control is None:
+            # Before semantic composition there can be no valid BindingV2
+            # grant.  Fail closed instead of silently dropping a trip.
+            raise CapabilityDenied("semantic durable safety-trip control is unavailable")
+        control.trip(
+            trip_code,
+            evidence_sha256=evidence_sha256,
+            tenant_bucket_sha256=tenant_bucket_sha256,
         )
 
     @staticmethod
@@ -2594,6 +2691,9 @@ class RuntimeBuilder(Generic[RuntimeT]):
             config=host.config,
             resources=host.resources,
             operations=host.operations,
+            host_semantic_flow_observer=lambda kind, **facts: (
+                host.semantic_runtime_flow.observe_memory(kind, **facts)
+            ),
         )
         host.data_flow = DataFlowManager(
             host.uow.authority,
@@ -2616,6 +2716,10 @@ class RuntimeBuilder(Generic[RuntimeT]):
             operations=host.operations,
             require_recovery_lease=host.lifecycle.require_recovery_lease,
             data_flow=host.data_flow,
+            semantic_authority_lifecycle_observer=partial(
+                RuntimeBuilder._semantic_authority_lifecycle,
+                host,
+            ),
         )
         host.external_primitive_boundary_names = (
             register_protected_operation_descriptors(
@@ -2689,6 +2793,20 @@ class RuntimeBuilder(Generic[RuntimeT]):
             config=host.config,
             transitions=host.process_transitions,
             process_terminal_cleanup=host.process.retry_terminal_cleanup,
+            host_semantic_policy_preflight=lambda request: (
+                host.semantic.deterministic_deny_preflight(request)
+            ),
+            host_semantic_mode_reader=lambda: (
+                host.semantic_control.current().mode.value
+            ),
+            host_semantic_settlement_recorder=partial(
+                RuntimeBuilder._semantic_machine_settlement_recorder,
+                host,
+            ),
+            host_semantic_outcome_linker=partial(
+                RuntimeBuilder._semantic_human_outcome_link,
+                host,
+            ),
         )
         host.data_flow.bind_human(host.human)
         with host.lifecycle.recovery_lease():
@@ -2778,7 +2896,8 @@ class RuntimeBuilder(Generic[RuntimeT]):
         injected = getattr(host, "_semantic_assessor_override", None)
         if injected is not None and not callable(getattr(injected, "assess", None)):
             raise TypeError("semantic_assessor must implement synchronous assess()")
-        if config.mode == "shadow" and config.adapter == "scripted":
+        semantic_active = config.mode in {"shadow", "enforce_deny", "canary_auto"}
+        if semantic_active and config.adapter == "scripted":
             if injected is None:
                 raise ValueError(
                     "semantic adapter=scripted requires a Host-injected assessor"
@@ -2787,7 +2906,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             classifier_id = "semantic.scripted"
             classifier_version = "1"
             artifact_sha256 = None
-        elif config.mode == "shadow" and config.adapter == "external":
+        elif semantic_active and config.adapter == "external":
             if injected is not None:
                 raise ValueError(
                     "semantic adapter=external cannot be replaced by an injected assessor"
@@ -2823,6 +2942,146 @@ class RuntimeBuilder(Generic[RuntimeT]):
             classifier_id = f"semantic.{config.adapter}"
             classifier_version = "1"
             artifact_sha256 = None
+        tenant_bucketer = getattr(
+            host,
+            "_semantic_tenant_bucketer_override",
+            None,
+        )
+        if config.mode == "canary_auto":
+            if not callable(tenant_bucketer):
+                raise ValueError(
+                    "semantic canary_auto requires a Host-keyed tenant bucketer"
+                )
+            epoch = config.policy_epoch
+            assert epoch is not None
+            if config.adapter != "external":
+                raise ValueError(
+                    "semantic canary_auto requires an external classifier"
+                )
+            assert config.external_profile_id is not None
+            live_snapshot = host.llms.profile_snapshot(
+                config.external_profile_id
+            )
+            live_model = live_snapshot.profile.model
+            if live_model is None:
+                raise ValueError("semantic classifier model is not pinned")
+            live_model_sha256 = hashlib.sha256(
+                live_model.encode("utf-8")
+            ).hexdigest()
+            if (
+                epoch.classifier_profile_id != config.external_profile_id
+                or epoch.classifier_profile_sha256
+                != live_snapshot.identity_sha256
+                or epoch.classifier_model_sha256 != live_model_sha256
+            ):
+                raise ValueError(
+                    "semantic canary classifier profile/model drifted from the static epoch"
+                )
+
+        semantic_control = SemanticRuntimeControl(
+            host.uow.semantic,
+            mode=config.mode,
+            policy_epoch=config.policy_epoch,
+        )
+        # Admission is part of assembly, not worker startup.  Policy/epoch CAS
+        # conflicts therefore fail Runtime.open instead of silently degrading.
+        semantic_control.admit()
+        flow_graph = SemanticFlowService(
+            host.uow.semantic,
+            capture_failure_observer=lambda **facts: (
+                getattr(getattr(host, "semantic", None), "record_capture_failure", lambda **_kwargs: None)(
+                    **facts
+                )
+            ),
+        )
+        flow_validator = SemanticFlowProvenanceValidator(
+            flow_graph,
+            live_binding_resolver=partial(
+                RuntimeBuilder._semantic_live_flow_binding,
+                host,
+            ),
+        )
+        control_fence = HostSemanticControlFence(
+            host.uow.semantic,
+            control_resolver=semantic_control.authority_view,
+        )
+        authority_validator = HostSemanticAuthorityValidator(
+            control_resolver=semantic_control.authority_view,
+            provenance_validator=flow_validator,
+            control_fence=control_fence,
+            local_safety_latch=(
+                host.capability.trip_semantic_authority_locally
+            ),
+            safety_trip=partial(
+                RuntimeBuilder._semantic_safety_trip,
+                host,
+            ),
+        )
+        budget = HostSemanticRateBudget(
+            host.uow.semantic,
+            control_resolver=semantic_control.authority_view,
+            control_fence=control_fence,
+        )
+        semantic_machine_port = (
+            host.human._issue_host_semantic_machine_settlement_port()
+        )
+        semantic_machine_terminalizer = semantic_machine_port.terminalize
+        auto_settlement = HostSemanticAutoApprovalSettlement(
+            host.capability,
+            transaction=semantic_machine_port.transaction,
+            machine_terminalizer=semantic_machine_terminalizer,
+            live_binding_factory=partial(
+                RuntimeBuilder._semantic_live_binding,
+                host,
+            ),
+            budget=budget,
+        )
+        deny_settlement = HostSemanticDenySettlement(
+            transaction=semantic_machine_port.transaction,
+            machine_terminalizer=semantic_machine_terminalizer,
+            control_fence=control_fence,
+        )
+        RuntimeBuilder._install_semantic_runtime(
+            host,
+            config=config,
+            assessor=assessor,
+            semantic_control=semantic_control,
+            control_fence=control_fence,
+            flow_graph=flow_graph,
+            authority_validator=authority_validator,
+            budget=budget,
+            auto_settlement=auto_settlement,
+            deny_settlement=deny_settlement,
+            classifier_id=classifier_id,
+            classifier_version=classifier_version,
+            artifact_sha256=artifact_sha256,
+            tenant_bucketer=tenant_bucketer,
+        )
+
+    @staticmethod
+    def _install_semantic_runtime(
+        host: Runtime,
+        *,
+        config: Any,
+        assessor: Any,
+        semantic_control: Any,
+        control_fence: Any,
+        flow_graph: Any,
+        authority_validator: Any,
+        budget: Any,
+        auto_settlement: Any,
+        deny_settlement: Any,
+        classifier_id: str,
+        classifier_version: str,
+        artifact_sha256: str | None,
+        tenant_bucketer: Any,
+    ) -> None:
+        host.semantic_control = semantic_control
+        host.semantic_control_fence = control_fence
+        host.semantic_flow = flow_graph
+        host.semantic_authority_validator = authority_validator
+        host.semantic_rate_budget = budget
+        host.semantic_auto_approval = auto_settlement
         host.semantic = SemanticManager(
             host.uow.semantic,
             config=config,
@@ -2834,18 +3093,25 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 RuntimeBuilder._semantic_human_outcome_reader,
                 host,
             ),
+            human_request_reader=host.uow.processes.get_human_request,
             root_goal_reader=partial(
                 RuntimeBuilder._semantic_root_goal_reader,
                 host,
             ),
+            root_flow_resolver=host.data_flow.context_from_object_snapshot,
+            flow_graph=flow_graph,
+            auto_settlement=auto_settlement,
+            deny_settlement=deny_settlement,
+            control=semantic_control,
+            rate_budget=budget,
             classifier_id=classifier_id,
             classifier_version=classifier_version,
             artifact_sha256=artifact_sha256,
             owner_id=host.instance_id,
-            tenant_bucketer=getattr(
+            tenant_bucketer=tenant_bucketer,
+            hard_deny_facts_resolver=partial(
+                RuntimeBuilder._semantic_hard_deny_facts,
                 host,
-                "_semantic_tenant_bucketer_override",
-                None,
             ),
             shutdown_registrar=partial(
                 host.lifecycle.bind_finalizer,
@@ -2870,12 +3136,43 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 host,
             ),
         )
+        host.semantic_runtime_flow = SemanticRuntimeFlowObserver(
+            flow_graph,
+            objects=host.uow.objects,
+            # This predicate is invoked from committed memory callbacks that
+            # may still own a store transaction.  It must remain lock-free to
+            # avoid inverting the semantic worker's manager/store lock order.
+            enabled=host.semantic.capture_enabled,
+            tenant_bucketer=tenant_bucketer,
+            capture_failure=lambda **facts: host.semantic.record_capture_failure(
+                **facts
+            ),
+            filesystem=host.filesystem,
+            data_flow=host.data_flow,
+        )
+        host.semantic_authority_recovery = SemanticMachineAuthorityRecovery(
+            host.uow.semantic,
+            capability_reader=host.uow.authority.get_capability,
+            capability_revoker=lambda cap_id: host.capability.revoke(
+                cap_id,
+                revoked_by="policy:semantic:startup-recovery",
+                reason="semantic exact-once startup terminalization",
+                require_authority=False,
+            ),
+            capability_expired=host.capability.is_expired,
+            effect_reader=host.uow.protected_effects.get_external_effect,
+            rate_budget=budget,
+            control=semantic_control,
+            local_trip=host.capability.trip_semantic_authority_locally,
+        )
 
     @staticmethod
     def _start_semantic(host: Runtime) -> None:
         try:
             host.semantic.start()
         except Exception:
+            if host.config.semantic.mode in {"enforce_deny", "canary_auto"}:
+                raise
             host.semantic.degrade_after_startup_failure()
 
     @staticmethod
@@ -2894,6 +3191,1327 @@ class RuntimeBuilder(Generic[RuntimeT]):
         return request.status.value if request is not None else None
 
     @staticmethod
+    def _semantic_hard_deny_facts(
+        host: Runtime,
+        request: HumanRequest,
+        captured_job: Any | None,
+    ) -> dict[str, Any]:
+        """Resolve deterministic denial facts from current Host state only.
+
+        Every nullable value is deliberately tri-state: only an explicit
+        ``False`` is executable by the enforcement broker.  Missing captures,
+        unsupported target resolvers, conditional release, and read failures
+        remain unknown so Human retains the decision.
+        """
+
+        exact = decode_exact_semantic_approval_request(request)
+        capture = RuntimeBuilder._semantic_deny_capture(
+            host,
+            request=request,
+            captured_job=captured_job,
+        )
+        binding_current = RuntimeBuilder._semantic_capture_binding_current(
+            host,
+            request=request,
+            exact=exact,
+            capture=capture,
+        )
+        manifest_current, policy_current = (
+            RuntimeBuilder._semantic_capture_policy_current(
+                host,
+                request=request,
+                capture=capture,
+            )
+        )
+        target_state_current = RuntimeBuilder._semantic_target_state_current(
+            host,
+            exact=exact,
+        )
+        data_flow_allowed = RuntimeBuilder._semantic_deny_data_flow_allowed(
+            host,
+            request=request,
+            exact=exact,
+        )
+        facts = {
+            "schema_version": 1,
+            "binding_current": binding_current,
+            "target_state_current": target_state_current,
+            "manifest_current": manifest_current,
+            "policy_current": policy_current,
+            "data_flow_allowed": data_flow_allowed,
+        }
+        capture_id = getattr(capture, "job_id", None) or getattr(
+            capture,
+            "assessment_id",
+            None,
+        )
+        facts["evidence_sha256"] = RuntimeBuilder._semantic_canonical_digest(
+            {
+                **facts,
+                "request_id_sha256": RuntimeBuilder._semantic_canonical_digest(
+                    request.request_id
+                ),
+                "request_revision": request.revision,
+                "effect_id_sha256": RuntimeBuilder._semantic_canonical_digest(
+                    exact.binding["effect_id"]
+                ),
+                "action_sha256": RuntimeBuilder._semantic_canonical_digest(
+                    exact.action_id
+                ),
+                "capture_id_sha256": (
+                    RuntimeBuilder._semantic_canonical_digest(capture_id)
+                    if isinstance(capture_id, str)
+                    else None
+                ),
+            }
+        )
+        return facts
+
+    @staticmethod
+    def _semantic_deny_capture(
+        host: Runtime,
+        *,
+        request: HumanRequest,
+        captured_job: Any | None,
+    ) -> Any | None:
+        if captured_job is not None:
+            return captured_job
+        getter = getattr(
+            host.uow.semantic,
+            "get_semantic_assessment_job_for_request",
+            None,
+        )
+        if callable(getter):
+            initial = getter(request.request_id, 0)
+            if initial is not None:
+                return initial
+        query = getattr(host.uow.semantic, "query_semantic_assessments", None)
+        if not callable(query):
+            return None
+        page = query(
+            after=None,
+            limit=2,
+            request_id=request.request_id,
+        )
+        records = tuple(getattr(page, "records", ()))
+        return records[0] if len(records) == 1 else None
+
+    @staticmethod
+    def _semantic_capture_binding_current(
+        host: Runtime,
+        *,
+        request: HumanRequest,
+        exact: Any,
+        capture: Any | None,
+    ) -> bool | None:
+        if capture is None:
+            return None
+        latest = host.uow.processes.get_human_request(request.request_id)
+        if (
+            not isinstance(latest, HumanRequest)
+            or latest.pid != request.pid
+            or latest.revision != request.revision
+            or latest.status is not HumanRequestStatus.PENDING
+        ):
+            return False
+        try:
+            live_exact = decode_exact_semantic_approval_request(latest)
+        except ValidationError:
+            return False
+        if (
+            live_exact.action_id != exact.action_id
+            or live_exact.resource != exact.resource
+            or live_exact.right != exact.right
+            or live_exact.binding != exact.binding
+        ):
+            return False
+        bindings = getattr(capture, "bindings", None)
+        values = bindings if isinstance(bindings, Mapping) else capture
+        kind = getattr(capture, "kind", None)
+        expected = {
+            "action_sha256": RuntimeBuilder._semantic_canonical_digest(
+                exact.action_id
+            ),
+            "resource_sha256": RuntimeBuilder._semantic_canonical_digest(
+                exact.resource
+            ),
+            "args_sha256": RuntimeBuilder._semantic_canonical_digest(
+                exact.context
+            ),
+            "state_sha256": RuntimeBuilder._semantic_canonical_digest(
+                exact.binding
+            ),
+        }
+        return bool(
+            kind == "approval"
+            and getattr(capture, "request_id", None) == request.request_id
+            and getattr(capture, "pid", None) == request.pid
+            and getattr(capture, "effect_id", None)
+            == exact.binding["effect_id"]
+            and all(
+                RuntimeBuilder._semantic_capture_value(values, key) == value
+                for key, value in expected.items()
+            )
+        )
+
+    @staticmethod
+    def _semantic_capture_value(capture: Any, key: str) -> Any:
+        return capture.get(key) if isinstance(capture, Mapping) else getattr(
+            capture,
+            key,
+            None,
+        )
+
+    @staticmethod
+    def _semantic_capture_policy_current(
+        host: Runtime,
+        *,
+        request: HumanRequest,
+        capture: Any | None,
+    ) -> tuple[bool | None, bool | None]:
+        if capture is None:
+            return None, None
+        bindings = getattr(capture, "bindings", None)
+        values = bindings if isinstance(bindings, Mapping) else capture
+        captured_manifest = RuntimeBuilder._semantic_capture_value(
+            values,
+            "manifest_sha256",
+        )
+        captured_policy = RuntimeBuilder._semantic_capture_value(
+            values,
+            "policy_sha256",
+        )
+        if not isinstance(captured_manifest, str):
+            return None, None
+        manifest = host.authority_manifests.get_for_process(request.pid)
+        if manifest is None:
+            return False, False
+        try:
+            host.authority_manifests._require_live(manifest)
+        except CapabilityDenied:
+            return False, False
+        current_manifest = getattr(manifest, "manifest_hash", None)
+        approval_policy = getattr(manifest, "approval_policy", None)
+        raw_policy = (
+            approval_policy.get("semantic_auto_approval")
+            if isinstance(approval_policy, Mapping)
+            else None
+        )
+        current_policy = hashlib.sha256(
+            dumps(
+                dict(raw_policy)
+                if isinstance(raw_policy, Mapping)
+                else {"schema_version": 1, "rules": []}
+            ).encode("utf-8")
+        ).hexdigest()
+        return (
+            isinstance(current_manifest, str)
+            and current_manifest == captured_manifest,
+            isinstance(current_policy, str)
+            and isinstance(captured_policy, str)
+            and current_policy == captured_policy,
+        )
+
+    @staticmethod
+    def _semantic_target_state_current(
+        host: Runtime,
+        *,
+        exact: Any,
+    ) -> bool | None:
+        context = exact.context
+        action_id = exact.action_id
+        if action_id == "jsonrpc.call":
+            return RuntimeBuilder._semantic_registry_binding_current(
+                host.jsonrpc,
+                context=context,
+                owner_key="endpoint_id",
+            )
+        if action_id == "mcp.call":
+            return RuntimeBuilder._semantic_registry_binding_current(
+                host.mcp,
+                context=context,
+                owner_key="server_id",
+            )
+        expected = exact.binding.get("target_state_version")
+        if expected is None:
+            return None
+        try:
+            if action_id.startswith("git.") and isinstance(expected, str):
+                worktree_id = context.get("worktree_id", "main")
+                if not isinstance(worktree_id, str) or not worktree_id:
+                    return None
+                worktree = host.git._worktree_path(worktree_id)
+                with host.git.provider.repository_lock(worktree=worktree):
+                    state = host.git.provider.repository_state(worktree=worktree)
+                return host.git._state_token(state).token == expected
+            if action_id.startswith("filesystem."):
+                path = context.get("path")
+                if not isinstance(path, str) or not path:
+                    return None
+                if isinstance(expected, int) and not isinstance(expected, bool):
+                    current = (
+                        host.data_flow.store.get_file_label_binding_generation(path)
+                    )
+                elif isinstance(expected, str):
+                    current = host.data_flow.file_state_version(path)
+                else:
+                    return None
+                return type(current) is type(expected) and current == expected
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _semantic_registry_binding_current(
+        primitive: Any,
+        *,
+        context: Mapping[str, Any],
+        owner_key: str,
+    ) -> bool | None:
+        owner = context.get(owner_key)
+        expected_digest = context.get("registry_spec_sha256")
+        expected_generation = context.get("registry_generation")
+        if (
+            not isinstance(owner, str)
+            or not owner
+            or not isinstance(expected_digest, str)
+            or isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+        ):
+            return None
+        resolver_name = (
+            "_registry_binding_context"
+            if owner_key == "endpoint_id"
+            else "_registry_binding_context"
+        )
+        resolver = getattr(primitive, resolver_name, None)
+        if not callable(resolver):
+            return None
+        try:
+            current = resolver(owner)
+        except Exception:
+            return None
+        if not isinstance(current, Mapping):
+            return None
+        return bool(
+            current.get("registry_spec_sha256") == expected_digest
+            and current.get("registry_generation") == expected_generation
+        )
+
+    @staticmethod
+    def _semantic_deny_data_flow_allowed(
+        host: Runtime,
+        *,
+        request: HumanRequest,
+        exact: Any,
+    ) -> bool | None:
+        action = DEFAULT_ACTION_ONTOLOGY.resolve(exact.action_id)
+        if action is None or not action.requires_data_flow_egress:
+            return None
+        identity_sha256 = exact.context.get("sink_identity_sha256")
+        if identity_sha256 is not None and (
+            not isinstance(identity_sha256, str)
+            or len(identity_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in identity_sha256)
+        ):
+            return None
+        try:
+            sink = DataSink(exact.resource, identity_sha256)
+            flow = host.semantic.host_human_flow(request.payload)
+            with host.data_flow.store.locked():
+                source_error = host.data_flow._validate_source_refs(
+                    flow.source_refs,
+                    allow_recovered_source_snapshots=False,
+                )
+                if source_error is not None:
+                    return False
+                try:
+                    trust = host.data_flow.resolve_sink_trust(sink)
+                except Exception:
+                    return None
+                # Absence of an exact Host Sink rule is uncertainty for the
+                # semantic enforcement broker.  The ordinary DataFlow guard
+                # may still apply its conservative default at provider time,
+                # but Phase 3 may execute a terminal machine denial only from
+                # an explicit current Host clearance proof.
+                if trust is None:
+                    return None
+                if (
+                    identity_sha256 is None
+                    and trust.identity_sha256 is not None
+                ):
+                    return None
+                policy_error = host.data_flow._clearance_error(
+                    sink,
+                    flow.labels,
+                    trust,
+                    minimum_integrity=DataIntegrity.UNTRUSTED,
+                )
+        except Exception:
+            return None
+        if policy_error is not None:
+            return False
+        if (
+            trust.trust_level is SinkTrustLevel.CONDITIONAL
+            and sensitivity_rank(flow.labels.sensitivity)
+            > sensitivity_rank(DataSensitivity.NORMAL)
+        ):
+            return None
+        return True
+
+    @staticmethod
+    def _semantic_canonical_digest(value: Any) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                to_jsonable(value),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _semantic_digest(value: Any) -> str:
+        return hashlib.sha256(
+            dumps(to_jsonable(value)).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _semantic_current_file_flow(
+        host: Runtime,
+        *,
+        pid: str,
+        action_id: str,
+        resource: str,
+        context: Any,
+        effect_id: str | None,
+        capture: bool,
+    ) -> tuple[dict[str, str], Any, str]:
+        """Resolve one current catalog source without retaining its payload."""
+
+        if not isinstance(context, dict):
+            raise CapabilityDenied("semantic operation context is malformed")
+        if action_id == "filesystem.read":
+            facts, flow_context, tenant_bucket, provenance_sha256 = (
+                RuntimeBuilder._semantic_file_snapshot(
+                    host,
+                    resource=resource,
+                    context=context,
+                )
+            )
+        elif action_id in {"git.read", "git.diff"}:
+            facts, flow_context, tenant_bucket, provenance_sha256 = (
+                RuntimeBuilder._semantic_git_snapshot(
+                    host,
+                    action_id=action_id,
+                    resource=resource,
+                    context=context,
+                )
+            )
+        else:
+            raise CapabilityDenied(
+                "semantic catalog provenance is unavailable for this action"
+            )
+        entity_id = RuntimeBuilder._semantic_flow_entity(
+            host,
+            pid=pid,
+            action_id=action_id,
+            effect_id=effect_id,
+            facts=facts,
+            flow_context=flow_context,
+            tenant_bucket=tenant_bucket,
+            provenance_sha256=provenance_sha256,
+            capture=capture,
+        )
+        return {"entity_id": entity_id, **facts}, flow_context, tenant_bucket
+
+    @staticmethod
+    def _semantic_file_snapshot(
+        host: Runtime,
+        *,
+        resource: str,
+        context: dict[str, Any],
+    ) -> tuple[dict[str, str], Any, str, str]:
+        path = context.get("path")
+        if not isinstance(path, str) or not path:
+            raise CapabilityDenied("semantic filesystem binding has no exact path")
+        target, relative = host.filesystem.resolve_path(path)
+        if host.filesystem.resource_for(relative) != resource:
+            raise CapabilityDenied("semantic filesystem resource changed")
+        maximum = int(host.config.tools.filesystem_read_hard_limit_bytes)
+        with host.filesystem.hold_file_label_io_paths((relative,)):
+            before_context, before_label_state = host.data_flow.file_snapshot(
+                relative
+            )
+            binding = host.data_flow.current_file_label_binding(relative)
+            if (
+                binding is None
+                or binding.tombstoned
+                or not binding.active
+                or binding.content_sha256 is None
+            ):
+                raise CapabilityDenied(
+                    "semantic filesystem auto approval requires a current file-label binding"
+                )
+            first_state = host.filesystem.provider.state(target)
+            if (
+                not first_state.exists
+                or first_state.kind != "file"
+                or first_state.size_bytes is None
+                or first_state.size_bytes < 0
+                or first_state.size_bytes > maximum
+            ):
+                raise CapabilityDenied(
+                    "semantic filesystem target is missing, non-file, or too large"
+                )
+            content = host.filesystem.provider.read_bytes(
+                target,
+                max_bytes=maximum,
+            )
+            second_state = host.filesystem.provider.state(target)
+            after_context, after_label_state = host.data_flow.file_snapshot(
+                relative
+            )
+        if first_state != second_state or before_label_state != after_label_state:
+            raise CapabilityDenied("semantic filesystem target changed during preflight")
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        if content_sha256 != binding.content_sha256:
+            raise CapabilityDenied(
+                "semantic filesystem content differs from its current label binding"
+            )
+        detector = LocalDlpAccumulator(input_sha256=content_sha256)
+        detector.scan(content)
+        findings = detector.findings
+        labels = after_context.labels
+        if findings:
+            labels = DataLabels(
+                sensitivity=DataSensitivity.SECRET,
+                integrity=labels.integrity,
+                trust_level=labels.trust_level,
+                origin=labels.origin,
+                tenant=labels.tenant,
+                principal=labels.principal,
+                declassification_authority=labels.declassification_authority,
+            )
+            after_context = DataFlowContext(
+                labels=labels,
+                source_refs=after_context.source_refs,
+                materialization_id=after_context.materialization_id,
+            )
+        tenant_bucket = RuntimeBuilder._semantic_exact_tenant_bucket(
+            host,
+            labels,
+        )
+        state_sha256 = RuntimeBuilder._semantic_digest(
+            {
+                "schema_version": 1,
+                "resource_sha256": RuntimeBuilder._semantic_digest(resource),
+                "exists": second_state.exists,
+                "kind": second_state.kind,
+                "size_bytes": second_state.size_bytes,
+                "modified_at": second_state.modified_at,
+                "label_state_sha256": RuntimeBuilder._semantic_digest(
+                    after_label_state
+                ),
+            }
+        )
+        version_sha256 = RuntimeBuilder._semantic_digest(
+            {
+                "schema_version": 1,
+                "content_sha256": content_sha256,
+                "state_sha256": state_sha256,
+                "binding_id_sha256": RuntimeBuilder._semantic_digest(
+                    binding.binding_id
+                ),
+                "binding_generation": binding.generation,
+                "local_dlp_evidence_sha256s": [
+                    item.evidence_sha256 for item in findings
+                ],
+            }
+        )
+        provenance_sha256 = RuntimeBuilder._semantic_digest(
+            {
+                "schema_version": 1,
+                "source_refs_sha256": after_context.source_refs_hash(),
+                "labels_sha256": RuntimeBuilder._semantic_digest(
+                    {
+                        "sensitivity": labels.sensitivity.value,
+                        "integrity": labels.integrity.value,
+                        "trust_level": labels.trust_level.value,
+                        "identity_present": True,
+                        "identity_mixed": False,
+                    }
+                ),
+                "binding_generation": binding.generation,
+            }
+        )
+        return (
+            {
+                "current_content_sha256": content_sha256,
+                "current_version_sha256": version_sha256,
+                "current_state_sha256": state_sha256,
+            },
+            after_context,
+            tenant_bucket,
+            provenance_sha256,
+        )
+
+    @staticmethod
+    def _semantic_git_snapshot(
+        host: Runtime,
+        *,
+        action_id: str,
+        resource: str,
+        context: dict[str, Any],
+    ) -> tuple[dict[str, str], Any, str, str]:
+        git_facts, flow_context = host.git._semantic_read_flow_snapshot(
+            action_id=action_id,
+            resource=resource,
+            context=context,
+        )
+        labels = flow_context.labels
+        tenant_bucket = RuntimeBuilder._semantic_exact_tenant_bucket(
+            host,
+            labels,
+        )
+        state_sha256 = RuntimeBuilder._semantic_digest(
+            {"schema_version": 1, "git": git_facts}
+        )
+        content_sha256 = RuntimeBuilder._semantic_digest(
+            {
+                "schema_version": 1,
+                "action_id": action_id,
+                "args_sha256": RuntimeBuilder._semantic_digest(context),
+                "repository_state_sha256": git_facts[
+                    "repository_state_sha256"
+                ],
+                "flow_state_sha256": git_facts["flow_state_sha256"],
+            }
+        )
+        version_sha256 = RuntimeBuilder._semantic_digest(
+            {
+                "schema_version": 1,
+                "content_sha256": content_sha256,
+                "state_sha256": state_sha256,
+            }
+        )
+        provenance_sha256 = RuntimeBuilder._semantic_digest(
+            {
+                "schema_version": 1,
+                "source_refs_sha256": flow_context.source_refs_hash(),
+                "labels_sha256": RuntimeBuilder._semantic_labels_digest(labels),
+                "git_flow_state_sha256": git_facts["flow_state_sha256"],
+            }
+        )
+        return (
+            {
+                "current_content_sha256": content_sha256,
+                "current_version_sha256": version_sha256,
+                "current_state_sha256": state_sha256,
+            },
+            flow_context,
+            tenant_bucket,
+            provenance_sha256,
+        )
+
+    @staticmethod
+    def _semantic_exact_tenant_bucket(host: Runtime, labels: Any) -> str:
+        if labels.is_mixed_identity or labels.tenant is None:
+            raise CapabilityDenied(
+                "semantic canary requires one exact non-mixed tenant identity"
+            )
+        tenant_bucket = host.semantic.host_tenant_bucket(labels.tenant)
+        if not isinstance(tenant_bucket, str):
+            raise CapabilityDenied("semantic Host tenant bucketing failed")
+        return tenant_bucket
+
+    @staticmethod
+    def _semantic_labels_digest(labels: Any) -> str:
+        return RuntimeBuilder._semantic_digest(
+            {
+                "sensitivity": labels.sensitivity.value,
+                "integrity": labels.integrity.value,
+                "trust_level": labels.trust_level.value,
+                "identity_present": True,
+                "identity_mixed": False,
+            }
+        )
+
+    @staticmethod
+    def _semantic_flow_entity(
+        host: Runtime,
+        *,
+        pid: str,
+        action_id: str,
+        effect_id: str | None,
+        facts: dict[str, str],
+        flow_context: Any,
+        tenant_bucket: str,
+        provenance_sha256: str,
+        capture: bool,
+    ) -> str:
+        if capture:
+            capture_facts = dict(
+                pid=pid,
+                action_id=action_id,
+                content_sha256=facts["current_content_sha256"],
+                version_sha256=facts["current_version_sha256"],
+                state_sha256=facts["current_state_sha256"],
+                provenance_sha256=provenance_sha256,
+                labels=flow_context.labels,
+                tenant_bucket_sha256=tenant_bucket,
+                effect_id=effect_id,
+                coverage=FlowCoverageStatus.COMPLETE,
+                created_at=utc_now(),
+            )
+            if action_id == "filesystem.read":
+                bundle = host.semantic_flow.capture_file_version(
+                    operation="read",
+                    **capture_facts,
+                )
+            else:
+                bundle = host.semantic_flow.capture_git_snapshot(
+                    **capture_facts,
+                )
+            if bundle is None or len(bundle.entities) != 1:
+                raise CapabilityDenied("semantic source FlowGraph capture failed")
+            return bundle.entities[0].entity_id
+        return RuntimeBuilder._semantic_existing_flow_entity(
+            host,
+            pid=pid,
+            action_id=action_id,
+            tenant_bucket=tenant_bucket,
+            facts=facts,
+        )
+
+    @staticmethod
+    def _semantic_existing_flow_entity(
+        host: Runtime,
+        *,
+        pid: str,
+        action_id: str,
+        tenant_bucket: str,
+        facts: dict[str, str],
+    ) -> str:
+        page = host.uow.semantic.query_semantic_flow_entities(
+            after=None,
+            limit=500,
+            pid=pid,
+            kind="file_binding_version",
+            tenant_bucket_sha256=tenant_bucket,
+        )
+        if page.next_cursor is not None:
+            raise CapabilityDenied(
+                "semantic source FlowGraph lookup exceeded its safety bound"
+            )
+        matches = tuple(
+            entity.entity_id
+            for entity in page.records
+            if host.semantic_flow.approval_eligibility(
+                action_id=action_id,
+                entity_id=entity.entity_id,
+                tenant_bucket_sha256=tenant_bucket,
+                current_content_sha256=facts["current_content_sha256"],
+                current_version_sha256=facts["current_version_sha256"],
+                current_state_sha256=facts["current_state_sha256"],
+            ).eligible
+        )
+        if len(matches) != 1:
+            raise CapabilityDenied(
+                "semantic source FlowGraph has no unique current version"
+            )
+        return matches[0]
+
+    @staticmethod
+    def _semantic_live_flow_binding(
+        host: Runtime,
+        *,
+        binding: SemanticApprovalBindingV2,
+        phase: str,
+        capability: Capability,
+        context: Any,
+        effect_id: str | None,
+        control: Any,
+        epoch: Any,
+    ) -> dict[str, str]:
+        del phase, capability, control
+        if any(
+            value is not None
+            for value in (
+                binding.sink_identity_sha256,
+                binding.tool_schema_sha256,
+                binding.provider_spec_sha256,
+            )
+        ):
+            raise SemanticSafetyTripRequired(
+                SemanticTripCode.BINDING_MISMATCH,
+                "semantic catalog v1 transport provenance must be inapplicable",
+            )
+        if any(
+            context.get(name) is not None
+            for name in (
+                "sink_identity_sha256",
+                "tool_schema_sha256",
+                "provider_spec_sha256",
+                "registry_spec_sha256",
+            )
+        ):
+            raise SemanticSafetyTripRequired(
+                SemanticTripCode.BINDING_MISMATCH,
+                "semantic catalog v1 transport context drifted",
+            )
+        if canonical_effect_hash(dict(context)) != binding.canonical_args_hash:
+            raise SemanticSafetyTripRequired(
+                SemanticTripCode.BINDING_MISMATCH,
+                "semantic protected operation arguments drifted",
+            )
+        profile_id = getattr(epoch, "classifier_profile_id", None)
+        if not isinstance(profile_id, str):
+            raise SemanticSafetyTripRequired(
+                SemanticTripCode.BINDING_MISMATCH,
+                "semantic classifier profile is not pinned",
+            )
+        snapshot = host.llms.profile_snapshot(profile_id)
+        model = snapshot.profile.model
+        if model is None:
+            raise SemanticSafetyTripRequired(
+                SemanticTripCode.BINDING_MISMATCH,
+                "semantic classifier model is not pinned",
+            )
+        model_sha256 = hashlib.sha256(model.encode("utf-8")).hexdigest()
+        if (
+            snapshot.identity_sha256
+            != getattr(epoch, "classifier_profile_sha256", None)
+            or snapshot.identity_sha256 != binding.classifier_profile_sha256
+            or model_sha256 != getattr(epoch, "classifier_model_sha256", None)
+            or model_sha256 != binding.classifier_model_sha256
+        ):
+            raise SemanticSafetyTripRequired(
+                SemanticTripCode.BINDING_MISMATCH,
+                "semantic classifier profile/model drifted",
+            )
+        if effect_id is not None and effect_id != binding.effect_id:
+            raise SemanticSafetyTripRequired(
+                SemanticTripCode.UNAUTHORIZED_EFFECT,
+                "semantic protected effect binding changed",
+            )
+        facts, flow_context, _tenant = RuntimeBuilder._semantic_current_file_flow(
+            host,
+            pid=binding.pid,
+            action_id=binding.authority_operation,
+            resource=binding.resource,
+            context=dict(context),
+            effect_id=binding.effect_id,
+            capture=False,
+        )
+        return {
+            **facts,
+            "source_labels_sha256": RuntimeBuilder._semantic_labels_digest(
+                flow_context.labels
+            ),
+            "source_refs_sha256": flow_context.source_refs_hash(),
+        }
+
+    @staticmethod
+    def _semantic_live_binding(
+        host: Runtime,
+        request: HumanRequest,
+        assessment_id: str,
+        assessment: SemanticAssessment,
+        candidate: SemanticApprovalCandidate,
+    ) -> SemanticApprovalBindingV2:
+        payload = request.payload
+        context = payload.get("context")
+        raw_effect = payload.get("effect_binding")
+        if not isinstance(context, dict) or not isinstance(raw_effect, dict):
+            raise ValidationError("semantic live approval request is incomplete")
+        effect = normalize_approval_binding(raw_effect)
+        prepared, live_candidate, hard_violations = (
+            host.semantic.prepare_host_approval(
+                request,
+                RuntimeBuilder._semantic_digest(payload),
+            )
+        )
+        facts = prepared.features
+        required = (
+            facts.schema_valid,
+            facts.request_is_exact_external_operation,
+            facts.binding_current,
+            facts.manifest_current,
+            facts.policy_current,
+            facts.action_known,
+            facts.action_auto_eligible,
+            facts.low_risk,
+            facts.resource_exact,
+            facts.single_non_control_right,
+            facts.ceiling_matched,
+            facts.data_flow_allowed,
+        )
+        if hard_violations or not all(required) or live_candidate is None:
+            raise CapabilityDenied(
+                "semantic live Host predicates do not permit exact approval"
+            )
+        if any(
+            value is not None
+            for value in (
+                prepared.sink_identity_sha256,
+                prepared.tool_schema_sha256,
+                prepared.provider_spec_sha256,
+            )
+        ):
+            raise CapabilityDenied(
+                "semantic catalog v1 transport provenance is not applicable"
+            )
+        if not RuntimeBuilder._semantic_candidate_matches(
+            live_candidate,
+            candidate,
+        ):
+            raise CapabilityDenied("semantic Task ceiling changed")
+        flow_facts, flow_context, tenant_bucket = (
+            RuntimeBuilder._semantic_current_file_flow(
+                host,
+                pid=request.pid,
+                action_id=live_candidate.authority_operation,
+                resource=live_candidate.resource,
+                context=context,
+                effect_id=effect["effect_id"],
+                capture=True,
+            )
+        )
+        eligibility = host.semantic_flow.approval_eligibility(
+            action_id=live_candidate.authority_operation,
+            entity_id=flow_facts["entity_id"],
+            tenant_bucket_sha256=tenant_bucket,
+            current_content_sha256=flow_facts["current_content_sha256"],
+            current_version_sha256=flow_facts["current_version_sha256"],
+            current_state_sha256=flow_facts["current_state_sha256"],
+        )
+        if not eligibility.eligible:
+            raise CapabilityDenied("semantic file FlowGraph is not complete")
+        control_view, profile, model_sha256 = (
+            RuntimeBuilder._semantic_classifier_snapshot(host)
+        )
+        epoch = control_view.epoch
+        issued_at = datetime.now(timezone.utc)
+        expires_at = issued_at + timedelta(seconds=epoch.capability_ttl_s)
+        source_labels_sha256 = RuntimeBuilder._semantic_labels_digest(
+            flow_context.labels
+        )
+        return SemanticApprovalBindingV2(
+            request_id=request.request_id,
+            request_revision=request.revision,
+            pid=request.pid,
+            operation_id=(
+                context.get("operation_id")
+                if isinstance(context.get("operation_id"), str)
+                else None
+            ),
+            effect_id=effect["effect_id"],
+            authority_operation=live_candidate.authority_operation,
+            resource=live_candidate.resource,
+            right=live_candidate.rights[0],
+            canonical_args_hash=canonical_effect_hash(context),
+            target_state_version=effect["target_state_version"],
+            manifest_id=live_candidate.manifest_id,
+            manifest_sha256=live_candidate.manifest_sha256,
+            ceiling_sha256=live_candidate.policy_sha256,
+            policy_epoch_id=epoch.epoch_id,
+            policy_epoch_sha256=epoch.canonical_sha256(),
+            control_generation=control_view.control.generation,
+            assessment_id=assessment_id,
+            assessment_sha256=assessment.canonical_sha256(),
+            classifier_profile_sha256=profile.identity_sha256,
+            classifier_model_sha256=model_sha256,
+            tenant_bucket_sha256=tenant_bucket,
+            source_labels_sha256=source_labels_sha256,
+            source_refs_sha256=flow_context.source_refs_hash(),
+            flow_snapshot_sha256=eligibility.canonical_sha256(),
+            sink_identity_sha256=prepared.sink_identity_sha256,
+            tool_schema_sha256=prepared.tool_schema_sha256,
+            provider_spec_sha256=prepared.provider_spec_sha256,
+            nonce=new_id("semantic-nonce"),
+            issued_at=issued_at.isoformat(),
+            expires_at=expires_at.isoformat(),
+        )
+
+    @staticmethod
+    def _semantic_candidate_matches(
+        live: SemanticApprovalCandidate,
+        captured: SemanticApprovalCandidate,
+    ) -> bool:
+        if (
+            live.rule_id != captured.rule_id
+            or live.authority_operation != captured.authority_operation
+            or live.rights != captured.rights
+            or live.manifest_id != captured.manifest_id
+            or live.manifest_sha256 != captured.manifest_sha256
+            or live.policy_sha256 != captured.policy_sha256
+        ):
+            return False
+        expected_resource = (
+            "digest:" + RuntimeBuilder._semantic_digest(live.resource)
+            if captured.resource.startswith("digest:")
+            else live.resource
+        )
+        return captured.resource == expected_resource
+
+    @staticmethod
+    def _semantic_classifier_snapshot(host: Runtime) -> tuple[Any, Any, str]:
+        control_view = host.semantic_control.authority_view()
+        epoch = control_view.epoch
+        profile_id = epoch.classifier_profile_id
+        if profile_id is None:
+            raise CapabilityDenied("semantic classifier profile is not pinned")
+        profile = host.llms.profile_snapshot(profile_id)
+        model = profile.profile.model
+        if model is None:
+            raise CapabilityDenied("semantic classifier model is not pinned")
+        model_sha256 = hashlib.sha256(model.encode("utf-8")).hexdigest()
+        if (
+            profile.identity_sha256 != epoch.classifier_profile_sha256
+            or model_sha256 != epoch.classifier_model_sha256
+        ):
+            raise CapabilityDenied("semantic classifier profile/model drifted")
+        return control_view, profile, model_sha256
+
+    @staticmethod
+    def _semantic_machine_settlement_recorder(
+        host: Runtime,
+        request: HumanRequest,
+        *,
+        status: HumanRequestStatus,
+        decision: Any,
+        authority_evidence: Any,
+        responder: str,
+    ) -> dict[str, Any]:
+        """Append/read back the typed receipt inside Human's outer UoW."""
+
+        del decision
+        if not isinstance(authority_evidence, dict):
+            raise ValidationError("semantic authority evidence is malformed")
+        if status is HumanRequestStatus.APPROVED:
+            return RuntimeBuilder._semantic_issued_settlement_receipt(
+                host,
+                request,
+                authority_evidence,
+            )
+        if status is not HumanRequestStatus.REJECTED:
+            raise ValidationError("semantic settlement status is unsupported")
+        if responder != "policy:semantic:hard-deny":
+            raise ValidationError("semantic rejection responder is invalid")
+        return RuntimeBuilder._semantic_denied_settlement_receipt(
+            host,
+            request,
+            authority_evidence,
+        )
+
+    @staticmethod
+    def _semantic_human_outcome_link(
+        host: Runtime,
+        request: HumanRequest,
+        *,
+        responder: str,
+    ) -> Any | None:
+        """Append a Human/semantic join without giving Shadow a veto.
+
+        Human and cancellation links are observational evidence.  Their
+        capture failure must not change the Human terminal result in any
+        semantic mode.  Machine-policy links are part of the complete Host
+        provenance required for a machine terminal and therefore remain
+        fail-closed in the shared settlement transaction.
+        """
+
+        source = RuntimeBuilder._semantic_human_outcome_source(
+            request,
+            responder=responder,
+        )
+        try:
+            # The link is written while the Human terminal UoW is still open.
+            # Give the observational statement its own savepoint before
+            # swallowing a failure: PostgreSQL marks the whole transaction as
+            # aborted after a statement error until ROLLBACK TO SAVEPOINT.
+            # A Python ``try`` alone would therefore still veto the Human
+            # winner at outer commit time.
+            with host.uow.transaction():
+                return RuntimeBuilder._semantic_human_outcome_link_strict(
+                    host,
+                    request,
+                    responder=responder,
+                )
+        except Exception as exc:
+            if source == "machine_policy":
+                raise
+            try:
+                host.semantic.record_capture_failure(
+                    source="human_outcome_link",
+                    error_type=type(exc).__name__,
+                )
+            except Exception:
+                # Even health diagnostics are observational for a Human or
+                # cancellation winner and can never roll that winner back.
+                pass
+            return None
+
+    @staticmethod
+    def _semantic_human_outcome_link_strict(
+        host: Runtime,
+        request: HumanRequest,
+        *,
+        responder: str,
+    ) -> Any | None:
+        """Strict append used by the source-aware isolation wrapper."""
+
+        if host.config.semantic.mode == "off":
+            return None
+        if request.status not in {
+            HumanRequestStatus.APPROVED,
+            HumanRequestStatus.REJECTED,
+            HumanRequestStatus.CANCELLED,
+        }:
+            raise ValidationError("semantic Human outcome is not terminal")
+        from agent_libos.storage.semantic_v6 import (
+            SemanticHumanOutcomeLinkRecord,
+        )
+
+        assessments = host.uow.semantic.query_semantic_assessments(
+            after=None,
+            limit=2,
+            request_id=request.request_id,
+        )
+        assessment_records = tuple(assessments.records)
+        if len(assessment_records) > 1:
+            raise ValidationError(
+                "semantic Human request has ambiguous assessment evidence"
+            )
+        assessment = assessment_records[0] if assessment_records else None
+        job_id = getattr(assessment, "job_id", None)
+        assessment_id = getattr(assessment, "assessment_id", None)
+        if assessment is None:
+            job = host.uow.semantic.get_semantic_assessment_job_for_request(
+                request.request_id,
+                0,
+            )
+            job_id = getattr(job, "job_id", None)
+
+        source = RuntimeBuilder._semantic_human_outcome_source(
+            request,
+            responder=responder,
+        )
+        settlement_id = RuntimeBuilder._semantic_human_settlement_id(
+            host,
+            request=request,
+            source=source,
+        )
+        identity_sha256 = RuntimeBuilder._semantic_canonical_digest(
+            {
+                "schema_version": 1,
+                "request_id": request.request_id,
+                "request_revision": request.revision,
+                "outcome": request.status.value,
+                "source": source,
+            }
+        )
+        record = SemanticHumanOutcomeLinkRecord(
+            link_id=f"semantic-human-link_{identity_sha256}",
+            request_id=request.request_id,
+            request_revision=request.revision,
+            pid=request.pid,
+            assessment_id=assessment_id,
+            job_id=job_id,
+            settlement_id=settlement_id,
+            outcome=request.status.value,
+            source=source,
+            decision_sha256=RuntimeBuilder._semantic_canonical_digest(
+                request.decision
+            ),
+            created_at=request.updated_at,
+        )
+        return host.uow.semantic.append_semantic_human_outcome_link(record)
+
+    @staticmethod
+    def _semantic_human_outcome_source(
+        request: HumanRequest,
+        *,
+        responder: str,
+    ) -> str:
+        if request.status is HumanRequestStatus.CANCELLED:
+            return "cancel"
+        if responder.startswith("policy:semantic:"):
+            return "machine_policy"
+        return "human"
+
+    @staticmethod
+    def _semantic_human_settlement_id(
+        host: Runtime,
+        *,
+        request: HumanRequest,
+        source: str,
+    ) -> str | None:
+        if source != "machine_policy":
+            return None
+        expected_outcome = (
+            "issued"
+            if request.status is HumanRequestStatus.APPROVED
+            else "denied"
+        )
+        page = host.uow.semantic.query_semantic_machine_settlements(
+            after=None,
+            limit=2,
+            request_id=request.request_id,
+            outcome=expected_outcome,
+        )
+        records = tuple(page.records)
+        if len(records) != 1:
+            raise ValidationError(
+                "semantic machine Human outcome has no unique settlement"
+            )
+        settlement = records[0]
+        if (
+            settlement.request_revision != request.revision - 1
+            or settlement.pid != request.pid
+        ):
+            raise ValidationError(
+                "semantic machine settlement does not match Human terminal CAS"
+            )
+        return settlement.settlement_id
+
+    @staticmethod
+    def _semantic_issued_settlement_receipt(
+        host: Runtime,
+        request: HumanRequest,
+        authority_evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        settlement_id = authority_evidence.get("settlement_id")
+        if not isinstance(settlement_id, str):
+            raise ValidationError(
+                "semantic issued authority has no settlement identity"
+            )
+        record = host.uow.semantic.get_semantic_machine_settlement(settlement_id)
+        if (
+            record is None
+            or record.request_id != request.request_id
+            or record.request_revision != request.revision
+            or record.pid != request.pid
+            or record.outcome != "issued"
+            or record.capability_id != authority_evidence.get("capability_id")
+        ):
+            raise ValidationError(
+                "semantic issued settlement readback does not match authority"
+            )
+        return {
+            "schema_version": 1,
+            "settlement_id": record.settlement_id,
+            "outcome": record.outcome,
+            "policy_sha256": record.policy_sha256,
+            "binding_sha256": record.binding_sha256,
+            "capability_id": record.capability_id,
+        }
+
+    @staticmethod
+    def _semantic_denied_settlement_receipt(
+        host: Runtime,
+        request: HumanRequest,
+        authority_evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            reasons = tuple(
+                SemanticReasonCode(value)
+                for value in authority_evidence["reason_codes"]
+            )
+            effect_id = str(authority_evidence["effect_id"])
+            policy_sha256 = str(authority_evidence["policy_sha256"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValidationError(
+                "semantic deterministic denial evidence is malformed"
+            ) from exc
+        host.semantic_control_fence.fence(
+            expected_policy_sha256=policy_sha256,
+            allowed_modes=(
+                SemanticRuntimeMode.ENFORCE_DENY,
+                SemanticRuntimeMode.CANARY_AUTO,
+            ),
+        )
+        try:
+            exact = decode_exact_semantic_approval_request(request)
+        except ValidationError:
+            exact = None
+        expected_effect_id = semantic_effect_identity(request)
+        if effect_id != expected_effect_id:
+            raise ValidationError(
+                "semantic deterministic denial effect identity changed"
+            )
+        if exact is None:
+            action_id = "runtime.malformed_external_operation"
+            operation_id = None
+        else:
+            action_id = exact.action_id
+            raw_operation_id = exact.context.get("operation_id")
+            operation_id = (
+                raw_operation_id
+                if isinstance(raw_operation_id, str)
+                and raw_operation_id.startswith("op_")
+                and len(raw_operation_id) <= 128
+                else None
+            )
+        try:
+            flow = host.semantic.host_human_flow(request.payload)
+        except ValidationError:
+            flow = None
+        tenant_bucket = host.semantic.host_tenant_bucket(
+            flow.labels.tenant if flow is not None else None
+        )
+        if tenant_bucket is None:
+            tenant_bucket = FLOW_NO_TENANT_BUCKET_SHA256
+        epoch = host.config.semantic.policy_epoch
+        if epoch is None:
+            raise ValidationError(
+                "semantic machine rejection requires a static policy epoch"
+            )
+        settlement = MachinePolicySettlementV1(
+            settlement_id=new_id("semantic-settlement"),
+            assessment_id=None,
+            job_id=None,
+            request_id=request.request_id,
+            request_revision=request.revision,
+            pid=request.pid,
+            operation_id=operation_id,
+            effect_id=effect_id,
+            epoch_id=epoch.epoch_id,
+            policy_sha256=policy_sha256,
+            tenant_bucket_sha256=tenant_bucket,
+            action_id=action_id,
+            outcome=SemanticMachineSettlementOutcome.DENIED,
+            capability_id=None,
+            binding_sha256=RuntimeBuilder._semantic_digest(
+                {
+                    "request_id": request.request_id,
+                    "revision": request.revision,
+                    "effect_id": effect_id,
+                    "evidence_sha256": authority_evidence.get(
+                        "evidence_sha256"
+                    ),
+                }
+            ),
+            decision_sha256=RuntimeBuilder._semantic_digest(
+                authority_evidence
+            ),
+            matched_rule_id=None,
+            reason_codes=reasons,
+            created_at=utc_now(),
+        )
+        persisted = host.uow.semantic.append_semantic_machine_settlement(
+            settlement
+        )
+        return {
+            "schema_version": 1,
+            "settlement_id": persisted.settlement_id,
+            "outcome": persisted.outcome,
+            "policy_sha256": persisted.policy_sha256,
+            "binding_sha256": persisted.binding_sha256,
+        }
+
+    @staticmethod
     def _semantic_capture_approval(host: Runtime, request: Any) -> None:
         host.semantic.capture_approval(request)
 
@@ -2907,11 +4525,21 @@ class RuntimeBuilder(Generic[RuntimeT]):
         process = host.uow.processes.get_process(pid)
         if process is None or process.parent_pid is not None:
             return
-        host.semantic.capture_root_goal(
+        job = host.semantic.capture_root_goal(
             pid,
             image_id=image_id,
             publication_id=publication_id,
         )
+        if job is None:
+            return
+        root_state_sha256 = job.bindings.get("state_sha256")
+        goal = RuntimeBuilder._semantic_root_goal_reader(host, pid)
+        if isinstance(root_state_sha256, str) and goal is not None:
+            host.semantic_runtime_flow.observe_root_goal_binding(
+                pid=pid,
+                goal=goal,
+                root_state_sha256=root_state_sha256,
+            )
 
     @staticmethod
     def _semantic_capture_provider_ingress(
@@ -2921,7 +4549,13 @@ class RuntimeBuilder(Generic[RuntimeT]):
     ) -> None:
         if observation.contract_name == "semantic.llm.assess":
             return
-        host.semantic.capture_provider_ingress(result, observation)
+        try:
+            host.semantic.capture_provider_ingress(result, observation)
+        finally:
+            host.semantic_runtime_flow.observe_provider_result(
+                result,
+                observation,
+            )
 
     @staticmethod
     def _semantic_capture_failure(host: Runtime, failure: Any) -> None:
@@ -2931,6 +4565,31 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 source="provider_result_observer",
                 error_type=str(getattr(failure, "error_type", "Exception"))[:128],
             )
+
+    @staticmethod
+    def _semantic_authority_lifecycle(
+        host: Runtime,
+        observation: Any,
+    ) -> None:
+        """Bridge payload-free protected-operation lifecycle evidence.
+
+        The SDK invokes this only for BindingV2-selected authority.  During
+        early assembly no operation can dispatch; keep the callback present so
+        a canary Runtime can never run without a Host lifecycle observer.
+        """
+
+        semantic = getattr(host, "semantic", None)
+        recorder = getattr(semantic, "record_machine_lifecycle", None)
+        if not callable(recorder):
+            # There is no semantic authority before SemanticManager/control is
+            # assembled.  Once a BindingV2 exists, absence is a fail-closed
+            # composition error and the SDK's process-local latch remains set.
+            if getattr(host.config.semantic, "mode", "off") == "canary_auto":
+                raise RuntimeError(
+                    "semantic machine lifecycle recorder is unavailable"
+                )
+            return
+        recorder(observation)
 
     @staticmethod
     def _runtime_mcp_provider(host: Runtime) -> McpProvider:
@@ -3110,6 +4769,9 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 config=host.config,
                 blocking_work=host.blocking_work,
                 task_runs=host.task_runs,
+                host_semantic_result_observer=(
+                    host.semantic_runtime_flow.observe_model_output
+                ),
             )
         host.lifecycle.bind_components(
             scheduler=host.scheduler,
@@ -3334,6 +4996,11 @@ class RuntimeBuilder(Generic[RuntimeT]):
             # and atomically restore the capability reservations bound in its
             # metadata.  Stale-reservation abandonment must run afterwards or
             # it would destroy the state that receipt settlement restores.
+            host.recovered_semantic_authority = (
+                host.semantic_authority_recovery.recover(
+                    page_size=min(recovery_page_size, 500),
+                )
+            )
             host.recovered_capability_use_reservations = (
                 host.uow.authority.abandon_stale_capability_use_reservations(
                     require_recovery_lease=host.lifecycle.require_recovery_lease,

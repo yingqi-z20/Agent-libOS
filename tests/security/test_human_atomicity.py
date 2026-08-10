@@ -460,12 +460,7 @@ def test_human_decision_limits_reject_before_request_or_capability_side_effects(
             "owner",
             {
                 "type": "question",
-                "question": "Approve bounded authority?",
-                "requested_once_capability": {
-                    "subject": pid,
-                    "resource": resource,
-                    "rights": [CapabilityRight.READ.value],
-                },
+                "question": "Return a bounded answer?",
             },
             blocking=True,
         )
@@ -480,7 +475,7 @@ def test_human_decision_limits_reject_before_request_or_capability_side_effects(
         runtime.close()
 
 
-def test_bounded_human_decision_control_still_applies_approved_side_effects() -> None:
+def test_bounded_human_decision_control_approves_without_authority_side_effects() -> None:
     base = AgentLibOSConfig()
     runtime = Runtime.open(
         "local",
@@ -502,12 +497,7 @@ def test_bounded_human_decision_control_still_applies_approved_side_effects() ->
             "owner",
             {
                 "type": "question",
-                "question": "Approve bounded authority?",
-                "requested_once_capability": {
-                    "subject": pid,
-                    "resource": resource,
-                    "rights": [CapabilityRight.READ.value],
-                },
+                "question": "Return a bounded answer?",
             },
             blocking=True,
         )
@@ -519,7 +509,7 @@ def test_bounded_human_decision_control_still_applies_approved_side_effects() ->
 
         assert approved.status == HumanRequestStatus.APPROVED
         assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
-        assert runtime.capability.check(pid, resource, CapabilityRight.READ)
+        assert not runtime.capability.check(pid, resource, CapabilityRight.READ)
     finally:
         runtime.close()
 
@@ -542,11 +532,6 @@ def test_oversized_terminal_provider_answer_is_rejected_without_approval() -> No
             {
                 "type": "question",
                 "question": "Return a bounded answer?",
-                "requested_once_capability": {
-                    "subject": pid,
-                    "resource": resource,
-                    "rights": [CapabilityRight.READ.value],
-                },
             },
             blocking=True,
         )
@@ -588,7 +573,7 @@ def test_oversized_terminal_provider_answer_is_rejected_without_approval() -> No
         approved = runtime.human.process_next_terminal()
         assert approved is not None and approved.status == HumanRequestStatus.APPROVED
         assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
-        assert runtime.capability.check(pid, resource, CapabilityRight.READ)
+        assert not runtime.capability.check(pid, resource, CapabilityRight.READ)
     finally:
         runtime.close()
 

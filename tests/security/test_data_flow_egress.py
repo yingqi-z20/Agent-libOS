@@ -221,6 +221,67 @@ def test_protected_write_rejects_untrusted_integrity_before_provider_dispatch() 
         )
 
 
+def test_ordinary_data_flow_evidence_retains_source_identity_by_default() -> None:
+    """Semantic classifier redaction must not alter ordinary DataFlow evidence."""
+
+    with workspace_runtime() as (runtime, _root):
+        pid = runtime.process.spawn(goal="preserve ordinary DataFlow provenance")
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {"value": "ordinary provenance"},
+            metadata=ObjectMetadata(
+                origin="test:ordinary-origin",
+                tenant="tenant-a",
+                principal="analyst-a",
+            ),
+        )
+        context = runtime.data_flow.context_from_source_oids(pid, [source.oid])
+        sink = DataSink("test:ordinary-egress")
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=sink.identity,
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="normal",
+                tenants=("tenant-a",),
+                principals=("analyst-a",),
+            ),
+            actor="test.host",
+            require_capability=False,
+        )
+
+        decision, release = runtime.data_flow.authorize_egress(
+            pid=pid,
+            sink=sink,
+            context=context,
+            payload={"size": 1},
+            operation="test.ordinary_egress",
+        )
+
+        assert release is None
+        assert decision.source_refs == context.source_refs
+        assert decision.labels == context.labels
+        assert context.labels.origin is not None
+        assert context.labels.tenant == "tenant-a"
+        assert context.labels.principal == "analyst-a"
+        event = next(
+            item
+            for item in runtime.events.list(target=f"data_flow_sink:{sink.identity}")
+            if item.payload.get("decision_id") == decision.decision_id
+        )
+        audit = next(
+            item
+            for item in runtime.audit.trace()
+            if item.action == "data_flow.egress"
+            and (item.decision or {}).get("decision_id") == decision.decision_id
+        )
+        assert event.payload["source_refs"] == [
+            item.to_dict() for item in context.source_refs
+        ]
+        assert event.payload["labels"] == context.labels.to_dict()
+        assert audit.input_refs == [source.oid]
+
+
 def test_configured_integrity_floor_blocks_real_filesystem_provider(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1091,6 +1152,91 @@ def test_interactive_cli_presents_conditional_question_only_after_exact_release(
             runtime.human.get(request_id)
         )
         assert "DATA_FLOW_SECRET_SENTINEL" in str(completed_release)
+
+
+def test_conditional_external_approval_returns_post_release_preview_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with workspace_runtime() as (runtime, _root):
+        pid = runtime.process.spawn(goal="conditional external approval preview")
+        source = _secret_source(runtime, pid)
+        human = runtime.config.runtime.default_human
+        channel = runtime.config.runtime.terminal_channel
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=f"human:{human}:{channel}",
+                trust_level=SinkTrustLevel.CONDITIONAL,
+                max_sensitivity="secret",
+            ),
+            actor="test.host",
+            require_capability=False,
+        )
+        delivered: list[str] = []
+        monkeypatch.setattr(runtime.human.provider, "output_sink", delivered.append)
+        resource = "filesystem:workspace:reports/conditional-preview.txt"
+        request_id = runtime.human.query_authority_request(
+            pid,
+            human,
+            {
+                "type": "external_operation_approval",
+                "question": "Approve DATA_FLOW_SECRET_SENTINEL read?",
+                "requested_once_capability": {
+                    "subject": pid,
+                    "resource": resource,
+                    "rights": [CapabilityRight.READ.value],
+                    "constraints": {},
+                },
+                "context": {
+                    "adapter": "filesystem",
+                    "authority_operation": "filesystem.read",
+                    "primitive": "runtime.filesystem.read_text",
+                    "operation": "read_text",
+                    "pid": pid,
+                    "resource": resource,
+                    "right": CapabilityRight.READ.value,
+                    "target_state_version": None,
+                },
+            },
+            authority_origin="external_operation",
+            source_oids=[source.oid],
+        )
+        state: dict[str, Any] = {}
+
+        _show_pending_interactive_human_request(runtime, human, state)
+        release = next(
+            request
+            for request in runtime.human.pending(human=human)
+            if request.payload.get("type") == "data_release_approval"
+        )
+        _show_pending_interactive_human_request(runtime, human, state)
+        runtime.human.approve(
+            release.request_id,
+            {"approved": True, "source": "test"},
+        )
+
+        _show_pending_interactive_human_request(runtime, human, state)
+
+        current = runtime.human.get(request_id)
+        view = runtime.human.public_request_view(current)
+        assert state["shown_request_id"] == request_id
+        assert state["shown_request_revision"] == current.revision
+        assert state["shown_preview_sha256"] == view["preview_sha256"]
+        assert "Canonical operation approval preview" in delivered[-1]
+        assert "DATA_FLOW_SECRET_SENTINEL" not in delivered[-1]
+
+        assert (
+            _handle_interactive_line(
+                runtime,
+                "/approve",
+                state,
+                human,
+                channel,
+                [],
+            )
+            is None
+        )
+        settled = runtime.human.get(request_id)
+        assert settled.status is HumanRequestStatus.APPROVED
 
 
 def test_interactive_cli_retains_release_outside_bounded_pending_window(

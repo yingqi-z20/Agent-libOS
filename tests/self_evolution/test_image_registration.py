@@ -1141,6 +1141,7 @@ workspace:
                 runtime.close()
 
     @pytest.mark.real_deno
+    @pytest.mark.deno_resource_monitor
     def test_image_package_jit_boot_validation_uses_broker_resource_limits_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(Path(temp_dir) / 'package-agent', with_jit=True)

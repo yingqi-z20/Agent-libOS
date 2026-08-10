@@ -7,7 +7,7 @@ import json
 import os
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping, TYPE_CHECKING
+from typing import Any, Callable, Mapping, TYPE_CHECKING
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models.exceptions import (
@@ -115,6 +115,7 @@ from agent_libos.models import (
     ViewMode,
 )
 from agent_libos.sdk import (
+    PostCommitResultObservation,
     ProtectedOperationEvidence,
     ProtectedOperationInvocation,
     ProviderPhase,
@@ -221,6 +222,13 @@ class _LLMCallState:
     invalid_completion_usage_fields: set[str] = field(default_factory=set)
     provider_trace: dict[str, Any] | None = None
     provider_dispatched: bool = False
+    # Runtime-internal, transient identity of the durably committed provider
+    # result.  It is populated by the protected-operation observer and lets
+    # the Host FlowGraph bind MODEL_OUTPUT to the exact PROVIDER_RESULT row.
+    semantic_provider_observation: PostCommitResultObservation | None = field(
+        default=None,
+        repr=False,
+    )
     budget_admission_denial_audited: bool = False
     egress_payload: dict[str, Any] = field(default_factory=dict)
     canonical_args: dict[str, Any] = field(default_factory=dict)
@@ -258,6 +266,7 @@ class LLMProcessExecutor:
         config: AgentLibOSConfig | None = None,
         blocking_work: Any | None = None,
         task_runs: TaskRunLLMHook | None = None,
+        host_semantic_result_observer: Callable[..., None] | None = None,
     ) -> None:
         self.config = config or DEFAULT_CONFIG
         self._processes = unit_of_work.processes
@@ -284,6 +293,11 @@ class LLMProcessExecutor:
         self._authority_manifests = authority_manifests
         self._capabilities = capabilities
         self._task_runs = task_runs
+        if host_semantic_result_observer is not None and not callable(
+            host_semantic_result_observer
+        ):
+            raise TypeError("semantic model-result observer must be callable")
+        self._host_semantic_result_observer = host_semantic_result_observer
         if client is not None:
             self._llms.set_test_client(self.config.llm.default_profile_id, client)
         self.pending = LLMPendingActionService(
@@ -326,6 +340,54 @@ class LLMProcessExecutor:
     @client.setter
     def client(self, value: Any) -> None:
         self._llms.set_test_client(self.config.llm.default_profile_id, value)
+
+    def bind_host_semantic_result_observer(
+        self,
+        observer: Callable[..., None],
+    ) -> None:
+        """Install the one-shot Host observer for payload-free model lineage."""
+
+        if not callable(observer):
+            raise TypeError("semantic model-result observer must be callable")
+        if self._host_semantic_result_observer is not None:
+            raise RuntimeError("semantic model-result observer is already bound")
+        self._host_semantic_result_observer = observer
+
+    def _observe_host_semantic_result(
+        self,
+        state: _LLMCallState,
+        completion: Any,
+        record: Any,
+    ) -> None:
+        observer = self._host_semantic_result_observer
+        if observer is None:
+            return
+        try:
+            result = observer(state, completion, record)
+            if result is not None:
+                raise TypeError("semantic model-result observer must be synchronous")
+        except Exception:
+            # Semantic lineage is observational and cannot change a completed
+            # provider call or its durable LLM record.
+            return
+
+    @staticmethod
+    def _bind_semantic_provider_observation(
+        state: _LLMCallState,
+        _result: Any,
+        observation: PostCommitResultObservation,
+    ) -> None:
+        """Bind one committed LLM result to its transient call state."""
+
+        if (
+            not isinstance(observation, PostCommitResultObservation)
+            or observation.contract_name != "primitive.llm.complete"
+            or observation.pid != state.pid
+            or not observation.effect_id
+            or not observation.result_sha256
+        ):
+            raise ValidationError("LLM semantic provider observation is malformed")
+        state.semantic_provider_observation = observation
 
     def _requestable_capabilities_for_prompt(
         self,
@@ -5974,6 +6036,13 @@ class LLMProcessExecutor:
                 error,
                 phase,
             ),
+            post_commit_result_observer=lambda result, observation: (
+                self._bind_semantic_provider_observation(
+                    state,
+                    result,
+                    observation,
+                )
+            ),
         )
         with self._protected_operations.start(
             "primitive.llm.complete",
@@ -6328,6 +6397,7 @@ class LLMProcessExecutor:
                 "invocation",
                 metadata={"call_id": state.call_id},
             )
+        self._observe_host_semantic_result(state, completion, success_record)
         return (
             completion,
             state.parallel_tool_calls,

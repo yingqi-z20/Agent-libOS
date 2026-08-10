@@ -1,58 +1,65 @@
-# Semantic Approval and Data Identification (Phase 0+1)
+# Semantic Approval and Data Identification (Phase 0–4)
 
-Agent libOS includes an opt-in semantic assessment plane for evaluating Human
-approval requests and identifying potentially sensitive or low-integrity data.
-This release is **Shadow-only**: it records `would_issue_exact_once`,
-`would_deny`, or `require_human`, but it never answers, cancels, or settles a
-Human request, issues or consumes a Capability, changes a permission policy,
-updates `DataLabels`, creates a data-release approval, or changes a provider
-result.
+Agent libOS includes an opt-in semantic assessment and data-flow plane for
+evaluating Human approval requests and identifying potentially sensitive or
+low-integrity data. The default remains `semantic.mode: off`. Phase 2 adds a
+payload-free FlowGraph, Phase 3 allows a closed set of deterministic hard
+violations to reject a pending request, and Phase 4 can issue an exact,
+short-lived, nondelegable, one-use Capability for a frozen low-risk action.
 
-The semantic plane is evidence, not authority. The existing Capability, Task
-Authority, Human, DataFlow, Protected Operation, provider-policy, state-version,
-and resource-budget checks remain the only execution path.
+The classifier remains evidence, not authority: it may veto or escalate, but
+it cannot supply an allow predicate, select a rule, decide a terminal status,
+or mutate labels. Every machine settlement is produced by Host code after
+live Task Authority, DataFlow, binding, epoch, state, and budget checks. The
+normal Capability and Protected Operation path still owns provider dispatch.
 
 ## Release boundary
 
-Phase 0+1 implements:
+Agent libOS 1.4.1 implements:
 
 - a strict, Host-authored `semantic_auto_approval` Task Authority ceiling;
 - a deterministic, pure Shadow broker and a closed action/effect ontology;
 - typed semantic assessment and data-finding records;
 - durable, lease/CAS-backed assessment jobs and an append-only assessment
-  ledger in store schema v5;
+  ledger in store schema v6;
 - best-effort capture for eligible external-operation approval requests, root
   goals, and committed provider ingress observations;
 - deterministic/scripted assessment and an optional, explicitly configured
   external classifier path;
-- read-only CLI, HTTP, and GUI inspection surfaces.
+- append-only FlowGraph entity, activity, edge, and monotonic label-assertion
+  evidence with explicit coverage;
+- deterministic hard denial through a Host-only settlement boundary;
+- canary-only exact-once issuance under an immutable static Host policy epoch;
+- canonical approval previews and read-only CLI, HTTP, and GUI inspection.
 
-It deliberately does **not** implement a machine settlement method, a semantic
-HTTP write endpoint, automatic Capability issuance, deterministic real denial,
-label writeback, declassification, endorsement, a complete FlowGraph,
-field-level executable lineage, long-term memory, Cedar/OPA integration, or a
-production rollout controller. Those require separate security review.
+It deliberately does **not** implement label writeback, declassification,
+endorsement, high-risk/write/network auto approval, `always_allow`, long-term
+memory, Cedar/OPA, a remote policy control plane, or automatic canary expansion.
 
-## Authority-neutral architecture
+## Authority architecture
 
 ```mermaid
 flowchart LR
-    C["Approval, root goal, or provider ingress capture"] --> J["Durable bounded job"]
-    J --> W["Lease/CAS Shadow worker"]
+    C["Approval, root goal, provider, tool, memory, or file capture"] --> J["Durable bounded job and FlowGraph"]
+    J --> W["Lease/CAS semantic worker"]
     W --> A["Typed deterministic or external assessment"]
     A --> B["DeterministicApprovalBroker"]
-    B --> E["Append-only semantic evidence"]
+    B --> E["Append-only assessment evidence"]
     E --> R["Read-only CLI, HTTP, and GUI"]
-    H["Existing Human decision path"] --> P["Existing protected operation path"]
-    C -. "no settlement or label writeback" .-> H
-    B -. "would_* only" .-> P
+    B --> S["Host-only settlement port"]
+    S --> H["Shared Human revision/status CAS kernel"]
+    H --> G["Exact one-use Capability"]
+    G --> P["Protected Operation revalidation and dispatch"]
+    C -. "no label writeback" .-> P
+    M["Classifier findings"] -. "veto/escalate only" .-> B
 ```
 
-Capture, enqueue, classifier, observer, or evidence failures are isolated from
-the business operation. A Human can approve or reject while assessment is in
-flight. A late result records the observed Human outcome alongside the
-historical Shadow decision; it does not overwrite that decision or reopen the
-request. Post-commit result observers run only after the protected effect
+Capture, enqueue, classifier, observer, or evidence failures never create
+authority. A Human can approve or reject while assessment is in flight. Human,
+cancel, machine deny, and canary auto approval share one request revision/status
+CAS, so exactly one terminal transition wins. A late result records the
+observed outcome and a race-lost/stale settlement; it cannot overwrite the
+winner or reopen the request. Post-commit result observers run only after the protected effect
 transaction commits. Runtime composition binds the Host observer once; an
 invocation-specific observer is additive and cannot replace or suppress it.
 Each observer is isolated independently, so an observer failure does not
@@ -61,9 +68,11 @@ running.
 
 `mode: off` is the global kill switch and the default. In off mode capture
 performs no semantic repository writes and workers do not claim jobs. Turning
-an active runtime off stops new claims, cancels queued jobs, and records any
-still-claimed ambiguous work as `provider_outcome_unknown`; every such terminal
-job reduces its retained projection to hash-only evidence.
+an active runtime off advances the durable control generation, stops new
+settlements, invalidates every unconsumed or undispatched semantic grant at
+authorization and dispatch revalidation, cancels queued jobs, and records any
+still-claimed ambiguous classifier work as `provider_outcome_unknown`; every
+such terminal job reduces its retained projection to hash-only evidence.
 
 ## Host-authored semantic ceiling
 
@@ -93,11 +102,13 @@ wildcard, and non-control rights. Unknown fields, wildcard operations, unsafe
 or unsupported operations, data release, permission administration, and
 control rights fail manifest admission.
 
-The production ontology intentionally has only narrow, read-like candidate
-operations. Filesystem read, Git read, and Git diff can be candidates when the
-exact operation/resource/right tuple is covered. Shell, JSON-RPC, MCP, writes,
-deletes, remote Git effects, and administration may still be assessed, but
-cannot become auto-approval candidates in this phase.
+Action catalog v1 is frozen to `filesystem.read`, `git.read`, and `git.diff`.
+Those operations can be candidates only when the exact operation/resource/right
+tuple is covered. Shell, JSON-RPC, MCP, writes, deletes, remote Git effects,
+data release, permission/capability administration, and control rights may be
+assessed but are structurally unreachable from automatic Capability issuance.
+Adding another action requires a new catalog/policy epoch and a release; an
+unknown action never inherits eligibility.
 
 Both parent and child must explicitly declare the ceiling. A child omission is
 deny-all; a child rule must retain its parent's operation and narrow its
@@ -110,14 +121,14 @@ and rights plus the matched rule, manifest, and policy digests. It is a
 side-effect-free lookup, not a permit. It cannot create Human requests,
 Capabilities, operations, events, or audit records.
 
-## Decision contract
+## Decision and enforcement contract
 
 The classifier returns only closed, typed findings, calibration metadata, OOD,
 and abstention. It has no `allow`, `deny`, free-form explanation, or hidden
 reasoning field. A data finding contains a category, bounded field/span
 locator, sensitivity floor, integrity/trust ceiling, confidence in basis
 points, and an evidence digest. Findings are advisory and monotonic: they may
-only suggest a higher sensitivity or a lower integrity/trust level. Phase 0+1
+only suggest a higher sensitivity or a lower integrity/trust level. Phase 2–4
 does not apply even those conservative suggestions to ambient
 `DataFlowContext` or stored labels.
 
@@ -135,7 +146,100 @@ The deterministic broker is a pure function. Its precedence is:
 
 Model findings may prevent a positive Shadow outcome. They cannot supply a
 missing allow predicate, change the ontology, select a broader rule, or produce
-a final permit.
+a final permit or denial. Real enforcement uses a second Host-owned pure broker
+and a closed result type; model output is never a safety oracle.
+
+The four modes have intentionally different authority:
+
+| Mode | Capture/evidence | Machine denial | Machine approval |
+| --- | --- | --- | --- |
+| `off` | none | none | none |
+| `shadow` | assessment and FlowGraph evidence | none (`would_deny` only) | none (`would_issue_exact_once` only) |
+| `enforce_deny` | yes | closed Host hard-deny set only | none |
+| `canary_auto` | yes | closed Host hard-deny set only | exact one-use grant when every Host predicate holds |
+
+A real hard denial is limited to a malformed/incomplete exact operation
+request, request/effect/subject/resource/right binding mismatch, stale target
+state/manifest/policy epoch, an explicit DataFlow denial, or an exact Host
+hard-deny rule. Ceiling misses, unsupported/high-risk operations, incomplete
+FlowGraph coverage, OOD, abstention, low confidence, timeouts, classifier
+errors, and every model finding remain pending for Human review.
+
+Before applying a Human approval in `enforce_deny` or `canary_auto`, the same
+live hard-deny preflight runs inside the terminal transaction. A newly observed
+hard violation produces a `semantic_policy_response` event and independent
+policy audit actor; it never impersonates `human_response`. Retrying the
+operation creates a new request/effect/binding rather than rewriting the
+terminal request.
+
+External-operation presentation is generated from Host facts as
+`CanonicalApprovalPreviewV1`, not from model explanation text. It binds the
+request revision, action, exact resource/right, risk, source/sink identities,
+labels, reason codes, TTL, and applicable epoch into `preview_sha256`. In
+`enforce_deny` and `canary_auto`, a GUI/CLI/terminal Human response must return
+the exact `expected_revision` and `preview_sha256`; a missing, stale, malformed,
+or mismatched preview is rejected before any terminal side effect. The preview
+is evidence for what was shown, not an allow predicate.
+
+## FlowGraph and monotonic data findings
+
+Store schema v6 records content-free flow entities for root goals,
+Object/file versions, provider and Tool results, materializations, and model
+outputs, plus activities for Process, provider, Tool, LLM, Object, and file
+operations. Edges use the closed `direct`, `indirect`, or `control` relation.
+Every record contains bounded IDs, versions, hashes, labels, identity state,
+coverage, and Host provenance; it contains no body, path, argv, prompt,
+response, credential, or reasoning.
+
+JSON field and text-chunk locators are digest-only prototypes. A locator may
+identify a bounded JSON path/value digest or text chunk ordinal/offset/digest;
+it cannot recover source text. Host edges are append-only. A model assertion
+may only raise the effective sensitivity floor or lower integrity/trust. It
+cannot remove an edge, weaken a label, endorse, declassify, or write ambient
+`DataLabels`.
+
+Coverage is one of `complete`, `partial`, `unknown`, `conflict`, or `stale`.
+Only `complete` coverage for one non-mixed tenant identity can satisfy a
+canary allow predicate. Historical v5 activity and every capture failure are
+`unknown`, never inferred safe from the absence of an edge. Filesystem reads
+also require a current file binding/content version; Git reads and diffs require
+the frozen local repository/ref/state identity.
+
+## Policy epoch and exact-once settlement
+
+An active canary epoch is an immutable, digest-bound static Host policy using
+catalog v1. `canary_auto` requires the external adapter and a dedicated
+non-default safe classifier profile; the epoch pins that exact profile and
+model digest. The Host configuration must name an exact non-empty tenant bucket
+allowlist, the eligible rule set, expected previous policy digest, and control
+generation. There is no wildcard tenant, implicit epoch, auto-activation,
+in-process expansion, or remote policy mutation. Conflicting activation state
+fails Runtime assembly closed.
+
+The Host-only settlement port re-reads the pending request, revision, Process,
+Task Authority ceiling, DataFlow/FlowGraph state, epoch, tenant, action,
+provider/tool/Sink/state identities, classifier provenance, and budget inside
+the same transaction. It may issue only when the classifier result is valid,
+contains no finding/OOD/abstention/error, has at least 9,900 confidence basis
+points with `very_high` calibration, and every independent Host allow predicate
+is already true. Classifier confidence is a veto threshold, not proof of safety.
+
+Issuance atomically settles the assessment job, appends assessment and
+settlement evidence, CASes the request, transitions the Process, emits policy
+event/audit evidence, debits the rate budget, and creates one revocable,
+nondelegable Capability with `uses_remaining=1`. Its default TTL is 60 seconds
+and hard maximum is 300 seconds. The v1 upper bounds are 10 grants per minute,
+100 per day, and 2 inflight for each tenant/rule; an epoch can only narrow them.
+The machine path never installs `always_allow`.
+
+The approval binding includes request/revision, effect/action/resource/right,
+canonical arguments and target state, manifest/ceiling/policy epoch,
+assessment/classifier, tenant/source labels, Sink/tool/provider identities,
+nonce, issuance time, and deadline. Protected Operation rechecks that binding
+and the durable control generation during authorization, reservation, prepare,
+and before each provider dispatch. Certified `not_started` can restore the same
+approved reservation; an unknown provider outcome consumes authority, forbids
+automatic replay, and trips the active epoch.
 
 ## Captured inputs and privacy
 
@@ -238,7 +342,7 @@ message, audit, event, or ordinary LLM rows payload-free.
 ## External classifier configuration
 
 External assessment is optional. It must use a named, non-default LLM profile
-selected by the Host. Enabling external Shadow rejects configuration unless
+selected by the Host. Enabling any external semantic mode rejects configuration unless
 all of these profile properties are explicit and stable:
 
 - a non-empty model;
@@ -272,15 +376,18 @@ request automatically.
 Development and deterministic tests should use the scripted adapter. Real LLM
 tests are opt-in integration smoke tests and are not a safety oracle.
 An embedded Host must inject the scripted adapter through the Runtime
-constructor's `semantic_assessor` dependency; enabled scripted Shadow fails
+constructor's `semantic_assessor` dependency; an enabled scripted semantic mode fails
 assembly without it. External and deterministic modes reject that replacement,
 and no CLI, HTTP, GUI, model Tool, Skill, JIT, or Runtime Module can install an
 assessor.
 
-## Durable jobs and assessments
+## Durable jobs, graph, and settlement evidence
 
-Store schema v5 adds mutable `semantic_assessment_jobs`, append-only
-`semantic_assessments`, and `human_requests.revision`. Jobs use revision/status
+Store schema v5 introduced mutable `semantic_assessment_jobs`, append-only
+`semantic_assessments`, and `human_requests.revision`. Store schema v6 adds
+append-only FlowGraph, immutable policy epochs, a revisioned control pointer
+and rate buckets, plus append-only machine settlement, health/trip, Human
+outcome-link, and review evidence. Jobs use revision/status
 CAS and a bounded lease. The external attempt counter is limited to zero or
 one; lease recovery may recover a claim but cannot replay an already attempted
 external request. Terminalization and assessment append share a transaction,
@@ -291,25 +398,39 @@ Runtime shutdown signals the worker pool and joins it for the bounded
 normal Runtime cleanup result; it does not authorize a replay or alter a Human
 or provider result.
 
-Assessment rows are immutable through the repository surface: there is append,
+Assessment, FlowGraph history, policy epochs, settlement, health, and review
+rows are immutable through the repository surface: there is append,
 get, and bounded keyset query, but no update or delete method. The record holds
 closed status/findings/Shadow fields and Host provenance digests rather than a
 prompt or source payload. Checkpoint restore and fork do not copy, rewrite, or
 delete this Host evidence ledger.
 
-See [Runtime Storage](storage.md#offline-v4-to-v5-migration) for the only
-supported v4-to-v5 migration workflow. Ordinary `Runtime.open()` never runs a
-migration.
+See [Runtime Storage](storage.md) for the ordered offline v4-to-v5 and
+v5-to-v6 migration workflows. Ordinary `Runtime.open()` never runs a migration.
 
 ## Inspection surfaces
 
-The CLI provides versioned JSON only:
+The CLI emits versioned JSON. Runtime inspection is read-only; the sole write
+surface is an offline Host-only review-evidence append, which cannot alter an
+epoch, control state, request, Capability, label, or provider operation:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite semantic status
 uv run agent-libos --db .agent_libos.sqlite semantic assessments \
   --pid <pid> --domain filesystem --status success --limit 50
 uv run agent-libos --db .agent_libos.sqlite semantic show <assessment_id>
+uv run agent-libos --db .agent_libos.sqlite semantic flow status
+uv run agent-libos --db .agent_libos.sqlite semantic flow entities --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic flow edges --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic flow lineage <node_id>
+uv run agent-libos --db .agent_libos.sqlite semantic settlements --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic policy epochs --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic control status
+uv run agent-libos --db .agent_libos.sqlite semantic control history --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic health --limit 50
+uv run agent-libos --db .agent_libos.sqlite semantic metrics
+uv run agent-libos --db .agent_libos.sqlite semantic review import \
+  --file <strict-json-review-evidence>
 ```
 
 Assessment lists accept `pid`, `request_id`, `operation_id`, `kind`, `status`,
@@ -322,11 +443,21 @@ The authenticated local GUI server exposes only:
 
 - `GET /api/semantic/status`;
 - `GET /api/semantic/assessments`;
-- `GET /api/semantic/assessments/{assessment_id}`.
+- `GET /api/semantic/assessments/{assessment_id}`;
+- `GET /api/semantic/flow/status`;
+- `GET /api/semantic/flow/entities`;
+- `GET /api/semantic/flow/edges`;
+- `GET /api/semantic/flow/lineage/{node_id}`;
+- `GET /api/semantic/settlements`;
+- `GET /api/semantic/policy/epochs`;
+- `GET /api/semantic/control` and `/api/semantic/control/history`;
+- `GET /api/semantic/health`;
+- `GET /api/semantic/metrics`.
 
 Unknown, duplicate, empty, or overlong query parameters fail before the
 service is called. There is no semantic `POST`, `PUT`, `PATCH`, or `DELETE`
-route. The GUI Semantic tab reads those pages on demand, uses process scope as
+route, and no route can import reviews or mutate policy/control. The GUI
+Semantic tab reads those pages on demand, uses process scope as
 a PID filter, and keeps semantic history out of the existing bounded Runtime
 snapshot. Its strict decoder rejects unknown/private fields. It displays
 reason codes, the normalized Human outcome, OOD/abstention, latency, Shadow
@@ -361,7 +492,7 @@ three fields as `null`. Telemetry never changes the assessment status, Shadow
 outcome, or authority.
 
 Status metrics keep Shadow and real execution separate. The status response is
-schema v2. Alongside the scalar totals it carries complete, exact-key
+schema v3. Alongside the scalar totals it carries complete, exact-key
 `by_status` counters for every assessment status and `by_domain` counters for
 every semantic domain. The former has exactly `success`, `skipped_policy`,
 `egress_blocked`, `timeout`, `provider_error`, `provider_outcome_unknown`,
@@ -369,18 +500,24 @@ every semantic domain. The former has exactly `success`, `skipped_policy`,
 `filesystem`, `shell`, `git`, `jsonrpc`, `mcp`, `runtime`, and `unknown`. Both
 maps must sum to `total`; `success + error` and the three Shadow outcomes must
 also each sum to `total`, and scalar OOD must equal `by_status.ood`. CLI, HTTP,
-and GUI decoders reject missing, extra, malformed, or inconsistent counters. In
-this phase the real auto-approval object is
-strictly `0 / 0 / null`; any other numerator, denominator, or rate is rejected,
-and the CLI and GUI render `null` as not applicable, never as “0% unsafe.”
+and GUI decoders reject missing, extra, malformed, or inconsistent counters.
+Real machine counters distinguish eligible, issued, consumed, succeeded,
+failed, unknown, expired, revoked, race-lost, and deterministic denied. Public
+control state is `inactive`, `active`, `tripped`, or `revoked`, with an exact
+generation and optional active epoch/trip reason. The status embeds typed
+FlowGraph counts/coverage while the Flow endpoints provide bounded records.
+A rate whose denominator is
+zero is `null`, and the CLI and GUI render it as not applicable, never as “0%
+unsafe.” The unsafe-review rate uses the Host-reviewed count as its denominator;
+without any reviewed settlement it is `null`.
 Assessment rows retain schema/status, reason, Human outcome, latency,
 calibration, nullable token/cost fields, data-finding, domain/action, and
 optional tenant-bucket evidence; list filters support domain, action, and an
 existing tenant bucket. Token/cost values are available only on rows with
 validated external telemetry and remain `null` otherwise; status does not sum
-them into billing metrics. The v2 status response does not itself publish a
-risk/tenant cube or an aggregate accuracy metric, and aggregate accuracy would
-not be a safety conclusion.
+them into billing metrics. Metrics are segmented by action, tenant bucket,
+risk, and policy epoch. No aggregate accuracy value is treated as a safety
+conclusion.
 Queue and assessment counts come from exact store aggregation; status does not
 silently truncate older assessment rows. `capture_failures` is a runtime-local
 health counter and resets on reopen; it is not an append-only assessment
@@ -388,21 +525,27 @@ record.
 
 ## Operational checklist
 
-Before enabling Shadow for a tenant-scoped deployment or workload:
+Before enabling any semantic mode for a tenant-scoped deployment or workload:
 
-1. migrate an offline canonical v4 store to v5 and verify the v5 shape;
+1. migrate an offline canonical v4 store to v5, then v5 to v6, and verify the
+   complete v6 shape;
 2. keep `mode: off` while validating configuration and scripted assessment;
 3. if using an external adapter, register a dedicated non-default profile and
    confirm the frozen model/Sink/DataFlow contract;
 4. query `semantic status` and confirm zero unexpected queue/capture failures;
 5. enable only Shadow mode and verify Human, Capability, permission, label,
    release, process, and business-effect outcomes match the off baseline;
-6. monitor segmented outcomes and secret-sentinel tests; turn the kill switch
+6. activate a new immutable static Host epoch for one exact tenant bucket
+   before `enforce_deny` or `canary_auto`; never reuse or revive an old epoch;
+7. keep each action/epoch canary for at least seven days and review the first
+   1,000 issued grants at 100% coverage before a new epoch expands the cohort;
+8. monitor segmented outcomes and secret-sentinel tests; turn the kill switch
    off on drift, leakage, OOD growth, or provider ambiguity.
 
-`semantic.mode` is a global Runtime switch in this release. Agent libOS does
-not provide an in-process per-tenant rollout controller; tenant scoping must be
-established by the Host deployment. `tenant_bucket_sha256` is nullable and can
+`semantic.mode` is a global Runtime switch in this release. Epochs and exact
+tenant buckets are supplied by immutable static Host configuration. Agent libOS
+does not provide a remote or in-process rollout controller; cohort expansion
+requires a new policy epoch and restart. `tenant_bucket_sha256` is nullable and can
 contain only an opaque lower-case digest produced by a trusted Host bucketer;
 it is neither tenant plaintext nor, by itself, an anonymization guarantee. The
 assembled Runtime defaults to `null`. An embedded Host may supply
@@ -410,8 +553,24 @@ assembled Runtime defaults to `null`. An embedded Host may supply
 HMAC over a canonical tenant identifier and return its 64-character lower-case
 SHA-256 encoding. The callback is a Host dependency only—there is no YAML,
 CLI, HTTP, GUI, model, Skill, JIT, or Module mutation/installation entrypoint.
-Without that callback Agent libOS performs no tenant grouping. A bucketer error
-is a capture failure and cannot change the business operation.
+Without that callback Agent libOS performs no tenant grouping and cannot enter
+`canary_auto`. A bucketer error is a capture failure and cannot create
+authority.
+
+Runtime admission enforces rollout as a fail-closed ratchet. A strict
+tenant/rule/resource narrowing may rotate immediately. Any same-size tenant
+swap, cohort addition, or rule/resource widening must be proven against the
+preceding immutable epoch for every affected action: its durable activation
+transition is at least seven days old, at least 1,000 distinct grants were
+issued, the earliest 1,000 have only complete `safe` review evidence, and no
+issued grant in that epoch/action has an `unsafe` review. Policy `created_at`
+does not satisfy the age check because static configuration can be backdated.
+
+An unsafe review, critical/high machine grant, cross-tenant grant, secret
+egress, replay, binding mismatch, unauthorized effect, or unknown provider
+outcome trips the current epoch. A trip blocks new settlements and invalidates
+unconsumed/undispatched grants through the durable control-generation check.
+It never claims to roll back an already dispatched external effect.
 
 Provider-side retention, abuse monitoring, billing, and deletion behavior
 remain properties of the selected external service. `store: false` controls

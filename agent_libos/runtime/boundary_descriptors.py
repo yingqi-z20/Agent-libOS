@@ -239,6 +239,11 @@ HUMAN_CONTROL_MUTATION_ADMISSION_BOUNDARIES = (
         "bind_host_request_capture",
         "control.human.bind_host_request_capture",
     ),
+    (
+        "human",
+        "query_authority_request",
+        "control.human.query_authority_request",
+    ),
     ("human", "request_data_release", "control.human.request_data_release"),
     ("human", "answer_for_request", "control.human.answer_for_request"),
     ("human", "approve", "control.human.approve"),
@@ -272,6 +277,7 @@ HUMAN_CONTROL_MUTATION_ADMISSION_BOUNDARIES = (
 # classification into a static ratchet.
 HUMAN_READ_ONLY_PUBLIC_METHODS = frozenset(
     {
+        "canonical_approval_preview",
         "format_terminal_request",
         "get",
         "is_request_withheld_for_presentation",
@@ -432,6 +438,7 @@ DATA_FLOW_READ_ONLY_PUBLIC_METHODS = frozenset(
         "context_from_materialization",
         "context_from_trusted_source_oids",
         "current_context",
+        "current_file_label_binding",
         "directory_label_snapshot",
         "directory_label_state_version",
         "external_file_context",
@@ -445,6 +452,7 @@ DATA_FLOW_READ_ONLY_PUBLIC_METHODS = frozenset(
         "file_tree_state_version",
         "inspect_sink_trust",
         "is_release_binding_current",
+        "identity_safe_evidence_labels",
         "list_sink_trust",
         "provenance_sources",
         "release_binding",

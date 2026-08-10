@@ -287,6 +287,77 @@ benchmark_attack_classes:
 
         assert errors == []
 
+    def test_directory_selected_paths_cover_descendant_nodes(self) -> None:
+        node = "tests/runtime/test_nested.py::test_evidence"
+        manifest = {
+            "invariants": [
+                {
+                    "id": "directory-scoped-invariant",
+                    "title": "Directory-scoped invariant",
+                    "lane": "runtime",
+                    "node_ids": [node],
+                }
+            ]
+        }
+        errors: list[str] = []
+
+        checker._check_invariant_execution(
+            manifest,
+            executed_nodeids=set(),
+            errors=errors,
+            lane="runtime",
+            platform="windows",
+            selected_test_paths=("tests/runtime",),
+            selected_nodeids={node},
+        )
+
+        assert errors == [
+            "directory-scoped-invariant: no declared regression node completed "
+            "without skip in the runtime lane"
+        ]
+        errors.clear()
+        checker._check_invariant_execution(
+            manifest,
+            executed_nodeids={node},
+            errors=errors,
+            lane="runtime",
+            platform="windows",
+            selected_test_paths=("tests/runtime",),
+            selected_nodeids={node},
+        )
+        assert errors == []
+
+    def test_directory_selected_paths_still_enforce_required_platform_node(self) -> None:
+        generic = "tests/security/test_monitor.py::test_generic"
+        required = "tests/security/test_monitor.py::test_linux"
+        manifest = {
+            "invariants": [
+                {
+                    "id": "directory-platform-invariant",
+                    "title": "Directory platform invariant",
+                    "lane": "security",
+                    "node_ids": [generic, required],
+                    "required_platform_nodes": {"linux": [required]},
+                }
+            ]
+        }
+        errors: list[str] = []
+
+        checker._check_invariant_execution(
+            manifest,
+            executed_nodeids={generic},
+            errors=errors,
+            lane="security",
+            platform="linux",
+            selected_test_paths=("tests/security",),
+            selected_nodeids={generic, required},
+        )
+
+        assert errors == [
+            "directory-platform-invariant: required linux pytest node did not "
+            f"complete without skip: {required}"
+        ]
+
     def test_platform_scoped_invariant_is_not_required_on_other_platform(
         self,
     ) -> None:

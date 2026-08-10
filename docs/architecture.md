@@ -594,23 +594,25 @@ process-tree containment: an inherited death pipe plus isolated process group
 on POSIX, or a `KILL_ON_JOB_CLOSE` Job Object on Windows. Sandbox execution
 fails closed if that containment cannot be established.
 
-## Semantic Shadow Evidence Plane
+## Semantic Approval and Flow Plane
 
-The optional semantic subsystem is a Host-owned evidence plane beside, not
-inside, the authority path. Approval-request, root-goal, and committed-provider
-ingress capture creates bounded durable jobs. A lease/CAS worker executes a
-typed deterministic, scripted, or explicitly configured external assessment;
-the pure broker records only `would_issue_exact_once`, `would_deny`, or
-`require_human`. The existing Human and protected-operation paths neither wait
-for nor consume that output.
+The optional semantic subsystem is Host-owned. Approval, root-goal, provider,
+Tool, LLM, Object/file, and materialization capture create bounded jobs and a
+payload-free FlowGraph. A lease/CAS worker executes a typed deterministic,
+scripted, or explicitly configured external assessment; the Shadow broker
+records `would_issue_exact_once`, `would_deny`, or `require_human`. Classifier
+findings can veto or escalate but cannot supply allow predicates or terminal
+instructions.
 
-The default `semantic.mode` is `off`, which performs no capture writes and
-claims no jobs. `shadow` can add only semantic job/assessment evidence and
-bounded health diagnostics. Capture and post-commit observer exceptions are
-isolated from the process, Human decision, Capability/permission tables,
-`DataLabels`, data release, and business provider effect. There is no Runtime,
-CLI, HTTP, GUI, model Tool, Skill, JIT, or Module entrypoint that turns a Shadow
-result into a Human terminal state or Capability.
+The default `semantic.mode` is `off`, which performs no capture writes, claims
+no jobs, and invalidates undispatched semantic grants. `shadow` adds only
+semantic evidence. `enforce_deny` may terminalize only the closed Host
+hard-deny set. `canary_auto` may issue one exact, short-lived, nondelegable,
+one-use Capability for catalog-v1 reads under an immutable static Host policy
+epoch. The private settlement port shares the Human revision/status CAS and
+transactional terminal kernel, so Human/cancel/machine races have one winner.
+No Runtime facade, CLI, HTTP, GUI, model Tool, Skill, JIT, or Module exposes
+that mutation port or policy activation/revocation.
 
 Approval and provider-ingress jobs are metadata-only. A root-goal job may
 temporarily contain a deterministic redacted intent only for bounded
@@ -636,11 +638,22 @@ never automatically replayed. The general LLM process executor is not reused,
 so its full-I/O persistence path cannot capture the semantic prompt or
 response.
 
-Store schema v5 keeps mutable queue state separate from the append-only
-assessment ledger. Temporary safe projections are bounded and reduced to
+Store schema v6 keeps mutable queue/control/rate state separate from append-only
+assessment, FlowGraph, policy epoch, machine-settlement, health, and review
+evidence. Temporary safe projections are bounded and reduced to
 hash-only at terminalization, expiry, cancellation, failure, or kill-switch
 cleanup. Assessment records retain closed findings and Host provenance digests,
-never prompts, raw task/provider text, classifier responses, or reasoning. See
+never prompts, raw task/provider text, classifier responses, or reasoning.
+FlowGraph coverage other than `complete`, mixed tenant identity, stale input,
+or any model finding forces Human review; semantic findings never write
+`DataLabels`, declassify, or endorse.
+
+At issuance, the machine transaction re-reads the request, Process, manifest,
+ceiling, epoch, tenant, graph coverage, provider/tool/Sink/state identities,
+classifier provenance, and budget. Protected Operation revalidates the
+versioned exact binding and durable control generation during authorization,
+reservation, prepare, and before each dispatch. `off`, epoch revocation, or a
+safety trip blocks new settlement and every unconsumed/undispatched grant. See
 [Semantic Approval and Data Identification](semantic_shadow.md) for the full
 contract.
 
@@ -668,8 +681,9 @@ including:
 - Object Tasks and agent ratings,
 - Host Sink trust rows, data-flow decisions and releases, and durable file
   labels,
-- semantic assessment jobs with lease/CAS state and append-only, payload-free
-  Shadow assessment evidence,
+- semantic assessment jobs with lease/CAS state, payload-free FlowGraph,
+  immutable policy epochs, revisioned control/rate state, and append-only
+  control-transition, assessment, machine-settlement, health, and review evidence,
 - explainable operations, evidence links, and context manifests,
 - durable LLM pending-action generations, `image_only` native transcript tool
   outputs, compatible Responses-continuation rows, and context generations,

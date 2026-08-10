@@ -12,11 +12,15 @@ import zipfile
 import pytest
 import yaml
 
+from agent_libos import __version__
+from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models import SEMANTIC_STATUS_SCHEMA_VERSION
 from agent_libos.skills.builtin_catalog import (
     BUILTIN_SKILL_IDS as RUNTIME_BUILTIN_SKILL_IDS,
     BUILTIN_SKILL_MAX_FILE_BYTES as RUNTIME_BUILTIN_SKILL_MAX_FILE_BYTES,
     BUILTIN_SKILL_MAX_INSTRUCTION_BYTES as RUNTIME_BUILTIN_SKILL_MAX_INSTRUCTION_BYTES,
 )
+from agent_libos.storage import STORE_SCHEMA_VERSION
 from scripts.check_release_artifacts import (
     ALLOWED_SECRET_FIXTURE_SHA256,
     BUILTIN_SKILL_ARCHIVE_PATHS,
@@ -151,7 +155,7 @@ def _write_test_sdist(
     return target
 
 
-def _write_release_pair(target: Path, *, version: str = "1.4.0") -> tuple[Path, Path]:
+def _write_release_pair(target: Path, *, version: str = "1.4.1") -> tuple[Path, Path]:
     wheel = _write_test_wheel(
         target / f"agent_libos-{version}-py3-none-any.whl",
         version=version,
@@ -164,7 +168,15 @@ def _write_release_pair(target: Path, *, version: str = "1.4.0") -> tuple[Path, 
 
 
 def test_release_version_identifiers_are_aligned() -> None:
-    assert validate_version_alignment(ROOT) == "1.4.0"
+    assert validate_version_alignment(ROOT) == "1.4.1"
+
+
+def test_release_protocol_versions_are_independent_and_default_off() -> None:
+    assert __version__ == "1.4.1"
+    assert STORE_SCHEMA_VERSION == 6
+    assert SEMANTIC_STATUS_SCHEMA_VERSION == 3
+    assert DEFAULT_CONFIG.semantic.mode == "off"
+    assert DEFAULT_CONFIG.semantic.policy_epoch is None
 
 
 def test_agentdojo_lock_tracks_current_editable_agent_libos_metadata() -> None:
@@ -174,7 +186,7 @@ def test_agentdojo_lock_tracks_current_editable_agent_libos_metadata() -> None:
         )
     )
     package = next(item for item in lock["package"] if item["name"] == "agent-libos")
-    assert package["version"] == "1.4.0"
+    assert package["version"] == "1.4.1"
     assert package["source"] == {"editable": "../../"}
     assert {
         (item["specifier"], item["marker"])
@@ -187,7 +199,7 @@ def test_root_lock_resolves_the_reviewed_mcp_sdk_v2_graph() -> None:
     lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
     packages = {item["name"]: item for item in lock["package"]}
 
-    assert packages["agent-libos"]["version"] == "1.4.0"
+    assert packages["agent-libos"]["version"] == "1.4.1"
     assert packages["mcp"]["version"] == "2.0.0"
     assert packages["mcp-types"]["version"] == "2.0.0"
     assert {
@@ -472,7 +484,7 @@ def test_release_checksum_manifest_records_and_verifies_exact_artifacts(
 
 def test_release_status_contains_current_version_state_only() -> None:
     text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
-    assert text.startswith("# Agent libOS 1.4.0 Status\n")
+    assert text.startswith("# Agent libOS 1.4.1 Status\n")
     forbidden = {
         "dirty state": r"\bdirty\b",
         "worktree state": r"\bwork(?:ing)?[ -]?tree\b",
@@ -510,6 +522,40 @@ def test_release_status_requires_an_immutable_ci_receipt_binding() -> None:
         assert unbound_claim not in text
 
 
+def test_semantic_phase2_to_4_release_contract_is_default_off_and_host_controlled() -> None:
+    release = " ".join(
+        (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8").split()
+    )
+    semantic = " ".join(
+        (ROOT / "docs" / "semantic_shadow.md").read_text(encoding="utf-8").split()
+    )
+    support = " ".join(
+        (ROOT / "docs" / "support_matrix.md").read_text(encoding="utf-8").split()
+    )
+
+    for required in (
+        "Semantic approval and ingress classification remain default-off",
+        "immutable static Host policy epoch",
+        "Classifier output is only a veto/escalation signal",
+        "never an allow predicate or safety oracle",
+        "Semantic HTTP and GUI surfaces remain read-only",
+        "no remotely reachable policy activation or revocation endpoint",
+    ):
+        assert required in release
+    for required in (
+        "The default remains `semantic.mode: off`",
+        "The classifier remains evidence, not authority",
+        "The machine path never installs `always_allow`",
+        "There is no wildcard tenant, implicit epoch, auto-activation",
+        "There is no semantic `POST`, `PUT`, `PATCH`, or `DELETE` route",
+    ):
+        assert required in semantic
+    assert "Default-off Phase 2–4 plane" in support
+    assert "Real classifier smoke is opt-in and never a safety oracle" in support
+    assert "Shadow-only" not in release
+    assert "Shadow-only" not in support
+
+
 def test_release_status_references_do_not_describe_a_metadata_ledger() -> None:
     documents = [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
     forbidden = ("commit", "dirty", "worktree", "working-tree", "ledger", "sha-256", "sha256", "exact commands")
@@ -529,7 +575,7 @@ def test_release_status_bounds_unarchived_evidence_and_volatile_counts() -> None
     text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
 
     assert "## Unarchived real-LLM observation" in text
-    assert "not Agent libOS 1.4.0 release evidence" in text
+    assert "not Agent libOS 1.4.1 release evidence" in text
     assert "AgentDojo harness is a required CI matrix" in text
     assert "collected pytest nodes" not in text
     assert not re.search(r"selects [\d,]+ tests", text)
@@ -603,7 +649,7 @@ def test_mcp_v2_release_contract_is_precise_and_strict_core_only() -> None:
         "`auto`",
         "Tools list/call and modern `server/discover` only",
         "that is not OAuth conformance",
-        "the Store uses schema v5",
+        "the Store uses schema v6",
     ):
         assert required in mcp
     for excluded in (
@@ -715,11 +761,11 @@ def test_release_builtin_skill_validation_rejects_missing_or_unparseable_package
 def test_readme_clean_install_smoke_covers_wheel_and_source_distribution() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "dist/agent_libos-1.4.0-py3-none-any.whl" in readme
-    assert "dist/agent_libos-1.4.0.tar.gz" in readme
+    assert "dist/agent_libos-1.4.1-py3-none-any.whl" in readme
+    assert "dist/agent_libos-1.4.1.tar.gz" in readme
     assert readme.count("--require-hashes") >= 3
-    assert "--no-deps dist/agent_libos-1.4.0-py3-none-any.whl" in readme
-    assert "--no-deps --no-build-isolation dist/agent_libos-1.4.0.tar.gz" in readme
+    assert "--no-deps dist/agent_libos-1.4.1-py3-none-any.whl" in readme
+    assert "--no-deps --no-build-isolation dist/agent_libos-1.4.1.tar.gz" in readme
     for entrypoint in EXPECTED_CONSOLE_SCRIPTS:
         assert readme.count(f"/{entrypoint} --help") >= 2
     assert readme.count("uv pip check --python /tmp/agent-libos-") >= 2
@@ -738,7 +784,7 @@ def test_gui_dependency_baseline_is_current_and_lockfile_aligned() -> None:
         (ROOT / "gui" / "package-lock.json").read_text(encoding="utf-8")
     )
 
-    assert package["version"] == "1.4.0"
+    assert package["version"] == "1.4.1"
     assert package["dependencies"] == {
         "lucide-react": "^1.28.0",
         "react": "^19.2.8",
@@ -767,7 +813,7 @@ def test_gui_dependency_baseline_is_current_and_lockfile_aligned() -> None:
     }
     assert "overrides" not in package
     locked_root = lockfile["packages"][""]
-    assert locked_root["version"] == "1.4.0"
+    assert locked_root["version"] == "1.4.1"
     assert locked_root["dependencies"] == package["dependencies"]
     assert locked_root["devDependencies"] == package["devDependencies"]
     assert locked_root["engines"] == package["engines"]
@@ -1581,8 +1627,8 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         "cancel-in-progress": True,
     }
     assert parsed["env"] == {
-        "RELEASE_WHEEL": "dist/agent_libos-1.4.0-py3-none-any.whl",
-        "RELEASE_SDIST": "dist/agent_libos-1.4.0.tar.gz",
+        "RELEASE_WHEEL": "dist/agent_libos-1.4.1-py3-none-any.whl",
+        "RELEASE_SDIST": "dist/agent_libos-1.4.1.tar.gz",
         "RELEASE_CHECKSUMS": "dist/SHA256SUMS",
     }
     release_steps = release_job["steps"]

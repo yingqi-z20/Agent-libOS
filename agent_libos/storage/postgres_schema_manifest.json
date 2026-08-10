@@ -4621,6 +4621,1584 @@
           "type": "text"
         }
       ],
+      "semantic_control_state": [
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "singleton",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "integer"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "revision",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "generation",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "mode",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "active_epoch_id",
+          "nullable": true,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "active_policy_sha256",
+          "nullable": true,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "tripped",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "integer"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "trip_code",
+          "nullable": true,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "updated_at",
+          "nullable": false,
+          "ordinal": 9,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "1",
+          "generated": "",
+          "identity": "",
+          "name": "schema_version",
+          "nullable": false,
+          "ordinal": 10,
+          "type": "integer"
+        }
+      ],
+      "semantic_control_transitions": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "transition_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "revision",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "generation",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "mode",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "active_epoch_id",
+          "nullable": true,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "active_policy_sha256",
+          "nullable": true,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "tripped",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "integer"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "trip_code",
+          "nullable": true,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "evidence_sha256",
+          "nullable": false,
+          "ordinal": 9,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 10,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "1",
+          "generated": "",
+          "identity": "",
+          "name": "schema_version",
+          "nullable": false,
+          "ordinal": 11,
+          "type": "integer"
+        }
+      ],
+      "semantic_flow_activities": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "activity_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "kind",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "pid",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "action_id",
+          "nullable": true,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "effect_id",
+          "nullable": true,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "state_sha256",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "provider_spec_sha256",
+          "nullable": true,
+          "ordinal": 7,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "tool_schema_sha256",
+          "nullable": true,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "model_artifact_sha256",
+          "nullable": true,
+          "ordinal": 9,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "tenant_bucket_sha256",
+          "nullable": false,
+          "ordinal": 10,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 11,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "1",
+          "generated": "",
+          "identity": "",
+          "name": "schema_version",
+          "nullable": false,
+          "ordinal": 12,
+          "type": "integer"
+        }
+      ],
+      "semantic_flow_edges": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "edge_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "relation",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "source_node_id",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "source_node_type",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "target_node_id",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "target_node_type",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "pid",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "provenance_sha256",
+          "nullable": false,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 9,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "1",
+          "generated": "",
+          "identity": "",
+          "name": "schema_version",
+          "nullable": false,
+          "ordinal": 10,
+          "type": "integer"
+        }
+      ],
+      "semantic_flow_entities": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "entity_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "kind",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "pid",
+          "nullable": true,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "tenant_bucket_sha256",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "content_sha256",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "version_sha256",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "provenance_sha256",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "baseline_labels_json",
+          "nullable": false,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "identity_present",
+          "nullable": false,
+          "ordinal": 9,
+          "type": "integer"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "identity_mixed",
+          "nullable": false,
+          "ordinal": 10,
+          "type": "integer"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "coverage",
+          "nullable": false,
+          "ordinal": 11,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 12,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "1",
+          "generated": "",
+          "identity": "",
+          "name": "schema_version",
+          "nullable": false,
+          "ordinal": 13,
+          "type": "integer"
+        }
+      ],
+      "semantic_flow_label_assertions": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "assertion_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "entity_id",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "source",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "sensitivity_floor",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "integrity_ceiling",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "trust_ceiling",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "evidence_sha256",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "assessment_id",
+          "nullable": true,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "locator_sha256",
+          "nullable": true,
+          "ordinal": 9,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "locator_kind",
+          "nullable": true,
+          "ordinal": 10,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "path_sha256s_json",
+          "nullable": false,
+          "ordinal": 11,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "value_sha256",
+          "nullable": true,
+          "ordinal": 12,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "ordinal",
+          "nullable": true,
+          "ordinal": 13,
+          "type": "integer"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "offset_start",
+          "nullable": true,
+          "ordinal": 14,
+          "type": "integer"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "offset_end",
+          "nullable": true,
+          "ordinal": 15,
+          "type": "integer"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "category",
+          "nullable": true,
+          "ordinal": 16,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "coverage",
+          "nullable": false,
+          "ordinal": 17,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 18,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "1",
+          "generated": "",
+          "identity": "",
+          "name": "schema_version",
+          "nullable": false,
+          "ordinal": 19,
+          "type": "integer"
+        }
+      ],
+      "semantic_health_events": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "event_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "event_kind",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "severity",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "epoch_id",
+          "nullable": true,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "tenant_bucket_sha256",
+          "nullable": true,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "evidence_sha256",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "1",
+          "generated": "",
+          "identity": "",
+          "name": "schema_version",
+          "nullable": false,
+          "ordinal": 8,
+          "type": "integer"
+        }
+      ],
+      "semantic_human_outcome_links": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "link_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "request_id",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "request_revision",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "pid",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "assessment_id",
+          "nullable": true,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "job_id",
+          "nullable": true,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "settlement_id",
+          "nullable": true,
+          "ordinal": 7,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "outcome",
+          "nullable": false,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "source",
+          "nullable": false,
+          "ordinal": 9,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "decision_sha256",
+          "nullable": false,
+          "ordinal": 10,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 11,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "1",
+          "generated": "",
+          "identity": "",
+          "name": "schema_version",
+          "nullable": false,
+          "ordinal": 12,
+          "type": "integer"
+        }
+      ],
+      "semantic_legacy_coverage": [
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "singleton",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "integer"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "source_schema_version",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "integer"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "assessment_count",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "coverage",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "evidence_sha256",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "1",
+          "generated": "",
+          "identity": "",
+          "name": "schema_version",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "integer"
+        }
+      ],
+      "semantic_machine_outcomes": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "outcome_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "settlement_id",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "effect_id",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "outcome",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "evidence_sha256",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "1",
+          "generated": "",
+          "identity": "",
+          "name": "schema_version",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "integer"
+        }
+      ],
+      "semantic_machine_settlements": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "settlement_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "assessment_id",
+          "nullable": true,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "job_id",
+          "nullable": true,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "request_id",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "request_revision",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "pid",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "operation_id",
+          "nullable": true,
+          "ordinal": 7,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "effect_id",
+          "nullable": false,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "epoch_id",
+          "nullable": false,
+          "ordinal": 9,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "policy_sha256",
+          "nullable": false,
+          "ordinal": 10,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "tenant_bucket_sha256",
+          "nullable": false,
+          "ordinal": 11,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "action_id",
+          "nullable": false,
+          "ordinal": 12,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "outcome",
+          "nullable": false,
+          "ordinal": 13,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "capability_id",
+          "nullable": true,
+          "ordinal": 14,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "binding_sha256",
+          "nullable": false,
+          "ordinal": 15,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "decision_sha256",
+          "nullable": false,
+          "ordinal": 16,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "matched_rule_id",
+          "nullable": true,
+          "ordinal": 17,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "reason_codes_json",
+          "nullable": false,
+          "ordinal": 18,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 19,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "1",
+          "generated": "",
+          "identity": "",
+          "name": "schema_version",
+          "nullable": false,
+          "ordinal": 20,
+          "type": "integer"
+        }
+      ],
+      "semantic_policy_epochs": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "epoch_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "generation",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "catalog_version",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "integer"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "policy_sha256",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "expected_previous_sha256",
+          "nullable": true,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "rollout_scope_json",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "1",
+          "generated": "",
+          "identity": "",
+          "name": "schema_version",
+          "nullable": false,
+          "ordinal": 8,
+          "type": "integer"
+        }
+      ],
+      "semantic_rate_budgets": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "bucket_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "epoch_id",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "tenant_bucket_sha256",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "rule_id",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "minute_window_started_at",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "day_window_started_at",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "minute_count",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "integer"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "day_count",
+          "nullable": false,
+          "ordinal": 8,
+          "type": "integer"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "inflight_count",
+          "nullable": false,
+          "ordinal": 9,
+          "type": "integer"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "revision",
+          "nullable": false,
+          "ordinal": 10,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "updated_at",
+          "nullable": false,
+          "ordinal": 11,
+          "type": "text"
+        }
+      ],
+      "semantic_review_labels": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "review_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "settlement_id",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "outcome",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "reviewer_sha256",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "evidence_sha256",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "1",
+          "generated": "",
+          "identity": "",
+          "name": "schema_version",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "integer"
+        }
+      ],
       "sink_trust_records": [
         {
           "collation": null,
@@ -7824,6 +9402,1618 @@
         "referenced_schema": null,
         "referenced_table": null,
         "table": "semantic_assessments",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "active_epoch_id",
+          "active_policy_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((active_epoch_id IS NULL) = (active_policy_sha256 IS NULL))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_state_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_state",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "tripped",
+          "trip_code"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((tripped = 1) = (trip_code IS NOT NULL))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_state_check1",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_state",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "generation"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (generation >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_state_generation_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_state",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "mode"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (mode = ANY (ARRAY['off'::text, 'shadow'::text, 'enforce_deny'::text, 'canary_auto'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_state_mode_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_state",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "singleton"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (singleton)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_control_state_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_state",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "revision"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (revision >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_state_revision_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_state",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (schema_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_state_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_state",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "singleton"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (singleton = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_state_singleton_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_state",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "tripped"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (tripped = ANY (ARRAY[0, 1]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_state_tripped_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_state",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "active_epoch_id",
+          "active_policy_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((active_epoch_id IS NULL) = (active_policy_sha256 IS NULL))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_transitions_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_transitions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "tripped",
+          "trip_code"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((tripped = 1) = (trip_code IS NOT NULL))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_transitions_check1",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_transitions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "generation"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (generation >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_transitions_generation_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_transitions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "mode"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (mode = ANY (ARRAY['off'::text, 'shadow'::text, 'enforce_deny'::text, 'canary_auto'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_transitions_mode_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_transitions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "transition_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (transition_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_control_transitions_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_transitions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "revision"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (revision >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_transitions_revision_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_transitions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (schema_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_transitions_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_transitions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "tripped"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (tripped = ANY (ARRAY[0, 1]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_control_transitions_tripped_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_control_transitions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "kind"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (kind = ANY (ARRAY['process_spawn'::text, 'provider_call'::text, 'tool_call'::text, 'llm_call'::text, 'object_create'::text, 'object_update'::text, 'object_append'::text, 'object_materialize'::text, 'object_read'::text, 'file_read'::text, 'file_write'::text, 'transformation'::text, 'aggregation'::text, 'conditional'::text, 'tool_selection'::text, 'memory_retrieval'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_activities_kind_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_activities",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "activity_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (activity_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_flow_activities_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_activities",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (schema_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_activities_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_activities",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "source_node_id",
+          "target_node_id",
+          "source_node_type",
+          "target_node_type"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (source_node_id <> target_node_id OR source_node_type <> target_node_type)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_edges_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_edges",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "edge_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (edge_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_flow_edges_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_edges",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "relation"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (relation = ANY (ARRAY['direct'::text, 'indirect'::text, 'control'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_edges_relation_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_edges",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (schema_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_edges_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_edges",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "source_node_type"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (source_node_type = ANY (ARRAY['entity'::text, 'activity'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_edges_source_node_type_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_edges",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "target_node_type"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (target_node_type = ANY (ARRAY['entity'::text, 'activity'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_edges_target_node_type_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_edges",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "identity_mixed",
+          "identity_present"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (identity_mixed = 0 OR identity_present = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_entities_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_entities",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "coverage"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (coverage = ANY (ARRAY['complete'::text, 'partial'::text, 'unknown'::text, 'conflict'::text, 'stale'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_entities_coverage_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_entities",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "identity_mixed"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (identity_mixed = ANY (ARRAY[0, 1]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_entities_identity_mixed_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_entities",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "identity_present"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (identity_present = ANY (ARRAY[0, 1]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_entities_identity_present_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_entities",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "kind"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (kind = ANY (ARRAY['root_goal'::text, 'object_version'::text, 'file_binding_version'::text, 'provider_result'::text, 'tool_result'::text, 'materialization'::text, 'model_output'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_entities_kind_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_entities",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "entity_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (entity_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_flow_entities_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_entities",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (schema_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_entities_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_entities",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "locator_sha256",
+          "locator_kind",
+          "path_sha256s_json",
+          "value_sha256",
+          "ordinal",
+          "offset_start",
+          "offset_end"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (locator_sha256 IS NULL AND locator_kind IS NULL AND path_sha256s_json = '[]'::text AND value_sha256 IS NULL AND ordinal IS NULL AND offset_start IS NULL AND offset_end IS NULL OR locator_sha256 IS NOT NULL AND locator_kind = 'json_field'::text AND path_sha256s_json <> '[]'::text AND value_sha256 IS NOT NULL AND ordinal IS NULL AND offset_start IS NULL AND offset_end IS NULL OR locator_sha256 IS NOT NULL AND locator_kind = 'text_chunk'::text AND path_sha256s_json = '[]'::text AND value_sha256 IS NOT NULL AND ordinal >= 0 AND offset_start >= 0 AND offset_end > offset_start)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_label_assertions_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_label_assertions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "coverage"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (coverage = ANY (ARRAY['complete'::text, 'partial'::text, 'unknown'::text, 'conflict'::text, 'stale'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_label_assertions_coverage_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_label_assertions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "assertion_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (assertion_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_flow_label_assertions_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_label_assertions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (schema_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_label_assertions_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_label_assertions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "source"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (source = ANY (ARRAY['host'::text, 'model'::text, 'deterministic'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_flow_label_assertions_source_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_flow_label_assertions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "event_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (event_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_health_events_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_health_events",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (schema_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_health_events_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_health_events",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "severity"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (severity = ANY (ARRAY['info'::text, 'warning'::text, 'critical'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_health_events_severity_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_health_events",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "source",
+          "outcome"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((source = 'cancel'::text) = (outcome = 'cancelled'::text))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_human_outcome_links_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_human_outcome_links",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "outcome"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (outcome = ANY (ARRAY['approved'::text, 'rejected'::text, 'cancelled'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_human_outcome_links_outcome_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_human_outcome_links",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "link_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (link_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_human_outcome_links_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_human_outcome_links",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "request_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "UNIQUE (request_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "u",
+        "match_type": " ",
+        "name": "semantic_human_outcome_links_request_id_key",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_human_outcome_links",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "request_revision"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (request_revision >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_human_outcome_links_request_revision_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_human_outcome_links",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (schema_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_human_outcome_links_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_human_outcome_links",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "source"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (source = ANY (ARRAY['human'::text, 'machine_policy'::text, 'cancel'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_human_outcome_links_source_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_human_outcome_links",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "assessment_count"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (assessment_count >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_legacy_coverage_assessment_count_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_legacy_coverage",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "coverage"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (coverage = 'unknown'::text)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_legacy_coverage_coverage_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_legacy_coverage",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "singleton"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (singleton)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_legacy_coverage_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_legacy_coverage",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (schema_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_legacy_coverage_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_legacy_coverage",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "singleton"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (singleton = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_legacy_coverage_singleton_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_legacy_coverage",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "source_schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (source_schema_version = 5)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_legacy_coverage_source_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_legacy_coverage",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "outcome"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (outcome = ANY (ARRAY['issued'::text, 'consumed'::text, 'succeeded'::text, 'failed'::text, 'outcome_unknown'::text, 'expired'::text, 'revoked'::text, 'race_lost'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_machine_outcomes_outcome_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_machine_outcomes",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "outcome_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (outcome_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_machine_outcomes_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_machine_outcomes",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (schema_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_machine_outcomes_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_machine_outcomes",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "outcome",
+          "capability_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((outcome = 'issued'::text) = (capability_id IS NOT NULL))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_machine_settlements_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_machine_settlements",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "outcome"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (outcome = ANY (ARRAY['issued'::text, 'denied'::text, 'require_human'::text, 'race_lost'::text, 'stale'::text, 'budget_exhausted'::text, 'revoked'::text, 'expired'::text, 'failed'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_machine_settlements_outcome_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_machine_settlements",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "settlement_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (settlement_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_machine_settlements_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_machine_settlements",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "request_revision"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (request_revision >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_machine_settlements_request_revision_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_machine_settlements",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (schema_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_machine_settlements_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_machine_settlements",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "catalog_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (catalog_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_policy_epochs_catalog_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_policy_epochs",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "generation"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (generation > 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_policy_epochs_generation_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_policy_epochs",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "generation"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "UNIQUE (generation)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "u",
+        "match_type": " ",
+        "name": "semantic_policy_epochs_generation_key",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_policy_epochs",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "epoch_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (epoch_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_policy_epochs_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_policy_epochs",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "policy_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "UNIQUE (policy_sha256)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "u",
+        "match_type": " ",
+        "name": "semantic_policy_epochs_policy_sha256_key",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_policy_epochs",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (schema_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_policy_epochs_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_policy_epochs",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "day_count"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (day_count >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_rate_budgets_day_count_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_rate_budgets",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "inflight_count"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (inflight_count >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_rate_budgets_inflight_count_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_rate_budgets",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "minute_count"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (minute_count >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_rate_budgets_minute_count_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_rate_budgets",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "bucket_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (bucket_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_rate_budgets_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_rate_budgets",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "revision"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (revision >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_rate_budgets_revision_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_rate_budgets",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "outcome"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (outcome = ANY (ARRAY['safe'::text, 'unsafe'::text, 'inconclusive'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_review_labels_outcome_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_review_labels",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "review_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (review_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "semantic_review_labels_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_review_labels",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "schema_version"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (schema_version = 1)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "semantic_review_labels_schema_version_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "semantic_review_labels",
         "update_action": " ",
         "validated": true
       },
@@ -14596,6 +17786,1472 @@
         "access_method": "btree",
         "attribute_count": 1,
         "attributes": [
+          "singleton"
+        ],
+        "clustered": false,
+        "collations": [
+          null
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_control_state_pkey ON semantic_control_state USING btree (singleton)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_control_state_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.int4_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_control_state",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "created_at",
+          "transition_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_control_transitions_created ON semantic_control_transitions USING btree (created_at, transition_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_semantic_control_transitions_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_control_transitions",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "active_epoch_id",
+          "created_at",
+          "transition_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_control_transitions_epoch_created ON semantic_control_transitions USING btree (active_epoch_id, created_at, transition_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_control_transitions_epoch_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_control_transitions",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "transition_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_control_transitions_pkey ON semantic_control_transitions USING btree (transition_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_control_transitions_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_control_transitions",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "created_at",
+          "activity_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_flow_activities_created ON semantic_flow_activities USING btree (created_at, activity_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_semantic_flow_activities_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_flow_activities",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "pid",
+          "created_at",
+          "activity_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_flow_activities_pid_created ON semantic_flow_activities USING btree (pid, created_at, activity_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_flow_activities_pid_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_flow_activities",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "activity_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_flow_activities_pkey ON semantic_flow_activities USING btree (activity_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_flow_activities_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_flow_activities",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "created_at",
+          "edge_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_flow_edges_created ON semantic_flow_edges USING btree (created_at, edge_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_semantic_flow_edges_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_flow_edges",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "source_node_id",
+          "created_at",
+          "edge_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_flow_edges_source_created ON semantic_flow_edges USING btree (source_node_id, created_at, edge_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_flow_edges_source_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_flow_edges",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "target_node_id",
+          "created_at",
+          "edge_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_flow_edges_target_created ON semantic_flow_edges USING btree (target_node_id, created_at, edge_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_flow_edges_target_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_flow_edges",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "edge_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_flow_edges_pkey ON semantic_flow_edges USING btree (edge_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_flow_edges_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_flow_edges",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "created_at",
+          "entity_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_flow_entities_created ON semantic_flow_entities USING btree (created_at, entity_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_semantic_flow_entities_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_flow_entities",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "pid",
+          "created_at",
+          "entity_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_flow_entities_pid_created ON semantic_flow_entities USING btree (pid, created_at, entity_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_flow_entities_pid_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_flow_entities",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "tenant_bucket_sha256",
+          "created_at",
+          "entity_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_flow_entities_tenant_created ON semantic_flow_entities USING btree (tenant_bucket_sha256, created_at, entity_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_flow_entities_tenant_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_flow_entities",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "entity_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_flow_entities_pkey ON semantic_flow_entities USING btree (entity_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_flow_entities_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_flow_entities",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "entity_id",
+          "created_at",
+          "assertion_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_flow_assertions_entity_created ON semantic_flow_label_assertions USING btree (entity_id, created_at, assertion_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_flow_assertions_entity_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_flow_label_assertions",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "assertion_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_flow_label_assertions_pkey ON semantic_flow_label_assertions USING btree (assertion_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_flow_label_assertions_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_flow_label_assertions",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "created_at",
+          "event_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_health_created ON semantic_health_events USING btree (created_at, event_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_semantic_health_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_health_events",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "epoch_id",
+          "created_at",
+          "event_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_health_epoch_created ON semantic_health_events USING btree (epoch_id, created_at, event_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_health_epoch_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_health_events",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "event_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_health_events_pkey ON semantic_health_events USING btree (event_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_health_events_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_health_events",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "assessment_id",
+          "created_at",
+          "link_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_human_outcomes_assessment_created ON semantic_human_outcome_links USING btree (assessment_id, created_at, link_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_human_outcomes_assessment_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_human_outcome_links",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "created_at",
+          "link_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_human_outcomes_created ON semantic_human_outcome_links USING btree (created_at, link_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_semantic_human_outcomes_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_human_outcome_links",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "pid",
+          "created_at",
+          "link_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_human_outcomes_pid_created ON semantic_human_outcome_links USING btree (pid, created_at, link_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_human_outcomes_pid_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_human_outcome_links",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "settlement_id",
+          "created_at",
+          "link_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_human_outcomes_settlement_created ON semantic_human_outcome_links USING btree (settlement_id, created_at, link_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_human_outcomes_settlement_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_human_outcome_links",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "link_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_human_outcome_links_pkey ON semantic_human_outcome_links USING btree (link_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_human_outcome_links_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_human_outcome_links",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "request_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_human_outcome_links_request_id_key ON semantic_human_outcome_links USING btree (request_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_human_outcome_links_request_id_key",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_human_outcome_links",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "singleton"
+        ],
+        "clustered": false,
+        "collations": [
+          null
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_legacy_coverage_pkey ON semantic_legacy_coverage USING btree (singleton)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_legacy_coverage_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.int4_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_legacy_coverage",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "created_at",
+          "outcome_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_outcomes_created ON semantic_machine_outcomes USING btree (created_at, outcome_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_semantic_outcomes_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_machine_outcomes",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "settlement_id",
+          "created_at",
+          "outcome_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_outcomes_settlement_created ON semantic_machine_outcomes USING btree (settlement_id, created_at, outcome_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_outcomes_settlement_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_machine_outcomes",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "outcome_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_machine_outcomes_pkey ON semantic_machine_outcomes USING btree (outcome_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_machine_outcomes_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_machine_outcomes",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "created_at",
+          "settlement_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_settlements_created ON semantic_machine_settlements USING btree (created_at, settlement_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_semantic_settlements_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_machine_settlements",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 4,
+        "attributes": [
+          "epoch_id",
+          "tenant_bucket_sha256",
+          "created_at",
+          "settlement_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_settlements_epoch_tenant_created ON semantic_machine_settlements USING btree (epoch_id, tenant_bucket_sha256, created_at, settlement_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 4,
+        "live": true,
+        "name": "idx_semantic_settlements_epoch_tenant_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_machine_settlements",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "request_id",
+          "created_at",
+          "settlement_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_settlements_request_created ON semantic_machine_settlements USING btree (request_id, created_at, settlement_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_settlements_request_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_machine_settlements",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "settlement_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_machine_settlements_pkey ON semantic_machine_settlements USING btree (settlement_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_machine_settlements_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_machine_settlements",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "created_at",
+          "epoch_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_policy_epochs_created ON semantic_policy_epochs USING btree (created_at, epoch_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_semantic_policy_epochs_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_policy_epochs",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "generation"
+        ],
+        "clustered": false,
+        "collations": [
+          null
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_policy_epochs_generation_key ON semantic_policy_epochs USING btree (generation)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_policy_epochs_generation_key",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.int8_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_policy_epochs",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "epoch_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_policy_epochs_pkey ON semantic_policy_epochs USING btree (epoch_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_policy_epochs_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_policy_epochs",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "policy_sha256"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_policy_epochs_policy_sha256_key ON semantic_policy_epochs USING btree (policy_sha256)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_policy_epochs_policy_sha256_key",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_policy_epochs",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "tenant_bucket_sha256",
+          "rule_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.default"
+        ],
+        "definition": "CREATE UNIQUE INDEX idx_semantic_budgets_scope ON semantic_rate_budgets USING btree (tenant_bucket_sha256, rule_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_semantic_budgets_scope",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_rate_budgets",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "bucket_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_rate_budgets_pkey ON semantic_rate_budgets USING btree (bucket_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_rate_budgets_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_rate_budgets",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "settlement_id",
+          "created_at",
+          "review_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_semantic_reviews_settlement_created ON semantic_review_labels USING btree (settlement_id, created_at, review_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_semantic_reviews_settlement_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_review_labels",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "review_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX semantic_review_labels_pkey ON semantic_review_labels USING btree (review_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "semantic_review_labels_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "semantic_review_labels",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
           "pattern"
         ],
         "clustered": false,
@@ -16342,6 +20998,174 @@
         "force_row_security": false,
         "is_partition": false,
         "kind": "r",
+        "name": "semantic_control_state",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "semantic_control_transitions",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "semantic_flow_activities",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "semantic_flow_edges",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "semantic_flow_entities",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "semantic_flow_label_assertions",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "semantic_health_events",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "semantic_human_outcome_links",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "semantic_legacy_coverage",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "semantic_machine_outcomes",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "semantic_machine_settlements",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "semantic_policy_epochs",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "semantic_rate_budgets",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "semantic_review_labels",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
         "name": "sink_trust_records",
         "options": [],
         "persistence": "p",
@@ -16497,7 +21321,7 @@
     "rewrite_rules": [],
     "triggers": []
   },
-  "catalog_sha256": "6e5ee9463e5c998e2469064bd4b2049321170c4406f067722a431a78114f3a64",
+  "catalog_sha256": "5945b66467704dcf5b38983017c5227bca1dd8ccf30ba5dd17674e04fa2573ed",
   "format_version": 1,
   "generated_postgres_version_num": 170010
 }

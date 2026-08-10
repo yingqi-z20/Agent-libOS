@@ -711,7 +711,7 @@ class JsonRpcPrimitive:
                 method_id=str(context["method_id"]),
             )
             approval_context = {**context, "sandbox_profile": self._profile_json(profile)}
-            request_id = self.human.query(
+            request_id = self.human.query_authority_request(
                 pid=pid,
                 human=self.config.runtime.default_human,
                 request={
@@ -726,6 +726,7 @@ class JsonRpcPrimitive:
                     "context": approval_context,
                 },
                 blocking=True,
+                authority_origin="external_operation",
                 source_oids=source_oids,
             )
             raise HumanApprovalRequired(
@@ -798,7 +799,7 @@ class JsonRpcPrimitive:
             method_id=str(context["method_id"]),
         )
         approval_context = {**context, "right": right, "sandbox_profile": self._profile_json(profile)}
-        request_id = self.human.query(
+        request_id = self.human.query_authority_request(
             pid=pid,
             human=self.config.runtime.default_human,
             request={
@@ -813,6 +814,7 @@ class JsonRpcPrimitive:
                 "context": approval_context,
             },
             blocking=True,
+            authority_origin="external_operation",
             source_oids=source_oids,
         )
         raise HumanApprovalRequired(

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import field
+import hashlib
 import math
 import re
+from dataclasses import field
 from typing import Annotated, Final, Literal
 from urllib.parse import SplitResult, unquote_plus, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -18,6 +19,7 @@ from agent_libos.models.data_flow import (
     SinkTrustRule,
     sensitivity_rank,
 )
+from agent_libos.models.semantic import SemanticPolicyEpochV1
 
 _PYDANTIC_CONFIG = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 _TIMEZONE_KEY_PATTERN = re.compile(
@@ -560,11 +562,12 @@ class LLMDefaults:
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class SemanticDefaults:
-    """Host-owned Shadow assessment settings; ``off`` has no capture effects."""
+    """Host-owned semantic assessment and enforcement settings."""
 
-    mode: Literal["off", "shadow"] = "off"
+    mode: Literal["off", "shadow", "enforce_deny", "canary_auto"] = "off"
     adapter: Literal["deterministic", "scripted", "external"] = "deterministic"
     external_profile_id: str | None = None
+    policy_epoch: SemanticPolicyEpochV1 | None = None
     max_concurrency: StrictInt = 2
     assessment_timeout_s: StrictFloat = 30.0
     job_lease_s: StrictFloat = 60.0
@@ -575,6 +578,10 @@ class SemanticDefaults:
     projection_max_bytes: StrictInt = 16_384
     assessment_list_limit: StrictInt = 100
     assessment_list_hard_limit: StrictInt = 1_000
+    flow_query_limit: StrictInt = 100
+    flow_query_hard_limit: StrictInt = 1_000
+    settlement_list_limit: StrictInt = 100
+    settlement_list_hard_limit: StrictInt = 1_000
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -1809,6 +1816,49 @@ def _validate_llm_config(
 
 
 def _validate_semantic_config(semantic: SemanticDefaults, llm: LLMDefaults) -> None:
+    _validate_semantic_active_policy(semantic)
+    _validate_semantic_worker_bounds(semantic)
+    _validate_semantic_query_bounds(semantic)
+    if semantic.adapter != "external":
+        if semantic.external_profile_id is not None:
+            raise ValueError(
+                "semantic.external_profile_id is allowed only with adapter=external"
+            )
+        return
+    if semantic.mode == "off":
+        # An external adapter can be staged while disabled without resolving
+        # credentials or requiring an installed profile.
+        return
+    _validate_semantic_external_profile(semantic.external_profile_id, llm)
+    if semantic.mode == "canary_auto":
+        _validate_semantic_canary_classifier_pin(semantic, llm)
+
+
+def _validate_semantic_active_policy(semantic: SemanticDefaults) -> None:
+    if semantic.mode in {"enforce_deny", "canary_auto"}:
+        if semantic.policy_epoch is None:
+            raise ValueError(
+                f"semantic mode {semantic.mode} requires a static policy_epoch"
+            )
+    if semantic.policy_epoch is not None and not isinstance(
+        semantic.policy_epoch, SemanticPolicyEpochV1
+    ):
+        raise TypeError("semantic.policy_epoch must be SemanticPolicyEpochV1")
+    if (
+        semantic.mode == "canary_auto"
+        and semantic.policy_epoch is not None
+        and not semantic.policy_epoch.auto_approval_rules
+    ):
+        raise ValueError(
+            "semantic canary_auto requires at least one auto_approval_rule"
+        )
+    if semantic.mode == "canary_auto" and semantic.adapter != "external":
+        raise ValueError(
+            "semantic canary_auto requires the external classifier adapter"
+        )
+
+
+def _validate_semantic_worker_bounds(semantic: SemanticDefaults) -> None:
     _positive("semantic.max_concurrency", semantic.max_concurrency)
     if semantic.max_concurrency > 32:
         raise ValueError("semantic.max_concurrency must not exceed 32")
@@ -1845,6 +1895,9 @@ def _validate_semantic_config(semantic: SemanticDefaults, llm: LLMDefaults) -> N
         raise ValueError("semantic.intent_max_chars must not exceed 2000")
     if semantic.projection_max_bytes < 512 or semantic.projection_max_bytes > 16_384:
         raise ValueError("semantic.projection_max_bytes must be from 512 through 16384")
+
+
+def _validate_semantic_query_bounds(semantic: SemanticDefaults) -> None:
     _positive("semantic.assessment_list_limit", semantic.assessment_list_limit)
     _positive("semantic.assessment_list_hard_limit", semantic.assessment_list_hard_limit)
     _require_at_least(
@@ -1853,17 +1906,49 @@ def _validate_semantic_config(semantic: SemanticDefaults, llm: LLMDefaults) -> N
         "semantic.assessment_list_limit",
         semantic.assessment_list_limit,
     )
-    if semantic.adapter != "external":
-        if semantic.external_profile_id is not None:
-            raise ValueError(
-                "semantic.external_profile_id is allowed only with adapter=external"
-            )
-        return
-    if semantic.mode != "shadow":
-        # An external adapter can be staged while disabled without resolving
-        # credentials or requiring an installed profile.
-        return
-    _validate_semantic_external_profile(semantic.external_profile_id, llm)
+    for list_name, hard_name in (
+        ("flow_query_limit", "flow_query_hard_limit"),
+        ("settlement_list_limit", "settlement_list_hard_limit"),
+    ):
+        selected = getattr(semantic, list_name)
+        hard = getattr(semantic, hard_name)
+        _positive(f"semantic.{list_name}", selected)
+        _positive(f"semantic.{hard_name}", hard)
+        _require_at_least(
+            f"semantic.{hard_name}",
+            hard,
+            f"semantic.{list_name}",
+            selected,
+        )
+        if hard > 1_000:
+            raise ValueError(f"semantic.{hard_name} must not exceed 1000")
+
+
+def _validate_semantic_canary_classifier_pin(
+    semantic: SemanticDefaults,
+    llm: LLMDefaults,
+) -> None:
+    epoch = semantic.policy_epoch
+    assert epoch is not None
+    if epoch.classifier_profile_id != semantic.external_profile_id:
+        raise ValueError(
+            "semantic policy epoch must pin the external classifier profile"
+        )
+    if epoch.classifier_model_sha256 is None:
+        raise ValueError(
+            "semantic canary_auto policy epoch must pin the classifier model digest"
+        )
+    if epoch.classifier_profile_sha256 is None:
+        raise ValueError(
+            "semantic canary_auto policy epoch must pin the classifier profile identity digest"
+        )
+    profile = llm.profiles[semantic.external_profile_id]
+    assert profile.model is not None
+    model_sha256 = hashlib.sha256(profile.model.encode("utf-8")).hexdigest()
+    if epoch.classifier_model_sha256 != model_sha256:
+        raise ValueError(
+            "semantic policy epoch classifier model digest does not match the configured model"
+        )
 
 
 def _validate_semantic_external_profile(
