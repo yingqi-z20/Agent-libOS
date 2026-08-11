@@ -1920,7 +1920,12 @@ class TestJitSecurity:
 
     @pytest.mark.real_deno
     def test_deno_empty_test_validation_compiles_without_executing_candidate(self) -> None:
-        checker = DenoTypescriptSandbox(deno_executable='deno')
+        # A cold Deno type-check can exceed the production default timeout on
+        # a loaded Windows runner; this test validates compile-only behavior.
+        checker = DenoTypescriptSandbox(
+            deno_executable='deno',
+            default_timeout_s=15.0,
+        )
         invalid = checker.run_tests(
             'export function run(args, libos) { return {}; }\n'
             'const syntaxError: string = ;',

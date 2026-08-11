@@ -178,7 +178,9 @@ def _manifest(
                 else {}
             ),
         ),
-        timeout_s=2.0,
+        # These tests exercise result postconditions, not short-deadline
+        # behavior.  Leave enough time for protected setup on loaded runners.
+        timeout_s=10.0,
         max_request_bytes=16_384,
         max_response_bytes=16_384,
         protocol_mode=McpProtocolMode.REVISION_2026_07_28,
@@ -304,7 +306,10 @@ def test_custom_tool_cannot_publish_unbacked_input_required(
             issued_by="test",
         )
 
-        with pytest.raises(ValidationError) as captured:
+        with pytest.raises(
+            ValidationError,
+            match="exact durable provenance",
+        ) as captured:
             runtime.mcp.call_tool(pid, "custom-modern", "review_tool", {})
 
         assert provider.sensitive_values == ()
