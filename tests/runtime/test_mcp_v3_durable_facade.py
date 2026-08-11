@@ -44,13 +44,19 @@ from agent_libos.substrate import (
 from agent_libos.utils.serde import dumps, to_jsonable
 
 
+_FUNCTIONAL_PROVIDER_TIMEOUT_S = 10.0
+
+
 def _manifest() -> McpServerManifestV3:
     return McpServerManifestV3(
         schema_version=3,
         server_id="durable-mrtr",
         transport="streamable_http",
         http=McpHttpTransportSpec(url="http://127.0.0.1:8765/mcp"),
-        timeout_s=2.0,
+        # These tests exercise durable protected-operation bookkeeping, not
+        # latency. Leave enough budget for loaded Windows CI runners; explicit
+        # deadline tests below replace this value with their measured budget.
+        timeout_s=_FUNCTIONAL_PROVIDER_TIMEOUT_S,
         max_request_bytes=16_384,
         max_response_bytes=16_384,
         protocol_mode=McpProtocolMode.REVISION_2026_07_28,
@@ -80,7 +86,7 @@ def _resource_prompt_manifest() -> McpServerManifestV3:
         server_id="durable-host-surfaces",
         transport="streamable_http",
         http=McpHttpTransportSpec(url="http://127.0.0.1:8765/mcp"),
-        timeout_s=2.0,
+        timeout_s=_FUNCTIONAL_PROVIDER_TIMEOUT_S,
         max_request_bytes=16_384,
         max_response_bytes=16_384,
         protocol_mode=McpProtocolMode.REVISION_2026_07_28,
