@@ -2366,9 +2366,13 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         assert "'expected_package_sha256': selected['package_sha256']" in command
         assert "activation.ok" in command
         assert (
-            "activation.payload['result']['package_sha256'] "
-            "== selected['package_sha256']"
+            "activation.payload['result'] == {'skill_id': selected['skill_id'], "
+            "'name': selected['name'], 'version': selected['version'], "
+            "'tool_names': sorted(selected['allowed_tools'])}"
         ) in command
+        assert "activation.payload['result']['package_sha256']" not in command
+        assert "refreshed['package_sha256'] == selected['package_sha256']" in command
+        assert "refreshed['active'] is True" in command
         for entrypoint in EXPECTED_CONSOLE_SCRIPTS:
             assert f'/{entrypoint}" --help' in command
     sdist_step = str(sdist_install_step["run"])
