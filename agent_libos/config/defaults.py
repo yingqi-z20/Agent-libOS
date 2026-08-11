@@ -49,6 +49,9 @@ PromptCacheRetention = Annotated[
     Literal["in_memory", "24h"] | None,
     BeforeValidator(_normalize_prompt_cache_retention),
 ]
+PromptLayout = Literal["legacy_v1", "cache_optimized_v2"]
+PromptCacheMode = Literal["provider_default", "implicit", "explicit"]
+PromptCacheTTL = Literal["30m"] | None
 
 _SENSITIVE_LLM_URL_QUERY_KEY_NAMES = frozenset(
     {
@@ -509,6 +512,8 @@ class LLMProfile:
     safety_identifier_env: str | None = None
     prompt_cache_key: str | None = None
     prompt_cache_retention: PromptCacheRetention = None
+    prompt_cache_mode: PromptCacheMode | None = None
+    prompt_cache_ttl: PromptCacheTTL = None
     responses_previous_response_id: bool | None = None
     parallel_tool_calls: bool | None = None
     auto_wait_on_empty_tool_calls: bool | None = None
@@ -538,8 +543,11 @@ class LLMDefaults:
     api_mode: Literal["auto", "responses", "chat"] = "auto"
     store: bool = False
     safety_identifier: str | None = None
+    prompt_layout: PromptLayout = "legacy_v1"
     prompt_cache_key: str | None = None
     prompt_cache_retention: PromptCacheRetention = None
+    prompt_cache_mode: PromptCacheMode = "provider_default"
+    prompt_cache_ttl: PromptCacheTTL = None
     responses_previous_response_id: bool = False
     parallel_tool_calls: bool = False
     auto_wait_on_empty_tool_calls: bool = False
@@ -1698,83 +1706,17 @@ def _validate_llm_config(
         )
     for profile_id, profile in llm.profiles.items():
         prefix = f"llm.profiles[{profile_id!r}]"
-        _require_non_empty("llm.profiles key", profile_id)
-        if profile.kind != "openai_compatible":
-            raise ValueError(f"{prefix}.kind is not supported: {profile.kind}")
-        if profile.base_url is not None:
-            _require_non_empty(f"{prefix}.base_url", profile.base_url)
-            validate_llm_base_url(
-                profile.base_url,
-                label=f"{prefix}.base_url",
-            )
-        if profile.model is not None:
-            _require_non_empty(f"{prefix}.model", profile.model)
-        _require_non_empty(f"{prefix}.api_key_env", profile.api_key_env)
-        if profile.api_mode is not None and profile.api_mode not in {
-            "auto",
-            "responses",
-            "chat",
-        }:
-            raise ValueError(f"{prefix}.api_mode is not supported: {profile.api_mode}")
-        _optional_non_empty(f"{prefix}.safety_identifier", profile.safety_identifier)
-        _optional_max_chars(f"{prefix}.safety_identifier", profile.safety_identifier, 64)
-        _optional_non_empty(
-            f"{prefix}.safety_identifier_env",
-            profile.safety_identifier_env,
-        )
-        _optional_non_empty(f"{prefix}.prompt_cache_key", profile.prompt_cache_key)
-        _positive_optional(f"{prefix}.timeout_s", profile.timeout_s)
-        _nonnegative_optional(f"{prefix}.max_retries", profile.max_retries)
-        _nonnegative_optional(f"{prefix}.temperature", profile.temperature)
-        _positive_optional(f"{prefix}.max_tokens", profile.max_tokens)
-        _positive_optional(
-            f"{prefix}.max_input_tokens_per_call",
-            profile.max_input_tokens_per_call,
-        )
-        _positive_optional(
-            f"{prefix}.max_total_tokens_per_call",
-            profile.max_total_tokens_per_call,
-        )
-        _positive_optional(
-            f"{prefix}.context_window_tokens",
-            profile.context_window_tokens,
-        )
-        effective_max_tokens = (
-            llm.max_tokens if profile.max_tokens is None else profile.max_tokens
-        )
-        effective_context_window = (
-            llm.context_window_tokens
-            if profile.context_window_tokens is None
-            else profile.context_window_tokens
-        )
-        effective_max_input_tokens = (
-            llm.max_input_tokens_per_call
-            if profile.max_input_tokens_per_call is None
-            else profile.max_input_tokens_per_call
-        )
-        effective_max_total_tokens = (
-            llm.max_total_tokens_per_call
-            if profile.max_total_tokens_per_call is None
-            else profile.max_total_tokens_per_call
-        )
-        if effective_max_tokens >= effective_context_window:
-            raise ValueError(
-                f"{prefix} effective max_tokens must be less than "
-                "effective context_window_tokens"
-            )
-        if effective_max_input_tokens > effective_max_total_tokens:
-            raise ValueError(
-                f"{prefix} effective max_input_tokens_per_call must not exceed "
-                "effective max_total_tokens_per_call"
-            )
-        if effective_max_tokens > effective_max_total_tokens:
-            raise ValueError(
-                f"{prefix} effective max_tokens must not exceed "
-                "effective max_total_tokens_per_call"
-            )
+        _validate_llm_profile(profile_id, profile, llm, prefix=prefix)
     _optional_non_empty("llm.safety_identifier", llm.safety_identifier)
     _optional_max_chars("llm.safety_identifier", llm.safety_identifier, 64)
     _optional_non_empty("llm.prompt_cache_key", llm.prompt_cache_key)
+    _validate_prompt_cache_policy(
+        "llm",
+        mode=llm.prompt_cache_mode,
+        key=llm.prompt_cache_key,
+        retention=llm.prompt_cache_retention,
+        ttl=llm.prompt_cache_ttl,
+    )
     _nonnegative("llm.temperature", llm.temperature)
     _positive("llm.max_tokens", llm.max_tokens)
     _positive("llm.max_input_tokens_per_call", llm.max_input_tokens_per_call)
@@ -1813,6 +1755,101 @@ def _validate_llm_config(
     _require_status_codes("llm.fallback_status_codes", llm.fallback_status_codes)
     if semantic is not None:
         _validate_semantic_config(semantic, llm)
+
+
+def _validate_llm_profile(
+    profile_id: str,
+    profile: LLMProfile,
+    llm: LLMDefaults,
+    *,
+    prefix: str,
+) -> None:
+    _require_non_empty("llm.profiles key", profile_id)
+    if profile.kind != "openai_compatible":
+        raise ValueError(f"{prefix}.kind is not supported: {profile.kind}")
+    if profile.base_url is not None:
+        _require_non_empty(f"{prefix}.base_url", profile.base_url)
+        validate_llm_base_url(profile.base_url, label=f"{prefix}.base_url")
+    if profile.model is not None:
+        _require_non_empty(f"{prefix}.model", profile.model)
+    _require_non_empty(f"{prefix}.api_key_env", profile.api_key_env)
+    if profile.api_mode is not None and profile.api_mode not in {
+        "auto",
+        "responses",
+        "chat",
+    }:
+        raise ValueError(f"{prefix}.api_mode is not supported: {profile.api_mode}")
+    _optional_non_empty(f"{prefix}.safety_identifier", profile.safety_identifier)
+    _optional_max_chars(f"{prefix}.safety_identifier", profile.safety_identifier, 64)
+    _optional_non_empty(
+        f"{prefix}.safety_identifier_env",
+        profile.safety_identifier_env,
+    )
+    _optional_non_empty(f"{prefix}.prompt_cache_key", profile.prompt_cache_key)
+    _validate_llm_profile_cache(profile, llm, prefix=prefix)
+    _positive_optional(f"{prefix}.timeout_s", profile.timeout_s)
+    _nonnegative_optional(f"{prefix}.max_retries", profile.max_retries)
+    _nonnegative_optional(f"{prefix}.temperature", profile.temperature)
+    for field in (
+        "max_tokens",
+        "max_input_tokens_per_call",
+        "max_total_tokens_per_call",
+        "context_window_tokens",
+    ):
+        _positive_optional(f"{prefix}.{field}", getattr(profile, field))
+    _validate_llm_profile_token_bounds(profile, llm, prefix=prefix)
+
+
+def _validate_llm_profile_cache(
+    profile: LLMProfile,
+    llm: LLMDefaults,
+    *,
+    prefix: str,
+) -> None:
+    def inherited(field: str) -> Any:
+        profile_value = getattr(profile, field)
+        return getattr(llm, field) if profile_value is None else profile_value
+
+    _validate_prompt_cache_policy(
+        prefix,
+        mode=inherited("prompt_cache_mode"),
+        key=inherited("prompt_cache_key"),
+        retention=inherited("prompt_cache_retention"),
+        ttl=inherited("prompt_cache_ttl"),
+    )
+
+
+def _validate_llm_profile_token_bounds(
+    profile: LLMProfile,
+    llm: LLMDefaults,
+    *,
+    prefix: str,
+) -> None:
+    effective_max_tokens = profile.max_tokens or llm.max_tokens
+    effective_context_window = (
+        profile.context_window_tokens or llm.context_window_tokens
+    )
+    effective_max_input_tokens = (
+        profile.max_input_tokens_per_call or llm.max_input_tokens_per_call
+    )
+    effective_max_total_tokens = (
+        profile.max_total_tokens_per_call or llm.max_total_tokens_per_call
+    )
+    if effective_max_tokens >= effective_context_window:
+        raise ValueError(
+            f"{prefix} effective max_tokens must be less than "
+            "effective context_window_tokens"
+        )
+    if effective_max_input_tokens > effective_max_total_tokens:
+        raise ValueError(
+            f"{prefix} effective max_input_tokens_per_call must not exceed "
+            "effective max_total_tokens_per_call"
+        )
+    if effective_max_tokens > effective_max_total_tokens:
+        raise ValueError(
+            f"{prefix} effective max_tokens must not exceed "
+            "effective max_total_tokens_per_call"
+        )
 
 
 def _validate_semantic_config(semantic: SemanticDefaults, llm: LLMDefaults) -> None:
@@ -1975,8 +2012,12 @@ def _validate_semantic_external_profile(
     if (
         profile.prompt_cache_key is not None
         or profile.prompt_cache_retention is not None
+        or profile.prompt_cache_mode not in {None, "provider_default"}
+        or profile.prompt_cache_ttl is not None
         or llm.prompt_cache_key is not None
         or llm.prompt_cache_retention is not None
+        or llm.prompt_cache_mode != "provider_default"
+        or llm.prompt_cache_ttl is not None
     ):
         raise ValueError("semantic external LLM profile must disable prompt caching")
     if profile.responses_previous_response_id is not False:
@@ -1990,6 +2031,36 @@ def _positive_or_non_empty(name: str, value: object) -> None:
         _require_non_empty(name, value)
     else:
         _positive(name, value)
+
+
+def _validate_prompt_cache_policy(
+    prefix: str,
+    *,
+    mode: str,
+    key: str | None,
+    retention: str | None,
+    ttl: str | None,
+) -> None:
+    if mode not in {"provider_default", "implicit", "explicit"}:
+        raise ValueError(f"{prefix}.prompt_cache_mode is not supported: {mode}")
+    if ttl is not None and ttl != "30m":
+        raise ValueError(f"{prefix}.prompt_cache_ttl must be 30m or null")
+    if retention is not None and ttl is not None:
+        raise ValueError(
+            f"{prefix}.prompt_cache_retention and prompt_cache_ttl are mutually exclusive"
+        )
+    if mode != "provider_default" and not str(key or "").strip():
+        raise ValueError(
+            f"{prefix}.prompt_cache_key is required when prompt_cache_mode is {mode}"
+        )
+    if mode == "provider_default" and ttl is not None:
+        raise ValueError(
+            f"{prefix}.prompt_cache_ttl requires implicit or explicit prompt_cache_mode"
+        )
+    if mode != "provider_default" and retention is not None:
+        raise ValueError(
+            f"{prefix}.prompt_cache_retention cannot be combined with prompt_cache_mode {mode}"
+        )
 
 
 def _nonnegative_fields(prefix: str, obj: object, names: tuple[str, ...]) -> None:

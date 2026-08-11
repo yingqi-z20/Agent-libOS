@@ -1007,6 +1007,70 @@ class TestConfigDefaults:
             == 'in_memory'
         )
 
+    def test_load_config_file_accepts_v2_prompt_layout_and_cache_policy(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / 'prompt-cache-v2.yaml'
+        path.write_text(
+            '\n'.join(
+                [
+                    'llm:',
+                    '  prompt_layout: cache_optimized_v2',
+                    '  prompt_cache_key: tenant-domain',
+                    '  prompt_cache_mode: explicit',
+                    '  prompt_cache_ttl: 30m',
+                    '  profiles:',
+                    '    default:',
+                    '      model: gpt-5.6',
+                    '      prompt_cache_mode: implicit',
+                    '      prompt_cache_ttl: 30m',
+                ]
+            ),
+            encoding='utf-8',
+        )
+
+        config = load_config_file(path)
+
+        assert config.llm.prompt_layout == 'cache_optimized_v2'
+        assert config.llm.prompt_cache_mode == 'explicit'
+        assert config.llm.prompt_cache_ttl == '30m'
+        assert config.llm.profiles['default'].prompt_cache_mode == 'implicit'
+        assert config.llm.profiles['default'].prompt_cache_ttl == '30m'
+
+    def test_prompt_cache_v2_remains_opt_in_until_release_gate(self) -> None:
+        assert DEFAULT_CONFIG.llm.prompt_layout == 'legacy_v1'
+
+    @pytest.mark.parametrize(
+        'body',
+        [
+            'llm:\n  prompt_layout: future_v3\n',
+            'llm:\n  prompt_cache_mode: explicit\n',
+            (
+                'llm:\n'
+                '  prompt_cache_key: domain\n'
+                '  prompt_cache_mode: explicit\n'
+                '  prompt_cache_retention: 24h\n'
+            ),
+            (
+                'llm:\n'
+                '  prompt_cache_key: domain\n'
+                '  prompt_cache_mode: explicit\n'
+                '  prompt_cache_ttl: 1h\n'
+            ),
+        ],
+    )
+    def test_load_config_file_rejects_invalid_v2_cache_policy(
+        self,
+        tmp_path: Path,
+        body: str,
+    ) -> None:
+        path = tmp_path / 'invalid-prompt-cache-v2.yaml'
+        path.write_text(body, encoding='utf-8')
+
+        with pytest.raises((PydanticValidationError, ValueError)):
+            load_config_file(path)
+
     def test_load_config_file_rejects_invalid_yaml_shape(self, tmp_path: Path) -> None:
         path = tmp_path / 'config.yaml'
         path.write_text('- runtime\n', encoding='utf-8')

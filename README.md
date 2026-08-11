@@ -326,9 +326,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.4.1-py3-none-any.whl dist/agent_libos-1.4.1.tar.gz
+  dist/agent_libos-1.4.2-py3-none-any.whl dist/agent_libos-1.4.2.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.4.1-py3-none-any.whl
+  dist/agent_libos-1.4.2-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 uv export --frozen --no-dev --no-emit-project --output-file runtime-requirements.txt
 uv export --frozen --only-group release --no-emit-project --output-file release-build-requirements.txt
@@ -342,7 +342,7 @@ uv venv /tmp/agent-libos-wheel-check
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
   --require-hashes -r runtime-requirements.txt
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
-  --no-deps dist/agent_libos-1.4.1-py3-none-any.whl
+  --no-deps dist/agent_libos-1.4.2-py3-none-any.whl
 uv pip check --python /tmp/agent-libos-wheel-check/bin/python
 /tmp/agent-libos-wheel-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-wheel-check/bin/agent-libos --help
@@ -355,7 +355,7 @@ uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
   --require-hashes -r release-build-requirements.txt
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
-  --no-deps --no-build-isolation dist/agent_libos-1.4.1.tar.gz
+  --no-deps --no-build-isolation dist/agent_libos-1.4.2.tar.gz
 uv pip check --python /tmp/agent-libos-sdist-check/bin/python
 /tmp/agent-libos-sdist-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-sdist-check/bin/agent-libos --help
@@ -530,13 +530,13 @@ uv sync --frozen --extra postgres
 uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" init
 ```
 
-Agent libOS 1.4.1 creates and opens only RuntimeStore schema v6. A canonical v5
+Agent libOS 1.4.2 creates and opens only RuntimeStore schema v6. A canonical v5
 store is rejected by ordinary startup until an operator runs the explicit,
 offline, digest-bound v5-to-v6 migration. A schema-v4 store must first use the
 v4-to-v5 migration; a schema-v3 store is rejected before
 initialization or any write; use Agent libOS 1.0.1 only to view or archive it.
 There is no automatic migration, read-only bridge, or dual-schema Runtime mode
-in 1.4.1.
+in 1.4.2.
 
 Both backends implement the same runtime store contract. Process metadata,
 capabilities, audit/events, messages, human requests, LLM call records,

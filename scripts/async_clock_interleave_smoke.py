@@ -29,6 +29,80 @@ _SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
 class ProcessPlan:
     label: str
     actions: list[dict[str, Any]]
+    completion_payload: dict[str, Any]
+
+
+def _find_completion_review(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, str):
+        try:
+            return _find_completion_review(json.loads(value))
+        except json.JSONDecodeError:
+            for line in value.splitlines():
+                candidate = line.strip()
+                if not candidate.startswith("{"):
+                    continue
+                try:
+                    found = _find_completion_review(json.loads(candidate))
+                except json.JSONDecodeError:
+                    continue
+                if found is not None:
+                    return found
+            return None
+    if isinstance(value, list):
+        for item in value:
+            found = _find_completion_review(item)
+            if found is not None:
+                return found
+        return None
+    if not isinstance(value, dict):
+        return None
+    review = value.get("completion_review")
+    if isinstance(review, dict) and isinstance(review.get("review_token"), str):
+        return review
+    for item in value.values():
+        found = _find_completion_review(item)
+        if found is not None:
+            return found
+    return None
+
+
+def _completion_claim(
+    review: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    available = [
+        str(tool)
+        for tool in review.get("available_evidence_tools", [])
+        if isinstance(tool, str) and tool != "process_exit"
+    ]
+    if not available:
+        raise AssertionError("completion review exposed no successful evidence tool")
+    requirements = review.get("requirements")
+    if not isinstance(requirements, list) or not requirements:
+        raise AssertionError("completion review exposed no ordered requirements")
+    checks = []
+    for requirement in requirements:
+        eligible = (
+            requirement.get("eligible_evidence_tools")
+            if isinstance(requirement, dict)
+            else None
+        )
+        candidates = [tool for tool in available if not eligible or tool in eligible]
+        checks.append(
+            {
+                "status": "completed",
+                "evidence_tool_calls": candidates[:1],
+                "evidence_summary": "Verified by the cited successful runtime tool call.",
+            }
+        )
+    return {
+        "payload": dict(payload),
+        "review_token": review["review_token"],
+        "completion_evidence": {
+            "acceptance_checks": checks,
+            "final_verification": available[:1],
+        },
+    }
 
 
 async def run_interleaved_clock_demo(
@@ -185,8 +259,13 @@ class InterleavingClockClient:
             actions.append({"action": "human_output", "label": label, "iteration": iteration, "from_last_time": True})
             if iteration < iterations:
                 actions.append({"action": "sleep", "seconds": interval_s})
-        actions.append({"action": "process_exit", "payload": {"label": label, "iterations": iterations}})
-        self._plans[pid] = ProcessPlan(label=label, actions=actions)
+        completion_payload = {"label": label, "iterations": iterations}
+        actions.append({"action": "process_exit", "payload": completion_payload})
+        self._plans[pid] = ProcessPlan(
+            label=label,
+            actions=actions,
+            completion_payload=completion_payload,
+        )
 
     def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
         pid = self._pid_from_messages(messages)
@@ -195,9 +274,16 @@ class InterleavingClockClient:
             plan = self._plans.get(pid)
             if plan is None:
                 raise AssertionError(f"no action plan registered for pid {pid}")
-            if not plan.actions:
-                raise AssertionError(f"no planned action remains for pid {pid}")
-            action = dict(plan.actions.pop(0))
+            review = _find_completion_review(messages)
+            if review is not None:
+                action = {
+                    "action": "process_exit",
+                    **_completion_claim(review, plan.completion_payload),
+                }
+            else:
+                if not plan.actions:
+                    raise AssertionError(f"no planned action remains for pid {pid}")
+                action = dict(plan.actions.pop(0))
         if action.pop("from_last_time", False):
             iso8601 = self._last_tool_time(messages)
             label = action.pop("label")
@@ -213,21 +299,20 @@ class InterleavingClockClient:
 
     def _pid_from_messages(self, messages: list[dict[str, str]]) -> str:
         pid = static_prefix(messages).get("pid")
-        if not isinstance(pid, str) or not pid:
-            for message in messages:
-                content = message.get("content")
-                if not isinstance(content, str):
-                    continue
-                match = re.search(
-                    r"(?m)^(?:Process|Process facts):\n- pid: (?P<pid>\S+)$",
-                    content,
-                )
-                if match is not None:
-                    pid = match.group("pid")
-                    break
-        if not isinstance(pid, str) or not pid:
-            raise AssertionError("prompt did not include process pid")
-        return pid
+        if isinstance(pid, str) and pid:
+            return pid
+        # cache_optimized_v2 intentionally does not disclose the caller pid.
+        # This deterministic fixture selects its Host-owned plan from the
+        # semantic goal label instead of relying on private process identity.
+        rendered = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+        matches = [
+            candidate_pid
+            for candidate_pid, plan in self._plans.items()
+            if f"Process {plan.label}:" in rendered
+        ]
+        if len(matches) != 1:
+            raise AssertionError("prompt did not identify one semantic clock plan")
+        return matches[0]
 
     def _last_tool_time(self, messages: list[dict[str, str]]) -> str:
         result = last_tool_result(messages, "get_current_time")

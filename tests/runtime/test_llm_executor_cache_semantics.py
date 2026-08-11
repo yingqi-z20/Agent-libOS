@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from agent_libos import AgentImage, Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import (
     EventType,
@@ -14,6 +16,10 @@ from tests.support.fakes import RecordingActionClient
 
 
 IMAGE_ID = "executor-cache-semantics:v0"
+_V2_CONFIG = replace(
+    DEFAULT_CONFIG,
+    llm=replace(DEFAULT_CONFIG.llm, prompt_layout="cache_optimized_v2"),
+)
 
 
 def _register_cumulative_image(runtime: Runtime) -> None:
@@ -103,7 +109,7 @@ def test_missing_materialized_goal_is_recovered_from_retained_context() -> None:
 def test_source_only_event_projection_represents_full_batch_before_advancing_cursor(
 ) -> None:
     sentinel = "RAW_PROCESS_SIGNAL_PAYLOAD_MUST_NOT_REACH_MODEL"
-    runtime = Runtime.open("local")
+    runtime = Runtime.open("local", config=_V2_CONFIG)
     try:
         _register_cumulative_image(runtime)
         client = RecordingActionClient(
@@ -132,7 +138,7 @@ def test_source_only_event_projection_represents_full_batch_before_advancing_cur
         prompt = client.user_prompts[0]
         assert sentinel not in prompt
         assert "event_projection_summary" in prompt
-        assert all(event.event_id in prompt for event in markers)
+        assert all(event.event_id not in prompt for event in markers)
         assert runtime.process.get(pid).event_cursor == fetched[-1].event_id
         request = [
             record
@@ -189,6 +195,55 @@ def test_effective_provider_options_override_configured_cache_telemetry() -> Non
             "prompt_cache_key",
             "prompt_cache_retention",
         ]
+        assert options["openai_prompt_cache_mode"] == "provider_default"
+        assert options["openai_prompt_cache_breakpoint_count"] == 0
+        assert options["openai_prompt_cache_downgrade_reason"] == (
+            "provider_rejected_cache_options"
+        )
+    finally:
+        runtime.close()
+
+
+def test_prompt_projection_telemetry_records_only_sizes_tokens_and_hashes() -> None:
+    goal = "PROMPT_PLAINTEXT_MUST_NOT_BE_COPIED_TO_TELEMETRY"
+    runtime = Runtime.open("local", config=_V2_CONFIG)
+    try:
+        _register_cumulative_image(runtime)
+        runtime.llm.client = RecordingActionClient(
+            [{"action": "echo", "milestone": "measure projection"}]
+        )
+        pid = runtime.process.spawn(image=IMAGE_ID, goal=goal)
+
+        result = runtime.run_process_once(pid)
+
+        assert result["ok"], result
+        options = runtime.store.list_llm_calls(pid)[0].request_options
+        projection = options["prompt_projection"]
+        assert projection["schema_version"] == 1
+        assert projection["layout"] == "cache_optimized_v2"
+        assert projection["stable_prefix_message_count"] == 2
+        assert len(projection["stable_prefix_sha256"]) == 64
+        assert projection["segments"]
+        assert all(
+            set(segment)
+            == {
+                "ordinal",
+                "part",
+                "role",
+                "bytes",
+                "estimated_tokens",
+                "sha256",
+                "stable_prefix",
+            }
+            for segment in projection["segments"]
+        )
+        assert set(projection["tools"]) == {
+            "bytes",
+            "estimated_tokens",
+            "sha256",
+        }
+        assert goal not in json.dumps(projection, sort_keys=True)
+        assert options["llm_latency_ms"] >= 0
     finally:
         runtime.close()
 

@@ -1406,15 +1406,10 @@ class TestSkillPackageLoading:
                 assert activated.ok, activated.error
                 assert set(activated.payload) == {'result'}
                 assert set(activated.payload['result']) == {
-                    'pid',
                     'skill_id',
                     'name',
                     'version',
                     'tool_names',
-                    'tool_ids',
-                    'jit_tool_ids',
-                    'instructions_hash',
-                    'package_sha256',
                 }
                 resource = runtime.skills.read_skill_resource(pid, 'resource-skill', 'references/guide.md')
                 assert 'resource-token' in resource['content']
@@ -1472,7 +1467,6 @@ class TestSkillPackageLoading:
                 assert unloaded.ok, unloaded.error
                 assert set(unloaded.payload) == {'result'}
                 assert set(unloaded.payload['result']) == {
-                    'pid',
                     'skill_id',
                     'removed_tools',
                 }
@@ -1727,7 +1721,12 @@ class TestSkillPackageLoading:
                     },
                 )
                 assert activated.ok
-                assert activated.payload['result']['package_sha256'] == package_b['package_sha256']
+                assert (
+                    reopened.process.get(pid).loaded_skills[
+                        skill_id
+                    ]['package_sha256']
+                    == package_b['package_sha256']
+                )
                 assert reopened.store.get_capability(execute.cap_id).uses_remaining == 0
                 assert prepare_calls == 1
 

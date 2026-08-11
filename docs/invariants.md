@@ -318,7 +318,7 @@ longer defines.
   pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
   typed boundaries compute the next state generation, preventing a direct-write
   rewind from reviving a stale token.
-- `v6-persisted-state-is-strict-and-versioned`: ordinary 1.4.1 Runtime startup
+- `v6-persisted-state-is-strict-and-versioned`: ordinary 1.4.2 Runtime startup
   accepts only the frozen version-6 physical schema (including Durable Task
   Run, typed process state, Human revision, semantic job/evidence state,
   FlowGraph, policy epochs, and machine-settlement evidence) plus canonical

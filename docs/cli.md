@@ -248,7 +248,7 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint --actor-pid <actor_pid> i
 
 ## Persistent Runtime Basics
 
-Agent libOS 1.4.1 opens only store schema v6. A canonical schema-v5 database is
+Agent libOS 1.4.2 opens only store schema v6. A canonical schema-v5 database is
 rejected before `init`, recovery, audit, or any other write until an operator
 uses the explicit offline `store migrate --to 6` workflow below. A v4 store
 must first use `store migrate --to 5`. Older,

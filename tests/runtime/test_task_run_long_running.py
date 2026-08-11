@@ -61,6 +61,16 @@ def _config():
     )
 
 
+def _v2_config():
+    return replace(
+        _config(),
+        llm=replace(
+            DEFAULT_CONFIG.llm,
+            prompt_layout="cache_optimized_v2",
+        ),
+    )
+
+
 def _spec(
     title: str,
     *,
@@ -205,22 +215,16 @@ class _UnresolvedCompletionClient:
             )
         review = _find_completion_review(messages)
         assert review is not None
-        source_refs = review["completion_source_refs"]
-        assert isinstance(source_refs, list) and source_refs
+        requirements = review.get("requirements")
+        assert isinstance(requirements, list) and len(requirements) == 1
         return _completion(
             "unresolved-3",
             {
                 "action": "process_exit",
                 "review_token": review["review_token"],
                 "completion_evidence": {
-                    "goal_oid": review["goal"]["oid"],
-                    "reviewed_message_ids": review[
-                        "acknowledged_human_message_ids"
-                    ],
                     "acceptance_checks": [
                         {
-                            "requirement": "the Run requirement is unresolved",
-                            "source_refs": source_refs,
                             "status": self.reported_status,
                             "evidence_tool_calls": [],
                             "evidence_summary": "The model cannot prove completion.",
@@ -261,16 +265,11 @@ class _StructuredTaskRunCompletionClient:
         review = _find_completion_review(messages)
         assert review is not None
         self.review = review
-        task_run = review.get("task_run")
-        assert isinstance(task_run, dict)
-        requirements = task_run.get("requirements")
+        requirements = review.get("requirements")
         assert isinstance(requirements, list) and len(requirements) == 2
-        requirement_ids = [str(item["requirement_id"]) for item in requirements]
         if self.bundle_requirements:
             checks = [
                 {
-                    "requirement": "one generic check for both requirements",
-                    "source_refs": requirement_ids,
                     "status": "completed",
                     "evidence_tool_calls": ["discover_skills"],
                     "evidence_summary": "A generic catalog read was observed.",
@@ -279,24 +278,18 @@ class _StructuredTaskRunCompletionClient:
         else:
             checks = [
                 {
-                    "requirement": f"independent requirement {index}",
-                    "source_refs": [requirement_id],
                     "status": "completed",
                     "evidence_tool_calls": ["discover_skills"],
                     "evidence_summary": "The cited catalog read is the proof.",
                 }
-                for index, requirement_id in enumerate(requirement_ids, start=1)
+                for _requirement in requirements
             ]
         completion_evidence: Any = {
-            "goal_oid": review["goal"]["oid"],
-            "reviewed_message_ids": review[
-                "acknowledged_human_message_ids"
-            ],
             "acceptance_checks": checks,
             "final_verification": ["discover_skills"],
         }
         if self.malformed_completion_evidence:
-            completion_evidence = '{"goal_oid":'
+            completion_evidence = '{"acceptance_checks":'
         elif self.stringify_completion_evidence:
             completion_evidence = json.dumps(
                 completion_evidence,
@@ -556,7 +549,10 @@ def test_integrity_bound_root_exit_satisfies_prompt_requirements(
 def test_one_generic_check_cannot_satisfy_two_task_run_requirements(
     tmp_path: Path,
 ) -> None:
-    runtime = Runtime.open(tmp_path / "bundled-requirements.sqlite", config=_config())
+    runtime = Runtime.open(
+        tmp_path / "bundled-requirements.sqlite",
+        config=_v2_config(),
+    )
     try:
         created = _create_coding_completion_run(runtime, "bundled-requirements")
         followed = runtime.task_runs.follow_up(
@@ -582,10 +578,13 @@ def test_one_generic_check_cannot_satisfy_two_task_run_requirements(
 
         assert rejected.status is not TaskRunStatus.SUCCEEDED
         assert client.review is not None
+        assert created.root_pid is not None
+        assert "task_run" not in client.review
+        assert len(client.review["requirements"]) == 2
+        assert client.review["available_evidence_tools"] == ["discover_skills"]
         assert all(
-            item["eligible_evidence_tool_calls"] == ["discover_skills"]
-            and len(item["eligible_evidence_receipts"]) == 1
-            for item in client.review["task_run"]["requirements"]
+            "eligible_evidence_tools" not in item
+            for item in client.review["requirements"]
         )
         assert {
             requirement.status
@@ -593,7 +592,6 @@ def test_one_generic_check_cannot_satisfy_two_task_run_requirements(
                 created.run_id
             )
         } == {TaskRunRequirementStatus.IN_PROGRESS}
-        assert created.root_pid is not None
         assert runtime.process.get(created.root_pid).status is ProcessStatus.RUNNABLE
     finally:
         runtime.close()
@@ -602,7 +600,10 @@ def test_one_generic_check_cannot_satisfy_two_task_run_requirements(
 def test_tool_receipt_from_old_llm_binding_cannot_prove_new_follow_up(
     tmp_path: Path,
 ) -> None:
-    runtime = Runtime.open(tmp_path / "old-follow-up-evidence.sqlite", config=_config())
+    runtime = Runtime.open(
+        tmp_path / "old-follow-up-evidence.sqlite",
+        config=_v2_config(),
+    )
     try:
         created = _create_coding_completion_run(runtime, "old-follow-up-evidence")
         observed = _run_discover_quantum(
@@ -628,18 +629,15 @@ def test_tool_receipt_from_old_llm_binding_cannot_prove_new_follow_up(
 
         assert rejected.status is not TaskRunStatus.SUCCEEDED
         assert client.review is not None
-        projected = client.review["task_run"]["requirements"]
-        assert projected[0]["eligible_evidence_tool_calls"] == ["discover_skills"]
-        assert len(projected[0]["eligible_evidence_receipts"]) == 1
-        assert projected[1]["eligible_evidence_tool_calls"] == []
-        assert projected[1]["eligible_evidence_receipts"] == []
+        assert created.root_pid is not None
+        assert "eligible_evidence_tools" not in client.review["requirements"][0]
+        assert client.review["requirements"][1]["eligible_evidence_tools"] == []
         assert {
             requirement.status
             for requirement in runtime.store.list_task_run_requirements(
                 created.run_id
             )
         } == {TaskRunRequirementStatus.IN_PROGRESS}
-        assert created.root_pid is not None
         assert runtime.process.get(created.root_pid).status is ProcessStatus.RUNNABLE
     finally:
         runtime.close()
@@ -650,7 +648,7 @@ def test_tool_dispatched_after_follow_up_keeps_frozen_old_requirement_binding(
 ) -> None:
     runtime = Runtime.open(
         tmp_path / "frozen-binding-follow-up-race.sqlite",
-        config=_config(),
+        config=_v2_config(),
     )
     provider = _BlockingDiscoverClient()
     try:
@@ -705,11 +703,8 @@ def test_tool_dispatched_after_follow_up_keeps_frozen_old_requirement_binding(
         assert rejected.status is not TaskRunStatus.SUCCEEDED
         assert followed.requirement_count == 2
         assert claim_client.review is not None
-        projected = claim_client.review["task_run"]["requirements"]
-        assert projected[0]["eligible_evidence_tool_calls"] == ["discover_skills"]
-        assert len(projected[0]["eligible_evidence_receipts"]) == 1
-        assert projected[1]["eligible_evidence_tool_calls"] == []
-        assert projected[1]["eligible_evidence_receipts"] == []
+        assert "task_run" not in claim_client.review
+        assert claim_client.review["requirements"][1]["eligible_evidence_tools"] == []
         assert {
             requirement.status
             for requirement in runtime.store.list_task_run_requirements(
@@ -725,7 +720,7 @@ def test_structured_completion_persists_causal_receipts_and_started_at(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "causal-completion-receipts.sqlite"
-    runtime = Runtime.open(database, config=_config())
+    runtime = Runtime.open(database, config=_v2_config())
     try:
         created = _create_coding_completion_run(runtime, "causal-completion-receipts")
         followed = runtime.task_runs.follow_up(
@@ -816,7 +811,7 @@ def test_structured_completion_persists_causal_receipts_and_started_at(
     finally:
         runtime.close()
 
-    reopened = Runtime.open(database, config=_config())
+    reopened = Runtime.open(database, config=_v2_config())
     try:
         assert (
             reopened.store.list_task_run_requirements(created.run_id)
@@ -838,7 +833,7 @@ def test_json_stringified_completion_evidence_satisfies_each_requirement(
 ) -> None:
     runtime = Runtime.open(
         tmp_path / "stringified-completion-evidence.sqlite",
-        config=_config(),
+        config=_v2_config(),
     )
     try:
         created = _create_coding_completion_run(
@@ -898,7 +893,7 @@ def test_malformed_stringified_completion_evidence_fails_before_terminal_exit(
 ) -> None:
     runtime = Runtime.open(
         tmp_path / "malformed-stringified-completion-evidence.sqlite",
-        config=_config(),
+        config=_v2_config(),
     )
     try:
         created = _create_coding_completion_run(
@@ -965,7 +960,7 @@ def test_coding_exit_cannot_promote_unresolved_requirement_to_satisfied(
     reported_status: str,
 ) -> None:
     database = tmp_path / f"unresolved-{reported_status}.sqlite"
-    runtime = Runtime.open(database, config=_config())
+    runtime = Runtime.open(database, config=_v2_config())
     try:
         created = runtime.task_runs.create(
             TaskRunSpecV1(

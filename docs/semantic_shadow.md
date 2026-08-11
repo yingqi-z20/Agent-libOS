@@ -15,7 +15,7 @@ normal Capability and Protected Operation path still owns provider dispatch.
 
 ## Release boundary
 
-Agent libOS 1.4.1 implements:
+Agent libOS 1.4.2 implements:
 
 - a strict, Host-authored `semantic_auto_approval` Task Authority ceiling;
 - a deterministic, pure Shadow broker and a closed action/effect ontology;

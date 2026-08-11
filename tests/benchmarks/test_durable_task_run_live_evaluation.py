@@ -393,6 +393,61 @@ def _find_review(value: Any) -> dict[str, Any] | None:
 
 
 def _completion_evidence(review: dict[str, Any]) -> dict[str, Any]:
+    requirements = review.get("requirements")
+    if not isinstance(requirements, list):
+        return _legacy_completion_evidence(review)
+    assert isinstance(requirements, list) and requirements
+    preferred = [
+        "read_text_file",
+        "run_shell_command",
+        "write_text_file",
+        "git_status",
+        "git_diff",
+        "create_checkpoint",
+        "human_output",
+    ]
+    available = [
+        tool
+        for tool in preferred
+        if tool in review.get("available_evidence_tools", [])
+    ]
+    assert available
+    checks = []
+    for requirement in requirements:
+        eligible = requirement.get("eligible_evidence_tools")
+        evidence_tools = [
+            tool
+            for tool in available
+            if not isinstance(eligible, list) or tool in eligible
+        ]
+        assert evidence_tools
+        checks.append(
+            {
+                "status": "completed",
+                "evidence_tool_calls": evidence_tools,
+                "evidence_summary": (
+                    "The governed pricing requirement was implemented, verified, "
+                    "inspected, checkpointed, and reported by successful tools."
+                ),
+            }
+        )
+    return {
+        "acceptance_checks": checks,
+        "final_verification": [
+            tool
+            for tool in (
+                "run_shell_command",
+                "git_status",
+                "git_diff",
+                "create_checkpoint",
+                "human_output",
+            )
+            if tool in available
+        ],
+    }
+
+
+def _legacy_completion_evidence(review: dict[str, Any]) -> dict[str, Any]:
     goal_oid = str(review["goal"]["oid"])
     message_ids = [str(item) for item in review["acknowledged_human_message_ids"]]
     task_run = review.get("task_run")

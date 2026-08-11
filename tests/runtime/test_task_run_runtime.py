@@ -7972,7 +7972,7 @@ def test_task_run_rejects_extra_binding_during_activate_skill_settlement(
         tampered_activation = tampered_outcome["result"]["result"]["payload"][
             "result"
         ]
-        tampered_activation["tool_ids"]["read_text_file"] = "tool_forged"
+        tampered_activation["skill_id"] = "forged-skill"
         with pytest.raises(
             ValidationError,
             match="does not match durable state",

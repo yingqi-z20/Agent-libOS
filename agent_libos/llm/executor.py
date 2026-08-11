@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, TYPE_CHECKING
@@ -49,6 +50,7 @@ from agent_libos.llm.prompt import (
     build_system_prompt,
     build_user_prompt,
     recover_initial_goal_context,
+    split_cache_optimized_user_prompt,
 )
 from agent_libos.llm.records import observable_llm_call_fields
 from agent_libos.llm.provider_trace import (
@@ -67,6 +69,7 @@ from agent_libos.llm.task_runs import (
     normalize_task_run_prompt_context,
     normalize_validated_action_manifest,
     task_run_contract_message,
+    task_run_dynamic_state_message,
     validated_action_manifest,
 )
 from agent_libos.llm.pending import (
@@ -222,6 +225,7 @@ class _LLMCallState:
     invalid_completion_usage_fields: set[str] = field(default_factory=set)
     provider_trace: dict[str, Any] | None = None
     provider_dispatched: bool = False
+    started_monotonic: float = field(default_factory=time.perf_counter)
     # Runtime-internal, transient identity of the durably committed provider
     # result.  It is populated by the protected-operation observer and lets
     # the Host FlowGraph bind MODEL_OUTPUT to the exact PROVIDER_RESULT row.
@@ -237,6 +241,130 @@ class _LLMCallState:
     @property
     def prepared(self) -> bool:
         return self.resolved is not None and self.client is not None and self.sink is not None
+
+
+def _project_prompt_messages_for_observation(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[int, int], int | None, int | None]:
+    explicit_target: int | None = None
+    partial_prefixes: dict[int, int] = {}
+    leading_static_target: int | None = None
+    leading_static = True
+    projected_messages: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        projected_messages.append(
+            {
+                key: value
+                for key, value in message.items()
+                if key
+                not in {
+                    "_agent_libos_cache_stable",
+                    "_agent_libos_cache_stable_prefix_chars",
+                }
+            }
+        )
+        prefix_chars = message.get("_agent_libos_cache_stable_prefix_chars")
+        if (
+            isinstance(prefix_chars, int)
+            and not isinstance(prefix_chars, bool)
+            and prefix_chars > 0
+        ):
+            partial_prefixes[index] = prefix_chars
+        elif message.get("_agent_libos_cache_stable") is True:
+            explicit_target = index
+        role = str(message.get("role") or "user")
+        if leading_static and role in {"system", "developer"}:
+            leading_static_target = index
+        else:
+            leading_static = False
+    partial_target = max(partial_prefixes, default=None)
+    stable_target = explicit_target
+    if stable_target is None and partial_target is not None:
+        stable_target = partial_target - 1
+    if stable_target is None:
+        stable_target = leading_static_target
+    return projected_messages, partial_prefixes, stable_target, partial_target
+
+
+def _logical_prompt_projection_parts(
+    index: int,
+    message: dict[str, Any],
+    *,
+    prefix_chars: int | None,
+    stable_target: int | None,
+) -> list[tuple[str, dict[str, Any], bool]]:
+    content = message.get("content")
+    if (
+        prefix_chars is None
+        or not isinstance(content, str)
+        or prefix_chars >= len(content)
+    ):
+        return [
+            (
+                "message",
+                message,
+                stable_target is not None and index <= stable_target,
+            )
+        ]
+    prefix_message = dict(message)
+    prefix_message["content"] = content[:prefix_chars]
+    tail_message = dict(message)
+    tail_message["content"] = content[prefix_chars:]
+    return [
+        ("stable_text_prefix", prefix_message, True),
+        ("dynamic_text_tail", tail_message, False),
+    ]
+
+
+def _prompt_projection_segments(
+    messages: list[dict[str, Any]],
+    *,
+    partial_prefixes: dict[int, int],
+    stable_target: int | None,
+) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        logical_parts = _logical_prompt_projection_parts(
+            index,
+            message,
+            prefix_chars=partial_prefixes.get(index),
+            stable_target=stable_target,
+        )
+        for part, logical_message, is_stable in logical_parts:
+            encoded = dumps(to_jsonable(logical_message)).encode("utf-8")
+            segments.append(
+                {
+                    "ordinal": index,
+                    "part": part,
+                    "role": str(message.get("role") or "user"),
+                    "bytes": len(encoded),
+                    "estimated_tokens": estimate_request_input_tokens(
+                        [logical_message],
+                        [],
+                    ),
+                    "sha256": hashlib.sha256(encoded).hexdigest(),
+                    "stable_prefix": is_stable,
+                }
+            )
+    return segments
+
+
+def _stable_prompt_projection_material(
+    messages: list[dict[str, Any]],
+    *,
+    partial_prefixes: dict[int, int],
+    stable_target: int | None,
+    partial_target: int | None,
+) -> list[dict[str, Any]]:
+    if partial_target is None:
+        return messages[: stable_target + 1] if stable_target is not None else []
+    partial_message = dict(messages[partial_target])
+    partial_content = partial_message.get("content")
+    if isinstance(partial_content, str):
+        partial_message["content"] = partial_content[
+            : partial_prefixes[partial_target]
+        ]
+    return [*messages[:partial_target], partial_message]
 
 
 class LLMProcessExecutor:
@@ -697,21 +825,37 @@ class LLMProcessExecutor:
         *,
         system_message: Mapping[str, Any],
         task_context: Mapping[str, Any],
-        current_user_message: Mapping[str, Any] | None = None,
+        current_user_messages: list[Mapping[str, Any]] | None = None,
+        prompt_layout: str = "legacy_v1",
     ) -> list[dict[str, Any]]:
+        contract_message: dict[str, Any] = {
+            "role": "user",
+            "content": task_run_contract_message(
+                task_context,
+                prompt_layout=prompt_layout,
+            ),
+        }
+        if prompt_layout == "cache_optimized_v2":
+            contract_message["_agent_libos_cache_stable"] = True
         messages: list[dict[str, Any]] = [
             dict(system_message),
-            {
-                "role": "user",
-                "content": task_run_contract_message(task_context),
-            },
+            contract_message,
             *[
                 dict(message)
                 for message in task_context["transcript_messages"]
             ],
         ]
-        if current_user_message is not None:
-            messages.append(dict(current_user_message))
+        if prompt_layout == "cache_optimized_v2":
+            dynamic_state = task_run_dynamic_state_message(task_context)
+            if dynamic_state:
+                messages.append({"role": "user", "content": dynamic_state})
+        for current_user_message in current_user_messages or []:
+            selected = dict(current_user_message)
+            # The TaskRun contract is the explicit stable breakpoint. Current
+            # materialization/runtime state stays after transcript history.
+            selected.pop("_agent_libos_cache_stable", None)
+            selected.pop("_agent_libos_cache_stable_prefix_chars", None)
+            messages.append(selected)
         return messages
 
     def _image_only_transcript_anchor(
@@ -1374,7 +1518,7 @@ class LLMProcessExecutor:
         skills: list[dict[str, Any]],
         available_skills: list[dict[str, Any]] | None = None,
         original_goal_context: str | None = None,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         try:
             fallback_json_actions = (
                 self._llms.fallback_json_actions_for_process(pid)
@@ -1383,27 +1527,37 @@ class LLMProcessExecutor:
             # Provider resolution owns the durable fail-closed error path for
             # an unknown profile; prompt construction must not escape it.
             fallback_json_actions = False
-        return [
+        user_prompt = build_user_prompt(
+            process=process,
+            context=context,
+            events=events,
+            capabilities=capabilities,
+            tools=tools,
+            skills=skills,
+            available_skills=available_skills or [],
+            prompt_mode=image.prompt_mode,
+            requestable_capabilities=(
+                self._requestable_capabilities_for_prompt(pid)
+            ),
+            original_goal_context=original_goal_context,
+            fallback_json_actions=fallback_json_actions,
+            prompt_layout=self.config.llm.prompt_layout,
+        )
+        messages: list[dict[str, Any]] = [
             {"role": "system", "content": build_system_prompt(image)},
-            {
-                "role": "user",
-                "content": build_user_prompt(
-                    process=process,
-                    context=context,
-                    events=events,
-                    capabilities=capabilities,
-                    tools=tools,
-                    skills=skills,
-                    available_skills=available_skills or [],
-                    prompt_mode=image.prompt_mode,
-                    requestable_capabilities=(
-                        self._requestable_capabilities_for_prompt(pid)
-                    ),
-                    original_goal_context=original_goal_context,
-                    fallback_json_actions=fallback_json_actions,
-                ),
-            },
         ]
+        user_message: dict[str, Any] = {
+            "role": "user",
+            "content": user_prompt,
+        }
+        if self.config.llm.prompt_layout == "cache_optimized_v2":
+            stable, dynamic = split_cache_optimized_user_prompt(user_prompt)
+            if stable and dynamic:
+                user_message["_agent_libos_cache_stable_prefix_chars"] = len(
+                    stable
+                )
+        messages.append(user_message)
+        return messages
 
     def _assemble_llm_request(
         self,
@@ -1514,7 +1668,8 @@ class LLMProcessExecutor:
             messages = self._task_run_messages(
                 system_message=messages[0],
                 task_context=task_context,
-                current_user_message=messages[1],
+                current_user_messages=messages[1:],
+                prompt_layout=self.config.llm.prompt_layout,
             )
         input_refs = list(context.object_refs)
         if (
@@ -1590,6 +1745,7 @@ class LLMProcessExecutor:
                     "content": build_system_prompt(image),
                 },
                 task_context=task_context,
+                prompt_layout=self.config.llm.prompt_layout,
             )
             flow_context = self._include_task_run_labels(
                 self._data_flow.context_from_materialization(pid, context),
@@ -5209,9 +5365,24 @@ class LLMProcessExecutor:
                     if isinstance(client, LLMClient)
                     else None
                 ),
+                "prompt_layout": self.config.llm.prompt_layout,
+                "openai_prompt_cache_mode_configured": (
+                    client.prompt_cache_mode
+                    if isinstance(client, LLMClient)
+                    else "provider_default"
+                ),
+                "openai_prompt_cache_ttl_configured": (
+                    client.prompt_cache_ttl
+                    if isinstance(client, LLMClient)
+                    else None
+                ),
                 "openai_prompt_cache_key_sent": None,
                 "openai_prompt_cache_options_sent": None,
                 "openai_prompt_cache_retention": None,
+                "openai_prompt_cache_mode": None,
+                "openai_prompt_cache_ttl": None,
+                "openai_prompt_cache_breakpoint_count": None,
+                "openai_prompt_cache_downgrade_reason": None,
                 "openai_safety_identifier_configured": bool(
                     isinstance(client, LLMClient) and client.safety_identifier
                 ),
@@ -6260,6 +6431,10 @@ class LLMProcessExecutor:
         if not preserve_domain_text:
             public_error, internal_error = self._llm_error_artifacts(error)
             selected_error = public_error["message"]
+        state.request_options["llm_latency_ms"] = max(
+            0,
+            int((time.perf_counter() - state.started_monotonic) * 1000),
+        )
         observable = observable_llm_call_fields(
             messages=state.request_messages,
             tools=state.tools,
@@ -6326,6 +6501,10 @@ class LLMProcessExecutor:
         completion: Any,
     ) -> tuple[Any, bool, bool, bool, str, str]:
         self._prepare_image_only_transcript_record(state, completion)
+        state.request_options["llm_latency_ms"] = max(
+            0,
+            int((time.perf_counter() - state.started_monotonic) * 1000),
+        )
         usage = dict(state.completion_usage)
         invalid_usage_fields = set(state.invalid_completion_usage_fields)
         self._record_effective_provider_request_options(state, completion)
@@ -6673,16 +6852,43 @@ class LLMProcessExecutor:
             state.request_options["openai_safety_identifier_sent"] = (
                 effective.get("safety_identifier_sent") is True
             )
+            state.request_options["openai_prompt_cache_mode"] = (
+                effective.get("prompt_cache_mode")
+                if effective.get("prompt_cache_mode")
+                in {"provider_default", "implicit", "explicit"}
+                else "provider_default"
+            )
+            state.request_options["openai_prompt_cache_ttl"] = (
+                "30m" if effective.get("prompt_cache_ttl") == "30m" else None
+            )
+            breakpoint_count = effective.get("prompt_cache_breakpoint_count")
+            state.request_options["openai_prompt_cache_breakpoint_count"] = (
+                breakpoint_count
+                if isinstance(breakpoint_count, int) and breakpoint_count >= 0
+                else 0
+            )
 
         removed = getattr(completion, "compatibility_removed_options", None)
         if isinstance(removed, (list, tuple, set)):
-            state.request_options["openai_compatibility_removed_options"] = sorted(
+            removed_options = sorted(
                 {
                     item
                     for item in removed
                     if isinstance(item, str) and 0 < len(item) <= 64
                 }
             )[:32]
+            state.request_options["openai_compatibility_removed_options"] = (
+                removed_options
+            )
+            if {
+                "prompt_cache_key",
+                "prompt_cache_retention",
+                "prompt_cache_options",
+                "prompt_cache_breakpoint",
+            } & set(removed_options):
+                state.request_options["openai_prompt_cache_downgrade_reason"] = (
+                    "provider_rejected_cache_options"
+                )
 
     def _fallback_json_action_was_used(
         self,
@@ -6720,6 +6926,13 @@ class LLMProcessExecutor:
         )
         state.max_total_tokens_per_call = int(
             resolved.max_total_tokens_per_call
+        )
+        state.request_options["prompt_projection"] = (
+            self._prompt_projection_observation(
+                state.request_messages,
+                state.tools,
+                layout=self.config.llm.prompt_layout,
+            )
         )
         state.estimated_input_tokens = estimate_request_input_tokens(
             state.request_messages,
@@ -7357,6 +7570,48 @@ class LLMProcessExecutor:
             else:
                 non_strict += 1
         return {"strict": strict, "non_strict": non_strict}
+
+    @staticmethod
+    def _prompt_projection_observation(
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        layout: str,
+    ) -> dict[str, Any]:
+        """Measure the model projection without retaining additional plaintext."""
+
+        (
+            projected_messages,
+            partial_prefixes,
+            stable_target,
+            partial_target,
+        ) = _project_prompt_messages_for_observation(messages)
+        segments = _prompt_projection_segments(
+            projected_messages,
+            partial_prefixes=partial_prefixes,
+            stable_target=stable_target,
+        )
+        tools_encoded = dumps(to_jsonable(tools)).encode("utf-8")
+        stable_material = _stable_prompt_projection_material(
+            projected_messages,
+            partial_prefixes=partial_prefixes,
+            stable_target=stable_target,
+            partial_target=partial_target,
+        )
+        return {
+            "schema_version": 1,
+            "layout": layout,
+            "segments": segments,
+            "tools": {
+                "bytes": len(tools_encoded),
+                "estimated_tokens": estimate_request_input_tokens([], tools),
+                "sha256": hashlib.sha256(tools_encoded).hexdigest(),
+            },
+            "stable_prefix_message_count": len(stable_material),
+            "stable_prefix_sha256": hashlib.sha256(
+                dumps(to_jsonable(stable_material)).encode("utf-8")
+            ).hexdigest(),
+        }
 
     async def _complete_action(
         self,

@@ -40,6 +40,10 @@ from agent_libos.utils.serde import to_jsonable
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 _API_MODES = {"auto", "responses", "chat"}
+_PROMPT_CACHE_MODES = {"provider_default", "implicit", "explicit"}
+_CACHE_STABLE_MESSAGE_KEY = "_agent_libos_cache_stable"
+_CACHE_STABLE_PREFIX_CHARS_KEY = "_agent_libos_cache_stable_prefix_chars"
+_CACHE_STABLE_PROJECTION_KEY = "_agent_libos_cache_stable_projection"
 _ACTIVE_PROVIDER_TRACE: contextvars.ContextVar[ProviderTraceBuilder | None] = (
     contextvars.ContextVar("agent_libos_provider_trace", default=None)
 )
@@ -119,6 +123,8 @@ class LLMClient:
     safety_identifier: str | None = None
     prompt_cache_key: str | None = None
     prompt_cache_retention: Literal["in_memory", "24h"] | None = None
+    prompt_cache_mode: Literal["provider_default", "implicit", "explicit"] | None = None
+    prompt_cache_ttl: Literal["30m"] | None = None
     responses_previous_response_id: bool | None = None
     parallel_tool_calls: bool | None = None
     fallback_json_actions: bool | None = None
@@ -143,6 +149,24 @@ class LLMClient:
             if self.prompt_cache_retention is None
             else self.prompt_cache_retention,
             label="prompt_cache_retention",
+        )
+        self.prompt_cache_mode = _normalize_prompt_cache_mode(
+            self.defaults.prompt_cache_mode
+            if self.prompt_cache_mode is None
+            else self.prompt_cache_mode,
+            label="prompt_cache_mode",
+        )
+        self.prompt_cache_ttl = _normalize_prompt_cache_ttl(
+            self.defaults.prompt_cache_ttl
+            if self.prompt_cache_ttl is None
+            else self.prompt_cache_ttl,
+            label="prompt_cache_ttl",
+        )
+        _validate_prompt_cache_options(
+            mode=self.prompt_cache_mode,
+            key=self.prompt_cache_key,
+            retention=self.prompt_cache_retention,
+            ttl=self.prompt_cache_ttl,
         )
         self.responses_previous_response_id = (
             self.defaults.responses_previous_response_id
@@ -202,6 +226,14 @@ class LLMClient:
             prompt_cache_retention=(
                 _prompt_cache_retention_env_from(env, "OPENAI_PROMPT_CACHE_RETENTION")
                 or defaults.prompt_cache_retention
+            ),
+            prompt_cache_mode=(
+                _prompt_cache_mode_env_from(env, "OPENAI_PROMPT_CACHE_MODE")
+                or defaults.prompt_cache_mode
+            ),
+            prompt_cache_ttl=(
+                _prompt_cache_ttl_env_from(env, "OPENAI_PROMPT_CACHE_TTL")
+                or defaults.prompt_cache_ttl
             ),
             responses_previous_response_id=_bool_env_from(
                 env,
@@ -818,8 +850,13 @@ class LLMClient:
             and self._use_openai_request_options()
             and not _messages_have_unrepresentable_tool_output(messages)
         )
-        instructions, input_items = _messages_to_responses_parts(
+        provider_messages = _messages_for_provider(
             messages,
+            api="responses",
+            add_cache_breakpoint=self.prompt_cache_mode == "explicit",
+        )
+        instructions, input_items = _messages_to_responses_parts(
+            provider_messages,
             native_tool_outputs=will_use_previous_response_id,
             tool_output_max_chars=self.defaults.tool_output_prompt_max_chars,
         )
@@ -832,6 +869,10 @@ class LLMClient:
         }
         if instructions:
             payload["instructions"] = instructions
+        if self.prompt_cache_mode == "implicit":
+            payload[_CACHE_STABLE_PROJECTION_KEY] = (
+                _host_stable_message_projection(messages)
+            )
         if temperature is not None:
             payload["temperature"] = temperature
         if will_use_previous_response_id:
@@ -853,7 +894,11 @@ class LLMClient:
 
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": _messages_for_provider(
+                messages,
+                api="chat",
+                add_cache_breakpoint=self.prompt_cache_mode == "explicit",
+            ),
             "temperature": temperature,
             "max_completion_tokens": max_tokens,
         }
@@ -863,6 +908,10 @@ class LLMClient:
             payload["reasoning_effort"] = self.reasoning_effort
         if self.verbosity:
             payload["verbosity"] = self.verbosity
+        if self.prompt_cache_mode == "implicit":
+            payload[_CACHE_STABLE_PROJECTION_KEY] = (
+                _host_stable_message_projection(messages)
+            )
         self._add_provider_request_options(payload)
         extra_body = self._extra_body()
         if extra_body:
@@ -870,10 +919,12 @@ class LLMClient:
         return payload
 
     async def _create_response(self, payload: dict[str, Any]) -> _ProviderCallResult:
+        self._finalize_prompt_cache_request(payload)
         async with self._async_client_scope() as client:
             return await self._call_with_compatibility(client.responses.create, payload, api="responses")
 
     async def _create_chat_completion(self, payload: dict[str, Any]) -> _ProviderCallResult:
+        self._finalize_prompt_cache_request(payload)
         async with self._async_client_scope() as client:
             return await self._call_with_compatibility(client.chat.completions.create, payload, api="chat")
 
@@ -917,6 +968,11 @@ class LLMClient:
                 removed_options.update(
                     key for key in request if key not in retry
                 )
+                if (
+                    _prompt_cache_breakpoint_count(retry)
+                    < _prompt_cache_breakpoint_count(request)
+                ):
+                    removed_options.add("prompt_cache_breakpoint")
                 request = retry
         assert last_error is not None
         raise _openai_sdk_request_error(last_error) from last_error
@@ -958,7 +1014,12 @@ class LLMClient:
             return response, sequence
         raise AssertionError("unreachable Provider retry loop")
 
-    def _compatibility_retry_payload(self, payload: dict[str, Any], exc: Exception, api: str) -> dict[str, Any] | None:
+    def _compatibility_retry_payload(
+        self,
+        payload: dict[str, Any],
+        exc: Exception,
+        api: str,
+    ) -> dict[str, Any] | None:
         message = str(exc).lower()
         retry = dict(payload)
 
@@ -976,42 +1037,14 @@ class LLMClient:
         if "strict" in message and isinstance(retry.get("tools"), list):
             retry["tools"] = _tools_without_strict(retry["tools"])
             return retry
-        for key in (
-            "parallel_tool_calls",
-            "response_format",
-            "temperature",
-            "store",
-            "reasoning",
-            "reasoning_effort",
-            "previous_response_id",
-            "prompt_cache_key",
-            "prompt_cache_retention",
-            # GPT-5.6+ uses this newer option instead of retention. Agent
-            # libOS does not emit it until it can also model explicit content
-            # breakpoints, but compatible callers must still downgrade safely.
-            "prompt_cache_options",
-            "safety_identifier",
-        ):
-            if key in message and key in retry:
-                retry.pop(key, None)
-                return retry
-        if "verbosity" in message:
-            if "verbosity" in retry:
-                retry.pop("verbosity", None)
-                return retry
-            text = retry.get("text")
-            if isinstance(text, dict) and "verbosity" in text:
-                updated_text = dict(text)
-                updated_text.pop("verbosity", None)
-                retry["text"] = updated_text
-                return retry
-        if ("text" in message or "json_schema" in message or "json_object" in message) and "text" in retry:
-            retry.pop("text", None)
-            return retry
-        if "response_format" in message and "response_format" in retry:
-            retry.pop("response_format", None)
-            return retry
-        return None
+        cache_retry = _prompt_cache_compatibility_retry(
+            retry,
+            message,
+            enabled=self.prompt_cache_mode != "provider_default",
+        )
+        if cache_retry is not None:
+            return cache_retry
+        return _generic_compatibility_retry(retry, message)
 
     def _completion_from_response(
         self,
@@ -1252,7 +1285,12 @@ class LLMClient:
             payload["safety_identifier"] = self.safety_identifier
         if self.prompt_cache_key:
             payload["prompt_cache_key"] = self.prompt_cache_key
-        if self.prompt_cache_retention:
+        if self.prompt_cache_mode != "provider_default":
+            options: dict[str, str] = {"mode": str(self.prompt_cache_mode)}
+            if self.prompt_cache_ttl is not None:
+                options["ttl"] = self.prompt_cache_ttl
+            payload["prompt_cache_options"] = options
+        elif self.prompt_cache_retention:
             # Normalize again at the provider boundary so even a caller that
             # mutates the dataclass after construction can never dispatch the
             # retired hyphenated spelling.
@@ -1262,6 +1300,52 @@ class LLMClient:
             )
             self.prompt_cache_retention = selected_retention
             payload["prompt_cache_retention"] = selected_retention
+
+    def _finalize_prompt_cache_request(self, payload: dict[str, Any]) -> None:
+        """Bind an opt-in cache key to the stable prefix and tool set.
+
+        The configured key is a Host privacy/routing domain.  Hashing it with
+        the exact marked prefix and normalized tools avoids per-Run identifiers
+        while keeping unrelated prompt families off the same hot routing key.
+        Legacy/provider-default behavior preserves the configured key verbatim.
+        """
+
+        host_stable = payload.pop(_CACHE_STABLE_PROJECTION_KEY, None)
+        if self.prompt_cache_mode == "provider_default":
+            return
+        base_key = payload.get("prompt_cache_key")
+        if not isinstance(base_key, str) or not base_key:
+            raise LLMError(
+                "prompt_cache_key is required for implicit or explicit prompt caching"
+            )
+        if base_key.startswith("alibos:v2:"):
+            return
+        stable = (
+            host_stable
+            if host_stable is not None
+            else _stable_prompt_cache_projection(payload)
+        )
+        if stable is None:
+            raise LLMError(
+                "prompt cache mode requires one stable prompt_cache_breakpoint"
+            )
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "version": 2,
+                    "domain": base_key,
+                    "provider": str(self.base_url or "https://api.openai.com/v1"),
+                    "model": payload.get("model"),
+                    "stable_prefix": stable,
+                    "tools": payload.get("tools", []),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        payload["prompt_cache_key"] = f"alibos:v2:{digest[:54]}"
 
     def _use_openai_request_options(self) -> bool:
         return self.base_url is None or _is_openai_base_url(self.base_url)
@@ -1518,6 +1602,224 @@ def _reject_active_provider_sequence(
         trace.limited = True
 
 
+def _prompt_cache_compatibility_retry(
+    payload: dict[str, Any],
+    message: str,
+    *,
+    enabled: bool,
+) -> dict[str, Any] | None:
+    cache_option_error = any(
+        option in message
+        for option in (
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "prompt_cache_options",
+            "prompt_cache_breakpoint",
+        )
+    )
+    if not cache_option_error or not enabled:
+        return None
+    retry = dict(payload)
+    retry.pop("prompt_cache_key", None)
+    retry.pop("prompt_cache_retention", None)
+    retry.pop("prompt_cache_options", None)
+    return _without_prompt_cache_breakpoints(retry)
+
+
+def _generic_compatibility_retry(
+    payload: dict[str, Any],
+    message: str,
+) -> dict[str, Any] | None:
+    retry = dict(payload)
+    for key in (
+        "parallel_tool_calls",
+        "response_format",
+        "temperature",
+        "store",
+        "reasoning",
+        "reasoning_effort",
+        "previous_response_id",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "prompt_cache_options",
+        "safety_identifier",
+    ):
+        if key in message and key in retry:
+            retry.pop(key, None)
+            return retry
+    if "verbosity" in message:
+        if "verbosity" in retry:
+            retry.pop("verbosity", None)
+            return retry
+        text = retry.get("text")
+        if isinstance(text, dict) and "verbosity" in text:
+            updated_text = dict(text)
+            updated_text.pop("verbosity", None)
+            retry["text"] = updated_text
+            return retry
+    if (
+        any(option in message for option in ("text", "json_schema", "json_object"))
+        and "text" in retry
+    ):
+        retry.pop("text", None)
+        return retry
+    if "response_format" in message and "response_format" in retry:
+        retry.pop("response_format", None)
+        return retry
+    return None
+
+
+def _messages_for_provider(
+    messages: list[dict[str, Any]],
+    *,
+    api: Literal["responses", "chat"],
+    add_cache_breakpoint: bool,
+) -> list[dict[str, Any]]:
+    """Remove Host-only message metadata and mark one stable text block."""
+
+    selected, explicit_target, prefix_chars, leading_static_target = (
+        _prepare_provider_messages(messages)
+    )
+    if not add_cache_breakpoint or not selected:
+        return selected
+    target = explicit_target if explicit_target is not None else leading_static_target
+    if target is None:
+        return selected
+    _attach_cache_breakpoint(
+        selected[target],
+        api=api,
+        stable_prefix_chars=prefix_chars.get(target),
+    )
+    return selected
+
+
+def _prepare_provider_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int | None, dict[int, int], int | None]:
+    selected: list[dict[str, Any]] = []
+    explicit_target: int | None = None
+    stable_prefix_chars: dict[int, int] = {}
+    leading_static_target: int | None = None
+    leading_static = True
+    for index, message in enumerate(messages):
+        copied = {
+            key: value
+            for key, value in message.items()
+            if key not in {
+                _CACHE_STABLE_MESSAGE_KEY,
+                _CACHE_STABLE_PREFIX_CHARS_KEY,
+            }
+        }
+        selected.append(copied)
+        prefix_chars = message.get(_CACHE_STABLE_PREFIX_CHARS_KEY)
+        if (
+            isinstance(prefix_chars, int)
+            and not isinstance(prefix_chars, bool)
+            and prefix_chars > 0
+        ):
+            stable_prefix_chars[index] = prefix_chars
+            explicit_target = index
+        elif message.get(_CACHE_STABLE_MESSAGE_KEY) is True:
+            explicit_target = index
+        role = str(message.get("role") or "user")
+        if leading_static and role in {"system", "developer"}:
+            leading_static_target = index
+        else:
+            leading_static = False
+    return selected, explicit_target, stable_prefix_chars, leading_static_target
+
+
+def _attach_cache_breakpoint(
+    message: dict[str, Any],
+    *,
+    api: Literal["responses", "chat"],
+    stable_prefix_chars: int | None,
+) -> None:
+    content = message.get("content")
+    block_type = "input_text" if api == "responses" else "text"
+    breakpoint = {"mode": "explicit"}
+    if isinstance(content, str):
+        if not content:
+            return
+        if stable_prefix_chars is not None and stable_prefix_chars < len(content):
+            message["content"] = [
+                {
+                    "type": block_type,
+                    "text": content[:stable_prefix_chars],
+                    "prompt_cache_breakpoint": breakpoint,
+                },
+                {
+                    "type": block_type,
+                    "text": content[stable_prefix_chars:],
+                },
+            ]
+            return
+        message["content"] = [
+            {
+                "type": block_type,
+                "text": content,
+                "prompt_cache_breakpoint": breakpoint,
+            }
+        ]
+        return
+    if not isinstance(content, list):
+        return
+    copied_parts = [dict(part) if isinstance(part, dict) else part for part in content]
+    for part_index in range(len(copied_parts) - 1, -1, -1):
+        part = copied_parts[part_index]
+        if not isinstance(part, dict) or not isinstance(part.get("text"), str):
+            continue
+        part = dict(part)
+        part["type"] = block_type
+        part["prompt_cache_breakpoint"] = breakpoint
+        copied_parts[part_index] = part
+        message["content"] = copied_parts
+        return
+
+
+def _host_stable_message_projection(
+    messages: list[dict[str, Any]],
+) -> dict[str, Any] | list[dict[str, Any]] | None:
+    """Return the routing-stable prompt family without private markers."""
+
+    explicit_target: int | None = None
+    leading_static_target: int | None = None
+    leading_static = True
+    selected: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        selected.append(
+            {
+                key: value
+                for key, value in message.items()
+                if key not in {
+                    _CACHE_STABLE_MESSAGE_KEY,
+                    _CACHE_STABLE_PREFIX_CHARS_KEY,
+                }
+            }
+        )
+        prefix_chars = message.get(_CACHE_STABLE_PREFIX_CHARS_KEY)
+        if (
+            isinstance(prefix_chars, int)
+            and not isinstance(prefix_chars, bool)
+            and prefix_chars > 0
+        ):
+            explicit_target = index
+        elif message.get(_CACHE_STABLE_MESSAGE_KEY) is True:
+            explicit_target = index
+        role = str(message.get("role") or "user")
+        if leading_static and role in {"system", "developer"}:
+            leading_static_target = index
+        else:
+            leading_static = False
+    if leading_static_target is not None:
+        return {
+            "leading_instructions": selected[: leading_static_target + 1],
+        }
+    if explicit_target is None:
+        return None
+    return selected[: explicit_target + 1]
+
+
 def _messages_to_responses_parts(
     messages: list[dict[str, Any]],
     *,
@@ -1529,8 +1831,18 @@ def _messages_to_responses_parts(
     represented_call_ids: set[str] = set()
     for message in messages:
         role = str(message.get("role", "user"))
+        raw_content = message.get("content")
         content = _message_content_for_search(message)
         if role in {"system", "developer"}:
+            if _content_has_prompt_cache_breakpoint(raw_content):
+                input_items.append(
+                    {
+                        "type": "message",
+                        "role": role,
+                        "content": raw_content,
+                    }
+                )
+                continue
             if content:
                 instructions.append(content)
             continue
@@ -1573,10 +1885,124 @@ def _messages_to_responses_parts(
         input_items.append(
             {
                 "role": "assistant" if role == "assistant" else "user",
-                "content": content,
+                "content": (
+                    raw_content
+                    if _content_has_prompt_cache_breakpoint(raw_content)
+                    else content
+                ),
             }
         )
     return ("\n\n".join(instructions) if instructions else None), input_items
+
+
+def _content_has_prompt_cache_breakpoint(value: Any) -> bool:
+    return isinstance(value, list) and any(
+        isinstance(part, dict) and "prompt_cache_breakpoint" in part
+        for part in value
+    )
+
+
+def _prompt_cache_breakpoint_count(payload: dict[str, Any]) -> int:
+    count = 0
+    for container_key in ("messages", "input"):
+        entries = payload.get(container_key)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            content = entry.get("content")
+            if isinstance(content, list):
+                count += sum(
+                    1
+                    for part in content
+                    if isinstance(part, dict)
+                    and "prompt_cache_breakpoint" in part
+                )
+    return count
+
+
+def _without_prompt_cache_breakpoints(payload: dict[str, Any]) -> dict[str, Any]:
+    selected = dict(payload)
+    for container_key in ("messages", "input"):
+        entries = selected.get(container_key)
+        if not isinstance(entries, list):
+            continue
+        updated_entries: list[Any] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                updated_entries.append(entry)
+                continue
+            updated_entry = dict(entry)
+            content = updated_entry.get("content")
+            if isinstance(content, list):
+                updated_content: list[Any] = []
+                for part in content:
+                    if isinstance(part, dict):
+                        updated_part = dict(part)
+                        updated_part.pop("prompt_cache_breakpoint", None)
+                        updated_content.append(updated_part)
+                    else:
+                        updated_content.append(part)
+                updated_entry["content"] = updated_content
+            updated_entries.append(updated_entry)
+        selected[container_key] = updated_entries
+    return selected
+
+
+def _stable_prompt_cache_projection(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the invariant routing family, falling back to the breakpoint."""
+
+    instructions = payload.get("instructions")
+    for container_key in ("messages", "input"):
+        entries = payload.get(container_key)
+        if not isinstance(entries, list):
+            continue
+        leading: list[Any] = []
+        for entry in entries:
+            if not isinstance(entry, dict) or str(entry.get("role") or "") not in {
+                "system",
+                "developer",
+            }:
+                break
+            leading.append(entry)
+        if instructions not in (None, "", [], {}) or leading:
+            return {
+                "instructions": instructions,
+                "leading_messages": leading,
+            }
+
+    for container_key in ("messages", "input"):
+        entries = payload.get(container_key)
+        if not isinstance(entries, list):
+            continue
+        prefix: list[Any] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                prefix.append(entry)
+                continue
+            content = entry.get("content")
+            if not isinstance(content, list):
+                prefix.append(entry)
+                continue
+            before: list[Any] = []
+            found = False
+            for part in content:
+                before.append(part)
+                if isinstance(part, dict) and "prompt_cache_breakpoint" in part:
+                    found = True
+                    break
+            if found:
+                marked_entry = dict(entry)
+                marked_entry["content"] = before
+                prefix.append(marked_entry)
+                return {
+                    "instructions": payload.get("instructions"),
+                    "container": container_key,
+                    "prefix": prefix,
+                }
+            prefix.append(entry)
+    return None
 
 
 def _responses_assistant_items(
@@ -1691,12 +2117,33 @@ def _provider_request_option_observation(
 ) -> dict[str, Any]:
     """Return non-secret facts about the request that actually succeeded."""
 
-    return {
+    cache_options = request.get("prompt_cache_options")
+    cache_mode = (
+        cache_options.get("mode")
+        if isinstance(cache_options, dict)
+        else "provider_default"
+    )
+    cache_ttl = (
+        cache_options.get("ttl")
+        if isinstance(cache_options, dict)
+        else None
+    )
+    observation = {
         "prompt_cache_key_sent": "prompt_cache_key" in request,
         "prompt_cache_retention": request.get("prompt_cache_retention"),
         "prompt_cache_options_sent": "prompt_cache_options" in request,
         "safety_identifier_sent": "safety_identifier" in request,
     }
+    breakpoint_count = _prompt_cache_breakpoint_count(request)
+    if "prompt_cache_options" in request or breakpoint_count:
+        observation.update(
+            {
+                "prompt_cache_mode": cache_mode,
+                "prompt_cache_ttl": cache_ttl,
+                "prompt_cache_breakpoint_count": breakpoint_count,
+            }
+        )
+    return observation
 
 
 def _is_openai_sdk_error(exc: Exception) -> bool:
@@ -2176,6 +2623,26 @@ def _prompt_cache_retention_env_from(env: dict[str, str], name: str) -> Literal[
     return _normalize_prompt_cache_retention(value, label=name)
 
 
+def _prompt_cache_mode_env_from(
+    env: dict[str, str],
+    name: str,
+) -> Literal["provider_default", "implicit", "explicit"] | None:
+    value = _optional_env_from(env, name)
+    if value is None:
+        return None
+    return _normalize_prompt_cache_mode(value, label=name)
+
+
+def _prompt_cache_ttl_env_from(
+    env: dict[str, str],
+    name: str,
+) -> Literal["30m"] | None:
+    value = _optional_env_from(env, name)
+    if value is None:
+        return None
+    return _normalize_prompt_cache_ttl(value, label=name)
+
+
 def _normalize_prompt_cache_retention(
     value: str | None,
     *,
@@ -2189,6 +2656,57 @@ def _normalize_prompt_cache_retention(
     if normalized not in {"in_memory", "24h"}:
         raise LLMError(f"{label} must be one of in_memory, 24h; got {value!r}")
     return normalized  # type: ignore[return-value]
+
+
+def _normalize_prompt_cache_mode(
+    value: str,
+    *,
+    label: str,
+) -> Literal["provider_default", "implicit", "explicit"]:
+    normalized = str(value).strip().lower()
+    if normalized not in _PROMPT_CACHE_MODES:
+        raise LLMError(
+            f"{label} must be one of provider_default, implicit, explicit; got {value!r}"
+        )
+    return normalized  # type: ignore[return-value]
+
+
+def _normalize_prompt_cache_ttl(
+    value: str | None,
+    *,
+    label: str,
+) -> Literal["30m"] | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized != "30m":
+        raise LLMError(f"{label} must be 30m or unset; got {value!r}")
+    return "30m"
+
+
+def _validate_prompt_cache_options(
+    *,
+    mode: str,
+    key: str | None,
+    retention: str | None,
+    ttl: str | None,
+) -> None:
+    if retention is not None and ttl is not None:
+        raise LLMError(
+            "prompt_cache_retention and prompt_cache_ttl are mutually exclusive"
+        )
+    if mode != "provider_default" and not str(key or "").strip():
+        raise LLMError(
+            "prompt_cache_key is required for implicit or explicit prompt caching"
+        )
+    if mode == "provider_default" and ttl is not None:
+        raise LLMError(
+            "prompt_cache_ttl requires implicit or explicit prompt_cache_mode"
+        )
+    if mode != "provider_default" and retention is not None:
+        raise LLMError(
+            "prompt_cache_retention cannot be combined with implicit or explicit mode"
+        )
 
 
 def _run_sync(awaitable: Any) -> Any:

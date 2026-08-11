@@ -43,9 +43,8 @@ Pass a non-empty `reason` and optional target `pid` (default: caller). The reaso
 must be at most 512 Unicode characters **and** at most 1,024 UTF-8 bytes; both
 limits apply, so non-ASCII text can hit the byte limit first. The complete
 validated reason is persisted, but the returned `reason` is only a bounded
-model-observability preview and may end in `…[truncated]`. Preserve and prefer
-the returned `checkpoint_id` and `pid`; never reconstruct the durable reason
-from its preview.
+model-observability preview and may end in `…[truncated]`. Model-visible success
+omits Host ids; list only when a later operation needs selection.
 
 Creation captures that PID's whole current subtree. Every target requires exact
 `write` on `checkpoint:process:<pid>`; the caller normally already has that
@@ -60,17 +59,21 @@ proof of external idleness. Size limits reject atomically, so require the id.
 
 List `pid` (default: caller), newest first, with process-checkpoint read. The
 schema publishes Host `checkpoint.list_limit` as both the default and maximum;
-the run path also bounds a supplied value to that Host cap. Each item is a strict
-six-field allowlist: `checkpoint_id`, `pid`, preview-only `reason`, `created_at`,
-`created_by`, and `snapshot_version`.
+the run path also bounds a supplied value to that Host cap. Durable items retain
+their six-field identity envelope. The model view uses `only` for one candidate
+and exact ids only to select among multiple candidates. Pass
+`checkpoint_id=only` for the sole candidate; it fails closed if the set changes.
 
 `count` is the number observed in the Host-bounded lookup window, not a global
 total and not necessarily `len(checkpoints)` when a smaller limit was requested.
 `has_more=true` only says that raising this call's limit up to the Host cap can
 expose more rows from that window. There is no cursor, and `has_more=false` at
-the cap does not prove older durable rows do not exist. Retain important ids.
+the cap does not prove older durable rows do not exist.
 Exact read on another known checkpoint does not make it listable without owner-
 process read; inspect/diff the known id.
+
+Never copy Host bookkeeping into final output or completion evidence; report
+semantic checkpoint outcomes.
 
 ### `inspect_checkpoint`
 

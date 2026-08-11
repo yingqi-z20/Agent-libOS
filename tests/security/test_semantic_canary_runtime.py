@@ -4,12 +4,13 @@ import hashlib
 import hmac
 import json
 import subprocess
+import time
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -307,6 +308,24 @@ def _non_catalog_approval_payload(
 def _drain_semantic(runtime: Runtime) -> None:
     while runtime.semantic.process_one():
         pass
+
+
+def _drain_semantic_until(
+    runtime: Runtime,
+    done: Callable[[], bool],
+    *,
+    timeout_s: float = 5.0,
+) -> None:
+    """Drain a stopped worker while asynchronous capture finishes publishing."""
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        progressed = runtime.semantic.process_one()
+        if done():
+            return
+        if not progressed:
+            time.sleep(0.01)
+    pytest.fail("semantic work did not reach the expected state before timeout")
 
 
 def _json_text(value: Any) -> str:
@@ -742,7 +761,10 @@ def test_external_shadow_assesses_five_domains_and_ceiling_miss_without_settleme
                 ),
             )
         )
-        _drain_semantic(runtime)
+        _drain_semantic_until(
+            runtime,
+            lambda: len(client.calls) == len(request_ids),
+        )
 
         assert len(client.calls) == len(request_ids)
         for request_id in request_ids:
@@ -1588,7 +1610,7 @@ def test_real_runtime_canary_exact_read_is_atomic_consumed_and_not_replayable() 
         root = Path(temp_dir)
         target = root / "reports" / "canary.txt"
         target.parent.mkdir(parents=True)
-        target.write_text("reviewed canary input\n", encoding="utf-8")
+        target.write_bytes(b"reviewed canary input\n")
         client = _SuccessfulSemanticClient()
         runtime = Runtime.open(
             "local",

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
+from agent_libos.config import DEFAULT_CONFIG
 from benchmarks.long_horizon_agent import report_all_successful, run_evaluation
 from benchmarks.long_horizon_agent.runner import (
     DEFAULT_MAX_QUANTA,
@@ -53,6 +55,12 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Exit non-zero unless every durable task-state oracle passes.",
     )
+    parser.add_argument(
+        "--prompt-layout",
+        choices=("legacy_v1", "cache_optimized_v2"),
+        default=DEFAULT_CONFIG.llm.prompt_layout,
+        help="Model prompt layout used for this paired evaluation arm.",
+    )
     args = parser.parse_args(argv)
     if not args.confirm_real_llm:
         parser.error("--confirm-real-llm is required to spend real LLM tokens")
@@ -61,6 +69,10 @@ def main(argv: list[str] | None = None) -> None:
             "OPENAI_API_KEY and OPENAI_LANGUAGE_MODEL or OPENAI_MODEL are required"
         )
     output = Path(args.output).resolve()
+    config = replace(
+        DEFAULT_CONFIG,
+        llm=replace(DEFAULT_CONFIG.llm, prompt_layout=args.prompt_layout),
+    )
     artifacts_root = (
         Path(args.artifacts_root).resolve() if args.artifacts_root else None
     )
@@ -79,6 +91,7 @@ def main(argv: list[str] | None = None) -> None:
                 repetitions=args.repetitions,
                 phase_one_quanta=args.phase_one_quanta,
                 max_quanta=args.max_quanta,
+                config=config,
             )
             report["artifacts_root"] = str(artifacts_root)
         else:
@@ -90,6 +103,7 @@ def main(argv: list[str] | None = None) -> None:
                     repetitions=args.repetitions,
                     phase_one_quanta=args.phase_one_quanta,
                     max_quanta=args.max_quanta,
+                    config=config,
                 )
         rendered = artifact.commit(report)
     print(rendered, end="")

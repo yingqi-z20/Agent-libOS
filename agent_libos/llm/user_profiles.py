@@ -33,6 +33,7 @@ _STRING_LIMITS = {
 }
 _API_MODES = {"auto", "responses", "chat"}
 _VERBOSITY = {"low", "medium", "high"}
+_PROMPT_CACHE_MODES = {"provider_default", "implicit", "explicit"}
 _USER_PROFILE_FIELDS = (
     "kind",
     "base_url",
@@ -46,6 +47,8 @@ _USER_PROFILE_FIELDS = (
     "verbosity",
     "safety_identifier_env",
     "prompt_cache_retention",
+    "prompt_cache_mode",
+    "prompt_cache_ttl",
     "responses_previous_response_id",
     "parallel_tool_calls",
     "auto_wait_on_empty_tool_calls",
@@ -192,6 +195,18 @@ def validate_user_llm_profile_payload(
     unknown = sorted(set(raw) - set(_USER_PROFILE_FIELDS))
     if unknown:
         raise ValidationError(f"unknown LLM profile fields: {', '.join(unknown)}")
+    _normalize_user_llm_profile_fields(raw)
+    cleaned = {key: value for key, value in raw.items() if value is not None}
+    selected_config = config or DEFAULT_CONFIG
+    _validate_user_llm_profile_token_bounds(raw, selected_config)
+    _validate_user_llm_profile_cache(raw, selected_config)
+    try:
+        return LLMProfile(**cleaned)
+    except (TypeError, ValueError, PydanticValidationError) as exc:
+        raise ValidationError(f"invalid LLM profile {profile_id}: {exc}") from exc
+
+
+def _normalize_user_llm_profile_fields(raw: dict[str, Any]) -> None:
     raw["kind"] = str(raw.get("kind") or "openai_compatible")
     if raw["kind"] != "openai_compatible":
         raise ValidationError(f"unsupported LLM profile kind: {raw['kind']}")
@@ -204,6 +219,14 @@ def validate_user_llm_profile_payload(
     raw["safety_identifier_env"] = _optional_env_name(raw.get("safety_identifier_env"), "safety_identifier_env")
     raw["prompt_cache_retention"] = _optional_prompt_cache_retention(
         raw.get("prompt_cache_retention")
+    )
+    raw["prompt_cache_mode"] = _optional_choice(
+        raw.get("prompt_cache_mode"),
+        "prompt_cache_mode",
+        _PROMPT_CACHE_MODES,
+    )
+    raw["prompt_cache_ttl"] = _optional_prompt_cache_ttl(
+        raw.get("prompt_cache_ttl")
     )
     raw["timeout_s"] = _optional_positive_float(raw.get("timeout_s"), "timeout_s")
     raw["max_retries"] = _optional_nonnegative_int(raw.get("max_retries"), "max_retries")
@@ -230,20 +253,24 @@ def validate_user_llm_profile_payload(
         "allow_custom_base_url",
     ):
         raw[key] = _optional_bool(raw.get(key), key)
-    cleaned = {key: value for key, value in raw.items() if value is not None}
-    selected_config = config or DEFAULT_CONFIG
-    effective_max_tokens = raw["max_tokens"] or selected_config.llm.max_tokens
+
+
+def _validate_user_llm_profile_token_bounds(
+    raw: Mapping[str, Any],
+    config: AgentLibOSConfig,
+) -> None:
+    effective_max_tokens = raw["max_tokens"] or config.llm.max_tokens
     effective_context_window = (
         raw["context_window_tokens"]
-        or selected_config.llm.context_window_tokens
+        or config.llm.context_window_tokens
     )
     effective_max_input_tokens = (
         raw["max_input_tokens_per_call"]
-        or selected_config.llm.max_input_tokens_per_call
+        or config.llm.max_input_tokens_per_call
     )
     effective_max_total_tokens = (
         raw["max_total_tokens_per_call"]
-        or selected_config.llm.max_total_tokens_per_call
+        or config.llm.max_total_tokens_per_call
     )
     if effective_max_tokens >= effective_context_window:
         raise ValidationError(
@@ -258,10 +285,44 @@ def validate_user_llm_profile_payload(
         raise ValidationError(
             "LLM profile max_tokens must not exceed max_total_tokens_per_call"
         )
-    try:
-        return LLMProfile(**cleaned)
-    except (TypeError, ValueError, PydanticValidationError) as exc:
-        raise ValidationError(f"invalid LLM profile {profile_id}: {exc}") from exc
+
+
+def _validate_user_llm_profile_cache(
+    raw: Mapping[str, Any],
+    config: AgentLibOSConfig,
+) -> None:
+    effective_cache_mode = (
+        raw["prompt_cache_mode"] or config.llm.prompt_cache_mode
+    )
+    effective_cache_retention = (
+        raw["prompt_cache_retention"]
+        if raw["prompt_cache_retention"] is not None
+        else config.llm.prompt_cache_retention
+    )
+    effective_cache_ttl = (
+        raw["prompt_cache_ttl"]
+        if raw["prompt_cache_ttl"] is not None
+        else config.llm.prompt_cache_ttl
+    )
+    if effective_cache_retention is not None and effective_cache_ttl is not None:
+        raise ValidationError(
+            "LLM profile prompt_cache_retention and prompt_cache_ttl are mutually exclusive"
+        )
+    if (
+        effective_cache_mode != "provider_default"
+        and not str(config.llm.prompt_cache_key or "").strip()
+    ):
+        raise ValidationError(
+            "LLM profile implicit/explicit prompt caching requires a Host prompt_cache_key"
+        )
+    if effective_cache_mode == "provider_default" and effective_cache_ttl is not None:
+        raise ValidationError(
+            "LLM profile prompt_cache_ttl requires implicit or explicit mode"
+        )
+    if effective_cache_mode != "provider_default" and effective_cache_retention is not None:
+        raise ValidationError(
+            "LLM profile legacy prompt_cache_retention cannot be combined with implicit/explicit mode"
+        )
 
 
 def serialize_user_llm_profile(profile: LLMProfile) -> dict[str, Any]:
@@ -275,6 +336,8 @@ def serialize_user_llm_profile(profile: LLMProfile) -> dict[str, Any]:
             continue
         if key == "prompt_cache_retention":
             value = _optional_prompt_cache_retention(value)
+        if key == "prompt_cache_ttl":
+            value = _optional_prompt_cache_ttl(value)
         serialized[key] = value
     return serialized
 
@@ -305,6 +368,10 @@ def summarize_llm_profile(
         "safety_identifier_env": profile.safety_identifier_env,
         "prompt_cache_retention": _optional_prompt_cache_retention(
             profile.prompt_cache_retention
+        ),
+        "prompt_cache_mode": profile.prompt_cache_mode,
+        "prompt_cache_ttl": _optional_prompt_cache_ttl(
+            profile.prompt_cache_ttl
         ),
         "responses_previous_response_id": profile.responses_previous_response_id,
         "parallel_tool_calls": profile.parallel_tool_calls,
@@ -393,6 +460,17 @@ def _optional_prompt_cache_retention(value: Any) -> str | None:
         raise ValidationError(
             "LLM profile prompt_cache_retention must be one of ['24h', 'in_memory']"
         )
+    return selected
+
+
+def _optional_prompt_cache_ttl(value: Any) -> str | None:
+    if value is None:
+        return None
+    selected = str(value).strip().lower()
+    if not selected:
+        return None
+    if selected != "30m":
+        raise ValidationError("LLM profile prompt_cache_ttl must be '30m'")
     return selected
 
 

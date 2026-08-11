@@ -270,6 +270,13 @@ def test_agent_routes_checkpoint_inspection_through_builtin_skill(
     runtime = Runtime.open(
         ":memory:",
         substrate=LocalResourceProviderSubstrate(tmp_path),
+        config=replace(
+            DEFAULT_CONFIG,
+            llm=replace(
+                DEFAULT_CONFIG.llm,
+                prompt_layout="cache_optimized_v2",
+            ),
+        ),
     )
     catalog = get_builtin_skill_catalog()
     checkpoint_skill = catalog.get("agent-libos-checkpoints")
@@ -310,7 +317,7 @@ def test_agent_routes_checkpoint_inspection_through_builtin_skill(
                 {"action": "list_checkpoints"},
                 {
                     "action": "inspect_checkpoint",
-                    "checkpoint_id": checkpoint_id,
+                    "checkpoint_id": "only",
                 },
                 {"action": "process_exit", "payload": {"verified": True}},
             ]
@@ -337,7 +344,13 @@ def test_agent_routes_checkpoint_inspection_through_builtin_skill(
         )
         listed = _payload(results, "list_checkpoints")["checkpoints"]
         inspected = _payload(results, "inspect_checkpoint")
-        assert [item["checkpoint_id"] for item in listed] == [checkpoint_id]
+        assert listed == [
+            {
+                "checkpoint_ref": "only",
+                "reason": "deterministic routing fixture",
+            }
+        ]
+        assert checkpoint_id not in json.dumps(listed, sort_keys=True)
         assert inspected["checkpoint"]["checkpoint_id"] == checkpoint_id
         assert inspected["subtree_pids"] == [pid]
     finally:

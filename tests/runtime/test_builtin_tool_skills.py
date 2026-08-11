@@ -1362,8 +1362,11 @@ def test_every_builtin_skill_has_positive_and_adjacent_negative_routing(
                 },
             )
             assert activation.ok, (case.scenario_id, activation.error)
-            assert activation.payload["result"]["package_sha256"] == (
-                selected["package_sha256"]
+            assert (
+                runtime.process.get(pid).loaded_skills[
+                    case.expected_skill_id
+                ]["package_sha256"]
+                == selected["package_sha256"]
             )
             unload = runtime.tools.call(
                 pid,

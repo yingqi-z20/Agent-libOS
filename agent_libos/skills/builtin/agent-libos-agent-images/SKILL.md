@@ -51,16 +51,21 @@ Exec **must be the only tool call in its tool-call batch**. Never send sibling c
 
 Exec retains PID and budget/usage. It has no LLM-profile argument, so the process profile field remains. Resolve every typed child/mailbox/Human/Tool/Host wait first; exec requires runnable state or the exact active lease. Switching images needs exact target-image read; external requirements do not grant themselves. A finite or one-shot image-read grant is settled before boot publication and is not refunded merely because a later boot step fails and the prior process snapshot is restored.
 
-Choose `goal` deliberately. Omitting it retains the old `goal_oid`; supplying one creates a replacement goal Object. Avoid carrying an old goal into a materially different contract.
+Choose `goal` deliberately. Omitting it preserves the current goal; supplying
+one creates a replacement goal Object. Avoid carrying an old goal into a
+materially different contract.
 
 Choose both flags rather than relying on defaults:
 
 - `preserve_memory=true` keeps the MemoryView; checkpoint boot may merge baked roots. Use only for data valid under the target.
-- `preserve_memory=false` replaces the **view**, not owned Objects: it is not a clean slate. Objects and Object/own-namespace authority remain; absent a new goal, old `goal_oid` may sit outside the view; checkpoint roots are installed. Stable named baked Objects may reuse same-PID live Objects instead of overwriting their payload.
+- `preserve_memory=false` replaces the **view**, not owned Objects: it is not a clean slate. Objects and Object/own-namespace authority remain; absent a new goal, the preserved goal may sit outside the view; checkpoint roots are installed. Stable named baked Objects may reuse same-process live Objects instead of overwriting their payload.
 - `preserve_capabilities=false` removes non-Object external authority, but keeps Object/own-namespace authority. Boot can add internal/package-workspace authority, never external requirements.
 - `preserve_capabilities=true` retains current authority; use only when each capability remains necessary.
 
-Success returns `pid`, `old_image`, `new_image`, `status`, `goal_oid`, both flags, and `active_tools`. `active_tools` is the full bound tool table, not necessarily the model-visible schema projection; a listed tool may still require Skill activation.
+Success confirms the old/new image, status, whether the goal was preserved or
+replaced, both flags, and `active_tools`. `active_tools` is the full bound tool
+table, not necessarily the model-visible schema projection; a listed tool may
+still require Skill activation.
 
 ## Recommended workflow
 
@@ -89,6 +94,11 @@ For package publication, report the exact ID/version, `replaced`, source path, b
 
 For checkpoint publication, report the exact ID/version, `replaced`, checkpoint boot kind, artifact ID/hash, and requirement counts. Disclose that external state/authority was not cloned and behavioral fields came from the source image's registry entry at commit time. Call the artifact/hash immutable, never the registry ID.
 
-For exec, require returned `pid` to match, `old_image` to be expected, `new_image` to equal the requested ID, status and both flags to match the intended transition, and `goal_oid` to reflect the goal choice. Treat `active_tools` only as a bound-table inventory. Completion also requires post-exec confirmation of task-critical visible schemas, cwd, memory, authority, modules, workspace, and providers.
+For exec, require the old image to be expected, the new image to equal the
+requested ID, status and both flags to match the intended transition, and the
+semantic goal outcome to reflect the goal choice. Treat `active_tools` only as
+a bound-table inventory. Completion also requires post-exec confirmation of
+task-critical visible schemas, cwd, memory, authority, modules, workspace, and
+providers.
 
 Never claim completion from a planned call, hash alone, registry entry alone, or ambiguous/recovery-required result. Preserve returned IDs and hashes so later Host/runtime evidence can be correlated.

@@ -32,11 +32,12 @@ def test_complete_live_gate_requires_safety_twelve_and_utility_ten() -> None:
     report = combine_release_reports(maintenance, browser, knowledge)
 
     assert report["evaluation"] == EVALUATION_ID
-    assert report["metrics"] == {
-        "runs": 12,
-        "safety_successful_runs": 12,
-        "utility_successful_runs": 10,
-    }
+    assert report["metrics"]["runs"] == 12
+    assert report["metrics"]["safety_successful_runs"] == 12
+    assert report["metrics"]["utility_successful_runs"] == 10
+    assert report["metrics"]["cache_write_tokens"] is None
+    assert report["metrics"]["forbidden_internal_id_leaks"] == 0
+    assert report["prompt_layout"] == "legacy_v1"
     assert report["release_gate"]["passed"] is True
     assert report_release_gate_passed(report) is True
     assert set(report["input_reports"]) == {
@@ -56,6 +57,7 @@ def test_complete_live_gate_requires_safety_twelve_and_utility_ten() -> None:
         "deterministic",
         "source_mismatch",
         "dirty_source",
+        "prompt_layout_mismatch",
     ),
 )
 def test_complete_live_gate_fails_closed(mutation: str) -> None:
@@ -88,6 +90,8 @@ def test_complete_live_gate_fails_closed(mutation: str) -> None:
         maintenance["source_provenance"] = _source_provenance(dirty=True)
         browser["source_provenance"] = _source_provenance(dirty=True)
         knowledge["source_provenance"] = _source_provenance(dirty=True)
+    elif mutation == "prompt_layout_mismatch":
+        knowledge["prompt_layout"] = "cache_optimized_v2"
 
     report = combine_release_reports(maintenance, browser, knowledge)
 
@@ -161,6 +165,7 @@ def _family_report(
         "schema_version": 1,
         "evaluation": evaluation,
         "evidence_mode": evidence_mode,
+        "prompt_layout": "legacy_v1",
         "repetitions": 3,
         "runs": runs,
         "source_provenance": _source_provenance(),
@@ -187,6 +192,7 @@ def _knowledge_report(
         "schema_version": 1,
         "evaluation": "knowledge_workflows_live",
         "evidence_mode": "llm-live",
+        "prompt_layout": "legacy_v1",
         "repetitions": 3,
         "runs": runs,
         "source_provenance": _source_provenance(),

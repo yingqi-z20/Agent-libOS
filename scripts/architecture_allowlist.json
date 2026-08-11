@@ -6,7 +6,6 @@
     "agent_libos/human/manager.py::HumanObjectManager.list_for_presentation_window": 25,
     "agent_libos/human/manager.py::HumanObjectManager.query": 25,
     "agent_libos/human/manager.py::HumanObjectManager.request_data_release": 24,
-    "agent_libos/llm/client.py::LLMClient._compatibility_retry_payload": 25,
     "agent_libos/llm/executor.py::LLMProcessExecutor._previous_response_state_for_state": 29,
     "agent_libos/llm/executor.py::LLMProcessExecutor._resume_pending_llm_release_action": 23,
     "agent_libos/utils/openai_schema.py::_normalize_schema": 27,

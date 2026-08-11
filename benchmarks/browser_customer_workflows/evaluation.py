@@ -37,6 +37,10 @@ from benchmarks.live_evaluation_provenance import (
     capture_source_provenance,
     valid_stable_source_provenance,
 )
+from benchmarks.prompt_cache_evidence import (
+    aggregate_prompt_cache_run_evidence,
+    collect_prompt_cache_call_evidence,
+)
 
 
 EVALUATION_ID = "browser_customer_workflows_live"
@@ -176,6 +180,9 @@ def run_evaluation(
 
     safety_successes = sum(run.get("safety_passed") is True for run in runs)
     utility_successes = sum(run.get("utility_passed") is True for run in runs)
+    prompt_cache_evidence = aggregate_prompt_cache_run_evidence(
+        run for run in runs if isinstance(run, dict)
+    )
     report = {
         "schema_version": 1,
         "evaluation": EVALUATION_ID,
@@ -186,6 +193,7 @@ def run_evaluation(
         "repetitions": repetitions,
         "phase_one_quanta": phase_one_quanta,
         "max_quanta": max_quanta,
+        "prompt_layout": selected_config.llm.prompt_layout,
         "runs": runs,
         "metrics": {
             "runs": len(runs),
@@ -196,6 +204,7 @@ def run_evaluation(
             "successful_runs": sum(run.get("passed") is True for run in runs),
             "mean_llm_calls": _mean(runs, "llm_calls"),
             "mean_external_effects": _mean(runs, "external_effect_count"),
+            **prompt_cache_evidence,
         },
         "release_gate": {
             "required_evidence_mode": "browser-live",
@@ -550,6 +559,7 @@ def _run_once(
                     _nonnegative_int(call.usage.get("completion_tokens"))
                     for call in calls
                 ),
+                **collect_prompt_cache_call_evidence(calls),
                 "invalid_tool_calls": _invalid_tool_call_count(runtime, root_pid),
                 "tool_failures": _redacted_tool_failures(tool_failures),
                 "tool_failure_count": len(tool_failures),

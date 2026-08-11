@@ -86,9 +86,30 @@ def normalize_openai_strict_schema(
 
     _validate_schema_bounds(schema)
     candidate = deepcopy(schema)
+    _strip_model_annotation_titles(candidate)
     if _normalize_schema(candidate):
         return candidate, True
-    return deepcopy(schema), False
+    return candidate, False
+
+
+def compact_model_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Remove non-semantic generated annotations from a model-facing schema."""
+
+    _validate_schema_bounds(schema)
+    selected = deepcopy(schema)
+    _strip_model_annotation_titles(selected)
+    return selected
+
+
+def _strip_model_annotation_titles(value: Any) -> None:
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            current.pop("title", None)
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
 
 
 def normalize_openai_structured_output_schema(
@@ -243,6 +264,7 @@ def _normalize_schema(schema: Any) -> bool:
 
 
 __all__ = [
+    "compact_model_json_schema",
     "normalize_openai_chat_tool_schema",
     "normalize_openai_strict_schema",
     "normalize_openai_structured_output_schema",

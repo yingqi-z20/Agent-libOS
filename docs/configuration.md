@@ -172,7 +172,8 @@ whose id equals `llm.default_profile_id` then inherits the matching legacy
 endpoint, model, or provider-policy settings. When neither is present,
 `llm.timeout_s`, `llm.max_retries`, `llm.api_mode`, `llm.store`,
 `llm.safety_identifier`, `llm.prompt_cache_key`,
-`llm.prompt_cache_retention`, `llm.responses_previous_response_id`,
+`llm.prompt_cache_retention`, `llm.prompt_cache_mode`,
+`llm.prompt_cache_ttl`, `llm.responses_previous_response_id`,
 `llm.parallel_tool_calls`, `llm.auto_wait_on_empty_tool_calls`,
 `llm.fallback_json_actions`,
 `llm.temperature`, `llm.max_tokens`, `llm.max_input_tokens_per_call`,
@@ -183,6 +184,7 @@ legacy mappings are
 `OPENAI_TIMEOUT`; `OPENAI_MAX_RETRIES`; `OPENAI_API_MODE`; `OPENAI_STORE`;
 `OPENAI_REASONING_EFFORT`; `OPENAI_VERBOSITY`; `OPENAI_SAFETY_IDENTIFIER`;
 `OPENAI_PROMPT_CACHE_KEY`; `OPENAI_PROMPT_CACHE_RETENTION`;
+`OPENAI_PROMPT_CACHE_MODE`; `OPENAI_PROMPT_CACHE_TTL`;
 `OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID`; and
 `OPENAI_PARALLEL_TOOL_CALLS`; and `OPENAI_FALLBACK_JSON_ACTIONS`. The default profile also snapshots
 `OPENAI_ENABLE_THINKING` and the OpenAI organization/project routing variables
@@ -237,7 +239,7 @@ same change.
 | `data_flow` | `default_trust_level`, `default_max_sensitivity`, `sink_rules`, `operation_minimum_integrity`, `registry_resource`, `registry_list_limit`, `decision_list_limit`, `file_binding_list_limit` |
 | `scheduler` | `max_quanta`, `poll_interval_s`, `max_workers`, `drain_window_s`, `shutdown_join_timeout_s` |
 | `process` | `max_tool_calls`, `max_child_processes`, `max_runtime_seconds`, `max_context_materialization_tokens`, `max_context_materialization_total_tokens`, `max_llm_calls`, `max_llm_total_tokens`, `max_subprocess_wall_seconds`, `max_subprocess_cpu_seconds`, `max_subprocess_memory_bytes`, `max_external_read_bytes`, `max_external_write_bytes`, `max_jsonrpc_bytes`, `max_mcp_bytes`, `max_deno_syscalls`, `default_goal_text`, `default_working_directory`, `fork_budget_divisor`, `fork_min_tool_calls`, `fork_min_child_processes` |
-| `llm` | `default_profile_id`, `profiles`, `temperature`, `max_tokens`, `max_input_tokens_per_call`, `max_total_tokens_per_call`, `context_window_tokens`, `timeout_s`, `max_retries`, `api_mode`, `store`, `safety_identifier`, `prompt_cache_key`, `prompt_cache_retention`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `fallback_json_actions`, `compatibility_retry_attempts`, `action_repair_attempts`, `tool_output_prompt_max_chars`, `content_preview_chars`, `tool_arguments_preview_chars`, `call_record_preview_chars`, `call_record_list_limit`, `call_record_hard_limit`, `persist_full_io`, `json_instruction`, `fallback_status_codes` |
+| `llm` | `default_profile_id`, `profiles`, `temperature`, `max_tokens`, `max_input_tokens_per_call`, `max_total_tokens_per_call`, `context_window_tokens`, `timeout_s`, `max_retries`, `api_mode`, `store`, `safety_identifier`, `prompt_layout`, `prompt_cache_key`, `prompt_cache_retention`, `prompt_cache_mode`, `prompt_cache_ttl`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `fallback_json_actions`, `compatibility_retry_attempts`, `action_repair_attempts`, `tool_output_prompt_max_chars`, `content_preview_chars`, `tool_arguments_preview_chars`, `call_record_preview_chars`, `call_record_list_limit`, `call_record_hard_limit`, `persist_full_io`, `json_instruction`, `fallback_status_codes` |
 | `tools` | `version`, `default_timeout_s`, `standard_timeout_s`, `interactive_timeout_s`, `default_text_encoding`, `tool_observability_preview_chars`, `tool_call_args_hard_limit_bytes`, `tool_result_payload_hard_limit_bytes`, `filesystem_read_max_bytes`, `filesystem_read_hard_limit_bytes`, `directory_entry_limit`, `directory_entry_hard_limit`, `executable_snapshot_sibling_limit`, `memory_payload_chars`, `memory_payload_hard_limit_chars`, `memory_payload_hard_limit_bytes`, `memory_append_entry_max_bytes`, `message_subject_max_chars`, `message_body_max_chars`, `message_payload_max_bytes`, `message_id_max_chars`, `message_read_limit`, `message_read_hard_limit`, `message_filter_ids_hard_limit`, `message_filter_json_max_bytes`, `message_wait_status_max_chars`, `human_request_payload_max_bytes`, `human_output_max_chars`, `human_request_list_limit`, `object_file_max_bytes`, `object_file_hard_limit_bytes`, `shell_timeout_s`, `sandbox_timeout_s`, `jit_source_max_chars`, `jit_tests_max_count`, `jit_test_case_max_bytes`, `jit_validation_timeout_s`, `jit_validation_log_max_chars`, `deno_executable`, `deno_timeout_s`, `deno_timeout_hard_limit_s`, `deno_max_rpc_calls`, `deno_max_stdout_bytes`, `deno_max_stderr_bytes`, `deno_jsr_allowlist`, `static_tool_id_digest_chars`, `approval_preview_chars`, `clock_timezone`, `max_sleep_seconds`, `sleep_timeout_grace_s`, `human_response_payload_max_bytes`, `human_response_max_depth`, `human_response_max_nodes` |
 | `shell` | `policy_capability_key`, `policy_resource`, `default_policy_level`, `timeout_hard_limit_s`, `max_stdout_chars`, `max_stderr_chars`, `stdout_hard_limit_chars`, `stderr_hard_limit_chars`, `rules`, `whitelist`, `blacklist` |
 | `git` | `enabled`, `executable`, `minimum_version`, `repository_resource`, `worktree_root`, `trusted_metadata_roots`, `local_timeout_s`, `remote_timeout_s`, `timeout_hard_limit_s`, `lock_timeout_s`, `status_entry_limit`, `status_entry_hard_limit`, `log_entry_limit`, `log_entry_hard_limit`, `output_max_bytes`, `output_hard_limit_bytes`, `patch_max_bytes`, `patch_hard_limit_bytes`, `state_content_hard_limit_bytes`, `allowed_remote_schemes`, `allow_scp_style_ssh`, `allow_file_remotes`, `inherit_credential_helpers`, `inherit_ssh_agent`, `protect_git_metadata`, `ref_list_limit`, `pull_request_list_limit` |
@@ -293,7 +295,7 @@ Each entry under `llm.profiles.<profile_id>` accepts exactly these fields:
 
 | Profile | Fields |
 | --- | --- |
-| `llm.profiles.<profile_id>` | `kind`, `base_url`, `model`, `api_key_env`, `api_mode`, `timeout_s`, `max_retries`, `store`, `reasoning_effort`, `verbosity`, `safety_identifier`, `safety_identifier_env`, `prompt_cache_key`, `prompt_cache_retention`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `fallback_json_actions`, `temperature`, `max_tokens`, `max_input_tokens_per_call`, `max_total_tokens_per_call`, `context_window_tokens`, `allow_custom_base_url` |
+| `llm.profiles.<profile_id>` | `kind`, `base_url`, `model`, `api_key_env`, `api_mode`, `timeout_s`, `max_retries`, `store`, `reasoning_effort`, `verbosity`, `safety_identifier`, `safety_identifier_env`, `prompt_cache_key`, `prompt_cache_retention`, `prompt_cache_mode`, `prompt_cache_ttl`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `fallback_json_actions`, `temperature`, `max_tokens`, `max_input_tokens_per_call`, `max_total_tokens_per_call`, `context_window_tokens`, `allow_custom_base_url` |
 
 The same test checks this nested inventory. Exact values remain authoritative
 in the live dump and typed source. Optional Runtime

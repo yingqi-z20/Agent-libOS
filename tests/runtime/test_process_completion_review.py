@@ -37,6 +37,12 @@ from agent_libos.utils.ids import utc_now
 from tests.support.public_errors import assert_public_error_message
 
 
+_V2_CONFIG = replace(
+    DEFAULT_CONFIG,
+    llm=replace(DEFAULT_CONFIG.llm, prompt_layout="cache_optimized_v2"),
+)
+
+
 def _completion_evidence(
     review: dict[str, object],
     *,
@@ -92,15 +98,47 @@ def _start_review(runtime: Runtime, pid: str) -> tuple[dict[str, object], str]:
     )
     assert first["ok"] is True
     assert first["payload"]["status"] == "completion_review_required"
-    review = first["payload"]["completion_review"]
-    assert isinstance(review, dict)
     result_oid = first["result_oid"]
     assert isinstance(result_oid, str)
-    return review, result_oid
+    return _host_completion_review(runtime, first), result_oid
+
+
+def _persisted_model_completion_review(
+    runtime: Runtime,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    result_oid = result.get("result_oid")
+    assert isinstance(result_oid, str)
+    stored = runtime.store.get_object(result_oid)
+    assert stored is not None
+    durable_result = stored.payload.get("result")
+    assert isinstance(durable_result, dict)
+    review = durable_result.get("completion_review")
+    assert isinstance(review, dict)
+    return review
+
+
+def _host_completion_review(
+    runtime: Runtime,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    persisted = _persisted_model_completion_review(runtime, result)
+    result_oid = result.get("result_oid")
+    assert isinstance(result_oid, str)
+    stored = runtime.store.get_object(result_oid)
+    assert stored is not None
+    review = _build_cumulative_exit_review(runtime, stored.created_by)
+    validation_errors = persisted.get("validation_errors")
+    if isinstance(validation_errors, list):
+        review["validation_errors"] = list(validation_errors)
+    return review
 
 
 def test_coding_exit_review_is_nonterminal_published_and_audited(tmp_path: Path) -> None:
-    runtime = Runtime.open(tmp_path / "completion-review.sqlite")
+    runtime = Runtime.open(
+        tmp_path / "completion-review.sqlite",
+        config=_V2_CONFIG,
+    )
     try:
         pid = runtime.process.spawn(
             image="coding-agent:v0",
@@ -116,8 +154,30 @@ def test_coding_exit_review_is_nonterminal_published_and_audited(tmp_path: Path)
         )
         assert first["ok"] is True
         assert first["payload"]["status"] == "completion_review_required"
-        review = first["payload"]["completion_review"]
+        model_review = first["payload"]["completion_review"]
+        assert isinstance(model_review, dict)
+        assert set(model_review) >= {
+            "review_token",
+            "requirements",
+            "available_evidence_tools",
+            "missing_work_hints",
+        }
+        encoded_model_review = json.dumps(model_review, sort_keys=True)
+        for forbidden in (
+            "goal_oid",
+            "reviewed_message_ids",
+            "source_refs",
+            "requirement_id",
+            pid,
+        ):
+            assert forbidden not in encoded_model_review
+        persisted_review = _persisted_model_completion_review(runtime, first)
+        assert persisted_review == model_review
+        review = _host_completion_review(runtime, first)
         review_result_oid = first["result_oid"]
+        stored_review_result = runtime.store.get_object(review_result_oid)
+        assert stored_review_result is not None
+        assert "model_projection" not in stored_review_result.payload
 
         process = runtime.process.get(pid)
         assert process.status == ProcessStatus.RUNNABLE
@@ -185,6 +245,59 @@ def test_coding_exit_review_is_nonterminal_published_and_audited(tmp_path: Path)
         assert len(passed) == 1
         assert passed[0].decision["authority_changed"] is False
         assert passed[0].decision["acceptance_check_count"] == 1
+    finally:
+        runtime.close()
+
+
+def test_v2_review_preserves_business_id_fields_and_binds_compact_evidence(
+    tmp_path: Path,
+) -> None:
+    runtime = Runtime.open(
+        tmp_path / "completion-review-business-fields.sqlite",
+        config=_V2_CONFIG,
+    )
+    try:
+        pid = runtime.process.spawn(
+            image="coding-agent:v0",
+            goal={
+                "task": "inspect the business record",
+                "run_id": "customer-run-42",
+                "requirement_id": "invoice-line-7",
+            },
+        )
+        inspected = runtime.llm.dispatch(pid, {"action": "list_capabilities"})
+        assert inspected["ok"] is True
+
+        first = runtime.llm.dispatch(pid, {"action": "process_exit"})
+
+        assert first["ok"] is True
+        model_review = first["payload"]["completion_review"]
+        encoded = json.dumps(model_review, sort_keys=True)
+        assert '"run_id": "customer-run-42"' in encoded
+        assert '"requirement_id": "invoice-line-7"' in encoded
+        assert pid not in encoded
+        assert "goal_oid" not in encoded
+        assert "source_refs" not in encoded
+        completed = runtime.llm.dispatch(
+            pid,
+            {
+                "action": "process_exit",
+                "review_token": model_review["review_token"],
+                "completion_evidence": {
+                    "acceptance_checks": [
+                        {
+                            "status": "completed",
+                            "evidence_tool_calls": ["list_capabilities"],
+                            "evidence_summary": "The successful inspection supplies evidence.",
+                        }
+                    ],
+                    "final_verification": ["list_capabilities"],
+                },
+            },
+        )
+
+        assert completed["payload"]["status"] == "exited"
+        assert runtime.process.get(pid).status == ProcessStatus.EXITED
     finally:
         runtime.close()
 
@@ -347,7 +460,7 @@ def test_exit_review_requires_explicit_human_facing_output_before_exit(
         assert premature["payload"]["status"] == "completion_review_required"
         assert (
             "explicit goal requirements still need successful tool calls: human_output"
-            in premature["payload"]["completion_review"]["validation_errors"]
+            in _host_completion_review(runtime, premature)["validation_errors"]
         )
         assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
         assert delivered == []
@@ -366,7 +479,7 @@ def test_exit_review_requires_explicit_human_facing_output_before_exit(
         assert delivered == ["Verified summary."]
 
         refreshed = runtime.llm.dispatch(pid, {"action": "process_exit"})
-        refreshed_review = refreshed["payload"]["completion_review"]
+        refreshed_review = _host_completion_review(runtime, refreshed)
         assert refreshed_review["explicit_unobserved_tool_hints"] == []
         completed = runtime.llm.dispatch(
             pid,
@@ -781,7 +894,7 @@ def test_exit_review_rejects_stale_token_after_human_followup(tmp_path: Path) ->
         )
 
         assert stale["payload"]["status"] == "completion_review_required"
-        stale_review = stale["payload"]["completion_review"]
+        stale_review = _host_completion_review(runtime, stale)
         assert stale_review["unread_human_message_ids"] == [message.message_id]
         assert message.body not in str(stale_review)
         assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
@@ -790,7 +903,7 @@ def test_exit_review_rejects_stale_token_after_human_followup(tmp_path: Path) ->
         read = runtime.llm.dispatch(pid, {"action": "read_process_messages"})
         assert read["ok"] is True
         refreshed = runtime.llm.dispatch(pid, {"action": "process_exit"})
-        refreshed_review = refreshed["payload"]["completion_review"]
+        refreshed_review = _host_completion_review(runtime, refreshed)
 
         assert refreshed_review["review_token"] != review["review_token"]
         assert refreshed_review["acknowledged_human_message_ids"] == [
@@ -835,7 +948,7 @@ def test_exit_review_rejects_stale_token_after_human_followup(tmp_path: Path) ->
             },
         )
         assert stale_after_ack["payload"]["status"] == "completion_review_required"
-        stale_after_ack_review = stale_after_ack["payload"]["completion_review"]
+        stale_after_ack_review = _host_completion_review(runtime, stale_after_ack)
         assert stale_after_ack_review["unread_human_message_ids"] == []
         assert stale_after_ack_review["review_token"] == refreshed_review[
             "review_token"
@@ -907,7 +1020,7 @@ def test_exit_review_token_binds_acknowledged_message_content_hash(
             },
         )
         assert rejected["payload"]["status"] == "completion_review_required"
-        assert rejected["payload"]["completion_review"]["validation_errors"] == [
+        assert _host_completion_review(runtime, rejected)["validation_errors"] == [
             "review_token is missing or stale; use the token from this review"
         ]
         assert runtime.process.get(pid).status is ProcessStatus.RUNNABLE
@@ -918,7 +1031,10 @@ def test_exit_review_token_binds_acknowledged_message_content_hash(
 def test_final_exit_rejects_missing_sources_and_unobserved_tool_claims(
     tmp_path: Path,
 ) -> None:
-    runtime = Runtime.open(tmp_path / "completion-review-evidence.sqlite")
+    runtime = Runtime.open(
+        tmp_path / "completion-review-evidence.sqlite",
+        config=_V2_CONFIG,
+    )
     try:
         pid = runtime.process.spawn(
             image="coding-agent:v0",
@@ -949,9 +1065,18 @@ def test_final_exit_rejects_missing_sources_and_unobserved_tool_claims(
 
         assert rejected["ok"] is True
         assert rejected["payload"]["status"] == "completion_review_required"
-        errors = rejected["payload"]["completion_review"]["validation_errors"]
-        assert "acceptance checks do not cover every expected_source_ref" in errors
+        errors = _host_completion_review(runtime, rejected)["validation_errors"]
+        assert (
+            "acceptance checks do not cover every expected_ordered requirement binding"
+            in errors
+        )
         assert any("cites unobserved tools" in error for error in errors)
+        audit_errors = [
+            record.decision["validation_errors"]
+            for record in runtime.audit.trace(actor=pid)
+            if record.action == "process.exit_review_required"
+        ][-1]
+        assert "acceptance checks do not cover every expected_source_ref" in audit_errors
         assert message.message_id in review["acknowledged_human_message_ids"]
         assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
     finally:
@@ -1021,7 +1146,7 @@ def test_exit_review_references_messages_without_reinlining_bodies(
         assert len(rendered_review) < 12_000
 
         repeated = runtime.llm.dispatch(pid, {"action": "process_exit"})
-        repeated_review = repeated["payload"]["completion_review"]
+        repeated_review = _host_completion_review(runtime, repeated)
         assert repeated_review["review_token"] == review["review_token"]
         assert (
             repeated_review["acknowledged_human_messages_sha256"]
@@ -1031,6 +1156,64 @@ def test_exit_review_references_messages_without_reinlining_bodies(
             repeated_review["observed_successful_tool_calls"]
             == review["observed_successful_tool_calls"]
         )
+    finally:
+        runtime.close()
+
+
+def test_v2_truncated_follow_up_has_an_executable_semantic_recovery(
+    tmp_path: Path,
+) -> None:
+    runtime = Runtime.open(
+        tmp_path / "completion-review-follow-up-recovery.sqlite",
+        config=_V2_CONFIG,
+    )
+    try:
+        pid = runtime.process.spawn(
+            image="coding-agent:v0",
+            goal="recover every acknowledged follow-up before completion",
+        )
+        tail = "MUST_UPLOAD_FINAL_REPORT"
+        message = runtime.human.send_process_message(
+            pid,
+            ("x" * 800) + tail,
+            subject="Long cumulative requirement",
+        )
+        runtime.activate_skill(pid, "agent-libos-child-processes")
+        acknowledged = runtime.llm.dispatch(
+            pid,
+            {"action": "read_process_messages"},
+        )
+        assert acknowledged["ok"] is True
+
+        runtime.llm.dispatch(pid, {"action": "list_capabilities"})
+        first = runtime.llm.dispatch(pid, {"action": "process_exit"})
+        model_review = first["payload"]["completion_review"]
+        human_requirement = next(
+            item
+            for item in model_review["requirements"]
+            if item["kind"] == "human_follow_up"
+        )["requirement"]
+
+        assert human_requirement["truncated"] is True
+        assert tail not in json.dumps(human_requirement, ensure_ascii=False)
+        assert len(
+            json.dumps(
+                human_requirement,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ) <= 512
+        recovery = human_requirement["recovery"]
+        assert recovery["tool"] == "read_process_messages"
+        assert "message_id" not in json.dumps(recovery, sort_keys=True)
+        recovered = runtime.llm.dispatch(
+            pid,
+            {"action": recovery["tool"], **recovery["arguments"]},
+        )
+        assert recovered["ok"] is True
+        assert recovered["payload"]["messages"][0]["message_id"] == message.message_id
+        assert recovered["payload"]["messages"][0]["body"].endswith(tail)
     finally:
         runtime.close()
 
@@ -1324,7 +1507,7 @@ def test_exit_review_survives_runtime_reopen(tmp_path: Path) -> None:
         assert review_result_oid in {handle.oid for handle in process.memory_view.roots}
 
         refreshed = reopened.llm.dispatch(pid, {"action": "process_exit"})
-        refreshed_review = refreshed["payload"]["completion_review"]
+        refreshed_review = _host_completion_review(reopened, refreshed)
         assert refreshed_review["goal"]["source"] == "object_memory"
         assert refreshed_review["goal"]["oid"] == initial_goal.oid
         assert refreshed_review["goal"]["version"] == initial_goal.version
@@ -1385,7 +1568,7 @@ def test_exit_review_recovers_goal_from_persistent_context_prompt(
     reopened = Runtime.open(database)
     try:
         review_result = reopened.llm.dispatch(pid, {"action": "process_exit"})
-        review = review_result["payload"]["completion_review"]
+        review = _host_completion_review(reopened, review_result)
 
         assert review["goal"]["source"] == "object_memory"
         assert review["goal"]["oid"] == initial_goal.oid

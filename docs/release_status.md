@@ -1,6 +1,6 @@
-# Agent libOS 1.4.1 Status
+# Agent libOS 1.4.2 Status
 
-Agent libOS 1.4.1 is a release candidate for the core Python runtime scope
+Agent libOS 1.4.2 is a release candidate for the core Python runtime scope
 defined in `docs/support_matrix.md`. Release-ready status for any source tree is
 conditional on that exact tree passing the checked-in CI workflow; local
 deterministic results do not substitute for its Python-version, PostgreSQL, and
@@ -26,7 +26,7 @@ checkout or candidate artifact.
   one root AgentProcess tree. They persist requirements, idempotent command
   receipts, append-only ledger links, and locally integrity-bound resume points;
   they do not introduce a generic workflow DSL or distributed scheduler.
-- RuntimeStore schema v6 is the only store format accepted by ordinary 1.4.1
+- RuntimeStore schema v6 is the only store format accepted by ordinary 1.4.2
   startup. A canonical v5 store has one explicit offline, digest-bound migration
   path to v6; v4 must first migrate to v5, and Runtime startup never migrates a
   store. Schema v3 remains archive-only under 1.0.1, and malformed/older stores
@@ -355,7 +355,7 @@ checkout or candidate artifact.
   The profile must validate exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The `release-artifacts` CI job is configured to build one canonical 1.4.1
+- The `release-artifacts` CI job is configured to build one canonical 1.4.2
   wheel/source pair, reject extra or non-regular output, and record an exact
   checksum manifest.
   Python 3.11 through 3.14 smoke jobs download and verify that same pair, install
@@ -375,7 +375,7 @@ endpoint to read a policy and CSV, compute a report, emit `human_output`, and
 exit. No provenance-bearing report for that run is checked in with the source
 revision, model/profile identity, redacted configuration, environment, and raw
 test outcome needed to reproduce or compare it. It is therefore an unarchived
-observation, not Agent libOS 1.4.1 release evidence, and supports no call-count,
+observation, not Agent libOS 1.4.2 release evidence, and supports no call-count,
 token-count, approval-count, latency, or serial-versus-parallel claim. Promote a
 future rerun only after using a documented opt-in real-model gate and preserving
 its reproducible report outside this status summary.
@@ -414,7 +414,7 @@ its reproducible report outside this status summary.
   non-bare workspace repository and system Git 2.26 or newer; unavailable Git
   fails individual calls without preventing Runtime startup. Host-configured
   remotes are the only first-class Git network exception. There is no Git CLI,
-  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.4.1.
+  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.4.2.
 
 ## Remaining environment gates and non-blocking debt
 

@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from pydantic import BaseModel, Field, StrictBool, StrictInt, field_validator
 
 from agent_libos.models import Capability, CapabilityEffect
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
-from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+from agent_libos.tools.base import (
+    SyncAgentTool,
+    ToolContext,
+    ToolErrorCode,
+    ToolExecutionError,
+    ToolPolicy,
+    ToolResult,
+)
 
 
 class ListCapabilitiesArgs(BaseModel):
@@ -123,6 +131,47 @@ def _mutation_capability_receipt(
         }
 
 
+def _model_capability(runtime: Any, ctx: ToolContext, value: Any) -> Any:
+    """Keep authority needed for action while omitting Host provenance."""
+
+    if not isinstance(value, Mapping):
+        return value
+    selected: dict[str, Any] = {}
+    for key in (
+        "cap_id",
+        "resource",
+        "rights",
+        "effect",
+        "status",
+        "uses_remaining",
+        "expires_at",
+        "constraints",
+        "delegable",
+        "rules",
+        "presentation_omitted",
+    ):
+        item = value.get(key)
+        if item not in (None, "", [], {}):
+            selected[key] = item
+    resource = selected.get("resource")
+    if isinstance(resource, str):
+        process = runtime.process.get(ctx.pid)
+        resource = resource.replace(ctx.pid, "self")
+        if process.goal_oid:
+            resource = resource.replace(process.goal_oid, "goal")
+        selected["resource"] = resource
+    delegation = value.get("delegation")
+    if isinstance(delegation, Mapping):
+        effective = {
+            key: delegation[key]
+            for key in ("delegable", "max_depth")
+            if delegation.get(key) not in (None, False)
+        }
+        if effective:
+            selected["delegation"] = effective
+    return selected
+
+
 class ListCapabilitiesTool(SyncAgentTool[ListCapabilitiesArgs]):
     name = "list_capabilities"
     description = "List the current process capabilities without granting new authority."
@@ -131,7 +180,7 @@ class ListCapabilitiesTool(SyncAgentTool[ListCapabilitiesArgs]):
     policy = ToolPolicy(side_effects=False)
     tags = ["capability", "authority"]
 
-    def run(self, args: ListCapabilitiesArgs, ctx: ToolContext) -> ListCapabilitiesOutput:
+    def run(self, args: ListCapabilitiesArgs, ctx: ToolContext) -> ToolResult:
         runtime = _runtime(ctx)
         page = runtime.capability.presentation_page(
             subject=ctx.pid,
@@ -140,11 +189,21 @@ class ListCapabilitiesTool(SyncAgentTool[ListCapabilitiesArgs]):
             after_cap_id=args.after_cap_id,
             max_bytes=_presentation_budget(runtime),
         )
-        return ListCapabilitiesOutput(
+        output = ListCapabilitiesOutput(
             capabilities=page.capabilities,
             has_more=page.has_more,
             next_cursor=page.next_cursor,
         )
+        model_data: dict[str, Any] = {
+            "capabilities": [
+                _model_capability(runtime, ctx, capability)
+                for capability in output.capabilities
+            ],
+            "has_more": output.has_more,
+        }
+        if output.next_cursor is not None:
+            model_data["next_cursor"] = output.next_cursor
+        return ToolResult.success(data=output.model_dump(), model_data=model_data)
 
 
 class InspectCapabilityTool(SyncAgentTool[InspectCapabilityArgs]):
@@ -155,18 +214,24 @@ class InspectCapabilityTool(SyncAgentTool[InspectCapabilityArgs]):
     policy = ToolPolicy(side_effects=False)
     tags = ["capability", "authority"]
 
-    def run(self, args: InspectCapabilityArgs, ctx: ToolContext) -> InspectCapabilityOutput:
+    def run(self, args: InspectCapabilityArgs, ctx: ToolContext) -> ToolResult:
         runtime = _runtime(ctx)
         cap = runtime.store.get_capability(args.cap_id)
         if cap is None:
             raise ToolExecutionError("Capability not found.", code=ToolErrorCode.VALIDATION_ERROR)
         if cap.subject != ctx.pid:
             raise ToolExecutionError("Cannot inspect another process capability.", code=ToolErrorCode.PERMISSION_DENIED)
-        return InspectCapabilityOutput(
+        output = InspectCapabilityOutput(
             capability=runtime.capability.inspect_for_presentation(
                 args.cap_id,
                 max_bytes=_presentation_budget(runtime),
             )
+        )
+        return ToolResult.success(
+            data=output.model_dump(),
+            model_data={
+                "capability": _model_capability(runtime, ctx, output.capability)
+            },
         )
 
 
@@ -178,7 +243,7 @@ class DelegateCapabilityTool(SyncAgentTool[DelegateCapabilityArgs]):
     policy = ToolPolicy(side_effects=True, idempotent=False, declared_permissions={"capability.write"})
     tags = ["capability", "authority"]
 
-    def run(self, args: DelegateCapabilityArgs, ctx: ToolContext) -> DelegateCapabilityOutput:
+    def run(self, args: DelegateCapabilityArgs, ctx: ToolContext) -> ToolResult:
         runtime = _runtime(ctx)
         child = runtime.process.get(args.child_pid)
         if child.parent_pid != ctx.pid:
@@ -201,8 +266,14 @@ class DelegateCapabilityTool(SyncAgentTool[DelegateCapabilityArgs]):
             )
         except CapabilityDenied as exc:
             raise ToolExecutionError(str(exc), code=ToolErrorCode.PERMISSION_DENIED) from exc
-        return DelegateCapabilityOutput(
+        output = DelegateCapabilityOutput(
             capability=_mutation_capability_receipt(runtime, cap)
+        )
+        return ToolResult.success(
+            data=output.model_dump(),
+            model_data={
+                "capability": _model_capability(runtime, ctx, output.capability)
+            },
         )
 
 
@@ -214,12 +285,18 @@ class RevokeCapabilityTool(SyncAgentTool[RevokeCapabilityArgs]):
     policy = ToolPolicy(side_effects=True, idempotent=False, declared_permissions={"capability.write"})
     tags = ["capability", "authority"]
 
-    def run(self, args: RevokeCapabilityArgs, ctx: ToolContext) -> RevokeCapabilityOutput:
+    def run(self, args: RevokeCapabilityArgs, ctx: ToolContext) -> ToolResult:
         runtime = _runtime(ctx)
         try:
             cap = runtime.capability.revoke(args.cap_id, revoked_by=ctx.pid, reason=args.reason)
         except CapabilityDenied as exc:
             raise ToolExecutionError(str(exc), code=ToolErrorCode.PERMISSION_DENIED) from exc
-        return RevokeCapabilityOutput(
+        output = RevokeCapabilityOutput(
             capability=_mutation_capability_receipt(runtime, cap)
+        )
+        return ToolResult.success(
+            data=output.model_dump(),
+            model_data={
+                "capability": _model_capability(runtime, ctx, output.capability)
+            },
         )

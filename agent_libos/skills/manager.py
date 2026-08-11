@@ -1123,6 +1123,50 @@ class SkillManager:
             "instructions_hash": self._hash_text(skill.instructions),
         }
 
+    def activated_skill_result_from_durable_state(
+        self,
+        pid: str,
+        skill_id: str,
+    ) -> dict[str, Any]:
+        """Reconstruct a complete activation receipt after runtime-only I/O expires."""
+
+        process = self.processes.get_process(pid)
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        loaded = process.loaded_skills.get(skill_id)
+        if not isinstance(loaded, dict):
+            raise ValidationError(
+                f"activated Skill has no durable loaded record: {skill_id}"
+            )
+        activation_kind = str(loaded.get("activation_kind") or "")
+        if activation_kind == "builtin_projection":
+            skill, tool_ids = self._validate_loaded_builtin_projection_record(
+                skill_id,
+                loaded,
+            )
+        elif activation_kind == "registered":
+            skill = self._skill_for_loaded_record(skill_id, loaded)
+            self._validate_registered_loaded_tool_sets(skill_id, skill, loaded)
+            tool_ids = self._loaded_tool_id_map(loaded, "tool_ids")
+        else:
+            raise ValidationError(
+                f"activated Skill has an invalid activation kind: {skill_id}"
+            )
+        jit_tool_ids = self._loaded_tool_id_map(loaded, "jit_tool_ids")
+        result = {
+            "pid": pid,
+            "skill_id": skill.skill_id,
+            "name": skill.name,
+            "version": skill.version,
+            "tool_names": sorted([*tool_ids, *jit_tool_ids]),
+            "tool_ids": tool_ids,
+            "jit_tool_ids": jit_tool_ids,
+            "instructions_hash": self._hash_text(skill.instructions),
+            "package_sha256": skill.package_sha256,
+        }
+        self.validate_activated_skill_result(pid, result)
+        return result
+
     def _validated_activation_result_shape(
         self,
         pid: str,

@@ -16,6 +16,7 @@ from agent_libos.tools.base import (
     ToolErrorCode,
     ToolExecutionError,
     ToolPolicy,
+    ToolResult,
 )
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -202,7 +203,12 @@ class ListCheckpointsOutput(BaseModel):
 
 
 class InspectCheckpointArgs(BaseModel):
-    checkpoint_id: str = Field(description="Checkpoint id returned by create_checkpoint or list_checkpoints.")
+    checkpoint_id: str = Field(
+        description=(
+            "Semantic selector 'only' when list_checkpoints exposed one candidate, "
+            "or an exact checkpoint id when it exposed multiple candidates."
+        )
+    )
     process_cursor: int = Field(
         default=0,
         ge=0,
@@ -250,7 +256,10 @@ class InspectCheckpointOutput(BaseModel):
 
 class DiffCheckpointArgs(BaseModel):
     checkpoint_id: str = Field(
-        description="Checkpoint id whose snapshot is compared with current reconstructable state."
+        description=(
+            "Semantic selector 'only' for one listed candidate, or the exact "
+            "checkpoint id whose snapshot is compared with current state."
+        )
     )
     external_effect_cursor: int = Field(
         default=0,
@@ -277,7 +286,12 @@ class DiffCheckpointOutput(BaseModel):
 
 
 class RestoreCheckpointArgs(BaseModel):
-    checkpoint_id: str = Field(description="Checkpoint id whose saved subtree will replace the live subtree.")
+    checkpoint_id: str = Field(
+        description=(
+            "Semantic selector 'only' for one listed candidate, or the exact "
+            "checkpoint id whose saved subtree will replace the live subtree."
+        )
+    )
 
 
 class RestoreCheckpointOutput(BaseModel):
@@ -375,7 +389,10 @@ def _restore_recovery_signal(
 
 class ForkCheckpointArgs(BaseModel):
     checkpoint_id: str = Field(
-        description="Checkpoint id to copy into a new subtree without changing the source subtree."
+        description=(
+            "Semantic selector 'only' for one listed candidate, or the exact "
+            "checkpoint id to copy without changing the source subtree."
+        )
     )
     parent_pid: str | None = Field(
         default=None,
@@ -429,14 +446,25 @@ class CreateCheckpointTool(SyncAgentTool[CreateCheckpointArgs]):
     )
     tags = ["checkpoint", "durable"]
 
-    def run(self, args: CreateCheckpointArgs, ctx: ToolContext) -> CreateCheckpointOutput:
+    def run(self, args: CreateCheckpointArgs, ctx: ToolContext) -> ToolResult:
         runtime = _runtime(ctx)
         target_pid = args.pid or ctx.pid
         checkpoint_id = runtime.checkpoint.create(target_pid, args.reason, actor=ctx.pid)
-        return CreateCheckpointOutput(
+        output = CreateCheckpointOutput(
             checkpoint_id=checkpoint_id,
             pid=target_pid,
             reason=_preview_text(args.reason, _model_preview_text_limit(ctx)),
+        )
+        return ToolResult.success(
+            data=output.model_dump(),
+            model_data=(
+                {
+                    "created": True,
+                    "reason": output.reason,
+                }
+                if _cache_optimized_v2(runtime)
+                else output.model_dump()
+            ),
         )
 
 
@@ -448,18 +476,19 @@ class ListCheckpointsTool(SyncAgentTool[ListCheckpointsArgs]):
     policy = ToolPolicy(side_effects=False, idempotent=True, timeout_s=_TOOL_DEFAULTS.standard_timeout_s)
     tags = ["checkpoint", "inspect"]
 
-    def run(self, args: ListCheckpointsArgs, ctx: ToolContext) -> ListCheckpointsOutput:
+    def run(self, args: ListCheckpointsArgs, ctx: ToolContext) -> ToolResult:
         runtime = _runtime(ctx)
         configured_limit = _checkpoint_list_limit(ctx)
         selected_limit = min(args.limit or configured_limit, configured_limit)
+        target_pid = args.pid or ctx.pid
         raw_checkpoints = runtime.checkpoint.list(
-            args.pid or ctx.pid,
+            target_pid,
             actor=ctx.pid,
             limit=configured_limit,
         )
         selected = raw_checkpoints[:selected_limit]
         text_limit = _model_preview_text_limit(ctx)
-        return ListCheckpointsOutput(
+        output = ListCheckpointsOutput(
             checkpoints=[
                 _checkpoint_list_item(value, text_limit=text_limit)
                 for value in selected
@@ -467,6 +496,21 @@ class ListCheckpointsTool(SyncAgentTool[ListCheckpointsArgs]):
             ],
             count=len(raw_checkpoints),
             has_more=len(raw_checkpoints) > selected_limit,
+        )
+        return ToolResult.success(
+            data=output.model_dump(),
+            model_data=(
+                {
+                    "checkpoints": _model_checkpoint_candidates(
+                        output,
+                        allow_only=target_pid == ctx.pid,
+                    ),
+                    "count": output.count,
+                    "has_more": output.has_more,
+                }
+                if _cache_optimized_v2(runtime)
+                else output.model_dump()
+            ),
         )
 
 
@@ -482,7 +526,8 @@ class InspectCheckpointTool(SyncAgentTool[InspectCheckpointArgs]):
     tags = ["checkpoint", "inspect"]
 
     def run(self, args: InspectCheckpointArgs, ctx: ToolContext) -> InspectCheckpointOutput:
-        data = _runtime(ctx).checkpoint.inspect(args.checkpoint_id, actor=ctx.pid)
+        checkpoint_id = _resolve_checkpoint_selector(args.checkpoint_id, ctx)
+        data = _runtime(ctx).checkpoint.inspect(checkpoint_id, actor=ctx.pid)
         limit = min(args.detail_limit, _model_preview_limit(ctx))
         return _inspect_output(
             data,
@@ -506,8 +551,9 @@ class DiffCheckpointTool(SyncAgentTool[DiffCheckpointArgs]):
 
     def run(self, args: DiffCheckpointArgs, ctx: ToolContext) -> DiffCheckpointOutput:
         limit = min(args.external_effect_limit, _model_preview_limit(ctx))
+        checkpoint_id = _resolve_checkpoint_selector(args.checkpoint_id, ctx)
         return _diff_output(
-            _runtime(ctx).checkpoint.diff(args.checkpoint_id, actor=ctx.pid),
+            _runtime(ctx).checkpoint.diff(checkpoint_id, actor=ctx.pid),
             cursor=args.external_effect_cursor,
             limit=limit,
             text_limit=_model_preview_text_limit(ctx),
@@ -540,8 +586,9 @@ class RestoreCheckpointTool(SyncAgentTool[RestoreCheckpointArgs]):
     tags = ["checkpoint", "restore", "high_risk"]
 
     def run(self, args: RestoreCheckpointArgs, ctx: ToolContext) -> RestoreCheckpointOutput:
+        checkpoint_id = _resolve_checkpoint_selector(args.checkpoint_id, ctx)
         try:
-            restored = _runtime(ctx).checkpoint.restore(ctx.pid, args.checkpoint_id)
+            restored = _runtime(ctx).checkpoint.restore(ctx.pid, checkpoint_id)
         except Exception as exc:
             recovery = _restore_recovery_signal(exc)
             if recovery is None:
@@ -558,7 +605,7 @@ class RestoreCheckpointTool(SyncAgentTool[RestoreCheckpointArgs]):
                 retryable=False,
                 details={
                     "checkpoint_restore_receipt": {
-                        "checkpoint_id": args.checkpoint_id,
+                        "checkpoint_id": checkpoint_id,
                         "publication_id": recovery.publication_id,
                         "operation_id": recovery.operation_id,
                         "state": recovery.state,
@@ -596,10 +643,11 @@ class ForkCheckpointTool(SyncAgentTool[ForkCheckpointArgs]):
     def run(self, args: ForkCheckpointArgs, ctx: ToolContext) -> ForkCheckpointOutput:
         limit = _model_preview_limit(ctx)
         text_limit = _model_preview_text_limit(ctx)
+        checkpoint_id = _resolve_checkpoint_selector(args.checkpoint_id, ctx)
         try:
             receipt = _runtime(ctx).checkpoint.fork_from_checkpoint(
                 ctx.pid,
-                args.checkpoint_id,
+                checkpoint_id,
                 parent_pid=args.parent_pid,
             )
         except Exception as exc:
@@ -978,6 +1026,71 @@ def _checkpoint_list_item(
             else None
         ),
     )
+
+
+def _model_checkpoint_candidates(
+    output: ListCheckpointsOutput,
+    *,
+    allow_only: bool,
+) -> list[dict[str, str]]:
+    """Use a fail-closed semantic selector when the bounded list is singular."""
+
+    if (
+        allow_only
+        and output.count == 1
+        and not output.has_more
+        and len(output.checkpoints) == 1
+    ):
+        item = output.checkpoints[0]
+        return [{"checkpoint_ref": "only", "reason": item.reason}]
+    return [
+        {"checkpoint_id": item.checkpoint_id, "reason": item.reason}
+        for item in output.checkpoints
+    ]
+
+
+def _cache_optimized_v2(runtime: Any) -> bool:
+    return (
+        str(
+            getattr(
+                getattr(getattr(runtime, "config", None), "llm", None),
+                "prompt_layout",
+                "legacy_v1",
+            )
+        )
+        == "cache_optimized_v2"
+    )
+
+
+def _resolve_checkpoint_selector(value: str, ctx: ToolContext) -> str:
+    """Resolve ``only`` iff the caller currently has exactly one listed row.
+
+    Resolution happens immediately before the operation and fails closed if a
+    concurrent checkpoint changed the candidate set. Exact ids retain their
+    existing capability semantics, including known checkpoints that are not
+    listable through the owner-process collection.
+    """
+
+    if value != "only":
+        return value
+    candidates = _runtime(ctx).checkpoint.list(
+        ctx.pid,
+        actor=ctx.pid,
+        limit=2,
+    )
+    if len(candidates) != 1:
+        raise ToolExecutionError(
+            "The semantic checkpoint selector 'only' no longer identifies "
+            "exactly one visible candidate; call list_checkpoints again.",
+            code=ToolErrorCode.VALIDATION_ERROR,
+        )
+    checkpoint_id = candidates[0].get("checkpoint_id")
+    if not isinstance(checkpoint_id, str) or not checkpoint_id:
+        raise ToolExecutionError(
+            "The sole visible checkpoint has no usable identifier.",
+            code=ToolErrorCode.EXECUTION_ERROR,
+        )
+    return checkpoint_id
 
 
 def _project_external_effect_summary(

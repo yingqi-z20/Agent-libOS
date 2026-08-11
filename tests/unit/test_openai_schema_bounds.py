@@ -68,3 +68,35 @@ def test_openai_schema_normalization_returns_detached_nonstrict_schema() -> None
 
     assert strict is False
     assert schema["additionalProperties"] == {"type": "string"}
+
+
+def test_openai_schema_normalization_removes_only_generated_titles_recursively() -> None:
+    schema = {
+        "title": "Root",
+        "type": "object",
+        "properties": {
+            "mode": {
+                "title": "Mode",
+                "description": "Keep this guidance.",
+                "enum": ["one", "two"],
+                "default": "one",
+            },
+            "nested": {
+                "title": "Nested",
+                "type": "array",
+                "items": {"title": "Item", "type": "integer", "minimum": 1},
+            },
+        },
+    }
+
+    normalized, strict = normalize_openai_strict_schema(schema)
+
+    assert strict is True
+    assert "title" not in str(normalized)
+    assert normalized["properties"]["mode"] == {
+        "description": "Keep this guidance.",
+        "enum": ["one", "two"],
+        "default": "one",
+    }
+    assert normalized["properties"]["nested"]["items"]["minimum"] == 1
+    assert schema["title"] == "Root"

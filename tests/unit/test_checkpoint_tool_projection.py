@@ -26,6 +26,10 @@ from agent_libos.tools.builtin.checkpoint import (
 _RECEIPT_SENTINEL = "provider-receipt-must-stay-out-of-model-output"
 _AUDIT_SENTINEL = "audit-event-id-must-stay-out-of-model-output"
 _LARGE_TEXT = "x" * 32_000
+_V2_CONFIG = replace(
+    DEFAULT_CONFIG,
+    llm=replace(DEFAULT_CONFIG.llm, prompt_layout="cache_optimized_v2"),
+)
 
 
 @pytest.mark.parametrize("pid", (None, "", "None", " null "))
@@ -204,6 +208,18 @@ def test_inspect_tool_pages_large_subtree_and_bounds_nested_process_state() -> N
     ]
 
     class Checkpoint:
+        def list(
+            self,
+            pid: str,
+            *,
+            actor: str,
+            limit: int | None,
+        ) -> list[dict[str, Any]]:
+            assert pid == "pid_caller"
+            assert actor == "pid_caller"
+            assert limit == 2
+            return [{"checkpoint_id": "ckpt_large"}]
+
         def inspect(self, checkpoint_id: str, *, actor: str) -> dict[str, Any]:
             assert checkpoint_id == "ckpt_large"
             assert actor == "pid_caller"
@@ -257,6 +273,13 @@ def test_inspect_tool_pages_large_subtree_and_bounds_nested_process_state() -> N
     assert _AUDIT_SENTINEL not in result.content
     assert _LARGE_TEXT not in result.content
     assert len(result.content.encode("utf-8")) < DEFAULT_CONFIG.tools.memory_payload_hard_limit_bytes
+
+    semantic = InspectCheckpointTool().invoke(
+        {"checkpoint_id": "only"},
+        _context(Checkpoint()),
+    )
+    assert semantic.ok
+    assert semantic.data["checkpoint"]["checkpoint_id"] == "ckpt_large"
 
 
 def test_restore_tool_preserves_commit_identity_while_bounding_large_reports() -> None:
@@ -483,7 +506,7 @@ def test_inspect_and_diff_honor_runtime_preview_limit_in_schema_and_execution() 
     assert diff.data["external_effects_page"]["next_cursor"] == 3
 
 
-def test_create_checkpoint_bounds_reason_and_keeps_checkpoint_identity_first() -> None:
+def test_create_checkpoint_bounds_reason_and_hides_identity_until_selection() -> None:
     calls: list[tuple[str, str, str]] = []
 
     class Checkpoint:
@@ -497,10 +520,17 @@ def test_create_checkpoint_bounds_reason_and_keeps_checkpoint_identity_first() -
     assert "1024 bytes" in schema["description"]
 
     reason = "界" * 300
-    result = tool.invoke({"reason": reason}, _context(Checkpoint()))
+    result = tool.invoke(
+        {"reason": reason},
+        _context(Checkpoint(), config=_V2_CONFIG),
+    )
     assert result.ok
     assert list(result.data) == ["checkpoint_id", "pid", "reason"]
     assert result.data["checkpoint_id"] == "ckpt_identity_survives"
+    assert result.model_projection(limit_bytes=2_048) == {
+        "created": True,
+        "reason": result.data["reason"],
+    }
     assert calls == [("pid_caller", reason, "pid_caller")]
     assert len(result.data["reason"]) <= DEFAULT_CONFIG.tools.tool_observability_preview_chars
     assert len(result.content.encode("utf-8")) < 2_048
@@ -518,9 +548,45 @@ def test_create_checkpoint_bounds_reason_and_keeps_checkpoint_identity_first() -
     assert len(calls) == 1
 
 
+def test_legacy_checkpoint_projection_preserves_exact_identity() -> None:
+    class Checkpoint:
+        def create(self, pid: str, reason: str, *, actor: str) -> str:
+            return "ckpt_legacy"
+
+        def list(
+            self,
+            pid: str,
+            *,
+            actor: str,
+            limit: int | None,
+        ) -> list[dict[str, Any]]:
+            return [
+                {
+                    "checkpoint_id": "ckpt_legacy",
+                    "pid": pid,
+                    "reason": "legacy rollback",
+                    "created_at": "2026-08-11T00:00:00+00:00",
+                    "created_by": actor,
+                    "snapshot_version": 4,
+                }
+            ]
+
+    context = _context(Checkpoint())
+    created = CreateCheckpointTool().invoke(
+        {"reason": "legacy rollback"},
+        context,
+    )
+    listed = ListCheckpointsTool().invoke({}, context)
+
+    assert created.ok and listed.ok
+    assert created.model_projection(limit_bytes=8_192) == created.data
+    assert listed.model_projection(limit_bytes=8_192) == listed.data
+
+
 def test_list_checkpoints_projects_bounded_allowlist_and_window_metadata() -> None:
     config = replace(
         DEFAULT_CONFIG,
+        llm=replace(DEFAULT_CONFIG.llm, prompt_layout="cache_optimized_v2"),
         checkpoint=replace(DEFAULT_CONFIG.checkpoint, list_limit=5),
     )
     observed_limits: list[int | None] = []
@@ -574,6 +640,19 @@ def test_list_checkpoints_projects_bounded_allowlist_and_window_metadata() -> No
     assert len(result.data["checkpoints"][0]["reason"]) <= DEFAULT_CONFIG.tools.tool_observability_preview_chars
     assert _RECEIPT_SENTINEL not in result.content
     assert _LARGE_TEXT not in result.content
+    model_projection = result.model_projection(limit_bytes=8_192)
+    assert model_projection["checkpoints"] == [
+        {
+            "checkpoint_id": "ckpt_0",
+            "reason": result.data["checkpoints"][0]["reason"],
+        },
+        {
+            "checkpoint_id": "ckpt_1",
+            "reason": result.data["checkpoints"][1]["reason"],
+        },
+    ]
+    assert "pid_source" not in str(model_projection)
+    assert "created_at" not in str(model_projection)
 
     full_window = tool.invoke({}, context)
     assert full_window.ok
@@ -581,6 +660,38 @@ def test_list_checkpoints_projects_bounded_allowlist_and_window_metadata() -> No
     assert full_window.data["count"] == 5
     assert full_window.data["has_more"] is False
     assert observed_limits == [5, 5]
+
+    class SingleCheckpoint(Checkpoint):
+        def list(
+            self,
+            pid: str,
+            *,
+            actor: str,
+            limit: int | None,
+        ) -> list[dict[str, Any]]:
+            return rows[:1]
+
+    singular = tool.invoke({}, _context(SingleCheckpoint(), config=config))
+    assert singular.ok
+    assert singular.model_projection(limit_bytes=8_192)["checkpoints"] == [
+        {
+            "checkpoint_ref": "only",
+            "reason": singular.data["checkpoints"][0]["reason"],
+        }
+    ]
+    assert "ckpt_0" not in str(singular.model_projection(limit_bytes=8_192))
+
+    cross_process = tool.invoke(
+        {"pid": "pid_source"},
+        _context(SingleCheckpoint(), config=config),
+    )
+    assert cross_process.ok
+    assert cross_process.model_projection(limit_bytes=8_192)["checkpoints"] == [
+        {
+            "checkpoint_id": "ckpt_0",
+            "reason": cross_process.data["checkpoints"][0]["reason"],
+        }
+    ]
 
 
 def test_fork_failure_preserves_bounded_retry_safety_receipt() -> None:

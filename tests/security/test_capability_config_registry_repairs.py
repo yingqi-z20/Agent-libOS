@@ -329,9 +329,16 @@ def test_capability_tools_preserve_large_receipts_and_page_large_inventory() -> 
         assert isinstance(delegated.payload, dict)
         receipt = delegated.payload["capability"]
         assert receipt["cap_id"]
-        assert receipt["metadata"] == {}
-        assert receipt["metadata_projection"]["omitted"] is True
+        assert "metadata" not in receipt
+        assert "metadata_projection" not in receipt
         assert "result_omitted" not in delegated.payload
+        assert delegated.result_handle is not None
+        stored_result = runtime.store.get_object(delegated.result_handle.oid)
+        assert stored_result is not None
+        durable_receipt = stored_result.payload["result"]["capability"]
+        assert durable_receipt["cap_id"] == receipt["cap_id"]
+        assert durable_receipt["metadata"] == {}
+        assert durable_receipt["metadata_projection"]["omitted"] is True
 
         expected_ids = {receipt["cap_id"]}
         for index in range(13):
@@ -381,7 +388,7 @@ def test_capability_tools_preserve_large_receipts_and_page_large_inventory() -> 
             )
             pages += 1
             if not listed.payload["has_more"]:
-                assert listed.payload["next_cursor"] is None
+                assert listed.payload.get("next_cursor") is None
                 break
             cursor = listed.payload["next_cursor"]
             assert cursor

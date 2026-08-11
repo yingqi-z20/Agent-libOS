@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -16,10 +17,21 @@ from agent_libos.models import (
     PROMPT_MODE_MINIMAL_RUNTIME,
     PROMPT_MODES,
 )
+from agent_libos.utils.openai_schema import compact_model_json_schema
 from agent_libos.utils.serde import loads
 
 
 PromptEvent = Event | Mapping[str, Any]
+
+PROMPT_LAYOUT_LEGACY_V1 = "legacy_v1"
+PROMPT_LAYOUT_CACHE_OPTIMIZED_V2 = "cache_optimized_v2"
+PROMPT_LAYOUTS = {
+    PROMPT_LAYOUT_LEGACY_V1,
+    PROMPT_LAYOUT_CACHE_OPTIMIZED_V2,
+}
+_DYNAMIC_RUNTIME_HEADING = (
+    "Current runtime state (volatile; applies only to this quantum):"
+)
 
 
 ACTION_PROTOCOL = """
@@ -32,7 +44,19 @@ The available library calls and their input schemas are supplied through the mod
 Match those JSON types exactly: integers, numbers, and booleans are unquoted
 JSON scalars (for example `{"limit":5}`, never `{"limit":"5"}`). If a call
 fails validation, correct the reported field/type instead of repeating unchanged arguments.
-Use object ids and process ids exactly as shown in context. Never invent a capability grant.
+Represent an absent nullable value as JSON `null`, never as the strings `"None"`
+or `"null"`; represent arrays and objects as JSON arrays and objects, not strings.
+Do not copy Host identifiers, hashes, timestamps, or protocol bookkeeping from
+tool results into human-facing text or completion payloads. The only exceptions
+are an explicit user request for the value, or the exact argument position of
+a visible tool that requires it as its target. An identifier used by an earlier
+tool call is never evidence by itself: do not repeat it in human_output,
+process_exit payload/message, or completion evidence; describe the semantic
+outcome instead.
+Use semantic targets such as `self` and `parent` when the tool schema offers
+them. Use an exact identifier only when a list/inspect result exposes multiple
+candidates and the selected tool schema requires that identifier. Never invent
+an identifier or capability grant.
 If an action is risky or requires unavailable authority, use request_permission
 for an exact resource/right, use ask_human for missing intent, or choose a
 lower-risk step. Never invent a tool name.
@@ -151,13 +175,47 @@ def build_user_prompt(
     requestable_capabilities: list[dict[str, Any]] | None = None,
     original_goal_context: str | None = None,
     fallback_json_actions: bool = False,
+    prompt_layout: str = PROMPT_LAYOUT_LEGACY_V1,
 ) -> str:
     mode = prompt_mode if prompt_mode in PROMPT_MODES else PROMPT_MODE_LIBOS_DEFAULT
+    layout = (
+        prompt_layout
+        if prompt_layout in PROMPT_LAYOUTS
+        else PROMPT_LAYOUT_LEGACY_V1
+    )
     if mode == PROMPT_MODE_IMAGE_ONLY:
         raise ValueError(
             "image_only user messages are built from the process goal and durable native transcript"
         )
     if context.policy_used == "llm_context_object":
+        context_text = (
+            _compact_materialized_context_text(
+                context.text,
+                include_object_ids=_visible_tools_accept_field(
+                    tools,
+                    "object_oid",
+                ),
+            )
+            if layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2
+            else context.text
+        )
+        dynamic_runtime = "\n\n".join(
+            part
+            for part in [
+                _requestable_capability_section(
+                    requestable_capabilities or [],
+                    process=process,
+                    tools=tools,
+                    prompt_layout=layout,
+                ),
+                _process_message_directive(process, events),
+            ]
+            if part.strip()
+        )
+        if dynamic_runtime and layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
+            dynamic_runtime = (
+                f"{_DYNAMIC_RUNTIME_HEADING}\n\n{dynamic_runtime}"
+            )
         return "\n\n".join(
             part
             for part in [
@@ -167,9 +225,8 @@ def build_user_prompt(
                 _original_goal_section(original_goal_context),
                 _skill_section(skills or []),
                 _fallback_tool_section(tools) if fallback_json_actions else "",
-                context.text,
-                _requestable_capability_section(requestable_capabilities or []),
-                _process_message_directive(process, events),
+                context_text,
+                dynamic_runtime,
             ]
             if part.strip()
         )
@@ -184,6 +241,7 @@ def build_user_prompt(
         requestable_capabilities=requestable_capabilities or [],
         original_goal_context=original_goal_context,
         fallback_json_actions=fallback_json_actions,
+        prompt_layout=layout,
     )
 
 
@@ -204,19 +262,26 @@ def _runtime_user_prompt(
     requestable_capabilities: list[dict[str, Any]],
     original_goal_context: str | None,
     fallback_json_actions: bool,
+    prompt_layout: str,
 ) -> str:
     parts = [
         _available_skill_section(available_skills),
         _original_goal_section(original_goal_context),
         _skill_section(skills),
         _fallback_tool_section(tools) if fallback_json_actions else "",
-        _context_body_section(context),
+        _context_body_section(
+            context,
+            tools=tools,
+            prompt_layout=prompt_layout,
+        ),
         _volatile_runtime_section(
             process=process,
             context=context,
             events=events,
             capabilities=capabilities,
             requestable_capabilities=requestable_capabilities,
+            tools=tools,
+            prompt_layout=prompt_layout,
         ),
     ]
     return "\n\n".join(part for part in parts if part.strip())
@@ -344,7 +409,7 @@ def _decode_json_object(
 
 
 def _is_goal_object_record(payload: dict[str, Any], goal_oid: str) -> bool:
-    return (
+    legacy_match = (
         payload.get("record_type") == "object_memory_object"
         and "payload" in payload
         and (
@@ -352,6 +417,12 @@ def _is_goal_object_record(payload: dict[str, Any], goal_oid: str) -> bool:
             or payload.get("oid") == goal_oid
         )
     )
+    semantic_match = (
+        payload.get("semantic_role") == "process_goal"
+        and payload.get("content_trust") == "untrusted_data"
+        and "payload" in payload
+    )
+    return legacy_match or semantic_match
 
 
 def _original_goal_section(original_goal_context: str | None) -> str:
@@ -405,7 +476,17 @@ def _process_message_directive(
     )
 
 
-def _process_fact_section(process: AgentProcess) -> str:
+def _process_fact_section(
+    process: AgentProcess,
+    *,
+    tools: list[dict[str, Any]],
+    prompt_layout: str,
+) -> str:
+    if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
+        facts = [f"- working_directory: {process.working_directory}"]
+        if process.status_message:
+            facts.append(f"- actionable_status: {process.status_message}")
+        return "Process facts:\n" + "\n".join(facts)
     return (
         "Process facts:\n"
         f"- pid: {process.pid}\n"
@@ -418,7 +499,46 @@ def _process_fact_section(process: AgentProcess) -> str:
     )
 
 
-def _capability_section(capabilities: list[Capability]) -> str:
+def _capability_section(
+    capabilities: list[Capability],
+    *,
+    process: AgentProcess,
+    tools: list[dict[str, Any]],
+    prompt_layout: str,
+) -> str:
+    if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
+        include_cap_id = _visible_tools_accept_field(tools, "cap_id")
+        include_object_id = _visible_tools_accept_field(tools, "object_oid")
+        include_delegation = bool(
+            {"delegate_capability", "revoke_capability", "inspect_capability"}
+            & _visible_tool_names(tools)
+        )
+        visible_by_fingerprint: dict[str, dict[str, Any]] = {}
+        for cap in capabilities:
+            if not cap.active:
+                continue
+            row: dict[str, Any] = {
+                "resource": _semantic_capability_resource(
+                    cap.resource,
+                    process=process,
+                    include_object_id=include_object_id,
+                ),
+                "rights": sorted(cap.rights),
+                "effect": cap.effect.value,
+            }
+            if cap.constraints:
+                row["constraints"] = cap.constraints
+            if cap.uses_remaining is not None:
+                row["uses_remaining"] = cap.uses_remaining
+            if include_cap_id:
+                row["cap_id"] = cap.cap_id
+            if include_delegation and cap.delegable:
+                row["delegable"] = True
+                if cap.max_delegation_depth is not None:
+                    row["max_delegation_depth"] = cap.max_delegation_depth
+            visible_by_fingerprint.setdefault(_prompt_json(row), row)
+        visible = sorted(visible_by_fingerprint.values(), key=_prompt_json)
+        return f"Capabilities:\n{_prompt_json(visible)}"
     visible = [
         {
             "cap_id": cap.cap_id,
@@ -453,10 +573,43 @@ def _capability_policy(cap: Capability) -> str:
 
 def _requestable_capability_section(
     requestable_capabilities: list[dict[str, Any]],
+    *,
+    process: AgentProcess | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    prompt_layout: str = PROMPT_LAYOUT_LEGACY_V1,
 ) -> str:
     if not requestable_capabilities:
         return ""
     visible = _sorted_capability_mappings(requestable_capabilities)
+    if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
+        include_object_id = _visible_tools_accept_field(
+            tools or [],
+            "object_oid",
+        )
+        visible = [
+            {
+                key: (
+                    _semantic_capability_resource(
+                        str(value),
+                        process=process,
+                        include_object_id=include_object_id,
+                    )
+                    if key == "resource" and process is not None
+                    else value
+                )
+                for key, value in row.items()
+                if key
+                in {
+                    "resource",
+                    "rights",
+                    "effect",
+                    "constraints",
+                    "uses_remaining",
+                }
+                and value not in (None, "", [], {})
+            }
+            for row in visible
+        ]
     return (
         "Permission-request ceilings (not capability grants):\n"
         f"{_prompt_json(visible)}\n"
@@ -599,7 +752,9 @@ def _fallback_tool_section(tools: list[dict[str, Any]]) -> str:
             {
                 "name": row.get("name"),
                 "description": spec.get("description", ""),
-                "input_schema": spec.get("input_schema", {}),
+                "input_schema": compact_model_json_schema(
+                    spec.get("input_schema", {})
+                ),
             }
         )
     visible.sort(key=_prompt_json)
@@ -610,18 +765,74 @@ def _fallback_tool_section(tools: list[dict[str, Any]]) -> str:
     )
 
 
-def _event_section(events: list[PromptEvent]) -> str:
-    visible = [_event_prompt_record(event) for event in events]
+def _event_section(
+    events: list[PromptEvent],
+    *,
+    include_event_id: bool = True,
+    prompt_layout: str = PROMPT_LAYOUT_LEGACY_V1,
+) -> str:
+    if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
+        actionable = [
+            event
+            for event in events
+            if _event_type_value(event) != "event_projection_summary"
+        ]
+        if not actionable:
+            summaries = [
+                event
+                for event in events
+                if _event_type_value(event) == "event_projection_summary"
+            ]
+            events = [
+                event
+                for event in summaries
+                if _event_summary_is_actionable(event)
+            ]
+    visible = [
+        _event_prompt_record(
+            event,
+            include_event_id=include_event_id,
+            prompt_layout=prompt_layout,
+        )
+        for event in events
+    ]
     if not visible:
         return ""
     return f"Recent events:\n{_prompt_json(visible)}"
 
 
-def _context_body_section(context: MaterializedContext) -> str:
-    return f"Materialized context:\n{context.text}"
+def _context_body_section(
+    context: MaterializedContext,
+    *,
+    tools: list[dict[str, Any]],
+    prompt_layout: str,
+) -> str:
+    text = context.text
+    if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
+        text = _compact_materialized_context_text(
+            text,
+            include_object_ids=_visible_tools_accept_field(
+                tools,
+                "object_oid",
+            ),
+        )
+    else:
+        text = _strip_persisted_model_projections(text)
+    return f"Materialized context:\n{text}"
 
 
-def _context_metadata_section(context: MaterializedContext) -> str:
+def _context_metadata_section(
+    context: MaterializedContext,
+    *,
+    prompt_layout: str,
+) -> str:
+    if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
+        if not context.omitted_objects:
+            return ""
+        return (
+            "Materialized context warning:\n"
+            f"- omitted_object_count: {len(context.omitted_objects)}"
+        )
     return (
         "Materialized context metadata (volatile):\n"
         f"- policy: {context.policy_used}\n"
@@ -638,17 +849,53 @@ def _volatile_runtime_section(
     events: list[PromptEvent],
     capabilities: list[Capability],
     requestable_capabilities: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    prompt_layout: str,
 ) -> str:
+    include_event_id = (
+        prompt_layout == PROMPT_LAYOUT_LEGACY_V1
+        or _visible_tools_accept_field(tools, "event_id")
+    )
     parts = [
-        "Current runtime state (volatile; applies only to this quantum):",
-        _process_fact_section(process),
-        _context_metadata_section(context),
-        _capability_section(capabilities),
-        _requestable_capability_section(requestable_capabilities),
-        _event_section(events),
+        _DYNAMIC_RUNTIME_HEADING,
+        _process_fact_section(
+            process,
+            tools=tools,
+            prompt_layout=prompt_layout,
+        ),
+        _context_metadata_section(context, prompt_layout=prompt_layout),
+        _capability_section(
+            capabilities,
+            process=process,
+            tools=tools,
+            prompt_layout=prompt_layout,
+        ),
+        _requestable_capability_section(
+            requestable_capabilities,
+            process=process,
+            tools=tools,
+            prompt_layout=prompt_layout,
+        ),
+        _event_section(
+            events,
+            include_event_id=include_event_id,
+            prompt_layout=prompt_layout,
+        ),
         _process_message_directive(process, events),
     ]
     return "\n\n".join(part for part in parts if part.strip())
+
+
+def split_cache_optimized_user_prompt(prompt: str) -> tuple[str, str | None]:
+    """Split one v2 user projection at the Host-owned volatile boundary."""
+
+    marker = f"\n\n{_DYNAMIC_RUNTIME_HEADING}"
+    boundary = prompt.find(marker)
+    if boundary < 0:
+        return prompt, None
+    stable = prompt[:boundary]
+    dynamic = prompt[boundary + 2 :]
+    return stable, dynamic
 
 
 def _prompt_json(value: Any) -> str:
@@ -671,26 +918,173 @@ def _event_type_value(event: PromptEvent) -> str:
     return str(event_type or "")
 
 
-def _event_prompt_record(event: PromptEvent) -> dict[str, Any]:
+def _event_summary_is_actionable(event: PromptEvent) -> bool:
+    payload = event.get("payload") if isinstance(event, Mapping) else event.payload
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("resource_usage_delta"):
+        return True
+    omitted = payload.get("omitted_reason_counts")
+    return isinstance(omitted, dict) and any(
+        reason not in {
+            "resource_charged",
+            "tool_completed",
+            "allowed_data_flow_decision",
+        }
+        and int(count or 0) > 0
+        for reason, count in omitted.items()
+    )
+
+
+def _event_prompt_record(
+    event: PromptEvent,
+    *,
+    include_event_id: bool = True,
+    prompt_layout: str = PROMPT_LAYOUT_LEGACY_V1,
+) -> dict[str, Any]:
+    if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
+        if isinstance(event, Mapping):
+            event_type = str(event.get("type") or "")
+            event_id = event.get("event_id")
+            payload = event.get("payload")
+        else:
+            event_type = event.type.value
+            event_id = event.event_id
+            payload = event.payload
+        selected = {
+            "type": event_type,
+            "payload": _compact_host_event_payload(payload),
+        }
+        if include_event_id and event_id:
+            selected["event_id"] = event_id
+        return selected
+    keys = (
+        ("event_id", "type", "source", "target", "payload")
+        if include_event_id
+        else ("type", "source", "target", "payload")
+    )
     if isinstance(event, Mapping):
         return {
             key: event[key]
-            for key in ("event_id", "type", "source", "target", "payload")
+            for key in keys
             if key in event
         }
-    return {
-        "event_id": event.event_id,
+    selected = {
         "type": event.type.value,
         "source": event.source,
         "target": event.target,
         "payload": event.payload,
     }
+    if include_event_id:
+        selected["event_id"] = event.event_id
+    return selected
+
+
+def _compact_host_event_payload(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    blocked = {
+        "event_id",
+        "run_id",
+        "task_run_id",
+        "requirement_id",
+        "payload_id",
+        "schema_version",
+        "materialization_id",
+        "view_id",
+        "generation_id",
+        "revision_id",
+        "input_event_ids_sha256",
+        "omitted_events_sha256",
+        "represented_through_event_id",
+        "created_at",
+        "updated_at",
+        "timestamp",
+        "pid",
+        "parent_pid",
+        "goal_oid",
+        "cap_id",
+        "capability_id",
+        "object_oid",
+        "oid",
+        "qualified_name",
+        "result_oid",
+        "checkpoint_id",
+        "message_id",
+        "llm_profile_id",
+    }
+    selected: dict[str, Any] = {}
+    for key, item in value.items():
+        if key in blocked or key.endswith("_sha256"):
+            continue
+        if key == "pids" or key.endswith("_pids"):
+            if isinstance(item, (list, tuple, set)):
+                semantic_key = (
+                    "process_count"
+                    if key == "pids"
+                    else f"{key[:-5]}_process_count"
+                )
+                selected[semantic_key] = len(item)
+            continue
+        if key == "oids" or key.endswith("_oids"):
+            if isinstance(item, (list, tuple, set)):
+                semantic_key = (
+                    "object_count"
+                    if key == "oids"
+                    else f"{key[:-5]}_object_count"
+                )
+                selected[semantic_key] = len(item)
+            continue
+        if key == "ids" or key.endswith("_ids"):
+            if isinstance(item, (list, tuple, set)):
+                semantic_key = (
+                    "item_count"
+                    if key == "ids"
+                    else f"{key[:-4]}_count"
+                )
+                selected[semantic_key] = len(item)
+            continue
+        if key.endswith(("_pid", "_oid", "_id")):
+            continue
+        if key in {"resource", "namespace", "name", "target"}:
+            item = _semantic_host_identifier_text(item)
+        selected[key] = item
+    return selected
+
+
+def _semantic_capability_resource(
+    resource: str,
+    *,
+    process: AgentProcess,
+    include_object_id: bool,
+) -> str:
+    selected = str(resource)
+    selected = selected.replace(process.pid, "self")
+    if process.goal_oid:
+        selected = selected.replace(process.goal_oid, "goal")
+    if re.fullmatch(r"checkpoint:ckpt_[A-Za-z0-9_-]+", selected):
+        # Ambient authority only needs to say that an exact checkpoint is
+        # readable.  The exact id belongs in list/inspect tool results when a
+        # model actually needs to select it, not in every dynamic prompt tail.
+        return "checkpoint:available"
+    if not include_object_id and selected.startswith("object:obj_"):
+        return "object:materialized"
+    return _semantic_host_identifier_text(selected)
+
+
+def _semantic_host_identifier_text(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    selected = re.sub(r"pid_[A-Za-z0-9]+", "self", value)
+    selected = re.sub(r"obj_[A-Za-z0-9]+", "materialized", selected)
+    selected = re.sub(r"cap_[A-Za-z0-9]+", "capability", selected)
+    return selected
 
 
 def _sorted_capability_mappings(
     capabilities: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    visible: list[dict[str, Any]] = []
+    visible_by_fingerprint: dict[str, dict[str, Any]] = {}
     for capability in capabilities:
         if not isinstance(capability, dict):
             continue
@@ -698,5 +1092,631 @@ def _sorted_capability_mappings(
         rights = projected.get("rights")
         if isinstance(rights, (list, tuple, set)):
             projected["rights"] = sorted(str(right) for right in rights)
-        visible.append(projected)
-    return sorted(visible, key=_prompt_json)
+        visible_by_fingerprint.setdefault(_prompt_json(projected), projected)
+    return sorted(visible_by_fingerprint.values(), key=_prompt_json)
+
+
+def _visible_tool_names(tools: list[dict[str, Any]]) -> set[str]:
+    return {
+        str(row.get("name"))
+        for row in tools
+        if isinstance(row, dict) and row.get("name")
+    }
+
+
+def _visible_tools_accept_field(
+    tools: list[dict[str, Any]],
+    field_name: str,
+) -> bool:
+    for row in tools:
+        if not isinstance(row, dict):
+            continue
+        spec = loads(row.get("spec_json"), {})
+        schema = spec.get("input_schema") if isinstance(spec, dict) else None
+        if _schema_declares_field(schema, field_name):
+            return True
+    return False
+
+
+def _schema_declares_field(value: Any, field_name: str) -> bool:
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            properties = current.get("properties")
+            if isinstance(properties, dict) and field_name in properties:
+                return True
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return False
+
+
+def _compact_materialized_context_text(
+    text: str,
+    *,
+    include_object_ids: bool,
+) -> str:
+    """Compact only libOS-owned Object envelopes, never nested user payloads."""
+
+    rendered: list[str] = []
+    for line in text.splitlines():
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            rendered.append(line)
+            continue
+        try:
+            record = json.loads(candidate)
+        except json.JSONDecodeError:
+            rendered.append(line)
+            continue
+        if not isinstance(record, dict):
+            rendered.append(line)
+            continue
+        compact = _compact_materialized_context_record(
+            record,
+            include_object_ids=include_object_ids,
+        )
+        if compact is not None:
+            rendered.append(_prompt_json(compact))
+            continue
+        # Unknown JSON lines can be user-authored documents. Preserve them byte
+        # for byte, including business fields whose names resemble Host ids.
+        rendered.append(line)
+    return "\n".join(rendered)
+
+
+def _strip_persisted_model_projections(text: str) -> str:
+    """Keep the v1 durable envelope while hiding the new Host-private replay view."""
+
+    rendered: list[str] = []
+    for line in text.splitlines():
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            rendered.append(line)
+            continue
+        try:
+            record = json.loads(candidate)
+        except json.JSONDecodeError:
+            rendered.append(line)
+            continue
+        if (
+            not isinstance(record, dict)
+            or record.get("record_type") != "object_memory_object"
+            or record.get("type") != "tool_result"
+            or not isinstance(record.get("payload"), dict)
+            or "model_projection" not in record["payload"]
+        ):
+            rendered.append(line)
+            continue
+        projected_record = dict(record)
+        projected_payload = dict(record["payload"])
+        projected_payload.pop("model_projection", None)
+        projected_record["payload"] = projected_payload
+        rendered.append(_prompt_json(projected_record))
+    return "\n".join(rendered)
+
+
+def _compact_materialized_context_record(
+    record: dict[str, Any],
+    *,
+    include_object_ids: bool,
+) -> dict[str, Any] | None:
+    if record.get("record_type") == "object_memory_object":
+        return _compact_materialized_object_record(
+            record,
+            include_object_ids=include_object_ids,
+        )
+    if record.get("record_type") == "object_memory_payload_entry":
+        return _compact_materialized_payload_entry_record(
+            record,
+            include_object_ids=include_object_ids,
+        )
+    return None
+
+
+def _compact_materialized_object_record(
+    record: dict[str, Any],
+    *,
+    include_object_ids: bool,
+) -> dict[str, Any]:
+    payload = record.get("payload")
+    if isinstance(payload, dict) and payload.get("kind") == "llm_context":
+        payload = _compact_llm_context_payload(payload)
+    if record.get("type") == "tool_result" and isinstance(payload, dict):
+        payload = _compact_tool_result_payload(payload)
+    semantic_name = _semantic_object_name(record.get("name"))
+    if record.get("type") == "tool_result":
+        tool_name = payload.get("tool_name") if isinstance(payload, dict) else None
+        semantic_name = f"tool_result:{tool_name or 'result'}"
+    compact: dict[str, Any] = {
+        "content_trust": record.get("content_trust", "untrusted_data"),
+        "name": semantic_name,
+        "namespace": _semantic_object_namespace(record.get("namespace")),
+        "type": record.get("type"),
+        "immutable": record.get("immutable"),
+        "payload": payload,
+    }
+    if semantic_name == "goal" and record.get("type") == "goal":
+        compact["semantic_role"] = "process_goal"
+    for key in ("title", "summary", "payload_append_field"):
+        if record.get(key) not in (None, "", [], {}):
+            compact[key] = record[key]
+    if isinstance(payload, dict) and not payload:
+        compact.pop("title", None)
+    if include_object_ids and record.get("object_oid"):
+        compact["object_oid"] = record["object_oid"]
+    return compact
+
+
+def _compact_tool_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Project a Host-owned ToolResult wrapper without filtering tool data.
+
+    The nested result can be a user document or an external provider payload,
+    so it is deliberately preserved byte-for-byte at the value level.  Only
+    libOS wrapper fields are removed.  Trusted built-ins may persist an
+    explicit narrower projection for replay after a restart.
+    """
+
+    tool_name = payload.get("tool_name")
+    selected: dict[str, Any] = {}
+    if isinstance(tool_name, str) and tool_name:
+        selected["tool_name"] = tool_name
+
+    if "model_projection" in payload:
+        selected["result"] = payload["model_projection"]
+    elif tool_name == "process_exit":
+        selected["result"] = _process_exit_model_projection(
+            payload.get("result")
+        )
+    elif tool_name in {
+        "create_memory_object",
+        "create_memory_namespace",
+        "list_memory_namespace",
+        "read_memory_object",
+        "append_memory_object",
+    }:
+        selected["result"] = _memory_tool_result_projection(
+            tool_name,
+            payload.get("result"),
+        )
+    elif "result" in payload:
+        selected["result"] = payload["result"]
+    elif "failure" in payload:
+        selected["result"] = payload["failure"]
+    elif payload.get("ok") is False:
+        selected["result"] = {
+            "ok": False,
+            "error": payload.get("error") or {"message": "Tool execution failed."},
+        }
+    else:
+        # Unknown wrappers can originate from older persisted tasks.  Preserve
+        # their data rather than recursively deleting business fields.
+        selected["result"] = payload
+
+    content = payload.get("content")
+    if isinstance(content, str) and content:
+        selected["content"] = content
+    artifacts = payload.get("artifacts")
+    if isinstance(artifacts, list) and artifacts:
+        selected["artifacts"] = artifacts
+    return selected
+
+
+def _process_exit_model_projection(value: Any) -> Any:
+    """Replay a v2 semantic review or fail closed for a pre-v2 review."""
+
+    if not isinstance(value, dict):
+        return value
+    status = value.get("status")
+    if status != "completion_review_required":
+        return {
+            key: value[key]
+            for key in ("status", "terminal_committed")
+            if key in value
+        }
+    review = value.get("completion_review")
+    if (
+        isinstance(review, dict)
+        and isinstance(review.get("review_token"), str)
+        and isinstance(review.get("requirements"), list)
+        and isinstance(review.get("available_evidence_tools"), list)
+    ):
+        # cache_optimized_v2 persists the semantic projection as the durable
+        # ToolResult.  Rebuild it from an allowlist so future Host-only fields
+        # cannot become model-visible merely by being added to persistence.
+        visible_review = {
+            key: review[key]
+            for key in (
+                "review_token",
+                "requirements",
+                "available_evidence_tools",
+                "missing_work_hints",
+                "unread_human_message_count",
+                "required_evidence_shape",
+                "instructions",
+                "validation_errors",
+            )
+            if key in review
+        }
+        return {
+            "status": "completion_review_required",
+            "completion_review": visible_review,
+            "terminal_committed": False,
+        }
+
+    # A legacy durable result contains Host bindings rather than the ordered
+    # semantic contract.  Never replay those bindings; require a fresh review.
+    observed_tools: list[str] = []
+    unread_count = 0
+    if isinstance(review, dict):
+        raw_tools = review.get("observed_successful_tool_calls")
+        if isinstance(raw_tools, list):
+            observed_tools = [str(item) for item in raw_tools if str(item)]
+        raw_unread = review.get("unread_human_message_ids")
+        if isinstance(raw_unread, list):
+            unread_count = len(raw_unread)
+    return {
+        "status": "completion_review_required",
+        "completion_review": {
+            "requirements": [],
+            "available_evidence_tools": observed_tools,
+            "missing_work_hints": [
+                "Request a fresh completion review before submitting evidence."
+            ],
+            "unread_human_message_count": unread_count,
+            "instructions": [
+                "Retry process_exit without copied Host identifiers to obtain a fresh review_token."
+            ],
+        },
+        "terminal_committed": False,
+    }
+
+
+def _memory_tool_result_projection(tool_name: str, value: Any) -> Any:
+    """Project Host-owned Object Memory identity without touching user data."""
+
+    if not isinstance(value, dict):
+        return value
+    projector = {
+        "create_memory_object": _created_memory_object_projection,
+        "create_memory_namespace": _created_memory_namespace_projection,
+        "list_memory_namespace": _listed_memory_namespace_projection,
+        "read_memory_object": _read_memory_object_projection,
+        "append_memory_object": _appended_memory_object_projection,
+    }.get(tool_name)
+    return projector(value) if projector is not None else value
+
+
+def _created_memory_object_projection(value: dict[str, Any]) -> dict[str, Any]:
+    projected = _memory_object_identity_projection(value)
+    default_name = f"{value.get('type')}:{value.get('oid')}"
+    if projected.get("name") == default_name:
+        projected.pop("name", None)
+    return projected
+
+
+def _created_memory_namespace_projection(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: (
+            _semantic_memory_namespace(item)
+            if key in {"namespace", "parent_namespace"}
+            else item
+        )
+        for key, item in value.items()
+        if key in {"namespace", "parent_namespace", "created"}
+        and item is not None
+    }
+
+
+def _listed_memory_namespace_projection(value: dict[str, Any]) -> dict[str, Any]:
+    objects = value.get("objects")
+    namespaces = value.get("namespaces")
+    return {
+        "namespace": _semantic_memory_namespace(value.get("namespace")),
+        "objects": [
+            _memory_object_identity_projection(item)
+            for item in (objects if isinstance(objects, list) else [])
+            if isinstance(item, dict)
+        ],
+        "namespaces": [
+            {
+                key: _semantic_memory_namespace(item.get(key))
+                for key in ("namespace", "parent_namespace")
+                if item.get(key) is not None
+            }
+            for item in (namespaces if isinstance(namespaces, list) else [])
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _read_memory_object_projection(value: dict[str, Any]) -> dict[str, Any]:
+    # payload and preview are user-owned Object data. Preserve them
+    # recursively, including business fields named run_id or similar.
+    return _selected_memory_result_fields(
+        value,
+        (
+            "oid",
+            "name",
+            "type",
+            "json_pointer",
+            "payload_type",
+            "shape",
+            "serialized_bytes",
+            "sha256",
+            "representation",
+            "payload",
+            "preview",
+            "preview_encoding",
+            "page_offset_bytes",
+            "page_bytes",
+            "truncated",
+            "omitted_bytes",
+            "next_cursor",
+        ),
+    )
+
+
+def _appended_memory_object_projection(value: dict[str, Any]) -> dict[str, Any]:
+    return _selected_memory_result_fields(
+        value,
+        ("oid", "name", "appended", "list_field", "length"),
+    )
+
+
+def _selected_memory_result_fields(
+    value: dict[str, Any],
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
+    projected = {
+        key: value[key]
+        for key in fields
+        if key in value and value[key] is not None
+    }
+    if "namespace" in value:
+        projected["namespace"] = _semantic_memory_namespace(value["namespace"])
+    return projected
+
+
+def _memory_object_identity_projection(value: dict[str, Any]) -> dict[str, Any]:
+    projected = {
+        key: value[key]
+        for key in ("oid", "name", "type")
+        if key in value and value[key] is not None
+    }
+    if "namespace" in value:
+        projected["namespace"] = _semantic_memory_namespace(value["namespace"])
+    return projected
+
+
+def _semantic_memory_namespace(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    return re.sub(r"(?<=process:)pid_[A-Za-z0-9]+", "self", value)
+
+
+def _compact_materialized_payload_entry_record(
+    record: dict[str, Any],
+    *,
+    include_object_ids: bool,
+) -> dict[str, Any]:
+    entry = record.get("entry")
+    if isinstance(entry, dict) and entry.get("kind") in {
+        "process_started",
+        "process_delta",
+        "process_snapshot",
+        "capabilities_delta",
+        "capabilities_snapshot",
+        "tool_table_delta",
+        "tool_table_snapshot",
+        "events_delta",
+        "memory_delta",
+        "context_omissions",
+        "context_compacted",
+    }:
+        entry = _compact_llm_context_entry(entry)
+    compact = {
+        "entry_index": record.get("entry_index"),
+        "entry": entry,
+    }
+    if include_object_ids and record.get("object_oid"):
+        compact["object_oid"] = record["object_oid"]
+    return compact
+
+
+def _compact_llm_context_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    entries = payload.get("entries")
+    compact: dict[str, Any] = {}
+    if isinstance(entries, list):
+        compact["entries"] = [
+            _compact_llm_context_entry(entry)
+            if isinstance(entry, dict)
+            else entry
+            for entry in entries
+        ]
+    return compact
+
+
+def _semantic_object_name(value: Any) -> Any:
+    selected = str(value) if value is not None else value
+    if isinstance(selected, str) and selected.startswith("goal:obj_"):
+        return "goal"
+    if isinstance(selected, str) and selected.startswith("llm-context:pid_"):
+        return "llm-context"
+    return selected
+
+
+def _semantic_object_namespace(value: Any) -> Any:
+    selected = str(value) if value is not None else value
+    if isinstance(selected, str) and selected.startswith("process:pid_"):
+        return "process:self"
+    return selected
+
+
+def _compact_llm_context_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    kind = str(entry.get("kind") or "runtime_update")
+    if kind == "process_started":
+        return {
+            "kind": kind,
+            "working_directory": entry.get("working_directory"),
+        }
+    if kind in {"process_delta", "process_snapshot"}:
+        state = entry.get("changed") if kind == "process_delta" else entry
+        state = state if isinstance(state, dict) else {}
+        actionable = {
+            key: state[key]
+            for key in (
+                "status",
+                "status_message",
+                "wait_state",
+                "outcome",
+                "working_directory",
+            )
+            if state.get(key) not in (None, "", [], {})
+        }
+        return {"kind": kind, "state": actionable}
+    if kind in {"capabilities_delta", "capabilities_snapshot"}:
+        return _compact_capabilities_context_entry(entry, kind=kind)
+    if kind in {"tool_table_delta", "tool_table_snapshot"}:
+        return _compact_tool_table_context_entry(entry, kind=kind)
+    if kind == "events_delta":
+        return _compact_events_context_entry(entry, kind=kind)
+    if kind == "memory_delta":
+        return _compact_memory_context_entry(entry, kind=kind)
+    if kind == "context_omissions":
+        omitted = entry.get("omitted_objects")
+        return {
+            "kind": kind,
+            "omitted_object_count": len(omitted) if isinstance(omitted, list) else 0,
+        }
+    if kind == "context_compacted":
+        return {"kind": kind, "summary": entry.get("summary")}
+    blocked = {
+        "at",
+        "pid",
+        "parent_pid",
+        "goal_oid",
+        "schema_version",
+        "materialization_id",
+        "view_id",
+        "generation_id",
+        "revision_id",
+    }
+    return {
+        key: value
+        for key, value in entry.items()
+        if key not in blocked and not key.endswith("_sha256")
+    }
+
+
+def _compact_capabilities_context_entry(
+    entry: dict[str, Any],
+    *,
+    kind: str,
+) -> dict[str, Any]:
+    raw_caps = entry.get("upserted", entry.get("capabilities", []))
+    capabilities = (
+        [
+            _compact_llm_context_capability(cap)
+            for cap in raw_caps
+            if isinstance(cap, dict)
+        ]
+        if isinstance(raw_caps, list)
+        else []
+    )
+    selected: dict[str, Any] = {"kind": kind, "capabilities": capabilities}
+    removed = entry.get("removed_capability_ids")
+    if isinstance(removed, list) and removed:
+        selected["removed_capability_count"] = len(removed)
+    return selected
+
+
+def _compact_tool_table_context_entry(
+    entry: dict[str, Any],
+    *,
+    kind: str,
+) -> dict[str, Any]:
+    raw_tools = entry.get("upserted", entry.get("tools", []))
+    names = (
+        sorted(
+            {
+                str(item.get("name"))
+                for item in raw_tools
+                if isinstance(item, dict) and item.get("name")
+            }
+        )
+        if isinstance(raw_tools, list)
+        else []
+    )
+    selected = {"kind": kind, "tool_names": names}
+    removed = entry.get("removed_tool_names")
+    if isinstance(removed, list) and removed:
+        selected["removed_tool_names"] = removed
+    return selected
+
+
+def _compact_events_context_entry(
+    entry: dict[str, Any],
+    *,
+    kind: str,
+) -> dict[str, Any]:
+    raw_events = entry.get("events")
+    events = []
+    if isinstance(raw_events, list):
+        for event in raw_events:
+            if not isinstance(event, dict):
+                continue
+            events.append(
+                {
+                    "type": event.get("type"),
+                    "payload": _compact_host_event_payload(event.get("payload")),
+                }
+            )
+    return {"kind": kind, "events": events}
+
+
+def _compact_memory_context_entry(
+    entry: dict[str, Any],
+    *,
+    kind: str,
+) -> dict[str, Any]:
+    raw_objects = entry.get("objects")
+    objects: list[dict[str, Any]] = []
+    if isinstance(raw_objects, list):
+        for obj in raw_objects:
+            if not isinstance(obj, dict):
+                continue
+            objects.append(
+                {
+                    key: obj[key]
+                    for key in ("name", "type", "title", "summary", "payload")
+                    if obj.get(key) not in (None, "", [], {})
+                }
+            )
+    selected = {"kind": kind, "objects": objects}
+    omitted = entry.get("omitted_objects")
+    if isinstance(omitted, list) and omitted:
+        selected["omitted_object_count"] = len(omitted)
+    return selected
+
+
+def _compact_llm_context_capability(value: dict[str, Any]) -> dict[str, Any]:
+    selected = {
+        key: value[key]
+        for key in (
+            "resource",
+            "rights",
+            "effect",
+            "policy",
+            "constraints",
+            "uses_remaining",
+            "delegable",
+        )
+        if value.get(key) not in (None, "", [], {}, False)
+    }
+    if "resource" in selected:
+        selected["resource"] = _semantic_host_identifier_text(
+            selected["resource"]
+        )
+    return selected

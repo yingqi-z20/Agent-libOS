@@ -178,34 +178,23 @@ probe that distinction with an empty terminal call. Use this state machine.
    a review token or invented evidence. Never use an empty `process_exit` as a
    gate probe: on a one-phase image it irreversibly exits with no result.
 2. If the result-bearing call returns `exited`, stop. If it returns
-   `completion_review_required`, inspect its goal, source refs, unread/ACKed IDs,
-   message count/hash/reference, observed tools, hints, required shape, and errors.
-3. Follow the review's source-neutral `skill_discovery` query, activate one
-   returned Skill that declares `read_process_messages`, then read unread Human
-   messages using exact IDs or `{}` when directed to drain the unread mailbox.
-   Default `ack=true` changes each returned message status. Status is part of
-   review identity, so ACK makes the first token stale.
+   `completion_review_required`, inspect its ordered semantic requirements,
+   available evidence tools, missing-work hints, unread-message count, required
+   shape, validation errors, and one-time review token.
+3. When unread Human input exists, discover and activate one Skill that declares
+   `read_process_messages`, then call that tool with `{}` to read and acknowledge
+   the current mailbox. Default `ack=true` changes message state and invalidates
+   the earlier review token.
 4. After ACK, repeat `process_exit` with the intended final result but still
-   without token/evidence to obtain a post-ACK review. Use only this review's
-   token, goal OID, acknowledged ID set, and expected refs. If more unread input
-   appears, repeat read then the same result-bearing review call. Never submit
-   the pre-ACK token.
+   without token/evidence to obtain a post-ACK review. Use only this fresh token
+   and its ordered requirements. If more unread input appears, repeat the read
+   and refresh again. Never submit a pre-ACK token.
 
-Review never inlines Human message bodies. It keeps every ACKed ID, count, and
-hash, plus an `acknowledged_human_message_reference`. Execute each
-`batches[].arguments` exactly; every batch already fits the active ID-count and
-filter-JSON limits and uses `include_acked=true`, `ack=false`. Inspect
-`has_more`/`continuation`. There is no cursor: if a durable-result bound splits a
-batch, subtract returned IDs from that batch's `arguments.message_ids` and issue
-the next exact-ID read with only the remainder and its count. Repeating identical
-filters replays the first page. No batches means no ACKed messages. Refresh the
-review after any ACK. Message-count overflow fails closed and requires a
-Host-approved consolidated successor.
-
-A live goal likewise carries a hash and Object Memory reference, not an inline
-preview. Copy the reference's namespace/name arguments and read by name—never
-use `goal_oid` as a name. Only when the live payload is missing after reopen may
-the review include the bounded full-I/O `fallback` described above.
+The compact review never asks you to copy Host identities or message
+bookkeeping. Recover the goal from ordinary materialized context and Human
+follow-ups from the message tool. If a persisted legacy task returns an older
+evidence shape, follow that exact returned shape only for recovery; do not copy
+its bookkeeping into Human output or an unrelated task.
 
 ### Evidence shape and terminal submission
 
@@ -213,15 +202,14 @@ Give every explicit deliverable its own check; one source citation does not prov
 all its requirements. Observed calls are unique tool names, not call IDs; cite
 exact names and explain concrete results.
 
-`completion_evidence` requires exact `goal_oid`; exact full
-`reviewed_message_ids` (or `[]`); nonempty `acceptance_checks`; and nonempty
-`final_verification`. Every check needs nonblank `requirement`, nonempty known
-`source_refs`, `status` (`completed|blocked|cancelled`), an
-`evidence_tool_calls` array, and concrete nonblank `evidence_summary`. Across
-checks cover every `expected_source_ref` and no unknown ref. Completed checks
-must cite observed successful tool names. Blocked/cancelled may cite none but
-must state the exact reason; any cited name must still be observed. Final
-verification may contain only observed successful tool names.
+`completion_evidence.acceptance_checks` must contain exactly one entry for every
+ordered requirement, in the same order. Do not repeat the requirement text.
+Each entry contains `status` (`completed|blocked|cancelled`), an
+`evidence_tool_calls` array, and a concrete nonblank `evidence_summary`.
+Completed entries cite only successful tool names allowed by the review.
+Blocked/cancelled entries may cite none but must state the exact reason. The
+nonempty `final_verification` list likewise contains only observed successful
+tool names.
 
 There is no separate “clear review” call. After the post-ACK review, complete
 missing tools, prepare evidence, and send required Human output in its own turn.

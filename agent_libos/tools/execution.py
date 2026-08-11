@@ -558,6 +558,16 @@ class ToolExecutionService:
                 ],
                 "metadata": tool_metadata,
             }
+            # Durable evidence retains the complete validated tool result.  If
+            # the trusted tool supplied a narrower model projection, persist
+            # that projection alongside the evidence so later context
+            # materialization cannot accidentally re-expose the full Host
+            # envelope on the next quantum or after restart.
+            if (
+                tool_result.model_data is not None
+                and payload != tool_result.data
+            ):
+                result_payload["model_projection"] = payload
             if (
                 tool_result.content
                 and not tool_result_content_duplicates_data(

@@ -171,10 +171,51 @@ iterator, count, or size violation fails the completion closed through the same
 text-free `LLMError` boundary; oversized provider content is not truncated into
 an apparently valid model action.
 
-Explicit `safety_identifier`, `prompt_cache_key`, and
-`prompt_cache_retention` fields are dispatched to the Host-selected
-OpenAI-compatible endpoint, including a custom base URL; bounded compatibility
-retry may remove a rejected field. `previous_response_id` is different: the
+Prompt caching has a model-visible layout and a provider transport policy.
+`llm.prompt_layout=cache_optimized_v2` keeps stable instructions and append-only
+TaskRun requirements ahead of volatile state, minimizes libOS-owned metadata,
+and removes generated JSON-Schema `title` annotations. `legacy_v1` remains the
+default and rollback layout during the profile opt-in canary; switch the default
+only after the paired release gate passes. `prompt_cache_mode=provider_default`
+sends no v2 cache options;
+`implicit` sends request-wide implicit mode, while `explicit` also places one
+stable text breakpoint. Both opt-in modes require `prompt_cache_key`; the
+wire key is derived from provider, model, Image/stable-prefix, tool fingerprint,
+and the configured privacy domain without a Run or process id. The only v2 TTL
+is `30m`, and it is mutually exclusive with legacy `prompt_cache_retention`.
+See the [OpenAI prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
+
+The maintenance, browser, and knowledge live evaluators accept
+`--prompt-layout`, and their redacted reports aggregate total input/output,
+cache reads, cache writes, uncached input, completion evidence, and forbidden
+Host-identifier counts. Build one arm from two or more provider reports with a
+JSON manifest and then compare paired arms:
+
+```bash
+uv run python scripts/build_prompt_cache_arm_report.py \
+  --manifest .benchmark_runs/cache-v2-providers.json \
+  --output .benchmark_runs/cache-v2-arm.json
+uv run python scripts/check_prompt_cache_gate.py \
+  --legacy .benchmark_runs/cache-v1-arm.json \
+  --candidate .benchmark_runs/cache-v2-arm.json
+```
+
+Each manifest provider entry contains a non-secret `provider_id`, `model_id`,
+`repetitions`, and report path. An optional `pricing` object uses per-million
+rates for `input_per_million`, `cached_input_per_million`,
+`output_per_million`, and (when applicable)
+`cache_write_input_per_million`. A distinct write rate requires reported write
+tokens; unknown is rejected rather than billed as zero. The strict gate
+requires the same two-or-more provider/model pairs in both arms, at least three
+repetitions and six workflows per provider, all oracles and completion evidence,
+the deterministic security flag, zero forbidden identifiers, the token
+reduction thresholds, non-regressing hit rate, and non-increasing known-price
+cost per successful task.
+
+Explicit cache policy fields are dispatched to the Host-selected OpenAI-compatible
+endpoint, including a custom base URL. If the endpoint rejects a v2 cache field,
+bounded compatibility retry removes the whole v2 cache option group and records
+a content-free downgrade reason. `previous_response_id` is different: the
 low-level client admits it only for the official Responses endpoint with
 provider storage enabled, and the AgentProcess executor never supplies one.
 

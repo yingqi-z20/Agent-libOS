@@ -36,12 +36,22 @@ from agent_libos.models import (
     ViewMode,
     process_state_to_mapping,
 )
-from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
+from agent_libos.tools.base import (
+    SyncAgentTool,
+    ToolContext,
+    ToolErrorCode,
+    ToolExecutionError,
+    ToolPolicy,
+    ToolResult,
+)
 from agent_libos.tools.observability import json_size_bytes
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _CUMULATIVE_EXIT_REVIEW = "cumulative_review"
 _COMPLETION_REVIEW_GOAL_FALLBACK_MAX_CHARS = 32_000
+_COMPLETION_REVIEW_REQUIREMENT_MAX_CHARS = 2_048
+_COMPLETION_REVIEW_FOLLOW_UP_MAX_CHARS = 512
+_PROCESS_EXIT_COMPLETION_BINDING_METADATA_KEY = "process_exit_completion_binding"
 _COMPLETION_HINT_NEGATIONS = (
     "avoid",
     "do not",
@@ -72,6 +82,19 @@ _COMPLETION_TOOL_PHRASES = {
 _COMPLETION_CONTROL_TOOLS = frozenset({"process_exit"})
 _COMPLETION_FENCED_CODE = re.compile(r"```(.*?)```", re.DOTALL)
 _COMPLETION_INLINE_CODE = re.compile(r"`([^`\n]*)`")
+
+
+class _CompletionReview(dict[str, Any]):
+    """Durable review mapping plus an ephemeral model-only semantic projection."""
+
+    def __init__(
+        self,
+        value: dict[str, Any],
+        *,
+        model_requirements: list[dict[str, Any]],
+    ) -> None:
+        super().__init__(value)
+        self.model_requirements = model_requirements
 
 
 class CompletionAcceptanceCheck(BaseModel):
@@ -134,12 +157,68 @@ class ProcessCompletionEvidence(BaseModel):
         return _parse_json_container(value)
 
 
+class CompactCompletionAcceptanceCheck(BaseModel):
+    """Model-facing evidence bound by ordinal through a review token."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["completed", "blocked", "cancelled"]
+    evidence_tool_calls: list[str] = Field(
+        description="Successful observed tool names supporting this requirement."
+    )
+    evidence_summary: str = Field(
+        min_length=1,
+        description=(
+            "Concrete verification evidence or blocker/cancellation reason. "
+            "Describe Host-managed objects semantically; never copy their ids, "
+            "hashes, timestamps, or protocol bookkeeping."
+        ),
+    )
+
+    @field_validator("evidence_tool_calls", mode="before")
+    @classmethod
+    def parse_tool_calls(cls, value: Any) -> Any:
+        return _parse_json_container(value)
+
+    @field_validator("evidence_summary")
+    @classmethod
+    def require_nonblank_summary(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must contain non-whitespace text")
+        return value
+
+
+class CompactProcessCompletionEvidence(BaseModel):
+    """v2 evidence shape: semantic order replaces copied Host identifiers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    acceptance_checks: list[CompactCompletionAcceptanceCheck] = Field(
+        min_length=1,
+        description=(
+            "Exactly one entry for each ordered requirement in the fresh review, "
+            "in the same order."
+        ),
+    )
+    final_verification: list[str] = Field(
+        min_length=1,
+        description="Successful observed tool names used for final verification.",
+    )
+
+    @field_validator("acceptance_checks", "final_verification", mode="before")
+    @classmethod
+    def parse_json_lists(cls, value: Any) -> Any:
+        return _parse_json_container(value)
+
+
 class ProcessExitArgs(BaseModel):
     payload: dict[str, Any] | None = Field(
         default=None,
         description=(
             "Optional structured final result mapping cumulative requested "
-            "deliverables to verification evidence, blockers, and residual risks."
+            "deliverables to verification evidence, blockers, and residual risks. "
+            "Do not copy Host ids, hashes, timestamps, or protocol bookkeeping; "
+            "this restriction does not alter user-supplied business data."
         ),
     )
     result_oid: str | None = Field(
@@ -153,7 +232,10 @@ class ProcessExitArgs(BaseModel):
     )
     message: str | None = Field(
         default=None,
-        description="Optional final message stored in a label-bearing result Object.",
+        description=(
+            "Optional final message stored in a label-bearing result Object. "
+            "Describe Host-managed results semantically without copying ids."
+        ),
     )
     review_token: str | None = Field(
         default=None,
@@ -164,7 +246,9 @@ class ProcessExitArgs(BaseModel):
             "'None' or 'null'."
         ),
     )
-    completion_evidence: ProcessCompletionEvidence | None = Field(
+    completion_evidence: (
+        ProcessCompletionEvidence | CompactProcessCompletionEvidence | None
+    ) = Field(
         default=None,
         description=(
             "For images using cumulative exit review: goal_oid, "
@@ -537,7 +621,11 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
     )
     tags = ["process", "lifecycle"]
 
-    def run(self, args: ProcessExitArgs, ctx: ToolContext) -> ProcessExitOutput:
+    def run(
+        self,
+        args: ProcessExitArgs,
+        ctx: ToolContext,
+    ) -> ProcessExitOutput | ToolResult:
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
@@ -553,7 +641,7 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
         ctx: ToolContext,
         runtime: Any,
         image: Any,
-    ) -> ProcessExitOutput:
+    ) -> ProcessExitOutput | ToolResult:
         try:
             return self._run_cumulative_exit_locked(args, ctx, runtime, image)
         except TaskRunCompletionContractError as exc:
@@ -575,7 +663,7 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
         ctx: ToolContext,
         runtime: Any,
         image: Any,
-    ) -> ProcessExitOutput:
+    ) -> ProcessExitOutput | ToolResult:
         # Human message posting and process exit use this same Runtime store
         # lock. Keep review, freshness validation, and terminal commit inside
         # one critical section so a follow-up cannot land between them.
@@ -606,9 +694,22 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
                         "authority_changed": False,
                     },
                 )
+                if _runtime_prompt_layout(runtime) == "cache_optimized_v2":
+                    # The v2 ToolResult is itself the safe Host-to-Model
+                    # projection.  Full goal/message/requirement/receipt
+                    # bindings remain in their authoritative stores and in the
+                    # audit decision above; validation reconstructs them from
+                    # the one-time review token.  Persisting both forms here
+                    # would duplicate a maximum-size review and can exceed the
+                    # ToolResult evidence budget.
+                    return ProcessExitOutput.model_validate(
+                        _model_completion_review_output(review)
+                    )
+                durable_review = dict(review)
+                durable_review.pop("model_requirements", None)
                 return ProcessExitOutput(
                     status="completion_review_required",
-                    completion_review=review,
+                    completion_review=durable_review,
                 )
             completion_evidence = args.completion_evidence
             if not isinstance(completion_evidence, ProcessCompletionEvidence):
@@ -633,7 +734,20 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
                     "authority_changed": False,
                 },
             )
-            return self._commit_exit(args, ctx, runtime, image)
+            committed = self._commit_exit(args, ctx, runtime, image)
+            return ToolResult.success(
+                data=committed.model_dump(mode="json"),
+                model_data=committed.model_dump(mode="json"),
+                metadata={
+                    _PROCESS_EXIT_COMPLETION_BINDING_METADATA_KEY: {
+                        "schema_version": 1,
+                        "acceptance_source_refs": [
+                            list(check.source_refs)
+                            for check in completion_evidence.acceptance_checks
+                        ],
+                    }
+                },
+            )
 
     def _commit_exit(
         self,
@@ -771,57 +885,17 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
     acknowledged_messages_sha256 = _canonical_sequence_sha256(
         _completion_message_identity(message) for message in acknowledged
     )
-    contract_identity = {
-        "goal_oid": goal_oid,
-        "goal_version": goal_version,
-        "task_run": (
-            {
-                "run_id": task_run_contract["run_id"],
-                "requirements": [
-                    {
-                        "requirement_id": item["requirement_id"],
-                        "requirement_sha256": item["requirement_sha256"],
-                        "status": item["status"],
-                        "created_at": item["created_at"],
-                        "started_at": item["started_at"],
-                    }
-                    for item in task_run_contract["requirements"]
-                ],
-            }
-            if task_run_contract is not None
-            else None
-        ),
-        "human_messages": [
-            {
-                "message_id": message.message_id,
-                "status": message.status.value,
-            }
-            for message in human_messages
-        ],
-        "acknowledged_human_messages_sha256": acknowledged_messages_sha256,
-    }
+    contract_identity = _completion_review_contract_identity(
+        goal_oid=goal_oid,
+        goal_version=goal_version,
+        task_run_contract=task_run_contract,
+        human_messages=human_messages,
+        acknowledged_messages_sha256=acknowledged_messages_sha256,
+    )
     acknowledged_message_ids = [message.message_id for message in acknowledged]
     successful_tool_receipts = _successful_tool_receipts(runtime, pid)
-    task_run_requirements = (
-        [
-            {
-                "requirement_id": item["requirement_id"],
-                "ordinal": item["ordinal"],
-                "kind": item["kind"],
-                "status": item["status"],
-                "requirement_sha256": item["requirement_sha256"],
-                "eligible_evidence_tool_calls": list(
-                    item["eligible_evidence_tool_calls"]
-                ),
-                "eligible_evidence_receipts": [
-                    dict(receipt)
-                    for receipt in item["eligible_evidence_receipts"]
-                ],
-            }
-            for item in task_run_contract["requirements"]
-        ]
-        if task_run_contract is not None
-        else []
+    task_run_requirements = _completion_review_task_run_requirements(
+        task_run_contract
     )
     outstanding_task_run_refs = [
         item["requirement_id"]
@@ -833,19 +907,24 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
         *acknowledged_message_ids,
     ]
     observed_tools = _successful_tool_calls_from_receipts(successful_tool_receipts)
-    goal_evidence: dict[str, Any] = {
-        "oid": goal_oid,
-        "version": goal_version,
-        "payload_sha256": goal_sha256,
-        "source": goal_source,
-        "reference": goal_reference,
-    }
-    if goal_fallback_required:
-        goal_evidence["fallback"] = _bounded_json_value(
-            goal_payload,
-            _COMPLETION_REVIEW_GOAL_FALLBACK_MAX_CHARS,
-        )
-    return {
+    model_requirements = _completion_review_model_requirements(
+        task_run_contract=task_run_contract,
+        task_run_requirements=task_run_requirements,
+        goal_payload=goal_payload,
+        goal_oid=goal_oid,
+        acknowledged=acknowledged,
+        observed_tools=observed_tools,
+    )
+    goal_evidence = _completion_review_goal_evidence(
+        goal_oid=goal_oid,
+        goal_version=goal_version,
+        goal_sha256=goal_sha256,
+        goal_source=goal_source,
+        goal_reference=goal_reference,
+        goal_payload=goal_payload,
+        fallback_required=goal_fallback_required,
+    )
+    return _CompletionReview({
         "schema_version": 2,
         "review_token": f"exitrev_{_canonical_sha256(contract_identity)}",
         "goal": goal_evidence,
@@ -924,7 +1003,325 @@ def _build_cumulative_exit_review(runtime: Any, pid: str) -> dict[str, Any]:
                 "then retry process_exit with review_token and completion_evidence."
             ),
         ],
+    }, model_requirements=model_requirements)
+
+
+def _completion_review_contract_identity(
+    *,
+    goal_oid: str,
+    goal_version: Any,
+    task_run_contract: Mapping[str, Any] | None,
+    human_messages: list[Any],
+    acknowledged_messages_sha256: str,
+) -> dict[str, Any]:
+    task_run_identity = None
+    if task_run_contract is not None:
+        task_run_identity = {
+            "run_id": task_run_contract["run_id"],
+            "requirements": [
+                {
+                    "requirement_id": item["requirement_id"],
+                    "requirement_sha256": item["requirement_sha256"],
+                    "status": item["status"],
+                    "created_at": item["created_at"],
+                    "started_at": item["started_at"],
+                }
+                for item in task_run_contract["requirements"]
+            ],
+        }
+    return {
+        "goal_oid": goal_oid,
+        "goal_version": goal_version,
+        "task_run": task_run_identity,
+        "human_messages": [
+            {
+                "message_id": message.message_id,
+                "status": message.status.value,
+            }
+            for message in human_messages
+        ],
+        "acknowledged_human_messages_sha256": acknowledged_messages_sha256,
     }
+
+
+def _completion_review_task_run_requirements(
+    task_run_contract: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if task_run_contract is None:
+        return []
+    return [
+        {
+            "requirement_id": item["requirement_id"],
+            "ordinal": item["ordinal"],
+            "kind": item["kind"],
+            "status": item["status"],
+            "requirement_sha256": item["requirement_sha256"],
+            "eligible_evidence_tool_calls": list(
+                item["eligible_evidence_tool_calls"]
+            ),
+            "eligible_evidence_receipts": [
+                dict(receipt) for receipt in item["eligible_evidence_receipts"]
+            ],
+        }
+        for item in task_run_contract["requirements"]
+    ]
+
+
+def _completion_review_model_requirements(
+    *,
+    task_run_contract: Mapping[str, Any] | None,
+    task_run_requirements: list[dict[str, Any]],
+    goal_payload: Any,
+    goal_oid: str,
+    acknowledged: list[Any],
+    observed_tools: list[str],
+) -> list[dict[str, Any]]:
+    requirements: list[dict[str, Any]] = []
+    if task_run_contract is None:
+        requirements.append(
+            {
+                "kind": "original_goal",
+                "requirement": _semantic_completion_value(goal_payload),
+                "source_refs": [goal_oid],
+                "eligible_evidence_tool_calls": observed_tools,
+            }
+        )
+    else:
+        content_by_requirement = {
+            str(item["requirement_id"]): item["content_text"]
+            for item in task_run_contract["requirements"]
+        }
+        for item in task_run_requirements:
+            if item["status"] in {"satisfied", "waived"}:
+                continue
+            requirements.append(
+                {
+                    "kind": item["kind"],
+                    "requirement": _bounded_semantic_text(
+                        content_by_requirement[item["requirement_id"]],
+                        _COMPLETION_REVIEW_REQUIREMENT_MAX_CHARS,
+                    ),
+                    "source_refs": [item["requirement_id"]],
+                    "eligible_evidence_tool_calls": list(
+                        item["eligible_evidence_tool_calls"]
+                    ),
+                }
+            )
+    acknowledged_order_by_sender: dict[str, int] = {}
+    for message in acknowledged:
+        sender = str(message.sender)
+        sender_order = acknowledged_order_by_sender.get(sender, 0) + 1
+        acknowledged_order_by_sender[sender] = sender_order
+        requirements.append(
+            {
+                "kind": "human_follow_up",
+                "requirement": _semantic_human_message(
+                    message,
+                    matching_sender_order=sender_order,
+                ),
+                "source_refs": [message.message_id],
+                "eligible_evidence_tool_calls": observed_tools,
+            }
+        )
+    return requirements
+
+
+def _completion_review_goal_evidence(
+    *,
+    goal_oid: str,
+    goal_version: Any,
+    goal_sha256: str,
+    goal_source: Any,
+    goal_reference: Any,
+    goal_payload: Any,
+    fallback_required: bool,
+) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "oid": goal_oid,
+        "version": goal_version,
+        "payload_sha256": goal_sha256,
+        "source": goal_source,
+        "reference": goal_reference,
+    }
+    if fallback_required:
+        evidence["fallback"] = _bounded_json_value(
+            goal_payload,
+            _COMPLETION_REVIEW_GOAL_FALLBACK_MAX_CHARS,
+        )
+    return evidence
+
+
+def _runtime_prompt_layout(runtime: Any) -> str:
+    config = getattr(runtime, "config", None)
+    llm = getattr(config, "llm", None)
+    return str(getattr(llm, "prompt_layout", "legacy_v1"))
+
+
+def _semantic_completion_value(value: Any) -> Any:
+    normalized = json.loads(_canonical_json(value))
+    rendered = _canonical_json(normalized)
+    if len(rendered) <= _COMPLETION_REVIEW_GOAL_FALLBACK_MAX_CHARS:
+        return normalized
+    return {
+        "truncated": True,
+        "preview": _project_json_to_limit(
+            normalized,
+            _COMPLETION_REVIEW_GOAL_FALLBACK_MAX_CHARS - 128,
+        ),
+        "instruction": "Recover the omitted goal content before claiming completion.",
+    }
+
+
+def _semantic_human_message(
+    message: Any,
+    *,
+    matching_sender_order: int,
+) -> dict[str, Any]:
+    selected: dict[str, Any] = {}
+    if message.subject:
+        selected["subject"] = message.subject
+    if message.body:
+        selected["body"] = message.body
+    if message.payload:
+        # This is user-owned business data. Preserve it recursively, including
+        # fields whose names happen to match libOS metadata names.
+        selected["payload"] = message.payload
+    selected = selected or {"requirement": "acknowledged human follow-up"}
+    rendered = _canonical_json(selected)
+    if len(rendered) <= _COMPLETION_REVIEW_FOLLOW_UP_MAX_CHARS:
+        return selected
+    recovery = {
+        "tool": "read_process_messages",
+        "arguments": {
+            "include_acked": True,
+            "ack": False,
+            "sender": str(message.sender),
+        },
+        "selection": {
+            "matching_sender_order": matching_sender_order,
+            "instruction": (
+                "Follow every matching continuation page and recover the full "
+                "message at this sender-relative order before completion."
+            ),
+        },
+    }
+    envelope: dict[str, Any] = {
+        "truncated": True,
+        "preview": None,
+        "recovery": recovery,
+    }
+    envelope_overhead = len(_canonical_json(envelope))
+    preview_limit = max(
+        32,
+        _COMPLETION_REVIEW_FOLLOW_UP_MAX_CHARS - envelope_overhead - 32,
+    )
+    envelope["preview"] = _project_json_to_limit(selected, preview_limit)
+    return envelope
+
+
+def _bounded_semantic_text(value: Any, max_chars: int) -> str:
+    selected = str(value)
+    if len(selected) <= max_chars:
+        return selected
+    marker = "\n[truncated; consult the durable TaskRun contract for full text]"
+    return selected[: max(0, max_chars - len(marker))] + marker
+
+
+def _model_completion_review_output(review: dict[str, Any]) -> dict[str, Any]:
+    raw_requirements = _review_model_requirements(review)
+    available_evidence_tools = list(
+        review.get("observed_successful_tool_calls") or []
+    )
+    requirements: list[dict[str, Any]] = []
+    if isinstance(raw_requirements, list):
+        for ordinal, item in enumerate(raw_requirements, start=1):
+            if not isinstance(item, dict):
+                continue
+            projected = {
+                "order": ordinal,
+                "kind": item.get("kind"),
+                "requirement": item.get("requirement"),
+            }
+            eligible = list(item.get("eligible_evidence_tool_calls") or [])
+            # Human follow-ups and a non-TaskRun goal share the globally
+            # available evidence set. Repeating it for every ordered item can
+            # make an otherwise valid maximum-size review exceed the model
+            # result carrier. Keep only per-requirement restrictions here.
+            if eligible != available_evidence_tools:
+                projected["eligible_evidence_tools"] = eligible
+            requirements.append(projected)
+    visible_review: dict[str, Any] = {
+        "review_token": review.get("review_token"),
+        "requirements": requirements,
+        "available_evidence_tools": available_evidence_tools,
+        "missing_work_hints": list(
+            review.get("explicit_unobserved_tool_hints") or []
+        ),
+        "unread_human_message_count": len(
+            review.get("unread_human_message_ids") or []
+        ),
+        "required_evidence_shape": {
+            "acceptance_checks": [
+                {
+                    "status": "completed | blocked | cancelled",
+                    "evidence_tool_calls": [
+                        "successful tool names supporting this ordered requirement"
+                    ],
+                    "evidence_summary": (
+                        "concise concrete evidence or blocker/cancellation reason; "
+                        "describe Host-managed results semantically without ids"
+                    ),
+                }
+            ],
+            "final_verification": [
+                "successful tool names used for final verification"
+            ],
+        },
+        "instructions": [
+            "Submit exactly one acceptance check per ordered requirement, in the same order.",
+            "Cite only available evidence tools eligible for that requirement.",
+            "Recover every truncated requirement with its named recovery tool before claiming completion.",
+            "Complete every missing-work hint and acknowledge unread human input before retrying.",
+            "Retry process_exit with this fresh review_token and compact completion_evidence.",
+            "Do not copy Host ids, hashes, timestamps, or protocol bookkeeping into evidence summaries or final output.",
+        ],
+    }
+    validation_errors = review.get("validation_errors")
+    if isinstance(validation_errors, list) and validation_errors:
+        visible_review["validation_errors"] = [
+            _model_completion_validation_error(str(error))
+            for error in validation_errors
+        ]
+    return {
+        "status": "completion_review_required",
+        "completion_review": visible_review,
+        "terminal_committed": False,
+    }
+
+
+def _review_model_requirements(review: dict[str, Any]) -> Any:
+    selected = getattr(review, "model_requirements", None)
+    if selected is not None:
+        return selected
+    # Compatibility for a short-lived pre-v2 development projection. This key
+    # is never emitted by current review builders.
+    return review.get("model_requirements")
+
+
+def _model_completion_validation_error(value: str) -> str:
+    replacements = {
+        "goal_oid": "reviewed goal",
+        "reviewed_message_ids": "acknowledged follow-ups",
+        "source_refs": "ordered requirement binding",
+        "source_ref": "ordered requirement binding",
+        "requirement_id": "ordered requirement",
+        "run_id": "task run",
+        "message_ids": "message selection",
+    }
+    selected = value
+    for internal, semantic in replacements.items():
+        selected = selected.replace(internal, semantic)
+    return selected
 
 
 def _acknowledged_human_message_reference(
@@ -1223,7 +1620,10 @@ def _goal_payload_from_recovered_context(
         decoded = None
     if isinstance(decoded, dict):
         referenced_oid = decoded.get("object_oid", decoded.get("oid"))
-        if referenced_oid == goal_oid and "payload" in decoded:
+        if (
+            referenced_oid == goal_oid
+            or decoded.get("semantic_role") == "process_goal"
+        ) and "payload" in decoded:
             return decoded["payload"]
 
     payload_marker = " payload: "
@@ -1270,8 +1670,17 @@ def _completion_evidence_errors(
     if args.review_token != review["review_token"]:
         errors.append("review_token is missing or stale; use the token from this review")
     evidence_model = args.completion_evidence
+    if isinstance(evidence_model, CompactProcessCompletionEvidence):
+        evidence_model, binding_errors = _bind_compact_completion_evidence(
+            evidence_model,
+            review=review,
+        )
+        errors.extend(binding_errors)
+        if evidence_model is not None:
+            args.completion_evidence = evidence_model
     if not isinstance(evidence_model, ProcessCompletionEvidence):
-        errors.append("completion_evidence must be a structured object")
+        if not errors:
+            errors.append("completion_evidence must be a structured object")
         return errors
     errors.extend(_completion_identity_errors(evidence_model, review=review))
     observed_tools = set(review["observed_successful_tool_calls"])
@@ -1313,6 +1722,66 @@ def _completion_evidence_errors(
     if set(evidence_model.final_verification) - observed_tools:
         errors.append("completion_evidence.final_verification cites unobserved tools")
     return errors
+
+
+def _bind_compact_completion_evidence(
+    evidence: CompactProcessCompletionEvidence,
+    *,
+    review: dict[str, Any],
+) -> tuple[ProcessCompletionEvidence | None, list[str]]:
+    raw_requirements = _review_model_requirements(review)
+    if not isinstance(raw_requirements, list) or not all(
+        isinstance(item, dict) for item in raw_requirements
+    ):
+        return None, ["completion review ordered requirement binding is invalid"]
+    if len(evidence.acceptance_checks) != len(raw_requirements):
+        return None, [
+            "completion_evidence.acceptance_checks must contain exactly one entry "
+            "for every ordered review requirement"
+        ]
+    checks: list[CompletionAcceptanceCheck] = []
+    try:
+        for item, submitted in zip(
+            raw_requirements,
+            evidence.acceptance_checks,
+            strict=True,
+        ):
+            requirement = item.get("requirement")
+            source_refs = item.get("source_refs")
+            if not isinstance(source_refs, list) or not all(
+                isinstance(source_ref, str) and source_ref
+                for source_ref in source_refs
+            ):
+                return None, [
+                    "completion review ordered requirement binding is invalid"
+                ]
+            checks.append(
+                CompletionAcceptanceCheck(
+                    requirement=(
+                        requirement
+                        if isinstance(requirement, str) and requirement.strip()
+                        else _canonical_json(requirement)
+                    ),
+                    source_refs=source_refs,
+                    status=submitted.status,
+                    evidence_tool_calls=list(submitted.evidence_tool_calls),
+                    evidence_summary=submitted.evidence_summary,
+                )
+            )
+        bound = ProcessCompletionEvidence(
+            goal_oid=str(review["goal"]["oid"]),
+            reviewed_message_ids=list(
+                review.get("acknowledged_human_message_ids") or []
+            ),
+            acceptance_checks=checks,
+            final_verification=list(evidence.final_verification),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        return None, [
+            "completion review ordered requirement binding is invalid: "
+            f"{type(exc).__name__}"
+        ]
+    return bound, []
 
 
 def _completion_task_run_requirements(
@@ -1825,7 +2294,7 @@ class ExecProcessTool(SyncAgentTool[ExecProcessArgs]):
     )
     tags = ["process", "lifecycle", "exec"]
 
-    def run(self, args: ExecProcessArgs, ctx: ToolContext) -> ExecProcessOutput:
+    def run(self, args: ExecProcessArgs, ctx: ToolContext) -> ToolResult:
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
@@ -1849,7 +2318,7 @@ class ExecProcessTool(SyncAgentTool[ExecProcessArgs]):
                 code=ToolErrorCode.VALIDATION_ERROR,
                 details={"image": args.image},
             ) from exc
-        return ExecProcessOutput(
+        output = ExecProcessOutput(
             pid=process.pid,
             old_image=old_image,
             new_image=process.image_id,
@@ -1858,6 +2327,18 @@ class ExecProcessTool(SyncAgentTool[ExecProcessArgs]):
             preserve_memory=args.preserve_memory,
             preserve_capabilities=args.preserve_capabilities,
             active_tools=sorted(process.tool_table),
+        )
+        return ToolResult.success(
+            data=output.model_dump(),
+            model_data={
+                "old_image": output.old_image,
+                "new_image": output.new_image,
+                "status": output.status,
+                "goal": "replaced" if args.goal is not None else "preserved",
+                "preserve_memory": output.preserve_memory,
+                "preserve_capabilities": output.preserve_capabilities,
+                "active_tools": output.active_tools,
+            },
         )
 
 
