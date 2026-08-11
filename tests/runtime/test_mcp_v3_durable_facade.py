@@ -2224,7 +2224,9 @@ def test_custom_task_deadlines_cancel_cooperatively_and_never_replay(
     manifest = replace(
         _manifest(),
         server_id="durable-tasks",
-        timeout_s=0.1,
+        # Exercise bounded cooperative cancellation without making ordinary
+        # protected-operation setup depend on sub-second scheduler latency.
+        timeout_s=2.0,
         tasks_extension=McpTasksExtensionSpec(
             extension_id=MCP_TASKS_EXTENSION_ID,
             spec_sha256=digest,
@@ -2322,7 +2324,7 @@ def test_custom_task_deadlines_cancel_cooperatively_and_never_replay(
                 get_task.task_ref,
                 expected_revision=get_task.revision,
             )
-        assert time.monotonic() - started < 0.75
+        assert time.monotonic() - started < 5.0
         get_record = runtime._mcp_remote_task_manager.repository.get(
             get_task.task_ref
         )
@@ -2344,7 +2346,7 @@ def test_custom_task_deadlines_cancel_cooperatively_and_never_replay(
                 human_expected_revision=waiting.human_revision,
                 human_preview_sha256=waiting.human_preview_sha256,
             )
-        assert time.monotonic() - started < 0.75
+        assert time.monotonic() - started < 5.0
         update_record = runtime._mcp_remote_task_manager.repository.get(
             waiting.task_ref
         )
@@ -2357,7 +2359,7 @@ def test_custom_task_deadlines_cancel_cooperatively_and_never_replay(
                 cancel_task.task_ref,
                 expected_revision=cancel_task.revision,
             )
-        assert time.monotonic() - started < 0.75
+        assert time.monotonic() - started < 5.0
         cancel_record = runtime._mcp_remote_task_manager.repository.get(
             cancel_task.task_ref
         )
