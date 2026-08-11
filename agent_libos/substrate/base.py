@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import socket
 import stat
@@ -587,6 +588,129 @@ def _mirror_executable_snapshot_siblings(
         )
 
 
+def _copy_snapshot_support_file(
+    source: Path,
+    destination: Path,
+    *,
+    deadline: float | None = None,
+) -> None:
+    """Copy one stable regular support file into an executable snapshot."""
+
+    _check_executable_absolute_deadline(deadline, stage="snapshot support stat")
+    try:
+        path_before = os.stat(source, follow_symlinks=False)
+    except OSError as exc:
+        _check_executable_absolute_deadline(deadline, stage="snapshot support stat")
+        raise ValidationError(
+            f"executable snapshot cannot inspect support file: {source}"
+        ) from exc
+    if stat.S_ISLNK(path_before.st_mode) or not stat.S_ISREG(path_before.st_mode):
+        raise ValidationError(
+            f"executable snapshot support file is not a regular file: {source}"
+        )
+
+    source_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    source_flags |= getattr(os, "O_CLOEXEC", 0)
+    source_flags |= getattr(os, "O_NOFOLLOW", 0)
+    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    destination_flags |= getattr(os, "O_BINARY", 0)
+    destination_flags |= getattr(os, "O_CLOEXEC", 0)
+    source_fd: int | None = None
+    destination_fd: int | None = None
+    try:
+        _check_executable_absolute_deadline(deadline, stage="snapshot support open")
+        source_fd = os.open(source, source_flags)
+        before = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or _executable_stat_identity(path_before)
+            != _executable_stat_identity(before)
+        ):
+            raise ValidationError(
+                f"executable snapshot support file changed before copy: {source}"
+            )
+        destination_fd = os.open(destination, destination_flags, 0o600)
+        _copy_executable_snapshot_bytes(
+            source_fd,
+            destination_fd,
+            deadline=deadline,
+        )
+        _check_executable_absolute_deadline(deadline, stage="snapshot support fsync")
+        os.fsync(destination_fd)
+        _validate_executable_snapshot_source_identity(
+            source,
+            source_fd,
+            before,
+            deadline=deadline,
+        )
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        if source_fd is not None:
+            os.close(source_fd)
+
+
+def _prepare_windows_python_venv_snapshot(
+    selected: Path,
+    snapshot_root: Path,
+    *,
+    deadline: float | None = None,
+) -> None:
+    """Preserve Windows virtual-environment startup beside copied Python."""
+
+    if (
+        os.name != "nt"
+        or selected.parent.name.casefold() != "scripts"
+        or re.fullmatch(
+            r"python(?:w)?(?:\d+(?:\.\d+)*)?\.exe",
+            selected.name,
+            flags=re.IGNORECASE,
+        )
+        is None
+    ):
+        return
+    venv_root = selected.parent.parent
+    configuration = venv_root / "pyvenv.cfg"
+    try:
+        os.stat(configuration, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ValidationError(
+            "executable snapshot cannot inspect Windows virtual environment"
+        ) from exc
+
+    _copy_snapshot_support_file(
+        configuration,
+        snapshot_root / "pyvenv.cfg",
+        deadline=deadline,
+    )
+    site_packages = venv_root / "Lib" / "site-packages"
+    if not site_packages.is_dir():
+        return
+    _check_executable_absolute_deadline(
+        deadline,
+        stage="snapshot virtual environment bootstrap",
+    )
+    bootstrap = snapshot_root / "Lib" / "site-packages"
+    bootstrap.mkdir(parents=True)
+    # A copied Windows venv launcher derives sys.prefix from the private
+    # snapshot. Re-run normal site-directory processing for the selected venv
+    # so its .pth files (notably pywin32.pth) retain their ordinary semantics.
+    bootstrap_line = (
+        "import site; site.addsitedir("
+        f"{ascii(str(site_packages))})\n"
+    )
+    (bootstrap / "agent_libos_venv.pth").write_text(
+        bootstrap_line,
+        encoding="utf-8",
+    )
+    _check_executable_absolute_deadline(
+        deadline,
+        stage="snapshot virtual environment bootstrap",
+    )
+
+
 def snapshot_executable(
     executable: str | Path,
     *,
@@ -669,6 +793,11 @@ def snapshot_executable(
             sibling_limit=sibling_limit,
             sibling_policy=sibling_policy,
             header=header,
+            deadline=deadline,
+        )
+        _prepare_windows_python_venv_snapshot(
+            selected,
+            directory,
             deadline=deadline,
         )
         _check_executable_absolute_deadline(deadline, stage="snapshot finalization")

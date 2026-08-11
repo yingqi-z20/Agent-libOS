@@ -116,7 +116,8 @@ from agent_libos.models.exceptions import (
 from agent_libos.models.snapshot import SnapshotRows
 
 
-_THREAD_SYNC_TIMEOUT_S = 30.0
+# Match the Windows runtime lane's documented hosted-runner I/O allowance.
+_THREAD_SYNC_TIMEOUT_S = 120.0 if os.name == "nt" else 30.0
 
 
 STORE_BACKENDS = [

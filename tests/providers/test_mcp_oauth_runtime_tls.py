@@ -365,7 +365,8 @@ def _oauth_tls_fixture(
                 process.kill()
                 process.wait(timeout=5)
         stdout, stderr = process.communicate()
-        assert process.returncode in {0, -15}, (
+        expected_returncodes = {0, 1} if os.name == "nt" else {0, -15}
+        assert process.returncode in expected_returncodes, (
             f"OAuth TLS fixture failed: stdout={stdout[-2000:]!r} "
             f"stderr={stderr[-2000:]!r}"
         )
@@ -394,6 +395,14 @@ def _write_test_certificates(tmp_path: Path) -> tuple[Path, Path, Path]:
         .not_valid_before(now - timedelta(minutes=1))
         .not_valid_after(now + timedelta(days=1))
         .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
         .add_extension(
             x509.KeyUsage(
                 digital_signature=True,
@@ -434,6 +443,14 @@ def _write_test_certificates(tmp_path: Path) -> tuple[Path, Path, Path]:
             critical=False,
         )
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(server_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
         .add_extension(
             x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]),
             critical=False,

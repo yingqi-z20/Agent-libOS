@@ -45,8 +45,11 @@ from agent_libos.runtime.syscalls import LibOSSyscallSession
 CHILD_PROCESS_SKILL = "agent-libos-child-processes"
 HUMAN_COLLABORATION_SKILL = "agent-libos-human-collaboration"
 REAL_DEADLINE_TEST_WINDOW_S = 5.0
-THREAD_SYNC_TIMEOUT_S = 30.0
-BATCH_CONTROL_SYNC_TIMEOUT_S = 90.0 if os.name == "nt" else THREAD_SYNC_TIMEOUT_S
+# Hosted Windows runners can spend tens of seconds in SQLite/Defender I/O while
+# four xdist workers are active. Keep synchronization below pytest's 300-second
+# bound without mistaking scheduling variance for a concurrency failure.
+THREAD_SYNC_TIMEOUT_S = 120.0 if os.name == "nt" else 30.0
+BATCH_CONTROL_SYNC_TIMEOUT_S = THREAD_SYNC_TIMEOUT_S
 
 
 def _config():

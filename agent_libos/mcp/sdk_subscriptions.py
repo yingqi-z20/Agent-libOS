@@ -208,6 +208,13 @@ class _SdkSubscriptionHandle:
             if not self.close_requested:
                 self.close_requested = True
                 self.handoff.set()
+                # Cancel opening readiness before cancelling the owner. Python
+                # 3.14 deliberately reports a shielded inner Future that gains
+                # an exception after its outer waiter was cancelled. The
+                # closing caller already owns the cancellation/deadline result,
+                # so readiness must become cancellation-only in this path.
+                if not self.ready.done():
+                    self.ready.cancel()
                 if self.driver is not None and not self.driver.done():
                     self.driver.cancel()
             driver = self.driver

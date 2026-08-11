@@ -1062,7 +1062,10 @@ class TestLLMProfiles:
             client = AsyncCloseOnlyClient()
             runtime.llms.set_test_client("default", client)
 
-            result = runtime.shutdown(actor="test", reason="event-loop-shutdown")
+            result = await runtime.ashutdown(
+                actor="test",
+                reason="event-loop-shutdown",
+            )
 
             assert result["ok"] is True
             return client.closed

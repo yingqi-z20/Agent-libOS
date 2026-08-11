@@ -291,9 +291,16 @@ def test_call_uses_one_detached_canonical_argument_object_across_boundaries(
             server: Any,
             tool: Any,
             arguments: dict[str, Any],
+            *,
+            deadline: float | None = None,
         ) -> None:
             boundary_ids["schema"] = id(arguments)
-            original_schema_validation(server, tool, arguments)
+            original_schema_validation(
+                server,
+                tool,
+                arguments,
+                deadline=deadline,
+            )
 
         monkeypatch.setattr(
             runtime.mcp,

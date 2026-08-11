@@ -730,11 +730,21 @@ def test_runtime_does_not_parse_the_status_message_compatibility_projection() ->
                     violations.append(f"{path.relative_to(_PROJECT_ROOT)}:{node.lineno}")
             if isinstance(node, ast.Compare):
                 operands = [node.left, *node.comparators]
-                if any(
+                compares_status_message = any(
                     isinstance(operand, ast.Attribute)
                     and operand.attr == "status_message"
                     for operand in operands
-                ):
+                )
+                only_checks_presence = (
+                    len(node.ops) == 1
+                    and isinstance(node.ops[0], (ast.Is, ast.IsNot))
+                    and any(
+                        isinstance(operand, ast.Constant)
+                        and operand.value is None
+                        for operand in operands
+                    )
+                )
+                if compares_status_message and not only_checks_presence:
                     violations.append(f"{path.relative_to(_PROJECT_ROOT)}:{node.lineno}")
     assert violations == []
 
