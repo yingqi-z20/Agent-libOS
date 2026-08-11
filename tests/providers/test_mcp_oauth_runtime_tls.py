@@ -18,10 +18,6 @@ from urllib.parse import urlsplit
 
 import anyio
 import pytest
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
 
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
@@ -376,6 +372,14 @@ def _oauth_tls_fixture(
 
 
 def _write_test_certificates(tmp_path: Path) -> tuple[Path, Path, Path]:
+    # ``cryptography`` belongs to the optional MCP SDK environment.  Import it
+    # only when this transport test actually runs so default/postgres pytest
+    # collection can still discover the invariant node without that extra.
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
     now = datetime.now(timezone.utc)
     ca_key = rsa.generate_private_key(public_exponent=65_537, key_size=2048)
     ca_name = x509.Name(

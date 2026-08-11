@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from io import BytesIO
 import json
 from pathlib import Path
@@ -773,6 +774,44 @@ def test_mcp_sdk_optional_test_files_are_explicitly_marked() -> None:
         if "pytest.mark.mcp_transport" in path.read_text(encoding="utf-8")
     }
     assert actual_marked == set(expected_marked)
+
+
+def test_mcp_sdk_optional_test_files_defer_nondefault_imports() -> None:
+    optional_roots = {
+        "cryptography",
+        "httpcore2",
+        "httpx2",
+        "keyring",
+        "mcp",
+        "opentelemetry",
+    }
+    offenders: list[str] = []
+
+    for path in (ROOT / "tests" / "providers").glob("test_mcp*.py"):
+        source = path.read_text(encoding="utf-8")
+        if "pytest.mark.mcp_transport" not in source:
+            continue
+        tree = ast.parse(source, filename=str(path))
+        for statement in tree.body:
+            imported_roots: set[str] = set()
+            if isinstance(statement, ast.Import):
+                imported_roots = {alias.name.partition(".")[0] for alias in statement.names}
+            elif isinstance(statement, ast.ImportFrom) and statement.module:
+                imported_roots = {statement.module.partition(".")[0]}
+            elif (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Attribute)
+                and isinstance(statement.value.func.value, ast.Name)
+                and statement.value.func.value.id == "pytest"
+                and statement.value.func.attr == "importorskip"
+            ):
+                offenders.append(path.relative_to(ROOT).as_posix())
+                continue
+            if imported_roots & optional_roots:
+                offenders.append(path.relative_to(ROOT).as_posix())
+
+    assert offenders == []
 
 
 def test_mcp_provider_gate_is_closed_over_the_full_pytest_tree() -> None:

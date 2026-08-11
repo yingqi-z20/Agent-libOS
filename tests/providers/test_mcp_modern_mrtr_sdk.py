@@ -1,21 +1,9 @@
-from __future__ import annotations
-
 import asyncio
 import contextlib
 import time
 from typing import Any
 
 import pytest
-
-pytest.importorskip("mcp")
-
-from mcp import Client
-from mcp.server.mcpserver import Context, MCPServer
-from mcp.types import (
-    ElicitRequest,
-    ElicitRequestFormParams,
-    InputRequiredResult,
-)
 
 from agent_libos.mcp.wire import McpSdkV3ContinuationProvider
 from agent_libos.models.mcp import (
@@ -26,24 +14,6 @@ from agent_libos.models.mcp import (
 
 
 pytestmark = [pytest.mark.mcp, pytest.mark.mcp_transport]
-
-
-def _input_required(*, request_id: str, request_state: str) -> InputRequiredResult:
-    return InputRequiredResult(
-        inputRequests={
-            request_id: ElicitRequest(
-                params=ElicitRequestFormParams(
-                    message="Approve this untrusted MCP content?",
-                    requestedSchema={
-                        "type": "object",
-                        "properties": {"approved": {"type": "boolean"}},
-                        "required": ["approved"],
-                    },
-                )
-            )
-        },
-        requestState=request_state,
-    )
 
 
 def _server_spec() -> McpServerSpec:
@@ -61,6 +31,34 @@ def _server_spec() -> McpServerSpec:
 
 
 def test_real_python_sdk_v2_resource_and_prompt_continuations_round_trip() -> None:
+    # The repository-wide and PostgreSQL jobs intentionally omit the MCP extra
+    # but must still collect this invariant node.  ``--run-mcp`` validates the
+    # complete extra before execution, so load SDK-only symbols inside the test.
+    from mcp import Client
+    from mcp.server.mcpserver import Context, MCPServer
+    from mcp.types import (
+        ElicitRequest,
+        ElicitRequestFormParams,
+        InputRequiredResult,
+    )
+
+    def input_required(*, request_id: str, request_state: str) -> InputRequiredResult:
+        return InputRequiredResult(
+            inputRequests={
+                request_id: ElicitRequest(
+                    params=ElicitRequestFormParams(
+                        message="Approve this untrusted MCP content?",
+                        requestedSchema={
+                            "type": "object",
+                            "properties": {"approved": {"type": "boolean"}},
+                            "required": ["approved"],
+                        },
+                    )
+                )
+            },
+            requestState=request_state,
+        )
+
     async def exercise() -> None:
         sdk_server = MCPServer("agent-libos-mrtr-fixture", version="2.0.0")
         resource_calls: list[tuple[str, bool, str | None, str | None, bool | None]] = []
@@ -80,7 +78,7 @@ def test_real_python_sdk_v2_resource_and_prompt_continuations_round_trip() -> No
                 resource_calls.append(
                     (name, False, ctx.request_state, ctx.protocol_version, None)
                 )
-                return _input_required(
+                return input_required(
                     request_id="resource-approval",
                     request_state="resource-state",
                 )
@@ -101,7 +99,7 @@ def test_real_python_sdk_v2_resource_and_prompt_continuations_round_trip() -> No
                 prompt_calls.append(
                     (focus, False, ctx.request_state, ctx.protocol_version, None)
                 )
-                return _input_required(
+                return input_required(
                     request_id="prompt-approval",
                     request_state="prompt-state",
                 )
