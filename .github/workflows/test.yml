@@ -144,10 +144,10 @@ jobs:
       - name: Build and validate distributions
         run: |
           uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
-          python scripts/check_release_artifacts.py dist --write-checksums
+          uv run --frozen --no-dev --group release python scripts/check_release_artifacts.py dist --write-checksums
           uv run --frozen --no-dev --group release twine check "$RELEASE_WHEEL" "$RELEASE_SDIST"
           uv run --frozen --no-dev --group release check-wheel-contents "$RELEASE_WHEEL"
-          python scripts/check_release_artifacts.py dist --verify-checksums
+          uv run --frozen --no-dev --group release python scripts/check_release_artifacts.py dist --verify-checksums
 
       - name: Preserve canonical candidate distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -195,7 +195,7 @@ jobs:
 
       - name: Verify canonical candidate distributions
         run: |
-          python scripts/check_release_artifacts.py dist --verify-checksums
+          uv run --frozen --no-dev --group release python scripts/check_release_artifacts.py dist --verify-checksums
           (cd dist && sha256sum --check --strict SHA256SUMS)
 
       - name: Export frozen artifact dependency sets

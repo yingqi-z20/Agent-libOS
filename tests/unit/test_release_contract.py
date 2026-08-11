@@ -2261,7 +2261,12 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         if step.get("name") == "Install frozen release build tools"
     )
     assert release_sync["run"] == "uv sync --frozen --no-dev --group release"
-    assert "python scripts/check_release_artifacts.py dist --write-checksums" in build_command
+    release_artifact_check = (
+        "uv run --frozen --no-dev --group release python "
+        "scripts/check_release_artifacts.py dist"
+    )
+    assert workflow.count(release_artifact_check) == 3
+    assert f"{release_artifact_check} --write-checksums" in build_command
     assert (
         'uv run --frozen --no-dev --group release twine check "$RELEASE_WHEEL" '
         '"$RELEASE_SDIST"'
@@ -2270,7 +2275,7 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         'uv run --frozen --no-dev --group release check-wheel-contents '
         '"$RELEASE_WHEEL"'
     ) in build_command
-    assert "python scripts/check_release_artifacts.py dist --verify-checksums" in build_command
+    assert f"{release_artifact_check} --verify-checksums" in build_command
     assert "dist/*" not in workflow
     assert "find dist" not in workflow
     runtime_safety_step = next(
@@ -2314,7 +2319,10 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         for step in smoke_steps
         if step.get("name") == "Verify canonical candidate distributions"
     )
-    assert "--verify-checksums" in str(verify_step["run"])
+    assert (
+        f"{release_artifact_check} --verify-checksums"
+        in str(verify_step["run"])
+    )
     assert "sha256sum --check --strict SHA256SUMS" in str(verify_step["run"])
     export_step = next(
         step
