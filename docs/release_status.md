@@ -230,14 +230,14 @@ checkout or candidate artifact.
   checks, and the invariant manifest to pass. The checker must resolve every
   declared invariant against the current pytest collection.
 - The workflow requires the per-lane deterministic matrix to pass all selected
-  tests. PostgreSQL service coverage, the complete MCP transport, adapter, and
-  SDK integration files, and the applicable fixed-upstream Tools-client
-  conformance scenarios without
-  an expected-failure baseline run on Python 3.11 and 3.14 in dedicated gates;
-  real remote MCP deployment and real-LLM coverage remain explicit
-  environment gates. Deterministic mocked MCP coverage is part of the normal
-  matrix. Platform-specific skips stay documented and real Deno runs by default
-  when installed.
+  tests. The complete MCP transport, adapter, and SDK integration files plus
+  the applicable fixed-upstream Tools-client conformance scenarios run without
+  an expected-failure baseline on Python 3.11 and 3.14 in a dedicated matrix.
+  PostgreSQL service coverage is a separate Python 3.11 gate. Real remote MCP
+  deployment and real-LLM coverage remain explicit environment gates.
+  Deterministic mocked MCP coverage is part of the normal matrix.
+  Platform-specific skips stay documented and real Deno runs by default when
+  installed.
 - The Durable Task Run gate requires fresh schema-v6 SQLite/PostgreSQL shape,
   older-store zero-write refusal, revision/command conflicts, stale Runtime-epoch
   fencing, plaintext opt-in and terminal purge, unknown-effect/ObjectTask
@@ -326,14 +326,24 @@ checkout or candidate artifact.
   waits for both entries. This gate covers deterministic harness behavior only
   and makes no real-model AgentDojo utility or security claim.
 - The GUI job requires the complete checked-in Vitest suite, TypeScript type
-  checking, and the production frontend build. Exact file and test counts are
-  intentionally left to the bound CI receipt because they change as coverage
-  grows.
+  checking, the production frontend build, and the Playwright Chromium
+  end-to-end suite against a real local GUI HTTP/SSE server. Exact file and
+  test counts are intentionally left to the bound CI receipt because they
+  change as coverage grows.
 - The runtime-safety release job is configured to gate all 33 checked-in
-  deterministic tasks on complete audit evidence, no unauthorized effects, and
-  no false denials. Its focused Git tasks cover managed-checkout containment,
-  malicious repository config, remote misuse, patch-label lineage, and
-  Semantic Shadow authority injection.
+  deterministic tasks with both `--require-all-passed` and
+  `--require-release-evidence`. The former requires every success and safety
+  oracle to pass, including no unauthorized effects; the latter independently
+  requires `audit_completeness == 1` for every result and a zero false-denial
+  numerator for every runner. Its focused Git tasks cover managed-checkout
+  containment, malicious repository config, remote misuse, patch-label
+  lineage, and Semantic Shadow authority injection.
+- The paired prompt-cache layout gate is release-qualification evidence for a
+  future change from `legacy_v1` to `cache_optimized_v2`, not part of
+  per-change CI. It remains an explicit credential- and token-spending
+  environment gate over matching legacy/candidate reports from at least two
+  provider/model pairs. A normal CI receipt or deterministic release-smoke
+  result does not claim that this paired gate ran or passed.
 - The practical-workflow gate requires three `native-live` scenarios and 80
   modeled scenarios to retain their distinct evidence labels, with no modeled
   fallback for native scenarios.
@@ -384,12 +394,12 @@ its reproducible report outside this status summary.
 
 - Python 3.11 through 3.14 is the declared package range. Per-change CI runs the
   Python lanes on Ubuntu 3.11 and 3.14, and the complete deterministic matrix
-  in per-lane jobs on Windows 3.11, with the large runtime and providers lanes
-  split into two and three deterministic file-weighted shards respectively.
+  in per-lane jobs on Windows 3.11, with runtime, providers, and benchmark split
+  into four, three, and two deterministic file-weighted shards respectively.
   This records checked-in CI coverage, not a separate local Windows run. The
-  canonical release build job uses Python 3.11, while downstream artifact-smoke
-  jobs cover Python 3.11 through 3.14; neither claim substitutes for evidence
-  from an unrecorded local clean install.
+  canonical release build job uses Python 3.11, while downstream
+  artifact-smoke jobs cover Python 3.11 through 3.14; neither claim substitutes
+  for evidence from an unrecorded local clean install.
 - The GUI package declares Node `^24.15.0 || >=26.0.0` and npm `>=11`.
   Per-change CI checks the Node 24 LTS line with its supplied npm version;
   Node 26 Current satisfies the engine contract but is not a separate job.

@@ -101,15 +101,48 @@ def compact_model_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return selected
 
 
-def _strip_model_annotation_titles(value: Any) -> None:
-    pending = [value]
+def _strip_model_annotation_titles(schema: dict[str, Any]) -> None:
+    pending = [schema]
     while pending:
         current = pending.pop()
-        if isinstance(current, dict):
-            current.pop("title", None)
-            pending.extend(current.values())
-        elif isinstance(current, list):
-            pending.extend(current)
+        current.pop("title", None)
+
+        for keyword in (
+            "additionalItems",
+            "additionalProperties",
+            "contains",
+            "contentSchema",
+            "else",
+            "if",
+            "items",
+            "not",
+            "propertyNames",
+            "then",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+        ):
+            child = current.get(keyword)
+            if isinstance(child, dict):
+                pending.append(child)
+
+        for keyword in (
+            "$defs",
+            "definitions",
+            "dependencies",
+            "dependentSchemas",
+            "patternProperties",
+            "properties",
+        ):
+            children = current.get(keyword)
+            if isinstance(children, dict):
+                pending.extend(
+                    child for child in children.values() if isinstance(child, dict)
+                )
+
+        for keyword in ("allOf", "anyOf", "items", "oneOf", "prefixItems"):
+            children = current.get(keyword)
+            if isinstance(children, list):
+                pending.extend(child for child in children if isinstance(child, dict))
 
 
 def normalize_openai_structured_output_schema(

@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
+from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.human.descriptors import (
+    PROTECTED_OPERATION_DESCRIPTORS as HUMAN_OPERATION_DESCRIPTORS,
+)
+from agent_libos.llm.prompt_cache_gate import PromptCacheGateThresholds
 from agent_libos.models import EventPriority, EventType, ProcessStatus
+from agent_libos.sdk import PostProviderFailureMode
+from agent_libos.sdk.protected_operations import _HOST_RESULT_CONTRACT_PREFIXES
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +35,11 @@ def _section(document: str, heading: str) -> str:
     return match.group("body")
 
 
+def _assert_in_order(document: str, *phrases: str) -> None:
+    positions = [document.index(phrase) for phrase in phrases]
+    assert positions == sorted(positions)
+
+
 def test_runtime_safety_task_count_is_consistent_across_current_docs() -> None:
     task_count = len(
         tuple((ROOT / "benchmarks/runtime_safety/tasks").glob("*.yaml"))
@@ -42,6 +55,46 @@ def test_runtime_safety_task_count_is_consistent_across_current_docs() -> None:
     }
     for path, expected_phrase in expected_phrases.items():
         assert expected_phrase in _words(_read(path))
+
+
+def test_security_docs_pin_provider_preintent_and_result_identity_contract() -> None:
+    protected = _words(_read("docs/protected_operation_sdk.md"))
+    semantic = _words(_read("docs/semantic_shadow.md"))
+    threat = _words(_read("docs/threat_model.md"))
+
+    for document in (protected, semantic, threat):
+        assert "`GitPrimitive._semantic_read_flow_snapshot`" in document
+        assert "pre-intent" in document
+        assert "external-effect intent of its own" in document
+        assert "Filesystem, Shell, Git, JSON-RPC, MCP, and LLM" in document
+        assert "`bytearray`" in document
+        assert "`StrEnum`" in document
+        assert "`LLMCompletion`" in document
+        assert "raw provider" in document.lower()
+
+    for required in (
+        "The default is `PostProviderFailureMode.PROPAGATE`",
+        "Both `primitive.human.read` and `primitive.human.write` use `PostProviderFailureMode.PRESERVE_RESULT`",
+        "pending/unknown intent must not be treated as safe to retry",
+        "does not suppress a failure of the conservative fallback settlement itself",
+    ):
+        assert required in protected
+
+    assert _HOST_RESULT_CONTRACT_PREFIXES == (
+        "primitive.filesystem.",
+        "primitive.shell.",
+        "primitive.git.",
+        "primitive.jsonrpc.",
+        "primitive.mcp.",
+        "primitive.llm.",
+    )
+    assert {
+        descriptor.name: descriptor.post_provider_failure_mode
+        for descriptor in HUMAN_OPERATION_DESCRIPTORS
+    } == {
+        "primitive.human.read": PostProviderFailureMode.PRESERVE_RESULT,
+        "primitive.human.write": PostProviderFailureMode.PRESERVE_RESULT,
+    }
 
 
 def test_semantic_phase2_to_4_docs_keep_authority_privacy_and_control_contract() -> None:
@@ -135,8 +188,56 @@ def test_event_catalog_tracks_the_complete_runtime_enum_in_order() -> None:
     documented = re.findall(r"^\| `([a-z][a-z0-9_]*)` \|", catalog, re.MULTILINE)
 
     assert documented == [event_type.value for event_type in EventType]
+    assert "One of the values in the catalog below" in documentation
+    assert re.search(r"One of the \d+ values in the catalog below", documentation) is None
     for priority in EventPriority:
         assert f"`{priority.value}`" in documentation
+
+
+def test_event_docs_pin_task_run_and_semantic_machine_response_shapes() -> None:
+    catalog = _section(_read("docs/events.md"), "Event type catalog")
+
+    task_run = re.search(
+        r"^\| `task_run_created` \|.*$",
+        catalog,
+        flags=re.MULTILINE,
+    )
+    assert task_run is not None
+    task_run_row = task_run.group(0)
+    assert "`runtime` → Run id" in task_run_row
+    assert "`runtime.task_runs`" not in task_run_row
+    for field in (
+        "schema_version",
+        "run_id",
+        "revision",
+        "status",
+        "root_pid",
+        "display_title",
+        "retention",
+    ):
+        assert f"`{field}`" in task_run_row
+
+    semantic = re.search(
+        r"^\| `semantic_policy_response` \|.*$",
+        catalog,
+        flags=re.MULTILINE,
+    )
+    assert semantic is not None
+    semantic_row = semantic.group(0)
+    for required in (
+        "`policy:semantic:auto` or `policy:semantic:hard-deny` → PID",
+        "top level: `request_id`, `status`, `source` (`machine_policy`), sanitized `policy`",
+        "nested `settlement_receipt`",
+        "`schema_version`, `settlement_id`, `outcome`, `policy_sha256`, and `binding_sha256`",
+        "`capability_id` only for an issued approval",
+    ):
+        assert required in semantic_row
+    for stale in (
+        "`policy:semantic:<epoch>`",
+        "expected `revision`",
+        "`epoch_id`",
+    ):
+        assert stale not in semantic_row
 
 
 def test_event_docs_keep_idempotency_ordering_and_atomicity_limits() -> None:
@@ -291,6 +392,21 @@ def test_data_flow_docs_do_not_promise_decisions_for_pre_flow_denials() -> None:
     assert "must not be expected to create that row or event" in documentation
 
 
+def test_data_flow_docs_pin_llm_sink_identity_and_host_result_domains() -> None:
+    documentation = _words(_read("docs/data_flow.md"))
+
+    for required in (
+        "prompt-cache retention/mode/TTL",
+        "`fallback_json_actions` policy identity hash",
+        "changing any bound effective policy invalidates a trust rule tied to the old identity hash",
+        "`prompt_cache_mode`, `prompt_cache_ttl`, or `fallback_json_actions` changes the profile identity hash",
+        "trusted Sink rule bound to the old `identity_sha256` no longer matches",
+        "six built-in provider domains—Filesystem, Shell, Git, JSON-RPC, MCP, and LLM—",
+    ):
+        assert required in documentation
+    assert "five built-in provider domains" not in documentation
+
+
 def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() -> None:
     documentation = _words(_read("docs/storage.md"))
     readme = _words(_read("README.md"))
@@ -309,7 +425,7 @@ def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() 
         "`semantic_policy_epochs` is immutable",
         "`semantic_machine_settlements`, `semantic_machine_outcomes`, `semantic_review_labels`, and `semantic_health_events`",
         "singleton marker CAS `5 -> 6`",
-        "complete canonical v6 table/column/check/index/collation manifest",
+        "complete canonical v6 storage catalog",
         "A v4 store is not accepted by `--to 6`",
         "## Offline v4 to v5 migration",
         "performs zero source/lease/sidecar writes",
@@ -317,7 +433,7 @@ def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() 
         "`--sqlite-backup`",
         "`--postgres-snapshot-confirmed`",
         "compare-and-swaps the singleton marker from 4 to 5",
-        "complete canonical v5 validator",
+        "complete canonical v5 storage catalog validator",
         "both source and independent backup",
         "exact mode `0600`",
         "Dry-run does not chmod either file",
@@ -329,10 +445,24 @@ def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() 
         "`current_database()` plus the exact `current_schema()`",
         "`sqlite_master.type = 'table'`",
         "`pg_class.relkind = 'r'`",
+        "requires the optional `postgres` dependency extra",
+        "server whose major version is `17`",
+        "PostgreSQL 17.10 is the tested, manifest-generation baseline",
+        "require the complete backend canonical storage catalog",
+        "The open-time validator does not compare raw DDL bytes",
+        "complete canonical storage catalog captured for that backend",
+        "PostgreSQL compares the pinned server major",
+        "standalone functions, enum/base types, or domains",
+        "complete canonical catalog comparison above still rejects drift",
         "`--schema=agent_libos_runtime`",
         "`--no-privileges`",
         "do not pre-create it",
         "Restore into the new target in one",
+        "The expected output includes `ok` and `6`",
+        "store schema version to equal `6` before opening the Runtime",
+        "restored `server_version_num` to have major version 17",
+        "server must be major version 17",
+        "`SHOW server_version_num`",
         "no application-level online-backup barrier",
         "supported full runbook therefore requires quiescence",
         "does not include other volatile Object payloads",
@@ -343,6 +473,32 @@ def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() 
         "cannot leave `rollback_pending`, `rolled_back`, `failed`, or `manual`",
     ):
         assert required in documentation
+
+    assert "does not compare column types" not in documentation
+    assert "The expected output includes `ok` and `5`" not in documentation
+    assert "schema version to equal `5` before opening the Runtime" not in documentation
+    assert "store schema version to equal `5` before opening the Runtime" not in documentation
+    assert "Planning a v5 or older store" not in documentation
+    assert _read("docs/storage.md").count("SHOW server_version_num") >= 3
+
+
+def test_current_evaluation_artifacts_name_schema_v6_runtime_databases() -> None:
+    for path in (
+        "experiments/run_durable_task_run_evaluation.py",
+        "experiments/run_knowledge_workflow_evaluation.py",
+        "experiments/run_browser_customer_flow_evaluation.py",
+    ):
+        string_constants = {
+            node.value
+            for node in ast.walk(ast.parse(_read(path)))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        assert any("v6 Runtime databases" in value for value in string_constants)
+        assert not any("v4 Runtime databases" in value for value in string_constants)
+
+    benchmark_docs = _words(_read("benchmarks/durable_task_runs/README.md"))
+    assert "retention v6 databases" in benchmark_docs
+    assert "retention v4 databases" not in benchmark_docs
 
 
 def test_retention_docs_cover_image_only_streams_and_goal_envelope_boundary() -> None:
@@ -378,6 +534,101 @@ def test_architecture_docs_keep_root_goal_recovery_narrow() -> None:
         assert required in documentation
 
 
+def test_architecture_docs_track_recovery_and_host_control_boundaries() -> None:
+    documentation = _words(_read("docs/architecture.md"))
+    recovery = documentation[
+        documentation.index("Before the lifecycle becomes") : documentation.index(
+            "Process/image/checkpoint publications"
+        )
+    ]
+
+    for required in (
+        "validates recoverable TaskRun plaintext and integrity bindings without dispatch",
+        "Pending-effect reconciliation precedes stale capability-reservation abandonment",
+        "provider receipt may prove an effect never started and restore its bound reservation",
+        "reserves the maximum call/token envelope before Provider dispatch",
+        "Public registry writes require configured `data_flow_sink_registry:*` admin authority",
+        "Before `OPEN`, the trusted Host bootstrap may reconcile only the Host-configured rules without a process capability",
+        "The Host-owned Python component graph does expose `semantic_control`",
+        "trusted composition/control surface, not a remote or model-facing one",
+        "bounded provider-response projection",
+        "it is not the provider's raw response",
+        "semantic/ Host semantic assessment, flow, control, settlement, and recovery",
+        "closed event catalog",
+    ):
+        assert required in documentation
+
+    _assert_in_order(
+        recovery,
+        "prepared protected operations",
+        "pending external effects",
+        "semantic authority",
+        "stale capability-use reservations",
+        "resource-usage reservations",
+        "process-exec publications",
+        "process-launch publications",
+        "checkpoint-restore publications",
+        "root-spawn initial-goal payloads",
+        "missing volatile Object payloads",
+        "registered JIT rehydration",
+        "stale Explainable Operations",
+        "stale process execution leases",
+        "Object Tasks",
+        "incomplete process-terminal cleanup intents",
+        "TaskRun recovery",
+    )
+    assert "current 46-value event catalog" not in documentation
+
+
+def test_runtime_docs_keep_prompt_layout_cache_and_projection_contract() -> None:
+    documentation = _words(_read("docs/runtime_model.md"))
+    thresholds = PromptCacheGateThresholds()
+
+    for required in (
+        "`prompt_mode` and the Host-selected `llm.prompt_layout` are separate prompt composition axes",
+        "TaskRun supervision is the explicit transparency exception",
+        "ordinary non-TaskRun `image_only` process",
+        "every call remains subject to the applicable Capability, Task Authority, data-flow, budget, and policy checks",
+        "Provider policy and durable external-effect settlement apply when the primitive crosses those respective boundaries",
+        "bounded, redacted Provider-response projection",
+        "It is not the complete Provider SDK response object",
+        f"`llm.prompt_layout={DEFAULT_CONFIG.llm.prompt_layout}`",
+        "`prompt_cache_mode=provider_default` sends no v2 `prompt_cache_options`",
+        "Both opt-in modes require a nonempty Host-configured `prompt_cache_key`",
+        "without a Run or process id",
+        "removes the cache key, options, and all cache breakpoints as one group",
+        "within the same logical protected LLM call",
+        "separately record configured policy",
+        "secret-free facts of the request that actually succeeded",
+        "content-free `prompt_projection`",
+        "strict gate rejects missing cache counters rather than accepting a numerical aggregate zero as complete evidence",
+        "does not execute the prompt-cache release gate during dispatch",
+        "paired `legacy_v1` and candidate arms",
+        f"reduce uncached input by at least {thresholds.minimum_uncached_input_reduction:.0%}",
+        f"total input by at least {thresholds.minimum_total_input_reduction:.0%}",
+        "`legacy_v1` remains the default and rollback layout",
+    ):
+        assert required in documentation
+
+
+def test_repository_guidelines_keep_semantic_and_prompt_cache_boundaries() -> None:
+    documentation = _words(_read("AGENTS.md"))
+
+    for required in (
+        "`ports/`, `sdk/`, `semantic/`, `storage/`",
+        "boundaries applicable to their effect class",
+        "only trusted Host bootstrap/reconciliation before Runtime OPEN may bypass a process Capability",
+        "Semantic policy control is a Host-composition surface reachable from the local Runtime Python object",
+        "Treat prompt-cache v2 as an explicit Host opt-in",
+        "same-logical-call compatibility downgrade",
+        "configured-versus-effective evidence",
+        "paired multi-provider release gate",
+        "reconcile prepared/pending effects before abandoning stale Capability reservations",
+        "Provider reconciliation may restore an effect-bound Capability reservation",
+    ):
+        assert required in documentation
+
+
 def test_object_docs_and_skills_do_not_generalize_root_goal_recovery() -> None:
     object_docs = _words(_read("docs/object_memory.md"))
     runtime_skill = _words(
@@ -396,3 +647,29 @@ def test_object_docs_and_skills_do_not_generalize_root_goal_recovery() -> None:
     assert "does not cover child/fork or exec replacement goals" in runtime_skill
     assert "does not make these ordinary Objects durable" in memory_skill
     assert "committed-root initial-GOAL recovery path does not apply" in transfer_skill
+
+
+def test_object_docs_cover_payload_bounds_and_paged_model_reads() -> None:
+    documentation = _words(_read("docs/object_memory.md"))
+    tools = DEFAULT_CONFIG.tools
+
+    for required in (
+        "Object payloads have a separate bounded-JSON contract",
+        "Cycles, non-finite numbers such as `NaN`/infinity",
+        "Create and payload replacement apply `tools.memory_payload_hard_limit_bytes`",
+        "Append applies `tools.memory_append_entry_max_bytes`",
+        (
+            f"current defaults are {tools.memory_payload_hard_limit_bytes:,} bytes "
+            f"per complete payload and {tools.memory_append_entry_max_bytes:,} bytes "
+            "per append entry"
+        ),
+        "A failed create, replacement, or append does not publish a partial Object change",
+        "`json_pointer` is an RFC 6901 pointer",
+        "`representation=json_value`",
+        f"default is {tools.memory_payload_chars:,} characters",
+        "`representation=canonical_json_page`",
+        "`page_offset_bytes` and `next_cursor` are UTF-8 byte offsets",
+        "positive cursor must include the preceding page's `sha256` as `expected_sha256`",
+        "cursor is relative to the JSON selected by that exact `json_pointer`",
+    ):
+        assert required in documentation

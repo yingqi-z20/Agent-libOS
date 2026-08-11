@@ -164,11 +164,36 @@ def test_remote_skills_keep_deadline_pagination_and_phase_local_contracts() -> N
     assert "no phase gets a fresh timeout" in jsonrpc
     assert "v1 live `tools/list` is deliberately unpaginated" in mcp
     assert "continuation cursors are neither exposed nor followed" in mcp
+    assert "Manifest v2 follows bounded pagination" in mcp
+    assert "Do not apply the v1 single-page recovery rule to v2" in mcp
+    assert "`input_required_unsupported`" in mcp
+    assert "never authorize fallback" in mcp
     assert "a non-empty MCP `nextCursor` is rejected as an incomplete catalog" in _words(
         _read("docs/mcp.md")
     )
     assert "one absolute deadline across the live exchange" in mcp
     assert "certificate is phase-local" in mcp
+
+
+def test_mcp_docs_keep_model_projection_distinct_from_runtime_evidence() -> None:
+    documentation = _words(_read("docs/mcp.md"))
+    skill = _words(_read("agent_libos/skills/builtin/agent-libos-mcp/SKILL.md"))
+
+    assert "model-facing `call_mcp_tool` output is intentionally narrower" in documentation
+    assert "omits `connection` and `receipts`" in documentation
+    assert "model-facing `list_mcp_tools` output" in documentation
+    assert "omits `schema_version`, `protocol_mode`, `connection`, and `receipts`" in documentation
+    assert "model-facing result deliberately omits" in skill
+
+
+def test_git_inspection_skill_discloses_repository_info_content_hashing() -> None:
+    skill = _words(
+        _read("agent_libos/skills/builtin/agent-libos-git-inspection/SKILL.md")
+    )
+
+    assert "does not return changed file contents" in skill
+    assert "reads and SHA-256-hashes regular-file bytes" in skill
+    assert "64 MiB by default" in skill
 
 
 def test_remote_manifest_docs_keep_explicit_null_rollback_default() -> None:
@@ -195,6 +220,24 @@ def test_durable_task_run_docs_keep_create_and_auto_run_identities_separate() ->
         "matching pending run receipt follows the local-only replay rules",
     ):
         assert required in documentation
+
+
+def test_durable_task_run_docs_keep_provider_state_out_of_resume() -> None:
+    documentation = _words(_read("docs/durable_task_runs.md"))
+
+    for required in (
+        "current full-snapshot AgentProcess executor always sends that complete locally rebuilt snapshot",
+        "never sends a provider `previous_response_id`",
+        "`previous_response_id_used=false` in the validated action/outcome manifest",
+        "rejects a durable resume record that claims otherwise",
+        "Provider response ids may remain in bounded call-observability records",
+        "not a Task Run optimization, resume source, or replay authority",
+        "low-level `LLMClient` chaining support",
+        "outside the AgentProcess and Task Run recovery contract",
+    ):
+        assert required in documentation
+
+    assert "may be used only as a verified optimization" not in documentation
 
 
 def test_durable_task_run_docs_keep_linked_recovery_gap_local_and_bound() -> None:

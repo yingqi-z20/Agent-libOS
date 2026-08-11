@@ -414,9 +414,16 @@ After a complete model action and all of its paired tool results have committed,
 Runtime may publish a local safe resume point. The resume point binds the
 process context generation, Image, tool table, provider identity, authority,
 payload hashes, and Runtime epoch. Reopen reconstructs prompts from locally
-persisted goal, requirements, transcript, and compacted context. A provider
-`previous_response_id` may be used only as a verified optimization; it is
-never the sole recovery record.
+persisted goal, requirements, transcript, and compacted context. The current
+full-snapshot AgentProcess executor always sends that complete locally rebuilt
+snapshot and never sends a provider `previous_response_id`, even when the
+low-level client setting is enabled. It leaves
+`previous_response_id_used=false` in the validated action/outcome manifest and
+rejects a durable resume record that claims otherwise. Provider response ids
+may remain in bounded call-observability records; they are not a Task Run
+optimization, resume source, or replay authority. The low-level `LLMClient`
+chaining support for explicitly supplied delta-style calls is outside the
+AgentProcess and Task Run recovery contract.
 
 Durable Task Runs v1 certifies one dynamic-binding transition: a validated
 `activate_skill` call that is the sole action in a non-parallel model response.

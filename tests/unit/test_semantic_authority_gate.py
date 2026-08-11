@@ -262,6 +262,123 @@ def test_live_authority_validator_rechecks_control_epoch_and_classifier() -> Non
             )
 
 
+def test_live_authority_validator_stale_epoch_does_not_trip_rotated_classifier() -> None:
+    previous_epoch = _epoch()
+    stale_binding = _binding(previous_epoch)
+    active_epoch = replace(
+        previous_epoch,
+        epoch_id="epoch-unit-v2",
+        generation=previous_epoch.generation + 1,
+        expected_previous_sha256=previous_epoch.canonical_sha256(),
+        classifier_profile_sha256=_E,
+        classifier_model_sha256=_F,
+    )
+    active_control = _control(active_epoch)
+    trips: list[dict[str, object]] = []
+    local_latches: list[bool] = []
+    provenance_calls: list[str] = []
+    validator = HostSemanticAuthorityValidator(
+        control_resolver=lambda: SemanticAuthorityControlView(
+            active_control,
+            active_epoch,
+        ),
+        provenance_validator=lambda **facts: provenance_calls.append(facts["phase"]),
+        control_fence=_control_fence(active_control, active_epoch),
+        local_safety_latch=lambda: local_latches.append(True),
+        safety_trip=lambda **facts: trips.append(facts),
+        now=lambda: datetime(2026, 8, 7, 0, 0, 20, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(
+        CapabilityDenied,
+        match="policy epoch or control generation changed",
+    ):
+        validator(
+            binding=stale_binding.to_dict(),
+            phase="authorize",
+            capability=_capability(stale_binding),
+            context={},
+            effect_id=None,
+        )
+
+    assert trips == []
+    assert local_latches == []
+    assert provenance_calls == []
+
+
+def test_live_authority_validator_trips_current_epoch_classifier_mismatch() -> None:
+    epoch = _epoch()
+    control = _control(epoch)
+    mismatched_binding = replace(
+        _binding(epoch),
+        classifier_profile_sha256=_F,
+    )
+    trips: list[dict[str, object]] = []
+    provenance_calls: list[str] = []
+    validator = HostSemanticAuthorityValidator(
+        control_resolver=lambda: SemanticAuthorityControlView(control, epoch),
+        provenance_validator=lambda **facts: provenance_calls.append(facts["phase"]),
+        control_fence=_control_fence(control, epoch),
+        local_safety_latch=lambda: None,
+        safety_trip=lambda **facts: trips.append(facts),
+        now=lambda: datetime(2026, 8, 7, 0, 0, 20, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(
+        CapabilityDenied,
+        match="classifier profile or model binding changed",
+    ):
+        validator(
+            binding=mismatched_binding.to_dict(),
+            phase="authorize",
+            capability=_capability(mismatched_binding),
+            context={},
+            effect_id=None,
+        )
+
+    assert [trip["trip_code"] for trip in trips] == [
+        SemanticTripCode.BINDING_MISMATCH
+    ]
+    assert provenance_calls == []
+
+
+def test_live_authority_validator_trips_classifier_and_policy_digest_mismatch() -> None:
+    epoch = _epoch()
+    control = _control(epoch)
+    mismatched_binding = replace(
+        _binding(epoch),
+        policy_epoch_sha256=_E,
+        classifier_profile_sha256=_F,
+    )
+    trips: list[dict[str, object]] = []
+    provenance_calls: list[str] = []
+    validator = HostSemanticAuthorityValidator(
+        control_resolver=lambda: SemanticAuthorityControlView(control, epoch),
+        provenance_validator=lambda **facts: provenance_calls.append(facts["phase"]),
+        control_fence=_control_fence(control, epoch),
+        local_safety_latch=lambda: None,
+        safety_trip=lambda **facts: trips.append(facts),
+        now=lambda: datetime(2026, 8, 7, 0, 0, 20, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(
+        CapabilityDenied,
+        match="classifier profile or model binding changed",
+    ):
+        validator(
+            binding=mismatched_binding.to_dict(),
+            phase="authorize",
+            capability=_capability(mismatched_binding),
+            context={},
+            effect_id=None,
+        )
+
+    assert [trip["trip_code"] for trip in trips] == [
+        SemanticTripCode.BINDING_MISMATCH
+    ]
+    assert provenance_calls == []
+
+
 def test_live_authority_validator_fences_dispatch_against_control_commit() -> None:
     epoch = _epoch()
     binding = _binding(epoch)

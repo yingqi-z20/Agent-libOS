@@ -26,7 +26,13 @@ Use a focused query such as `{"text":"git pull request","limit":8}` whenever the
 
 Pass exactly one ID and its hash from the same discovery result, for example `{"skill_id":"example-skill","expected_package_sha256":"<64 lowercase hex characters>"}`. Do not activate from a guessed name or omit, normalize, or substitute the discovered hash.
 
-Activation always has one model-visible result contract: the outer envelope is `{"result": {...}}`, whose nested result contains `pid`, `skill_id`, `name`, `version`, `tool_names`, `tool_ids`, `jit_tool_ids`, `instructions_hash`, and `package_sha256`. Package origin, Host trust mechanism, and internal activation provenance are not model routing inputs.
+Activation always has one model-visible result contract: the outer envelope is
+`{"result": {...}}`, whose nested result contains only `skill_id`, `name`,
+`version`, and `tool_names`. Durable ToolResult data retained by the Host also
+contains `pid`, `tool_ids`, `jit_tool_ids`, `instructions_hash`, and
+`package_sha256`; those binding/provenance fields are deliberately not
+model-visible and must not be required or copied. Package origin, Host trust
+mechanism, and internal activation provenance are not model routing inputs.
 
 The runtime compare-and-swaps against `expected_package_sha256`, then validates the exact package snapshot and every binding atomically under the registry lifecycle lock. If registration or catalog content changed after discovery, activation fails before process, tool, or JIT publication. A static binding may reveal an image-owned tool; a package-declared JIT binding may add a process-local tool. Neither case grants the primitive Capability or Human approval needed for an effect. Activation authority is determined by Host policy and package contents; if an ASK is pending, resume it rather than submitting a duplicate activation.
 
@@ -50,15 +56,19 @@ Call `{"skill_id":"example-skill"}` only after its guidance/resources are no lon
 
 Unload removes that snapshot and its contributed visibility, retires unshared JIT, and restores overlapping or base bindings. It never revokes Capability or reverses external effects. Host policy may require authority for the lifecycle mutation.
 
-The outer envelope is `{"result": {...}}`; the nested result contains `pid`, `skill_id`, and `removed_tools`. Empty `removed_tools` is normal when the full process table or another loaded Skill still owns every binding; it does not mean the prompt body remained loaded.
+The outer envelope is `{"result": {...}}`; the model-visible nested result
+contains only `skill_id` and `removed_tools`. Durable ToolResult data also keeps
+`pid`, but it is intentionally absent from the model projection. Empty
+`removed_tools` is normal when the full process table or another loaded Skill
+still owns every binding; it does not mean the prompt body remained loaded.
 
 ## Recommended workflow
 
 1. Check `Loaded skills` and visible schemas. If the exact Skill is already usable, stop navigation and perform the task.
 2. Discover once with two to four task terms and a sufficient but bounded limit.
 3. Select by exact ID, description, declared behavior, and package hash—not name resemblance or presumed source.
-4. If `next_step=use_loaded_skill`, do not reactivate. Otherwise activate once with the selected discovery row's exact ID and `package_sha256`; match both against the activation receipt.
-5. Validate `set(tool_names) == keys(tool_ids) union keys(jit_tool_ids)`. Treat any mismatch as incomplete settlement.
+4. If `next_step=use_loaded_skill`, do not reactivate. Otherwise activate once with the selected discovery row's exact ID and `package_sha256`; require the receipt's `skill_id`, `name`, and `version` to identify the intended Skill. The request performs the hash comparison, but the model receipt deliberately does not echo that hash.
+5. Treat returned `tool_names` as the names claimed by activation, not as Host binding-ID evidence. On the next turn validate the loaded Skill body and each needed visible schema; use fresh discovery `active=true` when the exact loaded/catalog hash must be confirmed.
 6. On the next turn, confirm the exact body under `Loaded skills` and inspect each newly visible schema before use. Read only required declared resources.
 7. Use the Skill to finish the user task. Keep it loaded across related steps; unload only when reduced prompt/tool exposure is useful and no later step depends on it.
 8. Recheck after transitions. Fork or restore can preserve snapshots; fresh spawn or exec may start with no loaded Skills or with target-image defaults.
@@ -67,7 +77,7 @@ The outer envelope is `{"result": {...}}`; the nested result contains `pid`, `sk
 
 - Already loaded: do not reactivate; it rewrites lifecycle evidence and can replace package-declared JIT.
 - No matching entry: follow `next_step=refine_search` and change or shorten the terms once only when the visible catalog was complete. For `next_step=catalog_access_required`, stop searching and report the authority-bounded conclusion; request the exact catalog read right only when the Human goal requires registered Skills. `has_more` only describes additional matches to the same query. Do not scan paths or invent an ID through these tools.
-- Tool-ID mismatch or invalid provenance: stop. Do not request partial activation or substitute an unverified similarly named tool.
+- Receipt identity, loaded-body, visible-schema, or fresh-discovery mismatch: stop. Do not request partial activation or substitute an unverified similarly named tool. Host binding IDs are not available for a model-side comparison.
 - `SkillPackageChanged` activation error: the stale activation made no lifecycle mutation. Rediscover, re-evaluate the changed metadata and hash, and activate only if that exact new content is still appropriate; never retry the stale hash.
 - Discovery or activation denial: request only the exact catalog or Skill right made available by Host policy; never duplicate a pending ASK.
 - Unknown activation settlement: inspect the next turn's `Loaded skills` or repeat focused discovery and check `active`. Do not blindly repeat a non-idempotent activation.
@@ -78,6 +88,10 @@ The outer envelope is `{"result": {...}}`; the nested result contains `pid`, `sk
 
 ## Completion evidence
 
-Navigation is complete when one exact Skill is loaded, identity and common tool maps are consistent, guidance and schemas are visible, and required resources came from that snapshot with hashes recorded. Domain completion still follows that Skill.
+Navigation is complete when one exact Skill is loaded, its model-visible identity
+receipt and current loaded state agree, guidance and required schemas are
+visible, and required resources came from that snapshot with hashes recorded.
+Host tool-ID maps are not a model completion condition. Domain completion still
+follows that Skill.
 
 After unload, require the exact Skill to be absent from the next `Loaded skills` section; focused discovery may additionally show `active=false`. Report `removed_tools` as full-table deletions only, not as a claim that every model schema or prior external effect disappeared.

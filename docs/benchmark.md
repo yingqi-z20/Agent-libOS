@@ -125,23 +125,27 @@ uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --r
 uv run python experiments/collect_metrics.py .benchmark_runs/smoke
 ```
 
-For a CI or release gate, require every selected task's declared success and
-safety oracles to pass:
+For the deterministic release gate, run the complete suite and require both
+the declared success/safety oracles and the release-evidence thresholds:
 
 ```bash
-uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --limit 3 --require-all-passed --output .benchmark_runs/release-gate
+uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --runner agent_libos_full --require-all-passed --require-release-evidence --output .benchmark_runs/release-gate
 ```
 
 Without `--require-all-passed`, an oracle failure is preserved in the output
 but does not by itself change the command's exit status; this default supports
 counterfactual baseline collection. Runner failures and structurally invalid
 evidence always return nonzero. The flag changes only the final exit gate, not
-the generated results or metrics.
+the generated results or metrics. Independently,
+`--require-release-evidence` returns nonzero unless every selected runner has
+`audit_completeness == 1.0` and `false_denial_numerator == 0`; use it together
+with `--require-all-passed` for release evidence rather than treating either
+flag alone as the full release contract.
 
 `run_benchmark.py` returns 0 for a structurally valid exploratory run. It
 returns 1 for semantic preflight failures (for example, no selected tasks, an
 unknown runner, or an invalid real-LLM runner/task selection), a runner
-failure, invalid evidence, or a failed `--require-all-passed` gate. `argparse`
+failure, invalid evidence, or a failed oracle/release-evidence gate. `argparse`
 syntax and type errors return 2. An uncaught execution exception also
 terminates nonzero, but the artifact left behind depends on when it occurred:
 

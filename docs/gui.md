@@ -115,16 +115,17 @@ destination, whether that destination is remote, local, relative, `data:`, or
 than the control responsible for preventing Markdown-triggered network egress.
 
 Only the checkpoint create/restore/fork, Skill activation/unload, Capability
-grant/delegate/revoke, image registration/commit, JSON-RPC registration, and
-MCP registration endpoints accept an optional `actor`. On those endpoints,
-omitting `actor` runs in GUI admin mode; supplying a non-empty process id opts
-into process-authority mode and requires that process to hold the capability
-needed by the underlying primitive. Skill registration is deliberately
-stricter: `POST /api/skills/register` requires a non-empty process `actor` and
-reads the package path through that process's workspace filesystem authority;
-there is no GUI-admin registration mode. Other mutation endpoints use
-Host/admin authority or an explicit `pid` field and reject a top-level `actor`
-instead of treating unused attribution as an authorization boundary.
+grant/delegate/revoke, image registration/commit, JSON-RPC registration, MCP
+registration, and MCP protocol-discovery endpoints accept an optional `actor`.
+On those endpoints, omitting `actor` runs in GUI Host/admin mode; supplying a
+non-empty process id opts into process-authority mode and requires that process
+to hold the capability needed by the underlying primitive. Skill registration
+is deliberately stricter: `POST /api/skills/register` requires a non-empty
+process `actor` and reads the package path through that process's workspace
+filesystem authority; there is no GUI-admin registration mode. Other mutation
+endpoints use Host/admin authority or an explicit `pid` field and reject a
+top-level `actor` instead of treating unused attribution as an authorization
+boundary.
 
 Closing the GUI server pauses auto-run and asks the scheduler to stop before it
 calls `Runtime.shutdown()` on an owned runtime. Every request that reads or
@@ -557,8 +558,8 @@ strings are returned as truncated strings, and truncation metadata is reported
 under the snapshot-level `_truncated` map.
 
 Top-level snapshot collections are bounded before response assembly. Processes,
-pending-first Human requests, tools, images, Skills, JSON-RPC endpoints, MCP
-servers, Runtime Modules, and LLM profiles fetch at most
+Durable Task Runs, pending-first Human requests, tools, images, Skills, JSON-RPC
+endpoints, MCP servers, Runtime Modules, and LLM profiles fetch at most
 `snapshot_collection_max_items + 1`, subject to any stricter subsystem list
 maximum. Skills, JSON-RPC, and MCP list APIs perform one additional internal
 lookahead even when that subsystem maximum is stricter than the GUI maximum.
@@ -575,12 +576,16 @@ updated terminal history, so a full snapshot does not hide current work behind
 old completed rows. If the bounded window contains a child but not its parent,
 the process tree renders that child as a temporary root rather than making it
 unreachable.
-Process message/count, bounded LLM-call-window count/token usage, rating,
-ancestor reservation, and hierarchical remaining-budget data are loaded through
-batch queries. Message and LLM windows select the newest configured rows per
-process; messages are returned chronologically. Snapshot construction therefore
-does not issue one message, LLM-call, rating, or resource query for every listed
-process.
+Process message/count, bounded recent LLM-window activity, rating, ancestor
+reservation, and hierarchical resource-counter/budget data are loaded through
+batch queries. The user-facing `llm_call_count` and `token_total` take the
+maximum of the durable hierarchical resource counters and the bounded
+recent-window values. This prevents a long-running process from being
+underreported at the window limit while still covering persisted or manually
+inserted LLM-call rows that are not represented in resource counters. Message
+and LLM windows select the newest configured rows per process; messages are
+returned chronologically. Snapshot construction therefore does not issue one
+message, LLM-call, rating, or resource query for every listed process.
 
 ## Semantic Panel
 
@@ -919,7 +924,11 @@ current operation's revision/era, legacy/sessionless/fallback state, bounded
 server identity, standard capabilities, and unsupported capabilities. A page
 reload returns to “not negotiated”; discovery/session state is neither placed
 in the GUI snapshot schema nor persisted by the Runtime. Discovery is a
-protected external read, not a high-risk mutation confirmation. The panel does
+protected external read, not a high-risk mutation confirmation. The bundled
+Discover action omits `actor` and therefore uses GUI Host/admin authority. An
+API client may instead supply a non-empty process `actor`; that opts into the
+process-authority path and requires the process capability for the discovery
+read, without adding or bypassing a `confirmed: true` boundary. The panel does
 not expose OAuth login, MRTR continuation, subscriptions, Resources, Prompts,
 Tasks, or other excluded MCP surfaces.
 

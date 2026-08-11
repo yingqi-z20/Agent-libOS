@@ -6,7 +6,9 @@ from dataclasses import replace
 from agent_libos import AgentImage, Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
+from agent_libos.llm.prompt import RETAINED_GOAL_CONTEXT_BINDING_KEY
 from agent_libos.models import (
+    CapabilityRight,
     EventType,
     ObjectType,
     PROMPT_MODE_LIBOS_DEFAULT,
@@ -63,7 +65,7 @@ def test_live_materialized_goal_is_not_replayed_as_retained_context() -> None:
 
 def test_missing_materialized_goal_is_recovered_from_retained_context() -> None:
     goal = "CACHE_RECOVERED_MISSING_GOAL_SENTINEL"
-    runtime = Runtime.open("local")
+    runtime = Runtime.open("local", config=_V2_CONFIG)
     try:
         _register_cumulative_image(runtime)
         client = RecordingActionClient(
@@ -102,6 +104,55 @@ def test_missing_materialized_goal_is_recovered_from_retained_context() -> None:
         ][-1]
         assert goal_oid is not None
         assert goal_oid in request_record.input_refs
+        first_call = runtime.store.list_llm_calls(pid=pid)[0]
+        assert first_call.request_options[RETAINED_GOAL_CONTEXT_BINDING_KEY][
+            "goal_oid"
+        ] == goal_oid
+    finally:
+        runtime.close()
+
+
+def test_exec_goal_does_not_recover_prior_v2_goal_without_matching_binding() -> None:
+    old_goal = "CACHE_OLD_EXEC_GOAL_MUST_NOT_REPLAY"
+    new_goal = "CACHE_NEW_EXEC_GOAL_IS_CURRENT"
+    runtime = Runtime.open("local", config=_V2_CONFIG)
+    try:
+        _register_cumulative_image(runtime)
+        client = RecordingActionClient(
+            [
+                {"action": "echo", "milestone": "old generation"},
+                {"action": "echo", "milestone": "new generation"},
+            ]
+        )
+        runtime.llm.client = client
+        pid = runtime.process.spawn(image=IMAGE_ID, goal=old_goal)
+        runtime.capability.grant(
+            pid,
+            f"image:{IMAGE_ID}",
+            [CapabilityRight.READ],
+            issued_by="test",
+        )
+
+        runtime.run_process_once(pid)
+        runtime.exec_process(pid, IMAGE_ID, goal=new_goal, preserve_memory=True)
+        unrelated = runtime.memory.create_object(
+            pid,
+            ObjectType.OBSERVATION,
+            {"summary": "the replacement goal is not in this explicit view"},
+        )
+        process = runtime.process.get(pid)
+        process.memory_view = runtime.memory.create_view(
+            pid,
+            [unrelated],
+            mode=ViewMode.READ_ONLY,
+        )
+        runtime.store.update_process(process)
+
+        runtime.run_process_once(pid)
+
+        second_prompt = client.user_prompts[1]
+        assert old_goal not in second_prompt
+        assert "Retained original goal contract" not in second_prompt
     finally:
         runtime.close()
 

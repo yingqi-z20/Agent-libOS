@@ -79,7 +79,7 @@ expected action that was actually invoked to have at least one successful
 receipt.
 
 Omitting `--artifacts-root` deletes the synthetic workspaces and permanent-
-retention v4 databases after the report is complete. If artifacts are retained
+retention v6 databases after the report is complete. If artifacts are retained
 for diagnosis, put them outside the repository and remove them after review.
 
 The complete live release gate also requires the real-Chromium customer

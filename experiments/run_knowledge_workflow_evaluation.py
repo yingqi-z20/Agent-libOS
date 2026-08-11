@@ -46,7 +46,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--artifacts-root",
         help=(
-            "Optional new directory retaining synthetic workspaces and v4 "
+            "Optional new directory retaining synthetic workspaces and v6 "
             "Runtime databases. Omit it for automatic temporary cleanup."
         ),
     )

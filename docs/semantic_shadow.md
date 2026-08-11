@@ -205,6 +205,17 @@ canary allow predicate. Historical v5 activity and every capture failure are
 also require a current file binding/content version; Git reads and diffs require
 the frozen local repository/ref/state identity.
 
+Git canary eligibility uses one explicit pre-intent provider exception:
+Host-only `GitPrimitive._semantic_read_flow_snapshot` may inspect local
+repository layout/state and run checker-reviewed read-only Git commands before
+authority exists to enter the ordinary Protected Operation. It returns only
+bounded digests plus DataFlow label/source-reference metadata, creates no
+durable external-effect intent of its own, and cannot perform remote or mutating
+work. The static checker pins the exact owner/root call graph and read-only
+runner shape. If the grant is later used, the ordinary Git read creates its
+protected intent and repeats the flow/state observation before returning
+payload; the preflight is not evidence of a protected dispatch.
+
 ## Policy epoch and exact-once settlement
 
 An active canary epoch is an immutable, digest-bound static Host policy using
@@ -307,13 +318,23 @@ outcome, and schema failure—but remain advisory and never write labels back.
 
 The Host post-commit boundary derives provider-result identity without invoking
 arbitrary provider hooks. Its general safe canonical projection accepts only
-bounded exact scalars, string-keyed mappings, lists/tuples, bytes, enums, and an
-explicit Host allowlist of result dataclasses, with a 4,096-node and 256 KiB
-budget. Filesystem, Shell, Git, JSON-RPC, and MCP contracts—and explicitly
-Host-bound result dataclasses—may fall back to an incremental Host streaming
+exact `None`, `bool`, `int`, finite `float`, `str`, `bytes`, and `bytearray`
+values; `StrEnum` values; exact `list`/`tuple` containers; exact `dict`
+containers with exact string keys; and an explicit Host allowlist of result
+dataclasses, with a 4,096-node and 256 KiB budget. Arbitrary `Enum` values are
+not accepted. Filesystem, Shell, Git, JSON-RPC, MCP, and LLM contracts—and
+explicitly Host-bound result dataclasses—may use an incremental Host streaming
 digest with a separate 500,000-node and 64 MiB ceiling. The streaming path
-reads only exact built-in containers, Host-bound enum/dataclass storage, and
-does not construct or persist a second aggregate plaintext value.
+accepts the same exact built-in values, but enums must be Host-owned,
+module-bound, and string-valued, and dataclasses must be Host-bound and
+allowlisted. It does not construct or persist a second aggregate plaintext
+value.
+
+For the allowlisted `LLMCompletion`, identity and local text traversal include
+only normalized fields consumed by the Runtime. Raw provider objects, hidden
+reasoning, provider request options, compatibility-removal metadata, provider
+trace, and provider-attempt sequence state are excluded; Semantic ingress does
+not claim to classify or bind those opaque fields.
 
 Both paths expose only a payload-free descriptor of at most 4 KiB containing
 schema version, bounded type identity, `canonical_bounded |

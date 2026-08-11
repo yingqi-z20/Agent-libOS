@@ -32,6 +32,10 @@ Use this skill when the goal is to fix, review, or improve a software repository
      searched file and for valid paths containing colons. The Host Shell
      provider must still resolve `rg` from its safe PATH and allow the command;
      activating this Skill does not prove that external dependency is usable.
+     Interpret its ripgrep `returncode`: `0` means at least one match, `1` is
+     the normal no-match result, and any other nonzero value is an execution
+     error. Claim no match only when `output_incomplete=false`, and inspect
+     `stderr` before reporting the negative result.
    - `swe_edit` for exactly one of three modes: non-empty `old_text`, paired
      `start_line`/`end_line`, or `create_if_missing: true`. Every mode requires
      non-empty `path` and an explicit `new_text`; do not mix mode fields.

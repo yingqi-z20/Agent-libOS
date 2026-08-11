@@ -47,9 +47,12 @@ from agent_libos.llm.context_management import (
 )
 from agent_libos.llm.event_projection import project_prompt_events
 from agent_libos.llm.prompt import (
+    PROMPT_LAYOUT_CACHE_OPTIMIZED_V2,
+    RETAINED_GOAL_CONTEXT_BINDING_KEY,
     build_system_prompt,
     build_user_prompt,
     recover_initial_goal_context,
+    retained_goal_context_binding,
     split_cache_optimized_user_prompt,
 )
 from agent_libos.llm.records import observable_llm_call_fields
@@ -557,6 +560,46 @@ class LLMProcessExecutor:
             # The completion gate owns the fail-closed user-facing recovery
             # path for an oversized or unavailable retained goal.
             return None
+
+    def _retained_goal_context_binding(
+        self,
+        process: Any,
+    ) -> dict[str, Any] | None:
+        """Build Host-only identity evidence for an id-free v2 goal record."""
+
+        if (
+            not self.config.llm.persist_full_io
+            or self.config.llm.prompt_layout != PROMPT_LAYOUT_CACHE_OPTIMIZED_V2
+        ):
+            return None
+        image = self._images.get(process.image_id)
+        if (
+            image is None
+            or image.prompt_mode == PROMPT_MODE_IMAGE_ONLY
+            or image.metadata.get("completion_gate") != "cumulative_review"
+        ):
+            return None
+        goal_oid = str(process.goal_oid or "")
+        if not goal_oid:
+            return None
+        goal = self._objects.get_object(goal_oid)
+        if goal is None or goal.type != ObjectType.GOAL:
+            return None
+        return retained_goal_context_binding(
+            goal_oid,
+            {
+                "content_trust": "untrusted_data",
+                "immutable": goal.immutable,
+                "name": goal.name,
+                "namespace": goal.namespace,
+                "object_oid": goal.oid,
+                "payload": goal.payload,
+                "record_type": "object_memory_object",
+                "summary": goal.metadata.summary,
+                "title": goal.metadata.title,
+                "type": goal.type.value,
+            },
+        )
 
     def _include_retained_goal_labels(
         self,
@@ -5164,6 +5207,9 @@ class LLMProcessExecutor:
                 request_options[_TASK_RUN_REQUIREMENT_BINDING_KEY] = json.loads(
                     dumps(dict(task_run_requirement_binding))
                 )
+            goal_binding = self._retained_goal_context_binding(process)
+            if goal_binding is not None:
+                request_options[RETAINED_GOAL_CONTEXT_BINDING_KEY] = goal_binding
             return _LLMCallState(
                 pid=pid,
                 process=process,

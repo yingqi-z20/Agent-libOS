@@ -221,6 +221,11 @@ uv run python experiments/run_benchmark.py --suite benchmarks/runtime_safety --r
 uv run python experiments/collect_metrics.py .benchmark_runs/docs-smoke
 ```
 
+This is a bounded oracle smoke. The complete deterministic release gate omits
+`--limit` and adds `--require-release-evidence` so audit completeness must be
+1.0 and the false-denial numerator must be zero in addition to all success and
+safety oracles passing.
+
 `.benchmark_runs/` is ignored and should not be committed.
 
 ## Release Artifacts

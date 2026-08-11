@@ -33,6 +33,10 @@ FORBIDDEN_MODEL_TEXT_PATTERNS = {
         rf'"(?:current_pid|caller_pid|parent_pid)"\s*:\s*"pid_{_HOST_ID_SUFFIX}"'
     ),
 }
+FORBIDDEN_MODEL_TEXT_CATEGORIES = (
+    *FORBIDDEN_MODEL_TEXT_PATTERNS,
+    "terminal_host_identifiers",
+)
 TERMINAL_HOST_IDENTIFIER_PATTERN = re.compile(
     rf"\b(?:(?:pid|obj|cap|ckpt|pmsg|evt|run|trreq|trp|ctxmat|view)_"
     rf"{_HOST_ID_SUFFIX}|tool_static_[0-9a-f]{{12,64}})\b"
@@ -48,9 +52,11 @@ def collect_prompt_cache_call_evidence(calls: Iterable[Any]) -> dict[str, Any]:
     return {
         **aggregate_cache_usage(selected),
         **_aggregate_total_token_usage(selected),
+        "forbidden_internal_id_leak_evidence_complete": True,
         "forbidden_internal_id_leaks": sum(categories.values()),
         "forbidden_internal_id_leaks_by_category": categories,
         "forbidden_internal_id_leak_calls": details,
+        "forbidden_internal_id_leak_call_count": len(details),
     }
 
 
@@ -58,6 +64,15 @@ def aggregate_prompt_cache_run_evidence(
     runs: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
     selected = list(runs)
+    validated_leak_evidence: list[Mapping[str, Any]] = []
+    leak_evidence_complete = bool(selected)
+    for run in selected:
+        try:
+            validated_leak_evidence.append(
+                validate_prompt_cache_leak_evidence(run)
+            )
+        except ValueError:
+            leak_evidence_complete = False
     total_calls = sum(
         _nonnegative_int(run.get("cache_total_calls")) for run in selected
     )
@@ -79,19 +94,22 @@ def aggregate_prompt_cache_run_evidence(
     uncached_input_tokens = sum(
         _nonnegative_int(run.get("uncached_input_tokens")) for run in selected
     )
-    categories = {category: 0 for category in FORBIDDEN_MODEL_TEXT_PATTERNS}
-    categories["terminal_host_identifiers"] = 0
-    for run in selected:
-        reported_categories = run.get("forbidden_internal_id_leaks_by_category")
-        if isinstance(reported_categories, Mapping):
-            for category in categories:
-                categories[category] += _nonnegative_int(
-                    reported_categories.get(category)
-                )
-            continue
-        details = _mapping_list(run.get("forbidden_internal_id_leak_calls"))
-        for category, count in aggregate_model_text_leak_details(details).items():
-            categories[category] += count
+    categories: dict[str, int] | None = None
+    leak_total: int | None = None
+    leak_call_count: int | None = None
+    if leak_evidence_complete:
+        categories = {
+            category: sum(
+                evidence["forbidden_internal_id_leaks_by_category"][category]
+                for evidence in validated_leak_evidence
+            )
+            for category in FORBIDDEN_MODEL_TEXT_CATEGORIES
+        }
+        leak_total = sum(categories.values())
+        leak_call_count = sum(
+            evidence["forbidden_internal_id_leak_call_count"]
+            for evidence in validated_leak_evidence
+        )
     known_write_tokens = sum(
         _nonnegative_int(run.get("cache_write_tokens")) for run in selected
     )
@@ -126,17 +144,95 @@ def aggregate_prompt_cache_run_evidence(
         "completion_evidence_successful_runs": sum(
             _completion_evidence_passed(run) for run in selected
         ),
-        "forbidden_internal_id_leaks": sum(categories.values()),
+        "forbidden_internal_id_leak_evidence_complete": leak_evidence_complete,
+        "forbidden_internal_id_leaks": leak_total,
         "forbidden_internal_id_leaks_by_category": categories,
-        "forbidden_internal_id_leak_call_count": sum(
-            _nonnegative_int(
-                run.get(
-                    "forbidden_internal_id_leak_call_count",
-                    len(_mapping_list(run.get("forbidden_internal_id_leak_calls"))),
-                )
+        "forbidden_internal_id_leak_call_count": leak_call_count,
+    }
+
+
+def validate_prompt_cache_leak_evidence(
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the closed, redacted leak-measurement contract for one run."""
+
+    if (
+        "forbidden_internal_id_leak_evidence_complete" in evidence
+        and evidence.get("forbidden_internal_id_leak_evidence_complete") is not True
+    ):
+        raise ValueError(
+            "forbidden_internal_id_leak_evidence_complete must be true"
+        )
+    total = _required_nonnegative_int(
+        evidence.get("forbidden_internal_id_leaks"),
+        "forbidden_internal_id_leaks",
+    )
+    raw_categories = evidence.get("forbidden_internal_id_leaks_by_category")
+    if not isinstance(raw_categories, Mapping):
+        raise ValueError(
+            "forbidden_internal_id_leaks_by_category must be an object"
+        )
+    expected_categories = set(FORBIDDEN_MODEL_TEXT_CATEGORIES)
+    if set(raw_categories) != expected_categories:
+        raise ValueError(
+            "forbidden_internal_id_leaks_by_category must contain exactly the "
+            "closed category set"
+        )
+    categories = {
+        category: _required_nonnegative_int(
+            raw_categories[category],
+            f"forbidden_internal_id_leaks_by_category.{category}",
+        )
+        for category in FORBIDDEN_MODEL_TEXT_CATEGORIES
+    }
+    if sum(categories.values()) != total:
+        raise ValueError(
+            "forbidden_internal_id_leaks must equal the category total"
+        )
+
+    raw_details = evidence.get("forbidden_internal_id_leak_calls")
+    details_present = "forbidden_internal_id_leak_calls" in evidence
+    details: list[Mapping[str, Any]] | None = None
+    if details_present:
+        if not isinstance(raw_details, list) or not all(
+            isinstance(item, Mapping) for item in raw_details
+        ):
+            raise ValueError(
+                "forbidden_internal_id_leak_calls must be a list of objects"
             )
-            for run in selected
-        ),
+        details = list(raw_details)
+
+    if "forbidden_internal_id_leak_call_count" in evidence:
+        call_count = _required_nonnegative_int(
+            evidence.get("forbidden_internal_id_leak_call_count"),
+            "forbidden_internal_id_leak_call_count",
+        )
+    elif details is not None:
+        # Compatibility for v1 raw-run reports, which carried the redacted
+        # detail list before an explicit count was added.
+        call_count = len(details)
+    else:
+        raise ValueError(
+            "forbidden_internal_id_leak_call_count must be reported"
+        )
+
+    if details is not None:
+        if len(details) != call_count:
+            raise ValueError(
+                "forbidden_internal_id_leak_call_count must equal the detail count"
+            )
+        if aggregate_model_text_leak_details(details) != categories:
+            raise ValueError(
+                "forbidden_internal_id_leak_calls must reconcile with categories"
+            )
+    if (total == 0) != (call_count == 0) or call_count > total:
+        raise ValueError(
+            "forbidden_internal_id_leak_call_count must reconcile with the leak total"
+        )
+    return {
+        "forbidden_internal_id_leaks": total,
+        "forbidden_internal_id_leaks_by_category": categories,
+        "forbidden_internal_id_leak_call_count": call_count,
     }
 
 
@@ -330,11 +426,19 @@ def _nonnegative_int(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
+def _required_nonnegative_int(value: Any, field: str) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    raise ValueError(f"{field} must be a non-negative integer")
+
+
 __all__ = [
+    "FORBIDDEN_MODEL_TEXT_CATEGORIES",
     "FORBIDDEN_MODEL_TEXT_PATTERNS",
     "TERMINAL_HOST_IDENTIFIER_PATTERN",
     "aggregate_model_text_leak_details",
     "aggregate_prompt_cache_run_evidence",
     "collect_prompt_cache_call_evidence",
     "forbidden_model_text_leak_details",
+    "validate_prompt_cache_leak_evidence",
 ]

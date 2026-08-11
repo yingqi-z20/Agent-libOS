@@ -155,6 +155,114 @@ class _FlowRepository:
         return records_page(records, limit=limit, id_field="assertion_id")
 
 
+def _append_split_merge_lineage(
+    repository: _FlowRepository,
+    *,
+    close_cycle: bool,
+) -> str:
+    labels = {
+        "sensitivity": "normal",
+        "trust_level": "unknown",
+        "integrity": "unknown",
+    }
+
+    def entity(
+        entity_id: str,
+        *,
+        kind: str = FlowEntityKind.OBJECT_VERSION.value,
+    ) -> SemanticFlowEntityRecord:
+        return SemanticFlowEntityRecord(
+            entity_id=entity_id,
+            kind=kind,
+            pid="pid-1",
+            tenant_bucket_sha256=_D5,
+            content_sha256=_D1,
+            version_sha256=_D2,
+            provenance_sha256=_D4,
+            baseline_labels=labels,
+            identity_present=False,
+            identity_mixed=False,
+            coverage=FlowCoverageStatus.COMPLETE.value,
+            created_at=_NOW,
+        )
+
+    def activity(
+        activity_id: str,
+        *,
+        action_id: str | None = None,
+        kind: str = FlowActivityKind.TRANSFORMATION.value,
+    ) -> SemanticFlowActivityRecord:
+        return SemanticFlowActivityRecord(
+            activity_id=activity_id,
+            kind=kind,
+            pid="pid-1",
+            action_id=action_id,
+            effect_id=None,
+            state_sha256=_D3,
+            provider_spec_sha256=None,
+            tool_schema_sha256=None,
+            model_artifact_sha256=None,
+            tenant_bucket_sha256=_D5,
+            created_at=_NOW,
+        )
+
+    def edge(
+        edge_id: str,
+        source_node_id: str,
+        source_node_type: str,
+        target_node_id: str,
+        target_node_type: str,
+    ) -> SemanticFlowEdgeRecord:
+        return SemanticFlowEdgeRecord(
+            edge_id=edge_id,
+            relation=FlowEdgeRelation.DIRECT.value,
+            source_node_id=source_node_id,
+            source_node_type=source_node_type,
+            target_node_id=target_node_id,
+            target_node_type=target_node_type,
+            pid="pid-1",
+            provenance_sha256=_D4,
+            created_at=_NOW,
+        )
+
+    target = "flowent-target"
+    output = "flowact-output"
+    ancestor = "flowent-ancestor"
+    left = "flowact-left"
+    right = "flowact-right"
+    shared = "flowent-shared"
+    edges = (
+        edge("edge-01-output", output, "activity", target, "entity"),
+        edge("edge-02-input", ancestor, "entity", output, "activity"),
+        edge("edge-03-left", left, "activity", ancestor, "entity"),
+        edge("edge-04-right", right, "activity", ancestor, "entity"),
+        edge("edge-05-left-shared", shared, "entity", left, "activity"),
+        edge("edge-06-right-shared", shared, "entity", right, "activity"),
+    )
+    if close_cycle:
+        edges += (
+            edge("edge-07-cycle", right, "activity", shared, "entity"),
+        )
+    repository.append_semantic_flow_bundle(
+        entities=(
+            entity(target, kind=FlowEntityKind.FILE_BINDING_VERSION.value),
+            entity(ancestor),
+            entity(shared),
+        ),
+        activities=(
+            activity(
+                output,
+                action_id="filesystem.read",
+                kind=FlowActivityKind.FILE_READ.value,
+            ),
+            activity(left),
+            activity(right),
+        ),
+        edges=edges,
+    )
+    return target
+
+
 def _finding(
     *,
     sensitivity: DataSensitivity = DataSensitivity.SECRET,
@@ -922,6 +1030,56 @@ def test_lineage_cycle_is_bounded_and_coverage_is_conflict() -> None:
     assert len(lineage["items"]) == 2
     assert lineage["coverage"] == "conflict"
     assert coverage.status is FlowCoverageStatus.CONFLICT
+
+
+def test_lineage_cycle_across_converging_branches_denies_approval() -> None:
+    repository = _FlowRepository()
+    target = _append_split_merge_lineage(repository, close_cycle=True)
+    service = SemanticFlowService(repository)
+
+    lineage = service.query_flow_lineage(target, limit=20, max_depth=16)
+    coverage = service.coverage(target, max_depth=16)
+    decision = service.approval_eligibility(
+        action_id="filesystem.read",
+        entity_id=target,
+        tenant_bucket_sha256=_D5,
+        current_content_sha256=_D1,
+        current_version_sha256=_D2,
+        current_state_sha256=_D3,
+        max_depth=16,
+    )
+
+    assert len(lineage["items"]) == 7
+    assert lineage["coverage"] == FlowCoverageStatus.CONFLICT.value
+    assert not lineage["truncated"]
+    assert coverage.status is FlowCoverageStatus.CONFLICT
+    assert not decision.eligible
+    assert decision.reason_codes == (FlowEligibilityReason.COVERAGE_INCOMPLETE,)
+
+
+def test_lineage_converging_diamond_dag_remains_complete_and_eligible() -> None:
+    repository = _FlowRepository()
+    target = _append_split_merge_lineage(repository, close_cycle=False)
+    service = SemanticFlowService(repository)
+
+    lineage = service.query_flow_lineage(target, limit=20, max_depth=16)
+    coverage = service.coverage(target, max_depth=16)
+    decision = service.approval_eligibility(
+        action_id="filesystem.read",
+        entity_id=target,
+        tenant_bucket_sha256=_D5,
+        current_content_sha256=_D1,
+        current_version_sha256=_D2,
+        current_state_sha256=_D3,
+        max_depth=16,
+    )
+
+    assert len(lineage["items"]) == 6
+    assert lineage["coverage"] == FlowCoverageStatus.COMPLETE.value
+    assert not lineage["truncated"]
+    assert coverage.status is FlowCoverageStatus.COMPLETE
+    assert decision.eligible
+    assert decision.reason_codes == (FlowEligibilityReason.ELIGIBLE,)
 
 
 def test_flow_capture_failure_is_counted_exactly_once() -> None:

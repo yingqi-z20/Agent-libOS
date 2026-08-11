@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tarfile
 import tomllib
 import zipfile
@@ -896,6 +897,42 @@ def test_gui_docs_cover_the_capability_inventory_page_contract() -> None:
         assert required in gui
 
 
+def test_gui_docs_cover_actor_snapshot_and_llm_counter_contracts() -> None:
+    gui = " ".join((ROOT / "docs" / "gui.md").read_text(encoding="utf-8").split())
+
+    actor_contract = gui.split("Only the checkpoint", 1)[1].split(
+        "Closing the GUI server", 1
+    )[0]
+    for required in (
+        "MCP registration, and MCP protocol-discovery endpoints",
+        "omitting `actor` runs in GUI Host/admin mode",
+        "supplying a non-empty process id opts into process-authority mode",
+    ):
+        assert required in actor_contract
+
+    snapshot_contract = gui.split("Top-level snapshot collections", 1)[1].split(
+        "## Semantic Panel", 1
+    )[0]
+    for required in (
+        "Durable Task Runs",
+        "`snapshot_collection_max_items + 1`",
+        (
+            "`llm_call_count` and `token_total` take the maximum of the durable "
+            "hierarchical resource counters and the bounded recent-window values"
+        ),
+    ):
+        assert required in snapshot_contract
+
+    discovery_contract = gui.split("The MCP panel exposes", 1)[1]
+    for required in (
+        "Discover action omits `actor` and therefore uses GUI Host/admin authority",
+        "supply a non-empty process `actor`",
+        "requires the process capability for the discovery read",
+        "without adding or bypassing a `confirmed: true` boundary",
+    ):
+        assert required in discovery_contract
+
+
 def test_release_docs_distinguish_windows_ci_from_remaining_environment_gates(
 ) -> None:
     status = " ".join(
@@ -965,41 +1002,200 @@ def test_anonymity_checklist_covers_exact_tree_history_and_binary_artifacts() ->
     normalized = " ".join(text.split())
 
     for required in (
+        "set -Eeuo pipefail",
+        "set -o pipefail",
         "git status --porcelain=v1 --untracked-files=all",
         "git submodule status --recursive",
-        "git lfs ls-files --all --long",
+        "git for-each-ref",
+        'ANON_SCAN_DIR="$(mktemp -d "$ANON_REVIEW_DIR/scan.XXXXXX")"',
+        "capture_matches()",
+        '0) test -s "$destination"',
+        '1) test ! -s "$destination"',
+        'raw = Path(sys.argv[1]).read_bytes().split(b"\\0")',
+        'if value != b"lfs"',
+        "unsupported Git content filter",
+        "Git LFS paths are unsupported by this runbook",
+        "flatten reviewed LFS bytes, remove the filter, commit, and restart",
         "git --no-replace-objects rev-list --objects --all",
         "git --no-replace-objects cat-file",
         "git --no-replace-objects cat-file --batch-all-objects",
-        "set -o pipefail",
-        'ANON_GIT_SCAN_DIR="$(mktemp -d)" || exit 1',
-        'test -n "$ANON_GIT_SCAN_DIR" || exit 1',
-        'test -n "${ANON_GIT_SCAN_DIR:-}" && test -d "$ANON_GIT_SCAN_DIR" || exit 1',
         'case "$object_type" in',
         'commit|tag|tree|blob)',
         "rg -a -qi",
-        'ANON_COMMIT_TREE="$ANON_GIT_SCAN_DIR/exact-commit-tree"',
-        'ANON_COMMIT_EXPORT="$ANON_GIT_SCAN_DIR/archive-projection"',
+        'ANON_COMMIT_TREE="$ANON_SCAN_DIR/exact-commit-tree"',
+        'ANON_COMMIT_EXPORT="$ANON_SCAN_DIR/archive-projection"',
         'git --no-replace-objects archive --format=tar "$ANON_COMMIT"',
-        '"$ANON_COMMIT_TREE" "$ANON_COMMIT_EXPORT" "$ANON_OUTPUT_DIR"; do',
+        "scan_root commit-tree",
+        "scan_root archive-projection",
+        "scan_root generated-output",
+        "candidate inventory changed; discard the old review and restart",
+        "review is required; candidates persisted at",
+        '"second_reviewer"',
+        'row.get("disposition") != "intentional non-identifying fixture"',
+        "non-regular archive member",
+        'archive.extractfile(member)',
+        'python3 "$ANON_SCAN_DIR/build_final_tar.py"',
+        'python3 "$ANON_SCAN_DIR/safe_tar.py"',
+        "source.extracted.inventory.json",
+        "generated.extracted.inventory.json",
+        "final-extract.mime-inventory",
         "find \"$ANON_BINARY_ROOT\" -type f -exec file --mime-type",
-        "-iname '*.whl'",
-        "Never copy a live secret",
+        "The initial archive hash is recorded only after",
     ):
         assert required in text
-    assert text.count('commit|tag|tree|blob)') >= 2
-    assert text.count(
-        'git --no-replace-objects cat-file "$object_type" "$object_oid"'
-    ) >= 2
+    assert text.count("scan_root archive-projection") >= 2
+    assert text.count("scan_root generated-output") >= 2
     assert "--batch-check='%(objectname) %(objecttype) %(objectsize) %(rest)'" in text
-    assert "structural package check is not an anonymity scan" in normalized
+    assert "Structural validation is not an anonymity scan" in normalized
     assert (
-        "raw exact-commit tree, deliverable archive projection, and "
-        "generated-output inventory"
+        "raw commit tree, archive projection, generated output, and safely "
+        "re-extracted final archive"
     ) in normalized
-    assert "`export-ignore` can omit tracked paths" in normalized
-    assert "`export-subst` can rewrite bytes" in normalized
+    assert "applies committed `export-ignore` and `export-subst` attributes" in normalized
     assert '["git", "--no-replace-objects", "cat-file", "blob", oid]' in text
+
+
+def test_anonymity_runbook_closes_filter_review_path_and_inventory_gates() -> None:
+    text = (ROOT / "docs" / "artifact_anonymity.md").read_text(encoding="utf-8")
+
+    assert "rg -a -q 'filter: lfs'" not in text
+    for required in (
+        'read_bytes().split(b"\\0")',
+        "if len(raw) % 3:",
+        'if value != b"lfs":',
+        'if test -f "$ANON_SCAN_DIR/lfs-required.json"; then',
+        "exit 4",
+        "if within(path, worktree) or within(worktree, path):",
+        "if within(output, review) or within(review, output):",
+        "if within(archive, output) or within(archive, review):",
+        "if path.parent != review:",
+        "recorded_argument = Path(sys.argv[6])",
+        "if recorded_argument.is_symlink():",
+        "recorded_candidates = recorded_argument.resolve(strict=False)",
+        '("recorded candidates", recorded_candidates)',
+        'ANON_RECORDED_CANDIDATES="$ANON_REVIEW_DIR/candidates-$ANON_COMMIT.json"',
+        "if recorded.is_symlink():",
+        'getattr(os, "O_NOFOLLOW", 0)',
+        'descriptor = os.open(recorded, flags, 0o600)',
+        'if ! test -f "$ANON_DISPOSITIONS"; then',
+        "exit 3",
+        '"mode": "0755" if path.is_dir() or path.stat().st_mode & 0o111 else "0644"',
+        "if expected != refreshed:",
+        "if expected != extracted:",
+        'sha256_file() {',
+        'ANON_VERIFIED_FINAL_SHA256="$(sha256_file "$ANON_FINAL_ARCHIVE")"',
+        'test "$ANON_VERIFIED_FINAL_SHA256" = "$ANON_FINAL_SHA256"',
+    ):
+        assert required in text
+
+    assert text.index("ANON_RECORDED_CANDIDATES=") < text.index("ANON_SCAN_DIR=")
+    assert text.index("descriptor = os.open(recorded, flags, 0o600)") < text.index(
+        'if ! test -f "$ANON_DISPOSITIONS"; then'
+    )
+
+
+def test_anonymity_prologue_rejects_dangling_candidate_symlink(
+    tmp_path: Path,
+) -> None:
+    text = (ROOT / "docs" / "artifact_anonymity.md").read_text(encoding="utf-8")
+    marker = '"$ANON_RECORDED_CANDIDATES" <<\'PY\'\n'
+    guard = text.split(marker, 1)[1].split("\nPY\n", 1)[0]
+
+    worktree = tmp_path / "worktree"
+    output = tmp_path / "generated"
+    review = tmp_path / "review"
+    for directory in (worktree, output, review):
+        directory.mkdir()
+    escaped = tmp_path / "escaped-candidates.json"
+    candidates = review / "candidates.json"
+    try:
+        candidates.symlink_to(escaped)
+    except OSError as exc:
+        pytest.skip(f"symbolic links unavailable: {exc}")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            str(worktree),
+            str(output),
+            str(review),
+            str(tmp_path / "final.tar"),
+            str(review / "dispositions.json"),
+            str(candidates),
+        ],
+        input=guard,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "recorded candidate path must not be a symbolic link" in completed.stderr
+    assert not escaped.exists()
+
+
+def test_maintainer_governance_docs_match_current_release_boundaries() -> None:
+    security = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
+    security_normalized = " ".join(security.split())
+    contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    releasing = (ROOT / "docs" / "releasing.md").read_text(encoding="utf-8")
+    releasing_normalized = " ".join(releasing.split())
+    version = tomllib.loads(
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["version"]
+
+    for link in ("AGENTS.md", "docs/development.md", "SECURITY.md"):
+        assert link in contributing
+    assert "only the non-sensitive coordination request" in contributing
+
+    assert (
+        "private vulnerability reporting is currently **not enabled**"
+        in security_normalized
+    )
+    assert "is not presently a working intake channel" in security_normalized
+    assert "only a non-sensitive request" in security_normalized
+    assert "does not invent an email address" in security_normalized
+    assert "No current validation or fix commitment" in security_normalized
+    assert "mailto:" not in security
+    assert re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", security) is None
+
+    assert "## Unreleased" in changelog
+    assert f"## {version} — release candidate" in changelog
+    assert "does not claim that a tag, PyPI upload, GitHub release" in changelog
+
+    for required in (
+        "read-only repository permission and no PyPI, tag, or GitHub-release authority",
+        "Public publication is blocked",
+        "enable GitHub private vulnerability reporting",
+        "Run the command blocks in order in the same trusted Bash session",
+        "Choose an unreused final-form numeric `X.Y.Z` version",
+        "PEP 440 spellings that a build backend can normalize are not",
+        "LOCAL_RELEASE_WHEEL=",
+        "RELEASE_DOWNLOAD_DIR=/absolute/path/to/download",
+        "requested.resolve(strict=True)",
+        "actual != expected or len(entries) != len(expected)",
+        "entry.is_symlink() or not entry.is_file()",
+        'RELEASE_WHEEL="$RELEASE_DOWNLOAD_DIR/agent_libos-${RELEASE_VERSION}-py3-none-any.whl"',
+        'RELEASE_SDIST="$RELEASE_DOWNLOAD_DIR/agent_libos-${RELEASE_VERSION}.tar.gz"',
+        "--repository testpypi",
+        "--repository pypi",
+        "explicitly authorizes or rejects that exact preview",
+        "yank the exact version",
+        "Never overwrite or reuse a published version",
+        ': "${RELEASE_COMMIT:?set the exact authorized commit}"',
+        'TAG_COMMIT="$(git rev-list -n 1 "v${RELEASE_VERSION}")"',
+        'test "$TAG_COMMIT" = "$RELEASE_COMMIT"',
+    ):
+        assert required in releasing_normalized
+    bash_blocks = re.findall(r"```bash\n(.*?)\n```", releasing, flags=re.DOTALL)
+    assert bash_blocks
+    assert all(
+        block.startswith("set -Eeuo pipefail\nIFS=$'\\n\\t'\n")
+        for block in bash_blocks
+    )
+    assert releasing.count('"$RELEASE_WHEEL" "$RELEASE_SDIST"') == 2
 
 
 def test_ci_actions_and_downloaded_toolchains_are_immutable() -> None:

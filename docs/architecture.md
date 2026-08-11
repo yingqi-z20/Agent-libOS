@@ -261,15 +261,19 @@ an owned store. Custom Runtime subclasses must be created through their
 constructor directly is outside this lifecycle contract.
 
 Before the lifecycle becomes `OPEN`, the assembled Runtime holds a dedicated
-recovery lease and drains durable startup work in dependency order: prepared
-protected operations, stale capability-use reservations, pending external
-effects, resource-usage reservations, process-exec publications, process-launch
-publications, checkpoint-restore publications, missing volatile Object
-payloads, registered JIT rehydration, stale Explainable Operations, stale
-process execution leases, Object Tasks, and incomplete process-terminal cleanup
-intents. Recovery queries use configured, hard-bounded keyset pages. External
-providers may reconcile an existing receipt but are never replayed; ambiguous
-resource reservations are charged to their maximum envelope.
+recovery lease. It first validates recoverable TaskRun plaintext and integrity
+bindings without dispatch, then drains durable startup work in dependency order:
+prepared protected operations, pending external effects, semantic authority,
+stale capability-use reservations, resource-usage reservations, process-exec
+publications, process-launch publications, checkpoint-restore publications,
+root-spawn initial-goal payloads, missing volatile Object payloads, registered
+JIT rehydration, stale Explainable Operations, stale process execution leases,
+Object Tasks, incomplete process-terminal cleanup intents, and TaskRun recovery.
+Pending-effect reconciliation precedes stale capability-reservation abandonment
+because a provider receipt may prove an effect never started and restore its
+bound reservation. Recovery queries use configured, hard-bounded keyset pages.
+External providers may reconcile an existing receipt but are never replayed;
+ambiguous resource reservations are charged to their maximum envelope.
 Process/image/checkpoint publications carry durable plans, phase receipts,
 exact recovery leases, and operation bindings so recovery can compensate or
 terminalize a specific owner rather than infer success from adjacent rows. A
@@ -381,12 +385,15 @@ The assembled graph includes:
 - `ResourceManager` validates hierarchical budgets, can durably reserve an
   operation-supplied maximum provider-usage envelope before dispatch, settles
   exact usage, and recovers those reservations conservatively on startup.
-  Callers such as the LLM executor that do not use this reservation path retain
-  their separately documented post-completion accounting semantics.
+  The LLM executor uses this path: after exact request assembly it reserves the
+  maximum call/token envelope before Provider dispatch and then exact-settles a
+  completed call or maximum-settles an ambiguous outcome.
 - `DataFlowManager` owns the versioned Host Sink registry, source/version
   validation, conditional releases, file label bindings, and append-only flow
-  decisions. Registry writes require configured `data_flow_sink_registry:*`
-  admin authority and are never projected as model tools.
+  decisions. Public registry writes require configured
+  `data_flow_sink_registry:*` admin authority and are never projected as model
+  tools. Before `OPEN`, the trusted Host bootstrap may reconcile only the
+  Host-configured rules without a process capability.
 - `ObjectMemoryManager` provides typed memory and namespace resolution.
 - `EventBus` validates and appends the closed `EventType` catalog. Its event
   insert and active operation-evidence link are atomic, while wider
@@ -451,10 +458,30 @@ The assembled graph includes:
   fingerprints; its narrower dispatch gate is an explicit id, an official
   stored Responses request, and representable tool history.
 
+Prompt caching separates a model-visible layout from provider transport policy.
+The defaults, `legacy_v1` and `provider_default`, preserve the legacy prompt and
+send no v2 cache options. Opt-in `cache_optimized_v2` keeps stable instructions
+and append-only TaskRun requirements ahead of volatile state and minimizes
+libOS-owned metadata. `implicit` and `explicit` cache modes require a
+Host-configured `prompt_cache_key`; Runtime derives the wire key from that
+privacy domain plus provider, model, stable prefix, and tool fingerprint rather
+than a Run or process id. Explicit mode also marks one stable text breakpoint.
+The only v2 TTL is `30m`, mutually exclusive with legacy
+`prompt_cache_retention`.
+
+If an endpoint rejects a cache field, the bounded compatibility retry removes
+the entire v2 cache-option group. That retry remains inside the same logical
+protected operation and resource reservation. The LLM record distinguishes
+configured layout/policy from the secret-free options accepted on the successful
+attempt and records a content-free downgrade reason. Promoting v2 from opt-in is
+guarded by the paired v1/v2 multi-provider release gate; this is release
+qualification rather than a Runtime authority boundary. See the detailed
+[provider policy and gate](providers.md#prompt-caching-v2-release-evidence).
+
 The default substrate is `LocalResourceProviderSubstrate`, rooted at the current
 workspace unless another substrate is injected.
 
-The durable event envelope, current 46-value event catalog, ordering model, and
+The durable event envelope, closed event catalog, ordering model, and
 transaction/causality limits are documented in [Runtime Events](events.md).
 
 The internal core module registers the built-in tool set and default images
@@ -611,8 +638,10 @@ hard-deny set. `canary_auto` may issue one exact, short-lived, nondelegable,
 one-use Capability for catalog-v1 reads under an immutable static Host policy
 epoch. The private settlement port shares the Human revision/status CAS and
 transactional terminal kernel, so Human/cancel/machine races have one winner.
-No Runtime facade, CLI, HTTP, GUI, model Tool, Skill, JIT, or Module exposes
-that mutation port or policy activation/revocation.
+No Runtime facade, CLI, HTTP, GUI, model Tool, Skill, JIT, or Module exposes that
+private settlement port. The Host-owned Python component graph does expose
+`semantic_control`, including policy admission and authority-narrowing disable;
+it is a trusted composition/control surface, not a remote or model-facing one.
 
 Approval and provider-ingress jobs are metadata-only. A root-goal job may
 temporarily contain a deterministic redacted intent only for bounded
@@ -696,12 +725,15 @@ including:
   and bounded observability envelopes. Full ordinary LLM I/O persistence is
   enabled by default for self-evolution training and fine-tuning pipelines: it
   retains prepared prompts and visible tools and, on success, output, tool
-  calls, reasoning metadata, and the raw response. Those fields may contain
-  sensitive material. A failed call's request fields follow the same setting,
-  but provider or extension exception text is never durable or model-visible,
-  regardless of `llm.persist_full_io`; only a stable public error envelope and
-  content-free internal observations such as type, length/hash, and correlation
-  id may cross those boundaries. Set `llm.persist_full_io: false` to store
+  calls, reasoning metadata, and a bounded provider-response projection. That
+  projection hashes recognized credential and opaque fields and replaces
+  over-limit structure or text with bounded digest descriptors; it is not the
+  provider's raw response. The retained fields may still contain sensitive
+  material. A failed call's request fields follow the same setting, but provider
+  or extension exception text is never durable or model-visible, regardless of
+  `llm.persist_full_io`; only a stable public error envelope and content-free
+  internal observations such as type, length/hash, and correlation id may cross
+  those boundaries. Set `llm.persist_full_io: false` to store
   content-free byte counts, JSON-kind/item-count metadata where applicable, and
   hashes for ordinary I/O fields. That setting cannot run an `image_only`
   Image, whose next quantum requires a lossless durable transcript head and
@@ -838,6 +870,7 @@ agent_libos/
   runtime/         public Runtime facade, composition, syscalls, scheduler, processes,
                    events, checkpoints, audit, and recovery coordination
   sdk/             public protected-operation lifecycle and provider-facing contracts
+  semantic/        Host semantic assessment, flow, control, settlement, and recovery
   skills/          Skill schema, strict loader, trust registry, and SkillManager
   substrate/       provider interfaces and local host-backed implementations
   storage/         UnitOfWork, typed repositories, store backends, and migrations

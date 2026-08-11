@@ -42,3 +42,28 @@ class TestPublicWording:
         assert "not the source of truth" in design_doc
         assert "current behavior" in design_doc
         assert "not the implementation reference" in roadmap
+
+    def test_provider_response_retention_is_described_as_a_bounded_projection(
+        self,
+    ) -> None:
+        expected_phrases = {
+            "README.md": "provider-response evidence is a bounded projection",
+            "docs/configuration.md": "bounded\n  provider-response projection",
+            "docs/evidence_payload_retention.md": (
+                "bounded provider-response\nprojection stored under `raw_response`"
+            ),
+            "docs/threat_model.md": "bounded provider-response\nprojection",
+        }
+
+        for relative_path, phrase in expected_phrases.items():
+            text = (ROOT / relative_path).read_text(encoding="utf-8")
+            assert phrase in text, relative_path
+
+    def test_long_horizon_docs_assign_retries_to_agent_libos(self) -> None:
+        text = (
+            ROOT / "benchmarks" / "long_horizon_agent" / "README.md"
+        ).read_text(encoding="utf-8")
+
+        assert "Agent libOS's explicit, attempt-traced\ntransport retry loop" in text
+        assert "provider-SDK internal retries are disabled" in text
+        assert "the SDK already applies" not in text

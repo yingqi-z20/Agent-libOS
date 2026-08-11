@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from agent_libos.api.cli import cli as cli_entrypoint
+from agent_libos.api.cli import _parse_cli_args
 from agent_libos.api.cli import main as cli_main
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import LibOSError
@@ -999,6 +1000,91 @@ def test_semantic_text_inputs_are_bounded(
 
     assert raised.value.code == 2
     assert "must contain" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["semantic", "assessments", "--action-id", "Filesystem.read"],
+        ["semantic", "settlements", "--action-id", "filesystem"],
+        ["semantic", "metrics", "--action-id", "Read File"],
+    ],
+)
+def test_semantic_action_filters_require_dotted_lower_case_identifiers(
+    argv: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        _parse_cli_args(argv)
+
+    assert raised.value.code == 2
+    assert "dotted lower-case identifier" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["semantic", "assessments"],
+        ["semantic", "settlements"],
+        ["semantic", "metrics"],
+    ],
+)
+def test_semantic_action_filters_accept_exact_ontology_shape(
+    argv: list[str],
+) -> None:
+    _, args = _parse_cli_args([*argv, "--action-id", "filesystem.read"])
+
+    assert args.action_id == "filesystem.read"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["semantic", "assessments"],
+        ["semantic", "flow", "entities"],
+        ["semantic", "settlements"],
+        ["semantic", "metrics"],
+    ],
+)
+def test_semantic_tenant_filters_reject_upper_case_sha256(
+    argv: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        _parse_cli_args([*argv, "--tenant-bucket-sha256", "A" * 64])
+
+    assert raised.value.code == 2
+    assert "64 lower-case hexadecimal" in capsys.readouterr().err
+
+
+def test_semantic_assessment_tenant_filter_rejects_non_sha256_text(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        _parse_cli_args(
+            ["semantic", "assessments", "--tenant-bucket-sha256", "tenant-one"]
+        )
+
+    assert raised.value.code == 2
+    assert "64 lower-case hexadecimal" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["semantic", "assessments"],
+        ["semantic", "flow", "entities"],
+        ["semantic", "settlements"],
+        ["semantic", "metrics"],
+    ],
+)
+def test_semantic_tenant_filters_accept_exact_lower_case_sha256(
+    argv: list[str],
+) -> None:
+    digest = "a" * 64
+    _, args = _parse_cli_args([*argv, "--tenant-bucket-sha256", digest])
+
+    assert args.tenant_bucket_sha256 == digest
 
 
 class _MigrationPayload:

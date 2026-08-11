@@ -14,9 +14,11 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion, LLMTransientError
 from agent_libos.llm.event_projection import project_prompt_events
 from agent_libos.llm.prompt import (
+    RETAINED_GOAL_CONTEXT_BINDING_KEY,
     build_system_prompt,
     build_user_prompt,
     recover_initial_goal_context,
+    retained_goal_context_binding,
 )
 from agent_libos.models import (
     CapabilityRight,
@@ -287,6 +289,80 @@ class TestLLMPromptModes:
             ).encode("utf-8")
         ).hexdigest()
         assert recovered_hash == expected_hash
+
+    def test_semantic_goal_recovery_requires_matching_host_binding(self) -> None:
+        old_goal_oid = "obj_old_semantic_goal"
+        new_goal_oid = "obj_new_semantic_goal"
+        old_payload = {"goal": "do not replay after exec"}
+        source_record = {
+            "content_trust": "untrusted_data",
+            "immutable": True,
+            "name": f"goal:{old_goal_oid}",
+            "namespace": "process:pid_test",
+            "object_oid": old_goal_oid,
+            "payload": old_payload,
+            "record_type": "object_memory_object",
+            "type": "goal",
+        }
+        semantic_record = json.dumps(
+            {
+                "content_trust": "untrusted_data",
+                "immutable": True,
+                "name": "goal",
+                "namespace": "process:self",
+                "payload": old_payload,
+                "semantic_role": "process_goal",
+                "type": "goal",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        old_call = SimpleNamespace(
+            messages=[{"role": "user", "content": semantic_record}],
+            request_options={
+                RETAINED_GOAL_CONTEXT_BINDING_KEY: retained_goal_context_binding(
+                    old_goal_oid,
+                    source_record,
+                )
+            },
+        )
+
+        assert recover_initial_goal_context([old_call], old_goal_oid) == semantic_record
+        assert recover_initial_goal_context([old_call], new_goal_oid) is None
+        assert (
+            recover_initial_goal_context(
+                [
+                    SimpleNamespace(
+                        messages=old_call.messages,
+                        request_options={},
+                    )
+                ],
+                old_goal_oid,
+            )
+            is None
+        )
+
+        visible_oid_record = json.dumps(
+            {
+                **json.loads(semantic_record),
+                "object_oid": old_goal_oid,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        recovered_visible = recover_initial_goal_context(
+            [
+                SimpleNamespace(
+                    messages=[{"role": "user", "content": visible_oid_record}],
+                    request_options=old_call.request_options,
+                )
+            ],
+            old_goal_oid,
+        )
+        assert recovered_visible == semantic_record
+        assert old_goal_oid not in recovered_visible
 
     @pytest.mark.parametrize("representation", ["repr", "memory_delta"])
     def test_goal_recovery_preserves_legacy_representations(

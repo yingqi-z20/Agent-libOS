@@ -3,11 +3,14 @@
 > 调研日期：2026-08-03<br>
 > 仓库基线：`dd46f1d5ec439f3539605fd41c7b8938971f45a6`（调研时工作区存在其他未提交修改）<br>
 > 适用对象：Agent libOS 的运行时、Capability、Human approval、Protected Operation、Object Memory、provider 与审计子系统<br>
-> 文档性质：技术预研与立项建议，不构成法律或合规意见
+> 文档性质：固定在上述 commit 的历史技术预研与立项建议，不构成当前产品、
+> 接口、安全或发布契约，也不构成法律或合规意见。除“当前状态”说明外，本文中
+> 的“当前”“已有”“缺口”“进入实现前”和行号链接都只指该历史基线。
 
-> 实施状态（2026-08-07）：本报告仍是调研与后续路线依据。Agent libOS
-> 1.4.1 已在默认关闭的前提下实现 Phase 2–4：payload-free FlowGraph、闭集
-> 确定性拒绝，以及静态 Host epoch 下的低风险 exact-once canary。
+> 当前状态（2026-08-11）：Agent libOS 1.4.2 已在默认关闭的前提下实现
+> Phase 0–4，包括 payload-free FlowGraph、闭集确定性拒绝，以及静态 Host
+> epoch 下的低风险 exact-once canary。本文的路线表和 backlog 是基线时的历史
+> 提案，不能用来判断这些阶段今天是否已实现。
 > 当前能力、配置、存储迁移、隐私边界与明确未实现项以
 > [Semantic Approval and Data Identification](semantic_shadow.md) 为准。本文中
 > 关于 Phase 5、长期记忆、Cedar/OPA、高风险自动权限或自动生产放量的描述仍是
@@ -69,22 +72,22 @@
 - **A 级：标准与规范**——NIST、W3C、OWASP 正式文档及授权/数据流规范；用于定义边界和术语。
 - **B 级：同行评审研究**——Zanzibar、AgentDojo、ToolEmu、Task Shield、经典 IFC/taint/provenance 与权限 UX 研究；用于判断已验证的机制和权衡。
 - **C 级：前沿预印本/研究发布**——CaMeL、FIDES、AutoCedar、Prose2Policy、2026 agent permission 综述；用于发现方向，不能当作生产保证。
-- **D 级：仓库证据**——直接检查当前代码、文档、invariants、tests 和历史 benchmark 报告；用于提出 Agent libOS 的接入点与缺口。
+- **D 级：仓库证据**——直接检查基线 commit 的代码、文档、invariants、tests 和当时的 benchmark 报告；用于提出 Agent libOS 的接入点与缺口。
 
 本轮是前期调研，没有修改运行时代码，也没有为新方案执行真实模型或生产流量实验。报告中的建议门槛需要后续 shadow 数据和受控红队验证。
 
-## 2. Agent libOS 现有底座与差距
+## 2. 调研基线中的 Agent libOS 底座与差距
 
-### 2.1 已有能力
+### 2.1 基线已有能力
 
 | 子系统 | 当前能力 | 对本项目的价值 |
 |---|---|---|
-| Capability | `authorize` 返回结构化决定，`require` 消耗有限次授权；真实优先级为 `DENY > 匹配当前 operation 的 exact one-shot approval > ASK > ALLOW > MISSING`；支持约束、委托衰减和一次性 reservation。参见 [`CapabilityManager`](../agent_libos/capability/manager.py#L127)、[`authorize`](../agent_libos/capability/manager.py#L706)、[`require`](../agent_libos/capability/manager.py#L805)。 | 可作为最终 PDP/PEP 与自动审批 token 的消费点；one-shot 只能消解匹配的 ASK，不能覆盖 DENY，也无需让模型直接操作权限存储。 |
-| Permission policy / Human | 已有 `always_allow`、`always_deny`、`ask_each_time`、`allow_once`，模型权限请求受 Task Authority ceiling 和请求形状限制；人工批准可产生精确授权。参见 [`request_permission`](../agent_libos/human/manager.py#L573) 与 [capabilities 文档](capabilities.md#permission-policy-and-human-approval)。 | 可复用其队列、并发单决策和原子 grant 模式，但机器决定必须用专用 API/event，不能伪装成现有 `human.response`。 |
+| Capability | `authorize` 返回结构化决定，`require` 消耗有限次授权；真实优先级为 `DENY > 匹配当前 operation 的 exact one-shot approval > ASK > ALLOW > MISSING`；支持约束、委托衰减和一次性 reservation。参见 [`CapabilityManager`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/capability/manager.py#L127)、[`authorize`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/capability/manager.py#L706)、[`require`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/capability/manager.py#L805)。 | 可作为最终 PDP/PEP 与自动审批 token 的消费点；one-shot 只能消解匹配的 ASK，不能覆盖 DENY，也无需让模型直接操作权限存储。 |
+| Permission policy / Human | 已有 `always_allow`、`always_deny`、`ask_each_time`、`allow_once`，模型权限请求受 Task Authority ceiling 和请求形状限制；人工批准可产生精确授权。参见 [`request_permission`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/human/manager.py#L573) 与 [capabilities 文档](capabilities.md#permission-policy-and-human-approval)。 | 可复用其队列、并发单决策和原子 grant 模式，但机器决定必须用专用 API/event，不能伪装成现有 `human.response`。 |
 | Task Authority | Host 在任务启动时声明 capability、effect、requestable ceiling、预算和数据接收域，子任务只能取交集或继续衰减。参见 [Task Authority Manifest](task_authority_manifest.md)。 | 可新增“哪些请求允许语义自动处理”的显式上限；默认不允许语义层扩大 authority。 |
-| Protected Operation | 用 durable、分阶段事务化状态机连接 capability reservation、effect ceiling、规范参数、状态/DataFlow 重检、dispatch intent、provider 调用、结算与证据。Provider I/O 发生在数据库事务外，模糊结果记录为 `unknown`。参见 [`ProtectedOperationContract`](../agent_libos/sdk/protected_operations.py#L140)、[`_preflight_data_flow`](../agent_libos/sdk/protected_operations.py#L1392)、[`_revalidate_data_flow`](../agent_libos/sdk/protected_operations.py#L1553)。 | 是一次性授权在真正副作用前重验、预留并保真记录外部不确定性的最佳执行点。 |
-| 数据标签 | 已有 sensitivity、trust、integrity、tenant/principal/declassification authority；聚合采用最高敏感度、最低可信度/完整性和冲突身份 fail-closed。参见 [`DataLabels`](../agent_libos/models/data_flow.py#L75) 与 [`aggregate`](../agent_libos/models/data_flow.py#L151)。 | 已经具备 IFC 的基础 lattice，可扩展类别、用途和语义证据而不推倒重来。 |
-| 来源与 sink | `DataFlowContext` 持有精确 Object version/hash 来源；sink 由 Host registry 解析为稳定身份；egress 在 provider 前检查并在执行前重检。参见 [`DataFlowContext`](../agent_libos/models/data_flow.py#L206)、[`DataSink`](../agent_libos/models/data_flow.py#L257)、[`authorize_egress`](../agent_libos/runtime/data_flow_manager.py#L461)。 | 能把语义分类与真实数据对象、目标、registry generation 和 payload digest 绑定。 |
+| Protected Operation | 用 durable、分阶段事务化状态机连接 capability reservation、effect ceiling、规范参数、状态/DataFlow 重检、dispatch intent、provider 调用、结算与证据。Provider I/O 发生在数据库事务外，模糊结果记录为 `unknown`。参见 [`ProtectedOperationContract`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/sdk/protected_operations.py#L140)、[`_preflight_data_flow`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/sdk/protected_operations.py#L1392)、[`_revalidate_data_flow`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/sdk/protected_operations.py#L1553)。 | 是一次性授权在真正副作用前重验、预留并保真记录外部不确定性的最佳执行点。 |
+| 数据标签 | 已有 sensitivity、trust、integrity、tenant/principal/declassification authority；聚合采用最高敏感度、最低可信度/完整性和冲突身份 fail-closed。参见 [`DataLabels`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/models/data_flow.py#L75) 与 [`aggregate`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/models/data_flow.py#L151)。 | 已经具备 IFC 的基础 lattice，可扩展类别、用途和语义证据而不推倒重来。 |
+| 来源与 sink | `DataFlowContext` 持有精确 Object version/hash 来源；sink 由 Host registry 解析为稳定身份；egress 在 provider 前检查并在执行前重检。参见 [`DataFlowContext`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/models/data_flow.py#L206)、[`DataSink`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/models/data_flow.py#L257)、[`authorize_egress`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/runtime/data_flow_manager.py#L461)。 | 能把语义分类与真实数据对象、目标、registry generation 和 payload digest 绑定。 |
 | 精确 release | 只有 `conditional` sink 接收高于 `normal` 的数据时，才可通过单独、一次性、与来源版本、manifest、目标状态和 payload 绑定的 release authority 放行；`untrusted` sink 不能靠人工 release 升级，`trusted` sink 在 clearance 内无需 release。参见 [data flow 文档](data_flow.md#exact-conditional-release)。 | 应复用其精确 binding，但严禁语义模型把“已脱敏/可以分享”当作 release 权限或把 untrusted sink 变 trusted。 |
 | Evidence | Capability/DataFlow/effect 等安全路径已有结构化事件与审计，部分记录采用 payload-free hash/metadata；但证据底座并不统一：Human request/decision、process message 可持久化完整内容，Human request 行可更新，Event/Audit 又是自由字典。 | 新 semantic assessment 必须使用独立 typed、append-only、payload-minimized record，不能假设现有所有证据都已统一脱敏或受同一 retention 管理。 |
 
@@ -99,7 +102,11 @@
 7. 模型只可做保守标注，不能提高 trust/integrity、降低 sensitivity、移除 tenant/principal 或赋予 declassification authority。
 8. 审批 UI 必须由可信运行时从实际 canonical action 生成，不能只展示模型写的摘要。
 
-### 2.3 主要缺口
+### 2.3 基线主要缺口
+
+本节是 `dd46f1d…` 的缺口快照，并不维护逐项解决状态。Phase 0–4 的当前
+能力和明确未实现项只以 [Semantic Approval and Data Identification](semantic_shadow.md)
+为准。
 
 当前底座能强制执行“已知的权限和标签”，但尚不能充分回答“动作为什么符合当前任务”及“内容中的哪些字段、条件和记忆影响了动作”。需要补齐：
 
@@ -108,28 +115,30 @@
 - **内容级分类**：当前标签主要来自 Host/Object/connector 边界，缺少 PII、凭证、源代码、合同、财务、健康等字段或 chunk 级语义识别。
 - **显式数据依赖图**：有保守高水位和来源快照，但缺少字段级 direct/indirect edge、transform、sanitizer、declassifier、endorser 记录。
 - **隐式/控制流**：秘密或低可信输入可以通过工具选择、调用次数、收件人选择、异常、重试或记忆命中影响可观察效果；仅跟踪 payload 复制无法覆盖。
-- **目标长期记忆治理**：若未来引入跨会话 durable memory，其写入是未来会话的持久 sink，读出又是 source，需要写入背书、检索完整性和沿 provenance 的撤回/失效。当前 Object Memory 的普通 payload 主要在运行时内存中，SQL 仅存 marker；重启后相关对象会释放，只有 metadata/provenance 等持久化，不能把它描述成已经存在的跨会话长期 payload store。参见 [Object Memory 文档](object_memory.md) 与 [`sql.py`](../agent_libos/storage/sql.py#L4052)。
+- **目标长期记忆治理**：若未来引入跨会话 durable memory，其写入是未来会话的持久 sink，读出又是 source，需要写入背书、检索完整性和沿 provenance 的撤回/失效。当前 Object Memory 的普通 payload 主要在运行时内存中，SQL 仅存 marker；重启后相关对象会释放，只有 metadata/provenance 等持久化，不能把它描述成已经存在的跨会话长期 payload store。参见 [Object Memory 文档](object_memory.md) 与 [`sql.py`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/storage/sql.py#L4052)。
 - **模型生命周期治理**：分类器版本、prompt、schema、校准集、OOD 和漂移尚未成为授权证据的一部分。
-- **评测覆盖**：现有 runtime-safety suite 有 32 个确定性任务并已覆盖若干 capability、shell、process 和一条 labeled exfiltration 路径，但不足以证明语义审批的 calibration、跨工具字段 lineage、间接流和长期记忆安全。
+- **评测覆盖**：基线 runtime-safety suite 有 32 个确定性任务；当前 suite 有
+  33 个。两者都不能单独证明语义审批的 calibration、跨工具字段 lineage、
+  间接流和长期记忆安全。
 
-### 2.4 代码级差距清单
+### 2.4 基线代码级差距清单
 
 以下项目不是对现有文档保证的否定，而是当前保证边界内、语义化建设需要优先处理的具体缺口：
 
 | 优先级 | 当前行为/缺口 | 影响与建议 |
 |---|---|---|
-| P0 | [`unclassified_ingress_context()`](../agent_libos/runtime/data_flow_manager.py#L957) 对未知外部输入采用 `normal / untrusted / untrusted`。 | 完整性较保守，但机密性可能低标：外部响应实际可含凭据、PII 或商业机密。应先创建精确 `ExternalSourceRef`，分类后由 runtime 签发 `DataFlowContext`；分类失败采用组织批准的保守上限或强制 ASK，不能把未识别等同于普通数据。 |
-| P0 | 原始 root goal 没有内容分类，无显式来源时使用默认 `normal / unknown / local` 元数据。参见 [`process_manager.py`](../agent_libos/runtime/process_manager.py#L2878)。 | 用户任务本身可能含秘密、第三方粘贴内容或低可信指令。应按 message segment 保留 source/integrity，而不是整段统一信任。 |
+| P0 | [`unclassified_ingress_context()`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/runtime/data_flow_manager.py#L957) 对未知外部输入采用 `normal / untrusted / untrusted`。 | 完整性较保守，但机密性可能低标：外部响应实际可含凭据、PII 或商业机密。应先创建精确 `ExternalSourceRef`，分类后由 runtime 签发 `DataFlowContext`；分类失败采用组织批准的保守上限或强制 ASK，不能把未识别等同于普通数据。 |
+| P0 | 原始 root goal 没有内容分类，无显式来源时使用默认 `normal / unknown / local` 元数据。参见 [`process_manager.py`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/runtime/process_manager.py#L2878)。 | 用户任务本身可能含秘密、第三方粘贴内容或低可信指令。应按 message segment 保留 source/integrity，而不是整段统一信任。 |
 | P0 | ingress 主要提升 ambient context，当前持久化 decision 以 egress 为中心。 | 应新增 ingress classification/assessment ledger，记录 source、detector、版本、标签下界、冲突和 evidence digest；否则无法重放标签为何出现。 |
-| P0 | 现有 Host `auto_approve` 是粗粒度运行时开关；对 permission request 可映射成持久 `always_allow`，其他请求做布尔批准。参见 [`_select_permission_policy`](../agent_libos/human/manager.py#L2629)。 | 适合测试/受控 Host 脚本，不应作为生产语义审批。新路径必须有独立 actor、三态结果、exact one-shot 和 policy/model provenance。 |
+| P0 | 现有 Host `auto_approve` 是粗粒度运行时开关；对 permission request 可映射成持久 `always_allow`，其他请求做布尔批准。参见 [`_select_permission_policy`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/human/manager.py#L2629)。 | 适合测试/受控 Host 脚本，不应作为生产语义审批。新路径必须有独立 actor、三态结果、exact one-shot 和 policy/model provenance。 |
 | P1 | 对象/ambient flow 是保守 high-water，缺字段、JSONPath、CSV 列和 span 级 lineage。 | 安全兜底应保留；在其上增加字段级 findings/edges，以降低 over-taint，但字段分析失败时退回整体标签。 |
 | P1 | 没有专门的 `pc_label`；工具选择、是否调用、次数、异常、文件名、收件人、长度和时间等控制依赖未被完整建模。 | 增加 strict mode 与 `CONTROL` edge；高保障 action 采用固定次数/预算或人工确认。 |
 | P1 | JSON-RPC、MCP、LLM、Shell 等响应多为粗粒度 origin 标签，缺少统一、可版本化的 provider-response source ref。 | 为每次外部响应创建 digest、provider spec/generation、call/effect ID 绑定的 source entity，便于跨工具追踪和撤回。 |
-| P1 | 当前 `trust_level` 主要传播；sink clearance 的关键检查集中在 integrity、sensitivity、identity domain 和 sink 配置。参见 [`_clearance_error`](../agent_libos/runtime/data_flow_manager.py#L1430)。 | 明确 `trust` 与 `integrity` 的策略语义，避免同名/近义字段只被记录却不执行；新增测试证明每个安全标签都被某个 policy 消费。 |
+| P1 | 当前 `trust_level` 主要传播；sink clearance 的关键检查集中在 integrity、sensitivity、identity domain 和 sink 配置。参见 [`_clearance_error`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/runtime/data_flow_manager.py#L1430)。 | 明确 `trust` 与 `integrity` 的策略语义，避免同名/近义字段只被记录却不执行；新增测试证明每个安全标签都被某个 policy 消费。 |
 | P1 | declassification 主要依赖对象级 admin capability，缺少 sanitizer/输出 hash/字段/目的/理由的变换证明。 | 建立 `TransformRegistry`，把 transform artifact、输入输出 digest、字段范围、sink、purpose 和 one-shot release 一起绑定。 |
 | P1 | Event/Audit payload 是自由字典，生产者自行负责标签与脱敏；部分 Shell evidence 可保存完整 argv。 | 语义分类会增加敏感信息面。应在 evidence schema 层集中执行 label、safe projection、size bound 和 retention，而非依赖字段名正则。 |
-| P1 | Human request/decision 与普通 process message 可保存完整 payload/body；Human request 状态是可更新记录，年龄型 payload retention 又主要覆盖 LLM Call/ExternalEffect。参见 [`sql.py`](../agent_libos/storage/sql.py#L14678)、[process message 存储](../agent_libos/storage/sql.py#L16026) 与 [`payload_retention.py`](../agent_libos/evidence/payload_retention.py#L68)。 | 不要把所有“审计/证据”笼统称为 append-only、payload-free。新增 semantic record 独立建 typed repository，并为各现有表做数据盘点、最小化与删除测试。 |
-| P1 | LLM 记录可保存完整 prompt、tool schema、response/reasoning/raw response，配置默认 `persist_full_io=True`；年龄 retention 默认关闭或覆盖面有限。参见 [`records.py`](../agent_libos/llm/records.py#L21)、[`defaults.py`](../agent_libos/config/defaults.py#L550) 和 [`payload_retention_enabled`](../agent_libos/config/defaults.py#L268)。 | 语义服务上线前必须做数据盘点、purpose/retention 配置、敏感 payload 分离、purge/legal-hold 测试；不能为审批可解释性无限保留原始上下文。 |
+| P1 | Human request/decision 与普通 process message 可保存完整 payload/body；Human request 状态是可更新记录，年龄型 payload retention 又主要覆盖 LLM Call/ExternalEffect。参见 [`sql.py`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/storage/sql.py#L14678)、[process message 存储](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/storage/sql.py#L16026) 与 [`payload_retention.py`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/evidence/payload_retention.py#L68)。 | 不要把所有“审计/证据”笼统称为 append-only、payload-free。新增 semantic record 独立建 typed repository，并为各现有表做数据盘点、最小化与删除测试。 |
+| P1 | LLM 记录可保存完整 prompt、tool schema、response/reasoning/raw response，配置默认 `persist_full_io=True`；年龄 retention 默认关闭或覆盖面有限。参见 [`records.py`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/llm/records.py#L21)、[`defaults.py`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/config/defaults.py#L550) 和 [`payload_retention_enabled`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/config/defaults.py#L268)。 | 语义服务上线前必须做数据盘点、purpose/retention 配置、敏感 payload 分离、purge/legal-hold 测试；不能为审批可解释性无限保留原始上下文。 |
 | P1 | Shell/native 子进程后续文件与网络 I/O 不在 runtime 的完整中介范围；文件 sidecar 也可能无法反映任意外部修改。 | 对需要保证的 action 使用窄 provider、sandbox、文件/网络代理和独立凭据；报告中明确 end-to-end 保证仅覆盖受中介效果。 |
 
 现有 `DataSourceRef(oid, version, content_sha256)`、file binding、stable sink 和 dispatch 前 revalidation 已为这些改造提供了正确的身份与 TOCTOU 基础，不需要用语义模型替代它们。
@@ -397,9 +406,9 @@ flowchart LR
 
 推荐短期接入点是“primitive 已产生并持久化 ASK、确定性检查已完成，但尚未读取真人终端”之后：
 
-1. 在 [`HumanObjectManager._process_claimed_terminal_request()`](../agent_libos/human/manager.py#L2030) 的 request type 分派与 terminal selector 之间接入 Host-owned `SemanticAssessmentPort` 与确定性 Broker，但只白名单接受现有 `type=external_operation_approval` 且含有效 `requested_once_capability` 的请求；未来若新增专用类型，也必须同样封闭。
-2. 在 [`builder.py`](../agent_libos/runtime/builder.py#L2662) 构造并绑定 port；模型、Skill 和 JIT 不可替换它。
-3. 不直接调用现有 `approve()`/`_decide`：当前实现会写 `human.response` 语义，也能安装持久 permission policy。应从 [`_decide_impl()`](../agent_libos/human/manager.py#L2167) 和 [`_transition_after_human_decision()`](../agent_libos/human/manager.py#L2260) 抽取公共的 terminal CAS、request terminalization、wait-set 更新和 revision/state-generation fenced process transition，再新增 machine-only 事务/API。`ISSUE_EXACT_ONCE` 必须在同一事务中把 request 从 `PENDING` 置为 `APPROVED`、安装 `uses_remaining=1` 的 exact capability、写独立 `policy.response` / `semantic_assessment` evidence，并在没有其他 blocking request 时把进程安全恢复为 `RUNNABLE`；确定性拒绝也要原子 terminalize 为 `REJECTED` 并正确更新 wait state。自动 actor 使用 `policy:semantic-auto:<policy_id>`。
+1. 在 [`HumanObjectManager._process_claimed_terminal_request()`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/human/manager.py#L2030) 的 request type 分派与 terminal selector 之间接入 Host-owned `SemanticAssessmentPort` 与确定性 Broker，但只白名单接受现有 `type=external_operation_approval` 且含有效 `requested_once_capability` 的请求；未来若新增专用类型，也必须同样封闭。
+2. 在 [`builder.py`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/runtime/builder.py#L2662) 构造并绑定 port；模型、Skill 和 JIT 不可替换它。
+3. 不直接调用现有 `approve()`/`_decide`：当前实现会写 `human.response` 语义，也能安装持久 permission policy。应从 [`_decide_impl()`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/human/manager.py#L2167) 和 [`_transition_after_human_decision()`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/human/manager.py#L2260) 抽取公共的 terminal CAS、request terminalization、wait-set 更新和 revision/state-generation fenced process transition，再新增 machine-only 事务/API。`ISSUE_EXACT_ONCE` 必须在同一事务中把 request 从 `PENDING` 置为 `APPROVED`、安装 `uses_remaining=1` 的 exact capability、写独立 `policy.response` / `semantic_assessment` evidence，并在没有其他 blocking request 时把进程安全恢复为 `RUNNABLE`；确定性拒绝也要原子 terminalize 为 `REJECTED` 并正确更新 wait state。自动 actor 使用 `policy:semantic-auto:<policy_id>`。
 4. machine、GUI、CLI 和 Human responder 必须共享 terminal lock、pending-state CAS 与单赢家语义；`REQUIRE_HUMAN` 不 terminalize request，只把它留给现有人类通道。只有批准路径完成 request terminalization 和安全唤醒后，执行方才重试原始调用，并再次经过 Capability evaluator 和 Protected Operation 的 preflight、reservation、DataFlow、provider/state revalidation 与 dispatch。执行 reservation 仍要到这次原 operation 重试后的 prepare 阶段才创建。
 5. 远期把 HumanManager 中 request parsing、binding 和事务提交抽为通用底层服务，但 Human decision 与 machine policy decision 保持不同的类型、事件和可允许副作用。
 
@@ -411,7 +420,7 @@ flowchart LR
 
 不建议：
 
-- 在 [`CapabilityEvaluator`](../agent_libos/capability/evaluator.py#L103) 内调用模型。该 evaluator 应保持无副作用和确定性。
+- 在 [`CapabilityEvaluator`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/capability/evaluator.py#L103) 内调用模型。该 evaluator 应保持无副作用和确定性。
 - 在每个 primitive 中各自实现语义审批。这会产生不一致的 schema、timeout、evidence 和 fail-closed 行为。
 - 让语义服务直接调用 `issue_trusted`、写 Capability store 或 dispatch provider。
 - 首版把 `permission_request` 自动转换为持久 `always_allow`。最多允许精确 per-use；长期 policy 变更必须是独立、可审阅的管理动作。
@@ -750,7 +759,10 @@ AgentDojo 本身被设计为可扩展环境而非静态测试集，并包含 97 
 
 固定 benchmark 无法证明面对适应性攻击的永久安全。NIST AI RMF Generative AI Profile 强调持续测量、红队、来源、访问控制与部署后监控，应把模型/策略更新视为持续治理而非一次验收。[NIST AI 600-1](https://www.nist.gov/publications/artificial-intelligence-risk-management-framework-generative-artificial-intelligence)
 
-## 11. 分阶段实施路线
+## 11. 历史分阶段实施提案
+
+下表记录调研时的建议顺序，不是 1.4.2 的未完成工作清单。当前阶段状态见
+[Semantic Approval and Data Identification](semantic_shadow.md)。
 
 | 阶段 | 建议周期 | 交付物 | 权限状态 | 退出条件 |
 |---|---:|---|---|---|
@@ -763,9 +775,12 @@ AgentDojo 本身被设计为可扩展环境而非静态测试集，并包含 97 
 
 建议最小团队包括：1–2 名 runtime/security 工程师、1 名 ML/NLP/校准工程师、1 名 data/provenance 工程师、1 名测试/红队工程师和兼职 UX/产品、安全负责人。涉及金融、医疗、法律等领域还需领域审批者。
 
-## 12. Agent libOS 具体工程 Backlog
+## 12. 历史工程 Backlog
 
-### P0：进入实现前
+以下条目保留用于解释设计来源；其中多项已经实现或被更严格的当前设计取代。
+不要据此创建“尚未实现”的产品声明。
+
+### P0：基线进入实现前
 
 - 明确 `SemanticAssessmentPort` findings schema、确定性 Broker decision schema、reason code enum 和 timeout/fail-closed 行为。
 - 在 Task Authority 中增加显式 `semantic_auto_approval` ceiling；默认空集，子任务只能衰减。
@@ -797,11 +812,18 @@ AgentDojo 本身被设计为可扩展环境而非静态测试集，并包含 97 
 - 建立 per-action threshold、budget、rate limit、batch cap、canary tenant 和 emergency revoke。
 - 将 benchmark metrics 扩展为 unsafe auto-approval share、unsafe-request miss rate、auto-coverage、unnecessary escalation、calibration、data-flow path recall 和 audit completeness。
 
-## 13. 一个需要优先独立验证的现状风险
+## 13. 基线发现且已修复的约束衰减风险
 
-本次只读调研中，对 Capability constraint 衰减逻辑的探索性复现发现：父 capability 若带有值为 `None` 的已知 constraint，而委托子 capability 省略该 key，当前通用 `dict.get()` 比较可能把“缺键”与“显式 `None`”视为相同，导致子 capability 丢失父约束后仍被授权。相关 admission/attenuation 逻辑位于 [`CapabilityManager`](../agent_libos/capability/manager.py#L2251) 和相邻约束比较代码。
+本次基线调研对 Capability constraint 衰减逻辑的探索性复现曾发现：父
+capability 带有值为 `None` 的已知 constraint，而委托子 capability 省略该 key
+时，旧实现可能把“缺键”与“显式 `None`”混同。当前实现已修复：已知约束拒绝
+null，委托比较显式检查 key presence，旧存储中的无效约束也 fail closed；回归见
+[`tests/security/test_capability.py`](../tests/security/test_capability.py)。历史问题所在的
+基线代码仍由 commit-pinned 的
+[`CapabilityManager`](https://github.com/yingqi-z20/Agent-libOS/blob/dd46f1d5ec439f3539605fd41c7b8938971f45a6/agent_libos/capability/manager.py#L2251)
+链接保留。
 
-该问题应在语义 constraint 扩展前作为独立安全修复验证：
+该问题当时要求以下独立安全修复验证；这些项目现在由当前实现和回归覆盖：
 
 1. 增加最小失败回归，覆盖缺键、显式 null、错误类型和未知 key；
 2. 比较前先检查 key presence；
@@ -809,7 +831,8 @@ AgentDojo 本身被设计为可扩展环境而非静态测试集，并包含 97 
 4. denial path、委托链、持久化 decode 和审计一起覆盖；
 5. 运行 security lane 和 invariant checker。
 
-本报告不在调研任务中修改该代码，也不把一次探索性复现替代完整漏洞验证；但它是语义授权立项的 P0 前置项，因为更复杂的语义约束会显著放大通用 attenuation 的风险。
+本报告本身没有修改该代码。不要再把这一节表述为 1.4.2 的现存漏洞；未来
+扩展任何新 constraint 类型时仍须维持显式偏序、缺键检查和 denial-path 回归。
 
 ## 14. 风险登记表
 

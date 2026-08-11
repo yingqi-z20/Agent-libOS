@@ -1,6 +1,6 @@
 ---
 name: task-plan
-description: Create, read, and update revisioned task plans in Agent libOS Object Memory. Use for multi-step work that needs explicit progress states, resumable plan context across prompt compaction, stale-update detection, or an auditable in-runtime plan history.
+description: Create, read, and update revisioned task plans in Agent libOS Object Memory. Use for multi-step work that needs explicit progress states, resumable plan context across prompt compaction, serialized stale-update checks, or an auditable in-runtime plan history.
 license: Apache-2.0
 metadata:
   agent-libos.version: v0
@@ -85,11 +85,12 @@ Replace the logical plan with a new complete snapshot:
       ]
     }
 
-Use the revision returned by the latest successful create, read, or update.
-The tool rejects stale revisions. An identical current snapshot is a no-op. An
-immediate retry whose expected revision is exactly one behind the identical
-current snapshot is also a no-op, preventing a duplicate append after an
-ambiguous result.
+Use the revision returned by the latest successful create, read, or update. In
+a serialized single-writer workflow, the tool rejects a stale revision before
+its append. An identical current snapshot is a no-op. An immediate retry whose
+expected revision is exactly one behind the identical current snapshot is also
+a no-op, preventing a duplicate append after an ambiguous result that was read
+back first.
 
 ## Workflow
 
@@ -101,10 +102,15 @@ ambiguous result.
 5. Re-read before completion and map every remaining step to a final status or
    an explicit blocker.
 
-Serialize updates. Do not issue parallel update_task_plan calls for the same
-Object: Object Memory append has no caller-supplied compare-and-swap token.
-After an unknown outcome, read first and retry only if the intended snapshot is
-not already current.
+Serialize updates. Do not issue parallel `update_task_plan` calls for the same
+Object. The tool performs `memory.read_object` and then
+`memory.append_object`; that pair is not an atomic compare-and-swap because
+Object Memory append has no caller-supplied version token. Parallel writers can
+both pass the read-side revision check, and a call can observe an error after an
+append has already committed. Such a race can leave duplicate logical revisions
+that the strict reader rejects. After any unknown or error outcome, read first
+and retry only if the validated ledger proves the intended snapshot is absent;
+if strict validation fails, stop for Host recovery instead of appending again.
 
 Skill activation changes tool visibility only. It grants no Object Memory
 authority and creates no explicit namespace. Every create, read, and append

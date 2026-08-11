@@ -304,13 +304,26 @@ authority boundaries. See [Durable Task Runs](durable_task_runs.md) for payload
 opt-in, retention, recovery, and external-effect semantics.
 
 `Runtime.semantic` is an evidence and review service, not a general
-authorization manager. Its public Host reads include `status()`,
-`query_assessments(pid=None, request_id=None, operation_id=None, kind=None,
-status=None, domain=None, action_id=None, tenant_bucket_sha256=None, after=None,
-limit=None)`, and
-`get_assessment(assessment_id)`, plus bounded FlowGraph entity/edge/lineage,
-machine-settlement, policy/control-history, health, and metrics queries.
-Queries are hard-bounded and keyset-paged. The
+authorization manager. Its complete public Host evidence/review surface is:
+
+| Method | Return |
+| --- | --- |
+| `runtime.semantic.status()` | schema-v3 status `dict[str, Any]` |
+| `runtime.semantic.flow_status()` | FlowGraph status `dict[str, Any]` |
+| `runtime.semantic.metrics(*, window=None, action_id=None, tenant_bucket_sha256=None, epoch_id=None, risk=None)` | metrics `dict[str, Any]` |
+| `runtime.semantic.control_status()` | control-state `dict[str, Any]` |
+| `runtime.semantic.query_assessments(*, pid=None, request_id=None, operation_id=None, kind=None, status=None, domain=None, action_id=None, tenant_bucket_sha256=None, after=None, limit=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.get_assessment(assessment_id)` | assessment `dict[str, Any]` or `None` |
+| `runtime.semantic.query_flow_entities(*, after=None, limit=None, pid=None, kind=None, tenant_bucket_sha256=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.query_flow_edges(*, after=None, limit=None, pid=None, relation=None, node_id=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.query_flow_lineage(node_id, *, direction="upstream", after=None, limit=None, max_depth=8)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.query_machine_settlements(*, after=None, limit=None, pid=None, request_id=None, effect_id=None, action_id=None, tenant_bucket_sha256=None, outcome=None, epoch_id=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.query_policy_epochs(*, after=None, limit=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.query_control_history(*, after=None, limit=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.query_health_events(*, after=None, limit=None, severity=None, code=None, epoch_id=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.append_review_label(*, settlement_id, outcome, reviewer_id, evidence_sha256, reviewed_at=None)` | appended review-evidence `dict[str, Any]` |
+
+Paged queries are hard-bounded and keyset-paged. The
 omitted direct-Host limit uses `semantic.assessment_list_limit`; an explicit
 limit cannot exceed the smaller of `semantic.assessment_list_hard_limit` and
 500. The CLI and local HTTP API apply their stricter 50-row default and 100-row
@@ -325,9 +338,10 @@ through `2^53 - 1`, matching JSON/TypeScript safe-integer decoding.
 conflict invalidates only that counter. Unknown/raw
 usage fields are never returned. Deterministic/scripted, missing, non-exact, or
 invalid telemetry remains `None`, and populated values are not authoritative
-billing evidence. The only public write is strict Host review-evidence append;
-it cannot settle a request, issue/revoke a Capability, activate/revoke an epoch,
-change control state, mutate labels, or call a provider. Runtime-internal
+billing evidence. `append_review_label(...)` is the only public write and is a
+strict Host review-evidence append; it cannot settle a request, issue/revoke a
+Capability, activate/revoke an epoch, change control state, mutate labels, or
+call a provider. Runtime-internal
 capture, enforcement, and worker methods are not exported as model Tools,
 Skills, JIT syscalls, Modules, HTTP writes, or Runtime facade settlement APIs.
 See [Semantic Approval and Data
@@ -340,10 +354,13 @@ Its
 `assessments.by_status` and
 `assessments.by_domain` mappings contain the complete closed enum key sets and
 must each sum to `assessments.total`; inconsistent mappings are rejected by the
-CLI and GUI adapters. Real execution separates eligible, issued, consumed,
-succeeded, failed, unknown, expired, revoked, and race-lost. Rates are `None`
-when their exact denominator is zero; safety rates are also `None` without
-complete Host review labels.
+CLI and GUI adapters. The exact machine counter set is `eligible`, `issued`,
+`consumed`, `succeeded`, `failed`, `unknown`, `expired`, `revoked`,
+`race_lost`, and `denied`. `actual_auto_approval.rate` is `None` exactly when
+`eligible` is zero; `review_metrics.unsafe_rate` is `None` exactly when
+`reviewed` is zero; and `review_metrics.issued_review_rate` is `None` exactly
+when `issued` is zero. A non-null review rate does not by itself prove complete
+Host review coverage.
 
 Embedded Hosts may pass `semantic_assessor=` to `Runtime(...)`,
 `Runtime.open(...)`, or `Runtime.aopen(...)` only when the configured adapter is

@@ -792,6 +792,8 @@ def _require_active_authority_view(
         raise CapabilityDenied("semantic auto approval is disabled")
     if control.tripped:
         raise CapabilityDenied("semantic policy epoch is safety-tripped")
+    if not _control_epoch_identity_matches_binding(view, binding):
+        raise CapabilityDenied("semantic policy epoch or control generation changed")
     if (
         epoch.classifier_profile_id is None
         or epoch.classifier_profile_sha256 is None
@@ -939,15 +941,27 @@ def _control_epoch_matches_binding(
     view: SemanticAuthorityControlView,
     binding: SemanticApprovalBindingV2,
 ) -> bool:
+    if not _control_epoch_identity_matches_binding(view, binding):
+        return False
+    control = view.control
+    epoch = view.epoch
+    return (
+        control.active_policy_sha256 == binding.policy_epoch_sha256
+        and epoch.canonical_sha256() == binding.policy_epoch_sha256
+    )
+
+
+def _control_epoch_identity_matches_binding(
+    view: SemanticAuthorityControlView,
+    binding: SemanticApprovalBindingV2,
+) -> bool:
     control = view.control
     epoch = view.epoch
     return (
         control.active_epoch_id == binding.policy_epoch_id
-        and control.active_policy_sha256 == binding.policy_epoch_sha256
         and control.generation == binding.control_generation
         and epoch.epoch_id == binding.policy_epoch_id
         and epoch.generation == binding.control_generation
-        and epoch.canonical_sha256() == binding.policy_epoch_sha256
     )
 
 

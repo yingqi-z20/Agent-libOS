@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -29,6 +30,8 @@ PROMPT_LAYOUTS = {
     PROMPT_LAYOUT_LEGACY_V1,
     PROMPT_LAYOUT_CACHE_OPTIMIZED_V2,
 }
+RETAINED_GOAL_CONTEXT_BINDING_KEY = "retained_goal_context_binding_v1"
+_RETAINED_GOAL_CONTEXT_BINDING_SCHEMA_VERSION = 1
 _DYNAMIC_RUNTIME_HEADING = (
     "Current runtime state (volatile; applies only to this quantum):"
 )
@@ -305,7 +308,11 @@ def recover_initial_goal_context(
             content = message.get("content")
             if not isinstance(content, str) or not content:
                 continue
-            selected = _goal_context_from_persisted_prompt(content, goal_oid)
+            selected = _goal_context_from_persisted_prompt(
+                content,
+                goal_oid,
+                semantic_binding=_semantic_goal_binding_from_call(call, goal_oid),
+            )
             if selected is None:
                 continue
             if len(selected) > max_chars:
@@ -319,16 +326,20 @@ def recover_initial_goal_context(
 def _goal_context_from_persisted_prompt(
     content: str,
     goal_oid: str,
+    *,
+    semantic_binding: Mapping[str, Any] | None = None,
 ) -> str | None:
-    for extractor in (
-        _legacy_tagged_goal_context,
-        _canonical_object_goal_context,
-        _memory_delta_goal_context,
-    ):
-        selected = extractor(content, goal_oid)
-        if selected is not None:
-            return selected
-    return None
+    selected = _legacy_tagged_goal_context(content, goal_oid)
+    if selected is not None:
+        return selected
+    selected = _canonical_object_goal_context(
+        content,
+        goal_oid,
+        semantic_binding=semantic_binding,
+    )
+    if selected is not None:
+        return selected
+    return _memory_delta_goal_context(content, goal_oid)
 
 
 def _legacy_tagged_goal_context(content: str, goal_oid: str) -> str | None:
@@ -357,7 +368,12 @@ def _legacy_tagged_goal_context(content: str, goal_oid: str) -> str | None:
     return content[source_start:source_end]
 
 
-def _canonical_object_goal_context(content: str, goal_oid: str) -> str | None:
+def _canonical_object_goal_context(
+    content: str,
+    goal_oid: str,
+    *,
+    semantic_binding: Mapping[str, Any] | None,
+) -> str | None:
     decoder = json.JSONDecoder()
     for line in content.splitlines():
         candidate = line.strip()
@@ -366,8 +382,18 @@ def _canonical_object_goal_context(content: str, goal_oid: str) -> str | None:
         payload = _decode_json_object(decoder, candidate, require_complete=True)
         if payload is None:
             continue
-        if _is_goal_object_record(payload, goal_oid):
+        if _is_legacy_goal_object_record(payload, goal_oid):
             return candidate
+        semantic_record = _bound_semantic_goal_record(
+            payload,
+            goal_oid,
+            semantic_binding=semantic_binding,
+        )
+        if semantic_record is not None:
+            # Object ids are conditionally model-visible in v2. Recovery uses
+            # the same id-free projection that was bound by the Host so a later
+            # tool-table change cannot replay a previously visible Host id.
+            return _prompt_json(semantic_record)
     return None
 
 
@@ -408,21 +434,100 @@ def _decode_json_object(
     return payload
 
 
-def _is_goal_object_record(payload: dict[str, Any], goal_oid: str) -> bool:
-    legacy_match = (
+def retained_goal_context_binding(
+    goal_oid: str,
+    object_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind an id-free v2 goal projection to one Host-owned goal Object."""
+
+    if not isinstance(goal_oid, str) or not goal_oid:
+        raise ValueError("retained goal binding requires a goal Object id")
+    if object_record.get("object_oid", object_record.get("oid")) != goal_oid:
+        raise ValueError("retained goal binding Object id does not match")
+    projected_record = _compact_materialized_context_record(
+        dict(object_record),
+        include_object_ids=False,
+    )
+    if (
+        projected_record is None
+        or projected_record.get("semantic_role") != "process_goal"
+        or projected_record.get("content_trust") != "untrusted_data"
+        or "payload" not in projected_record
+    ):
+        raise ValueError("retained goal binding requires a canonical goal record")
+    return {
+        "schema_version": _RETAINED_GOAL_CONTEXT_BINDING_SCHEMA_VERSION,
+        "goal_oid": goal_oid,
+        "record_sha256": _goal_record_sha256(projected_record),
+    }
+
+
+def _semantic_goal_binding_from_call(
+    call: Any,
+    goal_oid: str,
+) -> Mapping[str, Any] | None:
+    request_options = getattr(call, "request_options", None)
+    if not isinstance(request_options, Mapping):
+        return None
+    binding = request_options.get(RETAINED_GOAL_CONTEXT_BINDING_KEY)
+    if (
+        not isinstance(binding, Mapping)
+        or binding.get("schema_version")
+        != _RETAINED_GOAL_CONTEXT_BINDING_SCHEMA_VERSION
+        or binding.get("goal_oid") != goal_oid
+        or not _is_sha256(binding.get("record_sha256"))
+    ):
+        return None
+    return binding
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _goal_record_sha256(record: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_prompt_json(dict(record)).encode("utf-8")).hexdigest()
+
+
+def _is_legacy_goal_object_record(
+    payload: dict[str, Any],
+    goal_oid: str,
+) -> bool:
+    return (
         payload.get("record_type") == "object_memory_object"
+        and payload.get("semantic_role") != "process_goal"
         and "payload" in payload
         and (
             payload.get("object_oid") == goal_oid
             or payload.get("oid") == goal_oid
         )
     )
-    semantic_match = (
+
+
+def _bound_semantic_goal_record(
+    payload: dict[str, Any],
+    goal_oid: str,
+    *,
+    semantic_binding: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not (
         payload.get("semantic_role") == "process_goal"
         and payload.get("content_trust") == "untrusted_data"
         and "payload" in payload
-    )
-    return legacy_match or semantic_match
+        and semantic_binding is not None
+        and semantic_binding.get("goal_oid") == goal_oid
+    ):
+        return None
+    id_free = dict(payload)
+    id_free.pop("object_oid", None)
+    id_free.pop("oid", None)
+    if semantic_binding.get("record_sha256") != _goal_record_sha256(id_free):
+        return None
+    return id_free
 
 
 def _original_goal_section(original_goal_context: str | None) -> str:

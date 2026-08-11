@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from agent_libos.utils.openai_schema import normalize_openai_strict_schema
+from agent_libos.utils.openai_schema import (
+    compact_model_json_schema,
+    normalize_openai_strict_schema,
+)
 
 
 def test_openai_schema_normalization_rejects_cycles_before_copying() -> None:
@@ -100,3 +103,32 @@ def test_openai_schema_normalization_removes_only_generated_titles_recursively()
     }
     assert normalized["properties"]["nested"]["items"]["minimum"] == 1
     assert schema["title"] == "Root"
+
+
+def test_openai_schema_title_compaction_preserves_title_named_schema_entries() -> None:
+    schema = {
+        "title": "Root annotation",
+        "type": "object",
+        "$defs": {
+            "title": {
+                "title": "Definition annotation",
+                "type": "string",
+            }
+        },
+        "properties": {
+            "title": {
+                "title": "Property annotation",
+                "$ref": "#/$defs/title",
+            }
+        },
+    }
+
+    strict_schema, strict = normalize_openai_strict_schema(schema)
+    compact_schema = compact_model_json_schema(schema)
+
+    assert strict is True
+    for selected in (strict_schema, compact_schema):
+        assert "title" not in selected
+        assert selected["properties"]["title"] == {"$ref": "#/$defs/title"}
+        assert selected["$defs"]["title"] == {"type": "string"}
+    assert schema["title"] == "Root annotation"

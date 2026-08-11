@@ -1538,12 +1538,15 @@ class JsonRpcPrimitive:
         return MappingProxyType(resolved_headers)
 
     def _validate_url(self, url: str) -> None:
-        parsed = urlsplit(url)
+        try:
+            parsed = urlsplit(url)
+        except ValueError as exc:
+            raise ValidationError("JSON-RPC endpoint URL is invalid") from exc
         try:
             _ = parsed.port
         except ValueError as exc:
             raise ValidationError("JSON-RPC endpoint URL has invalid port") from exc
-        if parsed.username or parsed.password:
+        if parsed.username is not None or parsed.password is not None:
             raise ValidationError("JSON-RPC endpoint URL must not include userinfo")
         if parsed.fragment:
             raise ValidationError("JSON-RPC endpoint URL must not include a fragment")

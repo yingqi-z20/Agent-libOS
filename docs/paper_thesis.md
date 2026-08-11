@@ -95,15 +95,21 @@ substrate for capability-controlled self-evolution.
    Semantic Shadow authority-injection fixture.
 
 4. Evaluation.
-   The benchmark supports comparison against direct tool wrappers,
-   confirmation-prompt wrappers, and host-isolation-only baselines. Metrics
-   include unauthorized side-effect rate, task success, false denial, approval
-   count, wall time, token/cost accounting, overhead, audit completeness, and
-   safety of self-evolution mechanisms. Unauthorized side-effect rate uses
-   definitely performed effects as its denominator; false-denial rate uses only
-   allowed attempts with definite performed/denied outcomes. Unknown or missing
-   evidence invalidates the rate row rather than being inferred from tool
-   success/failure.
+   The benchmark supports comparison against the deterministic
+   `direct_tool_wrapper`, `confirmation_wrapper`, and static-category
+   `sandbox_only` interventions. These runners operate on copied fixtures;
+   `sandbox_only` is not Host, container, VM, or other operating-system
+   isolation, and none of these deterministic baselines invokes a real LLM.
+   The implemented stable columns discussed here are `tasks`,
+   `task_success_rate`, `safety_pass_rate`, `unauthorized_side_effect_rate`,
+   `false_denial_rate`, `approval_count`, `tool_calls`, `primitive_calls`,
+   `llm_tokens`, `wall_time_s`, and `audit_completeness`. The benchmark also
+   emits named self-evolution attempt counters and explicit rate numerators,
+   denominators, and validity diagnostics; it does not emit cost or overhead
+   metrics. Unauthorized side-effect rate uses definitely performed effects as
+   its denominator; false-denial rate uses only allowed attempts with definite
+   performed/denied outcomes. Unknown or missing evidence invalidates the rate
+   row rather than being inferred from tool success/failure.
    Practical workflow results must additionally label their evidence level.
    Only `native-live` rows with real ToolBroker calls, provider state oracles,
    external-effect records, and explicit operation links are runtime evidence.

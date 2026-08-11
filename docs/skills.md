@@ -175,10 +175,15 @@ replacement affects only new registered-Skill activations.
 The model-facing lifecycle tools use distinct outer envelopes: discovery
 returns its `skills` page and paging metadata directly, while successful
 activation and unload return `{"result": {...}}`; resource reads return
-`{"resource": {...}}`. The activation result contains `pid`, `skill_id`,
-`name`, `version`, `tool_names`, `tool_ids`, `jit_tool_ids`,
-`instructions_hash`, and `package_sha256`. The unload result contains `pid`,
-`skill_id`, and `removed_tools`.
+`{"resource": {...}}`. Model-facing activation contains only `skill_id`,
+`name`, `version`, and `tool_names`; model-facing unload contains only
+`skill_id` and `removed_tools`. The durable ToolResult data retained by the Host
+additionally records activation `pid`, `tool_ids`, `jit_tool_ids`,
+`instructions_hash`, and `package_sha256`, and unload `pid`. Those fields are
+intentionally absent from the model projection: model code must not require,
+copy, or compare them. Confirm the loaded hash through a fresh discovery row's
+`active` state and confirm actual visibility from the next turn's loaded Skill
+and tool-schema projection.
 
 A successful registered-Skill activation requires `skill:<name>` `execute` and
 binds the snapshot to the process. Reading a bundled resource from that loaded
@@ -529,7 +534,11 @@ truncated, `matches_incomplete` is true, `omitted_matches` is null because the
 total is unknowable, and an incomplete NUL-framed tail is excluded from both
 `matches` and `files`. `observed_omitted_matches` counts only complete captured
 matches excluded by `max_results`; `output_incomplete` also covers truncated
-stderr or malformed/incomplete stdout framing.
+stderr or malformed/incomplete stdout framing. Interpret ripgrep's returned
+`returncode` separately: `0` means at least one match, `1` is the normal
+no-match result, and any other nonzero value is an execution error. A no-match
+result supports a negative conclusion only when `output_incomplete=false`; also
+inspect `stderr` before reporting it.
 The Skill does not grant filesystem or shell authority. `swe_view` and
 `swe_edit` use typed filesystem primitives, but `swe_run` and `swe_grep`
 authorize the outer native-process launch through Shell Capability, policy,
@@ -539,3 +548,32 @@ does not re-enter the corresponding typed libOS primitives; Shell is not an
 operating-system sandbox. A Host that runs untrusted native code must supply a
 stronger container, WASM, VM, service-provider, or comparable isolation
 boundary.
+
+## Task Plan Skill
+
+The workspace also includes `skills/task-plan`, named and registerable as
+`task-plan`. It contributes three package JIT tools and no static tools:
+
+- `create_task_plan` creates revision 1 of a named mutable Object Memory plan;
+- `read_task_plan` validates and returns the latest complete snapshot;
+- `update_task_plan` appends a replacement snapshot after checking the expected
+  logical revision.
+
+Call each exact name under direct JIT exposure. Under multiplexed exposure call
+`run_jit_tool` with that name in `tool_name` and its published object in
+`arguments`; activation does not grant Object Memory authority. Plans contain
+1–32 steps, allow at most one `in_progress` step, and use only `pending`,
+`in_progress`, `blocked`, `completed`, or `cancelled` status.
+
+The payload survives prompt compaction only inside the current live Runtime.
+Ordinary Runtime reopen can retain Object identity and version evidence while
+losing the plan payload, so reopen durability requires an authorized checkpoint
+or export workflow.
+
+Updates must have one serialized writer. `expected_revision` is checked by a
+read followed by `memory.append_object`; Object Memory append has no
+caller-supplied compare-and-swap token covering that pair. Parallel updates can
+therefore both pass the read-side check, and an error observed after dispatch is
+not proof that no append committed. After compaction, handoff, or any uncertain
+result, read and validate the ledger before retrying. Never issue parallel
+`update_task_plan` calls for the same Object.

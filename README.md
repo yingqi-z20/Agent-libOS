@@ -11,11 +11,18 @@ register, execute, or commit new images from checkpoints, fork children,
 checkpoint/fork state, and use registered remote resources, but these
 self-evolution mechanisms do not grant resource authority by themselves.
 
-The current contribution is the runtime authority boundary:
+The current contribution separates three boundaries that must not be
+collapsed into one another:
 
 ```text
-process identity + capability + data labels + Host Sink trust + primitive + audit
+authority        = process identity + Task Authority + Capability/effect constraints
+information flow = data labels + Host Sink trust + exact release
+evidence         = Operations + events + audit/settlement records
 ```
+
+Authority and information-flow checks decide whether an operation may proceed.
+Evidence records explain and settle that decision after the relevant check;
+an audit record, event, or receipt is never an authority credential.
 
 LLM-facing tools, Skills, JIT tools, image definitions, child processes,
 checkpoints, and remote endpoint visibility are ergonomic affordances. They are
@@ -136,7 +143,10 @@ The implementation currently includes:
   selection reasons, versions, token counts, and hashes without copying payloads.
 - Deno/TypeScript JIT tools that can access libOS only through `libos.syscall`.
   A dedicated supervisor establishes host-lifetime process-tree containment
-  before Deno starts, so hard host termination cannot orphan untrusted code.
+  before Deno starts. Native CI exercises the supported containment mechanisms
+  on Ubuntu and Windows; broader native macOS process behavior remains an
+  environment release gate. A Host must not treat an unvalidated platform as
+  carrying the same hard-termination evidence merely because Deno starts.
 - Declarative Skills that can add prompt instructions, visible tools, and JIT
   candidates without granting resource authority. The shipped base, coding,
   review, and toolmaker Images use `metadata.tool_projection: skills`: a fresh
@@ -243,6 +253,8 @@ Start here, then read the deeper references as needed:
   `mini-swe-agent` image behavior and known interface differences.
 - [docs/development.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/development.md): setup, tests, real LLM smoke,
   configuration defaults, and contribution rules.
+- [docs/releasing.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/releasing.md): human-authorized release workflow,
+  canonical CI artifact binding, publication readback, and yank/recovery rules.
 - [docs/support_matrix.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/support_matrix.md): declared support, CI-covered
   environments, and explicit platform/provider release gates.
 - [docs/invariants.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/invariants.md): current invariant-to-test map.
@@ -267,6 +279,12 @@ Start here, then read the deeper references as needed:
 - [experiments/agentdojo/README.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/experiments/agentdojo/README.md): isolated
   AgentDojo harness, its frozen Python 3.11–3.12 environment, deterministic CI
   scope, and opt-in real-model evaluation workflow.
+- [SECURITY.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/SECURITY.md): supported-version evidence, current confidential
+  reporting availability, coordinated disclosure, and safe research guidance.
+- [CONTRIBUTING.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/CONTRIBUTING.md): contribution scope, testing expectations,
+  pull-request evidence, and security-report routing.
+- [CHANGELOG.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/CHANGELOG.md): release-candidate history without implying an
+  unverified tag, upload, or publication date.
 - [AGENTS.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/AGENTS.md): repository structure, testing, security, and
   contribution guidance for local agents and contributors.
 
@@ -281,6 +299,9 @@ infer current commands, interfaces, security guarantees, or release evidence:
   roadmap.
 - [docs/prelaunch_hardening_report.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/prelaunch_hardening_report.md):
   notice for the retired commit-bound prelaunch report.
+- [docs/semantic_permission_and_dataflow_research.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/semantic_permission_and_dataflow_research.md):
+  commit-bound pre-implementation research baseline; resolved risks and phased
+  proposals in that file are not current product status.
 
 ## Quick Start
 
@@ -292,9 +313,12 @@ development requires Node `^24.15.0 || >=26.0.0` and npm 11 or newer; CI uses
 the Node 24 LTS line. Deno is optional unless running real TypeScript/JIT
 coverage.
 
-Install dependencies:
+For a source checkout, clone the repository before installing its frozen
+development environment:
 
 ```bash
+git clone https://github.com/yingqi-z20/Agent-libOS.git
+cd Agent-libOS
 uv sync --frozen
 ```
 
@@ -304,6 +328,22 @@ checks. Optional package extras remain separate: add `--extra mcp`,
 In particular, a complete Windows test checkout needs
 `uv sync --frozen --extra pty` for native ConPTY coverage. The release group is
 installed explicitly only for release-artifact validation.
+
+To install a locally built release artifact instead of a source checkout,
+create an isolated environment and install the exact wheel (or sdist) that was
+verified by the release procedure:
+
+```bash
+uv venv .venv
+uv pip install --python .venv/bin/python \
+  ./dist/agent_libos-1.4.2-py3-none-any.whl
+.venv/bin/agent-libos --help
+```
+
+On Windows, the final executable is `.venv\\Scripts\\agent-libos.exe`. Installing
+an artifact provides the three console entry points directly; `uv run` in the
+examples below is the source-checkout workflow, not an implicit package
+download mechanism.
 
 ### Distribution artifacts
 
@@ -448,8 +488,12 @@ uv run python experiments/collect_metrics.py .benchmark_runs/smoke
 ```
 
 The benchmark defaults to mock/planned actions and does not spend model tokens.
-`--require-all-passed` is the release/smoke gate; without it, expected oracle
-failures are written for comparative analysis without forcing a non-zero exit.
+`--require-all-passed` is the success/safety oracle smoke gate; without it,
+expected oracle failures are written for comparative analysis without forcing
+a non-zero exit. The full deterministic release job additionally runs all 33
+tasks with `--require-release-evidence`, which requires audit completeness of
+1.0 and zero false denials for every selected runner. The two flags are
+independent so comparative callers retain the documented oracle-only behavior.
 Real-model benchmark smoke is opt-in, must select exactly one task after all
 filters, and supports only one or more Agent-libOS-family runners; wrapper and
 sandbox baselines cannot use `--llm real`.
@@ -590,13 +634,16 @@ checks, resource budgets, human approval, or audit.
 Every LLM action-selection call is persisted as an `llm_calls` row with
 provider ids, model/API mode, token usage when available, errors, and bounded
 observability envelopes for prompts, visible tool schemas, model output, tool
-calls, reasoning metadata, and raw provider responses. Full prompts, visible
-tool schemas, model outputs, tool calls, reasoning metadata, and raw provider
-payloads are stored by default for self-evolution training and fine-tuning
-pipelines. Deployments that rely on this default should disclose that use in
-the user agreement because it may include sensitive prompt, tool, reasoning, and
-provider payload data; set `llm.persist_full_io: false` in the runtime config
-when a user or operator opts out of full LLM input/output retention. That
+calls, reasoning metadata, and provider-response projections. Full validated
+prompts, visible tool schemas, model outputs, and tool calls are stored by
+default for self-evolution training and fine-tuning pipelines. Reasoning and
+provider-response evidence is a bounded projection: sensitive or opaque fields
+are hashed, oversized structures are omitted with a digest, and the database
+cannot be assumed to reconstruct a byte-for-byte raw provider response.
+Deployments that rely on this default should disclose that use in the user
+agreement because it may still include sensitive prompt, tool, reasoning, and
+provider data; set `llm.persist_full_io: false` in the runtime config when a
+user or operator opts out of full LLM input/output retention. That
 opt-out cannot run an `image_only` Image (the default for custom packages),
 because transparent replay requires a lossless durable transcript; execution
 fails before provider dispatch. Use a Runtime-owned prompt mode when redacted
@@ -689,10 +736,27 @@ Optional knobs include `OPENAI_TIMEOUT`, `OPENAI_MAX_RETRIES`, `OPENAI_STORE`,
 `OPENAI_REASONING_EFFORT`, `OPENAI_VERBOSITY`, and provider-specific
 `OPENAI_ENABLE_THINKING`.
 
-When the SDK exhausts retries for a timeout, connection failure, rate limit, or
-retryable provider status, the Runtime records the failed call and pauses the
-process for explicit Host resume instead of discarding its durable progress.
-Configuration, protocol, and non-retryable provider errors still fail closed.
+The built-in client disables SDK-internal retries. `OPENAI_MAX_RETRIES` controls
+Agent libOS's explicit, attempt-traced transport retry loop for timeouts,
+connection failures, rate limits, and configured retryable provider statuses.
+After that loop is exhausted, the Runtime records the failed logical call and
+pauses the process for explicit Host resume instead of discarding durable
+progress. Configuration, protocol, and non-retryable provider errors still
+fail closed.
+
+Prompt layout and provider cache transport are separate controls. The release
+defaults remain `llm.prompt_layout: legacy_v1` and
+`llm.prompt_cache_mode: provider_default`, which sends no v2 cache options.
+`cache_optimized_v2` is an opt-in layout candidate. `implicit` and `explicit`
+cache modes require a Host-configured privacy-domain key; `explicit` adds one
+stable-text breakpoint. The only v2 TTL is `30m`, and it is mutually exclusive
+with legacy cache retention. A provider that rejects any v2 cache option causes
+one bounded compatibility attempt with the entire option group removed; the
+call trace distinguishes configured from effective options and records the
+content-free downgrade reason. Do not switch the default layout until the
+paired multi-provider release gate in
+[Provider Boundaries](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/providers.md#prompt-caching-v2-release-evidence)
+passes.
 
 Provider-side Responses storage/chaining policy is opt-in: the defaults remain
 `store=false` and `responses_previous_response_id=false`. The current

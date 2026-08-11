@@ -596,10 +596,15 @@ arguments as data-flow evidence.
 
 ## Call And Tool-List Results
 
-`call_mcp_tool`, `mcp.call`, the Python primitive, and `mcp call` expose the
-same `McpCallResult` fields: `server_id`, `tool_id`, `mcp_name`, `status`,
-`ok`, `result`, `error`, `response_bytes`, `duration_s`, optional negotiated
-`connection`, and bounded phase receipts.
+The Python primitive, the `mcp.call` Runtime syscall, and `mcp call` expose the
+complete `McpCallResult`: `server_id`, `tool_id`, `mcp_name`, `status`, `ok`,
+`result`, `error`, `response_bytes`, `duration_s`, optional negotiated
+`connection`, and bounded phase receipts. The model-facing `call_mcp_tool`
+output is intentionally narrower: it exposes the same fields through
+`duration_s` but omits `connection` and `receipts`. Models therefore cannot
+claim negotiation or phase-dispatch evidence from that tool result; a Host must
+use the Runtime, syscall, CLI, or recorded effect evidence when those details
+matter.
 
 | `status` | Meaning |
 | --- | --- |
@@ -619,18 +624,24 @@ while the atomic SDK path returns `transport_error` with
 evidence. Status alone is not proof that dispatch did or did not start; use the
 recorded phase/effect evidence.
 
-`list_mcp_tools`/`mcp.tools` and `mcp tools` return `server_id`, `transport`,
-the manifest-declared `tools`, `refreshed`, and `response_bytes`. Cached
-listing has `refreshed: false` and `response_bytes: 0`. A successful live
-refresh has `refreshed: true` and augments declared tool entries with matched
-live metadata; refresh failures are raised with a sanitized provider error
-instead of returning a partial tool list.
+The model-facing `list_mcp_tools` output returns `server_id`, `transport`, the
+manifest-declared `tools`, `refreshed`, and `response_bytes`. It deliberately
+omits `schema_version`, `protocol_mode`, `connection`, and `receipts`. The
+Python primitive, `mcp.tools` Runtime syscall, and `mcp tools` CLI additionally
+return `schema_version` and `protocol_mode`; a successful live refresh also
+includes its optional `connection` and bounded `receipts`. Cached listing has
+`refreshed: false` and `response_bytes: 0`, with no operation-local connection
+or receipts. A successful live refresh has `refreshed: true` and augments
+declared tool entries with matched live metadata; refresh failures are raised
+with a sanitized provider error instead of returning a partial tool list.
 
 `discover` returns configured mode, protocol era and exact revision,
 sessionless/fallback flags, bounded server name/version, and standard versus
 unsupported capability names. The same optional connection projection appears
-on successful live Tool listing and call results. It is current-operation
-diagnostic state: it is not written into the Store or reused across operations.
+on successful live Tool listing and call results at the Python primitive,
+Runtime syscall, and CLI surfaces, but not in the two model-tool projections
+described above. It is current-operation diagnostic state: it is not written
+into the Store or reused across operations.
 
 ## CLI
 

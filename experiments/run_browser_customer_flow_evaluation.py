@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--artifacts-root",
         help=(
-            "Optional new directory retaining synthetic browser state and v4 "
+            "Optional new directory retaining synthetic browser state and v6 "
             "Runtime databases. Omit it for automatic temporary cleanup."
         ),
     )

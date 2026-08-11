@@ -249,12 +249,19 @@ OS-account, ACL, namespace, container, or VM isolation.
 - JIT code cannot use ambient Deno filesystem, network, environment, process,
   or FFI permission. Its mediated syscalls still require the caller's primitive
   authority.
-- Provider work has a durable intent and explicit phase/effect outcome. A
-  certified no-start can restore eligible authority while no completed phase
-  has mutated state, observed information, or committed authority. After such a
-  phase, or after an ambiguous provider start, uncertainty remains durable and
-  startup does not blindly replay an unknown effect. This is not a distributed
-  transaction with the provider.
+- Protected provider phases have a durable intent and explicit phase/effect
+  outcome. A certified no-start can restore eligible authority while no
+  completed phase has mutated state, observed information, or committed
+  authority. After such a phase, or after an ambiguous provider start,
+  uncertainty remains durable and startup does not blindly replay an unknown
+  effect. This is not a distributed transaction with the provider. The exact
+  Host-only `GitPrimitive._semantic_read_flow_snapshot` call graph is a
+  pre-intent exception used to revalidate canary FlowGraph eligibility: it may
+  perform only checker-pinned local read-only repository observations, returns
+  bounded digest/label/source-reference metadata, and creates no durable
+  external-effect intent of its own. It cannot perform remote or mutating work;
+  a later accepted Git read still creates an ordinary protected intent and
+  repeats the flow/state observation before returning payload.
 - A split-phase Task Run mutation commits a request- and generation-bound
   provisional command receipt before a lost response can be interpreted as a
   fresh dispatch. Its strict version-1 result has an exact variant schema,
@@ -384,14 +391,23 @@ model; assessment and dispatch revalidate profile resolution, client, and Sink
 identity. The provider schema is closed and the model supplies findings only.
 The deterministic broker requires Host-derived positive predicates and a
 strictly attenuated Task Authority ceiling. The model has no terminal decision
-or authority field and cannot fill a missing Host predicate. The Host provider-result
-observer is one-shot bound, invocation observers are additive, and only a
-bounded canonical Host digest can create ingress evidence. The generic digest
-has a 4,096-node/256 KiB ceiling; the five core provider domains and Host-bound
-dataclasses may use a 500,000-node/64 MiB incremental path, while the persisted
-descriptor remains payload-free and at most 4 KiB. An unavailable digest is an
-isolated capture failure. Incremental local DLP over allowlisted Host result
-structures persists only closed finding codes/digests, never scanned text.
+or authority field and cannot fill a missing Host predicate. The Host
+provider-result observer is one-shot bound, invocation observers are additive,
+and only a bounded canonical Host digest can create ingress evidence. The
+generic digest accepts only exact `None`, `bool`, `int`, finite `float`, `str`,
+`bytes`, and `bytearray` values; `StrEnum`; exact `list`/`tuple`; exact `dict`
+with exact string keys; and allowlisted Host dataclasses under a 4,096-node/256
+KiB ceiling. Filesystem, Shell, Git, JSON-RPC, MCP, and LLM are the six core
+provider domains that may use the 500,000-node/64 MiB incremental path; that
+path accepts only exact built-in values, Host-owned module-bound string-valued
+enums, and Host-bound allowlisted dataclasses. The allowlisted `LLMCompletion`
+binds only normalized Runtime-consumed fields; raw provider objects, hidden
+reasoning, provider options/trace, and attempt state are outside this identity
+and local-DLP path.
+The persisted descriptor remains payload-free and at most 4 KiB. An unavailable
+digest is an isolated capture failure. Incremental local DLP over allowlisted
+Host result structures persists only closed finding codes/digests, never
+scanned text.
 Observer failure cannot change the original result, and an ambiguous external
 classifier request is never automatically replayed.
 
@@ -502,8 +518,11 @@ Host-authorized.
 
 The RuntimeStore is also a confidentiality boundary. With the default
 `llm.persist_full_io: true`, it retains complete prompts, visible tools,
-reasoning metadata, outputs, tool calls, and raw provider responses. A database
-or backup reader can therefore see that material. Operators that do not need
+reasoning metadata, outputs, tool calls, and a bounded provider-response
+projection. The projection may retain readable provider content but hashes
+sensitive/opaque values and replaces oversized structures with omission
+metadata; it is not a byte-for-byte raw SDK response. A database or backup
+reader can therefore see the retained material. Operators that do not need
 lossless training/debugging records should disable full-I/O persistence and
 apply the separately documented payload-retention policy; neither setting is
 at-rest encryption.

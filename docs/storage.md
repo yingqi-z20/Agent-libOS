@@ -52,6 +52,14 @@ syntax-surface test ratchets that set. PostgreSQL therefore does not inherit the
 SQLite store or its connection/locking behavior, but it is also not a second,
 copied repository implementation.
 
+PostgreSQL support requires the optional `postgres` dependency extra and a
+server whose major version is `17`. The committed canonical catalog records
+PostgreSQL major 17, so startup fails closed on another major even if the
+application relations otherwise appear compatible. PostgreSQL 17.10 is the
+tested, manifest-generation baseline. Another 17.x release is not rejected by
+the major-version field alone, but remains outside the validated release matrix
+and must still match the complete canonical storage catalog.
+
 Library defaults are deliberately ephemeral. `Runtime.open()` and
 `Runtime.aopen()` do not load the repository's `config.yaml`; with neither an
 explicit target nor an explicit config they use `DEFAULT_CONFIG`, whose
@@ -92,15 +100,13 @@ the same acceptance rules, with one backend-specific initial probe order:
 1. SQLite validates `PRAGMA encoding` before reading the version marker;
    PostgreSQL reads the marker first and validates server encoding with the
    remaining shape probes.
-2. For a version-6 marker, require the exact manifest table set and exact
-   column-name set for every table, and validate the required keyset
-   text-column collations. The v6 Task Run/recovery/semantic/FlowGraph index manifest fixes
-   each required index's table, ordered columns, uniqueness, full/partial
-   shape, partial predicate, ascending direction, and keyset collation. A
-   PostgreSQL required index must additionally be valid, ready, and live. The
-   required Task Run and semantic unique constraints are checked, and extra
-   declared indexes on those constrained tables are rejected regardless of
-   index name. A required SQLite relation must have
+2. For a version-6 marker, run the focused relation, table/column, counter-seed,
+   encoding, keyset-collation, and recovery-index probes, then require the
+   complete backend canonical storage catalog. The v6 Task
+   Run/recovery/semantic/FlowGraph index contract fixes each required index's
+   table, ordered columns, uniqueness, full/partial shape, predicate, direction,
+   and keyset collation. A PostgreSQL required index must additionally be valid,
+   ready, and live. A required SQLite relation must have
    `sqlite_master.type = 'table'`, and a required PostgreSQL relation must have
    `pg_class.relkind = 'r'`; a same-column view cannot impersonate a manifest
    table and is rejected before the initializer can mutate the schema.
@@ -132,14 +138,23 @@ canonical keyset collation, required v6 index/unique shape, or required
 recovery predicate are rejected, and the runtime does not present that
 rejection as a migration.
 
-The open-time compatibility probe is intentionally not a byte-for-byte DDL
-validator. It rejects extra tables and columns, but apart from the checks above
-it does not compare column types, `NOT NULL`/`CHECK`/foreign-key/primary-key
-constraints, arbitrary collations outside the keyset manifest, extra non-table
-schema objects, or index/uniqueness definitions outside the explicit v6 Task
-Run/recovery/semantic manifest. Operators must create stores through this release's
-backend rather than treating a hand-built schema that passes the compatibility
-probe as canonical.
+The open-time validator does not compare raw DDL bytes: it normalizes the
+backend catalog before comparison. It nevertheless requires the complete
+canonical storage catalog captured for that backend, not merely the focused
+manifest probes above. SQLite compares every user table, index, trigger, and
+view; normalized `sqlite_master` definitions; table options; column type,
+nullability, default, primary-key position, generated/hidden shape; foreign
+keys; and complete index keys, direction, collation, uniqueness, origin, and
+partial shape. PostgreSQL compares the pinned server major; relations and their
+persistence/access method/options/replica identity/partition/RLS shape;
+columns, types, order, nullability, defaults, collations, identity and generated
+shape; constraints; indexes; triggers; policies; rewrite rules; and
+inheritance. Missing, extra, or changed captured entries fail closed. The
+PostgreSQL catalog does not claim to inventory a schema containing only
+standalone functions, enum/base types, or domains that create none of the
+captured relation kinds; those objects are outside the RuntimeStore DDL.
+Operators must create stores through this release's backend rather than
+treating a hand-built approximation as canonical.
 
 Text columns that form durable startup, recovery, or retention keysets have a
 canonical bytewise collation: `BINARY` on SQLite and `"C"` on PostgreSQL. Both
@@ -153,8 +168,9 @@ when its database encoding, any required keyset text column, or any required
 keyset text-column collation is not canonical; those required column
 collations are checked with one set-based catalog probe. A UTF-16 SQLite file
 or locale-inheriting draft PostgreSQL schema is therefore rejected rather than
-silently paginating with a different order or degrading to a sort. This check
-does not validate the collation of text columns outside the keyset manifest.
+silently paginating with a different order or degrading to a sort. That focused
+set-based keyset probe does not itself inspect other text-column collations;
+the complete canonical catalog comparison above still rejects drift in them.
 
 The only supported migrations are the explicit, offline, operator-invoked
 canonical v4-to-v5 and v5-to-v6 procedures below. They must be run in order.
@@ -289,11 +305,12 @@ uv run agent-libos --db <target> store migrate --to 6 --apply \
 
 It uses the same safety protocol as the legacy migration below: stop all
 writers, establish an independent recovery point, validate the complete
-canonical v5 source, obtain the SQLite exclusive lease or PostgreSQL advisory
-lock, repeat source/backup validation, and run DDL plus singleton marker CAS
-`5 -> 6` in one transaction. It then validates the complete canonical v6
-table/column/check/index/collation manifest before commit. Failure at any point
-rolls back both DDL and marker.
+canonical v5 source storage catalog, obtain the SQLite exclusive lease or
+PostgreSQL advisory lock, repeat source/backup validation, and run DDL plus
+singleton marker CAS `5 -> 6` in one transaction. It then validates the
+complete canonical v6 storage catalog, including every captured relation,
+column, constraint, index, and backend hook, before commit. Failure at any
+point rolls back both DDL and marker.
 
 SQLite dry-run is zero-write and requires `--sqlite-backup` to validate an
 independent, current-user-owned, single-link `0600` regular file without live
@@ -325,9 +342,9 @@ The supported procedure is:
    PostgreSQL, create and verify an operator-managed snapshot of the exact
    `current_database()` and `current_schema()`.
 3. Run `--dry-run` (with `--sqlite-backup` when validating SQLite). It inspects
-   a private snapshot, validates the complete canonical v4 shape and logical
-   digest, performs zero source/lease/sidecar writes, and prints a versioned
-   plan plus deterministic `ddl_sha256` and `plan_sha256`.
+   a private snapshot, validates the complete canonical v4 storage catalog and
+   logical digest, performs zero source/lease/sidecar writes, and prints a
+   versioned plan plus deterministic `ddl_sha256` and `plan_sha256`.
 4. Review the plan. Run `--apply` with that exact
    `--expected-plan-sha256`. SQLite additionally requires the same verified
    `--sqlite-backup`; PostgreSQL requires
@@ -336,7 +353,7 @@ The supported procedure is:
    advisory lock, repeats canonical v4 and backup/source validation, and opens
    one transaction. It adds `human_requests.revision`, creates the two semantic
    tables/indexes, compare-and-swaps the singleton marker from 4 to 5, runs the
-   complete canonical v5 validator, and only then commits.
+   complete canonical v5 storage catalog validator, and only then commits.
 6. Open the migrated target with this release and archive the plan/result with
    the operator recovery record. Keep the backup until application validation
    is complete.
@@ -345,8 +362,9 @@ A missing/mismatched plan digest, stale or non-self-contained SQLite backup,
 absent PostgreSQL confirmation, lock conflict, noncanonical v4 input, failed
 DDL, marker CAS miss, or failed v5 readback aborts. The transaction rolls back
 both schema changes and marker; it never silently repairs a malformed source.
-Planning a v5 or older store is also not an idempotent “success”: this command
-has exactly one source and target version. See [CLI Reference](cli.md#offline-store-migration)
+Planning an already-v5/newer or pre-v4 store is also not an idempotent
+“success”: this command accepts only an exact canonical v4 source and has
+exactly one target version. See [CLI Reference](cli.md#offline-store-migration)
 for concrete commands.
 
 On POSIX, SQLite apply additionally requires both source and independent backup
@@ -854,32 +872,36 @@ Use this procedure only for a file-backed SQLite target; `local` and
      "PRAGMA quick_check; SELECT schema_version FROM runtime_schema WHERE singleton = 1;"
    ```
 
-   The expected output includes `ok` and `5`.
+   The expected output includes `ok` and `6`.
 3. To restore, keep the source database untouched and materialize the verified
    backup at a new, owner-only path. Do not restore over a path held by a live
    Runtime and do not restore old lease/sidecar files. Point a stopped Host at
-   the new path and let `Runtime.open()` perform the complete schema-v6 shape,
-   encoding, collation, and startup-recovery checks. Keep the old target until
-   that open and a clean shutdown succeed.
+   the new path and let `Runtime.open()` perform the complete schema-v6
+   canonical storage catalog, encoding, and startup-recovery checks. Keep the
+   old target until that open and a clean shutdown succeed.
 
 ### PostgreSQL
 
 Use normal libpq credential mechanisms such as a service definition and
 password file; avoid placing credentials in shell history. The PostgreSQL
-Runtime identity and lease are scoped to `current_database()` plus the exact
-`current_schema()`, so the backup unit is that one schema rather than the whole
-database. Configure the service's `search_path` to select the Runtime schema;
+server must be major version 17; 17.10 is the tested baseline used to generate
+the committed catalog manifest. Check this before the dump with
+`SHOW server_version_num`; a restored target on another major is rejected by
+`Runtime.open()`. The PostgreSQL Runtime identity and lease are scoped to
+`current_database()` plus the exact `current_schema()`, so the backup unit is
+that one schema rather than the whole database. Configure the service's
+`search_path` to select the Runtime schema;
 the commands below use `agent_libos_runtime` as an example. With the Runtime
 stopped and its advisory-lock session closed:
 
-1. Confirm the selected schema and version, then create and inspect a
-   custom-format logical dump of that exact schema. Replace
-   `agent_libos_runtime` with the `current_schema()` result; do not use a schema
-   wildcard.
+1. Confirm the PostgreSQL server version, selected schema, and store version,
+   then create and inspect a custom-format logical dump of that exact schema.
+   Replace `agent_libos_runtime` with the `current_schema()` result; do not use
+   a schema wildcard.
 
    ```bash
    psql 'service=agent_libos' -At \
-     -c 'SELECT current_schema(); SELECT schema_version FROM runtime_schema WHERE singleton = 1;'
+     -c 'SHOW server_version_num; SELECT current_schema(); SELECT schema_version FROM runtime_schema WHERE singleton = 1;'
    mkdir -p /srv/backups
    chmod 700 /srv/backups
    (
@@ -910,16 +932,17 @@ stopped and its advisory-lock session closed:
      --dbname='service=agent_libos_restore' \
      /srv/backups/agent-libos-2026-07-30.dump
    psql 'service=agent_libos_restore' -At \
-     -c 'SELECT current_schema(); SELECT schema_version FROM runtime_schema WHERE singleton = 1;'
+     -c 'SHOW server_version_num; SELECT current_schema(); SELECT schema_version FROM runtime_schema WHERE singleton = 1;'
    ```
 
-   Require the restored `current_schema()` to equal the dumped schema and the
-   schema version to equal `5` before opening the Runtime.
+   Require the restored `server_version_num` to have major version 17,
+   `current_schema()` to equal the dumped schema, and the store schema version
+   to equal `6` before opening the Runtime.
 
 3. Point a stopped Host at the restored target. `Runtime.open()` must acquire
-   the new target's advisory lease and pass the schema-v6 table, column,
-   encoding, and keyset-collation probes before the target is promoted. Keep
-   the original database until the restored Runtime also shuts down cleanly.
+   the new target's advisory lease and pass the complete schema-v6 canonical
+   storage catalog and encoding probes before the target is promoted. Keep the
+   original database until the restored Runtime also shuts down cleanly.
 
 ### Coverage and online-backup boundary
 

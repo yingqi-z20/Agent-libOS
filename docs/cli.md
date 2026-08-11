@@ -827,9 +827,10 @@ For each executor-level logical LLM call, Runtime reserves one call plus the
 configured prompt/completion/total token envelope before Provider dispatch.
 Active reservations reduce the displayed remaining budget for the full process
 ancestry. Valid usage settles exactly, certified non-start releases, and an
-unknown outcome charges the aggregate maximum. Internal SDK retries remain one
-logical call, so these counters are not exact Provider request or monetary-cost
-meters.
+unknown outcome charges the aggregate maximum. Agent libOS's explicit,
+separately traced transport retries remain one logical executor call; provider
+SDK internal retries are disabled. These counters therefore are not exact
+Provider request or monetary-cost meters.
 
 Calls, tokens, syscalls, bytes, child counts, and peak-memory values are
 non-negative integers. Runtime and subprocess wall/CPU seconds are continuous
@@ -1272,6 +1273,10 @@ separate admin-operation audit.
 hold the method capability, such as
 `jsonrpc:demo-weather:forecast read`. The CLI cannot supply arbitrary URLs,
 headers, raw JSON-RPC method names, or request ids.
+`--params-json`, when present, must be strict JSON; malformed input, duplicate
+object keys, non-finite numbers, and excessive nesting are rejected before
+provider dispatch. The value must be an object, array, or `null`; scalar JSON
+values are rejected before authority or registry lookup.
 
 ## MCP Commands
 
@@ -1307,6 +1312,10 @@ separate admin-operation audit.
 | `tools` | exact server `read`; `--refresh` also requires server `execute` and the stdio local-spawn rights when applicable |
 | `unregister` | exact server `admin` |
 | `call <pid> ...` | the target `<pid>` supplies the declared tool right and any stdio local-spawn rights; an explicitly supplied `--actor-pid` must equal `<pid>` and does not add authority |
+
+`--arguments-json`, when present, must be a strict JSON object; malformed JSON,
+duplicate object keys, non-finite numbers, arrays, and scalars are rejected
+before provider dispatch. Omitting it supplies `{}`.
 
 Sink trust is intentionally not an MCP, model-tool, or process CLI registry.
 Administrators configure it under `data_flow.sink_rules` or use the Host-only
@@ -1378,8 +1387,11 @@ evidence-loss diagnosis, not as a green comparison gate. For rate-bearing
 comparisons, select the seven-runner command under [Benchmark: Running](benchmark.md#running).
 Default comparison mode writes valid success/safety oracle failures without
 making them command failures; `--require-all-passed` returns non-zero unless
-every selected run passes both oracles and is the appropriate release/smoke
-gate.
+every selected run passes both oracles and is the appropriate oracle smoke
+gate. The complete deterministic release command also passes
+`--require-release-evidence`, which requires audit completeness of 1.0 and zero
+false denials for every selected runner; neither flag alone represents the full
+release contract.
 
 Real LLM mode is explicit and scoped:
 

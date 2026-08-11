@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
@@ -2817,16 +2818,19 @@ class SemanticFlowService:
         root_pid = getattr(root, "pid", None)
         root_tenant = getattr(root, "tenant_bucket_sha256", None)
         root_key = (root_type, node_id)
-        frontier = [(root_type, node_id, 0, frozenset((root_key,)))]
+        frontier = deque(((root_type, node_id, 0),))
         seen_nodes = {root_key}
         seen_edges: set[str] = set()
+        adjacency: dict[tuple[str, str], set[tuple[str, str]]] = {
+            root_key: set()
+        }
         discovered: list[tuple[SemanticFlowEdgeRecord, dict[str, Any]]] = []
         truncated = False
         conflict = False
-        cycle = False
         missing = root is None
         while frontier:
-            _node_type, selected_node, depth, ancestry = frontier.pop(0)
+            selected_type, selected_node, depth = frontier.popleft()
+            selected_key = (selected_type, selected_node)
             if depth >= max_depth:
                 truncated = True
                 continue
@@ -2844,6 +2848,10 @@ class SemanticFlowService:
                 )
                 missing = missing or edge_missing
                 conflict = conflict or edge_conflict
+                key = (adjacent_type, adjacent_id)
+                if adjacent is not None:
+                    adjacency.setdefault(selected_key, set()).add(key)
+                    adjacency.setdefault(key, set())
                 discovered.append(
                     (
                         edge,
@@ -2857,16 +2865,21 @@ class SemanticFlowService:
                 )
                 if len(discovered) >= SEMANTIC_FLOW_LINEAGE_HARD_LIMIT:
                     return _LineageTraversalResult(
-                        tuple(discovered), True, conflict, cycle, missing
+                        tuple(discovered),
+                        True,
+                        conflict,
+                        _lineage_graph_has_cycle(adjacency),
+                        missing,
                     )
-                key = (adjacent_type, adjacent_id)
-                if adjacent is not None and key in ancestry:
-                    cycle = True
-                elif adjacent is not None and key not in seen_nodes:
+                if adjacent is not None and key not in seen_nodes:
                     seen_nodes.add(key)
-                    frontier.append((adjacent_type, adjacent_id, depth + 1, ancestry | {key}))
+                    frontier.append((adjacent_type, adjacent_id, depth + 1))
         return _LineageTraversalResult(
-            tuple(discovered), truncated, conflict, cycle, missing
+            tuple(discovered),
+            truncated,
+            conflict,
+            _lineage_graph_has_cycle(adjacency),
+            missing,
         )
 
     def _iter_lineage_edges(
@@ -3324,6 +3337,30 @@ def _lineage_item(
         "node_type": adjacent_type,
         "node": flow_record_to_dict(adjacent) if adjacent is not None else None,
     }
+
+
+def _lineage_graph_has_cycle(
+    adjacency: Mapping[tuple[str, str], set[tuple[str, str]]],
+) -> bool:
+    """Detect a directed cycle without treating converging DAG paths as cycles."""
+
+    indegree = {node: 0 for node in adjacency}
+    for adjacent_nodes in adjacency.values():
+        for adjacent in adjacent_nodes:
+            indegree.setdefault(adjacent, 0)
+            indegree[adjacent] += 1
+    ready = [node for node, degree in indegree.items() if degree == 0]
+    visited = 0
+    offset = 0
+    while offset < len(ready):
+        node = ready[offset]
+        offset += 1
+        visited += 1
+        for adjacent in adjacency.get(node, ()):
+            indegree[adjacent] -= 1
+            if indegree[adjacent] == 0:
+                ready.append(adjacent)
+    return visited != len(indegree)
 
 
 def _paginate_lineage(

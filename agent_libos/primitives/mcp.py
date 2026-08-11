@@ -5594,10 +5594,17 @@ class McpPrimitive:
         return MappingProxyType(resolved_environment)
 
     def _validate_url(self, url: str) -> None:
-        parsed = urlsplit(url)
+        try:
+            parsed = urlsplit(url)
+        except ValueError as exc:
+            raise ValidationError("MCP HTTP URL is invalid") from exc
+        try:
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValidationError("MCP HTTP URL has invalid port") from exc
         if parsed.scheme not in {"http", "https"}:
             raise ValidationError("MCP HTTP URL must use http or https")
-        if parsed.username or parsed.password:
+        if parsed.username is not None or parsed.password is not None:
             raise ValidationError("MCP HTTP URL must not include userinfo")
         if parsed.fragment:
             raise ValidationError("MCP HTTP URL must not include a fragment")

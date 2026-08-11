@@ -43,6 +43,14 @@ Product entrypoints use this order:
    - `llm.max_tokens`, `llm.max_input_tokens_per_call`,
      `llm.max_total_tokens_per_call`, `llm.temperature`, and each profile's
      corresponding token limits and temperature;
+   - every numeric field in `semantic`: `semantic.max_concurrency`,
+     `semantic.assessment_timeout_s`, `semantic.job_lease_s`,
+     `semantic.shutdown_join_timeout_s`, `semantic.projection_ttl_s`,
+     `semantic.recovery_batch_limit`, `semantic.intent_max_chars`,
+     `semantic.projection_max_bytes`, `semantic.assessment_list_limit`,
+     `semantic.assessment_list_hard_limit`, `semantic.flow_query_limit`,
+     `semantic.flow_query_hard_limit`, `semantic.settlement_list_limit`, and
+     `semantic.settlement_list_hard_limit`;
    - `git.ref_list_limit`, `git.pull_request_list_limit`, all six
      `memory.query_scan_*`/`memory.metadata_*` bounds, and
      `skills.max_package_directories`, `skills.max_package_depth`, and
@@ -202,8 +210,10 @@ ambiguous, potentially billable transport retries. Hosts can lower or raise it
 with a selected profile's `timeout_s` or, for the default profile only,
 `OPENAI_TIMEOUT`.
 
-After the SDK exhausts its configured retries, timeout, connection, rate-limit,
-and retryable HTTP status failures are recorded and pause the AgentProcess for
+Agent libOS performs the configured `max_retries` as explicit, separately
+traced transport retries; provider-SDK internal retries are disabled. After
+Agent libOS exhausts those retries, timeout, connection, rate-limit, and
+retryable HTTP status failures are recorded and pause the AgentProcess for
 explicit Host resume. Resuming issues a new, separately accounted provider call
 from the durable process context. Deterministic configuration, protocol, and
 non-retryable provider errors still fail the process closed; the Runtime never
@@ -308,7 +318,7 @@ Semantic assessment is disabled by default:
 
 ```yaml
 semantic:
-  mode: off
+  mode: "off"
   adapter: deterministic
   external_profile_id: null
   policy_epoch: null
@@ -338,9 +348,10 @@ for deterministic development/test fixtures. An `external_profile_id` is
 forbidden for the other adapters. `max_concurrency` is positive and at most 32;
 assessment, lease, and shutdown-join timeouts are positive, and the lease must
 be at least as long as both timeout values.
-Projection TTL and list limits are positive; each assessment, flow, and
-settlement selected limit cannot exceed its hard limit, and the new flow and
-settlement hard limits cannot exceed 1,000. Recovery/cleanup pages use the positive
+Projection TTL and list limits are positive, and `projection_ttl_s` must be at
+least `job_lease_s`; each assessment, flow, and settlement selected limit
+cannot exceed its hard limit, and the new flow and settlement hard limits
+cannot exceed 1,000. Recovery/cleanup pages use the positive
 `recovery_batch_limit`, capped at 500. The intent bound cannot exceed 2,000
 characters and the encoded projection bound must be from 512 through 16,384
 bytes.
@@ -359,16 +370,20 @@ that root-goal bound but cannot exceed 2,000 characters; it is not a switch
 that enables approval or provider payload export.
 
 An external adapter can be staged while mode is off without resolving a
-profile. Enabling any external semantic mode requires a configured named profile other
-than `llm.default_profile_id`, with an explicit model, `store: false`,
-`max_retries: 0`, no prompt-cache key/retention, no previous-response chaining,
-and a finite timeout compatible with `semantic.assessment_timeout_s`. The
-runtime freezes the profile snapshot identity and explicit model at assembly;
-assessment rechecks snapshot/resolution/client identity and model/timeout, and
-the Protected Operation revalidates the profile-bound Sink. Drift fails closed
-instead of inheriting permissive default-profile state. This is a
-classifier-only profile; ordinary processes continue to use their own selected
-LLM profiles. See [Semantic Approval and Data
+profile. Enabling any external semantic mode requires a configured named
+profile other than `llm.default_profile_id`, with an explicit model; explicit
+`api_mode: chat` or `api_mode: responses`; `store: false`; `max_retries: 0`;
+`responses_previous_response_id: false`; `fallback_json_actions: false`; and a
+finite timeout compatible with `semantic.assessment_timeout_s`. Prompt caching
+must be disabled both on that profile and in the global `llm` defaults: neither
+level may set a cache key, retention, or TTL; the profile cache mode may only be
+unset or `provider_default`, and the global cache mode must be
+`provider_default`. The runtime freezes the profile snapshot identity and
+explicit model at assembly; assessment rechecks snapshot/resolution/client
+identity and model/timeout, and the Protected Operation revalidates the
+profile-bound Sink. Drift fails closed instead of inheriting permissive
+default-profile state. This is a classifier-only profile; ordinary processes
+continue to use their own selected LLM profiles. See [Semantic Approval and Data
 Identification](semantic_shadow.md#external-classifier-configuration).
 
 Tenant bucketing is intentionally not a YAML setting. The default is no
@@ -376,19 +391,24 @@ bucketer and persisted `tenant_bucket_sha256` remains `null`. An embedded Host
 may inject `semantic_tenant_bucketer=` at Runtime construction and should back
 it with a deployment-keyed HMAC; no CLI, HTTP, GUI, model, Skill, JIT, or Module
 surface can install or replace it. `canary_auto` additionally requires the
-policy epoch to pin that exact profile id and a non-null classifier model
-digest.
+policy epoch to pin that exact profile id, the classifier profile identity
+digest, and the classifier model digest. These three classifier identity fields
+must always be supplied together; canary mode requires all three.
 
 `SemanticPolicyEpochV1` is a closed static Host object. It contains
 `schema_version`, `catalog_version`, `epoch_id`, positive `generation`,
 `expected_previous_sha256`, exact `tenant_bucket_sha256s`, closed
-`auto_approval_rules` and `hard_deny_rules`, optional paired classifier
-profile/model identity, `minimum_confidence_bps`,
+`auto_approval_rules` and `hard_deny_rules`, the optional grouped classifier
+profile id/profile digest/model digest identity, `minimum_confidence_bps`,
 `required_calibration_bucket`, Capability TTL, rate/day/inflight ceilings, and
 `created_at`. It requires at least one rule; auto rules require at least one
 exact tenant digest. Rule ids are unique across both arrays. Catalog v1 permits
 automatic candidates only for `filesystem.read`, `git.read`, and `git.diff`
 with their exact single read-like right.
+
+When generation 1 contains auto-approval rules, its tenant digest set must
+contain exactly one bucket. Later generations may contain more than one exact
+tenant digest, subject to the other static policy and rollout checks.
 
 The confidence floor cannot be below 9,900 basis points, calibration is fixed
 to `very_high`, Capability TTL cannot exceed 300 seconds, and the respective
@@ -489,8 +509,11 @@ configurable. A runtime release emits only the snapshot version it can decode.
   startup. See [Git Provider and Primitive](git.md).
 - `llm.persist_full_io` defaults to true. Set it to false when the deployment's
   user agreement does not authorize retention of full prompts, tool schemas,
-  reasoning, outputs, successful response content, and raw provider response
-  fields. Provider and extension exception text is never persisted or exposed
+  reasoning, outputs, successful response content, and the bounded
+  provider-response projection stored in the `raw_response` field. That field
+  is not a byte-for-byte SDK response: sensitive and opaque values are hashed
+  and oversized structures are replaced by omission metadata and a digest.
+  Provider and extension exception text is never persisted or exposed
   to the model, regardless of this setting. The opt-out persists canonical
   content-free summary envelopes containing byte counts,
   JSON shape/count metadata when available, and hashes rather than readable
@@ -535,7 +558,7 @@ configurable. A runtime release emits only the snapshot version it can decode.
   increase provider retention.
 - `runtime.launch_authority_mode: manifest_required` treats image capability
   requirements as declarations, not grants. It is the only accepted value in
-  the current 1.1.x contract.
+  the current 1.x contract.
 - `runtime.publication_recovery_max_attempts` bounds durable compensation
   retries. Exceeding it persists a `manual` publication disposition and fails
   every startup closed instead of silently repeating an uncertain cleanup

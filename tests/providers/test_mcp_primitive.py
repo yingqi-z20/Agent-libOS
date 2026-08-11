@@ -3354,6 +3354,8 @@ class TestMcpPrimitive:
                 _stdio_manifest("bad-cwd", cwd="../outside"),
                 _http_manifest("bad-http", "http://api.example.test/mcp"),
                 _http_manifest("bad-userinfo", "https://user:pass@example.test/mcp"),
+                _http_manifest("bad-empty-userinfo", "https://@example.test/mcp"),
+                _http_manifest("bad-port", "https://api.example.test:99999/mcp"),
                 _http_manifest("bad-fragment", "https://api.example.test/mcp#secret"),
                 _http_manifest("bad-private-ip", "https://10.0.0.10/mcp"),
                 _http_manifest("bad-nonpublic-ip", "https://100.64.0.1/mcp"),
@@ -3365,6 +3367,19 @@ class TestMcpPrimitive:
             for text in invalid_cases:
                 with pytest.raises(ValidationError):
                     runtime.mcp.register_server_from_yaml_text(text, actor="cli", require_capability=False)
+
+            with pytest.raises(ValidationError, match="MCP HTTP URL has invalid port"):
+                runtime.mcp.register_server_from_yaml_text(
+                    _http_manifest("normalized-bad-port", "https://api.example.test:99999/mcp"),
+                    actor="cli",
+                    require_capability=False,
+                )
+            with pytest.raises(ValidationError, match="MCP HTTP URL is invalid"):
+                runtime.mcp.register_server_from_yaml_text(
+                    _http_manifest("bad-bracket-host", "https://[::1/mcp"),
+                    actor="cli",
+                    require_capability=False,
+                )
         finally:
             runtime.close()
 

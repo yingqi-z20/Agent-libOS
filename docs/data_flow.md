@@ -169,7 +169,7 @@ and unregister from changing the registry.
 
 | Exit | Sink identity | Additional binding |
 | --- | --- | --- |
-| LLM | `llm:<profile-id>` | profile/model/endpoint/API-mode plus effective store, prompt-cache-retention, and Responses-continuation-policy identity hash |
+| LLM | `llm:<profile-id>` | profile/model/endpoint/API-mode plus effective store, prompt-cache retention/mode/TTL, Responses-continuation, and `fallback_json_actions` policy identity hash; changing any bound effective policy invalidates a trust rule tied to the old identity hash |
 | Human | `human:<recipient>:<channel>` | exact recipient and channel |
 | Human GUI projection | `human:<recipient>:gui` | complete gate-independent serialized public view (including status and decision) plus GUI presentation operation; trust aliases the configured Human terminal identity |
 | JSON-RPC | `jsonrpc:<endpoint-id>:<method-id>` | endpoint plus method manifest hash |
@@ -189,6 +189,10 @@ and unregister from changing the registry.
 `max_total_tokens_per_call` are local LLM scheduling/admission bounds, not
 Provider/Sink identity components. Changing only those values therefore does
 not invalidate an otherwise identical trusted LLM Sink rule.
+Conversely, changing an identity-bound effective provider policy such as
+`prompt_cache_mode`, `prompt_cache_ttl`, or `fallback_json_actions` changes the
+profile identity hash, so a trusted Sink rule bound to the old
+`identity_sha256` no longer matches.
 
 Each live PTY session keeps a monotonic data-flow high-water of labels and
 Object source references, seeded by the spawn request. A successful write or
@@ -484,8 +488,9 @@ declassification authority, endorsement, Sink clearance, or release row.
 Provider-ingress capture binds the committed result/effect/provider/source
 digests so the suggestion can be reviewed later. The result digest is derived
 only from the SDK's bounded Host canonicalization. The normal path is capped at
-4,096 nodes/256 KiB; five built-in provider domains and Host-bound dataclasses
-may use a 500,000-node/64 MiB incremental streaming digest. The descriptor is
+4,096 nodes/256 KiB; six built-in provider domains—Filesystem, Shell, Git,
+JSON-RPC, MCP, and LLM—and Host-bound dataclasses may use a 500,000-node/64 MiB
+incremental streaming digest. The descriptor is
 at most 4 KiB and never contains the result text. If the result is opaque,
 cyclic, ambiguous, or over budget, it reports `digest_unavailable` and semantic
 capture fails closed. Safely traversable provider text is also scanned

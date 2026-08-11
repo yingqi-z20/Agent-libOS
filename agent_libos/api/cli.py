@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import math
+import re
 import sys
 import threading
 import uuid
@@ -89,6 +90,13 @@ _SEMANTIC_REVIEW_IMPORT_MAX_BYTES = 64 * 1024
 _SEMANTIC_CURSOR_MAX_CHARS = 2_048
 _SEMANTIC_FILTER_MAX_CHARS = 512
 _SEMANTIC_ID_MAX_CHARS = 512
+_SEMANTIC_ACTION_ID_RE = re.compile(
+    r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$"
+)
+_SEMANTIC_ACTION_FILTER_HELP = "Exact dotted lower-case ontology action id."
+_SEMANTIC_TENANT_FILTER_HELP = (
+    "Exact 64-character lower-case tenant bucket SHA-256 digest."
+)
 _SEMANTIC_ASSESSMENT_KINDS = (
     "approval",
     "root_goal",
@@ -438,14 +446,22 @@ def _add_semantic_parser_args(parser: argparse.ArgumentParser) -> None:
         ("--pid", "pid"),
         ("--request-id", "request_id"),
         ("--operation-id", "operation_id"),
-        ("--action-id", "action_id"),
-        ("--tenant-bucket-sha256", "tenant_bucket_sha256"),
     ):
         assessments.add_argument(
             option,
             dest=destination,
             type=_semantic_filter_arg,
         )
+    assessments.add_argument(
+        "--action-id",
+        type=_semantic_action_id_arg,
+        help=_SEMANTIC_ACTION_FILTER_HELP,
+    )
+    assessments.add_argument(
+        "--tenant-bucket-sha256",
+        type=_semantic_tenant_bucket_sha256_arg,
+        help=_SEMANTIC_TENANT_FILTER_HELP,
+    )
     for option, destination, choices in (
         ("--kind", "kind", _SEMANTIC_ASSESSMENT_KINDS),
         ("--status", "status", _SEMANTIC_ASSESSMENT_STATUSES),
@@ -492,7 +508,11 @@ def _add_semantic_parser_args(parser: argparse.ArgumentParser) -> None:
             "model_output",
         ),
     )
-    entities.add_argument("--tenant-bucket-sha256", type=_sha256_cli_arg)
+    entities.add_argument(
+        "--tenant-bucket-sha256",
+        type=_semantic_tenant_bucket_sha256_arg,
+        help=_SEMANTIC_TENANT_FILTER_HELP,
+    )
     edges = flow_sub.add_parser("edges", help="List FlowGraph edges")
     _add_semantic_page_arguments(edges)
     edges.add_argument("--pid", type=_semantic_filter_arg)
@@ -524,10 +544,14 @@ def _add_semantic_parser_args(parser: argparse.ArgumentParser) -> None:
         ("--pid", "pid"),
         ("--request-id", "request_id"),
         ("--effect-id", "effect_id"),
-        ("--action-id", "action_id"),
         ("--epoch-id", "epoch_id"),
     ):
         settlements.add_argument(option, dest=destination, type=_semantic_filter_arg)
+    settlements.add_argument(
+        "--action-id",
+        type=_semantic_action_id_arg,
+        help=_SEMANTIC_ACTION_FILTER_HELP,
+    )
     settlements.add_argument(
         "--outcome",
         choices=(
@@ -542,7 +566,11 @@ def _add_semantic_parser_args(parser: argparse.ArgumentParser) -> None:
             "failed",
         ),
     )
-    settlements.add_argument("--tenant-bucket-sha256", type=_sha256_cli_arg)
+    settlements.add_argument(
+        "--tenant-bucket-sha256",
+        type=_semantic_tenant_bucket_sha256_arg,
+        help=_SEMANTIC_TENANT_FILTER_HELP,
+    )
 
     policy = sub.add_parser("policy", help="Inspect immutable semantic policy epochs")
     policy_sub = policy.add_subparsers(dest="semantic_policy_command", required=True)
@@ -572,8 +600,16 @@ def _add_semantic_parser_args(parser: argparse.ArgumentParser) -> None:
 
     metrics = sub.add_parser("metrics", help="Print bounded semantic canary metrics")
     metrics.add_argument("--window", type=_semantic_filter_arg)
-    metrics.add_argument("--action-id", type=_semantic_filter_arg)
-    metrics.add_argument("--tenant-bucket-sha256", type=_sha256_cli_arg)
+    metrics.add_argument(
+        "--action-id",
+        type=_semantic_action_id_arg,
+        help=_SEMANTIC_ACTION_FILTER_HELP,
+    )
+    metrics.add_argument(
+        "--tenant-bucket-sha256",
+        type=_semantic_tenant_bucket_sha256_arg,
+        help=_SEMANTIC_TENANT_FILTER_HELP,
+    )
     metrics.add_argument("--epoch-id", type=_semantic_filter_arg)
     metrics.add_argument(
         "--risk",
@@ -657,6 +693,26 @@ def _semantic_filter_arg(value: str) -> str:
         label="semantic filter",
         maximum=_SEMANTIC_FILTER_MAX_CHARS,
     )
+
+
+def _semantic_action_id_arg(value: str) -> str:
+    selected = _semantic_filter_arg(value)
+    if _SEMANTIC_ACTION_ID_RE.fullmatch(selected) is None:
+        raise argparse.ArgumentTypeError(
+            "semantic action id must be a dotted lower-case identifier"
+        )
+    return selected
+
+
+def _semantic_tenant_bucket_sha256_arg(value: str) -> str:
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise argparse.ArgumentTypeError(
+            "semantic tenant bucket SHA-256 must be exactly 64 lower-case "
+            "hexadecimal characters"
+        )
+    return value
 
 
 def _semantic_cursor_arg(value: str) -> str:
@@ -2310,6 +2366,13 @@ def _parse_json_value(value: str) -> Any:
         return {"content": value}
 
 
+def _parse_strict_json_value(value: str, label: str) -> Any:
+    try:
+        return bounded_json_loads(value)
+    except ValueError as exc:
+        raise SystemExit(f"{label} must be valid JSON: {exc}") from exc
+
+
 def _add_message_parser_args(parser: argparse.ArgumentParser, *, include_kind: bool = True) -> None:
     parser.add_argument("pid", help="Target process id.")
     parser.add_argument("body", help="Message body. Quote it to include spaces.")
@@ -2780,7 +2843,10 @@ def _add_jsonrpc_parser_args(parser: argparse.ArgumentParser) -> None:
     call.add_argument("pid")
     call.add_argument("endpoint_id")
     call.add_argument("method_id")
-    call.add_argument("--params-json", help="JSON-RPC params value. Omit for no params member.")
+    call.add_argument(
+        "--params-json",
+        help="Strict JSON-RPC params value. Omit for no params member.",
+    )
     unregister = sub.add_parser("unregister", help="Delete a registered JSON-RPC endpoint")
     unregister.add_argument("endpoint_id")
 
@@ -2835,7 +2901,15 @@ def _run_jsonrpc_command(runtime: Runtime, args: argparse.Namespace) -> dict[str
     if command == "call":
         if args.actor_pid is not None and args.actor_pid != args.pid:
             raise SystemExit("jsonrpc call --actor-pid must match the target process pid")
-        params = _parse_json_value(args.params_json) if args.params_json is not None else None
+        params = (
+            _parse_strict_json_value(args.params_json, "--params-json")
+            if args.params_json is not None
+            else None
+        )
+        if params is not None and not isinstance(params, (dict, list)):
+            raise SystemExit(
+                "--params-json must be a JSON object, array, or null"
+            )
         return to_jsonable(runtime.jsonrpc.call(args.pid, args.endpoint_id, args.method_id, params))
     if command == "unregister":
         return runtime.jsonrpc.unregister_endpoint(
@@ -2872,7 +2946,10 @@ def _add_mcp_parser_args(parser: argparse.ArgumentParser) -> None:
     call.add_argument("pid")
     call.add_argument("server_id")
     call.add_argument("tool_id")
-    call.add_argument("--arguments-json", help="MCP tool arguments object. Omit for {}.")
+    call.add_argument(
+        "--arguments-json",
+        help="Strict MCP tool arguments JSON object. Omit for {}.",
+    )
     unregister = sub.add_parser("unregister", help="Delete a registered MCP server")
     unregister.add_argument("server_id")
 
@@ -2942,7 +3019,13 @@ def _run_mcp_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, An
     if command == "call":
         if args.actor_pid is not None and args.actor_pid != args.pid:
             raise SystemExit("mcp call --actor-pid must match the target process pid")
-        arguments = _parse_json_value(args.arguments_json) if args.arguments_json is not None else {}
+        arguments = (
+            _parse_strict_json_value(args.arguments_json, "--arguments-json")
+            if args.arguments_json is not None
+            else {}
+        )
+        if not isinstance(arguments, dict):
+            raise SystemExit("--arguments-json must be a JSON object")
         return to_jsonable(runtime.mcp.call_tool(args.pid, args.server_id, args.tool_id, arguments))
     if command == "unregister":
         return runtime.mcp.unregister_server(

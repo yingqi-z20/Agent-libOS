@@ -4338,6 +4338,8 @@
         "tests/runtime/test_process_completion_review.py::test_exit_review_fails_closed_when_human_message_set_exceeds_bound",
         "tests/runtime/test_process_completion_review.py::test_exit_review_survives_runtime_reopen",
         "tests/runtime/test_process_completion_review.py::test_exit_review_recovers_goal_from_persistent_context_prompt",
+        "tests/runtime/test_llm_executor_cache_semantics.py::test_missing_materialized_goal_is_recovered_from_retained_context",
+        "tests/runtime/test_llm_executor_cache_semantics.py::test_exec_goal_does_not_recover_prior_v2_goal_without_matching_binding",
         "tests/runtime/test_process_completion_review.py::test_exit_review_fails_closed_after_reopen_without_full_io_retention",
         "tests/runtime/test_task_run_completion_persistence.py::test_task_run_completion_review_token_survives_reopen_without_redispatch",
         "tests/runtime/test_process_completion_review.py::test_non_gated_image_keeps_single_phase_process_exit",
@@ -4526,7 +4528,7 @@
     },
     {
       "id": "runtime-safety-benchmark-is-deterministic",
-      "title": "Runtime-safety benchmark tasks and smoke runs remain deterministic and token-free by default.",
+      "title": "Runtime-safety benchmark tasks, smoke runs, and release-evidence gates remain deterministic and token-free by default.",
       "lane": "benchmark",
       "node_ids": [
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_loads_runtime_safety_task_suite",
@@ -4556,6 +4558,7 @@
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_metrics_reject_truncated_artifact_without_raising",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_interrupted_reuse_cannot_mix_new_manifest_with_old_results",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_deterministic_smoke_run_across_baselines_and_libos",
+        "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_release_evidence_gate_is_stricter_without_changing_oracle_flag",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_self_evolution_smoke_run_across_wrapper_and_libos"
       ],
       "benchmark_attack_classes": []
@@ -4712,6 +4715,8 @@
       "lane": "security",
       "node_ids": [
         "tests/security/test_semantic_enforcement.py::test_epoch_revoke_and_binding_drift_block_unconsumed_machine_authority",
+        "tests/unit/test_semantic_authority_gate.py::test_live_authority_validator_stale_epoch_does_not_trip_rotated_classifier",
+        "tests/unit/test_semantic_authority_gate.py::test_live_authority_validator_trips_current_epoch_classifier_mismatch",
         "tests/runtime/test_semantic_runtime_wiring.py::test_approval_binding_tamper_is_fail_closed_without_authority_delta",
         "tests/runtime/test_semantic_storage.py::test_reopened_worker_refuses_classifier_artifact_drift_before_call[profile-drift]",
         "tests/runtime/test_semantic_storage.py::test_reopened_worker_refuses_classifier_artifact_drift_before_call[model-drift]",
@@ -4756,6 +4761,7 @@
         "tests/security/test_semantic_enforcement.py::test_flow_graph_never_persists_secret_payload_and_is_tenant_isolated",
         "tests/unit/test_semantic_flow.py::test_unbucketed_identity_is_unknown_and_blocks_memory_influence",
         "tests/unit/test_semantic_flow.py::test_effective_labels_fail_closed_when_assertion_page_is_truncated",
+        "tests/unit/test_semantic_flow.py::test_lineage_cycle_across_converging_branches_denies_approval",
         "tests/runtime/test_semantic_flow_graph.py::test_sqlite_derived_lineage_and_memory_gate_are_bounded",
         "tests/runtime/test_semantic_flow_graph.py::test_real_llm_provider_result_links_to_model_output_and_tightens_labels"
       ],

@@ -105,9 +105,10 @@ cancellation, and crash-ambiguous outcomes charge one call and the aggregate
 maximum without inventing a prompt/completion split. Settlement completes
 before the LLM call row or any model-selected tool dispatch.
 
-`max_llm_calls` counts executor-level logical calls. OpenAI SDK retries,
-compatibility retries, and API/tool-protocol fallbacks inside one such call may
-still perform multiple physical requests. The reservation is therefore a hard
+`max_llm_calls` counts executor-level logical calls. The built-in client
+disables OpenAI SDK retries; Agent libOS's explicit traced transport retries,
+compatibility retries, and API/tool-protocol fallbacks inside one logical call
+may still perform multiple physical requests. The reservation is therefore a hard
 Runtime admission/accounting boundary, not an exact physical-request,
 provider-billing, currency, or monetary-spend cap. Missing or invalid billable
 usage fails closed and charges the aggregate maximum when a cumulative token
@@ -171,6 +172,8 @@ iterator, count, or size violation fails the completion closed through the same
 text-free `LLMError` boundary; oversized provider content is not truncated into
 an apparently valid model action.
 
+### Prompt caching v2 release evidence
+
 Prompt caching has a model-visible layout and a provider transport policy.
 `llm.prompt_layout=cache_optimized_v2` keeps stable instructions and append-only
 TaskRun requirements ahead of volatile state, minimizes libOS-owned metadata,
@@ -200,10 +203,49 @@ uv run python scripts/check_prompt_cache_gate.py \
   --candidate .benchmark_runs/cache-v2-arm.json
 ```
 
-Each manifest provider entry contains a non-secret `provider_id`, `model_id`,
-`repetitions`, and report path. An optional `pricing` object uses per-million
-rates for `input_per_million`, `cached_input_per_million`,
-`output_per_million`, and (when applicable)
+The manifest is a complete JSON object. `security_invariants_passed` is a
+required operator attestation that the relevant deterministic security suite
+passed; omitting it is an input error, and setting it to `false` deliberately
+produces a non-releasable arm. The arm builder does not derive or verify a
+source revision from that boolean, so the release operator must separately
+archive the clean source identity and ensure both arms and the security run use
+that source. `providers` is a non-empty array; strict paired release evidence
+needs at least two unique provider/model pairs in each arm. The builder accepts
+at most 1 MiB for this manifest and 16 MiB for each provider report, and rejects
+duplicate JSON keys, non-finite numbers, and present fields of the wrong type.
+For example:
+
+```json
+{
+  "security_invariants_passed": true,
+  "providers": [
+    {
+      "provider_id": "provider-a",
+      "model_id": "model-a",
+      "repetitions": 3,
+      "report": "provider-a-cache-v2.json",
+      "pricing": {
+        "input_per_million": 2.5,
+        "cached_input_per_million": 1.25,
+        "output_per_million": 10.0
+      }
+    },
+    {
+      "provider_id": "provider-b",
+      "model_id": "model-b",
+      "repetitions": 3,
+      "report": "provider-b-cache-v2.json"
+    }
+  ]
+}
+```
+
+Each provider report path is resolved relative to the manifest and must point
+to a redacted live-evaluator report for the same explicit `prompt_layout`; its
+metrics supply the workflow count, oracle results, completion evidence, cache
+counters, and closed-category identifier-leak evidence. An optional `pricing`
+object uses per-million rates for `input_per_million`,
+`cached_input_per_million`, `output_per_million`, and (when applicable)
 `cache_write_input_per_million`. A distinct write rate requires reported write
 tokens; unknown is rejected rather than billed as zero. The strict gate
 requires the same two-or-more provider/model pairs in both arms, at least three

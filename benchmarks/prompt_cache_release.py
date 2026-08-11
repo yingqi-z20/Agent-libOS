@@ -7,7 +7,10 @@ from agent_libos.llm.prompt_cache_gate import (
     PromptCachePricing,
     calculate_prompt_cache_cost,
 )
-from benchmarks.prompt_cache_evidence import aggregate_prompt_cache_run_evidence
+from benchmarks.prompt_cache_evidence import (
+    aggregate_prompt_cache_run_evidence,
+    validate_prompt_cache_leak_evidence,
+)
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,7 @@ def _provider_row(item: ProviderPromptCacheArmInput) -> dict[str, Any]:
     ):
         raise ValueError("provider repetitions must be a positive integer")
     metrics = _report_metrics(item.report)
+    leak_evidence = validate_prompt_cache_leak_evidence(metrics)
     workflow_count = _nonnegative_int(metrics.get("runs"))
     if workflow_count < 1:
         raise ValueError("provider report must contain at least one workflow")
@@ -111,9 +115,9 @@ def _provider_row(item: ProviderPromptCacheArmInput) -> dict[str, Any]:
             successful_tasks == workflow_count and _report_gate_passed(item.report)
         ),
         "completion_evidence_passed": completion_successes == workflow_count,
-        "forbidden_internal_id_leaks": _nonnegative_int(
-            metrics.get("forbidden_internal_id_leaks")
-        ),
+        "forbidden_internal_id_leaks": leak_evidence[
+            "forbidden_internal_id_leaks"
+        ],
         "pricing_known": item.pricing is not None,
     }
     if item.pricing is not None:

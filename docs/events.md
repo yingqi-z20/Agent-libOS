@@ -13,7 +13,7 @@ Every stored `Event` has these fields:
 | Field | Contract |
 | --- | --- |
 | `event_id` | Opaque primary key. Ordinary `emit()` generates it; `emit_once()` requires the Host producer to supply a stable semantic id. Do not infer time or sequence from the id. |
-| `type` | One of the 46 values in the catalog below. Unknown values are rejected before insertion. |
+| `type` | One of the values in the catalog below. Unknown values are rejected before insertion. |
 | `source` | Producer-selected string identity. It may be a PID, Runtime/component name, capability issuer, Human identity, or resource; it is not a foreign key. |
 | `target` | Producer-selected string identity or `null` for a broadcast observation. It is not a grant or proof of visibility. A target-filtered query returns both exact-target events and `target=null` broadcasts. |
 | `payload` | JSON object owned by the event producer. The catalog lists current discriminators and common keys; failure/recovery variants may add diagnostic fields. Consumers must tolerate additional keys and must not treat an event payload as an authority decision unless the owning domain contract says so. |
@@ -35,7 +35,7 @@ stable discriminator/common fields rather than defining a closed JSON Schema.
 | Event type | Producer and meaning | Source → target | Payload | Non-normal priority |
 | --- | --- | --- | --- | --- |
 | `runtime_shutdown` | Runtime lifecycle records an admitted shutdown attempt reaching its evidence phase | shutdown actor → `runtime` | `reason` | — |
-| `task_run_created` | `TaskRunManager` atomically publishes a new durable Run together with its root process and initial requirement | `runtime.task_runs` → Run id | `schema_version`, `run_id`, `root_pid`, `revision` | — |
+| `task_run_created` | `TaskRunManager` atomically publishes a new durable Run together with its root process and initial requirement | `runtime` → Run id | `schema_version`, `run_id`, `revision`, `status`, `root_pid`, `display_title`, `retention` | — |
 | `process_created` | `ProcessManager` publishes a root or spawned child | `runtime` or parent PID → new PID | root: `pid`, `image`, `goal_oid`, `working_directory`, `llm_profile_id`; child: `parent`, `child`, `image`, `goal_oid`, `working_directory`, `status`, `llm_profile_id` | — |
 | `process_forked` | `ProcessManager` publishes a fork, or `CheckpointManager` publishes a checkpoint fork | parent/source actor → child/fork-root PID | direct fork: `parent`, `child`, `mode`, `working_directory`, `llm_profile_id`; checkpoint fork: `checkpoint_id`, `source_pid`, `fork_root_pid` | — |
 | `process_exec` | `ProcessManager` commits an image replacement | PID → same PID | `old_image`, `new_image`, `preserve_memory`, `preserve_capabilities`, `goal_oid`, `working_directory`, `llm_profile_id` | — |
@@ -58,7 +58,7 @@ stable discriminator/common fields rather than defining a closed JSON Schema.
 | `object_task_owner_change_undelivered` | `ObjectTaskManager` cannot deliver an owner-watch change | actor PID → owner OID | `task_id`, `runner_pid`, `event`, `error` | `high` |
 | `human_query` | `HumanObjectManager` commits a Human request | PID → `human:<id>` | `request_id`, `request_type`, bounded `request` observation, `blocking` | — |
 | `human_response` | `HumanObjectManager` records a decision or protected terminal read | responder/Human identity → PID or Human resource | decision evidence includes `request_id`, `status`; protected reads include `purpose`, `operation`, `chars`; producer-specific failure diagnostics may include `provider_outcome`, `outcome`, `phase`, or `error_type` | — |
-| `semantic_policy_response` | Host machine policy atomically terminalizes an eligible Human request | `policy:semantic:<epoch>` → PID | `request_id`, expected `revision`, `status`, `settlement_id`, `epoch_id`, `policy_sha256`, exact binding digest, reason code, and optional one-use `capability_id`; never contains Human-authored response content | — |
+| `semantic_policy_response` | Host machine policy atomically terminalizes an eligible Human request | `policy:semantic:auto` or `policy:semantic:hard-deny` → PID | top level: `request_id`, `status`, `source` (`machine_policy`), sanitized `policy`, and nested `settlement_receipt`; the receipt contains `schema_version`, `settlement_id`, `outcome`, `policy_sha256`, and `binding_sha256`, plus `capability_id` only for an issued approval; never contains Human-authored response content | — |
 | `image_registered` | `ImageRegistry` commits registration/replacement | actor → `image:<id>` | `image_id`, `name`, `version`, `replaced`, `source`, `boot_kind` | — |
 | `image_committed` | `ImageRegistry` commits a checkpoint-derived image | actor → `image:<id>` | `image_id`, `checkpoint_id`, `artifact_id`, `artifact_sha256`, `artifact_bytes` | — |
 | `skill_registered` | `SkillManager` commits a package registration | actor → `skill:<id>` | `skill_id`, `version`, `source_type` | — |

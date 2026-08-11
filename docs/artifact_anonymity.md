@@ -1,127 +1,289 @@
 # Artifact Publication and Anonymity Checklist
 
-This contributor-only checklist covers identity and secret scanning for a
-source archive, benchmark bundle, or anonymous research artifact. It is not a
-legal review, an end-user setup guide, or evidence that any particular release
-artifact has passed these checks.
+This contributor-only runbook covers identity and secret scanning for a source
+archive, benchmark bundle, or anonymous research artifact. It is not legal
+advice, an end-user setup guide, or evidence that any artifact passed review.
+The commands below are intentionally fail closed: an unreadable input, failed
+detector, unreviewed match, changed byte, unsafe archive member, or incomplete
+final rescan stops publication.
 
-## Paper Title And System Name
+## Paper title, system name, and license
 
 The paper title is fixed as:
 
 > Agent libOS: A Runtime Substrate for Capability-Controlled Self-Evolving LLM Agents
 
-Use `Agent libOS` consistently in paper drafts and artifact documentation. Do
-not use the older temporary anonymous name `Primitive Agent Runtime` (`PAR`).
-For double-blind review, anonymize author, institution, repository, and
-deployment metadata rather than renaming the runtime in source code.
+Use `Agent libOS` consistently. Do not revive the temporary anonymous name
+`Primitive Agent Runtime` (`PAR`). For double-blind review, anonymize authors,
+institutions, repository ownership, and deployment metadata instead of renaming
+the runtime in source code.
 
-## License Consistency
+The license gate is:
 
-- `LICENSE` must contain Apache License 2.0.
-- `pyproject.toml` must use `license = { text = "Apache-2.0" }`.
-- README and artifact docs must not claim MIT, proprietary, or dual licensing.
-- Generated distributions should include `LICENSE` and should not add a
-  conflicting classifier.
+- `LICENSE` contains Apache License 2.0;
+- `pyproject.toml` declares `Apache-2.0` and no conflicting classifier;
+- README and artifact documentation do not claim another license; and
+- the wheel and source distribution contain the expected license material.
 
-## Double-Blind Content Scan
+## What must be scanned
 
-Before making an anonymous artifact branch or archive, scan all tracked files
-and generated paper/artifact files for:
+Scan the exact commit, the exact `git archive` projection, every generated file,
+and the final packed deliverable. The review covers:
 
-- author names, lab names, school names, school emails, and personal emails,
-- personal GitHub, GitLab, homepage, cloud bucket, or institutional URLs,
+- author, username, institution, lab, email, repository, issue-tracker, cloud,
+  tenant, project, account, and deployment identifiers;
 - absolute local paths such as `C:\Users\...`, `/Users/...`, `/home/...`,
-  `/private/...`, or `/tmp/...`,
-- private API endpoints, dashboard URLs, project ids, tenant ids, and account ids,
-- `.env` contents, API keys, access tokens, SSH keys, cookies, and credentials,
-- LLM provider account metadata in logs, traces, screenshots, notebooks, or
-  benchmark results,
-- non-anonymous git remotes, branch names, tags, commit messages, and issue links,
-- PDF, DOCX, PPTX, image, and archive metadata that may contain author identity.
+  `/private/...`, and `/tmp/...`;
+- `.env` files, API keys, access tokens, private keys, cookies, connection
+  strings, credentials, private endpoints, and provider account metadata;
+- Git remotes, every ref name, commit/tag identity, signatures, messages, and
+  reachable history when Git metadata will be delivered; and
+- metadata and visible content in PDF, Office, notebook, image, media, model,
+  data, executable, and nested archive formats.
 
-Reviewers must not need real credentials to run the deterministic artifact
-subset. Real-model experiments may be optional, but their instructions must
-make the credential requirement explicit and must not embed secrets.
+Deterministic reviewers must not need real credentials. Optional real-provider
+instructions must say that credentials and paid tokens are required, without
+embedding either.
 
-## Required Scan Procedure And Evidence
+## One strict review session
 
-The scan applies to the exact commit and exact generated files that will be
-shared. Scanning only the working tree is insufficient because ignored paper
-builds, screenshots, binary documents, and the final archive can carry identity
-that is absent from tracked source. Start from a clean anonymous worktree and
-record these inventories in a private submission log:
+Run all shell blocks in the same Bash process. If the shell is restarted, rerun
+this prologue. Do not translate it to a shell without equivalent `errexit`,
+`nounset`, and `pipefail` behavior.
 
 ```bash
-ANON_OUTPUT_DIR=/absolute/path/to/generated-submission
+#!/usr/bin/env bash
+set -Eeuo pipefail
+set -o pipefail
+IFS=$'\n\t'
+umask 077
+
+: "${ANON_OUTPUT_DIR:?set this to the exact generated-output directory}"
+: "${ANON_FINAL_ARCHIVE:?set this to the new absolute .tar deliverable path}"
+: "${ANON_REVIEW_DIR:?set this to a persistent private review directory}"
+
+case "$ANON_OUTPUT_DIR" in /*) ;; *) printf 'ANON_OUTPUT_DIR must be absolute\n' >&2; exit 1;; esac
+case "$ANON_FINAL_ARCHIVE" in /*) ;; *) printf 'ANON_FINAL_ARCHIVE must be absolute\n' >&2; exit 1;; esac
+case "$ANON_REVIEW_DIR" in /*) ;; *) printf 'ANON_REVIEW_DIR must be absolute\n' >&2; exit 1;; esac
+case "$ANON_FINAL_ARCHIVE" in *.tar) ;; *) printf 'ANON_FINAL_ARCHIVE must end in .tar\n' >&2; exit 1;; esac
+
 test -d "$ANON_OUTPUT_DIR"
-ANON_COMMIT=$(git rev-parse --verify 'HEAD^{commit}') || exit 1
-ANON_STATUS=$(git status --porcelain=v1 --untracked-files=all) || exit 1
+test -d "$ANON_REVIEW_DIR"
+test -d "$(dirname "$ANON_FINAL_ARCHIVE")"
+test ! -e "$ANON_FINAL_ARCHIVE"
+
+for command_name in git rg python3; do
+  command -v "$command_name" >/dev/null
+done
+
+ANON_COMMIT="$(git rev-parse --verify 'HEAD^{commit}')"
+ANON_STATUS="$(git status --porcelain=v1 --untracked-files=all)"
 test -z "$ANON_STATUS"
+ANON_DISPOSITIONS="$ANON_REVIEW_DIR/dispositions-$ANON_COMMIT.json"
+ANON_RECORDED_CANDIDATES="$ANON_REVIEW_DIR/candidates-$ANON_COMMIT.json"
+
+python3 - \
+  "$(git rev-parse --show-toplevel)" \
+  "$ANON_OUTPUT_DIR" \
+  "$ANON_REVIEW_DIR" \
+  "$ANON_FINAL_ARCHIVE" \
+  "$ANON_DISPOSITIONS" \
+  "$ANON_RECORDED_CANDIDATES" <<'PY'
+from pathlib import Path
+import sys
+
+worktree = Path(sys.argv[1]).resolve(strict=True)
+output = Path(sys.argv[2]).resolve(strict=True)
+review = Path(sys.argv[3]).resolve(strict=True)
+archive = Path(sys.argv[4]).resolve(strict=False)
+dispositions = Path(sys.argv[5]).resolve(strict=False)
+recorded_argument = Path(sys.argv[6])
+if recorded_argument.is_symlink():
+    raise SystemExit("recorded candidate path must not be a symbolic link")
+recorded_candidates = recorded_argument.resolve(strict=False)
+
+
+def within(path: Path, parent: Path) -> bool:
+    return path == parent or path.is_relative_to(parent)
+
+
+for label, path in (("output", output), ("review", review)):
+    if within(path, worktree) or within(worktree, path):
+        raise SystemExit(
+            f"{label} and worktree must not contain one another: {path}"
+        )
+if within(archive, worktree):
+    raise SystemExit(f"archive must be outside the worktree: {archive}")
+if within(output, review) or within(review, output):
+    raise SystemExit("output and private review directories must not contain one another")
+if within(archive, output) or within(archive, review):
+    raise SystemExit("final archive must be outside output and private review directories")
+for label, path in (
+    ("dispositions", dispositions),
+    ("recorded candidates", recorded_candidates),
+):
+    if path.parent != review:
+        raise SystemExit(
+            f"{label} must remain directly inside the private review directory"
+        )
+PY
+
+ANON_SCAN_DIR="$(mktemp -d "$ANON_REVIEW_DIR/scan.XXXXXX")"
+test -n "$ANON_SCAN_DIR"
+test -d "$ANON_SCAN_DIR"
+trap 'test -n "${ANON_SCAN_DIR:-}" && rm -rf -- "$ANON_SCAN_DIR"' EXIT
+
+ANON_COMMIT_TREE="$ANON_SCAN_DIR/exact-commit-tree"
+ANON_COMMIT_EXPORT="$ANON_SCAN_DIR/archive-projection"
+ANON_FINAL_EXTRACT="$ANON_SCAN_DIR/final-extract"
+mkdir "$ANON_COMMIT_TREE" "$ANON_COMMIT_EXPORT" "$ANON_FINAL_EXTRACT"
+
 printf '%s\n' "$ANON_COMMIT"
-printf '%s' "$ANON_STATUS"
-git ls-files
-git ls-files -s | rg '^(120000|160000) '
-git submodule status --recursive
-git submodule foreach --recursive \
-  'git rev-parse HEAD; git status --porcelain=v1 --untracked-files=all'
-git ls-files -z | git check-attr --cached --stdin -z -a
-find "$ANON_OUTPUT_DIR" -print | LC_ALL=C sort
-find "$ANON_OUTPUT_DIR" -type l -exec ls -ld '{}' \;
 ```
 
-The status capture must succeed and its `test` must report a clean index and
-working tree, including ordinary untracked files. If the intended submission
-includes a working-tree change, first commit it on the anonymous branch and
-restart the scan against that exact commit; an untracked or merely staged file
-is otherwise not covered by history-based scans. Ignored files are not part of
-that commit: they are covered only if they appear under the exact
-`ANON_OUTPUT_DIR` that will be shared. Do not point that variable at a broader
-staging parent or a narrower subset. Prefer an output directory outside the
-worktree; if it is inside an ignored path, the explicit output inventory and
-recursive scans remain mandatory.
+The commands resolve and enforce that the output and private review directories
+are outside the worktree and do not contain one another, and that the final
+archive is outside all three. The private disposition and recorded-candidate
+paths are derived inside the review directory; the latter is rejected if it is
+a symbolic link. Neither can be packed accidentally. The final archive must
+not already exist: publication never overwrites an earlier reviewed deliverable.
+Commit an intended source change first, then restart against the new commit.
+Ignored or merely staged files are not commit evidence.
 
-Mode `120000` identifies tracked symlinks and mode `160000` identifies
-gitlinks/submodules. Inspect every tracked/generated symlink target and every
-submodule commit independently. Reject absolute symlink targets and targets
-that resolve outside the intended artifact root unless they are an explicitly
-documented part of the submission and their target bytes are separately
-inventoried and scanned. Any leading `-` in `git submodule status` means that
-content is not initialized and therefore has not been reviewed; initialize it
-from a trusted source or exclude the gitlink from the artifact. Neither the
-superproject text scan nor an archive of the superproject proves a submodule's
-contents anonymous.
+### Match-command status handling
 
-The NUL-delimited attribute inventory identifies content filters without
-misparsing unusual filenames. If it reports Git LFS, run the additional checks
-below with a recorded Git LFS version; apply an equivalent object inventory for
-any other filter:
+Both `rg` and `git grep` return `0` for a match, `1` for no match, and a value
+greater than `1` for an error. Under strict shell mode, use this helper for every
+candidate-producing invocation. It accepts only `0` and `1`, verifies that a
+no-match command emitted no candidate bytes, and propagates every real error.
 
 ```bash
-git lfs version
-git config --show-origin --get-regexp '^lfs\.(fetchinclude|fetchexclude)$'
-git lfs ls-files --all --long
-git lfs fsck --objects
-rg -l --hidden --no-ignore -F \
-  'version https://git-lfs.github.com/spec/v1' "$ANON_OUTPUT_DIR"
+capture_matches() {
+  local destination="$1"
+  shift
+  local status
+
+  test ! -e "$destination"
+  set +e
+  "$@" >"$destination"
+  status=$?
+  set -e
+
+  case "$status" in
+    0) test -s "$destination" ;;
+    1) test ! -s "$destination" ;;
+    *)
+      printf 'candidate detector failed (%s):' "$status" >&2
+      printf ' %q' "$@" >&2
+      printf '\n' >&2
+      return "$status"
+      ;;
+  esac
+}
 ```
 
-Remove fetch exclusions in the disposable review clone before treating the LFS
-checks as complete. `git lfs fsck --objects` verifies the current HEAD/index
-objects, may move a corrupt local object into `.git/lfs/bad`, and does not verify
-the historical inventory produced by `git lfs ls-files --all --long`; run it in
-that disposable clone. Retrieve, hash, and review every distinct LFS OID
-referenced by the shipped history separately, and review every pointer reported
-in the exact output. A pointer is acceptable only when the submission
-intentionally requires a later fetch, that fact is disclosed, and the fetched
-object bytes were independently scanned; otherwise export and scan the reviewed
-object bytes. Do not put the private scan log in the shared artifact.
+Never append `|| true` to a detector. A missing optional tool is an explicit
+environment gate, not a clean result.
 
-Before running the text scan, the submission owner must build and record an
-`ANON_IDENTITY_PATTERN` containing every author name and username, email and
-institutional domain, lab/institution name, personal repository/homepage, issue
-tracker, cloud bucket, and deployment identifier known to the authors. The
-example values below are placeholders and must be replaced:
+## Commit, attribute, submodule, and all-ref inventory
+
+Record these private inventories. NUL-delimited files remain private because
+they may contain identifying paths or URLs.
+
+```bash
+git ls-files -z >"$ANON_SCAN_DIR/tracked-files.nul"
+git ls-files -s >"$ANON_SCAN_DIR/tracked-modes"
+git check-attr --cached --stdin -z -a \
+  <"$ANON_SCAN_DIR/tracked-files.nul" \
+  >"$ANON_SCAN_DIR/tracked-attributes.nul"
+
+capture_matches "$ANON_SCAN_DIR/symlink-or-gitlink-modes" \
+  rg '^(120000|160000) ' "$ANON_SCAN_DIR/tracked-modes"
+
+git submodule status --recursive >"$ANON_SCAN_DIR/submodules"
+git submodule foreach --quiet --recursive \
+  'git rev-parse HEAD && git status --porcelain=v1 --untracked-files=all' \
+  >"$ANON_SCAN_DIR/submodule-status"
+
+git for-each-ref \
+  --format='%(refname)%09%(objectname)%09%(objecttype)%09%(authorname)%09%(authoremail)%09%(committername)%09%(committeremail)%09%(taggername)%09%(taggeremail)' \
+  >"$ANON_SCAN_DIR/all-refs"
+git log --all --format='%H%x09%an%x09%ae%x09%cn%x09%ce%x09%s' \
+  >"$ANON_SCAN_DIR/all-log-identities"
+git config --show-origin --list >"$ANON_SCAN_DIR/git-config"
+git remote -v >"$ANON_SCAN_DIR/git-remotes"
+```
+
+`git for-each-ref` deliberately has no `refs/heads`, `refs/remotes`, or
+`refs/tags` restriction. Custom refs, notes, stash, pull refs, and replace refs
+can identify an author just as easily as branches and tags.
+
+Mode `120000` is a symlink and `160000` a gitlink. This runbook rejects both
+from the packed artifact rather than following or silently omitting them. If an
+artifact genuinely needs either, flatten reviewed bytes into ordinary files on
+the anonymous branch and restart. A leading `-` in submodule status means the
+submodule bytes were never reviewed and keeps the gate open.
+
+Parse the NUL-delimited attribute triples exactly. LFS is the only recognized
+content-filter value, but this runbook does not support publishing an LFS
+pointer or its separately stored object. An unknown or valueless filter fails;
+an exact LFS value takes a distinct blocking path instead of being silently
+skipped:
+
+```bash
+python3 - \
+  "$ANON_SCAN_DIR/tracked-attributes.nul" \
+  "$ANON_SCAN_DIR/lfs-required.json" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+
+raw = Path(sys.argv[1]).read_bytes().split(b"\0")
+if raw and raw[-1] == b"":
+    raw.pop()
+if len(raw) % 3:
+    raise SystemExit("git check-attr emitted an incomplete NUL-delimited triple")
+
+lfs_paths: list[str] = []
+for index in range(0, len(raw), 3):
+    path, attribute, value = raw[index:index + 3]
+    if attribute != b"filter":
+        continue
+    if value != b"lfs":
+        raise SystemExit(
+            f"unsupported Git content filter {os.fsdecode(value)!r} "
+            f"on {os.fsdecode(path)!r}"
+        )
+    lfs_paths.append(os.fsdecode(path))
+
+if lfs_paths:
+    Path(sys.argv[2]).write_text(
+        json.dumps(sorted(lfs_paths), indent=2) + "\n",
+        encoding="utf-8",
+    )
+PY
+
+if test -f "$ANON_SCAN_DIR/lfs-required.json"; then
+  printf 'Git LFS paths are unsupported by this runbook:\n' >&2
+  sed 's/^/  /' "$ANON_SCAN_DIR/lfs-required.json" >&2
+  printf 'flatten reviewed LFS bytes, remove the filter, commit, and restart\n' >&2
+  exit 4
+fi
+```
+
+Fetch each required LFS object only in a private review environment, inspect
+its actual bytes, then replace the pointer with those reviewed ordinary bytes
+and remove the filter attribute on the anonymous branch. Commit that flattened
+tree and restart this runbook. The pointer alone is never evidence that its
+object is anonymous, and fetch include/exclude rules make an automated partial
+LFS scan unsafe for this checklist.
+
+## Patterns and tracked-tree cross-check
+
+The submission owner must replace the identity placeholders with a complete,
+private pattern covering every known author identity and deployment identifier.
+Keep the pattern and scan log outside the deliverable.
 
 ```bash
 ANON_IDENTITY_PATTERN='author-one|author@example\.edu|lab-name|institution-domain\.edu'
@@ -129,327 +291,702 @@ ANON_PATH_PATTERN='(/Users/|/home/|/private/|/tmp/|[A-Za-z]:\\Users\\)'
 ANON_SECRET_PATTERN='(api[_-]?key|access[_-]?token|client[_-]?secret|password|authorization)[[:space:]]*[:=]'
 ANON_PRIVATE_KEY_PATTERN='-----BEGIN ([A-Z ]+ )?PRIVATE KEY-----'
 
-git grep -lEI -e "$ANON_IDENTITY_PATTERN" -e "$ANON_PATH_PATTERN"
-rg -li --hidden --no-ignore \
-  -e "$ANON_IDENTITY_PATTERN" -e "$ANON_PATH_PATTERN" "$ANON_OUTPUT_DIR"
-git ls-files | rg -i -e "$ANON_IDENTITY_PATTERN" -e "$ANON_PATH_PATTERN"
-(cd "$ANON_OUTPUT_DIR" && find . -print) | \
-  rg -i -e "$ANON_IDENTITY_PATTERN" -e "$ANON_PATH_PATTERN"
+test "$ANON_IDENTITY_PATTERN" != \
+  'author-one|author@example\.edu|lab-name|institution-domain\.edu'
 
-git grep -lEI -e "$ANON_SECRET_PATTERN" -e "$ANON_PRIVATE_KEY_PATTERN"
-rg -li --hidden --no-ignore \
-  -e "$ANON_SECRET_PATTERN" -e "$ANON_PRIVATE_KEY_PATTERN" "$ANON_OUTPUT_DIR"
+capture_matches "$ANON_SCAN_DIR/all-refs-sensitive" \
+  rg -ali \
+    -e "$ANON_IDENTITY_PATTERN" -e "$ANON_PATH_PATTERN" \
+    -e "$ANON_SECRET_PATTERN" -e "$ANON_PRIVATE_KEY_PATTERN" \
+    "$ANON_SCAN_DIR/all-refs"
+capture_matches "$ANON_SCAN_DIR/git-metadata-sensitive" \
+  rg -ali \
+    -e "$ANON_IDENTITY_PATTERN" -e "$ANON_PATH_PATTERN" \
+    -e "$ANON_SECRET_PATTERN" -e "$ANON_PRIVATE_KEY_PATTERN" \
+    "$ANON_SCAN_DIR/all-log-identities" \
+    "$ANON_SCAN_DIR/git-config" \
+    "$ANON_SCAN_DIR/git-remotes"
 
-git ls-files | rg '(^|/)\.env($|\.)'
-find "$ANON_OUTPUT_DIR" -type f -name '.env*' -print
+capture_matches "$ANON_SCAN_DIR/git-grep-identity.nul" \
+  git grep -lzEI \
+    -e "$ANON_IDENTITY_PATTERN" -e "$ANON_PATH_PATTERN" \
+    "$ANON_COMMIT" --
+capture_matches "$ANON_SCAN_DIR/git-grep-secret.nul" \
+  git grep -lzEI \
+    -e "$ANON_SECRET_PATTERN" -e "$ANON_PRIVATE_KEY_PATTERN" \
+    "$ANON_COMMIT" --
 ```
 
-`git grep` exit status 1 and `rg` exit status 1 mean no matches. These are
-candidate scans, not automatic proofs: test fixtures and documentation can
-produce intentional matches, while account ids or project names may not match a
-generic credential pattern. The commands intentionally print only filenames:
-inspect each candidate in a restricted local view, and record only a redacted
-location, detector/category, and disposition. Never copy a live secret or an
-unredacted matching line into the scan log. Add an organization-approved,
-redacting secret/entropy scanner when available and cover provider-specific key
-formats, bearer/JWT material, cloud credentials, cookies, connection strings,
-and encoded secrets; the generic grep is only a first-pass locator. Record every
-hit, the reviewer, and one of
-`removed`, `replaced`, or `intentional non-identifying fixture`, then rerun the
-same command after remediation. Record the scanner's name, version,
-configuration, exact redacted command, and findings; it does not replace the
-identity pattern or manual review.
+These two results are a cross-check, not the final decision. The byte-exact
+materialized tree below is scanned with the same detectors as the archive
+projection and generated output. A non-empty candidate list requires an exact
+reviewed disposition; a detector error is never interpreted as no match.
 
-Inspect repository identity and history separately:
+## Safe materialization and archive extraction
+
+Create a helper that extracts only ordinary files and directories. It rejects
+absolute paths, `.`/`..`, control characters, duplicate canonical paths,
+symlinks, hard links, devices, FIFOs, and every other special member. It never
+calls `extractall()`.
 
 ```bash
-set -o pipefail
-ANON_GIT_SCAN_DIR="$(mktemp -d)" || exit 1
-test -n "$ANON_GIT_SCAN_DIR" || exit 1
-trap 'test -n "$ANON_GIT_SCAN_DIR" && rm -rf -- "$ANON_GIT_SCAN_DIR"' EXIT
+cat >"$ANON_SCAN_DIR/safe_tar.py" <<'PY'
+from __future__ import annotations
 
-git config --get-regexp '^(user|remote)\.'
-git remote -v
-git branch --all --no-color
-git tag --list
-git for-each-ref \
-  --format='%(refname)%09%(objectname)%09%(objecttype)%09%(authorname)%09%(authoremail)%09%(committername)%09%(committeremail)%09%(taggername)%09%(taggeremail)' \
-  refs/heads refs/remotes refs/tags
-git log --all --format='%H%x09%an%x09%ae%x09%cn%x09%ce'
-git --no-replace-objects rev-list --objects --all \
-  > "$ANON_GIT_SCAN_DIR/reachable-objects" || exit 1
-if rg -i -e "$ANON_IDENTITY_PATTERN" -e "$ANON_PATH_PATTERN" \
-  "$ANON_GIT_SCAN_DIR/reachable-objects"; then
-  : # review the matching object paths in the restricted local session
-elif test "$?" -ne 1; then
-  exit 1
-fi
+import argparse
+import os
+from pathlib import Path, PurePosixPath
+import shutil
+import tarfile
 
-git --no-replace-objects cat-file \
-  --batch-check='%(objectname) %(objecttype) %(objectsize) %(rest)' \
-  < "$ANON_GIT_SCAN_DIR/reachable-objects" \
-  > "$ANON_GIT_SCAN_DIR/reachable-metadata" || exit 1
-while read -r object_oid object_type object_size object_path; do
-  case "$object_type" in
-    commit|tag|tree|blob)
-      if ! git --no-replace-objects cat-file "$object_type" "$object_oid" \
-        > "$ANON_GIT_SCAN_DIR/object-bytes"; then
-        printf 'git cat-file failed for %s\n' "$object_oid" >&2
-        exit 1
-      fi
-      if rg -a -qi \
-          -e "$ANON_IDENTITY_PATTERN" \
-          -e "$ANON_PATH_PATTERN" \
-          -e "$ANON_SECRET_PATTERN" \
-          -e "$ANON_PRIVATE_KEY_PATTERN" \
-          "$ANON_GIT_SCAN_DIR/object-bytes"; then
-        printf '%s\t%s\t%s\t%s\n' \
-          "$object_oid" "$object_type" "$object_size" "$object_path"
-      elif test "$?" -ne 1; then
-        exit 1
-      fi
-      ;;
-  esac
-done < "$ANON_GIT_SCAN_DIR/reachable-metadata"
-```
 
-If the reviewers receive Git metadata, names, emails, remotes, branch/tag names,
-annotated-tag contents, full commit bodies and signatures, issue links, paths,
-and file contents in all reachable history must be anonymous. The object loop
-reads the complete raw bytes of every reachable commit, annotated tag, and
-distinct tree and blob while printing only object identity/type/size/path for a
-pattern hit. Raw tree bytes are included because filenames can themselves carry
-identity even when unusual names make a line-oriented path inventory awkward.
-Redact the path too when it is identifying. Run the approved secret scanner over
-Git history as well; the four regular expressions are not sufficient secret
-detection.
+def safe_parts(name: str) -> tuple[str, ...]:
+    path = PurePosixPath(name)
+    if path.is_absolute() or not path.parts:
+        raise ValueError(f"unsafe archive path: {name!r}")
+    if any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError(f"unsafe archive path: {name!r}")
+    if any(ord(character) < 32 or ord(character) == 127 for character in name):
+        raise ValueError(f"control character in archive path: {name!r}")
+    return tuple(path.parts)
 
-Pattern matching is not a substitute for semantic review. View full commit
-bodies with `git --no-replace-objects log --all --format=fuller --show-signature`
-and each annotated tag with
-`git --no-replace-objects cat-file tag <tag-object-id>` in a restricted local
-session. Disabling replace-object substitution is essential: a copied
-`refs/replace/*` entry must not hide the original object's bytes from review. Do
-the same for the value-bearing Git config and remote commands above because a
-remote URL can embed a credential. Do not capture any of their raw output in the
-submission log; record only redacted findings and dispositions.
 
-Prefer an export that excludes `.git`; a clean current tree is much easier to
-audit than a working repository. If a local `.git` directory itself will be
-copied, scanning refs and reflogs is not sufficient because loose or packed
-dangling objects are copied too. Inventory **every object in the object
-database** into a private temporary file and feed it through the same raw-byte
-loop (the output has no path for an unreachable object). Run this continuation
-in the same shell before the earlier `EXIT` trap removes the private directory;
-its first guard aborts rather than redirecting through an unset path:
+parser = argparse.ArgumentParser()
+parser.add_argument("archive")
+parser.add_argument("destination")
+args = parser.parse_args()
+destination = Path(args.destination).resolve(strict=True)
+seen: set[tuple[str, ...]] = set()
 
-```bash
-test -n "${ANON_GIT_SCAN_DIR:-}" && test -d "$ANON_GIT_SCAN_DIR" || exit 1
-git --no-replace-objects cat-file --batch-all-objects \
-  --batch-check='%(objectname) %(objecttype) %(objectsize)' \
-  > "$ANON_GIT_SCAN_DIR/all-object-metadata" || exit 1
-while read -r object_oid object_type object_size; do
-  case "$object_type" in
-    commit|tag|tree|blob)
-      if ! git --no-replace-objects cat-file "$object_type" "$object_oid" \
-        > "$ANON_GIT_SCAN_DIR/object-bytes"; then
-        printf 'git cat-file failed for %s\n' "$object_oid" >&2
-        exit 1
-      fi
-      if rg -a -qi \
-          -e "$ANON_IDENTITY_PATTERN" \
-          -e "$ANON_PATH_PATTERN" \
-          -e "$ANON_SECRET_PATTERN" \
-          -e "$ANON_PRIVATE_KEY_PATTERN" \
-          "$ANON_GIT_SCAN_DIR/object-bytes"; then
-        printf '%s\t%s\t%s\n' "$object_oid" "$object_type" "$object_size"
-      elif test "$?" -ne 1; then
-        exit 1
-      fi
-      ;;
-  esac
-done < "$ANON_GIT_SCAN_DIR/all-object-metadata"
-```
+with tarfile.open(args.archive, "r:*") as archive:
+    for member in archive:
+        parts = safe_parts(member.name)
+        if parts in seen:
+            raise ValueError(f"duplicate archive path: {member.name!r}")
+        seen.add(parts)
+        target = destination.joinpath(*parts)
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=False)
+            target.chmod(0o755)
+            continue
+        if not member.isfile():
+            raise ValueError(f"non-regular archive member: {member.name!r}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = archive.extractfile(member)
+        if source is None:
+            raise ValueError(f"unreadable archive member: {member.name!r}")
+        with source, target.open("xb") as output:
+            shutil.copyfileobj(source, output, length=1024 * 1024)
+        target.chmod(0o755 if member.mode & 0o111 else 0o644)
+PY
 
-Every producer above writes a file and must exit successfully before its
-consumer runs. The temporary directory must also be created successfully and
-validated as non-empty before the cleanup trap is installed. Each object read
-is checked independently; a failed `git cat-file` or `rg` exits the checklist
-instead of looking like a no-match result. `set -o pipefail` remains mandatory
-for any locally added pipelines.
-Scan `.git` metadata files without logging raw credentials. Historical binary
-blobs need the same format-aware inspection as current binaries or must be
-removed by an audited history rewrite. After a rewrite, regenerate or clone the
-deliverable and rerun the all-object scan; pruning alone is not evidence that a
-copied object database is anonymous.
+python3 - "$ANON_COMMIT" "$ANON_COMMIT_TREE" <<'PY'
+from __future__ import annotations
 
-`git log` alone does not inspect blobs, and inspecting only the current tree
-cannot prove reachable history anonymous. If reviewers receive an archive
-without Git metadata, inspect its member list and prove that `.git/`, repository
-credentials, and local Git configuration are absent; an anonymous current
-checkout does not sanitize an archive that embeds history by itself.
-
-Binary formats require format-aware inspection. Raw `git grep`, `rg -a`, and
-blob scans do not parse compressed OOXML members, PDF metadata, nested archives,
-or rendered content. Materialize the regular-file blobs from the exact commit
-into the private review directory before running the format-aware pass; do not
-substitute the current working tree or treat `git archive` as an identity-
-preserving materialization. Archive generation obeys committed
-`.gitattributes`, so `export-ignore` can omit tracked paths and `export-subst`
-can rewrite bytes.
-
-```bash
-test -n "${ANON_GIT_SCAN_DIR:-}" && test -d "$ANON_GIT_SCAN_DIR" || exit 1
-ANON_COMMIT_TREE="$ANON_GIT_SCAN_DIR/exact-commit-tree"
-test ! -e "$ANON_COMMIT_TREE" || exit 1
-mkdir "$ANON_COMMIT_TREE" || exit 1
-python3 - "$ANON_COMMIT" "$ANON_COMMIT_TREE" <<'PY' || exit 1
 import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 
-commit, destination = sys.argv[1:]
-root = Path(destination).resolve(strict=True)
+commit, destination_text = sys.argv[1:]
+destination = Path(destination_text).resolve(strict=True)
 listing = subprocess.run(
     ["git", "--no-replace-objects", "ls-tree", "-rz", "--full-tree", commit],
     check=True,
     stdout=subprocess.PIPE,
 ).stdout
+
 for record in listing.split(b"\0"):
     if not record:
         continue
     header, raw_path = record.split(b"\t", 1)
     mode, object_type, oid = header.decode("ascii").split()
-    if object_type != "blob" or mode == "120000":
-        # Symlink target blobs and gitlinks are reviewed separately by the
-        # mandatory inventory above; never create a live symlink here.
-        continue
-    if mode not in {"100644", "100755"}:
-        raise SystemExit(f"unsupported tree mode {mode}")
+    if object_type != "blob" or mode not in {"100644", "100755"}:
+        raise SystemExit(f"anonymous artifacts require regular tracked files: {raw_path!r}")
     path_text = os.fsdecode(raw_path)
+    if os.fsencode(path_text) != raw_path:
+        raise SystemExit("tracked path is not reversibly decodable")
     relative = PurePosixPath(path_text)
-    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
-        raise SystemExit("unsafe tree path")
-    target = root.joinpath(*relative.parts)
+    if relative.is_absolute() or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
+        raise SystemExit("unsafe tracked path")
+    if any(ord(character) < 32 or ord(character) == 127 for character in path_text):
+        raise SystemExit("control character in tracked path")
+    target = destination.joinpath(*relative.parts)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = subprocess.run(
         ["git", "--no-replace-objects", "cat-file", "blob", oid],
         check=True,
         stdout=subprocess.PIPE,
     ).stdout
-    with target.open("xb") as stream:
-        stream.write(payload)
+    with target.open("xb") as output:
+        output.write(payload)
+    target.chmod(0o755 if mode == "100755" else 0o644)
 PY
 
-# Separately inspect the projection that git archive would deliver. This view
-# may intentionally differ from the raw tree because of committed attributes.
-ANON_COMMIT_EXPORT="$ANON_GIT_SCAN_DIR/archive-projection"
-test ! -e "$ANON_COMMIT_EXPORT" || exit 1
-mkdir "$ANON_COMMIT_EXPORT" || exit 1
 git --no-replace-objects archive --format=tar "$ANON_COMMIT" \
-  > "$ANON_GIT_SCAN_DIR/archive-projection.tar" || exit 1
-tar -tf "$ANON_GIT_SCAN_DIR/archive-projection.tar" \
-  > "$ANON_GIT_SCAN_DIR/archive-projection-members" || exit 1
-tar -xf "$ANON_GIT_SCAN_DIR/archive-projection.tar" \
-  -C "$ANON_COMMIT_EXPORT" || exit 1
+  >"$ANON_SCAN_DIR/archive-projection.tar"
+python3 "$ANON_SCAN_DIR/safe_tar.py" \
+  "$ANON_SCAN_DIR/archive-projection.tar" "$ANON_COMMIT_EXPORT"
 ```
 
-The blob materializer deliberately skips live symlink creation; review every
-mode `120000` target from the earlier inventory and scan the referenced bytes
-under the stated symlink policy. Review gitlinks recursively. Keep the tar
-member inventory private, inspect unusual names and symlink entries, and
-confirm extraction stayed inside the fresh empty directory. Compare the
-archive projection with the cached attribute inventory and disposition every
-path affected by `export-ignore` or `export-subst`. Both views are tied to
-`ANON_COMMIT`; regenerating either from another revision requires restarting
-the review.
+The raw tree ignores export transformations by design. The archive projection
+applies committed `export-ignore` and `export-subst` attributes. Review both;
+neither is a substitute for the other.
 
-Apply every MIME, metadata, extraction, rendering, and manual visual check below
-to the raw `$ANON_COMMIT_TREE`, the `$ANON_COMMIT_EXPORT` archive projection,
-and `$ANON_OUTPUT_DIR`. First inventory every relevant file, then record the
-tool versions and output for each file:
+## Equal scans for all three inventories
+
+The following helper rejects symlinks, special files, undecodable/control
+characters in paths, and detector failures. It applies the same content
+detectors to the raw commit tree, archive projection, and generated output.
+Path-name candidates use the same identity/path patterns, while secret-like
+filenames receive a separate detector.
 
 ```bash
-file --version
+cat >"$ANON_SCAN_DIR/path_candidates.py" <<'PY'
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import re
+
+parser = argparse.ArgumentParser()
+parser.add_argument("root")
+parser.add_argument("pattern")
+args = parser.parse_args()
+root = Path(args.root).resolve(strict=True)
+pattern = re.compile(args.pattern, re.IGNORECASE)
+
+for current, directories, files in os.walk(root, followlinks=False):
+    current_path = Path(current)
+    for name in sorted([*directories, *files]):
+        path = current_path / name
+        if path.is_symlink():
+            raise SystemExit(f"symlink is not allowed: {path}")
+        relative = path.relative_to(root).as_posix()
+        if ".git" in Path(relative).parts:
+            raise SystemExit(f"Git metadata is not allowed in packed roots: {relative!r}")
+        if any(ord(character) < 32 or ord(character) == 127 for character in relative):
+            raise SystemExit(f"control character in path: {relative!r}")
+        if path.is_dir() or path.is_file():
+            if pattern.search(relative):
+                print(os.fspath(path), end="\0")
+        else:
+            raise SystemExit(f"special file is not allowed: {path}")
+PY
+
+scan_root() {
+  local label="$1"
+  local root="$2"
+  local destination="$3"
+  mkdir -p "$destination"
+  test -d "$root"
+
+  capture_matches "$destination/$label.identity-content.nul" \
+    rg -ali0 --hidden --no-ignore -e "$ANON_IDENTITY_PATTERN" -- "$root"
+  capture_matches "$destination/$label.path-content.nul" \
+    rg -ali0 --hidden --no-ignore -e "$ANON_PATH_PATTERN" -- "$root"
+  capture_matches "$destination/$label.secret-content.nul" \
+    rg -ali0 --hidden --no-ignore \
+      -e "$ANON_SECRET_PATTERN" -e "$ANON_PRIVATE_KEY_PATTERN" -- "$root"
+
+  python3 "$ANON_SCAN_DIR/path_candidates.py" \
+    "$root" "$ANON_IDENTITY_PATTERN" \
+    >"$destination/$label.identity-name.nul"
+  python3 "$ANON_SCAN_DIR/path_candidates.py" \
+    "$root" "$ANON_PATH_PATTERN" \
+    >"$destination/$label.path-name.nul"
+  python3 "$ANON_SCAN_DIR/path_candidates.py" \
+    "$root" '(^|/)(\.env($|\.)|[^/]*(key|token|credential|cookie|secret)[^/]*)' \
+    >"$destination/$label.secret-name.nul"
+}
+
+ANON_PRIMARY_SCAN="$ANON_SCAN_DIR/primary-scan"
+mkdir "$ANON_PRIMARY_SCAN"
+scan_root commit-tree "$ANON_COMMIT_TREE" "$ANON_PRIMARY_SCAN"
+scan_root archive-projection "$ANON_COMMIT_EXPORT" "$ANON_PRIMARY_SCAN"
+scan_root generated-output "$ANON_OUTPUT_DIR" "$ANON_PRIMARY_SCAN"
+```
+
+An approved entropy/secret scanner must also run over the same three roots. Its
+redacted candidate paths are added to the disposition process below. Generic
+patterns do not cover provider-specific tokens, JWTs, encoded credentials, or
+high-entropy secrets.
+
+### Exact candidate dispositions
+
+Intentional fixtures and documentation often contain words such as `api_key`.
+They may remain only after two humans review the exact bytes. Build one private
+candidate manifest whose key is detector, root label, relative path, kind, and
+SHA-256 (directories use `null`). Filenames are recorded; matching contents are
+not copied into the log.
+
+```bash
+cat >"$ANON_SCAN_DIR/candidate_manifest.py" <<'PY'
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+
+
+def digest(path: Path) -> str | None:
+    if path.is_dir():
+        return None
+    value = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def key(row: dict[str, object]) -> tuple[object, ...]:
+    return tuple(row[field] for field in ("detector", "root", "path", "kind", "sha256"))
+
+
+parser = argparse.ArgumentParser()
+subparsers = parser.add_subparsers(dest="command", required=True)
+build = subparsers.add_parser("build")
+build.add_argument("--scan-dir", required=True)
+build.add_argument("--root", action="append", required=True)
+build.add_argument("--output", required=True)
+verify = subparsers.add_parser("verify")
+verify.add_argument("--candidates", required=True)
+verify.add_argument("--dispositions", required=True)
+verify.add_argument("--root", action="append")
+args = parser.parse_args()
+
+if args.command == "build":
+    roots: dict[str, Path] = {}
+    for item in args.root:
+        label, separator, raw_root = item.partition("=")
+        if not separator or not label or label in roots:
+            raise SystemExit("each --root must be a unique label=/absolute/path")
+        roots[label] = Path(raw_root).resolve(strict=True)
+    rows: dict[tuple[object, ...], dict[str, object]] = {}
+    for match_file in sorted(Path(args.scan_dir).glob("*.nul")):
+        label, separator, detector = match_file.name.removesuffix(".nul").partition(".")
+        if not separator or label not in roots:
+            raise SystemExit(f"unexpected match file: {match_file.name}")
+        for raw_path in match_file.read_bytes().split(b"\0"):
+            if not raw_path:
+                continue
+            path_text = os.fsdecode(raw_path)
+            if os.fsencode(path_text) != raw_path:
+                raise SystemExit("candidate path is not reversibly decodable")
+            path = Path(path_text)
+            try:
+                relative = path.relative_to(roots[label]).as_posix()
+            except ValueError as error:
+                raise SystemExit(f"candidate escaped root: {path}") from error
+            if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                raise SystemExit(f"candidate is not a regular file/directory: {path}")
+            row = {
+                "detector": detector,
+                "root": label,
+                "path": relative,
+                "kind": "file" if path.is_file() else "directory",
+                "sha256": digest(path),
+            }
+            rows[key(row)] = row
+    output = Path(args.output)
+    output.write_text(
+        json.dumps(sorted(rows.values(), key=key), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+else:
+    candidates = json.loads(Path(args.candidates).read_text(encoding="utf-8"))
+    dispositions = json.loads(Path(args.dispositions).read_text(encoding="utf-8"))
+    if not isinstance(candidates, list) or not isinstance(dispositions, list):
+        raise SystemExit("candidate and disposition documents must be JSON arrays")
+    selected_roots = set(args.root or [])
+    candidate_by_key = {
+        key(row): row for row in candidates
+        if not selected_roots or row.get("root") in selected_roots
+    }
+    disposition_by_key: dict[tuple[object, ...], dict[str, object]] = {}
+    for row in dispositions:
+        if selected_roots and row.get("root") not in selected_roots:
+            continue
+        row_key = key(row)
+        if row_key in disposition_by_key:
+            raise SystemExit(f"duplicate disposition: {row_key}")
+        if row.get("disposition") != "intentional non-identifying fixture":
+            raise SystemExit(f"candidate must be removed/replaced or explicitly retained: {row_key}")
+        reviewer = str(row.get("reviewer") or "").strip()
+        second = str(row.get("second_reviewer") or "").strip()
+        reviewed_at = str(row.get("reviewed_at") or "")
+        if not reviewer or not second or reviewer == second:
+            raise SystemExit(f"two distinct reviewers are required: {row_key}")
+        if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", reviewed_at) is None:
+            raise SystemExit(f"invalid reviewed_at date: {row_key}")
+        disposition_by_key[row_key] = row
+    missing = sorted(set(candidate_by_key) - set(disposition_by_key))
+    stale = sorted(set(disposition_by_key) - set(candidate_by_key))
+    if missing or stale:
+        raise SystemExit(f"disposition mismatch: missing={missing}, stale={stale}")
+PY
+
+ANON_PRIMARY_CANDIDATES="$ANON_SCAN_DIR/primary-candidates.json"
+python3 "$ANON_SCAN_DIR/candidate_manifest.py" build \
+  --scan-dir "$ANON_PRIMARY_SCAN" \
+  --root "commit-tree=$ANON_COMMIT_TREE" \
+  --root "archive-projection=$ANON_COMMIT_EXPORT" \
+  --root "generated-output=$ANON_OUTPUT_DIR" \
+  --output "$ANON_PRIMARY_CANDIDATES"
+
+python3 - "$ANON_PRIMARY_CANDIDATES" "$ANON_RECORDED_CANDIDATES" <<'PY'
+import os
+from pathlib import Path
+import sys
+
+current = Path(sys.argv[1]).read_bytes()
+recorded = Path(sys.argv[2])
+if recorded.is_symlink():
+    raise SystemExit("recorded candidate path must not be a symbolic link")
+if recorded.exists():
+    if not recorded.is_file() or recorded.read_bytes() != current:
+        raise SystemExit("candidate inventory changed; discard the old review and restart")
+else:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(recorded, flags, 0o600)
+    with os.fdopen(descriptor, "wb") as output:
+        output.write(current)
+PY
+
+if ! test -f "$ANON_DISPOSITIONS"; then
+  printf 'review is required; candidates persisted at %s\n' \
+    "$ANON_RECORDED_CANDIDATES" >&2
+  printf 'create the reviewed disposition array at %s, then rerun\n' \
+    "$ANON_DISPOSITIONS" >&2
+  exit 3
+fi
+
+python3 "$ANON_SCAN_DIR/candidate_manifest.py" verify \
+  --candidates "$ANON_PRIMARY_CANDIDATES" \
+  --dispositions "$ANON_DISPOSITIONS"
+```
+
+The first scan always persists its exact candidate manifest in
+`ANON_REVIEW_DIR` and exits with status `3` when the matching disposition file
+does not exist. The temporary-directory cleanup therefore cannot erase the only
+copy needed to bootstrap review. Review candidate metadata—not matching
+content—and create the disposition JSON. Each retained entry repeats the five
+candidate key fields and adds:
+
+```json
+{
+  "disposition": "intentional non-identifying fixture",
+  "reviewer": "private-reviewer-id",
+  "second_reviewer": "different-private-reviewer-id",
+  "reviewed_at": "2099-01-31"
+}
+```
+
+The values above are format examples, not real review evidence. Removed or
+replaced matches disappear on the next scan; they must not be approved as still
+present. Any byte change changes SHA-256 and invalidates its disposition. Stale
+dispositions also fail so the record cannot silently describe another artifact.
+
+## Git history when Git metadata is delivered
+
+Prefer the final source archive below, which excludes `.git`. If Git metadata,
+a bundle, or repository clone is itself the deliverable, all-ref inventory is
+not enough. Scan every reachable object without replace-object substitution and
+then every object in the object database, including unreachable objects:
+
+```bash
+git --no-replace-objects rev-list --objects --all \
+  >"$ANON_SCAN_DIR/reachable-objects"
+git --no-replace-objects cat-file \
+  --batch-check='%(objectname) %(objecttype) %(objectsize) %(rest)' \
+  <"$ANON_SCAN_DIR/reachable-objects" \
+  >"$ANON_SCAN_DIR/reachable-metadata"
+git --no-replace-objects cat-file --batch-all-objects \
+  --batch-check='%(objectname) %(objecttype) %(objectsize)' \
+  >"$ANON_SCAN_DIR/all-object-metadata"
+
+scan_object_metadata() {
+  local metadata="$1"
+  local findings="$2"
+  : >"$findings"
+  while IFS=' ' read -r object_oid object_type object_size object_path; do
+    case "$object_type" in
+      commit|tag|tree|blob)
+        git --no-replace-objects cat-file "$object_type" "$object_oid" \
+          >"$ANON_SCAN_DIR/object-bytes"
+        local status
+        set +e
+        rg -a -qi \
+          -e "$ANON_IDENTITY_PATTERN" -e "$ANON_PATH_PATTERN" \
+          -e "$ANON_SECRET_PATTERN" -e "$ANON_PRIVATE_KEY_PATTERN" \
+          "$ANON_SCAN_DIR/object-bytes"
+        status=$?
+        set -e
+        case "$status" in
+          0) printf '%s\t%s\t%s\t%s\n' \
+               "$object_oid" "$object_type" "$object_size" "${object_path:-}" \
+               >>"$findings" ;;
+          1) ;;
+          *) return "$status" ;;
+        esac
+        ;;
+      *) printf 'unexpected object type: %s\n' "$object_type" >&2; return 1 ;;
+    esac
+  done <"$metadata"
+}
+
+scan_object_metadata "$ANON_SCAN_DIR/reachable-metadata" \
+  "$ANON_SCAN_DIR/reachable-findings"
+scan_object_metadata "$ANON_SCAN_DIR/all-object-metadata" \
+  "$ANON_SCAN_DIR/all-object-findings"
+```
+
+Review ref names, config, remotes, reflogs, signatures, commit/tag bodies,
+object paths, object bytes, hooks, and every copied `.git` metadata file. Do not
+put raw URLs, credentials, or matched bytes in the shared log. A history rewrite
+requires a fresh clone/export and a complete rerun; pruning does not prove a
+copied object database anonymous. Any unresolved history finding keeps the gate
+open.
+
+## Format-aware and visual review
+
+Raw regexes do not parse compressed OOXML, PDF metadata, notebook outputs,
+nested archives, or screenshots. Apply the same format-aware review to
+`$ANON_COMMIT_TREE`, `$ANON_COMMIT_EXPORT`, and `$ANON_OUTPUT_DIR`:
+
+```bash
 for ANON_BINARY_ROOT in \
   "$ANON_COMMIT_TREE" "$ANON_COMMIT_EXPORT" "$ANON_OUTPUT_DIR"; do
-  test -d "$ANON_BINARY_ROOT" || exit 1
-  find "$ANON_BINARY_ROOT" -type f -exec file --mime-type -- '{}' \; |
-    LC_ALL=C sort || exit 1
-  find "$ANON_BINARY_ROOT" -type f \( \
-    -iname '*.pdf' -o -iname '*.doc' -o -iname '*.docx' -o \
-    -iname '*.ppt' -o -iname '*.pptx' -o -iname '*.xls' -o \
-    -iname '*.xlsx' -o -iname '*.odt' -o -iname '*.ods' -o \
-    -iname '*.ipynb' -o -iname '*.png' -o -iname '*.jpg' -o \
-    -iname '*.jpeg' -o -iname '*.gif' -o -iname '*.tiff' -o \
-    -iname '*.webp' -o -iname '*.svg' -o -iname '*.heic' -o \
-    -iname '*.mp4' -o -iname '*.mov' -o -iname '*.webm' -o \
-    -iname '*.whl' -o -iname '*.zip' -o -iname '*.7z' -o \
-    -iname '*.tar' -o -iname '*.tar.gz' -o -iname '*.tgz' -o \
-    -iname '*.gz' -o -iname '*.bz2' -o -iname '*.xz' -o \
-    -iname '*.parquet' -o -iname '*.pkl' -o -iname '*.pickle' -o \
-    -iname '*.npy' -o -iname '*.npz' -o -iname '*.onnx' -o \
-    -iname '*.bin' -o -iname '*.exe' -o -iname '*.dll' -o \
-    -iname '*.so' -o -iname '*.dylib' \
-  \) -print || exit 1
+  test -d "$ANON_BINARY_ROOT"
+  find "$ANON_BINARY_ROOT" -type f -exec file --mime-type -- '{}' \; \
+    | LC_ALL=C sort \
+    >"$ANON_SCAN_DIR/$(basename "$ANON_BINARY_ROOT").mime-inventory"
 done
-exiftool -ver
-pdfinfo -v
 ```
 
-The MIME inventory, not the extension list, is authoritative: classify every
-file, including extensionless files, executables, fonts, media, databases, model
-weights, and unfamiliar data/container formats. Record the `file` version (or
-the equivalent classifier and version on the review platform), then select a
-format-aware inspection tool for every non-plain-text result. For every listed
-file (replace angle-bracket placeholders below with real paths, without the
-brackets):
+Record tool versions. For each non-plain-text MIME type:
 
-- run `exiftool -a -G1 -s <file>` and remove or replace author, creator,
-  company, host, software-user, GPS, source-path, comment, and custom fields;
-- run `pdfinfo <file.pdf>` and `pdftotext <file.pdf> -` for each PDF, apply the
-  identity/path scan to the extracted text, render every page, and visually
-  inspect title pages, acknowledgements, headers, footers, annotations, and
-  links;
-- inspect `docProps/core.xml`, `docProps/app.xml`, comments, revisions, notes,
-  hidden slides/sheets, custom properties, and relationships in each OOXML
-  document (for example, `unzip -p <file.docx> docProps/core.xml`), then render
-  and visually inspect the document;
-- inspect image metadata and visually inspect every plot and screenshot for
-  account names, avatars, browser tabs, terminal prompts, absolute paths,
-  dashboard ids, and hidden/cropped identity;
-- render every notebook and inspect its kernel metadata, cell outputs, embedded
-  images, widget state, execution errors, and stored paths; and
-- inspect archive comments and the complete member list with `zipinfo -v`,
-  `unzip -l`, or `tar -tvf` as appropriate. Check member paths, ownership names,
-  symlink targets, `.git`, `.env`, logs, and secret-like filenames. Extract only
-  with a path-traversal-safe tool into a fresh directory, then repeat the text
-  and metadata scans recursively over the extracted contents. Treat wheels as
-  ZIP archives and inspect their `METADATA`, `WHEEL`, `entry_points.txt`, license
-  files, and every packaged source/resource; a structural package check is not
-  an anonymity scan. For the project wheel and sdist, also run
-  `uv run python scripts/check_release_artifacts.py <artifact-directory>`, which
-  validates release structure but does not replace the anonymity review.
+- inspect metadata with a format-aware tool such as `exiftool`;
+- use `pdfinfo`, `pdftotext`, and a full-page render for every PDF;
+- inspect OOXML core/app/custom properties, comments, revisions, relationships,
+  notes, hidden slides/sheets, and then render the document;
+- inspect notebook kernels, outputs, widgets, errors, embedded media, and paths;
+- inspect and visually review every image, plot, screenshot, audio, and video;
+- inspect executables, databases, model/data files, fonts, and unfamiliar
+  containers with a recorded suitable tool; and
+- list every nested archive member, reject unsafe/link/special members, extract
+  with a path-safe tool into a fresh directory, and recursively repeat the same
+  text, secret, MIME, metadata, and visual checks.
 
-Finally, hash the exact files that passed review and record those hashes beside
-the commit, scan patterns, tool versions, commands, outputs, hit dispositions,
-manual reviewer, and review date. If an artifact is regenerated or repackaged,
-its hash changes and the binary/archive inspection must be repeated.
+For the project wheel and source distribution, also run
+`uv run python scripts/check_release_artifacts.py <artifact-directory>`.
+Structural validation is not an anonymity scan.
+
+## Build, hash, safely unpack, and rescan the final archive
+
+Only the reviewed archive projection and reviewed generated output are packed.
+The raw commit tree is evidence for transformations, not a second copy in the
+deliverable. The builder rejects links and special files, emits deterministic
+ownership/time metadata, and never includes `.git` implicitly.
 
 ```bash
-ANON_FINAL_COMMIT=$(git rev-parse --verify 'HEAD^{commit}') || exit 1
-ANON_FINAL_STATUS=$(git status --porcelain=v1 --untracked-files=all) || exit 1
-test "$ANON_FINAL_COMMIT" = "$ANON_COMMIT"
-test -z "$ANON_FINAL_STATUS"
-find "$ANON_OUTPUT_DIR" -type f -exec shasum -a 256 '{}' \; | LC_ALL=C sort
+cat >"$ANON_SCAN_DIR/tree_inventory.py" <<'PY'
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("root")
+args = parser.parse_args()
+root = Path(args.root).resolve(strict=True)
+rows: list[dict[str, object]] = []
+
+for path in [root, *sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix())]:
+    if path.is_symlink() or not (path.is_dir() or path.is_file()):
+        raise SystemExit(f"only ordinary files/directories may be inventoried: {path}")
+    relative = path.relative_to(root).as_posix()
+    if ".git" in Path(relative).parts:
+        raise SystemExit(f"Git metadata is not allowed in packed roots: {relative!r}")
+    if any(ord(character) < 32 or ord(character) == 127 for character in relative):
+        raise SystemExit(f"control character in inventoried path: {relative!r}")
+    row: dict[str, object] = {
+        "path": relative,
+        "kind": "directory" if path.is_dir() else "file",
+        # Compare the normalized mode emitted by build_final_tar.py, not the
+        # review host's umask-dependent staging mode.
+        "mode": "0755" if path.is_dir() or path.stat().st_mode & 0o111 else "0644",
+        "size": 0 if path.is_dir() else path.stat().st_size,
+        "sha256": None,
+    }
+    if path.is_file():
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        row["sha256"] = digest.hexdigest()
+    rows.append(row)
+
+print(json.dumps(rows, indent=2, sort_keys=True))
+PY
+
+python3 "$ANON_SCAN_DIR/tree_inventory.py" "$ANON_COMMIT_TREE" \
+  >"$ANON_SCAN_DIR/commit-tree.inventory.json"
+python3 "$ANON_SCAN_DIR/tree_inventory.py" "$ANON_COMMIT_EXPORT" \
+  >"$ANON_SCAN_DIR/source.expected.inventory.json"
+python3 "$ANON_SCAN_DIR/tree_inventory.py" "$ANON_OUTPUT_DIR" \
+  >"$ANON_SCAN_DIR/generated.expected.inventory.json"
+
+cat >"$ANON_SCAN_DIR/build_final_tar.py" <<'PY'
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import tarfile
+
+parser = argparse.ArgumentParser()
+parser.add_argument("archive")
+parser.add_argument("--source", required=True)
+parser.add_argument("--generated", required=True)
+args = parser.parse_args()
+archive_path = Path(args.archive)
+roots = {
+    "artifact/source": Path(args.source).resolve(strict=True),
+    "artifact/generated": Path(args.generated).resolve(strict=True),
+}
+
+with tarfile.open(archive_path, "x", format=tarfile.PAX_FORMAT) as archive:
+    for prefix, root in roots.items():
+        entries = [root, *sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix())]
+        for path in entries:
+            if path.is_symlink() or not (path.is_dir() or path.is_file()):
+                raise ValueError(f"only ordinary files/directories may be packed: {path}")
+            relative = path.relative_to(root).as_posix()
+            name = prefix if relative == "." else f"{prefix}/{relative}"
+            if any(ord(character) < 32 or ord(character) == 127 for character in name):
+                raise ValueError(f"control character in packed path: {name!r}")
+            info = archive.gettarinfo(path, arcname=name)
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            info.mtime = 0
+            info.mode = 0o755 if path.is_dir() or path.stat().st_mode & 0o111 else 0o644
+            if path.is_file():
+                with path.open("rb") as source:
+                    archive.addfile(info, source)
+            else:
+                archive.addfile(info)
+PY
+
+python3 "$ANON_SCAN_DIR/build_final_tar.py" "$ANON_FINAL_ARCHIVE" \
+  --source "$ANON_COMMIT_EXPORT" \
+  --generated "$ANON_OUTPUT_DIR"
+
+sha256_file() {
+  python3 - "$1" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+
+digest = hashlib.sha256()
+with Path(sys.argv[1]).open("rb") as source:
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
+
+ANON_FINAL_SHA256="$(sha256_file "$ANON_FINAL_ARCHIVE")"
+printf '%s  %s\n' "$ANON_FINAL_SHA256" "$ANON_FINAL_ARCHIVE"
+
+python3 "$ANON_SCAN_DIR/safe_tar.py" \
+  "$ANON_FINAL_ARCHIVE" "$ANON_FINAL_EXTRACT"
+
+ANON_FINAL_SCAN="$ANON_SCAN_DIR/final-scan"
+mkdir "$ANON_FINAL_SCAN"
+scan_root archive-projection \
+  "$ANON_FINAL_EXTRACT/artifact/source" "$ANON_FINAL_SCAN"
+scan_root generated-output \
+  "$ANON_FINAL_EXTRACT/artifact/generated" "$ANON_FINAL_SCAN"
+
+ANON_FINAL_CANDIDATES="$ANON_SCAN_DIR/final-candidates.json"
+python3 "$ANON_SCAN_DIR/candidate_manifest.py" build \
+  --scan-dir "$ANON_FINAL_SCAN" \
+  --root "archive-projection=$ANON_FINAL_EXTRACT/artifact/source" \
+  --root "generated-output=$ANON_FINAL_EXTRACT/artifact/generated" \
+  --output "$ANON_FINAL_CANDIDATES"
+python3 "$ANON_SCAN_DIR/candidate_manifest.py" verify \
+  --candidates "$ANON_FINAL_CANDIDATES" \
+  --dispositions "$ANON_DISPOSITIONS" \
+  --root archive-projection \
+  --root generated-output
+
+python3 "$ANON_SCAN_DIR/tree_inventory.py" "$ANON_COMMIT_EXPORT" \
+  >"$ANON_SCAN_DIR/source.refreshed.inventory.json"
+python3 "$ANON_SCAN_DIR/tree_inventory.py" "$ANON_OUTPUT_DIR" \
+  >"$ANON_SCAN_DIR/generated.refreshed.inventory.json"
+python3 "$ANON_SCAN_DIR/tree_inventory.py" \
+  "$ANON_FINAL_EXTRACT/artifact/source" \
+  >"$ANON_SCAN_DIR/source.extracted.inventory.json"
+python3 "$ANON_SCAN_DIR/tree_inventory.py" \
+  "$ANON_FINAL_EXTRACT/artifact/generated" \
+  >"$ANON_SCAN_DIR/generated.extracted.inventory.json"
+
+python3 - "$ANON_SCAN_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+for name in ("source", "generated"):
+    expected = (root / f"{name}.expected.inventory.json").read_bytes()
+    refreshed = (root / f"{name}.refreshed.inventory.json").read_bytes()
+    extracted = (root / f"{name}.extracted.inventory.json").read_bytes()
+    if expected != refreshed:
+        raise SystemExit(f"{name} input changed while the archive was built")
+    if expected != extracted:
+        raise SystemExit(f"{name} extracted inventory differs from reviewed input")
+PY
+
+find "$ANON_FINAL_EXTRACT" -type f -exec file --mime-type -- '{}' \; \
+  | LC_ALL=C sort \
+  >"$ANON_SCAN_DIR/final-extract.mime-inventory"
 ```
 
-On systems without `shasum`, use `sha256sum` and record that substitution.
+Repeat the MIME/metadata/nested-archive review on the safely extracted final
+tree. The commands compare deterministic path, kind, normalized mode, size, and
+SHA-256 inventories both against refreshed inputs and the extracted tree. Any
+difference is a failure. The initial archive hash is recorded only after
+construction and is recomputed after all extraction and review commands; the
+extracted bytes—not the staging directories—are the final evidence surface.
 
-## Runtime Artifact Commands
+Finally prove that the source did not move during review:
 
-These commands are baseline checks for a source artifact:
+```bash
+ANON_FINAL_COMMIT="$(git rev-parse --verify 'HEAD^{commit}')"
+ANON_FINAL_STATUS="$(git status --porcelain=v1 --untracked-files=all)"
+test "$ANON_FINAL_COMMIT" = "$ANON_COMMIT"
+test -z "$ANON_FINAL_STATUS"
+test -f "$ANON_FINAL_ARCHIVE"
+test -n "$ANON_FINAL_SHA256"
+ANON_VERIFIED_FINAL_SHA256="$(sha256_file "$ANON_FINAL_ARCHIVE")"
+test "$ANON_VERIFIED_FINAL_SHA256" = "$ANON_FINAL_SHA256"
+```
+
+If the archive, source commit, generated output, disposition file, or any
+reviewed binary changes, discard the result and restart.
+
+## Runtime validation
+
+Run the deterministic artifact baseline in a fresh clone before submission:
 
 ```bash
 uv sync --frozen
@@ -458,52 +995,31 @@ uv run python scripts/test_matrix.py --lane all
 uv run python scripts/check_test_invariants.py
 ```
 
-For an anonymous artifact branch, add a fresh-clone dry run before submission:
+Deno-backed tests run when Deno is installed. Use `--skip-real-deno` only when
+the submitted validation record explicitly says real Deno was excluded.
 
-```bash
-uv sync --frozen
-uv run python scripts/test_matrix.py --lane all
-```
+## Publication exit gate
 
-Deno-backed tests run by default when `deno` is installed. Tests that require a
-real Deno installation skip with a clear message when `deno` is missing; use
-`--skip-real-deno` only for runs that intentionally exclude them.
+The artifact is ready only when all of these statements are backed by the same
+private review record:
 
-## Documentation Consistency
+- license and package metadata agree;
+- the exact source commit is clean and unchanged;
+- the raw commit tree, archive projection, generated output, and safely
+  re-extracted final archive have complete inventories;
+- every detector completed successfully on all required roots;
+- every retained candidate has an exact current-byte disposition and two
+  distinct reviewers, with no stale or missing disposition;
+- all refs and, when shipped, all reachable/unreachable Git objects and Git
+  metadata have been reviewed;
+- every binary/container has completed format-aware, recursive, and visual
+  review with no unresolved identity or secret;
+- the final archive contains only regular files/directories, was extracted by
+  the rejecting path-safe extractor, and the extracted inventories match their
+  reviewed inputs;
+- fresh-clone runtime checks completed with environment gates stated; and
+- the recorded final SHA-256 matches the exact file being submitted.
 
-Use [README.md](../README.md) as the documentation index,
-[release_status.md](release_status.md) for the release contract, and
-[support_matrix.md](support_matrix.md) for environment coverage. Archived
-design and prelaunch notices are not current evidence. Documentation must not
-present Python JIT, direct external framework adapters, real GitHub providers,
-MCP Resources/Prompts, or unsupported rollback semantics as implemented.
-
-## Publication Exit Gate
-
-The artifact is ready to share only when:
-
-- the license metadata is internally consistent,
-- the CI workflow runs static compilation on Python 3.11 and deterministic
-  Python/security lanes on the endpoint versions listed in
-  `docs/support_matrix.md`; Python 3.12/3.13 remain declared but are not claimed
-  as per-change CI jobs,
-- every core invariant has test coverage or an explicit gap,
-- the benchmark contract uses task schema v1 and complete run-output schema v2,
-- benchmark harness documentation exists,
-- the raw tracked-blob tree, archive projection, and generated-output
-  inventories cover the exact commit and exact artifacts to be shared,
-- the recorded identity, absolute-path, credential, and secret scans have been
-  run against all three inventories and every hit has a reviewed disposition,
-- Git remotes, refs, and reachable history are anonymous when Git metadata is
-  shipped, or the final archive member list proves Git metadata is absent,
-- every Office, PDF, image, and archive file in the raw exact-commit tree,
-  deliverable archive projection, and generated-output inventory has completed
-  the format-aware metadata/content inspection above with no unresolved
-  identity or secret,
-- the final archive has been safely extracted and rescanned recursively, and
-- a second human has reviewed the scan record and the recorded SHA-256 hashes
-  match the exact files being submitted.
-
-The checklist's existence is not evidence that these checks ran. Any unresolved
-hit, uninspected generated file, changed post-scan hash, or missing human review
-keeps the publication gate open.
+This checklist is not a receipt. Any missing command result, detector error,
+unresolved match, changed hash, unsafe member, incomplete environment gate, or
+missing second review keeps publication blocked.
