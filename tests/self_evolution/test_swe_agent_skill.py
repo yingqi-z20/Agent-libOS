@@ -30,7 +30,7 @@ class TestSWEAgentSkill:
     def test_shipped_skill_pins_current_jit_extension_compatibility(self) -> None:
         skill_md = PACKAGE_ROOT.joinpath('SKILL.md').read_text(encoding='utf-8')
 
-        assert 'compatibility: agent-libos==1.4.2\n' in skill_md
+        assert 'compatibility: agent-libos==1.5.0\n' in skill_md
 
     def test_shipped_docs_explain_ripgrep_no_match_status(self) -> None:
         skill_md = PACKAGE_ROOT.joinpath('SKILL.md').read_text(encoding='utf-8')

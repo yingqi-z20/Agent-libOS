@@ -58,6 +58,38 @@ class TestTestMatrix:
         assert "--run-mcp" in command
         assert command[-2:] == ["-m", "not postgres and not real_llm"]
 
+    def test_run_mcp_rejects_an_incomplete_optional_dependency_set(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        parser = argparse.ArgumentParser()
+        monkeypatch.setattr(
+            test_matrix,
+            "missing_mcp_optional_dependencies",
+            lambda: ("httpx2", "opentelemetry-api"),
+        )
+
+        with pytest.raises(SystemExit):
+            test_matrix._validate_args(parser, _args(run_mcp=True))
+
+        error = capsys.readouterr().err
+        assert "httpx2, opentelemetry-api" in error
+        assert "uv sync --frozen --extra mcp" in error
+
+    def test_run_mcp_accepts_the_complete_optional_dependency_set(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        parser = argparse.ArgumentParser()
+        monkeypatch.setattr(
+            test_matrix,
+            "missing_mcp_optional_dependencies",
+            lambda: (),
+        )
+
+        test_matrix._validate_args(parser, _args(run_mcp=True))
+
     def test_keep_agent_outputs_sets_pytest_environment(self) -> None:
         assert test_matrix._pytest_env(_args(keep_agent_outputs=True)) == {
             "AGENT_LIBOS_KEEP_AGENT_OUTPUTS": "1"

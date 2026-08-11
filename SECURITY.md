@@ -8,8 +8,8 @@ corruption, containment failure, or vulnerable dependency are welcome.
 
 | Version | Current evidence and handling |
 | --- | --- |
-| Current `main` and the 1.4.2 release-candidate line | Target of current checked-in validation and best-effort fixes |
-| 1.3.x and older snapshots | No current validation or fix commitment; handling is decided per report |
+| Current `main` and the 1.5.0 release-candidate line | Target of current checked-in validation and best-effort fixes |
+| 1.4.x and older snapshots | No current validation or fix commitment; handling is decided per report |
 
 This table records repository evidence, not an owner-approved long-term support
 policy or SLA. A release-status page or CI run describes validation scope, not

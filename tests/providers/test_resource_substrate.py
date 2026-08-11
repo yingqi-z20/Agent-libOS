@@ -129,6 +129,304 @@ class TestResourceProviderSubstrate:
 
         assert substrate_base.executable_content_sha256(executable) == expected
 
+    def test_executable_hash_stops_when_deadline_expires_during_read(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        executable = tmp_path / "tool"
+        executable.write_bytes(b"x" * (3 * 1024 * 1024))
+        actual_read = os.read
+        observed_fds: list[int] = []
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+        clock = Clock()
+
+        class OsProxy:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(os, name)
+
+            def read(self, descriptor: int, size: int) -> bytes:
+                observed_fds.append(descriptor)
+                chunk = actual_read(descriptor, size)
+                clock.now = 2.0
+                return chunk
+
+        monkeypatch.setattr(substrate_base, "time", clock)
+        monkeypatch.setattr(substrate_base, "os", OsProxy())
+
+        with pytest.raises(TimeoutError, match="fingerprint read"):
+            substrate_base.executable_content_sha256(executable, deadline=1.0)
+
+        assert len(observed_fds) == 1
+        with pytest.raises(OSError):
+            os.fstat(observed_fds[0])
+
+    def test_executable_hash_fifo_swap_uses_nonblocking_open_and_fails_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        if os.name == "nt" or not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO executable swap regression is POSIX-only")
+        executable = tmp_path / "tool"
+        executable.write_bytes(b"regular-before-race")
+        actual_open = os.open
+        actual_stat = os.stat
+        swapped = False
+        observed_flags: list[int] = []
+
+        class OsProxy:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(os, name)
+
+            def stat(self, path: Any, *, follow_symlinks: bool = True) -> Any:
+                nonlocal swapped
+                result = actual_stat(path, follow_symlinks=follow_symlinks)
+                if not swapped and Path(path) == executable:
+                    executable.unlink()
+                    os.mkfifo(executable)
+                    swapped = True
+                return result
+
+            def open(self, path: Any, flags: int, *args: Any) -> int:
+                observed_flags.append(flags)
+                assert flags & os.O_NONBLOCK
+                return actual_open(path, flags, *args)
+
+        monkeypatch.setattr(substrate_base, "os", OsProxy())
+
+        with pytest.raises(ValidationError, match="regular file"):
+            substrate_base.executable_content_sha256(
+                executable,
+                deadline=time.monotonic() + 1.0,
+            )
+
+        assert swapped is True
+        assert len(observed_flags) == 1
+
+    def test_expired_snapshot_deadline_does_not_create_private_directory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        executable = tmp_path / "tool"
+        executable.write_bytes(b"snapshot-content")
+
+        class ExpiredClock:
+            @staticmethod
+            def monotonic() -> float:
+                return 2.0
+
+        class ForbiddenTempfile:
+            @staticmethod
+            def mkdtemp(*_args: Any, **_kwargs: Any) -> str:
+                raise AssertionError("expired snapshot must not create a directory")
+
+        monkeypatch.setattr(substrate_base, "time", ExpiredClock())
+        monkeypatch.setattr(substrate_base, "tempfile", ForbiddenTempfile())
+
+        with pytest.raises(TimeoutError, match="snapshot setup"):
+            snapshot_executable(executable, deadline=1.0)
+
+    @pytest.mark.parametrize("expire_during", ["read", "write"])
+    def test_executable_snapshot_copy_checks_deadline_after_each_io(
+        self,
+        expire_during: str,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        source = tmp_path / "source"
+        destination = tmp_path / "destination"
+        source.write_bytes(b"snapshot-content")
+        source_fd = os.open(source, os.O_RDONLY)
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        actual_read = os.read
+        actual_write = os.write
+        calls = {"read": 0, "write": 0}
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+        clock = Clock()
+
+        class OsProxy:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(os, name)
+
+            def read(self, descriptor: int, size: int) -> bytes:
+                calls["read"] += 1
+                chunk = actual_read(descriptor, size)
+                if expire_during == "read":
+                    clock.now = 2.0
+                return chunk
+
+            def write(self, descriptor: int, value: bytes) -> int:
+                calls["write"] += 1
+                written = actual_write(descriptor, value)
+                if expire_during == "write":
+                    clock.now = 2.0
+                return written
+
+        monkeypatch.setattr(substrate_base, "time", clock)
+        monkeypatch.setattr(substrate_base, "os", OsProxy())
+        try:
+            with pytest.raises(TimeoutError, match=f"snapshot {expire_during}"):
+                substrate_base._copy_executable_snapshot_bytes(
+                    source_fd,
+                    destination_fd,
+                    deadline=1.0,
+                )
+        finally:
+            os.close(destination_fd)
+            os.close(source_fd)
+
+        assert calls["read"] == 1
+        assert calls["write"] == (0 if expire_during == "read" else 1)
+
+    def test_snapshot_deadline_failure_closes_fds_and_removes_private_copy(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        executable = tmp_path / "tool"
+        executable.write_bytes(b"snapshot-content")
+        actual_open = os.open
+        actual_read = os.read
+        actual_mkdtemp = tempfile.mkdtemp
+        opened_fds: list[int] = []
+        snapshot_directories: list[Path] = []
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+        clock = Clock()
+
+        class OsProxy:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(os, name)
+
+            def open(self, path: Any, flags: int, *args: Any) -> int:
+                descriptor = actual_open(path, flags, *args)
+                opened_fds.append(descriptor)
+                return descriptor
+
+            def read(self, descriptor: int, size: int) -> bytes:
+                chunk = actual_read(descriptor, size)
+                clock.now = 2.0
+                return chunk
+
+        class TempfileProxy:
+            def mkdtemp(self, *args: Any, **kwargs: Any) -> str:
+                selected = actual_mkdtemp(*args, **kwargs)
+                snapshot_directories.append(Path(selected))
+                return selected
+
+        monkeypatch.setattr(substrate_base, "time", clock)
+        monkeypatch.setattr(substrate_base, "os", OsProxy())
+        monkeypatch.setattr(substrate_base, "tempfile", TempfileProxy())
+
+        with pytest.raises(TimeoutError, match="snapshot read"):
+            snapshot_executable(
+                executable,
+                sibling_policy="none",
+                deadline=1.0,
+            )
+
+        assert len(opened_fds) == 2
+        for descriptor in opened_fds:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+        assert len(snapshot_directories) == 1
+        assert not snapshot_directories[0].exists()
+
+    def test_snapshot_sibling_mirroring_stops_between_entries(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        if os.name == "nt":
+            pytest.skip("symlink iteration regression requires POSIX symlinks")
+        source_directory = tmp_path / "source"
+        snapshot_directory = tmp_path / "snapshot"
+        source_directory.mkdir()
+        snapshot_directory.mkdir()
+        executable = source_directory / "tool"
+        executable.write_bytes(b"tool")
+        (source_directory / "first").write_bytes(b"first")
+        (source_directory / "second").write_bytes(b"second")
+        actual_symlink_to = Path.symlink_to
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+        clock = Clock()
+
+        def expiring_symlink(
+            path: Path,
+            target: str | Path,
+            target_is_directory: bool = False,
+        ) -> None:
+            actual_symlink_to(
+                path,
+                target,
+                target_is_directory=target_is_directory,
+            )
+            clock.now = 2.0
+
+        monkeypatch.setattr(substrate_base, "time", clock)
+        monkeypatch.setattr(Path, "symlink_to", expiring_symlink)
+
+        with pytest.raises(TimeoutError, match="snapshot sibling mirror"):
+            substrate_base._mirror_executable_siblings(
+                executable,
+                snapshot_directory,
+                sibling_limit=4,
+                deadline=1.0,
+            )
+
+        assert len(list(snapshot_directory.iterdir())) == 1
+
+    def test_snapshot_deadline_is_optional_and_preserved_by_verify(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        executable = tmp_path / "tool"
+        executable.write_bytes(b"snapshot-content")
+        expected = hashlib.sha256(executable.read_bytes()).hexdigest()
+
+        assert substrate_base.executable_content_sha256(
+            executable,
+            deadline=time.monotonic() + 30.0,
+        ) == expected
+        with snapshot_executable(
+            executable,
+            sibling_policy="none",
+            deadline=time.monotonic() + 30.0,
+        ) as snapshot:
+            snapshot.verify(deadline=time.monotonic() + 30.0)
+            assert snapshot.content_sha256 == expected
+            with pytest.raises(TimeoutError, match="fingerprint setup"):
+                snapshot.verify(deadline=time.monotonic() - 1.0)
+
     def test_runtime_python_alias_requires_an_external_host_interpreter(
         self,
         monkeypatch: pytest.MonkeyPatch,

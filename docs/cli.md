@@ -248,10 +248,11 @@ uv run agent-libos --db .agent_libos.sqlite checkpoint --actor-pid <actor_pid> i
 
 ## Persistent Runtime Basics
 
-Agent libOS 1.4.2 opens only store schema v6. A canonical schema-v5 database is
-rejected before `init`, recovery, audit, or any other write until an operator
-uses the explicit offline `store migrate --to 6` workflow below. A v4 store
-must first use `store migrate --to 5`. Older,
+The current Runtime opens only store schema v7. A canonical schema-v6 database
+is rejected before `init`, recovery, audit, or any other write until an
+operator uses the explicit offline `store migrate --to 7` workflow below. A v5
+store must first use `store migrate --to 6`, and v4 must first use
+`store migrate --to 5`. Older,
 unversioned, and malformed stores remain unsupported; there is no implicit
 migration or read-only compatibility mode in ordinary Runtime startup.
 
@@ -438,14 +439,33 @@ Identification](semantic_shadow.md).
 ## Offline Store Migration
 
 `store migrate` is handled before `Runtime.open()` and is the only supported
-schema-v4 to schema-v5 and schema-v5 to schema-v6 path. Migrations are ordered;
-a v4 store must first complete `--to 5` and then independently plan/apply
-`--to 6`. Stop every CLI/GUI/embedded Runtime using the target first. Dry-run
+schema-v4 to v5, v5 to v6, and v6 to v7 path. Migrations are ordered; a v4
+store must independently plan/apply `--to 5`, then `--to 6`, then `--to 7`.
+Stop every CLI/GUI/embedded Runtime using the target first. Dry-run
 validates the complete canonical source shape against a private snapshot,
 performs zero writes beside the source, and returns a deterministic
 `plan_sha256`.
 
-For the current v5-to-v6 step:
+For the current v6-to-v7 step:
+
+```bash
+# Create an independent, quiesced, owner-only backup first.
+sqlite3 .agent_libos.sqlite ".backup '.agent_libos.v6.backup.sqlite'"
+chmod 600 .agent_libos.v6.backup.sqlite
+
+uv run agent-libos --db .agent_libos.sqlite store migrate --to 7 \
+  --dry-run --sqlite-backup .agent_libos.v6.backup.sqlite
+uv run agent-libos --db .agent_libos.sqlite store migrate --to 7 \
+  --apply --expected-plan-sha256 <plan_sha256> \
+  --sqlite-backup .agent_libos.v6.backup.sqlite
+```
+
+The PostgreSQL form uses the same target/digest flow and requires
+`--postgres-snapshot-confirmed` on apply. See the complete
+[v6-to-v7 runbook](storage.md#offline-v6-to-v7-migration) for the MCP v7 table,
+catalog, lease, backup, and rollback checks.
+
+For the preceding v5-to-v6 step:
 
 ```bash
 # Create an independent, quiesced, owner-only backup first.
@@ -546,7 +566,7 @@ status code 1.
 `task-run` is the Host CLI for a first-class Durable Task Run. It is separate
 from both the one-tool `workflow run` command and Object-bound background
 tasks. A Run supervises a root AgentProcess tree, persists a versioned goal and
-requirements, and exposes safe restart recovery through store schema v6.
+requirements, and exposes safe restart recovery through store schema v7.
 
 ```text
 task-run start
@@ -1295,8 +1315,88 @@ uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --a
 uv run agent-libos --db .agent_libos.sqlite mcp unregister demo-mcp
 ```
 
+Manifest v3 servers pinned to exact protocol revision `2026-07-28` expose the
+modern Host client commands:
+
+```bash
+# Resources and Templates are addressed only by registered logical ids.
+uv run agent-libos --db .agent_libos.sqlite mcp resources list demo-mcp
+uv run agent-libos --db .agent_libos.sqlite mcp resources templates demo-mcp
+uv run agent-libos --db .agent_libos.sqlite mcp resources read demo-mcp handbook --variables-json '{"locale":"zh-CN"}'
+
+# Prompt output is a preview requiring user confirmation; it is never trusted
+# as system/developer context.
+uv run agent-libos --db .agent_libos.sqlite mcp prompts list demo-mcp
+uv run agent-libos --db .agent_libos.sqlite mcp prompts get demo-mcp release-notes --arguments-json '{"version":"1.5.0"}'
+uv run agent-libos --db .agent_libos.sqlite mcp prompts complete demo-mcp prompt release-notes version 2
+
+# OAuth login is one foreground flow. It prints the authorization URL, waits
+# for the full callback URL, and completes before this Runtime exits.
+uv run agent-libos --db .agent_libos.sqlite mcp auth login work-oauth --profile-file oauth-profile.json --scope resources.read
+# Every later one-shot command explicitly rebinds the same strict Host profile.
+uv run agent-libos --db .agent_libos.sqlite mcp --oauth-profile-file oauth-profile.json auth status work-oauth
+uv run agent-libos --db .agent_libos.sqlite mcp --oauth-profile-file oauth-profile.json resources list demo-mcp
+# Confidential clients supply their secret through an inherited fd, never argv.
+uv run agent-libos --db .agent_libos.sqlite mcp auth login work-oauth --profile-file oauth-profile.json --client-secret-fd 3 3<client-secret
+uv run agent-libos --db .agent_libos.sqlite mcp auth logout work-oauth --profile-file oauth-profile.json
+
+# Durable Elicitation and Tasks use local ids plus revision CAS only.
+uv run agent-libos --db .agent_libos.sqlite mcp continuations inspect continuation-id
+uv run agent-libos --db .agent_libos.sqlite mcp continuations respond continuation-id --expected-revision 1 --human-request-id human-request-id --human-expected-revision 3 --human-preview-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --responses-json '{"input-1":{"action":"accept","content":{"approved":true}}}'
+uv run agent-libos --db .agent_libos.sqlite mcp continuations cancel continuation-id --expected-revision 1
+uv run agent-libos --db .agent_libos.sqlite mcp remote-tasks get local-task-ref
+uv run agent-libos --db .agent_libos.sqlite mcp remote-tasks update local-task-ref --expected-revision 1 --human-request-id human-request-id --human-expected-revision 4 --human-preview-sha256 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --responses-json '{"input-1":{"action":"accept","content":{"approved":true}}}'
+uv run agent-libos --db .agent_libos.sqlite mcp remote-tasks cancel local-task-ref --expected-revision 2
+
+# Notifications are inert Host ingress. The CLI owns one listener in this
+# foreground Runtime, streams events to stderr, and prints a final JSON summary
+# to stdout after its bound, terminal state, or Ctrl-C performs explicit stop.
+uv run agent-libos --db .agent_libos.sqlite mcp subscriptions listen demo-mcp --filter resourcesListChanged --max-seconds 300
+```
+
+Manifest and registry developer-experience commands are also Host-only. Live
+probe, scaffold transitions, and import apply require a named reviewer, a
+reason, and the matching explicit confirmation flag:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite mcp validate server.yaml
+uv run agent-libos --db .agent_libos.sqlite mcp doctor server.yaml
+uv run agent-libos --db .agent_libos.sqlite mcp probe server.yaml --confirm-probe --reviewer alice --reason 'review the unregistered full catalog'
+uv run agent-libos --db .agent_libos.sqlite mcp scaffold create base.yaml complete-probe.json --confirm-scaffold --reviewer alice --reason 'prepare allowlist candidate'
+uv run agent-libos --db .agent_libos.sqlite mcp scaffold approve reviewed-candidate.json --confirm-review --reviewer alice --reason 'approve edited authority contract'
+uv run agent-libos --db .agent_libos.sqlite mcp export --server demo-mcp > registry-export.json
+uv run agent-libos --db .agent_libos.sqlite mcp import plan registry-export.json
+uv run agent-libos --db .agent_libos.sqlite mcp import apply registry-export.json demo-mcp --confirm-import --reviewer alice --reason 'apply reviewed CAS plan'
+```
+
+`validate`, `doctor`, and both `scaffold` operations always open an ephemeral
+in-memory Runtime and ignore `--db`; they neither require a current persistent
+store schema nor read, migrate, or mutate the selected registry. `probe`,
+`export`, and both `import` operations intentionally use the selected store.
+`probe` is the only DX command above that crosses a provider boundary. It
+validates an unregistered Manifest v3 candidate and collects complete bounded
+Tool, Resource, Resource Template, and Prompt catalogs through the normal
+governed Runtime primitive without registering the candidate. Its report pins
+the exact source-manifest digest; `scaffold create` rejects a report produced
+for any other base manifest and carries all four catalogs into the conservative
+review bundle instead of silently discarding modern surfaces.
+`import apply` records the fixed Host boundary actor `mcp-cli-import`; it does
+not accept an actor override. The required reviewer and reason fields carry
+the human review attribution without allowing the registry audit actor to be
+relabeled from the command line.
+
 The manifest path is user supplied; copy and adapt [mcp.md](mcp.md). The `mcp`
-extra is not installed by the core dependency command.
+extra is not installed by the core dependency command. Host-mode registration
+reads at most `mcp.manifest_max_bytes + 1` bytes and requires valid UTF-8 before
+parsing; process-mode registration applies the same configured limit through
+the process filesystem primitive.
+
+`mcp list` returns `{servers, has_more}` rather than a bare array. A
+`has_more: true` value means the bounded window is incomplete; narrow `--text`
+or request a larger `--limit` within the configured registry ceiling instead of
+treating the returned servers as a complete inventory. That ceiling is
+`mcp.server_page_limit`; the deprecated `mcp.list_limit` applies only to
+Manifest v1/v2 live Tool catalogs and cannot truncate the server page.
 
 Registry commands accept `--actor-pid <pid>` with the following authority
 contract. Without it, mutations run as Host admin registry operations and emit
@@ -1313,9 +1413,88 @@ separate admin-operation audit.
 | `unregister` | exact server `admin` |
 | `call <pid> ...` | the target `<pid>` supplies the declared tool right and any stdio local-spawn rights; an explicitly supplied `--actor-pid` must equal `<pid>` and does not add authority |
 
+All modern groups (`resources`, `prompts`, `auth`, `continuations`,
+`remote-tasks`, and `subscriptions`) and all DX commands (`validate`, `doctor`,
+`probe`, `scaffold`, `export`, and `import`) reject `--actor-pid`. They are
+explicit Host surfaces and are not syscalls or model tools. The only additional
+model-visible surface is the separately governed Resource list/read pair when a
+Manifest v3 allowlist explicitly enables it.
+
+Resource, Prompt, and completion request objects are strict, byte-bounded JSON.
+Omission selects the documented default object, while an explicit JSON `null`
+is rejected. Resource variables and Prompt arguments require string values.
+Pagination cursors are opaque and `has_more` is derived from `next_cursor`; do
+not manufacture, decode, or reuse a cursor with another server or operation.
+
+Resource read and Prompt get may return `complete`, `input_required`, or
+`remote_task`; Prompt completion is complete-only. Continuation inspect is
+input-required-only, response may advance to any of the three result kinds,
+and cancellation is complete-only. Remote-Task get/update/cancel return only
+the local `remote_task` projection. Prompt `get` and Prompt completion both
+emit CLI-level `preview_only: true`, `user_confirmation_required: true`, and
+an untrusted user-context label. The Completion value itself retains only its
+Completion DTO fields; the CLI never inserts Prompt messages or completion
+output into a process, system prompt, or developer prompt.
+
+OAuth supports only Host-configured pre-registration and CIMD; DCR is not
+supported. A bounded, strict, extra-forbid profile JSON supplies the non-secret
+issuer/resource/client/redirect authority. `auth login` performs begin, manual
+browser authorization, callback input, and completion inside one foreground
+Runtime; there is deliberately no standalone `auth complete` command. A
+non-interactive caller must opt in with `--callback-stdin`, and callback values
+never appear in success or error JSON. The callback authorization code exists
+only in the foreground process's transient input/request memory for the single
+exchange attempt; the CLI releases its application-owned callback reference
+afterward and never writes the code to Store, broker storage, evidence, output,
+errors, or logs. A confidential client secret is accepted only through
+`--oauth-client-secret-fd` (or the login-local
+`--client-secret-fd`) and is never accepted as an argv or environment value.
+
+Successful client/token bundles remain only in deterministic secure-broker
+slots. Each later one-shot command must pass the same
+`mcp --oauth-profile-file ...` before its subcommand, which strictly rebinds
+that Host authority and can rehydrate the broker slot without putting a token,
+secret, or slot reference in RuntimeStore. `auth logout` likewise requires the
+profile file and explicitly purges the token. Runtime shutdown deletes every
+unfinished PKCE/state challenge, so no callback can be resumed by another CLI
+process. The default broker accepts only the exact reviewed `keyring==25.7.0`
+macOS Keychain, Windows Credential Manager, Linux Secret Service/libsecret, and
+KWallet 4/5 implementations; chained, plugin, lookalike, and unreviewed-version
+backends fail closed. With no accepted and operational secure credential
+backend, these operations fail closed.
+
+Continuation response and remote-Task update require the operation's
+`--expected-revision` plus the `--human-request-id`,
+`--human-expected-revision`, and `--human-preview-sha256` returned by the
+sanitized inspect/get view. Runtime first CAS-settles that exact HumanRequest
+preview, including its local identity, then consumes only its approved local
+responses. Each response is keyed by the local `input-N` id from that same
+view and contains an explicit `action`; a form acceptance carries its validated
+object under `content`. Cancellation requires only `--expected-revision`.
+The CLI does not accept binding hashes, effect ids, registry generations, auth
+principals, remote task ids, or deadlines. Runtime reconstructs and checks
+those bindings internally, and never replays the original Tool call. A remote
+Task cancellation acknowledgement is only a requested state, not proof that
+the remote work stopped. There is intentionally no `remote-tasks list` command.
+
+Subscription events are bounded untrusted ingress and cache-invalidation
+signals only. Reading them cannot launch a model, Tool, TaskRun, or another
+subscription. The CLI exposes only foreground `subscriptions listen`: start,
+event reads, status checks, and stop all happen in the same Runtime, and Ctrl-C
+still performs an explicit stop. It does not promise that a subscription id can
+be resumed by a later process. A lost listener requires a new foreground listen
+plus full refresh; the CLI neither sends `Last-Event-ID` nor performs hidden
+reconnect or replay. Long-lived Host Python and GUI surfaces may expose separate
+start/status/events/stop controls because they retain the owning Runtime.
+Event reads are single-consumer and acknowledge the returned batch: the next
+read must send the last returned local sequence as `after`. Empty reads retain
+the current cursor. Stale/future cursors and competing readers fail closed;
+the foreground CLI and GUI advance their cursor only after a validated batch.
+
 `--arguments-json`, when present, must be a strict JSON object; malformed JSON,
 duplicate object keys, non-finite numbers, arrays, and scalars are rejected
-before provider dispatch. Omitting it supplies `{}`.
+before provider dispatch. The encoded argument is rejected before JSON decode
+when it exceeds `mcp.max_request_hard_limit_bytes`. Omitting it supplies `{}`.
 
 Sink trust is intentionally not an MCP, model-tool, or process CLI registry.
 Administrators configure it under `data_flow.sink_rules` or use the Host-only
@@ -1330,6 +1509,10 @@ the pid additionally needs `process:spawn write` and `execute` on the exact
 wildcard that digest. Streamable HTTP servers do not need those two local-spawn
 grants. The CLI cannot supply arbitrary transports, commands, URLs, headers, or
 raw MCP tool names.
+
+`mcp call` always prints the structured call result. A returned MCP failure
+(`ok: false`) exits with status 1 after printing that JSON exactly once; the CLI
+does not retry the provider call.
 
 `mcp list` and `mcp inspect` show the Manifest version and configured protocol
 mode. `mcp discover`, live `mcp tools --refresh`, and `mcp call` project the

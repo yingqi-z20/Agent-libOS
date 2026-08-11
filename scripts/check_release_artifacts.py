@@ -14,10 +14,22 @@ import tarfile
 import tomllib
 import zipfile
 
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT_NAME = "agent-libos"
 ARCHIVE_NAME = "agent_libos"
+RELEASE_TARGET_VERSION = "1.5.0"
+MCP_EXTRA_REQUIREMENTS = (
+    "anyio<5,>=4.10; extra == 'mcp'",
+    "httpcore2<3,>=2.5; extra == 'mcp'",
+    "httpx2<3,>=2.5; extra == 'mcp'",
+    "keyring==25.7.0; extra == 'mcp'",
+    "mcp==2.0.0; extra == 'mcp'",
+    "opentelemetry-api<2,>=1.28; extra == 'mcp'",
+)
 EXPECTED_CONSOLE_SCRIPTS = {
     "agent-libos": "agent_libos.api.cli:cli",
     "agent-libos-gui-server": "agent_libos.api.gui.server:main",
@@ -59,10 +71,71 @@ BUILTIN_SKILL_ARCHIVE_PATHS = frozenset(
 )
 _BUILTIN_SKILL_MAX_FILE_BYTES = 24 * 1_024
 _BUILTIN_SKILL_MAX_INSTRUCTION_BYTES = 16 * 1_024
+_BUILTIN_SKILL_TOOL_COUNT = 101
 _BUILTIN_SKILL_FRONTMATTER_FIELDS = frozenset(
     {"name", "description", "allowed-tools"}
 )
 _BUILTIN_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
+
+
+MCP_WHEEL_REQUIRED_FILES = frozenset(
+    {
+        "agent_libos/mcp/__init__.py",
+        "agent_libos/mcp/_input.py",
+        "agent_libos/mcp/app_policy.py",
+        "agent_libos/mcp/client.py",
+        "agent_libos/mcp/continuations.py",
+        "agent_libos/mcp/dx.py",
+        "agent_libos/mcp/environment.py",
+        "agent_libos/mcp/human.py",
+        "agent_libos/mcp/manifest.py",
+        "agent_libos/mcp/oauth.py",
+        "agent_libos/mcp/prompts.py",
+        "agent_libos/mcp/providers.py",
+        "agent_libos/mcp/resources.py",
+        "agent_libos/mcp/runtime_bridge.py",
+        "agent_libos/mcp/sdk_subscriptions.py",
+        "agent_libos/mcp/side_effects.py",
+        "agent_libos/mcp/subscriptions.py",
+        "agent_libos/mcp/supervisor.py",
+        "agent_libos/mcp/tasks.py",
+        "agent_libos/mcp/types.py",
+        "agent_libos/mcp/wire.py",
+        "agent_libos/storage/mcp_v7.py",
+        "agent_libos/storage/mcp_v7_migration.py",
+        "agent_libos/storage/postgres_schema_contract.py",
+        "agent_libos/storage/postgres_schema_manifest.json",
+        "agent_libos/storage/v7_schema_contract.py",
+    }
+)
+MCP_SDIST_REQUIRED_FILES = frozenset(
+    {
+        "examples/mcp/README.md",
+        "examples/mcp/http-v3.yaml",
+        "examples/mcp/http_server.py",
+        "examples/mcp/run_lifecycle_e2e.py",
+        "examples/mcp/run_modern_contract_e2e.py",
+        "examples/mcp/run_oauth_e2e.py",
+        "examples/mcp/run_probe_scaffold_e2e.py",
+        "examples/mcp/run_tools_e2e.py",
+        "examples/mcp/stdio-v3.yaml",
+        "examples/mcp/stdio_server.py",
+        "docs/mcp.md",
+        "scripts/check_mcp_test_closure.py",
+        "scripts/mcp_conformance_oauth_harness.mts",
+        "scripts/mcp_dx.py",
+        "scripts/mcp_test_support.py",
+        "scripts/run_mcp_conformance.py",
+        "scripts/smoke_mcp_extra.py",
+        "scripts/smoke_mcp_installed_mrtr_tasks.py",
+        "tests/fixtures/mcp_sdk_v2/oauth_tls_server.py",
+        "tests/fixtures/mcp_sdk_v2/python_server.py",
+        "tests/fixtures/mcp_sdk_v2/tasks_extension_schema.json",
+        "tests/fixtures/mcp_sdk_v2/typescript_server/package-lock.json",
+        "tests/fixtures/mcp_sdk_v2/typescript_server/package.json",
+        "tests/fixtures/mcp_sdk_v2/typescript_server/server.mjs",
+    }
+)
 WHEEL_REQUIRED_FILES = frozenset(
     {
         "agent_libos/__init__.py",
@@ -71,7 +144,7 @@ WHEEL_REQUIRED_FILES = frozenset(
         "agent_libos/api/gui/server.py",
         "agent_libos/storage/tool_skill_migration.py",
     }
-) | BUILTIN_SKILL_ARCHIVE_PATHS
+) | BUILTIN_SKILL_ARCHIVE_PATHS | MCP_WHEEL_REQUIRED_FILES
 SDIST_REQUIRED_FILES = frozenset(
     {
         "LICENSE",
@@ -89,7 +162,7 @@ SDIST_REQUIRED_FILES = frozenset(
         "tests/invariants.yaml",
         "scripts/check_release_artifacts.py",
     }
-) | BUILTIN_SKILL_ARCHIVE_PATHS
+) | WHEEL_REQUIRED_FILES | MCP_SDIST_REQUIRED_FILES
 SDIST_FORBIDDEN_PARTS = frozenset(
     {
         ".benchmark_runs",
@@ -119,6 +192,11 @@ ALLOWED_SECRET_FIXTURE_SHA256 = {
 }
 ALLOWED_SECRET_FIXTURES = frozenset(ALLOWED_SECRET_FIXTURE_SHA256)
 CHECKSUM_MANIFEST_NAME = "SHA256SUMS"
+_FINAL_RELEASE_VERSION = re.compile(
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)\Z"
+)
 
 
 def _python_package_version(root: Path) -> str:
@@ -132,28 +210,107 @@ def _python_package_version(root: Path) -> str:
     raise ValueError("agent_libos.__version__ must be a string literal")
 
 
-def release_versions(root: Path = ROOT) -> dict[str, str]:
-    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-    uv_lock = tomllib.loads((root / "uv.lock").read_text(encoding="utf-8"))
-    project_lock = next(
-        (
-            package
-            for package in uv_lock.get("package", [])
-            if package.get("name") == PROJECT_NAME and package.get("source", {}).get("editable") == "."
-        ),
-        None,
+def _editable_lock_version(
+    root: Path,
+    relative_path: str,
+    *,
+    editable: str,
+) -> str:
+    lock = tomllib.loads((root / relative_path).read_text(encoding="utf-8"))
+    matches = [
+        package
+        for package in lock.get("package", [])
+        if package.get("name") == PROJECT_NAME
+        and isinstance(package.get("source"), dict)
+        and package["source"].get("editable") == editable
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"{relative_path} must contain exactly one editable "
+            f"{PROJECT_NAME} package from {editable!r}"
+        )
+    version = matches[0].get("version")
+    if not isinstance(version, str):
+        raise ValueError(
+            f"{relative_path} editable {PROJECT_NAME} version is invalid"
+        )
+    return version
+
+
+def _workflow_artifact_version(
+    root: Path,
+    variable: str,
+    *,
+    suffix: str,
+) -> str:
+    workflow_path = root / ".github" / "workflows" / "test.yml"
+    values: list[str] = []
+    for line in workflow_path.read_text(encoding="utf-8").splitlines():
+        key, separator, raw_value = line.strip().partition(":")
+        if separator and key == variable:
+            values.append(raw_value.strip())
+    if len(values) != 1:
+        raise ValueError(f"workflow must define {variable} exactly once")
+    value = values[0]
+    if value[:1] in {'"', "'"}:
+        if len(value) < 2 or value[-1] != value[0]:
+            raise ValueError(f"workflow {variable} must use balanced quotes")
+        value = value[1:-1]
+    prefix = f"dist/{ARCHIVE_NAME}-"
+    if not value.startswith(prefix) or not value.endswith(suffix):
+        raise ValueError(f"workflow {variable} is not a canonical artifact path")
+    version = value[len(prefix) : -len(suffix)]
+    if not version or "/" in version or "\\" in version:
+        raise ValueError(f"workflow {variable} version is invalid")
+    return version
+
+
+def _swe_agent_compatibility_version(root: Path) -> str:
+    path = root / "skills" / "swe-agent" / "SKILL.md"
+    matches = re.findall(
+        r"^compatibility:[ \t]+agent-libos==([^ \t\r\n]+)[ \t]*$",
+        path.read_text(encoding="utf-8"),
+        flags=re.MULTILINE,
     )
-    if project_lock is None:
-        raise ValueError(f"uv.lock does not contain the editable {PROJECT_NAME} package")
+    if len(matches) != 1:
+        raise ValueError(
+            "skills/swe-agent/SKILL.md must contain exactly one exact "
+            "agent-libos compatibility pin"
+        )
+    return matches[0]
+
+
+def release_versions(root: Path = ROOT) -> dict[str, str]:
+    pyproject = tomllib.loads(
+        (root / "pyproject.toml").read_text(encoding="utf-8")
+    )
     versions = {
         "pyproject.toml": str(pyproject["project"]["version"]),
         "agent_libos/__init__.py": _python_package_version(root),
-        "uv.lock": str(project_lock["version"]),
+        "uv.lock": _editable_lock_version(root, "uv.lock", editable="."),
+        "experiments/agentdojo/uv.lock": _editable_lock_version(
+            root,
+            "experiments/agentdojo/uv.lock",
+            editable="../../",
+        ),
+        ".github/workflows/test.yml RELEASE_WHEEL": _workflow_artifact_version(
+            root,
+            "RELEASE_WHEEL",
+            suffix="-py3-none-any.whl",
+        ),
+        ".github/workflows/test.yml RELEASE_SDIST": _workflow_artifact_version(
+            root,
+            "RELEASE_SDIST",
+            suffix=".tar.gz",
+        ),
+        "skills/swe-agent/SKILL.md": _swe_agent_compatibility_version(root),
     }
     gui_package_path = root / "gui" / "package.json"
     gui_lock_path = root / "gui" / "package-lock.json"
     if gui_package_path.exists() != gui_lock_path.exists():
-        raise ValueError("GUI package metadata must include both package.json and package-lock.json")
+        raise ValueError(
+            "GUI package metadata must include both package.json and package-lock.json"
+        )
     if gui_package_path.exists():
         gui_package = json.loads(gui_package_path.read_text(encoding="utf-8"))
         gui_lock = json.loads(gui_lock_path.read_text(encoding="utf-8"))
@@ -171,10 +328,28 @@ def release_versions(root: Path = ROOT) -> dict[str, str]:
 def validate_version_alignment(root: Path = ROOT) -> str:
     versions = release_versions(root)
     selected = versions["pyproject.toml"]
-    mismatches = {source: version for source, version in versions.items() if version != selected}
+    mismatches = {
+        source: version
+        for source, version in versions.items()
+        if version != selected
+    }
     if mismatches:
-        details = ", ".join(f"{source}={version}" for source, version in mismatches.items())
-        raise ValueError(f"release version identifiers do not match {selected}: {details}")
+        details = ", ".join(
+            f"{source}={version}" for source, version in mismatches.items()
+        )
+        raise ValueError(
+            f"release version identifiers do not match {selected}: {details}"
+        )
+    if _FINAL_RELEASE_VERSION.fullmatch(selected) is None:
+        raise ValueError(
+            "release version must use final-form numeric X.Y.Z with ASCII digits "
+            "and no leading zeros"
+        )
+    if selected != RELEASE_TARGET_VERSION:
+        raise ValueError(
+            f"release target version must be exactly {RELEASE_TARGET_VERSION}, "
+            f"found {selected}"
+        )
     return selected
 
 
@@ -408,9 +583,10 @@ def _validate_builtin_skill_archive_payloads(payloads: dict[str, bytes]) -> None
                     f"archive built-in tool {tool} is owned by both {previous} and {skill_id}"
                 )
             owner_by_tool[tool] = skill_id
-    if len(owner_by_tool) != 99:
+    if len(owner_by_tool) != _BUILTIN_SKILL_TOOL_COUNT:
         raise ValueError(
-            f"archive built-in Skill catalog must own exactly 99 tools, found {len(owner_by_tool)}"
+            "archive built-in Skill catalog must own exactly "
+            f"{_BUILTIN_SKILL_TOOL_COUNT} tools, found {len(owner_by_tool)}"
         )
 
 
@@ -441,6 +617,58 @@ def _validate_console_scripts(raw: bytes) -> None:
         raise ValueError(
             "wheel console entry points mismatch: "
             f"missing={missing}, unexpected={unexpected}, mismatched={mismatched}"
+        )
+
+
+def _requirement_signature(requirement: Requirement) -> tuple[str, tuple[str, ...], str, str]:
+    return (
+        canonicalize_name(requirement.name),
+        tuple(sorted(canonicalize_name(extra) for extra in requirement.extras)),
+        str(requirement.specifier),
+        str(requirement.marker or ""),
+    )
+
+
+def _is_mcp_extra_requirement(requirement: Requirement) -> bool:
+    marker = str(requirement.marker or "")
+    return bool(
+        re.search(r'\bextra\s*==\s*["\']mcp["\']', marker)
+        or re.search(r'["\']mcp["\']\s*==\s*extra\b', marker)
+    )
+
+
+def _validate_mcp_extra_metadata(metadata: object, *, artifact: str) -> None:
+    get_all = getattr(metadata, "get_all", None)
+    if not callable(get_all):
+        raise ValueError(f"{artifact} metadata cannot be inspected")
+
+    extras = [canonicalize_name(value) for value in get_all("Provides-Extra", [])]
+    if extras.count("mcp") != 1:
+        raise ValueError(
+            f"{artifact} metadata must declare Provides-Extra: mcp exactly once"
+        )
+
+    parsed: list[Requirement] = []
+    for value in get_all("Requires-Dist", []):
+        try:
+            parsed.append(Requirement(value))
+        except InvalidRequirement as exc:
+            raise ValueError(
+                f"{artifact} metadata contains an invalid Requires-Dist: {value!r}"
+            ) from exc
+    actual = [
+        _requirement_signature(requirement)
+        for requirement in parsed
+        if _is_mcp_extra_requirement(requirement)
+    ]
+    expected = [
+        _requirement_signature(Requirement(value))
+        for value in MCP_EXTRA_REQUIREMENTS
+    ]
+    if sorted(actual) != sorted(expected):
+        raise ValueError(
+            f"{artifact} metadata MCP extra requirements mismatch: "
+            f"expected={sorted(expected)!r}, actual={sorted(actual)!r}"
         )
 
 
@@ -500,6 +728,7 @@ def _validate_wheel(wheel_path: Path, version: str) -> None:
             raise ValueError(
                 "wheel Requires-Python must remain >=3.11,<3.15"
             )
+        _validate_mcp_extra_metadata(metadata, artifact="wheel")
         wheel_metadata = BytesParser(policy=policy.default).parsebytes(
             archive.read(wheel_metadata_path)
         )
@@ -578,6 +807,7 @@ def _validate_sdist(sdist_path: Path, version: str) -> None:
             raise ValueError(
                 "sdist Requires-Python must remain >=3.11,<3.15"
             )
+        _validate_mcp_extra_metadata(metadata, artifact="sdist")
         builtin_paths = {
             path
             for path in relative_files

@@ -254,7 +254,7 @@ same change.
 | `shell` | `policy_capability_key`, `policy_resource`, `default_policy_level`, `timeout_hard_limit_s`, `max_stdout_chars`, `max_stderr_chars`, `stdout_hard_limit_chars`, `stderr_hard_limit_chars`, `rules`, `whitelist`, `blacklist` |
 | `git` | `enabled`, `executable`, `minimum_version`, `repository_resource`, `worktree_root`, `trusted_metadata_roots`, `local_timeout_s`, `remote_timeout_s`, `timeout_hard_limit_s`, `lock_timeout_s`, `status_entry_limit`, `status_entry_hard_limit`, `log_entry_limit`, `log_entry_hard_limit`, `output_max_bytes`, `output_hard_limit_bytes`, `patch_max_bytes`, `patch_hard_limit_bytes`, `state_content_hard_limit_bytes`, `allowed_remote_schemes`, `allow_scp_style_ssh`, `allow_file_remotes`, `inherit_credential_helpers`, `inherit_ssh_agent`, `protect_git_metadata`, `ref_list_limit`, `pull_request_list_limit` |
 | `jsonrpc` | `registry_resource`, `endpoint_id_max_chars`, `method_id_max_chars`, `rpc_method_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `audit_preview_chars`, `header_env_allowlist` |
-| `mcp` | `registry_resource`, `server_id_max_chars`, `tool_id_max_chars`, `mcp_name_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `protocol_probe_timeout_s`, `list_max_pages`, `schema_max_depth`, `schema_max_nodes`, `schema_max_ref_hops`, `schema_max_composition_expansions`, `audit_preview_chars`, `header_env_allowlist`, `stdio_env_allowlist` |
+| `mcp` | `registry_resource`, `server_id_max_chars`, `tool_id_max_chars`, `mcp_name_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `server_page_limit`, `tool_catalog_limit`, `resource_catalog_limit`, `resource_template_limit`, `prompt_catalog_limit`, `provider_capability_limit`, `max_content_blocks`, `max_prompt_messages`, `max_completion_values`, `protocol_probe_timeout_s`, `list_max_pages`, `schema_max_depth`, `schema_max_nodes`, `schema_max_ref_hops`, `schema_max_composition_expansions`, `schema_regex_pattern_max_bytes`, `schema_regex_max_evaluations`, `schema_regex_match_timeout_s`, `connection_idle_ttl_s`, `connection_absolute_ttl_s`, `connection_max_open`, `mrtr_max_rounds`, `mrtr_max_input_requests`, `mrtr_request_state_max_bytes`, `continuation_ttl_s`, `continuation_max_records`, `continuation_terminal_records`, `subscription_max_open`, `subscription_queue_events`, `subscription_event_max_bytes`, `subscription_max_lifetime_s`, `remote_task_poll_min_interval_s`, `remote_task_max_wait_s`, `remote_task_max_records`, `remote_task_terminal_records`, `cursor_handle_limit`, `subscription_terminal_records`, `cache_hint_ttl_cap_ms`, `oauth_enabled`, `oauth_state_ttl_s`, `tasks_extension_enabled`, `tasks_extension_spec_sha256`, `audit_preview_chars`, `header_env_allowlist`, `stdio_env_allowlist` |
 | `image` | `registry_resource`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `manifest_hard_limit_bytes`, `structured_field_hard_limit_bytes`, `max_default_tools`, `max_required_capabilities`, `max_required_modules`, `package_manifest_name`, `package_workspace_dir`, `package_tools_dir`, `package_resources_dir`, `materialized_workspace_root`, `package_manifest_max_bytes`, `package_manifest_hard_limit_bytes`, `package_file_max_bytes`, `package_max_bytes`, `package_max_files`, `prompt_max_chars`, `max_package_jit_tools`, `max_workspace_grants` |
 | `image_commit` | `artifact_version`, `artifact_hard_limit_bytes`, `payload_capture_limit_bytes`, `max_required_capabilities`, `max_committed_tools`, `max_committed_jit_sources`, `metadata_preview_chars` |
 | `memory` | `object_schema_version`, `materialize_budget_tokens`, `query_limit`, `context_policy`, `metadata_sensitivity`, `metadata_retention_policy`, `process_namespace_prefix`, `query_scan_page_size`, `query_scan_ceiling`, `metadata_text_max_chars`, `metadata_collection_max_items`, `metadata_collection_item_max_chars`, `metadata_max_bytes` |
@@ -444,16 +444,25 @@ configurable. A runtime release emits only the snapshot version it can decode.
   fields are excluded from Provider/Sink and client-cache identity; they do not
   claim tokenizer-exact Provider billing or monetary cost control.
 - JSON-RPC/MCP header and stdio allowlists contain exact environment-variable
-  names or trailing-`*` prefix patterns. For example,
-  `AGENT_LIBOS_MCP_*` admits names beginning with `AGENT_LIBOS_MCP_`; `*` has no
-  wildcard meaning anywhere except the final character. Manifests reference
+  names or trailing-`*` prefix patterns. MCP configuration requires each entry
+  to be either a valid environment-variable name or a valid, non-empty prefix
+  followed by exactly one `*`. For example, `AGENT_LIBOS_MCP_*` admits names
+  beginning with `AGENT_LIBOS_MCP_`. A bare `*`, internal or repeated `*`,
+  whitespace, and invalid names are rejected for both MCP allowlists; an empty
+  MCP allowlist is valid and denies every manifest-selected variable.
+  Manifests reference
   those names; resolved secret values must not be persisted in registry rows,
   audit metadata, benchmark provenance, or GUI responses.
-  MCP Manifest v2 additionally requires `protocol_mode` in the manifest itself;
-  it is not a mutable global configuration fallback. Manifest v1 omits that
-  field and is permanently legacy-wire. Header names are checked
-  case-insensitively and cannot override protocol/session/content-negotiation,
-  `Mcp-Param-*`, trace, baggage, or other Host-generated MCP fields.
+  MCP Manifest v2 requires an explicit `protocol_mode`; Manifest v3 requires
+  exact `"2026-07-28"`. Neither is a mutable global configuration fallback.
+  Manifest v1 omits that field and is permanently legacy-wire. Header names
+  are checked case-insensitively. Every version rejects
+  protocol/session/resume, trace, and baggage controls. Manifest v2/v3
+  additionally reject all reserved content-negotiation and `Mcp-Param-*`
+  headers and protocol `_meta` keys;
+  Manifest v1 retains its compatibility support for `Accept`, `Mcp-Param-*`,
+  and application `_meta`, but none of those exceptions permits the common
+  high-risk controls.
 - `mcp.timeout_s` defaults to `10.0` seconds (with a `60.0` second hard limit)
   and is one absolute exchange deadline, not a fresh timeout for each I/O
   stage. DNS queueing and resolution, every resolved-address connect attempt,
@@ -464,8 +473,9 @@ configurable. A runtime release emits only the snapshot version it can decode.
   the remaining deadline. `mcp.max_request_bytes`
   defaults to `65536` and `mcp.max_response_bytes` to `1048576`; provider byte
   counters are cumulative across those phases, must cover the canonical JSON
-  payload, and may not under-report it. The complete live Tool catalog cannot
-  exceed `mcp.list_limit` (100 by default).
+  payload, and may not under-report it. The complete Manifest v1/v2 live Tool
+  catalog cannot exceed the deprecated compatibility setting `mcp.list_limit`
+  (100 by default).
   Stdio additionally caps each response frame at `max_response_bytes`, total
   stdout at four times that value, stderr at that value, each request frame at
   `max_request_bytes`, and total stdin at four times that value. Stdio children
@@ -481,6 +491,56 @@ configurable. A runtime release emits only the snapshot version it can decode.
   `mcp.schema_max_ref_hops: 128`, and
   `mcp.schema_max_composition_expansions: 1024`. These are Host policy caps;
   a server or model cannot raise them at dispatch time.
+  For Manifest v1, v2, and v3, JSON Schema `pattern` and
+  `patternProperties` validation additionally uses a shared maximum of 4,096
+  regex evaluations, a shared 50 ms monotonic matching deadline, and a
+  1,024-byte UTF-8 cap per pattern. These defaults are configured by
+  `mcp.schema_regex_max_evaluations`,
+  `mcp.schema_regex_match_timeout_s`, and
+  `mcp.schema_regex_pattern_max_bytes`. An exhausted budget, timeout, invalid
+  regex, or oversized pattern fails closed before provider dispatch.
+  `mcp.manifest_max_bytes` may be lowered from its 262,144-byte default but may
+  not exceed the shared YAML loader's fixed 1,048,576-byte UTF-8 ceiling.
+- `mcp.list_limit` is accepted only as a deprecated Manifest v1/v2
+  `tools/list` compatibility limit. It is not a fallback for registered-server
+  pages or Manifest v3 Tools. A YAML overlay that explicitly contains the
+  field emits one filterable `AgentLibOSConfigDeprecationWarning` with code
+  `deprecated_mcp_list_limit`; constructing or loading defaults does not emit a
+  warning. Equal or different values do not couple the independent limits:
+  migrate registered-server consumers to `server_page_limit` and Manifest v3
+  Tool catalogs to `tool_catalog_limit`.
+- MCP's modern-client bounds are purpose-specific. `server_page_limit`,
+  `tool_catalog_limit`, `resource_catalog_limit`, `resource_template_limit`,
+  and `prompt_catalog_limit` prevent one catalog from borrowing another's
+  budget. `provider_capability_limit`, `max_content_blocks`,
+  `max_prompt_messages`, and `max_completion_values` bound decoded provider
+  results before they reach a Host consumer. Connections have both idle and
+  absolute TTLs and a global open-count ceiling. MRTR continuations,
+  subscriptions, and remote Tasks have independent count, byte, time, and
+  queue limits; exhausted limits fail closed without reconnecting or replaying
+  an operation. `cursor_handle_limit` bounds the opaque cursor vault,
+  `subscription_terminal_records` bounds retained terminal diagnostics, and
+  `cache_hint_ttl_cap_ms` caps untrusted provider cache-hint TTLs. The modern
+  client does not implement a response-body cache.
+- Pre-release names `cache_max_entries`, `cache_max_bytes`,
+  `cache_ttl_cap_ms`, and `cache_public_cross_principal` are no longer accepted;
+  the strict configuration loader rejects them as unknown keys. Move opaque
+  cursor and terminal-diagnostic bounds to `cursor_handle_limit` and
+  `subscription_terminal_records`, and move the provider hint TTL cap to
+  `cache_hint_ttl_cap_ms`. There is no replacement response-cache setting
+  because no response-body cache exists.
+- OAuth and the digest-pinned Tasks extension are disabled by default.
+  Enabling Tasks requires `tasks_extension_spec_sha256` to be an exact
+  lowercase SHA-256 pin; a server-advertised digest cannot select or update it.
+  OAuth credentials and tokens are supplied by a Host credential broker and
+  are not configuration-file fields. The default system broker recognizes only
+  the reviewed `keyring==25.7.0` OS implementations listed in the support
+  matrix; Chainer/plugin/third-party backends and unreviewed versions fail
+  closed even when they advertise a positive priority. A Host-approved custom
+  secure store must be supplied explicitly as the caller-owned
+  `substrate.mcp_credential_broker` SPI. Provider cache hints are diagnostics
+  and never authorize reuse, cross-principal sharing, or retention of response
+  bodies.
 - `tools.shell_timeout_s` defaults to `30.0` seconds and
   `shell.timeout_hard_limit_s` to `300.0`. Provider timeout and subprocess-limit
   failures are recognized through their causal wrapper chain, charged once to

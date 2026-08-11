@@ -65,6 +65,16 @@ Review every resulting diff. Search for both the old and new product version;
 an unexplained old occurrence or unexpected protocol-version edit blocks the
 release.
 
+The local release checker proves only that checked-in version identifiers are
+aligned and use the final ASCII `X.Y.Z` spelling without leading zeros. It does
+not contact a package index or inspect remote Git references. For this release
+line it additionally pins the exact target `1.5.0`; a future release must
+intentionally update that target and its regression contract rather than
+passing merely because stale identifiers agree with one another. Immediately
+before publication authorization, the human owner must re-check the complete
+PyPI project history and the intended remote's tags to confirm that the exact
+version remains unused.
+
 ## 2. Run local deterministic and artifact checks
 
 Start from a clean candidate branch. Install locked dependencies and run the
@@ -102,22 +112,28 @@ from pathlib import Path
 print(tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])
 PY
 )"
-LOCAL_RELEASE_WHEEL="dist/agent_libos-${RELEASE_VERSION}-py3-none-any.whl"
-LOCAL_RELEASE_SDIST="dist/agent_libos-${RELEASE_VERSION}.tar.gz"
+LOCAL_RELEASE_DIR="$(mktemp -d)"
+LOCAL_RELEASE_WHEEL="$LOCAL_RELEASE_DIR/agent_libos-${RELEASE_VERSION}-py3-none-any.whl"
+LOCAL_RELEASE_SDIST="$LOCAL_RELEASE_DIR/agent_libos-${RELEASE_VERSION}.tar.gz"
 
 uv sync --frozen --no-dev --group release
-uv build --no-build-isolation --clear --out-dir dist \
+uv build --no-build-isolation --out-dir "$LOCAL_RELEASE_DIR" \
   --python .venv/bin/python --no-create-gitignore
-.venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
+.venv/bin/python scripts/check_release_artifacts.py "$LOCAL_RELEASE_DIR" \
+  --write-checksums
 uv run --frozen --no-dev --group release twine check \
   "$LOCAL_RELEASE_WHEEL" "$LOCAL_RELEASE_SDIST"
 uv run --frozen --no-dev --group release check-wheel-contents \
   "$LOCAL_RELEASE_WHEEL"
-.venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
+.venv/bin/python scripts/check_release_artifacts.py "$LOCAL_RELEASE_DIR" \
+  --verify-checksums
 ```
 
 This local build is not the artifact to publish. It proves that the candidate
 can build; the canonical pair is built once by CI after all upstream gates.
+Keep the fresh local directory only as long as needed to review the preflight
+artifacts. This procedure never clears or writes the repository's existing
+`dist/` directory.
 
 ## 3. Obtain the bound CI receipt
 

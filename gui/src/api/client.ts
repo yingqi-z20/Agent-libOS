@@ -1,5 +1,21 @@
-import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LlmCallDetail, LlmCallPage, LlmTraceContentChunk, LlmTraceContentField, LLMProfileInput, LLMProfileSummary, McpCallResult, McpDiscoveryResult, McpServerSummary, McpToolListResult, ModuleSummary, ObjectTask, OperationListResponse, RuntimeSnapshot, SemanticAssessmentDetail, SemanticAssessmentDomain, SemanticAssessmentKind, SemanticAssessmentPage, SemanticAssessmentStatus, SemanticStatus, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunSpecV1, TaskRunSummary } from "./types";
+import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LlmCallDetail, LlmCallPage, LlmTraceContentChunk, LlmTraceContentField, LLMProfileInput, LLMProfileSummary, McpCallResult, McpDiscoveryResult, McpServerSummary, McpToolListResult, McpUnregisterResult, ModuleSummary, ObjectTask, OperationListResponse, RuntimeSnapshot, SemanticAssessmentDetail, SemanticAssessmentDomain, SemanticAssessmentKind, SemanticAssessmentPage, SemanticAssessmentStatus, SemanticStatus, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunSpecV1, TaskRunSummary } from "./types";
 import type {
+  McpAuthorizationChallenge,
+  McpCompletionResult,
+  McpHumanReceipt,
+  McpInputRequired,
+  McpOAuthProfileInput,
+  McpOAuthStatus,
+  McpOperationResult,
+  McpPage,
+  McpPrompt,
+  McpPromptResult,
+  McpRemoteTask,
+  McpResource,
+  McpResourceContents,
+  McpResourceTemplate,
+  McpSubscription,
+  McpSubscriptionEvent,
   SemanticControlHistoryPage,
   SemanticControlState,
   SemanticFlowDirection,
@@ -20,9 +36,25 @@ import {
   assertLlmCallPage,
   assertLlmTraceContentChunk,
   assertMcpCallResult,
+  assertMcpAuthorizationChallenge,
+  assertMcpCompletionOperationResult,
+  assertMcpContinuationResult,
   assertMcpDiscoveryResult,
+  assertMcpInputRequired,
+  assertMcpOAuthProfileInput,
+  assertMcpOAuthStatus,
+  assertMcpOAuthStatuses,
+  assertMcpPromptOperationResult,
+  assertMcpPromptPage,
+  assertMcpRemoteTask,
+  assertMcpResourceOperationResult,
+  assertMcpResourcePage,
+  assertMcpResourceTemplatePage,
   assertMcpServerSummary,
+  assertMcpSubscription,
+  assertMcpSubscriptionEvents,
   assertMcpToolListResult,
+  assertMcpUnregisterResult,
   assertRuntimeSnapshot,
   assertSchedulerStatus,
   assertSemanticAssessmentDetailResponse,
@@ -763,13 +795,25 @@ export class LibOSClient {
     return value;
   }
 
-  async listMcpTools(serverId: string, refresh = false): Promise<McpToolListResult> {
+  async listMcpTools(serverId: string, refresh = false, actor?: string): Promise<McpToolListResult> {
     const value = await this.request<unknown>(
-      "GET",
-      `/api/mcp/${encodeURIComponent(serverId)}/tools${refresh ? "?refresh=true" : ""}`
+      refresh ? "POST" : "GET",
+      `/api/mcp/${encodeURIComponent(serverId)}/tools${refresh ? "/refresh" : ""}`,
+      refresh ? { ...(actor ? { actor } : {}) } : undefined,
+      refresh ? { timeoutMs: defaultReadRequestTimeoutMs } : {}
     );
     assertMcpToolListResult(value);
     if (value.server_id !== serverId) throw new Error("GUI MCP tool list identity does not match the requested server id.");
+    return value;
+  }
+
+  async unregisterMcpServer(serverId: string, confirmed: boolean, actor?: string): Promise<McpUnregisterResult> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/unregister`, {
+      confirmed,
+      ...(actor ? { actor } : {})
+    });
+    assertMcpUnregisterResult(value);
+    if (value.server_id !== serverId) throw new Error("GUI MCP unregister identity does not match the requested server id.");
     return value;
   }
 
@@ -804,6 +848,276 @@ export class LibOSClient {
     if (value.server_id !== serverId || value.tool_id !== toolId) {
       throw new Error("GUI MCP call identity does not match the requested tool.");
     }
+    return value;
+  }
+
+  async listMcpResources(serverId: string, cursor?: string | null): Promise<McpPage<McpResource>> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/resources/list`, {
+      ...(cursor ? { cursor } : {})
+    });
+    assertMcpResourcePage(value);
+    return value;
+  }
+
+  async listMcpResourceTemplates(serverId: string, cursor?: string | null): Promise<McpPage<McpResourceTemplate>> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/resource-templates/list`, {
+      ...(cursor ? { cursor } : {})
+    });
+    assertMcpResourceTemplatePage(value);
+    return value;
+  }
+
+  async readMcpResource(
+    serverId: string,
+    resourceId: string,
+    variables?: Record<string, string> | null
+  ): Promise<McpOperationResult<McpResourceContents>> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/resources/read`, {
+      resource_id: resourceId,
+      ...(variables ? { variables } : {})
+    });
+    assertMcpResourceOperationResult(value);
+    return value;
+  }
+
+  async listMcpPrompts(serverId: string, cursor?: string | null): Promise<McpPage<McpPrompt>> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/prompts/list`, {
+      ...(cursor ? { cursor } : {})
+    });
+    assertMcpPromptPage(value);
+    return value;
+  }
+
+  async getMcpPrompt(
+    serverId: string,
+    promptId: string,
+    args: Record<string, string> | null,
+    confirmed = false,
+    expectedPreviewSha256?: string
+  ): Promise<McpOperationResult<McpPromptResult>> {
+    if (confirmed && !expectedPreviewSha256) {
+      throw new Error("GUI MCP prompt confirmation requires its exact preview digest.");
+    }
+    if (!confirmed && expectedPreviewSha256) {
+      throw new Error("GUI MCP prompt preview must not include a confirmation digest.");
+    }
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/prompts/get`, {
+      prompt_id: promptId,
+      ...(args ? { arguments: args } : {}),
+      confirmed,
+      ...(expectedPreviewSha256 ? { expected_preview_sha256: expectedPreviewSha256 } : {})
+    });
+    assertMcpPromptOperationResult(value);
+    return value;
+  }
+
+  async completeMcpPrompt(
+    serverId: string,
+    referenceType: "prompt" | "resource_template",
+    referenceId: string,
+    argument: Record<string, string>,
+    context?: Record<string, string> | null
+  ): Promise<McpOperationResult<McpCompletionResult>> {
+    if (referenceType !== "prompt" && referenceType !== "resource_template") {
+      throw new Error("GUI MCP completion reference type is unsupported.");
+    }
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/completion`, {
+      reference_type: referenceType,
+      reference_id: referenceId,
+      argument,
+      ...(context ? { context } : {})
+    });
+    assertMcpCompletionOperationResult(value);
+    return value;
+  }
+
+  async getMcpOAuthStatus(profileId: string): Promise<McpOAuthStatus> {
+    const value = await this.request<unknown>("GET", `/api/mcp/auth/${encodeURIComponent(profileId)}/status`);
+    assertMcpOAuthStatus(value);
+    if (value.profile_id !== profileId) throw new Error("GUI MCP OAuth profile identity is malformed.");
+    return value;
+  }
+
+  async listMcpOAuthProfiles(): Promise<McpOAuthStatus[]> {
+    const value = await this.request<unknown>("GET", "/api/mcp/auth/profiles");
+    assertMcpOAuthStatuses(value);
+    return value;
+  }
+
+  async configureMcpOAuthProfile(
+    profile: McpOAuthProfileInput,
+    clientSecret: string | null,
+    replace: boolean,
+    confirmed: boolean
+  ): Promise<McpOAuthStatus> {
+    assertMcpOAuthProfileInput(profile);
+    const value = await this.request<unknown>("POST", "/api/mcp/auth/profiles", {
+      profile,
+      ...(clientSecret === null ? {} : { client_secret: clientSecret }),
+      replace,
+      confirmed
+    });
+    assertMcpOAuthStatus(value);
+    if (value.profile_id !== profile.profile_id) {
+      throw new Error("GUI MCP OAuth profile identity is malformed.");
+    }
+    return value;
+  }
+
+  async removeMcpOAuthProfile(
+    profileId: string,
+    confirmed: boolean
+  ): Promise<McpOAuthStatus> {
+    const value = await this.request<unknown>(
+      "POST",
+      `/api/mcp/auth/profiles/${encodeURIComponent(profileId)}/remove`,
+      { confirmed }
+    );
+    assertMcpOAuthStatus(value);
+    if (value.profile_id !== profileId) {
+      throw new Error("GUI MCP OAuth profile identity is malformed.");
+    }
+    return value;
+  }
+
+  async beginMcpOAuth(profileId: string, scopes: string[], confirmed: boolean): Promise<McpAuthorizationChallenge> {
+    const value = await this.request<unknown>("POST", `/api/mcp/auth/${encodeURIComponent(profileId)}/login`, {
+      scopes,
+      confirmed
+    });
+    assertMcpAuthorizationChallenge(value);
+    return value;
+  }
+
+  async completeMcpOAuth(challengeId: string, callbackUrl: string): Promise<McpOAuthStatus> {
+    const value = await this.request<unknown>("POST", `/api/mcp/auth/challenges/${encodeURIComponent(challengeId)}/callback`, {
+      callback_url: callbackUrl
+    });
+    assertMcpOAuthStatus(value);
+    return value;
+  }
+
+  async logoutMcpOAuth(profileId: string, confirmed: boolean): Promise<McpOAuthStatus> {
+    const value = await this.request<unknown>("POST", `/api/mcp/auth/${encodeURIComponent(profileId)}/logout`, { confirmed });
+    assertMcpOAuthStatus(value);
+    if (value.profile_id !== profileId) throw new Error("GUI MCP OAuth profile identity is malformed.");
+    return value;
+  }
+
+  async respondMcpContinuation(
+    continuationId: string,
+    expectedRevision: number,
+    responses: Record<string, unknown>,
+    humanReceipt: McpHumanReceipt,
+    confirmed: boolean
+  ): Promise<McpOperationResult<unknown>> {
+    const value = await this.request<unknown>("POST", `/api/mcp/continuations/${encodeURIComponent(continuationId)}/respond`, {
+      expected_revision: expectedRevision,
+      responses,
+      human_request_id: humanReceipt.human_request_id,
+      human_expected_revision: humanReceipt.human_revision,
+      human_preview_sha256: humanReceipt.human_preview_sha256,
+      confirmed
+    });
+    assertMcpContinuationResult(value);
+    return value;
+  }
+
+  async getMcpContinuation(continuationId: string): Promise<McpInputRequired> {
+    const value = await this.request<unknown>(
+      "POST",
+      `/api/mcp/continuations/${encodeURIComponent(continuationId)}/inspect`,
+      {}
+    );
+    assertMcpInputRequired(value);
+    if (value.continuation_id !== continuationId) {
+      throw new Error("GUI MCP continuation identity is malformed.");
+    }
+    return value;
+  }
+
+  async cancelMcpContinuation(
+    continuationId: string,
+    expectedRevision: number,
+    confirmed: boolean
+  ): Promise<McpOperationResult<unknown>> {
+    const value = await this.request<unknown>("POST", `/api/mcp/continuations/${encodeURIComponent(continuationId)}/cancel`, {
+      expected_revision: expectedRevision,
+      confirmed
+    });
+    assertMcpContinuationResult(value);
+    return value;
+  }
+
+  async getMcpRemoteTask(
+    taskRef: string,
+    expectedRevision?: number | null
+  ): Promise<McpRemoteTask> {
+    const value = await this.request<unknown>("POST", `/api/mcp/remote-tasks/${encodeURIComponent(taskRef)}/get`, {
+      ...(expectedRevision === undefined ? {} : { expected_revision: expectedRevision })
+    });
+    assertMcpRemoteTask(value);
+    if (value.task_ref !== taskRef) throw new Error("GUI MCP remote task identity is malformed.");
+    return value;
+  }
+
+  async updateMcpRemoteTask(
+    taskRef: string,
+    expectedRevision: number,
+    responses: Record<string, unknown>,
+    humanReceipt: McpHumanReceipt,
+    confirmed: boolean
+  ): Promise<McpRemoteTask> {
+    const value = await this.request<unknown>("POST", `/api/mcp/remote-tasks/${encodeURIComponent(taskRef)}/update`, {
+      expected_revision: expectedRevision,
+      responses,
+      human_request_id: humanReceipt.human_request_id,
+      human_expected_revision: humanReceipt.human_revision,
+      human_preview_sha256: humanReceipt.human_preview_sha256,
+      confirmed
+    });
+    assertMcpRemoteTask(value);
+    if (value.task_ref !== taskRef) throw new Error("GUI MCP remote task identity is malformed.");
+    return value;
+  }
+
+  async cancelMcpRemoteTask(taskRef: string, expectedRevision: number, confirmed: boolean): Promise<McpRemoteTask> {
+    const value = await this.request<unknown>("POST", `/api/mcp/remote-tasks/${encodeURIComponent(taskRef)}/cancel`, {
+      expected_revision: expectedRevision,
+      confirmed
+    });
+    assertMcpRemoteTask(value);
+    if (value.task_ref !== taskRef) throw new Error("GUI MCP remote task identity is malformed.");
+    return value;
+  }
+
+  async startMcpSubscription(serverId: string, filters: string[], confirmed: boolean): Promise<McpSubscription> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/subscriptions/start`, {
+      filters,
+      confirmed
+    });
+    assertMcpSubscription(value);
+    if (value.server_id !== serverId) throw new Error("GUI MCP subscription server identity is malformed.");
+    return value;
+  }
+
+  async getMcpSubscriptionStatus(subscriptionId: string): Promise<McpSubscription> {
+    const value = await this.request<unknown>("POST", `/api/mcp/subscriptions/${encodeURIComponent(subscriptionId)}/status`, {});
+    assertMcpSubscription(value);
+    if (value.subscription_id !== subscriptionId) throw new Error("GUI MCP subscription identity is malformed.");
+    return value;
+  }
+
+  async listMcpSubscriptionEvents(subscriptionId: string, after = 0, limit = 100): Promise<McpSubscriptionEvent[]> {
+    const value = await this.request<unknown>("POST", `/api/mcp/subscriptions/${encodeURIComponent(subscriptionId)}/events`, { after, limit });
+    assertMcpSubscriptionEvents(value);
+    return value;
+  }
+
+  async stopMcpSubscription(subscriptionId: string, confirmed: boolean): Promise<McpSubscription> {
+    const value = await this.request<unknown>("POST", `/api/mcp/subscriptions/${encodeURIComponent(subscriptionId)}/stop`, { confirmed });
+    assertMcpSubscription(value);
+    if (value.subscription_id !== subscriptionId) throw new Error("GUI MCP subscription identity is malformed.");
     return value;
   }
 

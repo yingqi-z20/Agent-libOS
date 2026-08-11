@@ -5,6 +5,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import inspect
 import json
 import math
 import re
@@ -84,6 +85,9 @@ from agent_libos.utils.serde import bounded_json_loads, to_jsonable
 
 _GUI_DEFAULTS = DEFAULT_CONFIG.gui
 _GUI_PRODUCTION_RENDERER_ORIGIN = "agent-libos://app"
+_MCP_ROUTE_NOT_HANDLED = object()
+_MCP_SECRET_ABSENT = object()
+_MCP_GUI_OAUTH_CLIENT_SECRET_MAX_BYTES = 16 * 1024
 _TERMINAL = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 _TASK_RUN_PAGE_MAX_ITEMS = 500
 _GUI_LLM_CONTENT_DEFAULT_BYTES = 32 * 1024
@@ -530,6 +534,288 @@ def _optional_body_string(body: dict[str, Any], key: str) -> str | None:
     if key not in body:
         return None
     return _required_body_string(body, key)
+
+
+def _optional_nullable_body_string(
+    body: dict[str, Any], key: str
+) -> str | None:
+    if key not in body or body[key] is None:
+        return None
+    return _required_body_string(body, key)
+
+
+def _required_json_object(body: dict[str, Any], key: str) -> dict[str, Any]:
+    value = body.get(key)
+    if not isinstance(value, dict):
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST, f"{key} must be a JSON object"
+        )
+    return value
+
+
+def _required_string_map(body: dict[str, Any], key: str) -> dict[str, str]:
+    value = _required_json_object(body, key)
+    if any(
+        type(name) is not str
+        or not name.strip()
+        or type(item) is not str
+        for name, item in value.items()
+    ):
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            f"{key} must contain only non-empty string keys and string values",
+        )
+    return dict(value)
+
+
+def _optional_string_map(body: dict[str, Any], key: str) -> dict[str, str] | None:
+    if key not in body or body[key] is None:
+        return None
+    return _required_string_map(body, key)
+
+
+def _required_unique_string_list(body: dict[str, Any], key: str) -> list[str]:
+    value = body.get(key)
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(type(item) is not str or not item for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            f"{key} must be a non-empty array of unique non-empty strings",
+        )
+    return list(value)
+
+
+def _optional_unique_string_list(body: dict[str, Any], key: str) -> list[str]:
+    if key not in body:
+        return []
+    value = body[key]
+    if value == []:
+        return []
+    return _required_unique_string_list(body, key)
+
+
+def _required_non_negative_body_int(body: dict[str, Any], key: str) -> int:
+    value = body.get(key)
+    if type(value) is not int or value < 0:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            f"{key} must be a non-negative JSON integer",
+        )
+    return value
+
+
+def _optional_non_negative_body_int(
+    body: dict[str, Any], key: str, *, default: int
+) -> int:
+    if key not in body:
+        return default
+    return _required_non_negative_body_int(body, key)
+
+
+def _optional_nullable_non_negative_body_int(
+    body: dict[str, Any], key: str
+) -> int | None:
+    if key not in body or body[key] is None:
+        return None
+    return _required_non_negative_body_int(body, key)
+
+
+def _optional_bounded_body_int(
+    body: dict[str, Any],
+    key: str,
+    *,
+    default: int,
+    maximum: int,
+) -> int:
+    if key not in body:
+        return default
+    value = body[key]
+    if type(value) is not int or not 1 <= value <= maximum:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            f"{key} must be a JSON integer between 1 and {maximum}",
+        )
+    return value
+
+
+_MCP_GUI_PRIVATE_RESPONSE_KEYS = frozenset(
+    {
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "client_secret",
+        "authorization_code",
+        "code_verifier",
+        "pkce_verifier",
+        "remote_task_id",
+    }
+)
+_MCP_GUI_PRIVATE_RESPONSE_KEYS_COMPACT = frozenset(
+    {
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "clientsecret",
+        "authorizationcode",
+        "codeverifier",
+        "pkceverifier",
+        "remotetaskid",
+    }
+)
+_MCP_GUI_OAUTH_STATUS_KEYS = frozenset(
+    {
+        "profile_id",
+        "status",
+        "issuer",
+        "resource",
+        "scopes",
+        "principal_sha256",
+        "expires_at",
+    }
+)
+_MCP_GUI_OAUTH_CHALLENGE_KEYS = frozenset(
+    {"challenge_id", "authorization_url", "expires_at"}
+)
+_MCP_GUI_OAUTH_STATUS_VALUES = frozenset(
+    {
+        "unconfigured",
+        "authorization_required",
+        "authorized",
+        "expired",
+        "revoked",
+        "needs_attention",
+    }
+)
+
+
+def _require_safe_mcp_gui_projection(value: Any) -> None:
+    """Reject secret-bearing or MCP Apps projections before HTTP serialization."""
+
+    pending: list[Any] = [value]
+    nodes = 0
+    while pending:
+        current = pending.pop()
+        nodes += 1
+        if nodes > 100_000:
+            raise GuiServerError(
+                HTTPStatus.BAD_GATEWAY,
+                "MCP result exceeds the GUI structural bound",
+                details={"code": "mcp_gui_projection_rejected"},
+            )
+        if isinstance(current, list):
+            pending.extend(current)
+            continue
+        if not isinstance(current, dict):
+            continue
+        for raw_key, item in current.items():
+            key = str(raw_key).casefold()
+            compact_key = re.sub(r"[^a-z0-9]", "", key)
+            if (
+                key in _MCP_GUI_PRIVATE_RESPONSE_KEYS
+                or compact_key in _MCP_GUI_PRIVATE_RESPONSE_KEYS_COMPACT
+            ):
+                raise GuiServerError(
+                    HTTPStatus.BAD_GATEWAY,
+                    "MCP result contains a private field and was rejected",
+                    details={"code": "mcp_private_projection_rejected"},
+                )
+            if key in {"resource_id", "template_id", "resource_handle"}:
+                if isinstance(item, str) and item.casefold().startswith("ui:"):
+                    raise GuiServerError(
+                        HTTPStatus.BAD_GATEWAY,
+                        "MCP Apps resources are unsupported",
+                        details={"code": "mcp_apps_unsupported"},
+                    )
+            if key in {"mime_type", "mimetype"} and _is_mcp_app_mime_text(item):
+                raise GuiServerError(
+                    HTTPStatus.BAD_GATEWAY,
+                    "MCP Apps HTML is unsupported",
+                    details={"code": "mcp_apps_unsupported"},
+                )
+            pending.append(item)
+
+
+def _require_safe_mcp_gui_oauth_projection(value: Any) -> None:
+    """Accept only the two public typed OAuth unions on GUI routes."""
+
+    if not isinstance(value, dict):
+        _reject_mcp_gui_oauth_projection()
+    keys = set(value)
+    if {"profile_id", "status"} <= keys <= _MCP_GUI_OAUTH_STATUS_KEYS:
+        _validate_mcp_gui_oauth_status(value)
+        return
+    if keys == _MCP_GUI_OAUTH_CHALLENGE_KEYS:
+        for key in _MCP_GUI_OAUTH_CHALLENGE_KEYS:
+            _bounded_mcp_gui_oauth_string(value.get(key))
+        return
+    _reject_mcp_gui_oauth_projection()
+
+
+def _require_safe_mcp_gui_oauth_status_list_projection(value: Any) -> None:
+    if not isinstance(value, (list, tuple)) or len(value) > 1_000:
+        _reject_mcp_gui_oauth_projection()
+    for item in value:
+        _require_safe_mcp_gui_oauth_projection(item)
+
+
+def _validate_mcp_gui_oauth_status(value: dict[str, Any]) -> None:
+    _bounded_mcp_gui_oauth_string(value.get("profile_id"))
+    if value.get("status") not in _MCP_GUI_OAUTH_STATUS_VALUES:
+        _reject_mcp_gui_oauth_projection()
+    for key in ("issuer", "resource", "expires_at"):
+        selected = value.get(key)
+        if selected is not None:
+            _bounded_mcp_gui_oauth_string(selected)
+    scopes = value.get("scopes", [])
+    if not isinstance(scopes, list) or len(scopes) > 128:
+        _reject_mcp_gui_oauth_projection()
+    for scope in scopes:
+        _bounded_mcp_gui_oauth_string(scope, maximum=256)
+    principal = value.get("principal_sha256")
+    if principal is not None and (
+        type(principal) is not str
+        or len(principal) != 64
+        or any(character not in "0123456789abcdef" for character in principal)
+    ):
+        _reject_mcp_gui_oauth_projection()
+
+
+def _bounded_mcp_gui_oauth_string(value: Any, *, maximum: int = 8192) -> None:
+    if (
+        type(value) is not str
+        or not (1 <= len(value) <= maximum)
+        or "\x00" in value
+        or "\r" in value
+        or "\n" in value
+    ):
+        _reject_mcp_gui_oauth_projection()
+
+
+def _reject_mcp_gui_oauth_projection() -> None:
+    raise GuiServerError(
+        HTTPStatus.BAD_GATEWAY,
+        "MCP OAuth result was rejected",
+        details={"code": "mcp_private_projection_rejected"},
+    )
+
+
+def _is_mcp_app_mime_text(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    parts = [part.strip() for part in value.split(";")]
+    if not parts or parts[0].casefold() != "text/html":
+        return False
+    return any(
+        name.strip().casefold() == "profile"
+        and separator
+        and selected.strip().strip("\"'").casefold() == "mcp-app"
+        for part in parts[1:]
+        for name, separator, selected in [part.partition("=")]
+    )
 
 
 def _optional_launch_body_strings(
@@ -2779,7 +3065,7 @@ class GuiRuntimeService:
             )
             mcp_servers, mcp_servers_have_more = self.runtime.mcp.list_servers_window(
                 require_capability=False,
-                limit=min(fetch_limit, self.runtime.config.mcp.list_limit),
+                limit=min(fetch_limit, self.runtime.config.mcp.server_page_limit),
             )
             self._static_snapshot_cache = {
                 "tools": _take_source_window(
@@ -3210,6 +3496,16 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 {"ok": False, "error": public_error},
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+        finally:
+            # A keep-alive request handler must never retain a parsed request
+            # body after the response.  In particular, OAuth client secrets
+            # are transient credential-broker inputs and must not survive an
+            # invalid-profile, confirmation, projection, or facade error.
+            cached = getattr(self, "_cached_json_body", None)
+            if isinstance(cached, dict):
+                cached.clear()
+            self._cached_json_body = {}
+            self._body_cached = False
 
     def _serve_authenticated_request(self, method: str, parsed: Any) -> None:
         if method == "GET" and parsed.path == "/api/events/stream":
@@ -3227,11 +3523,12 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
 
     def _dispatch_in_runtime_scope(self, method: str, parsed: Any) -> tuple[Any, bool]:
         path = parsed.path
-        # Semantic endpoints have a strict query contract.  Retain blank
-        # values there so ``?unknown=`` and ``?after=`` cannot disappear
-        # during parsing and accidentally bypass validation.
+        # Semantic and MCP endpoints have strict query contracts. Retain blank
+        # values so inputs such as ``?unknown=`` cannot disappear during
+        # parsing and accidentally bypass validation.
         semantic_path = path == "/api/semantic" or path.startswith("/api/semantic/")
-        if semantic_path:
+        mcp_path = path == "/api/mcp" or path.startswith("/api/mcp/")
+        if semantic_path or mcp_path:
             try:
                 query = parse_qs(
                     parsed.query,
@@ -3239,10 +3536,11 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                     max_num_fields=32,
                 )
             except ValueError as exc:
+                surface = "semantic" if semantic_path else "MCP"
                 raise GuiServerError(
                     HTTPStatus.BAD_REQUEST,
-                    "invalid semantic query string",
-                    details={"code": "invalid_semantic_query"},
+                    f"invalid {surface} query string",
+                    details={"code": f"invalid_{surface.lower()}_query"},
                 ) from exc
         else:
             query = parse_qs(parsed.query)
@@ -5037,16 +5335,34 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
     def _dispatch_mcp(self, method: str, route: list[str], query: dict[str, list[str]]) -> Any:
         if method == "GET":
             return self._dispatch_mcp_get(route, query)
+        if method == "POST":
+            _require_empty_query(query, surface="MCP POST")
+            modern = self._dispatch_mcp_modern_post(route)
+            if modern is not _MCP_ROUTE_NOT_HANDLED:
+                return modern
         if method == "POST" and len(route) == 2 and route[1] == "discover":
             return self._dispatch_mcp_discover(route[0])
+        if method == "POST" and len(route) == 3 and route[1:] == ["tools", "refresh"]:
+            return self._dispatch_mcp_tools_refresh(route[0])
         if method == "POST" and route == ["register"]:
             body = self._read_body()
+            source = body.get("source")
+            if source is not None and not isinstance(source, str):
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "source must be a JSON string or null",
+                )
+            replace = _json_bool(body, "replace", False)
             self._require_confirmed(
                 "mcp.register",
                 body,
-                {"source": body.get("source")},
+                {"source": source, "replace": replace},
             )
-            return self._dispatch_mcp_register(body)
+            return self._dispatch_mcp_register(
+                body,
+                source=source,
+                replace=replace,
+            )
         if method == "POST" and len(route) == 2 and route[1] == "call":
             body = self._read_body()
             self._require_confirmed(
@@ -5059,23 +5375,575 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return self._dispatch_mcp_call(route[0], body)
+        if method == "POST" and len(route) == 2 and route[1] == "unregister":
+            body = self._mcp_body(allowed={"actor", "confirmed"})
+            self._require_confirmed(
+                "mcp.unregister",
+                body,
+                {"server_id": route[0]},
+            )
+            return self._dispatch_mcp_unregister(route[0], body)
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown MCP endpoint")
 
     def _dispatch_mcp_get(self, route: list[str], query: dict[str, list[str]]) -> Any:
         mcp = self.server.service.runtime.mcp
+        if route == ["auth", "profiles"]:
+            _require_empty_query(query, surface="MCP OAuth profiles")
+            result = self._call_mcp_facade("list_oauth_profiles", actor="gui")
+            _require_safe_mcp_gui_oauth_status_list_projection(result)
+            return result
+        if len(route) == 3 and route[0] == "auth" and route[2] == "status":
+            _require_empty_query(query, surface="MCP OAuth status")
+            result = self._call_mcp_facade("auth_status", route[1], actor="gui")
+            _require_safe_mcp_gui_oauth_projection(result)
+            return result
         if not route:
             return mcp.list_servers(text=_query_str(query, "text"), require_capability=False)
         if len(route) == 1:
             return mcp.inspect_server(route[0], require_capability=False)
         if len(route) == 2 and route[1] == "tools":
-            refresh_value = (_query_str(query, "refresh") or "").lower()
+            _require_mcp_cached_tools_query(query)
             return mcp.list_tools(
                 route[0],
                 actor="gui",
                 require_capability=False,
-                refresh=refresh_value in {"1", "true", "yes", "on"},
+                refresh=False,
             )
         raise GuiServerError(HTTPStatus.NOT_FOUND, "unknown MCP endpoint")
+
+    def _dispatch_mcp_modern_post(self, route: list[str]) -> Any:
+        """Dispatch MCP v3 Host surfaces; every provider operation is POST-only.
+
+        These routes deliberately do not accept a process ``actor``.  They run
+        as the explicit local GUI Host principal and never become model tools.
+        Missing Runtime facades are reported as 501 instead of fabricating a
+        successful empty result while a rolling build is being upgraded.
+        """
+
+        handlers = (
+            self._dispatch_mcp_modern_resource_post,
+            self._dispatch_mcp_modern_prompt_post,
+            self._dispatch_mcp_modern_oauth_post,
+            self._dispatch_mcp_modern_continuation_post,
+            self._dispatch_mcp_modern_remote_task_post,
+            self._dispatch_mcp_modern_subscription_post,
+        )
+        for handler in handlers:
+            result = handler(route)
+            if result is not _MCP_ROUTE_NOT_HANDLED:
+                return result
+        return _MCP_ROUTE_NOT_HANDLED
+
+    def _dispatch_mcp_modern_resource_post(self, route: list[str]) -> Any:
+        if len(route) == 3 and route[1:] == ["resources", "list"]:
+            body = self._mcp_body(allowed={"cursor"})
+            return self._call_mcp_facade(
+                "list_resources",
+                route[0],
+                cursor=_optional_nullable_body_string(body, "cursor"),
+                actor="gui",
+            )
+        if len(route) == 3 and route[1:] == ["resource-templates", "list"]:
+            body = self._mcp_body(allowed={"cursor"})
+            return self._call_mcp_facade(
+                "list_resource_templates",
+                route[0],
+                cursor=_optional_nullable_body_string(body, "cursor"),
+                actor="gui",
+            )
+        if len(route) == 3 and route[1:] == ["resources", "read"]:
+            body = self._mcp_body(
+                allowed={"resource_id", "variables"}, required={"resource_id"}
+            )
+            return self._call_mcp_facade(
+                "read_resource",
+                route[0],
+                _required_body_string(body, "resource_id"),
+                variables=_optional_string_map(body, "variables"),
+                actor="gui",
+            )
+        return _MCP_ROUTE_NOT_HANDLED
+
+    def _dispatch_mcp_modern_prompt_post(self, route: list[str]) -> Any:
+        if len(route) == 3 and route[1:] == ["prompts", "list"]:
+            body = self._mcp_body(allowed={"cursor"})
+            return self._call_mcp_facade(
+                "list_prompts",
+                route[0],
+                cursor=_optional_nullable_body_string(body, "cursor"),
+                actor="gui",
+            )
+        if len(route) == 3 and route[1:] == ["prompts", "get"]:
+            body = self._mcp_body(
+                allowed={
+                    "prompt_id",
+                    "arguments",
+                    "confirmed",
+                    "expected_preview_sha256",
+                },
+                required={"prompt_id"},
+            )
+            confirmed = _json_bool(body, "confirmed", False)
+            expected_preview_sha256 = (
+                _required_package_sha256(body, "expected_preview_sha256")
+                if "expected_preview_sha256" in body
+                else None
+            )
+            if confirmed and expected_preview_sha256 is None:
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "confirmed MCP Prompt requires expected_preview_sha256",
+                    details={"code": "mcp_prompt_preview_binding_required"},
+                )
+            if not confirmed and expected_preview_sha256 is not None:
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "MCP Prompt preview must not supply expected_preview_sha256",
+                    details={"code": "unexpected_mcp_prompt_preview_binding"},
+                )
+            if confirmed:
+                self._require_confirmed(
+                    "mcp.prompt.confirm",
+                    body,
+                    {"server_id": route[0], "prompt_id": body.get("prompt_id")},
+                )
+            return self._call_mcp_facade(
+                "get_prompt",
+                route[0],
+                _required_body_string(body, "prompt_id"),
+                arguments=_optional_string_map(body, "arguments"),
+                confirmed=confirmed,
+                expected_preview_sha256=expected_preview_sha256,
+                actor="gui",
+            )
+        if len(route) == 2 and route[1] == "completion":
+            body = self._mcp_body(
+                allowed={
+                    "reference_type",
+                    "reference_id",
+                    "argument",
+                    "context",
+                },
+                required={"reference_type", "reference_id", "argument"},
+            )
+            argument = _required_string_map(body, "argument")
+            return self._call_mcp_facade(
+                "complete_prompt",
+                route[0],
+                _required_body_string(body, "reference_type"),
+                _required_body_string(body, "reference_id"),
+                argument,
+                context=_optional_string_map(body, "context"),
+                actor="gui",
+            )
+        return _MCP_ROUTE_NOT_HANDLED
+
+    def _dispatch_mcp_modern_oauth_post(self, route: list[str]) -> Any:
+        profile_result = self._dispatch_mcp_oauth_profile_admin_post(route)
+        if profile_result is not _MCP_ROUTE_NOT_HANDLED:
+            return profile_result
+        if len(route) == 3 and route[0] == "auth" and route[2] == "login":
+            body = self._mcp_body(allowed={"scopes", "confirmed"})
+            self._require_confirmed(
+                "mcp.auth.login", body, {"profile_id": route[1]}
+            )
+            scopes = _optional_unique_string_list(body, "scopes")
+            result = self._call_mcp_facade(
+                "auth_begin", route[1], scopes=tuple(scopes), actor="gui"
+            )
+            _require_safe_mcp_gui_oauth_projection(result)
+            return result
+        if len(route) == 3 and route[0] == "auth" and route[2] == "logout":
+            body = self._mcp_body(allowed={"confirmed"})
+            self._require_confirmed(
+                "mcp.auth.logout", body, {"profile_id": route[1]}
+            )
+            result = self._call_mcp_facade("auth_logout", route[1], actor="gui")
+            _require_safe_mcp_gui_oauth_projection(result)
+            return result
+        if (
+            len(route) == 4
+            and route[:2] == ["auth", "challenges"]
+            and route[3] == "callback"
+        ):
+            body = self._mcp_body(
+                allowed={"callback_url"}, required={"callback_url"}
+            )
+            callback_url = _required_body_string(body, "callback_url")
+            try:
+                # Never include callback_url, code, or state in error details,
+                # audit previews, response projections, or log messages.
+                result = self._call_mcp_facade(
+                    "auth_complete", route[2], callback_url, actor="gui"
+                )
+                _require_safe_mcp_gui_oauth_projection(result)
+                return result
+            except GuiServerError as exc:
+                if exc.details.get("code") == "mcp_surface_unavailable":
+                    raise
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "MCP OAuth callback was rejected",
+                    details={"code": "mcp_oauth_callback_rejected"},
+                ) from None
+            except BaseException:
+                raise GuiServerError(
+                    HTTPStatus.BAD_REQUEST,
+                    "MCP OAuth callback was rejected",
+                    details={"code": "mcp_oauth_callback_rejected"},
+                ) from None
+        return _MCP_ROUTE_NOT_HANDLED
+
+    def _dispatch_mcp_oauth_profile_admin_post(self, route: list[str]) -> Any:
+        if route == ["auth", "profiles"]:
+            return self._dispatch_mcp_oauth_profile_change()
+        if (
+            len(route) == 4
+            and route[:2] == ["auth", "profiles"]
+            and route[3] == "remove"
+        ):
+            return self._dispatch_mcp_oauth_profile_remove(route[2])
+        return _MCP_ROUTE_NOT_HANDLED
+
+    def _dispatch_mcp_oauth_profile_change(self) -> Any:
+        body, client_secret = self._mcp_oauth_profile_body()
+        profile_mapping = _required_json_object(body, "profile")
+        replace = _json_bool(body, "replace", False)
+        try:
+            from agent_libos.mcp import mcp_oauth_profile_from_mapping
+
+            profile = mcp_oauth_profile_from_mapping(profile_mapping)
+        except Exception:
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "MCP OAuth profile is invalid",
+                details={"code": "invalid_mcp_oauth_profile"},
+            ) from None
+        preview = {
+            "profile_id": profile.profile_id,
+            "server_id": profile.server_id,
+            "replace": replace,
+            "client_secret_present": client_secret is not None,
+        }
+        if replace:
+            self._require_confirmed("mcp.auth.profile.replace", body, preview)
+        else:
+            self._require_confirmed("mcp.auth.profile.add", body, preview)
+        try:
+            result = self._call_mcp_facade(
+                "replace_oauth_profile" if replace else "add_oauth_profile",
+                profile,
+                client_secret=client_secret,
+                actor="gui",
+            )
+            _require_safe_mcp_gui_oauth_projection(result)
+            return result
+        except GuiServerError:
+            raise
+        except Exception:
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "MCP OAuth profile change was rejected",
+                details={"code": "mcp_oauth_profile_change_rejected"},
+            ) from None
+        finally:
+            client_secret = None
+
+    def _dispatch_mcp_oauth_profile_remove(self, profile_id: str) -> Any:
+        body = self._mcp_body(allowed={"confirmed"})
+        self._require_confirmed(
+            "mcp.auth.profile.remove",
+            body,
+            {"profile_id": profile_id},
+        )
+        try:
+            result = self._call_mcp_facade(
+                "remove_oauth_profile", profile_id, actor="gui"
+            )
+            _require_safe_mcp_gui_oauth_projection(result)
+            return result
+        except GuiServerError:
+            raise
+        except Exception:
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "MCP OAuth profile removal was rejected",
+                details={"code": "mcp_oauth_profile_change_rejected"},
+            ) from None
+
+    def _dispatch_mcp_modern_continuation_post(self, route: list[str]) -> Any:
+        if (
+            len(route) == 3
+            and route[0] == "continuations"
+            and route[2] == "inspect"
+        ):
+            self._mcp_body(allowed=set())
+            return self._call_mcp_facade(
+                "get_continuation", route[1], actor="gui"
+            )
+        if len(route) == 3 and route[0] == "continuations" and route[2] in {
+            "respond",
+            "cancel",
+        }:
+            action = route[2]
+            allowed = {"expected_revision", "confirmed"}
+            if action == "respond":
+                allowed.update(
+                    {
+                        "responses",
+                        "human_request_id",
+                        "human_expected_revision",
+                        "human_preview_sha256",
+                    }
+                )
+            body = self._mcp_body(
+                allowed=allowed,
+                required={"expected_revision"}
+                | (
+                    {
+                        "responses",
+                        "human_request_id",
+                        "human_expected_revision",
+                        "human_preview_sha256",
+                    }
+                    if action == "respond"
+                    else set()
+                ),
+            )
+            self._require_confirmed(
+                f"mcp.continuation.{action}",
+                body,
+                {"continuation_id": route[1]},
+            )
+            revision = _required_non_negative_body_int(body, "expected_revision")
+            if action == "respond":
+                return self._call_mcp_facade(
+                    "respond_continuation",
+                    route[1],
+                    expected_revision=revision,
+                    responses=_required_json_object(body, "responses"),
+                    human_request_id=_required_body_string(body, "human_request_id"),
+                    human_expected_revision=_required_non_negative_body_int(
+                        body, "human_expected_revision"
+                    ),
+                    human_preview_sha256=_required_package_sha256(
+                        body, "human_preview_sha256"
+                    ),
+                    actor="gui",
+                )
+            return self._call_mcp_facade(
+                "cancel_continuation",
+                route[1],
+                expected_revision=revision,
+                actor="gui",
+            )
+        return _MCP_ROUTE_NOT_HANDLED
+
+    def _dispatch_mcp_modern_remote_task_post(self, route: list[str]) -> Any:
+        if len(route) == 3 and route[0] == "remote-tasks" and route[2] in {
+            "get",
+            "update",
+            "cancel",
+        }:
+            action = route[2]
+            allowed = {"expected_revision"}
+            if action == "update":
+                allowed.update(
+                    {
+                        "responses",
+                        "human_request_id",
+                        "human_expected_revision",
+                        "human_preview_sha256",
+                    }
+                )
+            if action != "get":
+                allowed.add("confirmed")
+            body = self._mcp_body(
+                allowed=allowed,
+                required=(set() if action == "get" else {"expected_revision"})
+                | (
+                    {
+                        "responses",
+                        "human_request_id",
+                        "human_expected_revision",
+                        "human_preview_sha256",
+                    }
+                    if action == "update"
+                    else set()
+                ),
+            )
+            revision = (
+                _optional_nullable_non_negative_body_int(body, "expected_revision")
+                if action == "get"
+                else _required_non_negative_body_int(body, "expected_revision")
+            )
+            if action != "get":
+                self._require_confirmed(
+                    f"mcp.remote_task.{action}", body, {"task_ref": route[1]}
+                )
+            kwargs: dict[str, Any] = {
+                "expected_revision": revision,
+                "actor": "gui",
+            }
+            if action == "update":
+                kwargs["responses"] = _required_json_object(body, "responses")
+                kwargs["human_request_id"] = _required_body_string(
+                    body, "human_request_id"
+                )
+                kwargs["human_expected_revision"] = _required_non_negative_body_int(
+                    body, "human_expected_revision"
+                )
+                kwargs["human_preview_sha256"] = _required_package_sha256(
+                    body, "human_preview_sha256"
+                )
+            return self._call_mcp_facade(
+                f"{action}_remote_task", route[1], **kwargs
+            )
+        return _MCP_ROUTE_NOT_HANDLED
+
+    def _dispatch_mcp_modern_subscription_post(self, route: list[str]) -> Any:
+        if len(route) == 3 and route[1:] == ["subscriptions", "start"]:
+            body = self._mcp_body(
+                allowed={"filters", "confirmed"}, required={"filters"}
+            )
+            self._require_confirmed(
+                "mcp.subscription.start", body, {"server_id": route[0]}
+            )
+            filters = _required_unique_string_list(body, "filters")
+            return self._call_mcp_facade(
+                "start_subscription",
+                route[0],
+                filters=tuple(filters),
+                actor="gui",
+            )
+        if len(route) == 3 and route[0] == "subscriptions" and route[2] in {
+            "status",
+            "events",
+            "stop",
+        }:
+            action = route[2]
+            allowed: set[str] = set()
+            if action == "events":
+                allowed.update({"after", "limit"})
+            if action == "stop":
+                allowed.add("confirmed")
+            body = self._mcp_body(allowed=allowed)
+            if action == "status":
+                return self._call_mcp_facade(
+                    "subscription_status", route[1], actor="gui"
+                )
+            if action == "events":
+                return self._call_mcp_facade(
+                    "subscription_events",
+                    route[1],
+                    after=_optional_non_negative_body_int(body, "after", default=0),
+                    limit=_optional_bounded_body_int(body, "limit", default=100, maximum=1000),
+                    actor="gui",
+                )
+            self._require_confirmed(
+                "mcp.subscription.stop", body, {"subscription_id": route[1]}
+            )
+            return self._call_mcp_facade(
+                "stop_subscription", route[1], actor="gui"
+            )
+        return _MCP_ROUTE_NOT_HANDLED
+
+    def _mcp_body(
+        self,
+        *,
+        allowed: set[str],
+        required: set[str] | None = None,
+    ) -> dict[str, Any]:
+        body = self._read_body()
+        unknown = sorted(set(body) - allowed)
+        if unknown:
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "unknown MCP request field",
+                details={"code": "unknown_request_field", "fields": unknown},
+            )
+        missing = sorted((required or set()) - set(body))
+        if missing:
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "missing required MCP request field",
+                details={"code": "missing_request_field", "fields": missing},
+            )
+        return body
+
+    def _mcp_oauth_profile_body(self) -> tuple[dict[str, Any], bytes | None]:
+        """Read one exact profile mutation body and scrub its secret first."""
+
+        body = self._read_body()
+        client_secret = self._take_mcp_oauth_client_secret(body)
+        allowed = {"profile", "replace", "confirmed"}
+        unknown = sorted(set(body) - allowed)
+        if unknown:
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "unknown MCP request field",
+                details={"code": "unknown_request_field", "fields": unknown},
+            )
+        missing = sorted({"profile", "replace"} - set(body))
+        if missing:
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "missing required MCP request field",
+                details={"code": "missing_request_field", "fields": missing},
+            )
+        return body, client_secret
+
+    def _take_mcp_oauth_client_secret(
+        self,
+        body: dict[str, Any],
+    ) -> bytes | None:
+        """Remove one transient GUI secret before any audit or projection path."""
+
+        raw = body.pop("client_secret", _MCP_SECRET_ABSENT)
+        cached = getattr(self, "_cached_json_body", None)
+        if isinstance(cached, dict):
+            cached.pop("client_secret", None)
+        if raw is _MCP_SECRET_ABSENT:
+            return None
+        if type(raw) is not str:
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "MCP OAuth client secret input is invalid or oversized",
+            )
+        try:
+            selected = raw.encode("utf-8")
+        except UnicodeError:
+            selected = b""
+        if (
+            not selected
+            or len(selected) > _MCP_GUI_OAUTH_CLIENT_SECRET_MAX_BYTES
+            or b"\x00" in selected
+            or b"\r" in selected
+            or b"\n" in selected
+        ):
+            raise GuiServerError(
+                HTTPStatus.BAD_REQUEST,
+                "MCP OAuth client secret input is invalid or oversized",
+            )
+        return selected
+
+    def _call_mcp_facade(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        method = getattr(self.server.service.runtime.mcp, method_name, None)
+        if not callable(method):
+            raise GuiServerError(
+                HTTPStatus.NOT_IMPLEMENTED,
+                "MCP client surface is unavailable in this Runtime",
+                details={
+                    "code": "mcp_surface_unavailable",
+                    "operation": method_name,
+                },
+            )
+        result = method(*args, **kwargs)
+        if inspect.isawaitable(result):
+            result = asyncio.run(result)
+        projected = to_jsonable(result)
+        _require_safe_mcp_gui_projection(projected)
+        return projected
 
     def _dispatch_mcp_discover(self, server_id: str) -> Any:
         body = self._read_body()
@@ -5088,7 +5956,25 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         service.publish_runtime_changes("mcp.discover")
         return to_jsonable(result)
 
-    def _dispatch_mcp_register(self, body: dict[str, Any]) -> Any:
+    def _dispatch_mcp_tools_refresh(self, server_id: str) -> Any:
+        body = self._mcp_body(allowed={"actor"})
+        service = self.server.service
+        result = service.runtime.mcp.list_tools(
+            server_id,
+            actor=str(body.get("actor") or "gui"),
+            require_capability=body.get("actor") is not None,
+            refresh=True,
+        )
+        service.publish_runtime_changes("mcp.tools.refresh")
+        return result
+
+    def _dispatch_mcp_register(
+        self,
+        body: dict[str, Any],
+        *,
+        source: str | None,
+        replace: bool,
+    ) -> Any:
         if "path" in body:
             raise GuiServerError(
                 HTTPStatus.BAD_REQUEST,
@@ -5101,9 +5987,9 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         result = service.runtime.mcp.register_server_from_yaml_text(
             text,
             actor=str(body.get("actor") or "gui"),
-            replace=_json_bool(body, "replace", False),
+            replace=replace,
             require_capability=body.get("actor") is not None,
-            source=body.get("source"),
+            source=source,
         )
         service.publish_runtime_changes("mcp.register")
         return result
@@ -5118,6 +6004,20 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         )
         service.publish_runtime_changes("mcp.call")
         return to_jsonable(result)
+
+    def _dispatch_mcp_unregister(
+        self,
+        server_id: str,
+        body: dict[str, Any],
+    ) -> Any:
+        service = self.server.service
+        result = service.runtime.mcp.unregister_server(
+            server_id,
+            actor=str(body.get("actor") or "gui"),
+            require_capability=body.get("actor") is not None,
+        )
+        service.publish_runtime_changes("mcp.unregister")
+        return result
 
     def _dispatch_modules(self, method: str, route: list[str]) -> Any:
         service = self.server.service
@@ -5521,6 +6421,48 @@ def _semantic_page_limit(query: dict[str, list[str]]) -> int:
 def _query_str(query: dict[str, list[str]], key: str) -> str | None:
     values = query.get(key)
     return values[0] if values else None
+
+
+def _require_empty_query(query: dict[str, list[str]], *, surface: str) -> None:
+    if query:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            f"{surface} does not accept query parameters",
+            details={"code": "unknown_query_parameter", "parameters": sorted(query)},
+        )
+
+
+def _require_mcp_cached_tools_query(query: dict[str, list[str]]) -> None:
+    unknown = sorted(set(query) - {"refresh"})
+    if unknown:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "unknown MCP tools query parameter",
+            details={"code": "unknown_query_parameter", "parameters": unknown},
+        )
+    duplicate = sorted(key for key, values in query.items() if len(values) != 1)
+    if duplicate:
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "MCP tools query parameters must not be repeated",
+            details={"code": "duplicate_query_parameter", "parameters": duplicate},
+        )
+    if "refresh" not in query:
+        return
+    refresh = query["refresh"][0]
+    if refresh == "false":
+        return
+    if refresh == "true":
+        raise GuiServerError(
+            HTTPStatus.BAD_REQUEST,
+            "GET MCP tools is cache-only; use POST /tools/refresh for a live read",
+            details={"code": "live_refresh_requires_post"},
+        )
+    raise GuiServerError(
+        HTTPStatus.BAD_REQUEST,
+        "refresh must be the literal false on GET MCP tools",
+        details={"code": "invalid_query_parameter", "parameter": "refresh"},
+    )
 
 
 def _require_semantic_query_contract(
@@ -6747,7 +7689,12 @@ def _gui_route_accepts_actor(method: str, route: list[str]) -> bool:
         ("mcp", "register"),
     }:
         return True
-    if len(route) == 3 and route[0] == "mcp" and route[2] == "discover":
+    if len(route) == 3 and route[0] == "mcp" and route[2] in {
+        "discover",
+        "unregister",
+    }:
+        return True
+    if len(route) == 4 and route[0] == "mcp" and route[2:] == ["tools", "refresh"]:
         return True
     if len(route) == 3 and route[0] == "checkpoints" and route[2] in {"restore", "fork"}:
         return True

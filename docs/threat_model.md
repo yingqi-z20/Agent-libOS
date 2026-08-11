@@ -184,17 +184,35 @@ negotiated revision and advertised server capabilities are untrusted
 operation-local observations and cannot grant authority. Automatic fallback is
 limited to protocol-recognized legacy signals, never authentication errors,
 server failures, malformed/oversized replies, or ambiguous transport failure.
-The client does not advertise Sampling, Roots, Elicitation, subscriptions,
-Tasks, or extensions, and rejects reverse requests without invoking Runtime
-behavior. An MRTR input request is non-retryable and preserves unknown mutation
-evidence rather than creating a model-controlled replay path.
+The v1/v2 Tool compatibility client advertises no Sampling, Roots, Elicitation,
+subscription, Task, or extension callback. An MRTR input result on that path is
+non-retryable and preserves unknown mutation evidence rather than creating a
+model-controlled replay path.
 
-MCP protocol/session/content-negotiation, trace, baggage, and reserved `_meta`
-fields are Host-generated. Manifest header matching is case-insensitive and
-cannot override them. Ambient OpenTelemetry context is cleared at this adapter
-boundary; the release installs no exporter and does not claim OTel propagation
-support. Static environment-backed Authorization values remain a Host transport
-choice, not an OAuth implementation or a source of Runtime capability.
+Manifest v3 is an exact `2026-07-28`, non-downgradable contract for governed
+Tools and the Host-owned Resources, Resource Templates, Prompts, Completion,
+bounded subscriptions, MRTR, digest-pinned Tasks extension, and
+Host-preconfigured OAuth surfaces. Logical
+manifest ids and post-operation registry/auth/owner fence validation prevent
+remote metadata or a concurrent replacement from becoming authority. Provider
+cursors, remote task ids, request-state, OAuth state/PKCE/codes/tokens, and
+subscription handles are opaque Host state, not model or durable Store
+payloads. Sanitized, revisioned continuation/Task/subscription projections may
+be durable; ambiguous mutation dispatch or restart becomes `needs_attention`
+or `lost` and is never replayed/reconnected automatically. Apps HTML/metadata,
+Roots, Sampling, Logging, an MCP server surface, OAuth DCR, and the deprecated
+standalone SSE transport remain excluded.
+
+MCP header matching is case-insensitive. Every manifest version rejects
+protocol/session/resume, trace, and baggage controls. Manifest v2/v3 strictly
+forbids the complete Host-reserved content-negotiation, `Mcp-Param-*`, and
+protocol `_meta` surface. Manifest v1 retains compatibility support for
+`Accept`, `Mcp-Param-*`, and application `_meta`, while still rejecting all
+common high-risk controls. Ambient OpenTelemetry context is cleared at this
+adapter boundary; the release installs no exporter and does not claim OTel
+propagation support. Static environment-backed Authorization values on the
+v1/v2 path are a Host transport choice, not OAuth. V3 OAuth uses an opaque Host
+profile and credential broker; it does not create Runtime capability.
 
 These controls reduce SSRF and DNS-rebinding risk; they are not a private
 network firewall or a substitute for TLS and resolver integrity. TLS relies on
@@ -490,6 +508,13 @@ Host-registered manifests, public-address policy, bounded wire payloads,
 environment allowlists, schema checks, no redirects, absolute deadlines, and
 sanitized public errors. The protected-operation state machine preserves
 unknown outcomes rather than retrying them as definitely not started.
+
+The hard network/stdio deadline belongs to the built-in governed transport.
+An injected exact-v3 Python Provider is trusted Host composition, not an
+in-process sandbox: it must yield, bound CPU work, honor the supplied deadline,
+and propagate cancellation. Runtime pre/post checks keep a late entered result
+unknown and non-replayable, but arbitrary blocking Python cannot be safely
+preempted. Deploy untrusted custom code behind a separately killable process.
 
 Remote services may still return adversarial content, lie at the application
 layer, retain data, or become unavailable. Provider receipts and reconciliation

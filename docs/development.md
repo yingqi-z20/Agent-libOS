@@ -94,11 +94,10 @@ Optional provider gates are excluded unless selected explicitly:
 
 ```bash
 uv sync --frozen --extra mcp
+npm --prefix tests/fixtures/mcp_sdk_v2/typescript_server \
+  ci --ignore-scripts --no-audit --no-fund
 uv run python -m pytest -q \
-  tests/providers/test_mcp_http_transport.py \
-  tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_sdk_http_client_uses_snapshotted_headers_and_disables_ambient_env \
-  tests/providers/test_mcp_v2_adapter.py \
-  tests/providers/test_mcp_sdk_integration.py \
+  tests -m "mcp and not postgres" \
   --run-mcp --fail-on-skip
 uv run python scripts/run_mcp_conformance.py
 uv run python -m pytest -q \
@@ -109,16 +108,65 @@ export AGENT_LIBOS_POSTGRES_DSN='postgresql://agent_libos:agent_libos@127.0.0.1:
 uv run python -m pytest -m postgres --run-postgres --fail-on-skip
 ```
 
-The MCP integration job runs all three complete transport, adapter, and SDK
-integration files plus the scoped optional HTTP-client snapshot test, without
-ignored tests, on Ubuntu Python 3.11 and 3.14. The `mcp` extra is the SDK v2
-environment: `mcp>=2.0,<3` plus directly declared `anyio`, `httpx2`,
-`httpcore2`, and `opentelemetry-api` bounds. Legacy wire compatibility is
-tested through SDK v2 and raw protocol fixtures; CI does not install SDK v1
-beside it.
+The MCP integration job selects the full-tree `mcp` marker closure,
+excluding only the separately gated PostgreSQL parametrizations, without a
+hand-maintained file allowlist, ignored tests, or skip-tolerant fallbacks, on
+Ubuntu Python 3.11 and 3.14. `scripts/check_mcp_test_closure.py` is the closure
+rule: it collects every lane and fails if an MCP-named, MCP-fixtured, or
+MCP-referencing node lacks the product marker. Deterministic lanes exclude that
+marker to avoid duplicate execution; the dedicated job owns the complete MCP
+closure. The job also
+runs independent real-stdio Python and TypeScript SDK
+v2 fixtures for Resources, Prompts, and modern resource subscriptions. The
+TypeScript fixture is installed from its checked-in lock file with lifecycle
+scripts disabled. A separate native job runs real stdio and loopback HTTP SDK
+smokes on Windows and macOS. Release-artifact jobs for Python 3.11 through 3.14
+clean-install both canonical wheel and sdist with their published `[mcp]` extra
+and, from a temporary working directory, execute a self-contained exact-v3
+stdio plus loopback Streamable HTTP server through the installed Runtime
+Resource, Resource Template, Prompt, Completion, bounded resource-subscription,
+and Tool protected paths. The same installed-package smoke writes its OAuth server fixture into
+that temporary directory, performs a Host-pinned loopback-TLS OAuth
+authorization-code, PKCE, and Bearer exchange, and runs an offline Store v6-to-v7
+migration followed by a schema-v7 reopen. A second installed-package smoke
+captures MRTR and remote-Task results through the protected Runtime, closes and
+reopens the SQLite Store, then drives continuation inspect/respond/cancel and
+Task get/update/cancel/re-observe through the installed CLI. It requires each
+initial Tool call and continuation/Task dispatch count exactly, and verifies
+that opaque request state and remote Task IDs never enter the Store or CLI
+projection. The artifact gate rejects a source-tree
+`agent_libos` import, nonempty fixture stderr, leaked supervised connections,
+or missing protected audit actions, so dependency imports alone cannot satisfy
+the artifact gate.
+
+The `mcp` extra pins the reviewed SDK environment at `mcp==2.0.0` and the
+audited OS-credential implementation at `keyring==25.7.0`, plus directly
+declared `anyio`, `httpx2`, `httpcore2`, and `opentelemetry-api` bounds. Legacy
+wire compatibility is tested through SDK v2 and raw protocol fixtures; CI does
+not install SDK v1 beside it. Supplying `--run-mcp` without this complete extra
+is a configuration error before collection, rather than a green run made only
+of skips.
 The conformance runner checks out one reviewed upstream revision in a temporary
-directory and runs only the applicable strict Tools-client scenarios. It uses
-no expected-failure baseline; its generated results remain under ignored
+directory and runs its explicit strict Tools/HTTP-schema allowlist, including
+the Resource/Prompt request-header branches, plus MRTR and the fixed-upstream
+OAuth pre-registration and CIMD scenarios. The OAuth harness
+obtains the Resource and Authorization fixture origins directly from the
+reviewed scenario object before constructing Runtime, pins both origins and
+metadata URLs, and never enables Dynamic Client Registration or treats PRM/401
+discovery as authority. Durable evidence for every upstream scenario retains
+only check ID, status, bounded specification references, a deterministic
+evidence digest, and the already pinned source identity in the summary; raw
+names, descriptions, timestamps, logs, and protocol or authorization details
+are dropped. It uses no expected-failure
+baseline. The remaining reviewed OAuth scenarios do not provide a Host-pinned
+expected issuer through their runner contract and are therefore listed by exact
+name and reason as unavailable rather than counted as passes. The pinned
+suite's `2025-03-26` OAuth backcompat, client-credentials,
+enterprise-managed-authorization, DPoP, and workload-identity scenarios are
+listed separately as reviewed product exclusions; they are not conflated with
+the unavailable authorization-code scenarios. A separate real
+loopback-TLS Runtime gate covers pinned issuer/resource/endpoints, PKCE, Bearer
+injection, and secret absence. Generated results remain under ignored
 `.benchmark_runs/` and are not release artifacts. Git checkout, `npm ci`, the
 explicit build target, the Node runner, and its Python client start from a
 minimal environment allowlist. Their HOME, temporary directories, XDG state,
@@ -243,9 +291,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.4.2-py3-none-any.whl dist/agent_libos-1.4.2.tar.gz
+  dist/agent_libos-1.5.0-py3-none-any.whl dist/agent_libos-1.5.0.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.4.2-py3-none-any.whl
+  dist/agent_libos-1.5.0-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 ```
 
@@ -253,6 +301,11 @@ The artifact checker requires the Python package, project metadata, and
 lockfile versions to agree; when GUI sources are present, both GUI package
 versions must agree as well. The artifact directory is a closed set: extra
 files, directories, symbolic links, and other non-regular entries are rejected.
+The wheel file contract closes over every `agent_libos.mcp` module plus the
+schema-v7 SQLite/PostgreSQL MCP contract files. The source-distribution contract
+also requires the reviewed MCP examples, conformance and installed-package
+smoke scripts, and the frozen Python/TypeScript fixture sources without vendored
+`node_modules` or generated caches.
 CI builds the pair once, records `SHA256SUMS`, and makes all four Python-version
 jobs download and verify that same pair before installing hash-checked locked
 dependencies and the artifact itself into fresh
@@ -655,10 +708,13 @@ Current behavior must not claim:
 
 - Python JIT compatibility,
 - direct external framework adapters as trusted boundaries,
-- MCP MRTR/OAuth/listen, Resources, Prompts, Tasks, Apps, Roots, Sampling,
-  Logging, OpenTelemetry product support, an MCP server surface, or real hosted
-  GitHub/GitLab provider integrations that are not implemented (the MCP
-  Tools-only client and typed local Git provider/simulated PRs are current),
+- MCP Apps, Roots, Sampling, Logging, OpenTelemetry product integration, OAuth
+  Dynamic Client Registration, the deprecated standalone SSE transport, an
+  MCP server surface, or real hosted GitHub/GitLab provider integrations. The
+  client-only exact-v3 governed Tools, Resources/Prompts/Completion, MRTR, bounded
+  subscriptions, Host-preconfigured OAuth, and digest-pinned Tasks extension
+  are current Host surfaces; they must not be generalized into the excluded
+  server- or model-authority surfaces,
 - provider-level compensation for rollbackable external side effects,
 - Skill activation as a capability grant.
 

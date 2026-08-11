@@ -31,6 +31,7 @@ from agent_libos.config.defaults import (
     ToolDefaults,
 )
 from agent_libos.config.loader import (
+    AgentLibOSConfigDeprecationWarning,
     get_project_root,
     load_config_file,
     load_config_from_cwd,
@@ -68,6 +69,7 @@ __all__ = [
     "ScriptDefaults",
     "SkillDefaults",
     "ToolDefaults",
+    "AgentLibOSConfigDeprecationWarning",
     "get_project_root",
     "load_config_file",
     "load_config_from_cwd",

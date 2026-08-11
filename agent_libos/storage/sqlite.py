@@ -24,6 +24,8 @@ from agent_libos.storage.sql import (
     _V5_REQUIRED_COLUMNS,
     _V6_KEYSET_TEXT_COLUMNS,
     _V6_REQUIRED_COLUMNS,
+    _V7_KEYSET_TEXT_COLUMNS,
+    _V7_REQUIRED_COLUMNS,
 )
 from agent_libos.storage.v5_schema_contract import (
     HUMAN_REQUEST_INDEX_CONTRACTS,
@@ -39,6 +41,12 @@ from agent_libos.storage.v6_schema_contract import (
     V6_STORAGE_KEY_CONSTRAINTS,
     V6_STORAGE_SQLITE_CHECKS,
     V6_TABLES,
+)
+from agent_libos.storage.v7_schema_contract import (
+    V7_STORAGE_COLUMN_CONTRACTS,
+    V7_STORAGE_KEY_CONSTRAINTS,
+    V7_STORAGE_SQLITE_CHECKS,
+    V7_TABLES,
 )
 from agent_libos.utils.ids import utc_now
 
@@ -308,10 +316,14 @@ _SQLITE_CANONICAL_V5_CATALOG_SHA256 = (
 _SQLITE_CANONICAL_V6_CATALOG_SHA256 = (
     "ac1735257279e943a9eaa4ad75ecb078c58b279e9ad4ba37aad2e2417d35c50d"
 )
+_SQLITE_CANONICAL_V7_CATALOG_SHA256 = (
+    "e488c584f494028648354dda0be1d9fcfa8061560ed092d868298bd699af5565"
+)
 _SQLITE_CANONICAL_CATALOG_SHA256 = {
     4: _SQLITE_CANONICAL_V4_CATALOG_SHA256,
     5: _SQLITE_CANONICAL_V5_CATALOG_SHA256,
     6: _SQLITE_CANONICAL_V6_CATALOG_SHA256,
+    7: _SQLITE_CANONICAL_V7_CATALOG_SHA256,
 }
 
 
@@ -830,13 +842,14 @@ class SQLiteStore(SQLRuntimeStore):
         *,
         label: str,
         error_type: type[ValidationError],
+        migration_label: str = "schema-v5",
     ) -> Iterator[Any]:
         """Open a disposable recovered snapshot for an offline migration probe."""
 
         helper = cls.__new__(cls)
         connection: sqlite3.Connection | None = None
         with tempfile.TemporaryDirectory(
-            prefix="agent-libos-v5-migration-preflight-"
+            prefix="agent-libos-migration-preflight-"
         ) as directory:
             snapshot_path = Path(directory) / "store.sqlite"
             try:
@@ -851,7 +864,7 @@ class SQLiteStore(SQLRuntimeStore):
                 yield connection
             except sqlite3.Error as exc:
                 raise error_type(
-                    f"unable to inspect {label} for schema-v5 migration"
+                    f"unable to inspect {label} for {migration_label} migration"
                 ) from exc
             finally:
                 if connection is not None:
@@ -864,6 +877,7 @@ class SQLiteStore(SQLRuntimeStore):
         path: Path,
         *,
         error_type: type[ValidationError],
+        migration_label: str = "schema-v5",
     ) -> Iterator[Any]:
         """Open the source under the backend's exclusive offline migration lease."""
 
@@ -907,7 +921,9 @@ class SQLiteStore(SQLRuntimeStore):
             busy_codes = {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
             if getattr(exc, "sqlite_errorcode", None) in busy_codes:
                 raise error_type(f"runtime store is already open: {path}") from exc
-            raise error_type(f"SQLite schema-v5 migration failed: {path}") from exc
+            raise error_type(
+                f"SQLite {migration_label} migration failed: {path}"
+            ) from exc
         except BaseException:
             if connection is not None:
                 try:
@@ -1178,6 +1194,38 @@ class SQLiteStore(SQLRuntimeStore):
         cls._require_full_schema_catalog(conn, version=6)
 
     @classmethod
+    def _require_v7_schema_shape(cls, conn: Any) -> None:
+        """Require every schema-v7 manifest relation to be a SQLite table."""
+
+        required_tables = sorted(_V7_REQUIRED_COLUMNS)
+        placeholders = ", ".join("?" for _ in required_tables)
+        rows = conn.execute(
+            "SELECT name, type FROM sqlite_master "
+            f"WHERE name IN ({placeholders})",
+            required_tables,
+        )
+        relation_types = {
+            str(row["name"]): str(row["type"]).lower()
+            for row in rows
+        }
+        invalid_relations = {
+            table: relation_types.get(table, "missing")
+            for table in required_tables
+            if relation_types.get(table) != "table"
+        }
+        if invalid_relations:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v7 "
+                "manifest relation types: "
+                f"{invalid_relations}; expected type 'table'"
+            )
+        super()._require_v7_schema_shape(conn)
+        cls._require_v5_storage_contract(conn)
+        cls._require_v6_storage_contract(conn)
+        cls._require_v7_storage_contract(conn)
+        cls._require_full_schema_catalog(conn, version=7)
+
+    @classmethod
     def _require_full_schema_catalog(cls, conn: Any, *, version: int) -> None:
         """Require every SQLite schema object to match the canonical catalog."""
 
@@ -1199,7 +1247,7 @@ class SQLiteStore(SQLRuntimeStore):
 
     @classmethod
     def _canonical_full_schema_catalog(cls, version: int) -> dict[str, Any]:
-        if version not in {4, 5, 6}:
+        if version not in {4, 5, 6, 7}:
             raise UnsupportedStoreVersion(
                 f"unsupported Agent libOS SQLite schema catalog version: {version}"
             )
@@ -1218,6 +1266,17 @@ class SQLiteStore(SQLRuntimeStore):
                 # is the canonical v5 base with only the explicit 4->5 delta
                 # reversed, matching the supported offline migration source.
                 reference = SQLiteStore(":memory:")
+                if version in {4, 5, 6}:
+                    for table in sorted(V7_TABLES):
+                        reference.conn.execute(f'DROP TABLE "{table}"')
+                    changed = reference.conn.execute(
+                        "UPDATE runtime_schema SET schema_version = 6 "
+                        "WHERE singleton = 1 AND schema_version = 7"
+                    )
+                    if changed.rowcount != 1:
+                        raise UnsupportedStoreVersion(
+                            "unable to construct canonical SQLite schema-v6 catalog"
+                        )
                 if version in {4, 5}:
                     for table in sorted(V6_TABLES):
                         reference.conn.execute(f'DROP TABLE "{table}"')
@@ -1279,6 +1338,22 @@ class SQLiteStore(SQLRuntimeStore):
         if problems:
             raise UnsupportedStoreVersion(
                 "unsupported Agent libOS schema v6 storage contract: "
+                f"{problems}"
+            )
+
+    @classmethod
+    def _require_v7_storage_contract(cls, conn: Any) -> None:
+        problems = {
+            **cls._storage_column_problems(conn, V7_STORAGE_COLUMN_CONTRACTS),
+            **cls._storage_check_problems(conn, V7_STORAGE_SQLITE_CHECKS),
+            **cls._storage_key_constraint_problems(
+                conn,
+                V7_STORAGE_KEY_CONSTRAINTS,
+            ),
+        }
+        if problems:
+            raise UnsupportedStoreVersion(
+                "unsupported Agent libOS schema v7 storage contract: "
                 f"{problems}"
             )
 

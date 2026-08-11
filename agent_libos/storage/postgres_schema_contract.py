@@ -35,6 +35,18 @@ _V6_SEMANTIC_TABLES = frozenset(
         "semantic_rate_budgets",
     }
 )
+_V7_MCP_TABLES = frozenset(
+    {
+        "mcp_continuations",
+        "mcp_remote_tasks",
+        "mcp_subscriptions",
+        "mcp_auth_metadata",
+        "mcp_side_effect_preparations",
+    }
+)
+POSTGRES_V6_CATALOG_SHA256 = (
+    "5945b66467704dcf5b38983017c5227bca1dd8ccf30ba5dd17674e04fa2573ed"
+)
 POSTGRES_V5_CATALOG_SHA256 = (
     "6e5ee9463e5c998e2469064bd4b2049321170c4406f067722a431a78114f3a64"
 )
@@ -569,7 +581,7 @@ def build_postgres_manifest(
 
 
 @lru_cache(maxsize=1)
-def load_postgres_v6_manifest() -> dict[str, Any]:
+def load_postgres_v7_manifest() -> dict[str, Any]:
     try:
         payload = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -589,6 +601,16 @@ def load_postgres_v6_manifest() -> dict[str, Any]:
             "Agent libOS PostgreSQL canonical schema manifest is invalid"
         )
     return copy.deepcopy(payload)
+
+
+def load_postgres_v6_manifest() -> dict[str, Any]:
+    """Return the historical v6 projection from the current v7 artifact."""
+
+    payload = load_postgres_v7_manifest()
+    return build_postgres_manifest(
+        _derive_postgres_v6_catalog(payload["catalog"]),
+        generated_postgres_version_num=payload["generated_postgres_version_num"],
+    )
 
 
 def _catalog_without_tables(
@@ -651,6 +673,17 @@ def _derive_postgres_v5_catalog(v6_catalog: Mapping[str, Any]) -> dict[str, Any]
     return catalog
 
 
+def _derive_postgres_v6_catalog(v7_catalog: Mapping[str, Any]) -> dict[str, Any]:
+    catalog = _catalog_without_tables(v7_catalog, _V7_MCP_TABLES)
+    _require_derived_catalog_digest(
+        catalog,
+        expected_sha256=POSTGRES_V6_CATALOG_SHA256,
+        version=6,
+        provenance="the released v6 contract",
+    )
+    return catalog
+
+
 def _derive_postgres_v4_catalog(v5_catalog: Mapping[str, Any]) -> dict[str, Any]:
     catalog = _catalog_without_tables(v5_catalog, _SEMANTIC_TABLES)
     catalog["columns"]["human_requests"] = [
@@ -680,11 +713,14 @@ def _derive_postgres_v4_catalog(v5_catalog: Mapping[str, Any]) -> dict[str, Any]
 
 
 def expected_postgres_catalog(store_version: int) -> dict[str, Any]:
-    v6_catalog = copy.deepcopy(load_postgres_v6_manifest()["catalog"])
+    v7_catalog = copy.deepcopy(load_postgres_v7_manifest()["catalog"])
+    if store_version == 7:
+        return v7_catalog
+    if store_version not in {4, 5, 6}:
+        raise ValueError(f"unsupported PostgreSQL catalog version: {store_version}")
+    v6_catalog = _derive_postgres_v6_catalog(v7_catalog)
     if store_version == 6:
         return v6_catalog
-    if store_version not in {4, 5}:
-        raise ValueError(f"unsupported PostgreSQL catalog version: {store_version}")
     v5_catalog = _derive_postgres_v5_catalog(v6_catalog)
     if store_version == 5:
         return v5_catalog

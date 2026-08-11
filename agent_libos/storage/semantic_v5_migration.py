@@ -420,8 +420,12 @@ def _backend_for_target(target: str | Path) -> str:
     return "sqlite"
 
 
-def _sqlite_path(target: str | Path) -> Path:
-    text = _sqlite_target_text(target)
+def _sqlite_path(
+    target: str | Path,
+    *,
+    migration_label: str = "schema-v5",
+) -> Path:
+    text = _sqlite_target_text(target, migration_label=migration_label)
     path = Path(text).resolve()
     _require_secure_regular_file(path, label="SQLite source", mode_600=False)
     return path
@@ -431,13 +435,14 @@ def _sqlite_target_text(
     target: str | Path,
     *,
     windows: bool | None = None,
+    migration_label: str = "schema-v5",
 ) -> str:
     """Decode a SQLite target without constructing a platform-specific Path."""
 
     text = str(target)
     if text in {"", ":memory:"}:
         raise StoreV5MigrationError(
-            "schema-v5 migration requires a file-backed SQLite store"
+            f"{migration_label} migration requires a file-backed SQLite store"
         )
     selected_windows = os.name == "nt" if windows is None else windows
     if not isinstance(selected_windows, bool):
@@ -454,7 +459,7 @@ def _sqlite_target_text(
                 text = text[1:]
         else:
             raise StoreV5MigrationError(
-                "schema-v5 migration requires a file-backed SQLite store"
+                f"{migration_label} migration requires a file-backed SQLite store"
             )
     elif parsed.scheme and not (
         selected_windows
@@ -462,7 +467,7 @@ def _sqlite_target_text(
         and text[1:3] in {":\\", ":/"}
     ):
         raise StoreV5MigrationError(
-            f"unsupported schema-v5 migration target scheme: {parsed.scheme}"
+            f"unsupported {migration_label} migration target scheme: {parsed.scheme}"
         )
     return text
 
@@ -530,12 +535,14 @@ def _sqlite_snapshot(
     path: Path,
     *,
     label: str,
+    migration_label: str = "schema-v5",
 ) -> Any:
     _require_secure_regular_file(path, label=label, mode_600=False)
     return SQLiteStore._migration_snapshot_connection(
         path,
         label=label,
         error_type=StoreV5MigrationError,
+        migration_label=migration_label,
     )
 
 

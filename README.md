@@ -161,15 +161,19 @@ The implementation currently includes:
   capabilities, provider-classified external effects, audit, and checkpoints.
   Per-item registry authority is checked before metadata lookup; registry row,
   stale-grant invalidation, event, and audit changes commit atomically.
-- Client-only MCP Tools through registered stdio or Streamable HTTP servers,
-  using Python MCP SDK v2 with explicit legacy/automatic/`2026-07-28`
-  negotiation. Tool capabilities, provider-classified external effects, audit,
-  and resource accounting retain the same authority-before-lookup and
-  transactional registry semantics.
-  The client surface introduced in 1.2.1 remains client-only and Tools-only:
-  MRTR/OAuth/listen,
-  Resources, Prompts, Tasks, Apps, Roots, Sampling, Logging, OpenTelemetry
-  product support, and an MCP server surface are intentionally excluded.
+- Client-only MCP through registered stdio or Streamable HTTP servers. Manifest
+  v1/v2 preserves the governed Tools compatibility contract and explicit
+  legacy/automatic/`2026-07-28` negotiation. Exact-`2026-07-28` Manifest v3
+  provides governed Tools with a closed modern result union and adds
+  Host-governed Resources, Resource Templates, Prompts, Completion, MRTR
+  continuations, bounded subscriptions, Host-preconfigured OAuth, and an
+  optional digest-pinned Tasks extension without weakening Tool capability,
+  data-flow, effect, audit, or resource accounting.
+  MCP Apps, Roots, Sampling, Logging, OpenTelemetry product integration, OAuth
+  Dynamic Client Registration, client-credentials, enterprise-managed
+  authorization, DPoP, workload identity, older OAuth backcompat modes, the
+  deprecated standalone SSE transport, and an MCP server surface remain
+  intentionally excluded.
 - A deterministic runtime-safety benchmark harness with 33 checked-in schema-v1
   tasks, including a self-evolution subset, baselines, evidence-backed
   side-effect oracle, fail-closed output validity, and explicit metric
@@ -225,17 +229,17 @@ Start here, then read the deeper references as needed:
   manifests, trust model, registration surfaces, CLI, and checkpoint behavior.
 - [docs/jsonrpc.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/jsonrpc.md): client-only JSON-RPC endpoint registry,
   capability resources, tools, syscalls, and checkpoint behavior.
-- [docs/mcp.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/mcp.md): client-only MCP server registry, Tools-only
-  Manifest v1/v2 scope, protocol negotiation, capability resources, and
-  checkpoint behavior.
+- [docs/mcp.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/mcp.md): client-only MCP registry, governed
+  Manifest v1/v2 compatibility plus exact-2026-07-28 Manifest v3 Tools and Host client,
+  OAuth/MRTR/Tasks/subscription lifecycle, DX, and recovery behavior.
 - [docs/skills.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/skills.md): standard `SKILL.md` packages,
   workspace/global sources, trust, activate/unload semantics, bundled JIT
   tools, and `swe-agent`.
 - [docs/checkpoints.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/checkpoints.md): scoped snapshots, restore, fork,
   replay diagnostics, retained runtime history, and external-effect reporting.
 - [docs/storage.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/storage.md): transaction rollback/poison semantics,
-  Object payload durability, schema-v6 validation, ordered offline v4-to-v5 and
-  v5-to-v6 migration,
+  Object payload durability, schema-v7 validation, ordered offline v4-to-v5,
+  v5-to-v6, and v6-to-v7 migration,
   active-runtime leases, and the backup/restore runbook.
 - [docs/evidence_payload_retention.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/evidence_payload_retention.md):
   explicit, auditable LLM/external-effect payload retention tiers and safety
@@ -336,7 +340,7 @@ verified by the release procedure:
 ```bash
 uv venv .venv
 uv pip install --python .venv/bin/python \
-  ./dist/agent_libos-1.4.2-py3-none-any.whl
+  ./dist/agent_libos-1.5.0-py3-none-any.whl
 .venv/bin/agent-libos --help
 ```
 
@@ -351,7 +355,7 @@ The Python wheel contains the core `agent_libos` package, its immutable built-in
 Tool Skills, and the `agent-libos`, `agent-libos-gui-server`, and explicit
 offline `agent-libos-migrate-tool-groups` console entrypoints. Release
 validation parses all 26 built-in Skill packages and their
-99 uniquely owned tools from both the wheel and source archive. Repository-level
+101 uniquely owned tools from both the wheel and source archive. Repository-level
 assets such as the optional PTY Runtime Module, bundled example Skill and Image,
 benchmarks, tests, and documentation are distributed with the Python source
 archive and source checkout, not installed into the core wheel. The
@@ -366,9 +370,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.4.2-py3-none-any.whl dist/agent_libos-1.4.2.tar.gz
+  dist/agent_libos-1.5.0-py3-none-any.whl dist/agent_libos-1.5.0.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.4.2-py3-none-any.whl
+  dist/agent_libos-1.5.0-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 uv export --frozen --no-dev --no-emit-project --output-file runtime-requirements.txt
 uv export --frozen --only-group release --no-emit-project --output-file release-build-requirements.txt
@@ -382,7 +386,7 @@ uv venv /tmp/agent-libos-wheel-check
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
   --require-hashes -r runtime-requirements.txt
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
-  --no-deps dist/agent_libos-1.4.2-py3-none-any.whl
+  --no-deps dist/agent_libos-1.5.0-py3-none-any.whl
 uv pip check --python /tmp/agent-libos-wheel-check/bin/python
 /tmp/agent-libos-wheel-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-wheel-check/bin/agent-libos --help
@@ -395,7 +399,7 @@ uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
   --require-hashes -r release-build-requirements.txt
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
-  --no-deps --no-build-isolation dist/agent_libos-1.4.2.tar.gz
+  --no-deps --no-build-isolation dist/agent_libos-1.5.0.tar.gz
 uv pip check --python /tmp/agent-libos-sdist-check/bin/python
 /tmp/agent-libos-sdist-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-sdist-check/bin/agent-libos --help
@@ -574,13 +578,12 @@ uv sync --frozen --extra postgres
 uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" init
 ```
 
-Agent libOS 1.4.2 creates and opens only RuntimeStore schema v6. A canonical v5
-store is rejected by ordinary startup until an operator runs the explicit,
-offline, digest-bound v5-to-v6 migration. A schema-v4 store must first use the
-v4-to-v5 migration; a schema-v3 store is rejected before
-initialization or any write; use Agent libOS 1.0.1 only to view or archive it.
-There is no automatic migration, read-only bridge, or dual-schema Runtime mode
-in 1.4.2.
+The current Runtime creates and opens only RuntimeStore schema v7. A canonical
+v6 store is rejected by ordinary startup until an operator runs the explicit,
+offline, digest-bound v6-to-v7 migration. Older supported stores must traverse
+the ordered v4-to-v5 and v5-to-v6 steps first; a schema-v3 store is rejected
+before initialization or any write. There is no automatic migration, read-only
+bridge, or dual-schema Runtime mode.
 
 Both backends implement the same runtime store contract. Process metadata,
 capabilities, audit/events, messages, human requests, LLM call records,
@@ -853,8 +856,10 @@ uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --a
 Create the manifest from [docs/mcp.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/mcp.md); the angle-bracket path is
 user supplied. The `mcp` extra is not installed by the core Quick Start command.
 Manifest v1 remains a legacy-wire compatibility contract. Manifest v2 requires
-an explicit `protocol_mode` of `legacy`, `auto`, or `2026-07-28`; discovery and
-negotiated connection diagnostics are available only for the modern modes.
+an explicit `protocol_mode` of `legacy`, `auto`, or `2026-07-28`; successful
+live Tool/call results expose bounded negotiated connection
+diagnostics in all three modes, while the standalone `discover` operation is
+limited to `auto` and `2026-07-28`.
 
 The `process:spawn` and exact `mcp_stdio:<sha256>` grants are required only for
 stdio servers. Copy `stdio_authority_resource` from `mcp inspect`; do not derive

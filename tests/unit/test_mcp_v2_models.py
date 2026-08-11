@@ -16,6 +16,7 @@ from agent_libos.models import (
     McpCallResult,
     McpCallStatus,
     McpConnectionInfo,
+    McpDispatchState,
     McpDiscoveryResult,
     McpExchangePhase,
     McpExchangeReceipt,
@@ -23,12 +24,18 @@ from agent_libos.models import (
     McpProviderDiscoveryResult,
     McpProtocolEra,
     McpProtocolMode,
+    McpRetryClass,
     McpServerSpec,
     McpToolListResult,
     McpToolSpec,
     mcp_server_spec_to_jsonable,
 )
-from agent_libos.substrate import McpModernProtocolProvider
+from agent_libos.substrate import (
+    McpAbsoluteDeadlineProvider,
+    McpModernProtocolProvider,
+)
+from agent_libos.tools.builtin.mcp import CallMcpToolOutput
+from agent_libos.utils.serde import to_jsonable
 
 
 def test_mcp_v2_public_types_are_exported_from_top_level_package() -> None:
@@ -37,9 +44,11 @@ def test_mcp_v2_public_types_are_exported_from_top_level_package() -> None:
     expected = {
         "McpCallResult",
         "McpConnectionInfo",
+        "McpDispatchState",
         "McpDiscoveryResult",
         "McpProtocolEra",
         "McpProtocolMode",
+        "McpRetryClass",
         "McpProviderCallResult",
         "McpToolListResult",
     }
@@ -100,6 +109,9 @@ def test_mcp_v1_model_construction_remains_compatible() -> None:
     assert provider_call.receipts == ()
     assert call.connection is None
     assert call.receipts == ()
+    assert call.dispatch_state is McpDispatchState.UNKNOWN
+    assert call.retry_class is McpRetryClass.UNSAFE_OR_UNKNOWN
+    assert call.automatic_retry_disabled is True
     assert "protocol_mode" not in mcp_server_spec_to_jsonable(server)
     assert "protocol_mode" not in canonical_mcp_server_spec_json(server)
 
@@ -114,6 +126,51 @@ def test_mcp_v2_canonical_projection_binds_explicit_protocol_mode() -> None:
     assert '"protocol_mode": "2026-07-28"' in canonical_mcp_server_spec_json(
         server
     )
+
+
+def test_model_call_output_exposes_only_bounded_retry_guidance() -> None:
+    receipt = McpExchangeReceipt(
+        phase=McpExchangePhase.SERVER_DISCOVER,
+        request_bytes=17,
+        response_bytes=31,
+        call_started=True,
+    )
+    result = McpCallResult(
+        server_id="demo",
+        tool_id="lookup",
+        mcp_name="lookup",
+        status=McpCallStatus.TRANSPORT_ERROR,
+        ok=False,
+        error={
+            "code": "mcp_provider_error",
+            "retryable": False,
+            "automatic_retry_disabled": True,
+        },
+        connection=_connection(),
+        receipts=(receipt,),
+        dispatch_state=McpDispatchState.NOT_STARTED,
+        retry_class=McpRetryClass.REOBSERVE_REQUIRED,
+    )
+
+    serialized = to_jsonable(result)
+    output = CallMcpToolOutput(
+        **{
+            field: serialized[field]
+            for field in CallMcpToolOutput.model_fields
+        }
+    )
+    payload = output.model_dump()
+
+    assert payload["dispatch_state"] == "not_started"
+    assert payload["retry_class"] == "reobserve_required"
+    assert payload["automatic_retry_disabled"] is True
+    assert payload["error"] == {
+        "code": "mcp_provider_error",
+        "retryable": False,
+        "automatic_retry_disabled": True,
+    }
+    assert "connection" not in payload
+    assert "receipts" not in payload
 
 
 def test_mcp_v2_models_are_immutable_and_json_friendly() -> None:
@@ -206,6 +263,17 @@ def test_modern_provider_is_an_optional_runtime_checkable_spi() -> None:
     ].default is None
 
 
+def test_absolute_deadline_provider_is_an_explicit_opt_in_spi() -> None:
+    class AbsoluteDeadlineProvider:
+        supports_mcp_absolute_deadline = True
+
+    class RelativeTimeoutProvider:
+        pass
+
+    assert isinstance(AbsoluteDeadlineProvider(), McpAbsoluteDeadlineProvider)
+    assert not isinstance(RelativeTimeoutProvider(), McpAbsoluteDeadlineProvider)
+
+
 def test_mcp_v2_safety_defaults_are_bounded_and_validated() -> None:
     defaults = DEFAULT_CONFIG.mcp
 
@@ -216,10 +284,28 @@ def test_mcp_v2_safety_defaults_are_bounded_and_validated() -> None:
     assert defaults.schema_max_nodes == 10_000
     assert defaults.schema_max_ref_hops == 128
     assert defaults.schema_max_composition_expansions == 1_024
+    assert defaults.schema_regex_pattern_max_bytes == 1_024
+    assert defaults.schema_regex_max_evaluations == 4_096
+    assert defaults.schema_regex_match_timeout_s == 0.05
 
     with pytest.raises(PydanticValidationError, match="must be > 0"):
         AgentLibOSConfig(
             mcp=replace(defaults, protocol_probe_timeout_s=0.0),
+        )
+
+    with pytest.raises(PydanticValidationError, match="must be > 0"):
+        AgentLibOSConfig(
+            mcp=replace(defaults, schema_regex_max_evaluations=0),
+        )
+
+    with pytest.raises(PydanticValidationError, match="must be > 0"):
+        AgentLibOSConfig(
+            mcp=replace(defaults, schema_regex_pattern_max_bytes=0),
+        )
+
+    with pytest.raises(PydanticValidationError, match="must be > 0"):
+        AgentLibOSConfig(
+            mcp=replace(defaults, schema_regex_match_timeout_s=0.0),
         )
 
     with pytest.raises(PydanticValidationError, match="release maximum 5.0"):

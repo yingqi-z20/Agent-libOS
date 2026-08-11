@@ -17,6 +17,7 @@ from agent_libos.storage.postgres_schema_contract import (
 )
 from agent_libos.storage.semantic_v5_migration import plan_store_v5_migration
 from agent_libos.storage.v6_schema_contract import V6_TABLES
+from agent_libos.storage.v7_schema_contract import V7_TABLES
 
 
 @contextlib.contextmanager
@@ -61,11 +62,11 @@ def _postgres_schema_dsn() -> Iterator[str]:
 @pytest.mark.parametrize(
     ("mutation", "error"),
     [
-        (
-            "ALTER TABLE human_requests "
-            "DROP CONSTRAINT human_requests_pkey",
-            "storage (?:column|key constraint) contract|human request index contract",
-        ),
+            (
+                "ALTER TABLE human_requests "
+                "DROP CONSTRAINT human_requests_pkey CASCADE",
+                "storage (?:column|key constraint) contract|human request index contract",
+            ),
         (
             "ALTER TABLE human_requests ALTER COLUMN status DROP NOT NULL",
             "storage column contract",
@@ -176,7 +177,7 @@ def test_postgres_v4_plan_rejects_noncanonical_human_contract() -> None:
     with _postgres_schema_dsn() as dsn:
         PostgresStore(dsn).close()
         with psycopg.connect(dsn, autocommit=True) as connection:
-            for table in sorted(V6_TABLES):
+            for table in sorted(V7_TABLES | V6_TABLES):
                 connection.execute(
                     sql.SQL("DROP TABLE {}").format(sql.Identifier(table))
                 )
@@ -200,7 +201,7 @@ def test_postgres_v4_plan_rejects_noncanonical_human_contract() -> None:
 
 
 @pytest.mark.postgres
-def test_fresh_v6_postgres_catalog_manifest_reopens() -> None:
+def test_fresh_v7_postgres_catalog_manifest_reopens() -> None:
     with _postgres_schema_dsn() as dsn:
         PostgresStore(dsn).close()
         PostgresStore(dsn).close()
@@ -378,7 +379,7 @@ def test_full_postgres_catalog_tamper_is_rejected(
 
         with pytest.raises(
             UnsupportedStoreVersion,
-            match="schema v6",
+            match="schema v7",
         ):
             PostgresStore(dsn)
 

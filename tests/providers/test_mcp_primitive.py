@@ -1895,6 +1895,165 @@ class TestMcpPrimitive:
         finally:
             runtime.close()
 
+    def test_opt_in_provider_receives_one_absolute_deadline_across_list_and_call(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class AbsoluteDeadlineProvider(_RecordingMcpProvider):
+            supports_mcp_absolute_deadline = True
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.deadlines: list[float] = []
+                self.timeouts: list[float] = []
+
+            def _capture(self, kwargs: dict[str, Any]) -> None:
+                self.deadlines.append(kwargs["deadline"])
+                self.timeouts.append(kwargs["timeout_s"])
+
+            def list_tools(self, server: Any, **kwargs: Any) -> McpToolListResult:
+                self._capture(kwargs)
+                return super().list_tools(server, **kwargs)
+
+            def call_tool(
+                self,
+                server: Any,
+                tool: Any,
+                arguments: dict[str, Any],
+                **kwargs: Any,
+            ) -> McpProviderCallResult:
+                self._capture(kwargs)
+                return super().call_tool(server, tool, arguments, **kwargs)
+
+        runtime = Runtime.open(":memory:")
+        provider = AbsoluteDeadlineProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(goal="one MCP absolute deadline")
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest("absolute-provider-deadline"),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "mcp:absolute-provider-deadline:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(runtime, pid)
+            validate_arguments = runtime.mcp._validate_arguments_against_schema
+
+            def delayed_schema_preflight(
+                server: McpServerSpec,
+                tool: McpToolSpec,
+                arguments: dict[str, Any],
+                *,
+                deadline: float | None = None,
+            ) -> None:
+                time.sleep(0.05)
+                validate_arguments(
+                    server,
+                    tool,
+                    arguments,
+                    deadline=deadline,
+                )
+
+            monkeypatch.setattr(
+                runtime.mcp,
+                "_validate_arguments_against_schema",
+                delayed_schema_preflight,
+            )
+
+            result = runtime.mcp.call_tool(
+                pid,
+                "absolute-provider-deadline",
+                "echo",
+                {"text": "hello"},
+            )
+
+            assert result.ok
+            assert len(provider.deadlines) == 2
+            assert provider.deadlines[0] == provider.deadlines[1]
+            assert provider.timeouts[1] <= provider.timeouts[0]
+            assert provider.timeouts[0] < 4.98
+        finally:
+            runtime.close()
+
+    def test_final_stdio_snapshot_timeout_blocks_provider_dispatch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class SnapshotProvider(_RecordingMcpProvider):
+            supports_executable_snapshots = True
+
+            def resolve_stdio_executable(
+                self,
+                _server: Any,
+                **_kwargs: Any,
+            ) -> str:
+                return sys.executable
+
+            def executable_snapshot_required(
+                self,
+                _server: Any,
+                _resolved: str,
+                **_kwargs: Any,
+            ) -> bool:
+                return True
+
+        captured_deadlines: list[float] = []
+
+        def expire_snapshot(
+            _path: Any,
+            *,
+            sibling_limit: int,
+            sibling_policy: str,
+            deadline: float,
+        ) -> Any:
+            del sibling_limit, sibling_policy
+            captured_deadlines.append(deadline)
+            raise TimeoutError("snapshot deadline")
+
+        monkeypatch.setattr(
+            "agent_libos.primitives.mcp.snapshot_executable",
+            expire_snapshot,
+        )
+        runtime = Runtime.open(":memory:")
+        provider = SnapshotProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(goal="expire final MCP snapshot")
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest("snapshot-deadline"),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "mcp:snapshot-deadline:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(runtime, pid)
+
+            with pytest.raises(
+                ProviderHostError,
+                match="mcp_provider_not_started",
+            ):
+                runtime.mcp.call_tool(
+                    pid,
+                    "snapshot-deadline",
+                    "echo",
+                    {"text": "hello"},
+                )
+
+            assert len(captured_deadlines) == 1
+            assert provider.list_calls == []
+            assert provider.call_args == []
+        finally:
+            runtime.close()
+
     def test_budgeted_stdio_dispatch_rejects_provider_without_limit_support(
         self,
     ) -> None:
@@ -1937,6 +2096,68 @@ class TestMcpPrimitive:
 
             assert provider.list_calls == []
             assert provider.call_args == []
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("operation", ["atomic_call", "live_refresh"])
+    def test_local_stdio_preflight_errors_are_not_wrapped_as_provider_errors(
+        self,
+        operation: str,
+    ) -> None:
+        class UnsupportedAtomicProvider(_ValidatedCallMcpProvider):
+            supports_subprocess_limits = False
+
+        runtime = Runtime.open(":memory:")
+        provider = UnsupportedAtomicProvider()
+        runtime.mcp.provider = provider
+        server_id = f"local-preflight-{operation}"
+        try:
+            pid = runtime.process.spawn(
+                goal="preserve local MCP preflight error type",
+                resource_budget=ResourceBudget(
+                    max_subprocess_wall_seconds=1.0,
+                ),
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest(server_id),
+                actor="cli",
+                require_capability=False,
+            )
+            _grant_stdio_spawn(runtime, pid)
+            if operation == "atomic_call":
+                runtime.capability.grant(
+                    pid,
+                    f"mcp:{server_id}:echo",
+                    [CapabilityRight.READ],
+                    issued_by="test",
+                )
+                invoke = lambda: runtime.mcp.call_tool(  # noqa: E731
+                    pid,
+                    server_id,
+                    "echo",
+                    {"text": "hello"},
+                )
+            else:
+                runtime.capability.grant(
+                    pid,
+                    f"mcp_server:{server_id}",
+                    [CapabilityRight.READ, CapabilityRight.EXECUTE],
+                    issued_by="test",
+                )
+                invoke = lambda: runtime.mcp.list_tools(  # noqa: E731
+                    server_id,
+                    actor=pid,
+                    refresh=True,
+                )
+
+            with pytest.raises(
+                ValidationError,
+                match="explicitly support SubprocessLimits",
+            ):
+                invoke()
+
+            assert provider.validate_calls == 0
+            assert provider.list_calls == []
         finally:
             runtime.close()
 
@@ -4062,7 +4283,16 @@ class TestMcpPrimitive:
 
             assert result.status.value == 'transport_error'
             assert 'mcp-provider-secret' not in str(result.error)
-            assert set(result.error or {}) == {'code', 'error_type', 'correlation_id'}
+            assert set(result.error or {}) == {
+                'code',
+                'error_type',
+                'correlation_id',
+                'retryable',
+                'automatic_retry_disabled',
+            }
+            assert result.error is not None
+            assert result.error['retryable'] is False
+            assert result.error['automatic_retry_disabled'] is True
             effect = runtime.store.list_external_effects(pid=pid)[0]
             assert effect.transaction_state == 'unknown'
             assert effect.state_mutation

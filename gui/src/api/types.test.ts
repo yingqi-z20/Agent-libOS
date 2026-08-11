@@ -5,6 +5,19 @@ import {
   assertLlmCallPage,
   assertLlmTraceContentChunk,
   assertMcpDiscoveryResult,
+  assertMcpAuthorizationChallenge,
+  assertMcpContinuationResult,
+  assertMcpInputRequired,
+  assertMcpOAuthProfileInput,
+  assertMcpOAuthStatus,
+  assertMcpOAuthStatuses,
+  assertMcpPromptOperationResult,
+  assertMcpRemoteTask,
+  assertMcpResourceOperationResult,
+  assertMcpResourcePage,
+  assertMcpResourceTemplatePage,
+  assertMcpSubscription,
+  assertMcpSubscriptionEvents,
   assertRuntimeSnapshot,
   assertSemanticAssessmentDetailResponse,
   assertSemanticAssessmentPage,
@@ -121,6 +134,350 @@ describe("MCP v2 API projection", () => {
       ...result,
       receipts: [{ ...result.receipts[0], phase: "subscriptions/listen" }]
     })).toThrow(/receipt/);
+  });
+});
+
+describe("MCP v3 GUI projection", () => {
+  it("accepts exact v3 registry identity and modern pages", () => {
+    expect(() => assertRuntimeSnapshot({
+      ...snapshot(),
+      mcp_servers: [{ ...mcpServer(), schema_version: 3, protocol_mode: "2026-07-28" }]
+    })).not.toThrow();
+    expect(() => assertRuntimeSnapshot({
+      ...snapshot(),
+      mcp_servers: [{ ...mcpServer(), schema_version: 3, protocol_mode: "auto" }]
+    })).toThrow(/summary/);
+    expect(() => assertMcpResourcePage({
+      items: [{ resource_id: "logical-doc", name: "Document" }],
+      next_cursor: "opaque",
+      cache_hint: { ttl_ms: 100, scope: "private" },
+      has_more: true
+    })).not.toThrow();
+  });
+
+  it("rejects MCP Apps and private provider identifiers", () => {
+    expect(() => assertMcpResourcePage({
+      items: [{ resource_id: "ui://app", name: "App" }],
+      next_cursor: null,
+      cache_hint: null
+    })).toThrow(/unsupported MCP App/);
+    expect(() => assertMcpPromptOperationResult({
+      kind: "complete",
+      preview_sha256: "a".repeat(64),
+      value: {
+        prompt_id: "review",
+        messages: [],
+        user_confirmation_required: true,
+        access_token: "private"
+      }
+    })).toThrow(/private credential/);
+    expect(() => assertMcpRemoteTask({
+      kind: "remote_task",
+      task_ref: "local-ref",
+      remote_task_id: "private-id",
+      status: "working"
+    })).toThrow(/private credential/);
+    expect(() => assertMcpPromptOperationResult({
+      kind: "complete",
+      value: {
+        prompt_id: "review",
+        messages: [],
+        user_confirmation_required: true
+      }
+    })).toThrow(/preview binding/);
+  });
+
+  it("parses MIME parameters and rejects every equivalent MCP Apps profile", () => {
+    const appMimeTypes = [
+      "text/html;profile=mcp-app;charset=utf-8",
+      'TEXT/HTML; charset="utf-8"; PROFILE = "MCP-APP"',
+      'text/html; profile="mcp-app"; sandbox=yes; note="a;b"'
+    ];
+    for (const mime_type of appMimeTypes) {
+      expect(() => assertMcpResourcePage({
+        items: [{ resource_id: "app", name: "App", mime_type }],
+        next_cursor: null,
+        cache_hint: null
+      })).toThrow(/unsupported MCP App/);
+      expect(() => assertMcpResourceTemplatePage({
+        items: [{ template_id: "app-template", name: "App", mime_type }],
+        next_cursor: null,
+        cache_hint: null
+      })).toThrow(/unsupported MCP App/);
+      expect(() => assertMcpResourceOperationResult({
+        kind: "complete",
+        value: {
+          resource_id: "safe-resource",
+          provenance: "untrusted_mcp_resource",
+          contents: [{
+            kind: "resource_link",
+            resource_handle: "opaque-local-handle",
+            name: "App",
+            mime_type
+          }]
+        }
+      })).toThrow(/unsupported MCP App/);
+    }
+    expect(() => assertMcpResourcePage({
+      items: [{
+        resource_id: "ordinary-html",
+        name: "Document",
+        mime_type: 'text/html; charset="utf-8"; profile=document'
+      }],
+      next_cursor: null,
+      cache_hint: null
+    })).not.toThrow();
+  });
+
+  it("rejects case-folded MCP Apps metadata namespaces at every nesting depth", () => {
+    expect(() => assertMcpResourcePage({
+      items: [{
+        resource_id: "resource",
+        name: "Resource",
+        metadata: { "Ui/component": "ui://private-app" }
+      }],
+      next_cursor: null,
+      cache_hint: null
+    })).toThrow(/unsupported MCP Apps metadata/);
+    expect(() => assertMcpResourceTemplatePage({
+      items: [{
+        template_id: "template",
+        name: "Template",
+        metadata: { nested: { "uI/widget": { enabled: true } } }
+      }],
+      next_cursor: null,
+      cache_hint: null
+    })).toThrow(/unsupported MCP Apps metadata/);
+    expect(() => assertMcpResourceOperationResult({
+      kind: "complete",
+      value: {
+        resource_id: "resource",
+        provenance: "untrusted_mcp_resource",
+        contents: [{
+          kind: "text",
+          text: "inert",
+          metadata: { nested: { "UI/render": "remote-html" } }
+        }]
+      }
+    })).toThrow(/unsupported MCP Apps metadata/);
+  });
+
+  it("accepts non-secret OAuth status metadata only", () => {
+    expect(() => assertMcpOAuthStatus({
+      profile_id: "profile-local",
+      status: "authorized",
+      scopes: ["resource.read"],
+      principal_sha256: "a".repeat(64)
+    })).not.toThrow();
+    expect(() => assertMcpOAuthStatus({
+      profile_id: "profile-local",
+      status: "authorized",
+      scopes: [],
+      refresh_token: "private"
+    })).toThrow(/private credential/);
+    for (const extra of [
+      { token: "private" },
+      { state: "private" },
+      { harmless_but_unknown: "still forbidden" }
+    ]) {
+      expect(() => assertMcpOAuthStatus({
+        profile_id: "profile-local",
+        status: "authorized",
+        scopes: [],
+        ...extra
+      })).toThrow(/OAuth status/);
+    }
+    expect(() => assertMcpAuthorizationChallenge({
+      challenge_id: "challenge-local",
+      authorization_url: "https://authorization.invalid/authorize",
+      expires_at: "2030-01-01T00:00:00Z"
+    })).not.toThrow();
+    for (const extra of [{ state: "private" }, { client_assertion: "private" }]) {
+      expect(() => assertMcpAuthorizationChallenge({
+        challenge_id: "challenge-local",
+        authorization_url: "https://authorization.invalid/authorize",
+        expires_at: "2030-01-01T00:00:00Z",
+        ...extra
+      })).toThrow(/OAuth challenge/);
+    }
+  });
+
+  it("accepts exact non-secret OAuth Host profiles and status-only lists", () => {
+    const profile = {
+      profile_id: "profile-local",
+      server_id: "server-local",
+      resource_uri: "https://resource.example/mcp",
+      expected_issuer: "https://issuer.example",
+      redirect_uri: "http://127.0.0.1/callback",
+      client_id: "gui-client",
+      registration_mode: "preregistered",
+      token_endpoint_auth_method: "client_secret_basic",
+      allowed_scopes: ["resource.read"],
+      default_scopes: ["resource.read"],
+      allow_loopback_http: true,
+      protocol_revision: "2026-07-28",
+      transport: "streamable_http"
+    };
+    expect(() => assertMcpOAuthProfileInput(profile)).not.toThrow();
+    expect(() => assertMcpOAuthProfileInput({
+      ...profile,
+      client_secret: "private"
+    })).toThrow(/profile input/);
+    expect(() => assertMcpOAuthProfileInput({
+      ...profile,
+      registration_mode: "dcr"
+    })).toThrow(/profile input/);
+    expect(() => assertMcpOAuthStatuses([{
+      profile_id: "profile-local",
+      status: "authorization_required",
+      scopes: []
+    }])).not.toThrow();
+    expect(() => assertMcpOAuthStatuses([{
+      profile_id: "profile-local",
+      status: "authorized",
+      scopes: [],
+      access_token: "private"
+    }])).toThrow(/private credential/);
+  });
+
+  it("rejects unknown keys on modern discriminated and subscription DTOs", () => {
+    expect(() => assertMcpContinuationResult({
+      kind: "complete",
+      value: null,
+      provider_debug: "forbidden"
+    })).toThrow(/complete result/);
+    expect(() => assertMcpContinuationResult({
+      kind: "input_required",
+      continuation_id: "continuation-local",
+      revision: 1,
+      respondable: true,
+      input_requests: [{
+        request_id: "input-local",
+        kind: "elicitation",
+        schema: { type: "object" },
+        provider_debug: "forbidden"
+      }],
+      human_request_id: "human-local",
+      human_revision: 1,
+      human_preview_sha256: "a".repeat(64)
+    })).toThrow(/input request/);
+    expect(() => assertMcpRemoteTask({
+      kind: "remote_task",
+      task_ref: "task-local",
+      revision: 1,
+      status: "working",
+      input_requests: [],
+      provider_debug: "forbidden"
+    })).toThrow(/remote task projection/);
+    expect(() => assertMcpSubscription({
+      subscription_id: "subscription-local",
+      server_id: "server-local",
+      status: "active",
+      requested_filters: [],
+      acknowledged_filters: [],
+      provider_debug: "forbidden"
+    })).toThrow(/subscription projection/);
+    expect(() => assertMcpSubscriptionEvents([{
+      sequence: 1,
+      event_type: "resourcesListChanged",
+      payload: {},
+      received_at: "2030-01-01T00:00:00Z",
+      provenance: "untrusted_mcp_notification",
+      provider_debug: "forbidden"
+    }])).toThrow(/subscription event/);
+  });
+
+  it("requires a real HumanRequest receipt for every input-required projection", () => {
+    const inputRequired = {
+      kind: "input_required",
+      continuation_id: "continuation-local",
+      revision: 3,
+      respondable: true,
+      input_requests: [{
+        request_id: "field-local",
+        kind: "elicitation",
+        mode: "url",
+        prompt: "Review the untrusted provider request",
+        schema: { type: "object" },
+        inert_url: "https://provider.invalid/review"
+      }],
+      human_request_id: "human-local",
+      human_revision: 4,
+      human_preview_sha256: "c".repeat(64)
+    };
+    expect(() => assertMcpContinuationResult(inputRequired)).not.toThrow();
+    expect(() => assertMcpInputRequired(inputRequired)).not.toThrow();
+    expect(() => assertMcpInputRequired({
+      ...inputRequired,
+      kind: "complete",
+      value: null
+    })).toThrow(/input-required/);
+    expect(() => assertMcpContinuationResult({
+      ...inputRequired,
+      human_request_id: null
+    })).toThrow(/input-required/);
+    expect(() => assertMcpContinuationResult({
+      ...inputRequired,
+      human_preview_sha256: "C".repeat(64)
+    })).toThrow(/input-required/);
+    expect(() => assertMcpInputRequired({
+      ...inputRequired,
+      input_requests: []
+    })).not.toThrow();
+
+    const unsupported = {
+      kind: "input_required",
+      continuation_id: "",
+      revision: 0,
+      respondable: false,
+      input_requests: [{
+        request_id: "sampling-local",
+        kind: "sampling_unsupported",
+        schema: {}
+      }],
+      human_request_id: null,
+      human_revision: null,
+      human_preview_sha256: null
+    };
+    expect(() => assertMcpInputRequired(unsupported)).not.toThrow();
+    expect(() => assertMcpInputRequired({
+      ...unsupported,
+      continuation_id: "forged-continuation"
+    })).toThrow(/unsupported input-required/);
+    expect(() => assertMcpInputRequired({
+      ...unsupported,
+      human_request_id: "forged-human"
+    })).toThrow(/unsupported input-required/);
+    expect(() => assertMcpInputRequired({
+      ...unsupported,
+      input_requests: [{
+        request_id: "elicitation-local",
+        kind: "elicitation",
+        mode: "form",
+        prompt: "not allowed on typed unsupported",
+        schema: { type: "object", properties: {} }
+      }]
+    })).toThrow(/unsupported input-required/);
+
+    const task = {
+      kind: "remote_task",
+      task_ref: "task-local",
+      revision: 8,
+      status: "input_required",
+      input_requests: inputRequired.input_requests,
+      human_request_id: "human-task-local",
+      human_revision: 2,
+      human_preview_sha256: "d".repeat(64)
+    };
+    expect(() => assertMcpRemoteTask(task)).not.toThrow();
+    expect(() => assertMcpRemoteTask({
+      ...task,
+      human_preview_sha256: null
+    })).toThrow(/Human request receipt/);
+    expect(() => assertMcpRemoteTask({
+      ...task,
+      status: "working"
+    })).toThrow(/Human request receipt/);
   });
 });
 

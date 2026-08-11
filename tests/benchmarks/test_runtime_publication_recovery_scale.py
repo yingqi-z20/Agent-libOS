@@ -793,12 +793,12 @@ def test_publication_scale_rejects_same_name_weak_reconciliation_index(
         "_seed_terminal_publication_history",
         seed_with_weak_index,
     )
-    # Schema v6 rejects the weakened same-name index during the store's
+    # Schema v7 rejects the weakened same-name index during the store's
     # full-catalog preflight, before the benchmark's redundant local shape
     # assertion can run.
     with pytest.raises(
         UnsupportedStoreVersion,
-        match="schema v6 full catalog",
+        match="schema v7 full catalog",
     ):
         run_publication_scale_benchmark(
             total_records=40,

@@ -2373,6 +2373,592 @@
           "type": "text"
         }
       ],
+      "mcp_auth_metadata": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "profile_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_id",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_spec_sha256",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_generation",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "status",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "issuer_sha256",
+          "nullable": true,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "resource_sha256",
+          "nullable": true,
+          "ordinal": 7,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "audience_sha256",
+          "nullable": true,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "scopes_sha256",
+          "nullable": false,
+          "ordinal": 9,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "principal_sha256",
+          "nullable": true,
+          "ordinal": 10,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "expires_at",
+          "nullable": true,
+          "ordinal": 11,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "credential_generation",
+          "nullable": false,
+          "ordinal": 12,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "revision",
+          "nullable": false,
+          "ordinal": 13,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "metadata_json",
+          "nullable": false,
+          "ordinal": 14,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 15,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "updated_at",
+          "nullable": false,
+          "ordinal": 16,
+          "type": "text"
+        }
+      ],
+      "mcp_continuations": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "continuation_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_id",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_spec_sha256",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_generation",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "bigint"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "owner_id",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "auth_principal_sha256",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "auth_scope_sha256",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "request_sha256",
+          "nullable": false,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "effect_id",
+          "nullable": false,
+          "ordinal": 9,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "capability_sha256",
+          "nullable": false,
+          "ordinal": 10,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "data_flow_sha256",
+          "nullable": false,
+          "ordinal": 11,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "human_request_id",
+          "nullable": false,
+          "ordinal": 12,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "broker_ref",
+          "nullable": true,
+          "ordinal": 13,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "broker_value_sha256",
+          "nullable": true,
+          "ordinal": 14,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "status",
+          "nullable": false,
+          "ordinal": 15,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "revision",
+          "nullable": false,
+          "ordinal": 16,
+          "type": "bigint"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "expires_at",
+          "nullable": false,
+          "ordinal": 17,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "metadata_json",
+          "nullable": false,
+          "ordinal": 18,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 19,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "updated_at",
+          "nullable": false,
+          "ordinal": 20,
+          "type": "text"
+        }
+      ],
+      "mcp_remote_tasks": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "task_ref",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_id",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_spec_sha256",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_generation",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "bigint"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "owner_id",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "auth_principal_sha256",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "auth_scope_sha256",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "origin_request_sha256",
+          "nullable": false,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "origin_effect_id",
+          "nullable": false,
+          "ordinal": 9,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "human_request_id",
+          "nullable": true,
+          "ordinal": 10,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "broker_ref",
+          "nullable": true,
+          "ordinal": 11,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "remote_id_sha256",
+          "nullable": false,
+          "ordinal": 12,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "status",
+          "nullable": false,
+          "ordinal": 13,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "revision",
+          "nullable": false,
+          "ordinal": 14,
+          "type": "bigint"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "expires_at",
+          "nullable": true,
+          "ordinal": 15,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "poll_interval_ms",
+          "nullable": true,
+          "ordinal": 16,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "status_message_sha256",
+          "nullable": true,
+          "ordinal": 17,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "result_ref",
+          "nullable": true,
+          "ordinal": 18,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "result_sha256",
+          "nullable": true,
+          "ordinal": 19,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "metadata_json",
+          "nullable": false,
+          "ordinal": 20,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 21,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "updated_at",
+          "nullable": false,
+          "ordinal": 22,
+          "type": "text"
+        }
+      ],
       "mcp_servers": [
         {
           "collation": null,
@@ -2422,6 +3008,420 @@
           "name": "updated_at",
           "nullable": false,
           "ordinal": 5,
+          "type": "text"
+        }
+      ],
+      "mcp_side_effect_preparations": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "preparation_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "operation_kind",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "operation_id",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "operation_revision",
+          "nullable": true,
+          "ordinal": 4,
+          "type": "bigint"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_id",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_spec_sha256",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_generation",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "bigint"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "owner_id",
+          "nullable": false,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "auth_principal_sha256",
+          "nullable": false,
+          "ordinal": 9,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "auth_scope_sha256",
+          "nullable": false,
+          "ordinal": 10,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "human_request_id",
+          "nullable": true,
+          "ordinal": 11,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "human_preview_sha256",
+          "nullable": true,
+          "ordinal": 12,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "broker_ref",
+          "nullable": true,
+          "ordinal": 13,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "broker_value_sha256",
+          "nullable": true,
+          "ordinal": 14,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "result_ref",
+          "nullable": true,
+          "ordinal": 15,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "result_sha256",
+          "nullable": true,
+          "ordinal": 16,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "status",
+          "nullable": false,
+          "ordinal": 17,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "revision",
+          "nullable": false,
+          "ordinal": 18,
+          "type": "bigint"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "expires_at",
+          "nullable": false,
+          "ordinal": 19,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "metadata_json",
+          "nullable": false,
+          "ordinal": 20,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 21,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "updated_at",
+          "nullable": false,
+          "ordinal": 22,
+          "type": "text"
+        }
+      ],
+      "mcp_subscriptions": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "subscription_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_id",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_spec_sha256",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "server_generation",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "bigint"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "owner_id",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "auth_principal_sha256",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "auth_scope_sha256",
+          "nullable": false,
+          "ordinal": 7,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "requested_filter_sha256",
+          "nullable": false,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "acknowledged_filter_sha256",
+          "nullable": true,
+          "ordinal": 9,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "status",
+          "nullable": false,
+          "ordinal": 10,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "queue_limit",
+          "nullable": false,
+          "ordinal": 11,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "event_max_bytes",
+          "nullable": false,
+          "ordinal": 12,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "received_count",
+          "nullable": false,
+          "ordinal": 13,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "dropped_count",
+          "nullable": false,
+          "ordinal": 14,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": "0",
+          "generated": "",
+          "identity": "",
+          "name": "revision",
+          "nullable": false,
+          "ordinal": 15,
+          "type": "bigint"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "last_event_at",
+          "nullable": true,
+          "ordinal": 16,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "metadata_json",
+          "nullable": false,
+          "ordinal": 17,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 18,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "updated_at",
+          "nullable": false,
+          "ordinal": 19,
           "type": "text"
         }
       ],
@@ -8393,6 +9393,916 @@
       },
       {
         "columns": [
+          "audience_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (audience_sha256 IS NULL OR length(audience_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_auth_metadata_audience_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_auth_metadata",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "credential_generation"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (credential_generation >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_auth_metadata_credential_generation_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_auth_metadata",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "issuer_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (issuer_sha256 IS NULL OR length(issuer_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_auth_metadata_issuer_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_auth_metadata",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "profile_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (profile_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "mcp_auth_metadata_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_auth_metadata",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "principal_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (principal_sha256 IS NULL OR length(principal_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_auth_metadata_principal_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_auth_metadata",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "resource_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (resource_sha256 IS NULL OR length(resource_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_auth_metadata_resource_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_auth_metadata",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "revision"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (revision >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_auth_metadata_revision_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_auth_metadata",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "scopes_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(scopes_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_auth_metadata_scopes_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_auth_metadata",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "server_generation"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (server_generation >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_auth_metadata_server_generation_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_auth_metadata",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "server_spec_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(server_spec_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_auth_metadata_server_spec_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_auth_metadata",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "status"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (status = ANY (ARRAY['unconfigured'::text, 'authorization_required'::text, 'authorized'::text, 'expired'::text, 'revoked'::text, 'needs_attention'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_auth_metadata_status_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_auth_metadata",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "auth_principal_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(auth_principal_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_continuations_auth_principal_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "auth_scope_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(auth_scope_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_continuations_auth_scope_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "broker_ref"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "UNIQUE (broker_ref)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "u",
+        "match_type": " ",
+        "name": "mcp_continuations_broker_ref_key",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "broker_value_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (broker_value_sha256 IS NULL OR length(broker_value_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_continuations_broker_value_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "capability_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(capability_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_continuations_capability_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "broker_ref",
+          "broker_value_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((broker_ref IS NULL) = (broker_value_sha256 IS NULL))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_continuations_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "data_flow_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(data_flow_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_continuations_data_flow_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "human_request_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (human_request_id) REFERENCES human_requests(request_id)",
+        "delete_action": "a",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "f",
+        "match_type": "s",
+        "name": "mcp_continuations_human_request_id_fkey",
+        "no_inherit": true,
+        "referenced_columns": [
+          "request_id"
+        ],
+        "referenced_schema": "<current>",
+        "referenced_table": "human_requests",
+        "table": "mcp_continuations",
+        "update_action": "a",
+        "validated": true
+      },
+      {
+        "columns": [
+          "human_request_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "UNIQUE (human_request_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "u",
+        "match_type": " ",
+        "name": "mcp_continuations_human_request_id_key",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "continuation_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (continuation_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "mcp_continuations_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "request_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(request_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_continuations_request_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "revision"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (revision >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_continuations_revision_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "server_generation"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (server_generation >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_continuations_server_generation_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "server_spec_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(server_spec_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_continuations_server_spec_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "status"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (status = ANY (ARRAY['input_required'::text, 'dispatching'::text, 'complete'::text, 'cancelled'::text, 'expired'::text, 'needs_attention'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_continuations_status_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_continuations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "auth_principal_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(auth_principal_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_auth_principal_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "auth_scope_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(auth_scope_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_auth_scope_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "broker_ref"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "UNIQUE (broker_ref)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "u",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_broker_ref_key",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "status",
+          "human_request_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (status <> 'input_required'::text OR human_request_id IS NOT NULL)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "result_ref",
+          "result_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((result_ref IS NULL) = (result_sha256 IS NULL))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_check1",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "human_request_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (human_request_id) REFERENCES human_requests(request_id)",
+        "delete_action": "a",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "f",
+        "match_type": "s",
+        "name": "mcp_remote_tasks_human_request_id_fkey",
+        "no_inherit": true,
+        "referenced_columns": [
+          "request_id"
+        ],
+        "referenced_schema": "<current>",
+        "referenced_table": "human_requests",
+        "table": "mcp_remote_tasks",
+        "update_action": "a",
+        "validated": true
+      },
+      {
+        "columns": [
+          "human_request_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "UNIQUE (human_request_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "u",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_human_request_id_key",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "origin_request_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(origin_request_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_origin_request_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "task_ref"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (task_ref)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "poll_interval_ms"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (poll_interval_ms IS NULL OR poll_interval_ms >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_poll_interval_ms_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "remote_id_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(remote_id_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_remote_id_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "result_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (result_sha256 IS NULL OR length(result_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_result_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "revision"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (revision >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_revision_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "server_generation"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (server_generation >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_server_generation_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "server_spec_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(server_spec_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_server_spec_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "status"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (status = ANY (ARRAY['working'::text, 'input_required'::text, 'completed'::text, 'failed'::text, 'cancelled'::text, 'cancel_requested'::text, 'update_dispatching'::text, 'cancel_dispatching'::text, 'needs_attention'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_status_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "status_message_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (status_message_sha256 IS NULL OR length(status_message_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_remote_tasks_status_message_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_remote_tasks",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
           "server_id"
         ],
         "deferrable": false,
@@ -8409,6 +10319,726 @@
         "referenced_schema": null,
         "referenced_table": null,
         "table": "mcp_servers",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "auth_principal_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(auth_principal_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_auth_principal_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "auth_scope_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(auth_scope_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_auth_scope_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "broker_ref"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "UNIQUE (broker_ref)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "u",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_broker_ref_key",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "broker_value_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (broker_value_sha256 IS NULL OR length(broker_value_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_broker_value_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "human_request_id",
+          "human_preview_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((human_request_id IS NULL) = (human_preview_sha256 IS NULL))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "broker_ref",
+          "broker_value_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((broker_ref IS NULL) = (broker_value_sha256 IS NULL))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_check1",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "result_ref",
+          "result_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((result_ref IS NULL) = (result_sha256 IS NULL))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_check2",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "broker_ref",
+          "result_ref"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (broker_ref IS NULL OR result_ref IS NULL OR broker_ref <> result_ref)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_check3",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "human_preview_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (human_preview_sha256 IS NULL OR length(human_preview_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_human_preview_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "human_request_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "UNIQUE (human_request_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "u",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_human_request_id_key",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "operation_kind"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (operation_kind = ANY (ARRAY['continuation'::text, 'remote_task'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_operation_kind_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "operation_kind",
+          "operation_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "UNIQUE (operation_kind, operation_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "u",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_operation_kind_operation_id_key",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "operation_revision"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (operation_revision IS NULL OR operation_revision >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_operation_revision_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "preparation_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (preparation_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "result_ref"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "UNIQUE (result_ref)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "u",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_result_ref_key",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "result_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (result_sha256 IS NULL OR length(result_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_result_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "revision"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (revision >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_revision_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "server_generation"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (server_generation >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_server_generation_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "server_spec_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(server_spec_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_server_spec_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "status"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (status = ANY (ARRAY['prepared'::text, 'cleaning'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_side_effect_preparations_status_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_side_effect_preparations",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "acknowledged_filter_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (acknowledged_filter_sha256 IS NULL OR length(acknowledged_filter_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_subscriptions_acknowledged_filter_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "auth_principal_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(auth_principal_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_subscriptions_auth_principal_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "auth_scope_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(auth_scope_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_subscriptions_auth_scope_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "dropped_count",
+          "received_count"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (dropped_count <= received_count)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_subscriptions_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "dropped_count"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (dropped_count >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_subscriptions_dropped_count_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "event_max_bytes"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (event_max_bytes > 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_subscriptions_event_max_bytes_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "subscription_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (subscription_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "mcp_subscriptions_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "queue_limit"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (queue_limit > 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_subscriptions_queue_limit_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "received_count"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (received_count >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_subscriptions_received_count_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "requested_filter_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(requested_filter_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_subscriptions_requested_filter_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "revision"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (revision >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_subscriptions_revision_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "server_generation"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (server_generation >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_subscriptions_server_generation_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "server_spec_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(server_spec_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_subscriptions_server_spec_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "status"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (status = ANY (ARRAY['starting'::text, 'active'::text, 'stopping'::text, 'stopped'::text, 'lost'::text, 'needs_attention'::text]))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "mcp_subscriptions_status_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "mcp_subscriptions",
         "update_action": " ",
         "validated": true
       },
@@ -14691,6 +17321,656 @@
       },
       {
         "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "expires_at",
+          "profile_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_auth_expiry ON mcp_auth_metadata USING btree (expires_at, profile_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_mcp_auth_expiry",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_auth_metadata",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 4,
+        "attributes": [
+          "server_id",
+          "server_generation",
+          "status",
+          "profile_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          null,
+          "pg_catalog.default",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_auth_server_status ON mcp_auth_metadata USING btree (server_id, server_generation, status, profile_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 4,
+        "live": true,
+        "name": "idx_mcp_auth_server_status",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.int8_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_auth_metadata",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "profile_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX mcp_auth_metadata_pkey ON mcp_auth_metadata USING btree (profile_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "mcp_auth_metadata_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_auth_metadata",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "created_at",
+          "continuation_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_continuations_created ON mcp_continuations USING btree (created_at, continuation_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_mcp_continuations_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_continuations",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "expires_at",
+          "continuation_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_continuations_expiry ON mcp_continuations USING btree (expires_at, continuation_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_mcp_continuations_expiry",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_continuations",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 4,
+        "attributes": [
+          "owner_id",
+          "status",
+          "created_at",
+          "continuation_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_continuations_owner_status ON mcp_continuations USING btree (owner_id, status, created_at, continuation_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 4,
+        "live": true,
+        "name": "idx_mcp_continuations_owner_status",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_continuations",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 5,
+        "attributes": [
+          "server_id",
+          "server_generation",
+          "status",
+          "created_at",
+          "continuation_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          null,
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_continuations_server_generation ON mcp_continuations USING btree (server_id, server_generation, status, created_at, continuation_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 5,
+        "live": true,
+        "name": "idx_mcp_continuations_server_generation",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.int8_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_continuations",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "broker_ref"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default"
+        ],
+        "definition": "CREATE UNIQUE INDEX mcp_continuations_broker_ref_key ON mcp_continuations USING btree (broker_ref)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "mcp_continuations_broker_ref_key",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_continuations",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "human_request_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default"
+        ],
+        "definition": "CREATE UNIQUE INDEX mcp_continuations_human_request_id_key ON mcp_continuations USING btree (human_request_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "mcp_continuations_human_request_id_key",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_continuations",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "continuation_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX mcp_continuations_pkey ON mcp_continuations USING btree (continuation_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "mcp_continuations_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_continuations",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "created_at",
+          "task_ref"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_remote_tasks_created ON mcp_remote_tasks USING btree (created_at, task_ref)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_mcp_remote_tasks_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_remote_tasks",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "expires_at",
+          "task_ref"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_remote_tasks_expiry ON mcp_remote_tasks USING btree (expires_at, task_ref)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_mcp_remote_tasks_expiry",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_remote_tasks",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 4,
+        "attributes": [
+          "owner_id",
+          "status",
+          "created_at",
+          "task_ref"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_remote_tasks_owner_status ON mcp_remote_tasks USING btree (owner_id, status, created_at, task_ref)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 4,
+        "live": true,
+        "name": "idx_mcp_remote_tasks_owner_status",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_remote_tasks",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "server_id",
+          "remote_id_sha256"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.default"
+        ],
+        "definition": "CREATE UNIQUE INDEX idx_mcp_remote_tasks_remote_id ON mcp_remote_tasks USING btree (server_id, remote_id_sha256)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_mcp_remote_tasks_remote_id",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_remote_tasks",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 5,
+        "attributes": [
+          "server_id",
+          "server_generation",
+          "status",
+          "created_at",
+          "task_ref"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          null,
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_remote_tasks_server_generation ON mcp_remote_tasks USING btree (server_id, server_generation, status, created_at, task_ref)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 5,
+        "live": true,
+        "name": "idx_mcp_remote_tasks_server_generation",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.int8_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_remote_tasks",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "broker_ref"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default"
+        ],
+        "definition": "CREATE UNIQUE INDEX mcp_remote_tasks_broker_ref_key ON mcp_remote_tasks USING btree (broker_ref)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "mcp_remote_tasks_broker_ref_key",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_remote_tasks",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "human_request_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default"
+        ],
+        "definition": "CREATE UNIQUE INDEX mcp_remote_tasks_human_request_id_key ON mcp_remote_tasks USING btree (human_request_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "mcp_remote_tasks_human_request_id_key",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_remote_tasks",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "task_ref"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX mcp_remote_tasks_pkey ON mcp_remote_tasks USING btree (task_ref)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "mcp_remote_tasks_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_remote_tasks",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
         "attribute_count": 1,
         "attributes": [
           "server_id"
@@ -14717,6 +17997,399 @@
         "ready": true,
         "replica_identity": false,
         "table": "mcp_servers",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "expires_at",
+          "preparation_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_side_effect_preparations_expiry ON mcp_side_effect_preparations USING btree (expires_at, preparation_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_mcp_side_effect_preparations_expiry",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_side_effect_preparations",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 4,
+        "attributes": [
+          "owner_id",
+          "status",
+          "created_at",
+          "preparation_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_side_effect_preparations_owner_status ON mcp_side_effect_preparations USING btree (owner_id, status, created_at, preparation_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 4,
+        "live": true,
+        "name": "idx_mcp_side_effect_preparations_owner_status",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_side_effect_preparations",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "broker_ref"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default"
+        ],
+        "definition": "CREATE UNIQUE INDEX mcp_side_effect_preparations_broker_ref_key ON mcp_side_effect_preparations USING btree (broker_ref)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "mcp_side_effect_preparations_broker_ref_key",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_side_effect_preparations",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "human_request_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default"
+        ],
+        "definition": "CREATE UNIQUE INDEX mcp_side_effect_preparations_human_request_id_key ON mcp_side_effect_preparations USING btree (human_request_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "mcp_side_effect_preparations_human_request_id_key",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_side_effect_preparations",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "operation_kind",
+          "operation_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX mcp_side_effect_preparations_operation_kind_operation_id_key ON mcp_side_effect_preparations USING btree (operation_kind, operation_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "mcp_side_effect_preparations_operation_kind_operation_id_key",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_side_effect_preparations",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "preparation_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX mcp_side_effect_preparations_pkey ON mcp_side_effect_preparations USING btree (preparation_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "mcp_side_effect_preparations_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_side_effect_preparations",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "result_ref"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default"
+        ],
+        "definition": "CREATE UNIQUE INDEX mcp_side_effect_preparations_result_ref_key ON mcp_side_effect_preparations USING btree (result_ref)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "mcp_side_effect_preparations_result_ref_key",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_side_effect_preparations",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "created_at",
+          "subscription_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_subscriptions_created ON mcp_subscriptions USING btree (created_at, subscription_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_mcp_subscriptions_created",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_subscriptions",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 4,
+        "attributes": [
+          "owner_id",
+          "status",
+          "created_at",
+          "subscription_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_subscriptions_owner_status ON mcp_subscriptions USING btree (owner_id, status, created_at, subscription_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 4,
+        "live": true,
+        "name": "idx_mcp_subscriptions_owner_status",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_subscriptions",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 5,
+        "attributes": [
+          "server_id",
+          "server_generation",
+          "status",
+          "created_at",
+          "subscription_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          null,
+          "pg_catalog.default",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_mcp_subscriptions_server_generation ON mcp_subscriptions USING btree (server_id, server_generation, status, created_at, subscription_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 5,
+        "live": true,
+        "name": "idx_mcp_subscriptions_server_generation",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.int8_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_subscriptions",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "subscription_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX mcp_subscriptions_pkey ON mcp_subscriptions USING btree (subscription_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "mcp_subscriptions_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "mcp_subscriptions",
         "unique": true,
         "valid": true
       },
@@ -20770,7 +24443,67 @@
         "force_row_security": false,
         "is_partition": false,
         "kind": "r",
+        "name": "mcp_auth_metadata",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "mcp_continuations",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "mcp_remote_tasks",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
         "name": "mcp_servers",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "mcp_side_effect_preparations",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "mcp_subscriptions",
         "options": [],
         "persistence": "p",
         "replica_identity": "d",
@@ -21321,7 +25054,7 @@
     "rewrite_rules": [],
     "triggers": []
   },
-  "catalog_sha256": "5945b66467704dcf5b38983017c5227bca1dd8ccf30ba5dd17674e04fa2573ed",
+  "catalog_sha256": "41a8a0e3c02edb9fa7dd30918f6f6cc46787ae1936b5b561e3ff5298b3090927",
   "format_version": 1,
   "generated_postgres_version_num": 170010
 }

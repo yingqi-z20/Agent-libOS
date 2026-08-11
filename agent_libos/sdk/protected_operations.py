@@ -2709,6 +2709,11 @@ class ProtectedOperation:
         assert payload is not _DATA_FLOW_PAYLOAD_UNSET
         try:
             current = resolver()
+        except TimeoutError:
+            # An absolute operation deadline is not an identity mismatch.  It
+            # remains a certified pre-dispatch timeout so the pending intent
+            # can be abandoned without misrecording a data-flow denial.
+            raise
         except (OSError, ValidationError) as error:
             manager = self.sdk.data_flow
             assert manager is not None

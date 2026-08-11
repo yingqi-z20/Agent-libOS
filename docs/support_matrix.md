@@ -27,10 +27,36 @@ Legend:
 | PTY Runtime Module | POSIX PTY plus optional Windows `pywinpty`/ConPTY session I/O; source checkout/source distribution only, not the core wheel | POSIX paths on Ubuntu; Windows 3.11 installs the `pty` extra before running the complete deterministic matrix | Current Windows backend has no Job Object, parent-death containment, or wall/CPU/RSS supervision; budgeted `SubprocessLimits` spawns fail closed. Native CI coverage does not expand those implementation guarantees |
 | Typed Git provider | System Git 2.26+, fixed non-bare workspace repository; local operations, managed worktrees, patch Objects, existing remotes, and repository-local simulated PRs | Deterministic provider/security/runtime tests use temporary SHA-1/SHA-256 repositories and local bare remotes on Ubuntu, with the complete deterministic matrix also running on Windows 3.11; Shell/PTY/provenance hardening is parameterized | Credential-manager integrations and real HTTPS/OpenSSH authentication require environment-gated runs; GitHub/GitLab APIs are not implemented |
 | JSON-RPC client | Registered HTTP endpoints only | Deterministic loopback/provider tests | Real network proxy/TLS/DNS policy is deployment-specific |
-| MCP client | Tools-only Manifest v1/v2 over Streamable HTTP or stdio, using Python MCP SDK v2; v1 is legacy-wire only and v2 explicitly selects `legacy`, `auto`, or modern `2026-07-28` | Deterministic primitive/provider/security tests, complete frozen-extra SDK integration, and the fixed-upstream applicable client conformance scenarios without an expected-failure baseline, on Ubuntu Python 3.11 and 3.14 | Real remote identity/proxy/TLS topology remains a deployment gate. MRTR/OAuth/`subscriptions/listen`, Resources, Prompts, Tasks, Apps, Roots, Sampling, Logging, OTel product support, and an MCP server surface are not implemented |
+| MCP client | Client-only Manifest v1/v2 governed Tools compatibility plus exact-`2026-07-28` Manifest v3 Tools, Resources, Resource Templates, Prompts, Completion, MRTR, bounded subscriptions, Host-preconfigured OAuth, and an optional digest-pinned Tasks extension over Streamable HTTP or stdio | Deterministic primitive/provider/security/DX tests; real loopback stdio, HTTP, and pinned-TLS OAuth/PKCE/Bearer Runtime gates; frozen Python/TypeScript SDK integration; reviewed fixed-upstream Tools/HTTP-schema (including Resource/Prompt request-header branches), MRTR, and Host-pinned pre-registration/CIMD OAuth client conformance on Ubuntu Python 3.11 and 3.14; native stdio/HTTP smokes on Windows/macOS; and clean-installed wheel/sdist stdio+HTTP Resource/Resource Template/Prompt/Completion/subscription/Tool, pinned-TLS OAuth/PKCE/Bearer, durable Runtime/Store/CLI MRTR+Tasks reopen, and Store-v6-to-v7 migration/reopen gates on Python 3.11–3.14 | Real remote identity/proxy/TLS/OAuth topology remains a deployment gate. OAuth conformance never enables DCR or promotes PRM/401 discovery into authority; authorization-code scenarios whose runner lacks a pre-Runtime Host issuer pin are reviewed-but-unavailable, not passing. Apps, Roots, Sampling, Logging, OTel product integration, OAuth DCR, OAuth client-credentials/enterprise-managed/DPoP/workload-identity and 2025-03-26 backcompat modes, deprecated standalone SSE, and an MCP server surface are excluded |
 | Real LLM | OpenAI Responses and OpenAI-compatible Chat profiles | Mock/action-selection paths only | Credentials and token-spending smoke are opt-in with `--run-real-llm`; run one scoped task/profile per release target |
 | Semantic approval/data identification | Default-off Phase 2–4 plane: payload-free FlowGraph, closed Host hard denial, and exact-once canary authority for frozen low-risk actions under a static immutable policy epoch | Deterministic unit/runtime/security/provider tests cover strict models, monotonic labels, coverage, authority ceiling, shared request CAS, exact binding/epoch revocation, budgets, privacy, read-only HTTP/GUI, Host-only review import, and fake provider failures | Label writeback, declassification/endorsement, high-risk/write/network auto approval, remote policy mutation, and automatic cohort expansion are not implemented. Real classifier smoke is opt-in and never a safety oracle; production calibration and native environment evidence remain operator gates |
 | Data-label egress enforcement | Host Sink registry and a unified gate cover LLM, Human, JSON-RPC, MCP, typed Git, filesystem writes, Shell/PTY, and internal process handoff | Deterministic unit/runtime/security/provider/benchmark tests, including pre-provider denial and exact conditional release | The guarantee covers runtime-mediated payloads; trusted modules/providers, native child I/O, Sink re-forwarding, and direct store administration remain operator trust boundaries |
+
+### MCP OAuth default credential-backend support
+
+The default `SystemKeyringMcpCredentialBroker` is intentionally narrower than
+the Python keyring plugin ecosystem. It accepts only `keyring==25.7.0` and the
+following exact distribution-owned implementation classes after verifying the
+official source path and reviewed file digest:
+
+| OS facility | Accepted exact backend identity |
+| --- | --- |
+| macOS Keychain | `keyring.backends.macOS.Keyring` |
+| Windows Credential Manager | `keyring.backends.Windows.WinVaultKeyring` |
+| Linux Secret Service (SecretStorage) | `keyring.backends.SecretService.Keyring` |
+| Linux Secret Service (libsecret) | `keyring.backends.libsecret.Keyring` |
+| Linux KWallet 5 | `keyring.backends.kwallet.DBusKeyring` |
+| Linux KWallet 4 | `keyring.backends.kwallet.DBusKeyringKWallet4` |
+
+`keyring.backends.chainer.ChainerBackend`, every plugin/third-party backend,
+subclasses and identity lookalikes, and any unreviewed keyring version fail
+closed. Selecting a configured exact backend is still not proof that the OS
+service is unlocked or usable; each actual read/write/delete also fails closed.
+Tests attest the real packaged class objects via `object.__new__` and fake only
+the module-level storage calls, so deterministic CI never reads or writes a
+developer's real keychain. Deployments using a different reviewed facility
+must explicitly inject a complete Host-owned `McpCredentialBroker`; an upgrade
+to keyring requires a new implementation/source-digest review and allowlist.
 
 ## GUI and API coverage
 

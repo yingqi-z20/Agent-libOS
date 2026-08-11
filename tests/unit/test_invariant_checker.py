@@ -68,7 +68,7 @@ benchmark_attack_classes:
         assert any("real-only: requires at least one deterministic regression node" in error for error in errors)
         assert any("missing-node: pytest node not collected" in error for error in errors)
 
-    def test_default_deterministic_collection_matches_the_test_matrix(self) -> None:
+    def test_deterministic_evidence_includes_nontransport_mcp_regressions(self) -> None:
         args = SimpleNamespace(
             workers="1",
             dist="loadfile",
@@ -82,8 +82,12 @@ benchmark_attack_classes:
 
         assert command[-2:] == [
             "-m",
-            checker.DEFAULT_DETERMINISTIC_MARKER_EXPRESSION,
+            "not postgres and not real_llm and not mcp",
         ]
+        assert checker.DEFAULT_DETERMINISTIC_MARKER_EXPRESSION == (
+            "not postgres and not real_llm and not mcp_transport"
+        )
+        assert command[-1] != checker.DEFAULT_DETERMINISTIC_MARKER_EXPRESSION
 
     def test_main_collects_the_default_matrix_marker_expression(
         self,

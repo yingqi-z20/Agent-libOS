@@ -16,7 +16,12 @@ from agent_libos.storage.semantic_v6_migration import (
     apply_store_v6_migration,
     plan_store_v6_migration,
 )
+from agent_libos.storage.mcp_v7_migration import (
+    apply_store_v7_migration,
+    plan_store_v7_migration,
+)
 from agent_libos.storage.v6_schema_contract import V6_TABLES
+from agent_libos.storage.v7_schema_contract import V7_TABLES
 
 
 def _v5_store(path: Path) -> None:
@@ -24,11 +29,11 @@ def _v5_store(path: Path) -> None:
     store.close()
     connection = sqlite3.connect(path)
     try:
-        for table in sorted(V6_TABLES):
+        for table in sorted(V7_TABLES | V6_TABLES):
             connection.execute(f'DROP TABLE "{table}"')
         changed = connection.execute(
             "UPDATE runtime_schema SET schema_version = 5 "
-            "WHERE singleton = 1 AND schema_version = 6"
+            "WHERE singleton = 1 AND schema_version = 7"
         )
         assert changed.rowcount == 1
         connection.commit()
@@ -104,10 +109,23 @@ def test_v5_to_v6_dry_run_is_zero_write_and_apply_requires_digest(
     )
 
     assert result.applied
+    with sqlite3.connect(source) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM runtime_schema WHERE singleton = 1"
+        ).fetchone() == (6,)
+    v6_backup = tmp_path / "backup-v6.sqlite"
+    shutil.copyfile(source, v6_backup)
+    os.chmod(v6_backup, 0o600)
+    v7_plan = plan_store_v7_migration(source, sqlite_backup=v6_backup)
+    apply_store_v7_migration(
+        source,
+        expected_plan_sha256=v7_plan.plan_sha256,
+        sqlite_backup=v6_backup,
+    )
     reopened = SQLiteStore(source)
     assert reopened.conn.execute(
         "SELECT schema_version FROM runtime_schema WHERE singleton = 1"
-    ).fetchone()[0] == 6
+    ).fetchone()[0] == 7
     legacy = reopened.get_semantic_legacy_coverage()
     assert legacy is not None
     assert legacy.source_schema_version == 5

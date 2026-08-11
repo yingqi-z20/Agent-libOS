@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 import pytest
@@ -20,11 +21,13 @@ from agent_libos.models import (
     ExternalEffectRollbackStatus,
     McpCallStatus,
     McpConnectionInfo,
+    McpDispatchState,
     McpExchangePhase,
     McpExchangeReceipt,
     McpHttpTransportSpec,
     McpProtocolEra,
     McpProtocolMode,
+    McpRetryClass,
     McpProviderCallResult,
     McpProviderDiscoveryResult,
     McpProviderTool,
@@ -609,7 +612,10 @@ def test_manifest_v1_canonical_registry_and_sink_hashes_are_stable() -> None:
         (_manifest(schema_version=1, protocol_mode=None), "must omit"),
         (_manifest(schema_version=2, protocol_mode=_ABSENT), "requires"),
         (_manifest(schema_version=2, protocol_mode="future"), "protocol_mode"),
-        (_manifest(schema_version=3, protocol_mode="auto"), "schema_version"),
+        (
+            _manifest(schema_version=3, protocol_mode="auto"),
+            "exact protocol_mode 2026-07-28",
+        ),
     ],
 )
 def test_manifest_protocol_mode_is_explicit_and_versioned(
@@ -679,6 +685,45 @@ def test_manifest_v2_rejects_host_overrides_of_protocol_headers(
                             "prefix": "",
                         }
                     }
+                ),
+                actor="test",
+                require_capability=False,
+            )
+        assert runtime.store.list_mcp_servers() == []
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "header_name",
+    [
+        "MCP-Protocol-Version",
+        "mCp-MeThOd",
+        "Mcp-Name",
+        "MCP-SESSION-ID",
+        "Last-Event-ID",
+        "TraceParent",
+        "traceSTATE",
+        "Baggage",
+    ],
+)
+def test_manifest_v1_rejects_high_risk_protocol_headers(
+    header_name: str,
+) -> None:
+    runtime = Runtime.open(":memory:")
+    try:
+        with pytest.raises(ValidationError, match="forbidden"):
+            runtime.mcp.register_server(
+                _manifest(
+                    server_id="legacy-dangerous-header",
+                    schema_version=1,
+                    protocol_mode=_ABSENT,
+                    headers={
+                        header_name: {
+                            "env": "AGENT_LIBOS_MCP_TEST_TOKEN",
+                            "prefix": "",
+                        }
+                    },
                 ),
                 actor="test",
                 require_capability=False,
@@ -866,6 +911,53 @@ def test_manifest_v1_reserved_envelope_reopens_with_stable_identity(
             spec.tools[0],
             stdio_executable=None,
         ) == expected_call_identity
+    finally:
+        reopened.close()
+
+
+def test_manifest_v1_persisted_high_risk_header_fails_closed_on_load(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "mcp-v1-dangerous-header.db"
+    server_id = "legacy-persisted-dangerous-header"
+    runtime = Runtime.open(database)
+    try:
+        runtime.mcp.register_server(
+            _manifest(
+                server_id=server_id,
+                schema_version=1,
+                protocol_mode=_ABSENT,
+            ),
+            actor="test",
+            require_capability=False,
+        )
+        row = runtime.store._query(
+            "SELECT spec_json FROM mcp_servers WHERE server_id = ?",
+            (server_id,),
+        )[0]
+        persisted = json.loads(row["spec_json"])
+        persisted["http"]["headers"]["MCP-Session-ID"] = {
+            "env": "AGENT_LIBOS_MCP_TEST_TOKEN",
+            "prefix": "",
+            "suffix": "",
+        }
+        runtime.store._execute(
+            "UPDATE mcp_servers SET spec_json = ? WHERE server_id = ?",
+            (
+                json.dumps(persisted, sort_keys=True, separators=(",", ":")),
+                server_id,
+            ),
+        )
+    finally:
+        runtime.close()
+
+    reopened = Runtime.open(database)
+    try:
+        with pytest.raises(ValidationError, match="forbidden"):
+            reopened.mcp.inspect_server(server_id, require_capability=False)
+        with pytest.raises(ValidationError, match="forbidden"):
+            reopened.mcp.list_servers(require_capability=False)
+        assert reopened.store.get_mcp_server(server_id) is not None
     finally:
         reopened.close()
 
@@ -1229,6 +1321,182 @@ def test_adiscover_uses_the_same_operation_local_contract() -> None:
         assert result.server_id == "async-discover"
         assert result.connection.protocol_revision == "2026-07-28"
         assert provider.discover_calls == ["async-discover"]
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("surface", ["discover", "list"])
+def test_v2_read_surface_deadline_includes_environment_preflight_without_effect(
+    surface: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Runtime.open(":memory:")
+    provider = _ModernFakeProvider()
+    runtime.mcp.provider = provider
+    server_id = f"preflight-deadline-{surface}"
+    manifest = _manifest(server_id=server_id)
+    manifest["timeout_s"] = 0.01
+    try:
+        runtime.mcp.register_server(
+            manifest,
+            actor="test",
+            require_capability=False,
+        )
+        resolve_environment = runtime.mcp._require_runtime_environment
+
+        def expire_environment(server: McpServerSpec, **kwargs: Any) -> Any:
+            time.sleep(0.03)
+            return resolve_environment(server, **kwargs)
+
+        monkeypatch.setattr(
+            runtime.mcp,
+            "_require_runtime_environment",
+            expire_environment,
+        )
+
+        with pytest.raises(ProviderHostError) as caught:
+            if surface == "discover":
+                runtime.mcp.discover(
+                    server_id,
+                    actor=None,
+                    require_capability=False,
+                )
+            else:
+                runtime.mcp.list_tools(
+                    server_id,
+                    actor=None,
+                    require_capability=False,
+                    refresh=True,
+                )
+
+        assert caught.value.code == "mcp_provider_not_started"
+        assert caught.value.error_type == "ProviderEffectNotStarted"
+        assert provider.discover_calls == []
+        assert provider.list_calls == []
+        assert runtime.store.list_external_effects() == []
+    finally:
+        runtime.close()
+
+
+def test_v1_call_deadline_includes_schema_preflight_without_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Runtime.open(":memory:")
+    provider = _ModernFakeProvider()
+    runtime.mcp.provider = provider
+    server_id = "preflight-deadline-call"
+    manifest = _manifest(
+        server_id=server_id,
+        schema_version=1,
+        protocol_mode=_ABSENT,
+    )
+    manifest["timeout_s"] = 0.01
+    try:
+        runtime.mcp.register_server(
+            manifest,
+            actor="test",
+            require_capability=False,
+        )
+        pid = runtime.process.spawn(goal="bound MCP schema preflight")
+        runtime.capability.grant(
+            pid,
+            f"mcp:{server_id}:echo",
+            [CapabilityRight.READ],
+            issued_by="test",
+        )
+        validate_arguments = runtime.mcp._validate_arguments_against_schema
+
+        def expire_schema(
+            server: McpServerSpec,
+            tool: McpToolSpec,
+            arguments: dict[str, Any],
+            *,
+            deadline: float | None = None,
+        ) -> None:
+            time.sleep(0.03)
+            validate_arguments(
+                server,
+                tool,
+                arguments,
+                deadline=deadline,
+            )
+
+        monkeypatch.setattr(
+            runtime.mcp,
+            "_validate_arguments_against_schema",
+            expire_schema,
+        )
+
+        with pytest.raises(ProviderHostError) as caught:
+            runtime.mcp.call_tool(
+                pid,
+                server_id,
+                "echo",
+                {"text": "hello"},
+            )
+
+        assert caught.value.code == "mcp_provider_not_started"
+        assert caught.value.error_type == "ProviderEffectNotStarted"
+        assert provider.validate_calls == 0
+        assert provider.call_calls == 0
+        assert provider.list_calls == []
+        assert runtime.store.list_external_effects(pid=pid) == []
+    finally:
+        runtime.close()
+
+
+def test_v1_call_deadline_expires_during_protected_preflight_without_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Runtime.open(":memory:")
+    provider = _ModernFakeProvider()
+    runtime.mcp.provider = provider
+    server_id = "protected-preflight-deadline-call"
+    manifest = _manifest(
+        server_id=server_id,
+        schema_version=1,
+        protocol_mode=_ABSENT,
+    )
+    manifest["timeout_s"] = 0.01
+    try:
+        runtime.mcp.register_server(
+            manifest,
+            actor="test",
+            require_capability=False,
+        )
+        pid = runtime.process.spawn(goal="bound MCP protected preflight")
+        runtime.capability.grant(
+            pid,
+            f"mcp:{server_id}:echo",
+            [CapabilityRight.READ],
+            issued_by="test",
+        )
+        resolve_sink = runtime.mcp._tool_data_sink_after_runtime_resolution
+
+        def expire_protected_preflight(*args: Any, **kwargs: Any) -> Any:
+            time.sleep(0.03)
+            return resolve_sink(*args, **kwargs)
+
+        monkeypatch.setattr(
+            runtime.mcp,
+            "_tool_data_sink_after_runtime_resolution",
+            expire_protected_preflight,
+        )
+
+        with pytest.raises(ProviderHostError) as caught:
+            runtime.mcp.call_tool(
+                pid,
+                server_id,
+                "echo",
+                {"text": "hello"},
+            )
+
+        assert caught.value.code == "mcp_provider_not_started"
+        assert caught.value.error_type == "ProviderEffectNotStarted"
+        assert provider.validate_calls == 0
+        assert provider.call_calls == 0
+        assert provider.list_calls == []
+        assert runtime.store.list_external_effects(pid=pid) == []
     finally:
         runtime.close()
 
@@ -1867,6 +2135,77 @@ def test_v2_call_receipts_bind_phase_order_dispatch_and_aggregate_fields() -> No
             receipt.phase is not McpExchangePhase.TOOLS_CALL
             for receipt in accepted_not_started.receipts
         )
+    finally:
+        runtime.close()
+
+
+def test_builtin_v2_negotiated_pre_list_failure_is_bounded_not_started() -> None:
+    runtime = Runtime.open(":memory:")
+    try:
+        server = runtime.mcp._coerce_server(
+            _manifest(server_id="negotiated-pre-list-failure")
+        )
+        connection = _connection()
+        provider_result = McpProviderCallResult(
+            error="MCP operation failed before tools/list dispatch",
+            error_type="McpPreCallFailure",
+            correlation_id="corr-pre-list",
+            duration_s=0.01,
+            call_started=False,
+            connection=connection,
+            receipts=_negotiation_receipts(connection),
+        )
+
+        result = runtime.mcp._call_result_from_provider(
+            server,
+            server.tools[0],
+            provider_result,
+        )
+
+        assert result.status is McpCallStatus.TRANSPORT_ERROR
+        assert result.dispatch_state is McpDispatchState.NOT_STARTED
+        assert result.retry_class is McpRetryClass.REOBSERVE_REQUIRED
+        assert result.automatic_retry_disabled is True
+        assert result.error is not None
+        assert result.error["retryable"] is False
+        assert result.error["automatic_retry_disabled"] is True
+        assert all(
+            receipt.phase is not McpExchangePhase.TOOLS_LIST
+            for receipt in result.receipts
+        )
+    finally:
+        runtime.close()
+
+
+def test_custom_v2_provider_cannot_self_certify_pre_list_or_not_started() -> None:
+    runtime = Runtime.open(":memory:")
+    runtime.mcp.provider = _ModernFakeProvider()
+    try:
+        server = runtime.mcp._coerce_server(
+            _manifest(server_id="custom-pre-list-failure")
+        )
+        connection = _connection()
+        with pytest.raises(ProviderHostError):
+            runtime.mcp._call_result_from_provider(
+                server,
+                server.tools[0],
+                McpProviderCallResult(
+                    error="untrusted pre-list claim",
+                    error_type="McpPreCallFailure",
+                    call_started=False,
+                    connection=connection,
+                    receipts=_negotiation_receipts(connection),
+                ),
+            )
+
+        result = runtime.mcp._call_result_from_provider(
+            server,
+            server.tools[0],
+            _pre_call_failure_result(error_type="LiveToolValidationError"),
+        )
+        assert result.dispatch_state is McpDispatchState.UNKNOWN
+        assert result.retry_class is McpRetryClass.UNSAFE_OR_UNKNOWN
+        assert result.automatic_retry_disabled is True
     finally:
         runtime.close()
 

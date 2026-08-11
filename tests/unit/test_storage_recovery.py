@@ -53,7 +53,7 @@ from agent_libos.storage.postgres import PostgresStore
 from agent_libos.storage.sql import (
     _V4_REQUIRED_COLUMNS,
     _V4_REQUIRED_INDEXES,
-    _V6_REQUIRED_COLUMNS,
+    _V7_REQUIRED_COLUMNS,
 )
 from agent_libos.process_transition import ProcessTransitionService
 from agent_libos.utils.ids import utc_now
@@ -1390,14 +1390,14 @@ class TestPostgresRuntimeLeaseIsolation:
 
 
 class TestUnsupportedStoreVersion:
-    def test_v6_schema_manifest_matches_fresh_store(self) -> None:
+    def test_v7_schema_manifest_matches_fresh_store(self) -> None:
         store = SQLiteStore(":memory:")
         try:
-            assert set(_V6_REQUIRED_COLUMNS) == {
+            assert set(_V7_REQUIRED_COLUMNS) == {
                 "runtime_schema",
                 *store.ALLOWED_TABLES,
             }
-            for table, expected_columns in _V6_REQUIRED_COLUMNS.items():
+            for table, expected_columns in _V7_REQUIRED_COLUMNS.items():
                 actual_columns = {
                     str(row["name"])
                     for row in store.conn.execute(f"PRAGMA table_info({table})")

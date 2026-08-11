@@ -24,7 +24,7 @@ from agent_libos.api.cli import _run_interactive_command
 from agent_libos.api.cli import _run_mcp_command
 from agent_libos.api.cli import _show_pending_interactive_human_request
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.config import AgentLibOSConfigDeprecationWarning, DEFAULT_CONFIG
 from agent_libos.models import (
     CapabilityRight,
     ObjectMetadata,
@@ -769,7 +769,7 @@ class TestCLIBuiltinCommand:
     ) -> None:
         message = (
             "Agent libOS store schema v3 is not writable or readable by this runtime; "
-            "expected 5. Use Agent libOS 1.0.1 to view or archive this store. "
+            "expected 7. Use Agent libOS 1.0.1 to view or archive this store. "
             "No migration was attempted."
         )
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -796,7 +796,7 @@ class TestCLIBuiltinCommand:
     def test_python_module_entrypoint_uses_structured_error_boundary(self) -> None:
         message = (
             "Agent libOS store schema v3 is not writable or readable by this runtime; "
-            "expected 5. Use Agent libOS 1.0.1 to view or archive this store. "
+            "expected 7. Use Agent libOS 1.0.1 to view or archive this store. "
             "No migration was attempted."
         )
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1399,12 +1399,37 @@ class TestCLIBuiltinCommand:
             listed = _run_cli_json(['--db', str(db), 'mcp', 'list'])
             inspected = _run_cli_json(['--db', str(db), 'mcp', 'inspect', 'cli-mcp'])
             tools = _run_cli_json(['--db', str(db), 'mcp', 'tools', 'cli-mcp'])
+            second_manifest = root / 'mcp-second.yaml'
+            second_manifest.write_text(_cli_mcp_manifest('cli-mcp-second'), encoding='utf-8')
+            _run_cli_json(['--db', str(db), 'mcp', 'register', str(second_manifest)])
+            limited = _run_cli_json(['--db', str(db), 'mcp', 'list', '--limit', '1'])
+            config = root / 'config.yaml'
+            config.write_text(
+                'mcp:\n'
+                '  list_limit: 1\n'
+                '  server_page_limit: 2\n'
+                '  tool_catalog_limit: 3\n',
+                encoding='utf-8',
+            )
+            with pytest.warns(
+                AgentLibOSConfigDeprecationWarning,
+                match=r'mcp\.list_limit is deprecated',
+            ):
+                purpose_limited = _run_cli_json([
+                    '--config', str(config), '--db', str(db), 'mcp', 'list',
+                ])
 
             assert registered['server_id'] == 'cli-mcp'
-            assert listed[0]['server_id'] == 'cli-mcp'
+            assert set(listed) == {'servers', 'has_more'}
+            assert listed['has_more'] is False
+            assert listed['servers'][0]['server_id'] == 'cli-mcp'
             assert inspected['transport']['type'] == 'stdio'
             assert tools['tools'][0]['tool_id'] == 'echo'
             assert tools['tools'][0]['resource'] == 'mcp:cli-mcp:echo'
+            assert len(limited['servers']) == 1
+            assert limited['has_more'] is True
+            assert len(purpose_limited['servers']) == 2
+            assert purpose_limited['has_more'] is False
 
     def test_cli_mcp_discover_forwards_process_actor_and_projects_connection(self) -> None:
         _parser, args = _parse_cli_args(

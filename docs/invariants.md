@@ -129,18 +129,24 @@ longer defines.
   sensitivity release, and the Host-declared floor remains in final effect
   evidence. This is an opt-in containment primitive; the permissive default
   preserves existing contracts.
-- `provider-usage-reservations-fail-closed`: MCP uses one absolute deadline
-  across DNS, executable snapshot, live listing, validation, and call dispatch.
-  An exhausted deadline cannot start a provider; known response bytes settle
-  exactly, an unknown host failure charges the current phase maximum, and a
-  later phase that never started charges zero rather than the full composite
-  reservation. Provider exceptions cross public, Tool, syscall, LLM, and
-  evidence surfaces only as a code/type/correlation envelope without host
-  exception text.
+- `provider-usage-reservations-fail-closed`: MCP uses one absolute deadline from
+  bounded schema/regex and environment/executable-identity preflight through
+  protected preparation, DNS, executable snapshot, live listing, validation,
+  and call dispatch. A pre-dispatch timeout during schema, identity, or
+  protected revalidation creates no effect and cannot start a provider; known
+  response bytes settle exactly, an unknown host failure charges the current
+  phase maximum, and a later phase
+  that never started charges zero rather than the full composite reservation.
+  Provider exceptions cross public, Tool, syscall, LLM, and evidence surfaces
+  only as a code/type/correlation envelope without host exception text.
 - `provider-results-are-decoded-at-the-host-boundary`: MCP and JSON-RPC provider
   results are detached and validated before runtime field access; malformed or
   unknown post-return failures expose only public envelopes, and unknown
   response bytes settle at the active-stage ceiling.
+- `mcp-registry-search-exposes-only-public-identifiers`: MCP registry text
+  search performs a case-insensitive literal substring match over public server
+  ids only; SQL wildcard characters remain literal and private canonical
+  manifest fields cannot be probed through search results.
 - `provider-approval-is-bound-to-versioned-spec`: JSON-RPC and MCP approvals
   bind an immutable registry-specification digest and monotonic generation,
   including absent first-registration state, and are revalidated before every
@@ -318,14 +324,38 @@ longer defines.
   pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
   typed boundaries compute the next state generation, preventing a direct-write
   rewind from reviving a stale token.
-- `v6-persisted-state-is-strict-and-versioned`: ordinary 1.4.2 Runtime startup
-  accepts only the frozen version-6 physical schema (including Durable Task
+- `v7-persisted-state-is-strict-and-versioned`: ordinary 1.5.0 Runtime startup
+  accepts only the frozen version-7 physical schema (including Durable Task
   Run, typed process state, Human revision, semantic job/evidence state,
-  FlowGraph, policy epochs, and machine-settlement evidence) plus canonical
-  security carriers. A canonical v5 source is accepted only by the explicit
-  offline digest-bound migration command; v4 must first migrate to v5. Older,
-  incomplete, or malformed state is rejected before Runtime mutation. Recovery
-  operates only on valid schema-v6 state.
+  FlowGraph, policy epochs, machine-settlement evidence, and sanitized MCP v3
+  continuation/Task/subscription/auth projections) plus canonical security
+  carriers. Canonical v4-to-v5, v5-to-v6, and v6-to-v7 upgrades are explicit,
+  offline, digest-bound migration steps; Runtime startup never migrates a
+  store. Older, incomplete, or malformed state is rejected before Runtime
+  mutation. Recovery operates only on valid schema-v7 state, and remote MCP
+  request state, input payloads, task ids, and OAuth secrets never become Store
+  columns. Every persisted input-required Task remains bound to a durable Human
+  request that is unique across continuations and Tasks, and each multi-round
+  continuation response atomically replaces that binding under its SQL
+  revision fence. Opaque credential-broker slots are likewise unique across
+  continuation broker state and both remote-Task broker fields. Before creating
+  any MCP Human question or credential-broker
+  value, the Runtime durably owns its preallocated id and exact reserved broker
+  slots in a payload-free preparation row. Atomic main-row commit advances that
+  row to a durable retirement stage; normal or startup cleanup deletes only the
+  superseded slots/Human binding, while a precommit abort deletes only newly
+  allocated state, without replaying Provider I/O. Ordinary sidecar CAS can
+  claim only an unchanged `abort` plan; only the atomic main-row commit methods
+  may produce `retire`. When one MCP handoff must publish multiple main rows,
+  or must settle another protected projection at the same commit point, their
+  prepared-row commits join one RuntimeStore transaction; external Human and
+  broker cleanup is deferred until that outer transaction commits, while a
+  rollback leaves every preparation in `prepared` for deterministic recovery.
+  Bounded retention first owns
+  old refs in a retirement-only preparation, then atomically deletes only
+  revision-matched terminal or `needs_attention` continuation/Task projections.
+  Unknown outcomes cannot permanently consume the active cap, and physical
+  cleanup never deletes Human identity, effect, event, or audit evidence.
 - `durable-task-run-ledger-is-versioned-and-generation-fenced`: mutable Run
   projections advance through revision CAS under the current monotonic Runtime
   epoch. Stable command identities make retries idempotent, while requirements,
@@ -1083,7 +1113,9 @@ longer defines.
   Refreshed tool listing/tool calls atomically reserve their
   deduplicated main, server, process-spawn, and exact stdio authority and persist
   pending evidence before DNS/live-provider boundaries. Local/stdio first-call
-  PENS may restore; non-local DNS observation cannot be erased.
+  PENS may restore; non-local DNS observation cannot be erased. The GUI cached
+  Tool-list GET cannot request live I/O; live refresh uses its explicit POST
+  route, and process-mode unregistration still requires exact server `admin`.
 - `mcp-protocol-mode-is-explicit-and-registry-fenced`: Manifest v1 omits
   protocol mode and retains its exact canonical registry/approval/Sink identity;
   Manifest v2 requires one of the three release-locked modes. Replacement
@@ -1094,15 +1126,83 @@ longer defines.
   legacy signal and only before Tool dispatch. Authentication/server errors,
   malformed or oversized replies, modern protocol errors, DNS/TLS failures, and
   ambiguous timeouts never become legacy evidence or a replay path.
-- `mcp-unsupported-modern-features-never-gain-runtime-authority`: discovered
-  server capabilities, annotations, cache hints, notifications, and unsupported
+- `mcp-v1-v2-unsupported-modern-features-never-gain-runtime-authority`: on the
+  Manifest v1/v2 governed-Tools compatibility path, discovered server
+  capabilities, annotations, cache hints, notifications, and unsupported
   reverse requests are untrusted diagnostics. They cannot register Tools,
   grant Capability, alter effect policy, invoke Runtime behavior, or persist a
-  negotiated session.
-- `mcp-input-required-is-never-automatically-replayed`: modern
-  `input_required` is a stable, non-retryable terminal result. Continuation
-  state is not persisted or returned; consequential/ambiguous mutation remains
-  unknown and a linked Durable Task Run requires Host attention.
+  negotiated session. Implemented Manifest v3 Host surfaces do not widen this
+  compatibility contract.
+- `mcp-v3-host-surfaces-are-closed-allowlisted-and-fenced`: Manifest v3 Host
+  Resources, Resource Templates, Prompts, Completion, and OAuth use closed
+  manifest allowlists and Host-pinned authority. Live discovery cannot add
+  authority; remote prompt/resource content stays untrusted; Apps content fails
+  closed; and a registry or OAuth fence change discards the provider result.
+  The real OAuth gate uses PKCE, pinned issuer/resource/endpoints, verified TLS,
+  and operation-local Bearer injection without persisting tokens or codes.
+  Fixed-upstream conformance retains only bounded check identity, status, and
+  specification references plus a deterministic digest; raw details and logs
+  are discarded on success and on every fail-closed path.
+  Frozen independent Python and TypeScript SDK v2 servers traverse this same
+  Runtime registry, ProtectedOperation, audit, and transport-cleanup path in the
+  release gate. CLI projections accept only the frozen, operation-specific
+  page, catalog-item, result-union, and Human-input DTO envelopes; unknown
+  fields fail closed, while only the explicitly typed metadata, schema, result,
+  and payload JSON slots remain opaque. Candidate-manifest probing is a
+  separate Host-only, reviewed, exact-digest ProtectedOperation: rejection
+  occurs before transport; success uses one pending-first bounded session,
+  records effect/audit/event evidence, returns untrusted candidate catalogs,
+  and cannot mutate registry generation, rows, or Capability authority.
+- `mcp-v3-subscription-events-are-consumed-bounded-and-inert`: Manifest v3
+  subscription notifications remain bounded, untrusted, inert records behind
+  an owner-fenced single-consumer cursor. Successful reads acknowledge and
+  evict only their returned prefix, preserving unread events and reclaiming
+  queue capacity; stale, future, or competing readers fail closed. Only
+  validated catalog-change events, and only after durable receipt accounting,
+  revoke that server's local opaque catalog cursors. Notification handling
+  cannot dispatch remote work or launch a model, Tool, TaskRun, or another
+  subscription. Task-status frames additionally require exact v3 Tasks pins and
+  an installed bounded ingress, then expose only the owner-bound local Task ref
+  after Apps removal and exact-secret redaction.
+- `mcp-v3-side-effect-preparations-are-crash-atomic`: Manifest v3 continuation
+  and remote-Task Human questions and credential-broker slots are preallocated
+  behind durable ownership before materialization. An uncommitted preparation
+  aborts only its newly owned Human/secret slots and cannot retire references
+  still named by the main record; an atomically committed transition or
+  retention deletion leaves a cleaning record until old Human/secret ownership
+  is retired. The same transaction publishes only a closed local-ref receipt
+  in the finalized protected effect, allowing Host recovery after a
+  commit-before-return crash without adding a remote Tasks list. SQLite restart
+  recovers later Elicitation rounds from broker-only state, while an ordinary
+  error or process-level interruption during protected evidence persistence
+  rolls back the Continuation, Task, receipt, event, and audit publication as
+  one unit. Recovery keeps completed response payloads out of the Store,
+  completes cleanup, marks interrupted mutations `needs_attention` without
+  Provider replay, leaves no answerable orphan, and runs only after TaskRun
+  payload preflight under the same Runtime recovery lease.
+- `mcp-input-required-is-never-automatically-replayed`: Manifest v1/v2
+  `input_required` remains a stable, non-retryable terminal result, with
+  consequential or ambiguous mutation retained as unknown. Manifest v3 uses a
+  separate opaque continuation: remote `requestState` and request keys remain
+  in the credential broker, and only an explicit revision-fenced Host response
+  may advance it. A stale response or restart never replays the initial
+  operation.
+- `mcp-model-resources-are-logical-allowlisted-and-protected`: model-facing
+  Manifest v3 Resource list/read accepts only registered logical server and
+  Resource ids, Host-issued opaque cursors, and exact string template variables,
+  then routes exclusively through the protected asynchronous Runtime facade.
+  Only `model_visible` manifest entries are eligible; raw URLs, URIs, headers,
+  transports, credentials, actors, provider cursors, Prompt/OAuth/Human-response,
+  subscription, and remote-task controls are absent. Binary content remains an
+  artifact receipt, ResourceLinks remain inert, and missing facade support fails
+  before provider dispatch. Model-facing v3 Tool outcomes form a closed union:
+  only sanitized Complete JSON, a local continuation or Task handle, bounded
+  status/final result, and a local Human receipt are projected. Provider input
+  requests, raw request state/Task ids, lifecycle revisions and timing metadata
+  remain Host-only. Provider-controlled Tool results are recursively redacted
+  against the exact operation credential snapshot before Runtime evidence,
+  persistence, or model projection; v1/v2 retain their established projected
+  payload.
 - `mcp-v1-identity-and-provider-contract-remain-stable`: adding Manifest v2 and
   the optional modern provider SPI does not add a v1 discovery probe, change v1
   canonical bytes/digests, or add required parameters to the existing
@@ -1285,14 +1385,16 @@ longer defines.
 - PostgreSQL CI uses PostgreSQL 17 on Ubuntu. Other supported server versions
   and deployment TLS/authentication topologies are not release-gated here.
 - JSON-RPC, MCP, and Git remote tests use deterministic loopback or local
-  remotes. The complete MCP transport, adapter, and SDK integration files plus
-  fixed-upstream applicable Tools-client conformance scenarios without an
-  expected-failure baseline run on Ubuntu Python 3.11 and 3.14 from the frozen
-  optional extra; real proxy/TLS/DNS policy,
+  remotes. The complete MCP transport, adapter, SDK integration, and modern
+  Host-client fixture files plus fixed-upstream Tools/HTTP-schema (including
+  Resource/Prompt request-header branches), MRTR, and Host-pinned
+  pre-registration/CIMD OAuth client scenarios run without an expected-failure
+  baseline on Ubuntu Python 3.11 and 3.14 from the frozen optional extra; real
+  proxy/TLS/DNS policy,
   HTTPS/OpenSSH authentication, and remote MCP deployment identity remain
-  environment-gated. GitHub/GitLab API integrations and MCP MRTR/OAuth/listen,
-  Resources, Prompts, Tasks, Apps, Roots, Sampling, Logging, OTel product
-  support, and server surfaces are not implemented.
+  environment-gated. GitHub/GitLab API integrations and MCP Apps, Roots,
+  Sampling, Logging, OTel product support, OAuth DCR, deprecated standalone
+  SSE, and server surfaces are not implemented.
 - Real LLM credentials and token-spending paths are opt-in. The default matrix
   covers mock/action-selection behavior, not a live request for every supported
   profile or provider deployment.

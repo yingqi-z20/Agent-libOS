@@ -1812,6 +1812,72 @@ textarea {
   color: #9a3412;
 }
 
+.mcpModernPanel {
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.mcpModernPanel > header h4,
+.mcpModernPanel > header p,
+.mcpModernPanel .adminDisclosure p {
+  margin: 0;
+}
+
+.mcpModernPanel > header p,
+.mcpModernPanel .adminDisclosure p {
+  color: #627d98;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.mcpModernPanel .adminDisclosure {
+  min-width: 0;
+}
+
+.mcpUntrustedNotice {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid #f5c2a3;
+  border-radius: 6px;
+  background: #fff7ed;
+}
+
+.mcpHumanReceipt {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 3px 8px;
+  margin: 0;
+  font-size: 11px;
+}
+
+.mcpHumanReceipt dt {
+  color: #627d98;
+  font-weight: 700;
+}
+
+.mcpHumanReceipt dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.mcpSchemaArguments {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
+  gap: 7px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid #d9e2ec;
+  border-radius: 6px;
+  background: #fff;
+}
+
 .adminFormGrid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

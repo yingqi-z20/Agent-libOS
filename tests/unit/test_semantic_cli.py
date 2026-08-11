@@ -1171,6 +1171,44 @@ def _install_v6_migration_module(
     monkeypatch.setitem(sys.modules, module.__name__, module)
 
 
+def _install_v7_migration_module(
+    monkeypatch: pytest.MonkeyPatch,
+    calls: list[tuple[str, object, dict[str, Any]]],
+) -> None:
+    module = ModuleType("agent_libos.storage.mcp_v7_migration")
+
+    def plan(target: object, **kwargs: Any) -> _MigrationPayload:
+        calls.append(("plan-v7", target, kwargs))
+        return _MigrationPayload(
+            {
+                "schema_version": 1,
+                "backend": "sqlite",
+                "from_version": 6,
+                "to_version": 7,
+                "statements": ["CREATE TABLE mcp_continuations"],
+                "plan_sha256": "c" * 64,
+            }
+        )
+
+    def apply(target: object, **kwargs: Any) -> _MigrationPayload:
+        calls.append(("apply-v7", target, kwargs))
+        return _MigrationPayload(
+            {
+                "schema_version": 1,
+                "backend": "sqlite",
+                "from_version": 6,
+                "to_version": 7,
+                "plan_sha256": "c" * 64,
+                "applied": True,
+                "already_applied": False,
+            }
+        )
+
+    module.plan_store_v7_migration = plan  # type: ignore[attr-defined]
+    module.apply_store_v7_migration = apply  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+
 def test_store_migration_dry_run_executes_before_runtime_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1232,6 +1270,78 @@ def test_store_v6_migration_dry_run_uses_explicit_offline_migrator(
     assert payload["from_version"] == 5
     assert payload["to_version"] == 6
     assert payload["plan_sha256"] == "b" * 64
+
+
+def test_store_v7_migration_dry_run_uses_explicit_offline_migrator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[str, object, dict[str, Any]]] = []
+    _install_v7_migration_module(monkeypatch, calls)
+    monkeypatch.setattr(
+        "agent_libos.api.cli.load_config_from_project_root",
+        lambda: DEFAULT_CONFIG,
+    )
+    monkeypatch.setattr(
+        "agent_libos.api.cli.Runtime.open",
+        lambda *_args, **_kwargs: pytest.fail("migration must not open Runtime"),
+    )
+    database = tmp_path / "runtime.sqlite"
+
+    cli_main(["--db", str(database), "store", "migrate", "--to", "7", "--dry-run"])
+
+    assert calls == [
+        (
+            "plan-v7",
+            str(database),
+            {"sqlite_backup": None, "postgres_snapshot_confirmed": False},
+        )
+    ]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["from_version"] == 6
+    assert payload["to_version"] == 7
+    assert payload["plan_sha256"] == "c" * 64
+
+
+def test_store_v7_migration_apply_forwards_digest_and_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[str, object, dict[str, Any]]] = []
+    _install_v7_migration_module(monkeypatch, calls)
+    monkeypatch.setattr(
+        "agent_libos.api.cli.load_config_from_project_root",
+        lambda: DEFAULT_CONFIG,
+    )
+    monkeypatch.setattr(
+        "agent_libos.api.cli.Runtime.open",
+        lambda *_args, **_kwargs: pytest.fail("migration must not open Runtime"),
+    )
+    database = tmp_path / "runtime.sqlite"
+    backup = tmp_path / "runtime-v6.sqlite.backup"
+
+    cli_main(
+        [
+            "--db", str(database), "store", "migrate", "--to", "7", "--apply",
+            "--expected-plan-sha256", "c" * 64,
+            "--sqlite-backup", str(backup),
+        ]
+    )
+
+    assert calls == [
+        (
+            "apply-v7",
+            str(database),
+            {
+                "expected_plan_sha256": "c" * 64,
+                "sqlite_backup": backup,
+                "postgres_snapshot_confirmed": False,
+            },
+        )
+    ]
+    assert json.loads(capsys.readouterr().out)["applied"] is True
 
 
 def test_store_migration_apply_forwards_digest_and_backup_before_runtime_open(

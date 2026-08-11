@@ -1,6 +1,6 @@
-# Agent libOS 1.4.2 Status
+# Agent libOS 1.5.0 Status
 
-Agent libOS 1.4.2 is a release candidate for the core Python runtime scope
+Agent libOS 1.5.0 is a release candidate for the core Python runtime scope
 defined in `docs/support_matrix.md`. Release-ready status for any source tree is
 conditional on that exact tree passing the checked-in CI workflow; local
 deterministic results do not substitute for its Python-version, PostgreSQL, and
@@ -26,11 +26,11 @@ checkout or candidate artifact.
   one root AgentProcess tree. They persist requirements, idempotent command
   receipts, append-only ledger links, and locally integrity-bound resume points;
   they do not introduce a generic workflow DSL or distributed scheduler.
-- RuntimeStore schema v6 is the only store format accepted by ordinary 1.4.2
-  startup. A canonical v5 store has one explicit offline, digest-bound migration
-  path to v6; v4 must first migrate to v5, and Runtime startup never migrates a
-  store. Schema v3 remains archive-only under 1.0.1, and malformed/older stores
-  have no read-only bridge or dual-schema mode.
+- RuntimeStore schema v7 is the only store format accepted by ordinary 1.5.0
+  startup. A canonical v6 store has one explicit offline, digest-bound migration
+  path to v7; v5 must first migrate to v6 and v4 must first migrate to v5.
+  Runtime startup never migrates a store. Schema v3 remains archive-only under
+  1.0.1, and malformed/older stores have no read-only bridge or dual-schema mode.
 - Semantic approval and ingress classification remain default-off. Shadow adds
   payload-free FlowGraph and assessment evidence without changing authority;
   `enforce_deny` can settle only the closed Host hard-deny set, and
@@ -114,16 +114,21 @@ checkout or candidate artifact.
   envelopes across primitive, JIT, Deno, ToolResult, and durable-result
   boundaries.
 - MCP uses Python SDK v2 while preserving Manifest v1 as a legacy-wire
-  compatibility contract. Manifest v2 explicitly selects `legacy`, `auto`, or
-  modern `2026-07-28`; discovery, pagination, live validation, and Tool call
+  compatibility contract. Manifests v1/v2 remain governed Tools-only
+  compatibility surfaces. Manifest v2 explicitly selects `legacy`, `auto`, or
+  modern `2026-07-28`; Tool discovery, pagination, live validation, and call
   phases share one absolute deadline, cumulative byte reservation, registry
   fence, and bounded receipts. Ambiguous failures never masquerade as legacy
-  fallback, unsupported server capabilities never grant authority, and an
-  MRTR input request is non-retryable.
-- The MCP product surface remains client-only and Tools-only. This release does
-  not implement MRTR continuation, OAuth/keyring login,
-  `subscriptions/listen`, Resources, Prompts, Tasks, Apps, Roots, Sampling,
-  Logging, OpenTelemetry product support, or an MCP server surface.
+  fallback, and unsupported server capabilities never grant authority.
+- The MCP product surface remains client-only. Manifest v1/v2 retains its
+  governed Tools compatibility contract; exact-`2026-07-28` Manifest v3 adds
+  governed Tools with the closed modern result union plus Host-governed
+  Resources, Resource Templates, Prompts, Completion, MRTR continuations,
+  bounded subscriptions, Host-preconfigured OAuth, and a digest-pinned Tasks
+  extension. A typed MRTR continuation is available only to Manifest v3 and
+  never replays the initial Tool call. MCP Apps, Roots, Sampling, Logging,
+  OpenTelemetry product integration, OAuth Dynamic Client Registration,
+  deprecated standalone SSE, and an MCP server surface remain out of scope.
 - A process exec operation covers the complete snapshot, publication, process,
   tool, boot, Skill, evidence, and compensation orchestration. Its terminal
   status is written only with the matching publication result. Host and worker
@@ -231,14 +236,31 @@ checkout or candidate artifact.
   declared invariant against the current pytest collection.
 - The workflow requires the per-lane deterministic matrix to pass all selected
   tests. The complete MCP transport, adapter, and SDK integration files plus
-  the applicable fixed-upstream Tools-client conformance scenarios run without
-  an expected-failure baseline on Python 3.11 and 3.14 in a dedicated matrix.
+  the reviewed fixed-upstream Tools/HTTP-schema scenarios (including the
+  Resource/Prompt request-header branches), MRTR, and OAuth
+  pre-registration/CIMD client conformance scenarios run
+  without an expected-failure baseline on Python 3.11 and 3.14 in a dedicated
+  matrix. For the two OAuth scenarios, a checked harness gets both fixture
+  origins directly from the pinned scenario object before Runtime construction,
+  pins the resource, issuer, and metadata URLs, and disables DCR. For every
+  upstream scenario the gate persists only check ID/status, bounded spec
+  references, and a deterministic digest; it drops raw names, descriptions,
+  timestamps, logs, protocol details, and authorization details. The
+  remaining upstream OAuth runner contracts do not supply the Host-pinned
+  expected issuer required to establish authority, so those exact reviewed
+  scenarios are reported as unavailable rather than counted as passes. The
+  pinned suite's older OAuth backcompat and optional client-credentials,
+  enterprise-managed-authorization, DPoP, and workload-identity scenarios are
+  separately reported as reviewed product exclusions; the same
+  matrix also runs a real TLS/PKCE/Bearer Runtime regression with pinned
+  issuer, resource, and endpoints and verifies that OAuth secrets do not enter
+  persisted or public evidence.
   PostgreSQL service coverage is a separate Python 3.11 gate. Real remote MCP
   deployment and real-LLM coverage remain explicit environment gates.
   Deterministic mocked MCP coverage is part of the normal matrix.
   Platform-specific skips stay documented and real Deno runs by default when
   installed.
-- The Durable Task Run gate requires fresh schema-v6 SQLite/PostgreSQL shape,
+- The Durable Task Run gate requires fresh schema-v7 SQLite/PostgreSQL shape,
   older-store zero-write refusal, revision/command conflicts, stale Runtime-epoch
   fencing, plaintext opt-in and terminal purge, unknown-effect/ObjectTask
   blocking, checkpoint intersection refusal, and GUI snapshot schema-v3 behavior. Its
@@ -312,7 +334,7 @@ checkout or candidate artifact.
   evidence, unstable or different source identities, and uncommitted source
   changes.
   Recommended invocations omit `--artifacts-root`, so synthetic workspaces,
-  browser state, and permanent-retention v6 databases are removed after the
+  browser state, and permanent-retention v7 databases are removed after the
   bounded reports are written. Put all reports in the operating system's
   temporary directory, outside the repository. These commands define an
   environment gate; the documentation does not claim that a fresh clean-source
@@ -365,15 +387,31 @@ checkout or candidate artifact.
   The profile must validate exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The `release-artifacts` CI job is configured to build one canonical 1.4.2
+- The `release-artifacts` CI job is configured to build one canonical 1.5.0
   wheel/source pair, reject extra or non-regular output, and record an exact
   checksum manifest.
   Python 3.11 through 3.14 smoke jobs download and verify that same pair, install
   hash-checked dependencies exported from the root lock, and then install the
   artifact without dependency re-resolution. The source build uses the frozen
   release backend without build isolation. Each job checks dependency
-  consistency and exercises all three installed console entrypoints plus the
-  deterministic demo. The build waits for its declared pre-build gates; these
+  consistency, exercises all three installed console entrypoints plus the
+  deterministic demo, and starts self-contained exact-v3 stdio and loopback
+  Streamable HTTP SDK servers through the clean-installed Runtime Resource,
+  Resource Template, Prompt, Completion, bounded resource-subscription, and Tool
+  protected paths.
+  It also writes a self-contained OAuth fixture into the temporary smoke
+  directory and runs Host-pinned loopback-TLS authorization-code/PKCE/Bearer
+  plus offline Store v6-to-v7 migration/reopen gates from the installed package. A
+  separate installed Runtime/SQLite/CLI smoke captures MRTR continuations and
+  remote Tasks, reopens the Store, responds/cancels continuations, and performs
+  Task get/update/cancel/re-observe while requiring exact dispatch counts and
+  proving opaque Provider request state and remote Task IDs absent from durable
+  and CLI projections. The MCP smoke rejects source-tree package shadowing, fixture stderr, supervised
+  connection leaks, and missing protected audit actions. The artifact checker
+  requires every `agent_libos.mcp` module and the schema-v7 SQLite/PostgreSQL MCP
+  contract files in the wheel, and requires the reviewed examples, scripts, and
+  frozen Python/TypeScript fixture sources in the sdist. The build waits for its
+  declared pre-build gates; these
   smoke jobs run afterward, and the candidate is not release-validated until
   the full downstream matrix succeeds. No workflow publishes or pushes
   candidate distributions.
@@ -385,7 +423,7 @@ endpoint to read a policy and CSV, compute a report, emit `human_output`, and
 exit. No provenance-bearing report for that run is checked in with the source
 revision, model/profile identity, redacted configuration, environment, and raw
 test outcome needed to reproduce or compare it. It is therefore an unarchived
-observation, not Agent libOS 1.4.2 release evidence, and supports no call-count,
+observation, not Agent libOS 1.5.0 release evidence, and supports no call-count,
 token-count, approval-count, latency, or serial-versus-parallel claim. Promote a
 future rerun only after using a documented opt-in real-model gate and preserving
 its reproducible report outside this status summary.
@@ -409,9 +447,9 @@ its reproducible report outside this status summary.
   depend on that job. This is a configured CI gate, not a claim that a separate
   local macOS CI run was performed.
 - SQLite and PostgreSQL implement the covered RuntimeStore contract. This
-  release accepts only store schema v6 at Runtime startup. A canonical v5 store
-  may use the explicit offline migration; v4 must first migrate to v5. A
-  schema-v3 store is rejected before
+  release accepts only store schema v7 at Runtime startup. A canonical v6 store
+  may use the explicit offline v6-to-v7 migration; v5 must first migrate to v6,
+  and v4 must first migrate to v5. A schema-v3 store is rejected before
   mutation and may be viewed or archived only with Agent libOS 1.0.1; still
   older stores require their matching archived release. Checkpoint and Image
   artifact versions remain independent of the store schema.
@@ -424,7 +462,7 @@ its reproducible report outside this status summary.
   non-bare workspace repository and system Git 2.26 or newer; unavailable Git
   fails individual calls without preventing Runtime startup. Host-configured
   remotes are the only first-class Git network exception. There is no Git CLI,
-  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.4.2.
+  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.5.0.
 
 ## Remaining environment gates and non-blocking debt
 

@@ -33,6 +33,13 @@ from agent_libos.storage.semantic_v6 import (
     SemanticReviewLabelRecord,
     SemanticV6Cursor,
 )
+from agent_libos.storage.mcp_v7 import (
+    McpAuthMetadataRecord,
+    McpContinuationRecord,
+    McpRemoteTaskRecord,
+    McpSideEffectPreparationRecord,
+    McpSubscriptionRecord,
+)
 from agent_libos.models import (
     AgentObject,
     AgentImage,
@@ -2445,6 +2452,102 @@ class OperationEvidenceBackendProtocol(TransactionBackendProtocol, Protocol):
     ) -> list[ExternalEffectRecord]: ...
 
 
+class McpV7BackendProtocol(Protocol):
+    """Payload-free durable MCP continuation/control state."""
+
+    def insert_mcp_continuation(self, record: McpContinuationRecord) -> McpContinuationRecord: ...
+    def get_mcp_continuation(self, continuation_id: str) -> McpContinuationRecord | None: ...
+    def list_mcp_continuations(
+        self, *, owner_id: str | None = None, server_id: str | None = None,
+        server_generation: int | None = None, status: str | None = None,
+        expired_before: str | None = None, limit: int = 100,
+    ) -> tuple[McpContinuationRecord, ...]: ...
+    def compare_and_swap_mcp_continuation(
+        self, continuation_id: str, *, expected_revision: int,
+        replacement: McpContinuationRecord,
+    ) -> bool: ...
+    def count_active_mcp_continuations(self, *, owner_id: str | None = None) -> int: ...
+    def list_terminal_mcp_continuations(
+        self, *, owner_id: str | None = None, limit: int = 100,
+    ) -> tuple[McpContinuationRecord, ...]: ...
+    def delete_terminal_mcp_continuation(
+        self, continuation_id: str, *, expected_revision: int,
+    ) -> bool: ...
+
+    def insert_mcp_remote_task(self, record: McpRemoteTaskRecord) -> McpRemoteTaskRecord: ...
+    def get_mcp_remote_task(self, task_ref: str) -> McpRemoteTaskRecord | None: ...
+    def get_mcp_remote_task_by_remote_id_sha256(
+        self, server_id: str, remote_id_sha256: str,
+    ) -> McpRemoteTaskRecord | None: ...
+    def list_mcp_remote_tasks(
+        self, *, owner_id: str | None = None, server_id: str | None = None,
+        server_generation: int | None = None, status: str | None = None,
+        expired_before: str | None = None, limit: int = 100,
+    ) -> tuple[McpRemoteTaskRecord, ...]: ...
+    def count_mcp_remote_tasks(self, *, owner_id: str | None = None) -> int: ...
+    def compare_and_swap_mcp_remote_task(
+        self, task_ref: str, *, expected_revision: int,
+        replacement: McpRemoteTaskRecord,
+    ) -> bool: ...
+    def count_active_mcp_remote_tasks(self, *, owner_id: str | None = None) -> int: ...
+    def list_terminal_mcp_remote_tasks(
+        self, *, owner_id: str | None = None, limit: int = 100,
+    ) -> tuple[McpRemoteTaskRecord, ...]: ...
+    def delete_terminal_mcp_remote_task(
+        self, task_ref: str, *, expected_revision: int,
+    ) -> bool: ...
+
+    def insert_mcp_subscription(self, record: McpSubscriptionRecord) -> McpSubscriptionRecord: ...
+    def get_mcp_subscription(self, subscription_id: str) -> McpSubscriptionRecord | None: ...
+    def list_mcp_subscriptions(
+        self, *, owner_id: str | None = None, server_id: str | None = None,
+        server_generation: int | None = None, status: str | None = None,
+        limit: int = 100,
+    ) -> tuple[McpSubscriptionRecord, ...]: ...
+    def compare_and_swap_mcp_subscription(
+        self, subscription_id: str, *, expected_revision: int,
+        replacement: McpSubscriptionRecord,
+    ) -> bool: ...
+
+    def insert_mcp_auth_metadata(self, record: McpAuthMetadataRecord) -> McpAuthMetadataRecord: ...
+    def get_mcp_auth_metadata(self, profile_id: str) -> McpAuthMetadataRecord | None: ...
+    def list_mcp_auth_metadata(
+        self, *, server_id: str | None = None,
+        server_generation: int | None = None, status: str | None = None,
+        expired_before: str | None = None, limit: int = 100,
+    ) -> tuple[McpAuthMetadataRecord, ...]: ...
+    def compare_and_swap_mcp_auth_metadata(
+        self, profile_id: str, *, expected_revision: int,
+        replacement: McpAuthMetadataRecord,
+    ) -> bool: ...
+
+    def insert_mcp_side_effect_preparation(
+        self, record: McpSideEffectPreparationRecord,
+    ) -> McpSideEffectPreparationRecord: ...
+    def get_mcp_side_effect_preparation(
+        self, preparation_id: str,
+    ) -> McpSideEffectPreparationRecord | None: ...
+    def list_mcp_side_effect_preparations(
+        self, *, owner_id: str | None = None,
+        operation_kind: str | None = None, status: str | None = None,
+        expired_before: str | None = None, limit: int = 100,
+    ) -> tuple[McpSideEffectPreparationRecord, ...]: ...
+    def compare_and_swap_mcp_side_effect_preparation(
+        self, preparation_id: str, *, expected_revision: int,
+        replacement: McpSideEffectPreparationRecord,
+    ) -> bool: ...
+    def delete_mcp_side_effect_preparation(
+        self, preparation_id: str, *, expected_revision: int,
+    ) -> bool: ...
+    def commit_mcp_side_effect_preparation(
+        self, preparation_id: str, *, expected_revision: int,
+        replacement: McpContinuationRecord | McpRemoteTaskRecord,
+    ) -> bool: ...
+    def commit_terminal_mcp_side_effect_preparation(
+        self, preparation_id: str, *, expected_revision: int,
+    ) -> bool: ...
+
+
 class UnitOfWorkBackendProtocol(
     SemanticAssessmentBackendProtocol,
     ProcessBackendProtocol,
@@ -2459,6 +2562,7 @@ class UnitOfWorkBackendProtocol(
     OperationEvidenceBackendProtocol,
     ToolArtifactRepositoryProtocol,
     PayloadRetentionStore,
+    McpV7BackendProtocol,
     Protocol,
 ):
     """Complete concrete backend contract required to assemble a UnitOfWork."""

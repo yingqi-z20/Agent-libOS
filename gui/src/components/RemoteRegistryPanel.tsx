@@ -6,6 +6,7 @@ import type { ConfirmationRequest } from "../adminTypes";
 import { useI18n } from "../i18n";
 import { RequestEpoch } from "../requestEpoch";
 import { CollapsibleJson } from "./CollapsibleJson";
+import { McpModernPanel } from "./McpModernPanel";
 
 type RemoteKind = "jsonrpc" | "mcp";
 type RemoteSummary = JsonRpcEndpointSummary | McpServerSummary;
@@ -45,10 +46,16 @@ export function RemoteRegistryPanel({
   const ids = useMemo(() => entries.map((entry) => entryId(kind, entry)).filter(isString), [entries, kind]);
   const selectedEntry = entries.find((entry) => entryId(kind, entry) === selectedId);
   const operationIds = useMemo(() => remoteOperationIds(kind, selectedEntry), [kind, selectedEntry]);
+  const mcpArgumentFields = useMemo(
+    () => kind === "mcp" ? schemaArgumentFields(selectedEntry as McpServerSummary | undefined, operationId) : [],
+    [kind, selectedEntry, operationId]
+  );
   const selectedEntryVersion = registryEntryVersion(kind, selectedEntry);
   const selectedMcpEntry = kind === "mcp" ? selectedEntry as McpServerSummary | undefined : undefined;
-  const canDiscover = selectedMcpEntry?.schema_version === 2
-    && (selectedMcpEntry.protocol_mode === "auto" || selectedMcpEntry.protocol_mode === "2026-07-28");
+  const canDiscover = (selectedMcpEntry?.schema_version === 2
+    && (selectedMcpEntry.protocol_mode === "auto" || selectedMcpEntry.protocol_mode === "2026-07-28"))
+    || (selectedMcpEntry?.schema_version === 3
+      && selectedMcpEntry.protocol_mode === "2026-07-28");
   const panelTitleId = `remote-${kind}-panel-title`;
   const discoverHintId = `remote-${kind}-discover-hint`;
 
@@ -200,6 +207,20 @@ export function RemoteRegistryPanel({
     });
   }
 
+  function confirmUnregister() {
+    if (kind !== "mcp" || !selectedId) return;
+    const selectedServerId = selectedId;
+    const actor = processAuthority ? process?.pid : undefined;
+    confirmAction({
+      title: "Unregister MCP server",
+      message: "This closes Runtime-owned connections and revokes the selected registry authority.",
+      details: { server_id: selectedServerId, authority: actor ? "process" : "host-admin", actor: actor ?? null },
+      action: async () => {
+        await client.unregisterMcpServer(selectedServerId, true, actor);
+      }
+    });
+  }
+
   const label = kind === "jsonrpc" ? "JSON-RPC" : "MCP";
   return (
     <section className="adminPanel remotePanel" aria-busy={loading || undefined} aria-labelledby={panelTitleId}>
@@ -230,6 +251,7 @@ export function RemoteRegistryPanel({
             </button>
             <button disabled={!selectedId || loading} onClick={() => void listTools()}><ListTree size={14} />{t("remote.listTools")}</button>
             <label className="toggle"><input type="checkbox" checked={refreshTools} onChange={(event) => setRefreshTools(event.currentTarget.checked)} />{t("remote.refreshTools")}</label>
+            <button className="warning" disabled={!selectedId || loading} onClick={confirmUnregister}>Unregister</button>
           </>
         ) : null}
       </div>
@@ -240,6 +262,15 @@ export function RemoteRegistryPanel({
       ) : null}
 
       {kind === "mcp" ? <McpProtocolSummary server={selectedMcpEntry} connection={mcpConnection} /> : null}
+      {kind === "mcp" && selectedMcpEntry?.schema_version === 3 ? (
+        <McpModernPanel
+          key={`${selectedId}:${selectedEntryVersion}`}
+          serverId={selectedId}
+          authProfileId={selectedMcpEntry.auth_profile_id}
+          client={client}
+          confirmAction={confirmAction}
+        />
+      ) : null}
 
       <details className="adminDisclosure">
         <summary>{t("remote.register", { kind: label })}</summary>
@@ -268,10 +299,22 @@ export function RemoteRegistryPanel({
               {operationIds.map((id) => <option value={id} key={id} />)}
             </datalist>
           </label>
-          <label className="fieldStack spanAll">
+          <div className="fieldStack spanAll">
             <span>{t("remote.arguments")}</span>
-            <textarea className="codeInput" value={argumentsText} onChange={(event) => setArgumentsText(event.currentTarget.value)} />
-          </label>
+            {kind === "mcp" && mcpArgumentFields.length ? (
+              <div className="mcpSchemaArguments" aria-label="Schema-driven MCP arguments">
+                {mcpArgumentFields.map((field) => (
+                  <McpSchemaArgumentField
+                    key={field.name}
+                    field={field}
+                    argumentsText={argumentsText}
+                    onChange={setArgumentsText}
+                  />
+                ))}
+              </div>
+            ) : null}
+            <textarea aria-label={`${label} JSON arguments`} className="codeInput" value={argumentsText} onChange={(event) => setArgumentsText(event.currentTarget.value)} />
+          </div>
         </div>
         <button className="danger" disabled={!process || !selectedId || !operationId.trim()} onClick={confirmCall}><Send size={14} />{t("remote.callAction")}</button>
       </details>
@@ -364,6 +407,131 @@ export function remoteOperationIds(kind: RemoteKind, entry: RemoteSummary | unde
 
 export function reconcileRemoteOperationId(current: string, operationIds: string[]): string {
   return operationIds.includes(current) ? current : (operationIds[0] ?? "");
+}
+
+type McpSchemaArgument = {
+  name: string;
+  label: string;
+  required: boolean;
+  kind: "string" | "number" | "integer" | "boolean";
+  choices: string[];
+};
+
+export function schemaArgumentFields(
+  entry: McpServerSummary | undefined,
+  toolId: string
+): McpSchemaArgument[] {
+  const tool = entry?.tools.find((item) => item.tool_id === toolId);
+  const schema = tool?.live?.input_schema ?? tool?.input_schema;
+  if (!schema || schema.type !== "object" || !isRecord(schema.properties)) return [];
+  const required = new Set(
+    Array.isArray(schema.required)
+      ? schema.required.filter((item): item is string => typeof item === "string")
+      : []
+  );
+  return Object.entries(schema.properties).slice(0, 64).flatMap(([name, raw]) => {
+    if (!name || !isRecord(raw)) return [];
+    const kind = raw.type;
+    if (kind !== "string" && kind !== "number" && kind !== "integer" && kind !== "boolean") return [];
+    const choices = kind === "string" && Array.isArray(raw.enum)
+      ? raw.enum.filter((item): item is string => typeof item === "string").slice(0, 256)
+      : [];
+    return [{
+      name,
+      label: typeof raw.title === "string" && raw.title ? raw.title : name,
+      required: required.has(name),
+      kind,
+      choices
+    }];
+  });
+}
+
+function McpSchemaArgumentField({
+  field,
+  argumentsText,
+  onChange
+}: {
+  field: McpSchemaArgument;
+  argumentsText: string;
+  onChange(value: string): void;
+}) {
+  const current = schemaArgumentValue(argumentsText, field.name);
+  const label = `${field.label}${field.required ? " *" : ""}`;
+  if (field.kind === "boolean") {
+    return (
+      <label className="toggle">
+        <input
+          type="checkbox"
+          checked={current === true}
+          onChange={(event) => onChange(updateSchemaArgument(argumentsText, field.name, event.currentTarget.checked))}
+        />
+        {label}
+      </label>
+    );
+  }
+  if (field.choices.length) {
+    return (
+      <label className="fieldStack">
+        <span>{label}</span>
+        <select
+          value={typeof current === "string" ? current : ""}
+          onChange={(event) => onChange(updateSchemaArgument(argumentsText, field.name, event.currentTarget.value, !event.currentTarget.value && !field.required))}
+        >
+          {!field.required ? <option value="">(omit)</option> : null}
+          {field.required && !field.choices.includes(String(current ?? "")) ? <option value="">Select…</option> : null}
+          {field.choices.map((choice) => <option key={choice} value={choice}>{choice}</option>)}
+        </select>
+      </label>
+    );
+  }
+  return (
+    <label className="fieldStack">
+      <span>{label}</span>
+      <input
+        type={field.kind === "string" ? "text" : "number"}
+        step={field.kind === "integer" ? 1 : "any"}
+        value={typeof current === "string" || typeof current === "number" ? String(current) : ""}
+        onChange={(event) => {
+          const raw = event.currentTarget.value;
+          if (!raw) {
+            onChange(updateSchemaArgument(argumentsText, field.name, undefined, true));
+            return;
+          }
+          const value = field.kind === "string" ? raw : Number(raw);
+          if (field.kind !== "string" && !Number.isFinite(value)) return;
+          onChange(updateSchemaArgument(argumentsText, field.name, value));
+        }}
+      />
+    </label>
+  );
+}
+
+function schemaArgumentValue(argumentsText: string, name: string): unknown {
+  try {
+    const parsed = JSON.parse(argumentsText || "{}");
+    return isRecord(parsed) ? parsed[name] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function updateSchemaArgument(
+  argumentsText: string,
+  name: string,
+  value: unknown,
+  omit = false
+): string {
+  let parsed: Record<string, unknown> = {};
+  try {
+    const current = JSON.parse(argumentsText || "{}");
+    if (isRecord(current)) parsed = { ...current };
+  } catch {
+    // A schema field edit deliberately starts a fresh valid object after the
+    // raw editor became invalid; it never submits until the user confirms.
+  }
+  if (omit) delete parsed[name];
+  else parsed[name] = value;
+  return JSON.stringify(parsed, null, 2);
 }
 
 function entryId(kind: RemoteKind, entry: RemoteSummary | undefined): string | null {

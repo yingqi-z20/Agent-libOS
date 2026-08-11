@@ -13,7 +13,7 @@ for every distributed built-in Skill. That catalog checks routing and
 activation only. The five paired scenarios remain the deeper effect-verified
 comparison and must not be described as exhaustive product coverage.
 
-The treatment image is derived from `coding-agent`, has all 99 catalog-owned
+The treatment image is derived from `coding-agent`, has all 101 catalog-owned
 tools in its authority ceiling, and starts with Skills-based projection. The
 baseline exposes all non-lifecycle tools immediately and omits the four Skill
 lifecycle tools, so it has neither a Skill catalog prompt nor activation path.
@@ -44,7 +44,7 @@ CLI evaluates all five held-out scenarios with the fixed three repetitions and
 two arms: 15 pairs and 30 runs. Repeating `--scenario` selects a subset but does
 not change the three repetitions. The separate 26-case activation catalog is a
 pytest-only routing check; it is not included in this JSON report. The current
-treatment authority ceiling contains 99 unique catalog-owned tools; this is an
+treatment authority ceiling contains 101 unique catalog-owned tools; this is an
 inventory fact for this source version, not a stable schema field.
 
 The fresh-state read oracles fail closed on incomplete evidence. Git must

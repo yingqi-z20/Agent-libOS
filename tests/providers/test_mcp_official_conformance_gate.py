@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import subprocess
 from pathlib import Path
@@ -18,19 +19,70 @@ _EXPECTED_SCENARIOS = (
     "http-invalid-tool-headers",
     "json-schema-ref-no-deref",
     "json-schema-2020-12-preservation",
+    "sep-2322-client-request-state",
+    "auth/pre-registration",
+    "auth/basic-cimd",
+)
+
+_EXPECTED_REVIEWED_OAUTH_SCENARIOS = (
+    "auth/metadata-default",
+    "auth/metadata-var1",
+    "auth/metadata-var2",
+    "auth/metadata-var3",
+    "auth/scope-from-www-authenticate",
+    "auth/scope-from-scopes-supported",
+    "auth/scope-omitted-when-undefined",
+    "auth/scope-step-up",
+    "auth/scope-retry-limit",
+    "auth/token-endpoint-auth-basic",
+    "auth/token-endpoint-auth-post",
+    "auth/token-endpoint-auth-none",
+    "auth/resource-mismatch",
+    "auth/offline-access-scope",
+    "auth/offline-access-not-supported",
+    "auth/authorization-server-migration",
+    "auth/iss-supported",
+    "auth/iss-not-advertised",
+    "auth/iss-supported-missing",
+    "auth/iss-wrong-issuer",
+    "auth/iss-unexpected",
+    "auth/iss-normalized",
+    "auth/metadata-issuer-mismatch",
+)
+
+_EXPECTED_OUT_OF_SCOPE_OAUTH_SCENARIOS = (
+    "auth/2025-03-26-oauth-metadata-backcompat",
+    "auth/2025-03-26-oauth-endpoint-fallback",
+    "auth/client-credentials-jwt",
+    "auth/client-credentials-basic",
+    "auth/enterprise-managed-authorization",
+    "auth/dpop",
+    "auth/dpop-nonce",
+    "auth/wif-jwt-bearer",
 )
 
 
 def _successful_checks(scenario: str) -> list[dict[str, str]]:
-    contract = gate.OFFICIAL_TOOLS_ONLY_SCENARIOS[scenario]
-    checks = [
-        {"id": check_id, "status": "SUCCESS"}
-        for check_id in sorted(contract.required_success_ids)
-    ]
-    checks.extend(
-        {"id": check_id, "status": "SKIPPED"}
-        for check_id in sorted(contract.required_skipped_ids)
-    )
+    contract = gate.OFFICIAL_CLIENT_SCENARIOS[scenario]
+    if contract.required_success_names:
+        repeated_id = min(contract.required_success_ids)
+        checks = [
+            {"id": repeated_id, "name": name, "status": "SUCCESS"}
+            for name in sorted(contract.required_success_names)
+        ]
+        checks.extend(
+            {"id": repeated_id, "name": name, "status": "SKIPPED"}
+            for name in sorted(contract.required_skipped_names)
+        )
+    else:
+        checks = [
+            {"id": check_id, "status": "SUCCESS"}
+            for check_id in sorted(contract.required_success_ids)
+        ]
+        checks.extend(
+            {"id": check_id, "status": "SKIPPED"}
+            for check_id in sorted(contract.required_skipped_ids)
+        )
     checks.extend(
         {"id": check_id, "status": "INFO"}
         for check_id in sorted(
@@ -40,7 +92,7 @@ def _successful_checks(scenario: str) -> list[dict[str, str]]:
     return checks
 
 
-def test_official_conformance_source_and_tools_only_allowlist_are_immutable() -> None:
+def test_official_conformance_source_and_reviewed_allowlist_are_immutable() -> None:
     assert gate.OFFICIAL_CONFORMANCE_REPOSITORY == (
         "https://github.com/modelcontextprotocol/conformance.git"
     )
@@ -49,10 +101,215 @@ def test_official_conformance_source_and_tools_only_allowlist_are_immutable() ->
     )
     assert gate.OFFICIAL_CONFORMANCE_PACKAGE_VERSION == "0.2.0-alpha.10"
     assert gate.MCP_PROTOCOL_REVISION == "2026-07-28"
-    assert tuple(gate.OFFICIAL_TOOLS_ONLY_SCENARIOS) == _EXPECTED_SCENARIOS
-    assert set(gate._SCENARIO_TOOLS) == set(_EXPECTED_SCENARIOS)
-    assert "sep-2322-client-request-state" not in gate.OFFICIAL_TOOLS_ONLY_SCENARIOS
-    assert not any(name.startswith("auth/") for name in gate.OFFICIAL_TOOLS_ONLY_SCENARIOS)
+    assert tuple(gate.OFFICIAL_CLIENT_SCENARIOS) == _EXPECTED_SCENARIOS
+    assert set(gate._SCENARIO_TOOLS) == gate.OFFICIAL_TOOL_SCENARIOS
+    assert gate.OFFICIAL_MRTR_SCENARIO in gate.OFFICIAL_CLIENT_SCENARIOS
+    assert gate.OFFICIAL_MRTR_SCENARIO not in gate._SCENARIO_TOOLS
+    assert gate.OFFICIAL_OAUTH_SCENARIOS == {
+        "auth/pre-registration",
+        "auth/basic-cimd",
+    }
+    assert gate.OFFICIAL_OAUTH_SCENARIOS <= set(gate.OFFICIAL_CLIENT_SCENARIOS)
+    assert gate.OFFICIAL_OAUTH_SCENARIOS.isdisjoint(gate._SCENARIO_TOOLS)
+
+
+def test_official_oauth_inventory_separates_safe_pinned_runs_from_unavailable() -> None:
+    assert (
+        gate.OFFICIAL_OAUTH_SCENARIOS_REVIEWED_BUT_NOT_RUNNABLE
+        == _EXPECTED_REVIEWED_OAUTH_SCENARIOS
+    )
+    assert not set(_EXPECTED_REVIEWED_OAUTH_SCENARIOS).intersection(
+        gate.OFFICIAL_OAUTH_SCENARIOS
+    )
+    assert (
+        gate.OFFICIAL_OAUTH_SCENARIOS_REVIEWED_OUT_OF_SCOPE
+        == _EXPECTED_OUT_OF_SCOPE_OAUTH_SCENARIOS
+    )
+    assert not set(_EXPECTED_OUT_OF_SCOPE_OAUTH_SCENARIOS).intersection(
+        gate.OFFICIAL_OAUTH_SCENARIOS
+        | set(_EXPECTED_REVIEWED_OAUTH_SCENARIOS)
+    )
+    reviewed_inventory = (
+        set(gate.OFFICIAL_OAUTH_SCENARIOS)
+        | set(_EXPECTED_REVIEWED_OAUTH_SCENARIOS)
+        | set(_EXPECTED_OUT_OF_SCOPE_OAUTH_SCENARIOS)
+    )
+    assert len(reviewed_inventory) == 33
+    assert gate.OFFICIAL_OAUTH_AUTHORITY_GAP_CODE == (
+        "runner_omits_host_pinned_expected_issuer"
+    )
+    assert "Host-reviewed expected issuer" in gate.OFFICIAL_OAUTH_AUTHORITY_GAP
+    assert gate.OFFICIAL_OAUTH_OUT_OF_SCOPE_REASON_CODE == (
+        "unsupported_oauth_extensions_or_backcompat"
+    )
+    assert "authorization-code client" in gate.OFFICIAL_OAUTH_OUT_OF_SCOPE_REASON
+    assert gate.RUNTIME_OAUTH_TLS_REGRESSION_NODE.endswith(
+        "test_runtime_oauth_pkce_tls_and_bearer_transport_end_to_end"
+    )
+
+
+def test_fixed_upstream_oauth_adapter_uses_runtime_pins_and_no_dcr() -> None:
+    source = inspect.getsource(gate._run_oauth_runtime_client_adapter)
+    for required in (
+        "Runtime.open",
+        "PinnedMcpOAuthHttpTransport",
+        'context.get("trusted_resource_url")',
+        'context["trusted_issuer"]',
+        'context["trusted_prm_url"]',
+        'context["trusted_as_metadata_url"]',
+        "runtime.mcp.add_oauth_profile",
+        "runtime.mcp.auth_begin",
+        "runtime.mcp.auth_complete",
+        "runtime.mcp.call_tool",
+        "pre-registration secret entered public evidence",
+    ):
+        assert required in source
+    for forbidden in (
+        "registration_endpoint",
+        "McpOAuthRegistrationMode.DCR",
+        "manager.begin(",
+        "manager.complete(",
+        "access_token(",
+    ):
+        assert forbidden not in source
+
+    harness = (
+        gate.REPOSITORY_ROOT / "scripts" / "mcp_conformance_oauth_harness.mts"
+    ).read_text(encoding="utf-8")
+    for required in (
+        'scenario.authServer?.getUrl()',
+        'shell: false',
+        'trusted_resource_url: resource.href',
+        'trusted_issuer: issuer.origin',
+        'registrationMode = "preregistered"',
+        'registrationMode = "cimd"',
+        'const durableChecks = checks.map',
+        'id: check.id',
+        'status: check.status',
+        'output omitted',
+    ):
+        assert required in harness
+    for forbidden in (
+        "details: check.details",
+        "name: check.name",
+        "description: check.description",
+        "timestamp: check.timestamp",
+        "source: check.source",
+        'writeFile(path.join(output, "stdout.txt")',
+        'writeFile(path.join(output, "stderr.txt")',
+    ):
+        assert forbidden not in harness
+    assert "--expected-failures" not in harness
+
+
+def test_durable_official_evidence_drops_raw_details_logs_and_secrets(
+    tmp_path: Path,
+) -> None:
+    scenario = tmp_path / "scenario"
+    result = scenario / "upstream-timestamped-result"
+    result.mkdir(parents=True)
+    raw_checks = [
+        {
+            "id": "check-id",
+            "status": "SUCCESS",
+            "name": "transient name",
+            "description": "transient description",
+            "timestamp": "future timestamp",
+            "details": {
+                "state": "private-state",
+                "code": "private-code",
+                "access_token": "private-token",
+            },
+            "source": {"logs": ["private log"]},
+            "specReferences": [
+                {
+                    "id": "RFC-TEST",
+                    "url": "https://example.invalid/spec",
+                    "private": "drop-me",
+                }
+            ],
+        }
+    ]
+    checks_path = result / "checks.json"
+    checks_path.write_text(json.dumps(raw_checks), encoding="utf-8")
+    (result / "stdout.txt").write_text("private stdout", encoding="utf-8")
+    (result / "stderr.txt").write_text("private stderr", encoding="utf-8")
+
+    digest = gate._persist_durable_scenario_evidence(scenario, raw_checks)
+
+    assert len(digest) == 64
+    int(digest, 16)
+    assert [path for path in scenario.rglob("*") if path.is_file()] == [checks_path]
+    assert json.loads(checks_path.read_text(encoding="utf-8")) == [
+        {
+            "id": "check-id",
+            "status": "SUCCESS",
+            "specReferences": [
+                {"id": "RFC-TEST", "url": "https://example.invalid/spec"}
+            ],
+        }
+    ]
+
+
+def test_failed_official_scenario_discards_every_raw_artifact(tmp_path: Path) -> None:
+    result = tmp_path / "scenario" / "upstream-result"
+    result.mkdir(parents=True)
+    for name in ("checks.json", "stdout.txt", "stderr.txt", "trace.log"):
+        (result / name).write_text("private raw evidence", encoding="utf-8")
+
+    gate._discard_raw_scenario_evidence(tmp_path / "scenario")
+
+    assert not any(path.is_file() for path in tmp_path.rglob("*"))
+
+
+def test_durable_official_evidence_digest_ignores_upstream_check_order(
+    tmp_path: Path,
+) -> None:
+    checks = [
+        {"id": "b", "status": "INFO"},
+        {"id": "a", "status": "SUCCESS"},
+    ]
+
+    first = gate._persist_durable_scenario_evidence(tmp_path / "first", checks)
+    second = gate._persist_durable_scenario_evidence(
+        tmp_path / "second", list(reversed(checks))
+    )
+
+    assert first == second
+
+
+def test_official_mrtr_adapter_uses_only_the_runtime_durable_facade() -> None:
+    source = inspect.getsource(gate._run_mrtr_runtime_client_adapter)
+    for required in (
+        "Runtime.open",
+        "register_server",
+        "runtime.mcp.call_tool",
+        "runtime.mcp.respond_continuation",
+        "human_request_id",
+        "primitive.mcp.continuation.respond",
+    ):
+        assert required in source
+    for forbidden in (
+        "from mcp.client",
+        "MemoryRepository",
+        "McpContinuationManager(",
+        "manager.respond(",
+    ):
+        assert forbidden not in source
+
+
+def test_request_metadata_uses_exact_v3_elicitation_contract() -> None:
+    contract = gate.OFFICIAL_CLIENT_SCENARIOS["request-metadata"]
+    elicitation = "sep-2575-client-declares-elicitation-capability"
+    assert elicitation in contract.required_success_ids
+    assert elicitation not in contract.required_skipped_ids
+    assert contract.required_skipped_ids == {
+        "sep-2575-client-declares-roots-capability",
+        "sep-2575-client-declares-sampling-capability",
+    }
+    manifest = gate._manifest("http://127.0.0.1:1234/mcp", "request-metadata")
+    assert manifest["schema_version"] == 3
+    assert manifest["protocol_mode"] == gate.MCP_PROTOCOL_REVISION
 
 
 @pytest.mark.parametrize("scenario", _EXPECTED_SCENARIOS)
@@ -135,6 +392,72 @@ def test_official_scenario_command_has_no_expected_failure_escape_hatch(
     assert gate.MCP_PROTOCOL_REVISION in command
     assert "--expected-failures" not in command
     assert "--force" not in command
+
+
+def test_scenario_subprocess_failure_omits_untrusted_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        gate.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ("official", "scenario"),
+            1,
+            "private stdout state",
+            "private stderr token",
+        ),
+    )
+
+    with pytest.raises(gate.ConformanceGateError) as captured:
+        gate._run_checked(
+            ("official", "scenario"),
+            env={"PATH": "/allowed/bin"},
+            reveal_failure_output=False,
+        )
+
+    message = str(captured.value)
+    assert "output omitted" in message
+    assert "private" not in message
+
+
+def test_fixed_upstream_oauth_command_uses_pinned_loader_and_no_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / "checkout"
+    loader = checkout / "node_modules" / "tsx" / "dist" / "loader.mjs"
+    loader.parent.mkdir(parents=True)
+    loader.write_text("// pinned fixture loader\n", encoding="utf-8")
+    captured: list[tuple[str, ...]] = []
+
+    def fake_run_checked(
+        argv: tuple[str, ...],
+        **_kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        captured.append(tuple(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(gate, "_run_checked", fake_run_checked)
+    monkeypatch.setattr(
+        gate,
+        "_load_checks",
+        lambda _root: _successful_checks("auth/pre-registration"),
+    )
+    summary = gate._run_fixed_upstream_oauth_scenario(
+        node="/allowed/bin/node",
+        checkout=checkout,
+        scenario="auth/pre-registration",
+        output_root=tmp_path / "results",
+        timeout_ms=30_000,
+        env={"PATH": "/allowed/bin"},
+    )
+
+    assert summary["scenario"] == "auth/pre-registration"
+    assert len(captured) == 1
+    command = captured[0]
+    assert command[:3] == ("/allowed/bin/node", "--import", str(loader))
+    assert "mcp_conformance_oauth_harness.mts" in command[3]
+    assert "--expected-failures" not in command
 
 
 def test_client_command_preserves_virtual_environment_launcher(
@@ -327,6 +650,60 @@ def test_client_manifests_pin_modern_mode_and_never_grant_unlisted_tools() -> No
     assert [tool["mcp_name"] for tool in invalid["tools"]] == ["valid_tool"]
     assert all(tool["input_schema"] == {} for tool in invalid["tools"])
 
+    headers = gate._manifest(
+        "http://127.0.0.1:1234/mcp",
+        "http-standard-headers",
+    )
+    assert headers["schema_version"] == 3
+    assert headers["protocol_mode"] == gate.MCP_PROTOCOL_REVISION
+    assert headers["resources"] == [
+        {
+            "resource_id": "header-resource",
+            "remote_uri": "file:///path/to/file%20name.txt",
+            "right": "read",
+            "information_flow": True,
+            "model_visible": False,
+            "mime_types": ["text/plain"],
+        }
+    ]
+    assert headers["prompts"] == [
+        {
+            "prompt_id": "header-prompt",
+            "mcp_name": "test_prompt",
+            "argument_names": [],
+        }
+    ]
+    assert headers["subscriptions"] == []
+
+
+def test_standard_header_scenario_requires_every_modern_request_path() -> None:
+    contract = gate.OFFICIAL_CLIENT_SCENARIOS["http-standard-headers"]
+
+    assert contract.expected_success_count == 8
+    assert contract.expected_skipped_count == 3
+    assert contract.required_success_names == {
+        "ClientMcpMethodHeader_tools_call",
+        "ClientMcpNameHeader_tools_call",
+        "ClientMcpMethodHeader_resources_list",
+        "ClientMcpMethodHeader_resources_read",
+        "ClientMcpNameHeader_resources_read",
+        "ClientMcpMethodHeader_prompts_list",
+        "ClientMcpMethodHeader_prompts_get",
+        "ClientMcpNameHeader_prompts_get",
+    }
+    assert contract.required_skipped_names == {
+        "ClientMcpMethodHeader_initialize",
+        "ClientMcpMethodHeader_notifications_initialized",
+        "ClientMcpMethodHeader_tools_list",
+    }
+    incomplete = _successful_checks("http-standard-headers")
+    incomplete[0] = {
+        **incomplete[0],
+        "status": "SKIPPED",
+    }
+    with pytest.raises(gate.ConformanceGateError, match="success_names="):
+        gate._validate_checks("http-standard-headers", incomplete)
+
 
 def test_custom_header_context_is_shape_checked(
     monkeypatch: pytest.MonkeyPatch,
@@ -387,4 +764,29 @@ def test_checks_loader_rejects_empty_or_ambiguous_artifacts(tmp_path: Path) -> N
     second.parent.mkdir()
     second.write_text("[]\n", encoding="utf-8")
     with pytest.raises(gate.ConformanceGateError, match="2 checks.json"):
+        gate._load_checks(tmp_path)
+
+
+def test_checks_loader_bounds_untrusted_upstream_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checks = tmp_path / "checks.json"
+    checks.write_text('[{"id":"check","status":"SUCCESS"}]', encoding="utf-8")
+    monkeypatch.setattr(gate, "_MAX_OFFICIAL_CHECKS_BYTES", 8)
+    with pytest.raises(gate.ConformanceGateError, match="evidence bound"):
+        gate._load_checks(tmp_path)
+
+    monkeypatch.setattr(gate, "_MAX_OFFICIAL_CHECKS_BYTES", 1_024)
+    monkeypatch.setattr(gate, "_MAX_OFFICIAL_CHECK_COUNT", 1)
+    checks.write_text(
+        json.dumps(
+            [
+                {"id": "first", "status": "SUCCESS"},
+                {"id": "second", "status": "SUCCESS"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(gate.ConformanceGateError, match="too many checks"):
         gate._load_checks(tmp_path)

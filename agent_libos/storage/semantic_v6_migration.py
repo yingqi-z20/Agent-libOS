@@ -144,15 +144,19 @@ def _plan_store_v6_migration(
             raise StoreV6MigrationError(
                 "SQLite schema-v6 planning requires an independent verified backup"
             )
-        source_path = _sqlite_path(target)
-        with _sqlite_snapshot(source_path, label="SQLite source") as source:
+        source_path = _sqlite_path(target, migration_label="schema-v6")
+        with _sqlite_snapshot(
+            source_path, label="SQLite source", migration_label="schema-v6"
+        ) as source:
             _require_canonical_v5(SQLiteStore, source)
             source_digest = _sqlite_logical_v5_sha256(source)
         backup_path = _validated_sqlite_backup_path(
             sqlite_backup,
             source_path=source_path,
         )
-        with _sqlite_snapshot(backup_path, label="SQLite backup") as backup:
+        with _sqlite_snapshot(
+            backup_path, label="SQLite backup", migration_label="schema-v6"
+        ) as backup:
             _require_canonical_v5(SQLiteStore, backup)
             backup_digest = _sqlite_logical_v5_sha256(backup)
         if not hmac.compare_digest(source_digest, backup_digest):
@@ -211,7 +215,7 @@ def _apply_store_v6_migration(
             raise StoreV6MigrationError(
                 "SQLite schema-v6 apply requires a verified sqlite_backup"
             )
-        source_path = _sqlite_path(target)
+        source_path = _sqlite_path(target, migration_label="schema-v6")
         return _apply_sqlite(
             source_path,
             backup_path=_validated_sqlite_backup_path(
@@ -415,7 +419,9 @@ def _apply_sqlite(
     expected_plan_sha256: str,
 ) -> StoreV6MigrationResult:
     _require_secure_regular_file(path, label="SQLite source", mode_600=True)
-    with _sqlite_snapshot(backup_path, label="SQLite backup") as backup:
+    with _sqlite_snapshot(
+        backup_path, label="SQLite backup", migration_label="schema-v6"
+    ) as backup:
         _require_canonical_v5(SQLiteStore, backup)
         backup_digest = _sqlite_logical_v5_sha256(backup)
     plan = _build_plan("sqlite")
@@ -423,6 +429,7 @@ def _apply_sqlite(
     with SQLiteStore._migration_apply_connection(
         path,
         error_type=StoreV6MigrationError,
+        migration_label="schema-v6",
     ) as connection:
         _require_canonical_v5(SQLiteStore, connection)
         source_digest = _sqlite_logical_v5_sha256(connection)

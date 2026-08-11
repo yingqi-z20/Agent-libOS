@@ -32,6 +32,10 @@ from agent_libos.storage import (
     AuthorityRepository,
     EvidenceRepository,
     ExtensionRepository,
+    McpAuthMetadataRepository,
+    McpContinuationRepository,
+    McpRemoteTaskRepository,
+    McpSubscriptionRepository,
     ObjectRepository,
     PayloadRetentionRepository,
     ProcessRepository,
@@ -721,6 +725,10 @@ def test_unit_of_work_composes_typed_repositories() -> None:
         assert isinstance(unit.evidence, EvidenceRepository)
         assert isinstance(unit.extensions, ExtensionRepository)
         assert isinstance(unit.module_publications, RuntimeModuleRepository)
+        assert isinstance(unit.mcp_continuations, McpContinuationRepository)
+        assert isinstance(unit.mcp_remote_tasks, McpRemoteTaskRepository)
+        assert isinstance(unit.mcp_subscriptions, McpSubscriptionRepository)
+        assert isinstance(unit.mcp_auth, McpAuthMetadataRepository)
         with unit.transaction(include_object_payloads=True) as active:
             assert active is unit
         with pytest.raises(AttributeError, match="no repository operation"):
@@ -988,6 +996,31 @@ def test_unit_of_work_rejects_missing_effect_ledger_reader_fail_fast() -> None:
         match=(
             r"UnitOfWork backend contract violation: .*operation-evidence\."
             r"current_effect_ledger_seq: missing concrete method"
+        ),
+    ):
+        UnitOfWork(backend_type())  # type: ignore[arg-type]
+
+
+def test_unit_of_work_rejects_missing_mcp_v7_cas_fail_fast() -> None:
+    def protocol_stub(self: object, *args: object, **kwargs: object) -> None:
+        del self, args, kwargs
+
+    methods = {
+        name: protocol_stub
+        for name, value in inspect.getmembers(
+            UnitOfWorkBackendProtocol,
+            predicate=inspect.isfunction,
+        )
+        if not name.startswith("__")
+    }
+    methods.pop("compare_and_swap_mcp_continuation")
+    backend_type = type("MissingMcpV7CasBackend", (), methods)
+
+    with pytest.raises(
+        TypeError,
+        match=(
+            r"UnitOfWork backend contract violation: .*mcp-v7\."
+            r"compare_and_swap_mcp_continuation: missing concrete method"
         ),
     ):
         UnitOfWork(backend_type())  # type: ignore[arg-type]

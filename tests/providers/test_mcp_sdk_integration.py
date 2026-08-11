@@ -34,7 +34,7 @@ from agent_libos.substrate.local import (
     _strict_stdio_client,
 )
 
-pytestmark = pytest.mark.mcp
+pytestmark = [pytest.mark.mcp, pytest.mark.mcp_transport]
 
 
 def _grant_stdio_spawn(

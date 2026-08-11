@@ -16,6 +16,7 @@ from agent_libos.storage.semantic_v5_migration import (
 )
 from agent_libos.storage.semantic_v6_migration import plan_store_v6_migration
 from agent_libos.storage.v6_schema_contract import V6_TABLES
+from agent_libos.storage.v7_schema_contract import V7_TABLES
 
 
 @contextlib.contextmanager
@@ -64,7 +65,7 @@ def test_postgres_v4_to_v5_migration_round_trip() -> None:
     with _postgres_schema_dsn() as dsn:
         PostgresStore(dsn).close()
         with psycopg.connect(dsn, autocommit=True) as connection:
-            for table in sorted(V6_TABLES):
+            for table in sorted(V7_TABLES | V6_TABLES):
                 connection.execute(
                     sql.SQL("DROP TABLE {}").format(sql.Identifier(table))
                 )

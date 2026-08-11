@@ -1,6 +1,6 @@
 # Runtime Events
 
-Agent libOS 1.4.2 persists a closed catalog of `EventType` values. Events
+Agent libOS 1.5.0 persists a closed catalog of `EventType` values. Events
 are durable observations for operators, the GUI, context materialization, and
 Explain evidence. They are not an authority source, a task queue, or a
 replacement for the process, operation, capability, Human-request, or external-

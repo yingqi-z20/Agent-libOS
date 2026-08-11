@@ -2,18 +2,21 @@ from __future__ import annotations
 import pytest
 import asyncio
 import json
+import warnings
 from dataclasses import asdict, fields, replace
 from pathlib import Path
 from pydantic import ValidationError as PydanticValidationError
 
 import agent_libos.config.loader as config_loader
 from agent_libos.config import (
+    AgentLibOSConfigDeprecationWarning,
     AgentLibOSConfig,
     CapabilityDefaults,
     DEFAULT_CONFIG,
     GitDefaults,
     LLMDefaults,
     LLMProfile,
+    McpDefaults,
     ObjectMemoryDefaults,
     RuntimeDefaults,
     ShellCommandRule,
@@ -307,7 +310,11 @@ class TestConfigDefaults:
         config = replace(
             DEFAULT_CONFIG,
             jsonrpc=replace(DEFAULT_CONFIG.jsonrpc, list_limit=173),
-            mcp=replace(DEFAULT_CONFIG.mcp, list_limit=181),
+            mcp=replace(
+                DEFAULT_CONFIG.mcp,
+                list_limit=7,
+                server_page_limit=181,
+            ),
             memory=replace(DEFAULT_CONFIG.memory, query_limit=191),
         )
 
@@ -316,6 +323,144 @@ class TestConfigDefaults:
         assert ListMemoryNamespaceTool().spec(config=config).input_schema["properties"]["limit"]["maximum"] == 191
         assert ListJsonRpcEndpointsArgs.model_validate({"limit": 150}).limit == 150
         assert ListMcpServersArgs.model_validate({"limit": 150}).limit == 150
+
+    def test_mcp_env_allowlists_accept_exact_prefix_and_empty_policies(self) -> None:
+        config = AgentLibOSConfig(
+            mcp=replace(
+                DEFAULT_CONFIG.mcp,
+                header_env_allowlist=(),
+                stdio_env_allowlist=("EXACT_TOKEN", "AGENT_LIBOS_MCP_*"),
+            ),
+        )
+
+        assert config.mcp.header_env_allowlist == ()
+        assert config.mcp.stdio_env_allowlist == (
+            "EXACT_TOKEN",
+            "AGENT_LIBOS_MCP_*",
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        (
+            "",
+            "*",
+            "AGENT_LIBOS_MCP_**",
+            "AGENT_*_MCP",
+            "AGENT*LIBOS*",
+            " AGENT_LIBOS_MCP_*",
+            "AGENT LIBOS",
+            "9AGENT_LIBOS",
+            "AGENT-LIBOS",
+        ),
+    )
+    @pytest.mark.parametrize(
+        "field",
+        ("header_env_allowlist", "stdio_env_allowlist"),
+    )
+    def test_mcp_env_allowlists_reject_invalid_names_and_wildcards(
+        self,
+        field: str,
+        value: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=field):
+            AgentLibOSConfig(
+                mcp=replace(DEFAULT_CONFIG.mcp, **{field: (value,)}),
+            )
+
+    def test_mcp_manifest_limit_cannot_exceed_yaml_loader_limit(self) -> None:
+        config = AgentLibOSConfig(
+            mcp=replace(
+                DEFAULT_CONFIG.mcp,
+                manifest_max_bytes=YAML_MAX_UTF8_BYTES,
+            ),
+        )
+        assert config.mcp.manifest_max_bytes == YAML_MAX_UTF8_BYTES
+
+        with pytest.raises(
+            ValueError,
+            match=r"mcp\.manifest_max_bytes must be <= YAML_MAX_UTF8_BYTES",
+        ):
+            AgentLibOSConfig(
+                mcp=replace(
+                    DEFAULT_CONFIG.mcp,
+                    manifest_max_bytes=YAML_MAX_UTF8_BYTES + 1,
+                ),
+            )
+
+    def test_mcp_v3_limits_are_independent_and_bounded(self) -> None:
+        mcp = DEFAULT_CONFIG.mcp
+        assert mcp.tool_catalog_limit == 100
+        assert mcp.resource_catalog_limit == 200
+        assert mcp.resource_template_limit == 200
+        assert mcp.prompt_catalog_limit == 200
+        assert mcp.max_completion_values == 100
+        assert mcp.cursor_handle_limit == 256
+        assert mcp.subscription_terminal_records == 256
+        assert mcp.cache_hint_ttl_cap_ms == 3_600_000
+        assert not hasattr(mcp, "cache_max_entries")
+        assert not hasattr(mcp, "cache_max_bytes")
+        assert not hasattr(mcp, "cache_public_cross_principal")
+        assert mcp.oauth_enabled is False
+        assert mcp.tasks_extension_enabled is False
+
+        with pytest.raises(ValueError, match="tool_catalog_limit"):
+            AgentLibOSConfig(mcp=replace(mcp, tool_catalog_limit=101))
+        with pytest.raises(ValueError, match="max_completion_values"):
+            AgentLibOSConfig(mcp=replace(mcp, max_completion_values=101))
+        with pytest.raises(ValueError, match="list_max_pages"):
+            AgentLibOSConfig(mcp=replace(mcp, list_max_pages=17))
+        with pytest.raises(ValueError, match="connection_absolute_ttl_s"):
+            AgentLibOSConfig(
+                mcp=replace(
+                    mcp,
+                    connection_idle_ttl_s=30.0,
+                    connection_absolute_ttl_s=29.0,
+                )
+            )
+
+    @pytest.mark.parametrize(
+        "removed_field",
+        (
+            "cache_max_entries",
+            "cache_max_bytes",
+            "cache_ttl_cap_ms",
+            "cache_public_cross_principal",
+        ),
+    )
+    def test_removed_mcp_response_cache_placeholders_fail_closed(
+        self,
+        removed_field: str,
+    ) -> None:
+        with pytest.raises(PydanticValidationError, match=removed_field):
+            McpDefaults(**{removed_field: 1})
+
+    def test_mcp_tasks_extension_requires_exact_host_digest_pin(self) -> None:
+        with pytest.raises(ValueError, match="requires tasks_extension_spec_sha256"):
+            AgentLibOSConfig(
+                mcp=replace(DEFAULT_CONFIG.mcp, tasks_extension_enabled=True)
+            )
+        configured = AgentLibOSConfig(
+            mcp=replace(
+                DEFAULT_CONFIG.mcp,
+                tasks_extension_enabled=True,
+                tasks_extension_spec_sha256="a" * 64,
+            )
+        )
+        assert configured.mcp.tasks_extension_spec_sha256 == "a" * 64
+
+    def test_mcp_legacy_tools_limit_is_independent_from_modern_limits(self) -> None:
+        configured = AgentLibOSConfig(
+            mcp=replace(
+                DEFAULT_CONFIG.mcp,
+                list_limit=1,
+                server_page_limit=2,
+                tool_catalog_limit=3,
+            )
+        )
+
+        assert configured.mcp.list_limit == 1
+        assert configured.mcp.server_page_limit == 2
+        assert configured.mcp.tool_catalog_limit == 3
 
     def test_object_memory_scan_and_metadata_bounds_have_independent_defaults(self) -> None:
         memory = DEFAULT_CONFIG.memory
@@ -430,6 +575,57 @@ class TestConfigDefaults:
         assert config.runtime.run_until_idle_max_quanta == 3
         assert config.tools.filesystem_read_max_bytes == 123
         assert config.scheduler.max_workers == 2
+
+    @pytest.mark.parametrize(
+        ("legacy_limit", "server_limit", "tool_limit"),
+        ((2, 2, 2), (1, 2, 3)),
+        ids=("equal-low-values", "conflicting-low-values"),
+    )
+    def test_explicit_mcp_legacy_list_limit_warns_without_aliasing_modern_limits(
+        self,
+        tmp_path: Path,
+        legacy_limit: int,
+        server_limit: int,
+        tool_limit: int,
+    ) -> None:
+        path = tmp_path / "legacy-mcp-list-limit.yaml"
+        path.write_text(
+            "mcp:\n"
+            f"  list_limit: {legacy_limit}\n"
+            f"  server_page_limit: {server_limit}\n"
+            f"  tool_catalog_limit: {tool_limit}\n",
+            encoding="utf-8",
+        )
+
+        with pytest.warns(
+            AgentLibOSConfigDeprecationWarning,
+            match=r"mcp\.list_limit is deprecated.*Manifest v1/v2 Tools",
+        ) as notices:
+            config = load_config_file(path)
+
+        assert len(notices) == 1
+        assert AgentLibOSConfigDeprecationWarning.code == "deprecated_mcp_list_limit"
+        assert config.mcp.list_limit == legacy_limit
+        assert config.mcp.server_page_limit == server_limit
+        assert config.mcp.tool_catalog_limit == tool_limit
+
+    def test_default_config_and_unrelated_overlay_do_not_emit_mcp_deprecation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "unrelated-config.yaml"
+        path.write_text("runtime:\n  default_image_id: quiet-base:v0\n", encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as notices:
+            warnings.simplefilter("always")
+            config = load_config_file(path)
+
+        assert config.runtime.default_image_id == "quiet-base:v0"
+        assert not [
+            item
+            for item in notices
+            if issubclass(item.category, AgentLibOSConfigDeprecationWarning)
+        ]
 
     def test_load_config_file_preserves_yaml_merge_override_semantics(
         self,

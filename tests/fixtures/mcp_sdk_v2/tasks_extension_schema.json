@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://modelcontextprotocol.io/extensions/tasks/2026-07-28/agent-libos-client-subset.schema.json",
+  "title": "Reviewed MCP Tasks client extension subset",
+  "extension_id": "io.modelcontextprotocol/tasks",
+  "protocol_revision": "2026-07-28",
+  "type": "object",
+  "oneOf": [
+    {
+      "properties": {
+        "method": { "const": "tasks/get" },
+        "params": {
+          "allOf": [{ "$ref": "#/$defs/taskReference" }],
+          "unevaluatedProperties": false
+        }
+      },
+      "required": ["method", "params"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "method": { "const": "tasks/update" },
+        "params": {
+          "allOf": [
+            { "$ref": "#/$defs/taskReference" },
+            {
+              "type": "object",
+              "properties": {
+                "inputResponses": {
+                  "type": "object",
+                  "minProperties": 1,
+                  "additionalProperties": { "type": "object" }
+                }
+              },
+              "required": ["inputResponses"]
+            }
+          ],
+          "unevaluatedProperties": false
+        }
+      },
+      "required": ["method", "params"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "method": { "const": "tasks/cancel" },
+        "params": {
+          "allOf": [{ "$ref": "#/$defs/taskReference" }],
+          "unevaluatedProperties": false
+        }
+      },
+      "required": ["method", "params"],
+      "additionalProperties": false
+    }
+  ],
+  "$defs": {
+    "taskReference": {
+      "type": "object",
+      "properties": { "taskId": { "type": "string", "minLength": 1 } },
+      "required": ["taskId"]
+    }
+  },
+  "x-agent-libos-excluded-methods": ["tasks/list", "tasks/result"]
+}

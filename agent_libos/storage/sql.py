@@ -224,6 +224,18 @@ from agent_libos.storage.gui_visibility import (
     is_gui_presentation_audit_fields,
     is_gui_presentation_event_fields,
 )
+from agent_libos.storage.mcp_v7 import (
+    MCP_V7_QUERY_HARD_LIMIT,
+    McpAuthMetadataRecord,
+    McpContinuationRecord,
+    McpRemoteTaskRecord,
+    McpSideEffectPreparationRecord,
+    McpSubscriptionRecord,
+    canonical_mcp_v7_metadata_json,
+    canonical_mcp_v7_side_effect_metadata_json,
+    parse_mcp_v7_metadata_json,
+    parse_mcp_v7_side_effect_metadata_json,
+)
 from agent_libos.storage.semantic import (
     SEMANTIC_QUERY_HARD_LIMIT,
     _TERMINAL_JOB_STATUSES,
@@ -860,7 +872,7 @@ def _dumps_strict_checkpoint_snapshot(snapshot: Any) -> str:
         ) from exc
 
 
-STORE_SCHEMA_VERSION = 6
+STORE_SCHEMA_VERSION = 7
 # Python cursor models compare strings by Unicode code point.  SQLite BINARY
 # and PostgreSQL "C" are the backend collations that preserve that ordering for
 # UTF-8 text.  Every durable text component used by a startup/recovery keyset
@@ -955,6 +967,53 @@ _V6_KEYSET_TEXT_COLUMNS: dict[str, frozenset[str]] = {
     ),
     "semantic_machine_outcomes": frozenset({"created_at", "outcome_id"}),
     "semantic_rate_budgets": frozenset({"bucket_id"}),
+}
+_V7_KEYSET_TEXT_COLUMNS: dict[str, frozenset[str]] = {
+    **_V6_KEYSET_TEXT_COLUMNS,
+    "mcp_continuations": frozenset(
+        {
+            "continuation_id",
+            "server_id",
+            "owner_id",
+            "expires_at",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "mcp_remote_tasks": frozenset(
+        {
+            "task_ref",
+            "server_id",
+            "owner_id",
+            "expires_at",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "mcp_subscriptions": frozenset(
+        {
+            "subscription_id",
+            "server_id",
+            "owner_id",
+            "last_event_at",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "mcp_auth_metadata": frozenset(
+        {"profile_id", "server_id", "expires_at", "created_at", "updated_at"}
+    ),
+    "mcp_side_effect_preparations": frozenset(
+        {
+            "preparation_id",
+            "operation_id",
+            "server_id",
+            "owner_id",
+            "expires_at",
+            "created_at",
+            "updated_at",
+        }
+    ),
 }
 _PROCESS_REVISION_COUNTER_PREFIX = "process_revision:"
 _PROCESS_EXECUTION_COUNTER_PREFIX = "process_execution_generation:"
@@ -1328,6 +1387,43 @@ _V6_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
         "day_count inflight_count revision updated_at".split()
     ),
 }
+_V7_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
+    **_V6_REQUIRED_COLUMNS,
+    "mcp_continuations": frozenset(
+        "continuation_id server_id server_spec_sha256 server_generation owner_id "
+        "auth_principal_sha256 auth_scope_sha256 request_sha256 effect_id "
+        "capability_sha256 data_flow_sha256 human_request_id broker_ref "
+        "broker_value_sha256 status revision expires_at metadata_json created_at "
+        "updated_at".split()
+    ),
+    "mcp_remote_tasks": frozenset(
+        "task_ref server_id server_spec_sha256 server_generation owner_id "
+        "auth_principal_sha256 auth_scope_sha256 origin_request_sha256 "
+        "origin_effect_id human_request_id broker_ref remote_id_sha256 status revision expires_at "
+        "poll_interval_ms status_message_sha256 result_ref result_sha256 "
+        "metadata_json created_at updated_at".split()
+    ),
+    "mcp_subscriptions": frozenset(
+        "subscription_id server_id server_spec_sha256 server_generation owner_id "
+        "auth_principal_sha256 auth_scope_sha256 requested_filter_sha256 "
+        "acknowledged_filter_sha256 status queue_limit event_max_bytes "
+        "received_count dropped_count revision last_event_at metadata_json "
+        "created_at updated_at".split()
+    ),
+    "mcp_auth_metadata": frozenset(
+        "profile_id server_id server_spec_sha256 server_generation status "
+        "issuer_sha256 resource_sha256 audience_sha256 scopes_sha256 "
+        "principal_sha256 expires_at credential_generation revision metadata_json "
+        "created_at updated_at".split()
+    ),
+    "mcp_side_effect_preparations": frozenset(
+        "preparation_id operation_kind operation_id operation_revision server_id "
+        "server_spec_sha256 server_generation owner_id auth_principal_sha256 "
+        "auth_scope_sha256 human_request_id human_preview_sha256 broker_ref "
+        "broker_value_sha256 result_ref result_sha256 status revision expires_at "
+        "metadata_json created_at updated_at".split()
+    ),
+}
 _SEMANTIC_TYPED_TABLES = frozenset(
     {
         "semantic_assessment_jobs",
@@ -1537,6 +1633,11 @@ class SQLRuntimeStore:
             "skill_trust",
             "jsonrpc_endpoints",
             "mcp_servers",
+            "mcp_continuations",
+            "mcp_remote_tasks",
+            "mcp_subscriptions",
+            "mcp_auth_metadata",
+            "mcp_side_effect_preparations",
             "images",
             "image_artifacts",
             "tools",
@@ -1619,9 +1720,9 @@ class SQLRuntimeStore:
                 self._write_store_schema_version()
                 # Validate the exact fresh contract inside the bootstrap
                 # transaction. A failed DDL surface rolls back to an empty
-                # database; existing v5 stores were already checked before
+                # database; existing v7 stores were already checked before
                 # initializer entry and cannot be repaired opportunistically.
-                self._require_v6_schema_shape(conn)
+                self._require_v7_schema_shape(conn)
 
     def _issue_checkpoint_restore_writer_token(self) -> object:
         """Issue the internal checkpoint publication mutation capability."""
@@ -1629,7 +1730,7 @@ class SQLRuntimeStore:
         return self.__checkpoint_restore_writer_token
 
     def _require_supported_store_version(self) -> bool:
-        """Reject every non-v6 store before initialization can mutate it."""
+        """Reject every non-v7 store before initialization can mutate it."""
 
         return self._require_supported_store_version_for(self.conn)
 
@@ -1639,6 +1740,11 @@ class SQLRuntimeStore:
         if marker_exists:
             version = marker_row.get("schema_version") if marker_row is not None else None
             if version != STORE_SCHEMA_VERSION:
+                if version == 6:
+                    raise UnsupportedStoreVersion(
+                        "Agent libOS store schema v6 requires the explicit offline "
+                        "v6-to-v7 migration; no migration was attempted"
+                    )
                 if version == 5:
                     raise UnsupportedStoreVersion(
                         "Agent libOS store schema v5 requires the explicit offline "
@@ -1652,14 +1758,14 @@ class SQLRuntimeStore:
                 if version == 3:
                     raise UnsupportedStoreVersion(
                         "Agent libOS store schema v3 is not writable or readable by "
-                        "this runtime; expected 5. Use Agent libOS 1.0.1 to view or "
+                        "this runtime; expected 7. Use Agent libOS 1.0.1 to view or "
                         "archive this store. No migration was attempted."
                     )
                 raise UnsupportedStoreVersion(
                     f"unsupported Agent libOS store schema: {version!r}; "
                     f"expected {STORE_SCHEMA_VERSION}; no migration was attempted"
                 )
-            cls._require_v6_schema_shape(conn)
+            cls._require_v7_schema_shape(conn)
             return False
         if cls._probe_user_schema_objects(conn):
             raise UnsupportedStoreVersion(
@@ -1724,6 +1830,36 @@ class SQLRuntimeStore:
         cls._require_v4_index_manifest(conn)
         cls._require_v5_semantic_index_manifest(conn)
         cls._require_v6_semantic_index_manifest(conn)
+        cls._require_v4_counter_seed(conn)
+
+    @classmethod
+    def _require_v7_schema_shape(cls, conn: SqlEngine) -> None:
+        mismatched: dict[str, dict[str, list[str]]] = {}
+        for table, required in _V7_REQUIRED_COLUMNS.items():
+            columns = cls._probe_columns(conn, table)
+            missing = sorted(required - columns)
+            extra = sorted(columns - required)
+            if missing or extra:
+                mismatched[table] = {"missing": missing, "extra": extra}
+        extra_tables = sorted(
+            cls._probe_user_tables(conn) - set(_V7_REQUIRED_COLUMNS)
+        )
+        if extra_tables:
+            mismatched["<tables>"] = {"missing": [], "extra": extra_tables}
+        if mismatched:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v7: "
+                f"{mismatched}"
+            )
+        cls._require_keyset_text_collations(
+            conn,
+            version=7,
+            keyset_columns=_V7_KEYSET_TEXT_COLUMNS,
+        )
+        cls._require_v4_index_manifest(conn)
+        cls._require_v5_semantic_index_manifest(conn)
+        cls._require_v6_semantic_index_manifest(conn)
+        cls._require_v7_mcp_index_manifest(conn)
         cls._require_v4_counter_seed(conn)
 
     @classmethod
@@ -1917,7 +2053,7 @@ class SQLRuntimeStore:
         bad_collations = [
             f"{column}={actual or 'missing'} expected {expected_collation}"
             for column, actual in zip(columns, collations)
-            if column in _V5_KEYSET_TEXT_COLUMNS.get(table, frozenset())
+            if column in _V7_KEYSET_TEXT_COLUMNS.get(table, frozenset())
             and actual != expected_collation
         ]
         return {"collations": bad_collations} if bad_collations else None
@@ -2823,6 +2959,36 @@ class SQLRuntimeStore:
         if problems:
             raise UnsupportedStoreVersion(
                 "unsupported or incomplete Agent libOS store schema v6 semantic "
+                f"index manifest: {problems}"
+            )
+
+    @classmethod
+    def _require_v7_mcp_index_manifest(cls, conn: SqlEngine) -> None:
+        from agent_libos.storage.v7_schema_contract import (
+            V7_INDEX_CONTRACTS,
+            V7_TABLES,
+        )
+
+        shapes = cls._probe_index_shapes(
+            conn,
+            {spec[0] for spec in V7_INDEX_CONTRACTS.values()},
+        )
+        problems: dict[str, Any] = {}
+        for name, expected in V7_INDEX_CONTRACTS.items():
+            problem = cls._v5_index_shape_problem(name, expected, shapes.get(name))
+            if problem is not None:
+                problems[name] = problem
+        declared = {
+            name
+            for name, shape in shapes.items()
+            if shape.get("origin") == "declared" and shape.get("table") in V7_TABLES
+        }
+        extra = sorted(declared - set(V7_INDEX_CONTRACTS))
+        if extra:
+            problems["<extra indexes>"] = extra
+        if problems:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v7 MCP "
                 f"index manifest: {problems}"
             )
 
@@ -3939,6 +4105,225 @@ class SQLRuntimeStore:
         self._initialize_v4_schema()
         self._create_v5_semantic_schema()
         self._create_v6_semantic_schema()
+        self._create_v7_mcp_schema()
+
+    def _create_v7_mcp_schema(self) -> None:
+        """Create payload-free modern MCP continuation/control state."""
+
+        self._execute_script(
+            """
+            CREATE TABLE IF NOT EXISTS mcp_continuations (
+              continuation_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+              server_id TEXT COLLATE BINARY NOT NULL,
+              server_spec_sha256 TEXT NOT NULL CHECK (length(server_spec_sha256) = 64),
+              server_generation BIGINT NOT NULL CHECK (server_generation >= 0),
+              owner_id TEXT COLLATE BINARY NOT NULL,
+              auth_principal_sha256 TEXT NOT NULL CHECK (length(auth_principal_sha256) = 64),
+              auth_scope_sha256 TEXT NOT NULL CHECK (length(auth_scope_sha256) = 64),
+              request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+              effect_id TEXT NOT NULL,
+              capability_sha256 TEXT NOT NULL CHECK (length(capability_sha256) = 64),
+              data_flow_sha256 TEXT NOT NULL CHECK (length(data_flow_sha256) = 64),
+              human_request_id TEXT NOT NULL UNIQUE,
+              broker_ref TEXT UNIQUE,
+              broker_value_sha256 TEXT CHECK (
+                broker_value_sha256 IS NULL OR length(broker_value_sha256) = 64
+              ),
+              status TEXT NOT NULL CHECK (status IN (
+                'input_required', 'dispatching', 'complete', 'cancelled',
+                'expired', 'needs_attention'
+              )),
+              revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0),
+              expires_at TEXT COLLATE BINARY NOT NULL,
+              metadata_json TEXT NOT NULL,
+              created_at TEXT COLLATE BINARY NOT NULL,
+              updated_at TEXT COLLATE BINARY NOT NULL,
+              CHECK ((broker_ref IS NULL) = (broker_value_sha256 IS NULL)),
+              FOREIGN KEY(human_request_id) REFERENCES human_requests(request_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_mcp_continuations_created
+              ON mcp_continuations(created_at COLLATE BINARY, continuation_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_mcp_continuations_owner_status
+              ON mcp_continuations(owner_id COLLATE BINARY, status, created_at COLLATE BINARY, continuation_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_mcp_continuations_server_generation
+              ON mcp_continuations(server_id COLLATE BINARY, server_generation, status, created_at COLLATE BINARY, continuation_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_mcp_continuations_expiry
+              ON mcp_continuations(expires_at COLLATE BINARY, continuation_id COLLATE BINARY);
+
+            CREATE TABLE IF NOT EXISTS mcp_remote_tasks (
+              task_ref TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+              server_id TEXT COLLATE BINARY NOT NULL,
+              server_spec_sha256 TEXT NOT NULL CHECK (length(server_spec_sha256) = 64),
+              server_generation BIGINT NOT NULL CHECK (server_generation >= 0),
+              owner_id TEXT COLLATE BINARY NOT NULL,
+              auth_principal_sha256 TEXT NOT NULL CHECK (length(auth_principal_sha256) = 64),
+              auth_scope_sha256 TEXT NOT NULL CHECK (length(auth_scope_sha256) = 64),
+              origin_request_sha256 TEXT NOT NULL CHECK (length(origin_request_sha256) = 64),
+              origin_effect_id TEXT NOT NULL,
+              human_request_id TEXT UNIQUE,
+              broker_ref TEXT UNIQUE,
+              remote_id_sha256 TEXT NOT NULL CHECK (length(remote_id_sha256) = 64),
+              status TEXT NOT NULL CHECK (status IN (
+                'working', 'input_required', 'completed', 'failed', 'cancelled',
+                'cancel_requested', 'update_dispatching', 'cancel_dispatching',
+                'needs_attention'
+              )),
+              revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0),
+              expires_at TEXT COLLATE BINARY,
+              poll_interval_ms BIGINT CHECK (poll_interval_ms IS NULL OR poll_interval_ms >= 0),
+              status_message_sha256 TEXT CHECK (
+                status_message_sha256 IS NULL OR length(status_message_sha256) = 64
+              ),
+              result_ref TEXT,
+              result_sha256 TEXT CHECK (
+                result_sha256 IS NULL OR length(result_sha256) = 64
+              ),
+              metadata_json TEXT NOT NULL,
+              created_at TEXT COLLATE BINARY NOT NULL,
+              updated_at TEXT COLLATE BINARY NOT NULL,
+              CHECK (status <> 'input_required' OR human_request_id IS NOT NULL),
+              CHECK ((result_ref IS NULL) = (result_sha256 IS NULL)),
+              FOREIGN KEY(human_request_id) REFERENCES human_requests(request_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_mcp_remote_tasks_created
+              ON mcp_remote_tasks(created_at COLLATE BINARY, task_ref COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_mcp_remote_tasks_owner_status
+              ON mcp_remote_tasks(owner_id COLLATE BINARY, status, created_at COLLATE BINARY, task_ref COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_mcp_remote_tasks_server_generation
+              ON mcp_remote_tasks(server_id COLLATE BINARY, server_generation, status, created_at COLLATE BINARY, task_ref COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_mcp_remote_tasks_expiry
+              ON mcp_remote_tasks(expires_at COLLATE BINARY, task_ref COLLATE BINARY);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_remote_tasks_remote_id
+              ON mcp_remote_tasks(server_id COLLATE BINARY, remote_id_sha256);
+
+            CREATE TABLE IF NOT EXISTS mcp_subscriptions (
+              subscription_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+              server_id TEXT COLLATE BINARY NOT NULL,
+              server_spec_sha256 TEXT NOT NULL CHECK (length(server_spec_sha256) = 64),
+              server_generation BIGINT NOT NULL CHECK (server_generation >= 0),
+              owner_id TEXT COLLATE BINARY NOT NULL,
+              auth_principal_sha256 TEXT NOT NULL CHECK (length(auth_principal_sha256) = 64),
+              auth_scope_sha256 TEXT NOT NULL CHECK (length(auth_scope_sha256) = 64),
+              requested_filter_sha256 TEXT NOT NULL CHECK (length(requested_filter_sha256) = 64),
+              acknowledged_filter_sha256 TEXT CHECK (
+                acknowledged_filter_sha256 IS NULL OR length(acknowledged_filter_sha256) = 64
+              ),
+              status TEXT NOT NULL CHECK (status IN (
+                'starting', 'active', 'stopping', 'stopped', 'lost',
+                'needs_attention'
+              )),
+              queue_limit BIGINT NOT NULL CHECK (queue_limit > 0),
+              event_max_bytes BIGINT NOT NULL CHECK (event_max_bytes > 0),
+              received_count BIGINT NOT NULL DEFAULT 0 CHECK (received_count >= 0),
+              dropped_count BIGINT NOT NULL DEFAULT 0 CHECK (dropped_count >= 0),
+              revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0),
+              last_event_at TEXT COLLATE BINARY,
+              metadata_json TEXT NOT NULL,
+              created_at TEXT COLLATE BINARY NOT NULL,
+              updated_at TEXT COLLATE BINARY NOT NULL,
+              CHECK (dropped_count <= received_count)
+            );
+            CREATE INDEX IF NOT EXISTS idx_mcp_subscriptions_created
+              ON mcp_subscriptions(created_at COLLATE BINARY, subscription_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_mcp_subscriptions_owner_status
+              ON mcp_subscriptions(owner_id COLLATE BINARY, status, created_at COLLATE BINARY, subscription_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_mcp_subscriptions_server_generation
+              ON mcp_subscriptions(server_id COLLATE BINARY, server_generation, status, created_at COLLATE BINARY, subscription_id COLLATE BINARY);
+
+            CREATE TABLE IF NOT EXISTS mcp_auth_metadata (
+              profile_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+              server_id TEXT COLLATE BINARY NOT NULL,
+              server_spec_sha256 TEXT NOT NULL CHECK (length(server_spec_sha256) = 64),
+              server_generation BIGINT NOT NULL CHECK (server_generation >= 0),
+              status TEXT NOT NULL CHECK (status IN (
+                'unconfigured', 'authorization_required', 'authorized',
+                'expired', 'revoked', 'needs_attention'
+              )),
+              issuer_sha256 TEXT CHECK (
+                issuer_sha256 IS NULL OR length(issuer_sha256) = 64
+              ),
+              resource_sha256 TEXT CHECK (
+                resource_sha256 IS NULL OR length(resource_sha256) = 64
+              ),
+              audience_sha256 TEXT CHECK (
+                audience_sha256 IS NULL OR length(audience_sha256) = 64
+              ),
+              scopes_sha256 TEXT NOT NULL CHECK (length(scopes_sha256) = 64),
+              principal_sha256 TEXT CHECK (
+                principal_sha256 IS NULL OR length(principal_sha256) = 64
+              ),
+              expires_at TEXT COLLATE BINARY,
+              credential_generation BIGINT NOT NULL DEFAULT 0 CHECK (credential_generation >= 0),
+              revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0),
+              metadata_json TEXT NOT NULL,
+              created_at TEXT COLLATE BINARY NOT NULL,
+              updated_at TEXT COLLATE BINARY NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mcp_auth_server_status
+              ON mcp_auth_metadata(server_id COLLATE BINARY, server_generation, status, profile_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_mcp_auth_expiry
+              ON mcp_auth_metadata(expires_at COLLATE BINARY, profile_id COLLATE BINARY);
+            """
+        )
+        SQLRuntimeStore._create_v7_mcp_side_effect_schema(self)
+
+    def _create_v7_mcp_side_effect_schema(self) -> None:
+        """Create durable ownership rows committed before external side effects."""
+
+        self._execute_script(
+            """
+            CREATE TABLE IF NOT EXISTS mcp_side_effect_preparations (
+              preparation_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+              operation_kind TEXT NOT NULL CHECK (operation_kind IN (
+                'continuation', 'remote_task'
+              )),
+              operation_id TEXT COLLATE BINARY NOT NULL,
+              operation_revision BIGINT CHECK (
+                operation_revision IS NULL OR operation_revision >= 0
+              ),
+              server_id TEXT COLLATE BINARY NOT NULL,
+              server_spec_sha256 TEXT NOT NULL CHECK (length(server_spec_sha256) = 64),
+              server_generation BIGINT NOT NULL CHECK (server_generation >= 0),
+              owner_id TEXT COLLATE BINARY NOT NULL,
+              auth_principal_sha256 TEXT NOT NULL CHECK (length(auth_principal_sha256) = 64),
+              auth_scope_sha256 TEXT NOT NULL CHECK (length(auth_scope_sha256) = 64),
+              human_request_id TEXT UNIQUE,
+              human_preview_sha256 TEXT CHECK (
+                human_preview_sha256 IS NULL OR length(human_preview_sha256) = 64
+              ),
+              broker_ref TEXT UNIQUE,
+              broker_value_sha256 TEXT CHECK (
+                broker_value_sha256 IS NULL OR length(broker_value_sha256) = 64
+              ),
+              result_ref TEXT UNIQUE,
+              result_sha256 TEXT CHECK (
+                result_sha256 IS NULL OR length(result_sha256) = 64
+              ),
+              status TEXT NOT NULL CHECK (status IN ('prepared', 'cleaning')),
+              revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0),
+              expires_at TEXT COLLATE BINARY NOT NULL,
+              metadata_json TEXT NOT NULL,
+              created_at TEXT COLLATE BINARY NOT NULL,
+              updated_at TEXT COLLATE BINARY NOT NULL,
+              UNIQUE(operation_kind, operation_id),
+              CHECK ((human_request_id IS NULL) = (human_preview_sha256 IS NULL)),
+              CHECK ((broker_ref IS NULL) = (broker_value_sha256 IS NULL)),
+              CHECK ((result_ref IS NULL) = (result_sha256 IS NULL)),
+              CHECK (
+                broker_ref IS NULL OR result_ref IS NULL OR broker_ref <> result_ref
+              )
+            );
+            CREATE INDEX IF NOT EXISTS idx_mcp_side_effect_preparations_owner_status
+              ON mcp_side_effect_preparations(
+                owner_id COLLATE BINARY, status, created_at COLLATE BINARY,
+                preparation_id COLLATE BINARY
+              );
+            CREATE INDEX IF NOT EXISTS idx_mcp_side_effect_preparations_expiry
+              ON mcp_side_effect_preparations(
+                expires_at COLLATE BINARY, preparation_id COLLATE BINARY
+              );
+            """
+        )
 
     def _create_v5_semantic_schema(self) -> None:
         """Create the schema-v5 advisory semantic evidence surfaces.
@@ -20486,6 +20871,10 @@ class SQLRuntimeStore:
             server,
         )
         with self.transaction() as cur:
+            self._fence_provider_registry_generation(
+                cur,
+                "mcp_registry_generation",
+            )
             cur.execute(
                 """
                 INSERT INTO mcp_servers (
@@ -20509,31 +20898,254 @@ class SQLRuntimeStore:
                 "mcp_registry_generation",
             )
 
+    def upsert_mcp_v3_server(
+        self,
+        server: Any,
+        *,
+        registered_by: str,
+        created_at: str,
+    ) -> None:
+        """Persist an exact Manifest-v3 server without reinterpreting v1/v2."""
+
+        from agent_libos.mcp.manifest import (
+            McpServerManifestV3,
+            canonical_mcp_v3_manifest_json,
+        )
+
+        if not isinstance(server, McpServerManifestV3):
+            raise ValidationError("MCP v3 registry write requires a typed Manifest v3")
+        spec_json = canonical_mcp_v3_manifest_json(server)
+        with self.transaction() as cur:
+            self._fence_provider_registry_generation(
+                cur,
+                "mcp_registry_generation",
+            )
+            cur.execute(
+                """
+                INSERT INTO mcp_servers (
+                    server_id, spec_json, registered_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(server_id) DO UPDATE SET
+                    spec_json = excluded.spec_json,
+                    registered_by = excluded.registered_by,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    server.server_id,
+                    spec_json,
+                    registered_by,
+                    created_at,
+                    created_at,
+                ),
+            )
+            self._advance_provider_registry_generation(
+                cur,
+                "mcp_registry_generation",
+            )
+
+    def compare_and_swap_mcp_v3_server(
+        self,
+        server: Any,
+        *,
+        expected_current_sha256: str | None,
+        registered_by: str,
+        created_at: str,
+    ) -> bool:
+        """Atomically replace one registry row only from an exact digest.
+
+        The registry-generation row is the write fence for *all* MCP registry
+        mutations.  A no-op update acquires the SQLite writer lease or the
+        PostgreSQL row lock before reading the current manifest, so a second
+        Runtime cannot pass a stale import-plan comparison.
+        """
+
+        from agent_libos.mcp.manifest import (
+            McpServerManifestV3,
+            canonical_mcp_v3_manifest_json,
+        )
+
+        if not isinstance(server, McpServerManifestV3):
+            raise ValidationError("MCP v3 registry CAS requires a typed Manifest v3")
+        if expected_current_sha256 is not None and (
+            type(expected_current_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", expected_current_sha256) is None
+        ):
+            raise ValidationError(
+                "MCP v3 registry expected_current_sha256 must be a lowercase SHA-256"
+            )
+        spec_json = canonical_mcp_v3_manifest_json(server)
+        with self.transaction() as cur:
+            self._fence_provider_registry_generation(
+                cur,
+                "mcp_registry_generation",
+            )
+            row = cur.execute(
+                "SELECT spec_json FROM mcp_servers WHERE server_id = ?",
+                (server.server_id,),
+            ).fetchone()
+            current_sha256 = (
+                None
+                if row is None
+                else hashlib.sha256(
+                    self._canonical_provider_registry_spec_json(
+                        "mcp",
+                        str(row["spec_json"]),
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+            if current_sha256 != expected_current_sha256:
+                return False
+            cur.execute(
+                """
+                INSERT INTO mcp_servers (
+                    server_id, spec_json, registered_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(server_id) DO UPDATE SET
+                    spec_json = excluded.spec_json,
+                    registered_by = excluded.registered_by,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    server.server_id,
+                    spec_json,
+                    registered_by,
+                    created_at,
+                    created_at,
+                ),
+            )
+            self._advance_provider_registry_generation(
+                cur,
+                "mcp_registry_generation",
+            )
+            return True
+
     def get_mcp_server(self, server_id: str) -> tuple[McpServerSpec, dict[str, Any]] | None:
         rows = self._query("SELECT * FROM mcp_servers WHERE server_id = ?", (server_id,))
         if not rows:
             return None
         row = rows[0]
-        return self._dict_to_mcp_server(loads(row["spec_json"], {})), self._mcp_server_row_metadata(row)
+        payload = loads(row["spec_json"], {})
+        if isinstance(payload, dict) and payload.get("schema_version") == 3:
+            return None
+        return self._dict_to_mcp_server(payload), self._mcp_server_row_metadata(row)
+
+    def get_mcp_v3_server(self, server_id: str) -> tuple[Any, dict[str, Any]] | None:
+        rows = self._query("SELECT * FROM mcp_servers WHERE server_id = ?", (server_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        payload = loads(row["spec_json"], {})
+        if not isinstance(payload, dict) or payload.get("schema_version") != 3:
+            return None
+        manifest = self._decode_mcp_v3_registry_spec(str(row["spec_json"]))
+        return manifest, self._mcp_server_row_metadata(row)
+
+    def get_mcp_server_manifest(self, server_id: str) -> tuple[Any, dict[str, Any]] | None:
+        """Return a typed v1/v2/v3 registry union for modern Host callers."""
+
+        rows = self._query("SELECT * FROM mcp_servers WHERE server_id = ?", (server_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        payload = loads(row["spec_json"], {})
+        if isinstance(payload, dict) and payload.get("schema_version") == 3:
+            selected = self._decode_mcp_v3_registry_spec(str(row["spec_json"]))
+        else:
+            selected = self._dict_to_mcp_server(payload)
+        return selected, self._mcp_server_row_metadata(row)
 
     def list_mcp_servers(self, text: str | None = None, limit: int | None = None) -> list[tuple[McpServerSpec, dict[str, Any]]]:
+        selected: list[tuple[McpServerSpec, dict[str, Any]]] = []
+        for row in self._mcp_registry_rows(text=text, limit=limit):
+            payload = loads(row["spec_json"], {})
+            if isinstance(payload, dict) and payload.get("schema_version") == 3:
+                continue
+            selected.append(
+                (
+                    self._dict_to_mcp_server(payload),
+                    self._mcp_server_row_metadata(row),
+                )
+            )
+        return selected
+
+    def list_mcp_v3_servers(
+        self,
+        text: str | None = None,
+        limit: int | None = None,
+    ) -> list[tuple[Any, dict[str, Any]]]:
+        rows = self._mcp_registry_rows(text=text, limit=limit)
+        selected: list[tuple[Any, dict[str, Any]]] = []
+        for row in rows:
+            payload = loads(row["spec_json"], {})
+            if not isinstance(payload, dict) or payload.get("schema_version") != 3:
+                continue
+            selected.append(
+                (
+                    self._decode_mcp_v3_registry_spec(str(row["spec_json"])),
+                    self._mcp_server_row_metadata(row),
+                )
+            )
+        return selected
+
+    def list_mcp_server_manifests(
+        self,
+        text: str | None = None,
+        limit: int | None = None,
+    ) -> list[tuple[Any, dict[str, Any]]]:
+        rows = self._mcp_registry_rows(text=text, limit=limit)
+        selected: list[tuple[Any, dict[str, Any]]] = []
+        for row in rows:
+            payload = loads(row["spec_json"], {})
+            if isinstance(payload, dict) and payload.get("schema_version") == 3:
+                manifest = self._decode_mcp_v3_registry_spec(str(row["spec_json"]))
+            else:
+                manifest = self._dict_to_mcp_server(payload)
+            selected.append((manifest, self._mcp_server_row_metadata(row)))
+        return selected
+
+    def _mcp_registry_rows(
+        self,
+        *,
+        text: str | None,
+        limit: int | None,
+    ) -> list[Any]:
         params: list[Any] = []
         sql = "SELECT * FROM mcp_servers"
         if text:
-            needle = f"%{text.lower()}%"
-            sql += " WHERE lower(server_id) LIKE ? OR lower(spec_json) LIKE ?"
-            params.extend([needle, needle])
+            needle = (
+                text.lower().replace("+", "++").replace("%", "+%").replace("_", "+_")
+            )
+            sql += " WHERE lower(server_id) LIKE ? ESCAPE '+'"
+            params.append(f"%{needle}%")
         sql += " ORDER BY server_id"
         if limit is not None:
+            if type(limit) is not int or limit < 0:
+                raise ValidationError("MCP registry limit must be non-negative")
             sql += " LIMIT ?"
             params.append(limit)
-        return [
-            (self._dict_to_mcp_server(loads(row["spec_json"], {})), self._mcp_server_row_metadata(row))
-            for row in self._query(sql, params)
-        ]
+        return self._query(sql, params)
+
+    @staticmethod
+    def _decode_mcp_v3_registry_spec(spec_json: str) -> Any:
+        from agent_libos.mcp.manifest import (
+            canonical_mcp_v3_manifest_json,
+            parse_mcp_v3_manifest_mapping,
+        )
+
+        payload = loads(spec_json, {})
+        if not isinstance(payload, dict) or payload.get("schema_version") != 3:
+            raise ValidationError("persisted MCP registry row is not Manifest v3")
+        manifest = parse_mcp_v3_manifest_mapping(payload)
+        if canonical_mcp_v3_manifest_json(manifest) != spec_json:
+            raise ValidationError("persisted MCP Manifest v3 is not canonical")
+        return manifest
 
     def delete_mcp_server(self, server_id: str) -> None:
         with self.transaction() as cur:
+            self._fence_provider_registry_generation(
+                cur,
+                "mcp_registry_generation",
+            )
             deleted = cur.execute(
                 "DELETE FROM mcp_servers WHERE server_id = ?",
                 (server_id,),
@@ -20552,6 +21164,17 @@ class SQLRuntimeStore:
             counter_name="mcp_registry_generation",
             registry="mcp",
         )
+
+    @staticmethod
+    def _fence_provider_registry_generation(cur: Any, counter_name: str) -> None:
+        fenced = cur.execute(
+            "UPDATE runtime_counters SET value = value WHERE counter_name = ?",
+            (counter_name,),
+        )
+        if fenced.rowcount != 1:
+            raise ValidationError(
+                f"provider registry generation counter is missing: {counter_name}"
+            )
 
     @staticmethod
     def _advance_provider_registry_generation(cur: Any, counter_name: str) -> int:
@@ -20629,7 +21252,7 @@ class SQLRuntimeStore:
     def _canonical_provider_registry_spec_json(
         self,
         registry: str,
-        value: JsonRpcEndpointSpec | McpServerSpec | str,
+        value: JsonRpcEndpointSpec | McpServerSpec | Any | str,
     ) -> str:
         """Return the one durable/hash representation for provider specs.
 
@@ -20653,6 +21276,15 @@ class SQLRuntimeStore:
                     "MCP manifest v2 requires an explicit protocol_mode"
                 )
             payload = mcp_server_spec_to_jsonable(value)
+        elif registry == "mcp":
+            from agent_libos.mcp.manifest import (
+                McpServerManifestV3,
+                canonical_mcp_v3_manifest_json,
+            )
+
+            if isinstance(value, McpServerManifestV3):
+                return canonical_mcp_v3_manifest_json(value)
+            payload = loads(value) if isinstance(value, str) else loads(dumps(value))
         else:
             payload = loads(value) if isinstance(value, str) else loads(dumps(value))
         if not isinstance(payload, dict):
@@ -20660,6 +21292,20 @@ class SQLRuntimeStore:
         if registry == "jsonrpc":
             return dumps(self._dict_to_jsonrpc_endpoint(payload))
         if registry == "mcp":
+            if payload.get("schema_version") == 3:
+                from agent_libos.mcp.manifest import (
+                    canonical_mcp_v3_manifest_json,
+                    parse_mcp_v3_manifest_mapping,
+                )
+
+                canonical = canonical_mcp_v3_manifest_json(
+                    parse_mcp_v3_manifest_mapping(payload)
+                )
+                if isinstance(value, str) and value != canonical:
+                    raise ValidationError(
+                        "persisted MCP Manifest v3 is not canonical"
+                    )
+                return canonical
             return canonical_mcp_server_spec_json(
                 self._dict_to_mcp_server(payload)
             )
@@ -22396,6 +23042,2039 @@ class SQLRuntimeStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    # Store schema-v7 MCP state.  These methods persist only digests, local
+    # identifiers, opaque broker references, and closed diagnostic metadata.
+    # They intentionally have no raw provider-content or OAuth-secret input.
+
+    @staticmethod
+    def _mcp_v7_limit(limit: int) -> int:
+        if type(limit) is not int or not 1 <= limit <= MCP_V7_QUERY_HARD_LIMIT:
+            raise ValidationError(
+                "MCP v7 query limit must be an exact integer between 1 and "
+                f"{MCP_V7_QUERY_HARD_LIMIT}"
+            )
+        return limit
+
+    @staticmethod
+    def _mcp_v7_filter_text(value: str | None, label: str) -> str | None:
+        if value is None:
+            return None
+        if (
+            type(value) is not str
+            or not value
+            or len(value) > 512
+            or value != value.strip()
+            or "\x00" in value
+        ):
+            raise ValidationError(f"{label} must be bounded canonical text")
+        return value
+
+    def insert_mcp_continuation(
+        self,
+        record: McpContinuationRecord,
+        *,
+        _preparation_id: str | None = None,
+    ) -> McpContinuationRecord:
+        if not isinstance(record, McpContinuationRecord):
+            raise ValidationError("MCP continuation insert requires a typed record")
+        if record.revision != 0:
+            raise ValidationError("initial MCP continuation revision must be zero")
+        with self._join_or_begin_transaction() as cursor:
+            self._fence_mcp_human_bindings(cursor)
+            self._require_mcp_preparation_slot_owner(
+                cursor,
+                operation_kind="continuation",
+                operation_id=record.continuation_id,
+                human_request_id=record.human_request_id,
+                broker_ref=record.broker_ref,
+                result_ref=None,
+                preparation_id=_preparation_id,
+            )
+            self._require_mcp_human_request_binding_available(
+                cursor,
+                human_request_id=record.human_request_id,
+                other_table="mcp_remote_tasks",
+            )
+            changed = cursor.execute(
+                "INSERT INTO mcp_continuations ("
+                "continuation_id, server_id, server_spec_sha256, server_generation, "
+                "owner_id, auth_principal_sha256, auth_scope_sha256, request_sha256, "
+                "effect_id, capability_sha256, data_flow_sha256, human_request_id, "
+                "broker_ref, broker_value_sha256, status, revision, expires_at, "
+                "metadata_json, created_at, updated_at) VALUES ("
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
+                self._mcp_continuation_values(record),
+            ).rowcount
+            if changed == 1:
+                return record
+            row = cursor.execute(
+                "SELECT * FROM mcp_continuations WHERE continuation_id = ?",
+                (record.continuation_id,),
+            ).fetchone()
+            if row is not None and self._row_to_mcp_continuation(row) == record:
+                return record
+            raise ValidationError("MCP continuation identity conflicts with durable state")
+
+    def get_mcp_continuation(
+        self,
+        continuation_id: str,
+    ) -> McpContinuationRecord | None:
+        selected = self._mcp_v7_filter_text(
+            continuation_id, "MCP continuation id"
+        )
+        rows = self._query(
+            "SELECT * FROM mcp_continuations WHERE continuation_id = ?",
+            (selected,),
+        )
+        return self._row_to_mcp_continuation(rows[0]) if rows else None
+
+    def list_mcp_continuations(
+        self,
+        *,
+        owner_id: str | None = None,
+        server_id: str | None = None,
+        server_generation: int | None = None,
+        status: str | None = None,
+        expired_before: str | None = None,
+        limit: int = 100,
+    ) -> tuple[McpContinuationRecord, ...]:
+        return tuple(
+            self._row_to_mcp_continuation(row)
+            for row in self._query_mcp_v7_rows(
+                table="mcp_continuations",
+                id_column="continuation_id",
+                owner_id=owner_id,
+                server_id=server_id,
+                server_generation=server_generation,
+                status=status,
+                expired_before=expired_before,
+                limit=limit,
+            )
+        )
+
+    def count_active_mcp_continuations(
+        self,
+        *,
+        owner_id: str | None = None,
+    ) -> int:
+        return self._count_active_mcp_operation_rows(
+            table="mcp_continuations",
+            owner_id=owner_id,
+            terminal_statuses=(
+                "complete", "cancelled", "expired", "needs_attention",
+            ),
+        )
+
+    def list_terminal_mcp_continuations(
+        self,
+        *,
+        owner_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[McpContinuationRecord, ...]:
+        return tuple(
+            self._row_to_mcp_continuation(row)
+            for row in self._list_terminal_mcp_operation_rows(
+                table="mcp_continuations",
+                id_column="continuation_id",
+                owner_id=owner_id,
+                terminal_statuses=(
+                    "complete", "cancelled", "expired", "needs_attention",
+                ),
+                limit=limit,
+            )
+        )
+
+    def delete_terminal_mcp_continuation(
+        self,
+        continuation_id: str,
+        *,
+        expected_revision: int,
+    ) -> bool:
+        return self._delete_terminal_mcp_operation_row(
+            table="mcp_continuations",
+            id_column="continuation_id",
+            operation_kind="continuation",
+            operation_id=continuation_id,
+            expected_revision=expected_revision,
+            terminal_statuses=(
+                "complete", "cancelled", "expired", "needs_attention",
+            ),
+        )
+
+    def compare_and_swap_mcp_continuation(
+        self,
+        continuation_id: str,
+        *,
+        expected_revision: int,
+        replacement: McpContinuationRecord,
+        _preparation_id: str | None = None,
+    ) -> bool:
+        if not isinstance(replacement, McpContinuationRecord):
+            raise ValidationError("MCP continuation CAS requires a typed replacement")
+        self._mcp_v7_filter_text(continuation_id, "MCP continuation id")
+        self._validate_mcp_v7_expected_revision(expected_revision, replacement.revision)
+        with self._join_or_begin_transaction() as cursor:
+            self._fence_mcp_human_bindings(cursor)
+            self._require_mcp_preparation_slot_owner(
+                cursor,
+                operation_kind="continuation",
+                operation_id=continuation_id,
+                human_request_id=replacement.human_request_id,
+                broker_ref=replacement.broker_ref,
+                result_ref=None,
+                preparation_id=_preparation_id,
+            )
+            self._require_mcp_human_request_binding_available(
+                cursor,
+                human_request_id=replacement.human_request_id,
+                other_table="mcp_remote_tasks",
+            )
+            row = cursor.execute(
+                "SELECT * FROM mcp_continuations WHERE continuation_id = ?",
+                (continuation_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            current = self._row_to_mcp_continuation(row)
+            if current.revision != expected_revision:
+                return False
+            self._require_mcp_continuation_transition(current, replacement)
+            changed = cursor.execute(
+                "UPDATE mcp_continuations SET human_request_id = ?, broker_ref = ?, "
+                "broker_value_sha256 = ?, status = ?, revision = ?, expires_at = ?, "
+                "metadata_json = ?, updated_at = ? WHERE continuation_id = ? "
+                "AND revision = ? AND server_id = ? AND server_spec_sha256 = ? "
+                "AND server_generation = ? AND owner_id = ? "
+                "AND auth_principal_sha256 = ? AND auth_scope_sha256 = ? "
+                "AND request_sha256 = ? AND effect_id = ? AND capability_sha256 = ? "
+                "AND data_flow_sha256 = ? AND human_request_id = ?",
+                (
+                    replacement.human_request_id,
+                    replacement.broker_ref,
+                    replacement.broker_value_sha256,
+                    replacement.status,
+                    replacement.revision,
+                    replacement.expires_at,
+                    canonical_mcp_v7_metadata_json(replacement.metadata),
+                    replacement.updated_at,
+                    continuation_id,
+                    expected_revision,
+                    current.server_id,
+                    current.server_spec_sha256,
+                    current.server_generation,
+                    current.owner_id,
+                    current.auth_principal_sha256,
+                    current.auth_scope_sha256,
+                    current.request_sha256,
+                    current.effect_id,
+                    current.capability_sha256,
+                    current.data_flow_sha256,
+                    current.human_request_id,
+                ),
+            ).rowcount
+            return changed == 1
+
+    @staticmethod
+    def _mcp_continuation_values(record: McpContinuationRecord) -> tuple[Any, ...]:
+        return (
+            record.continuation_id,
+            record.server_id,
+            record.server_spec_sha256,
+            record.server_generation,
+            record.owner_id,
+            record.auth_principal_sha256,
+            record.auth_scope_sha256,
+            record.request_sha256,
+            record.effect_id,
+            record.capability_sha256,
+            record.data_flow_sha256,
+            record.human_request_id,
+            record.broker_ref,
+            record.broker_value_sha256,
+            record.status,
+            record.revision,
+            record.expires_at,
+            canonical_mcp_v7_metadata_json(record.metadata),
+            record.created_at,
+            record.updated_at,
+        )
+
+    @staticmethod
+    def _require_mcp_continuation_transition(
+        current: McpContinuationRecord,
+        target: McpContinuationRecord,
+    ) -> None:
+        immutable = (
+            "continuation_id", "server_id", "server_spec_sha256",
+            "server_generation", "owner_id", "auth_principal_sha256",
+            "auth_scope_sha256", "request_sha256", "effect_id",
+            "capability_sha256", "data_flow_sha256", "expires_at", "created_at",
+        )
+        SQLRuntimeStore._require_mcp_v7_identity(current, target, immutable)
+        allowed = {
+            "input_required": {
+                "input_required", "dispatching", "cancelled", "expired",
+                "needs_attention",
+            },
+            "dispatching": {
+                "input_required", "complete", "cancelled", "expired",
+                "needs_attention",
+            },
+            "needs_attention": {"needs_attention", "dispatching", "cancelled", "expired"},
+            "complete": set(),
+            "cancelled": set(),
+            "expired": set(),
+        }
+        if target.status not in allowed[current.status]:
+            raise ValidationError("MCP continuation transition is invalid")
+        if (
+            target.human_request_id != current.human_request_id
+            and not (
+                current.status == "dispatching"
+                and target.status == "input_required"
+            )
+        ):
+            raise ValidationError(
+                "MCP continuation Human request may change only for a new input round"
+            )
+
+    def insert_mcp_remote_task(
+        self,
+        record: McpRemoteTaskRecord,
+        *,
+        _preparation_id: str | None = None,
+    ) -> McpRemoteTaskRecord:
+        if not isinstance(record, McpRemoteTaskRecord):
+            raise ValidationError("MCP remote task insert requires a typed record")
+        if record.revision != 0:
+            raise ValidationError("initial MCP remote task revision must be zero")
+        with self._join_or_begin_transaction() as cursor:
+            self._fence_mcp_human_bindings(cursor)
+            self._require_mcp_preparation_slot_owner(
+                cursor,
+                operation_kind="remote_task",
+                operation_id=record.task_ref,
+                human_request_id=record.human_request_id,
+                broker_ref=record.broker_ref,
+                result_ref=record.result_ref,
+                preparation_id=_preparation_id,
+            )
+            if record.human_request_id is not None:
+                self._require_mcp_human_request_binding_available(
+                    cursor,
+                    human_request_id=record.human_request_id,
+                    other_table="mcp_continuations",
+                )
+            changed = cursor.execute(
+                "INSERT INTO mcp_remote_tasks ("
+                "task_ref, server_id, server_spec_sha256, server_generation, "
+                "owner_id, auth_principal_sha256, auth_scope_sha256, "
+                "origin_request_sha256, origin_effect_id, human_request_id, broker_ref, "
+                "remote_id_sha256, status, revision, expires_at, poll_interval_ms, "
+                "status_message_sha256, result_ref, result_sha256, metadata_json, "
+                "created_at, updated_at) VALUES ("
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
+                self._mcp_remote_task_values(record),
+            ).rowcount
+            if changed == 1:
+                return record
+            row = cursor.execute(
+                "SELECT * FROM mcp_remote_tasks WHERE task_ref = ?", (record.task_ref,)
+            ).fetchone()
+            if row is not None and self._row_to_mcp_remote_task(row) == record:
+                return record
+            raise ValidationError("MCP remote task identity conflicts with durable state")
+
+    def get_mcp_remote_task(self, task_ref: str) -> McpRemoteTaskRecord | None:
+        selected = self._mcp_v7_filter_text(task_ref, "MCP remote task ref")
+        rows = self._query(
+            "SELECT * FROM mcp_remote_tasks WHERE task_ref = ?", (selected,)
+        )
+        return self._row_to_mcp_remote_task(rows[0]) if rows else None
+
+    def get_mcp_remote_task_by_remote_id_sha256(
+        self,
+        server_id: str,
+        remote_id_sha256: str,
+    ) -> McpRemoteTaskRecord | None:
+        selected_server = self._mcp_v7_filter_text(server_id, "MCP server id")
+        from agent_libos.storage.mcp_v7 import _sha256 as _mcp_v7_sha256
+
+        selected_digest = _mcp_v7_sha256(
+            remote_id_sha256,
+            "MCP remote task remote id",
+        )
+        rows = self._query(
+            "SELECT * FROM mcp_remote_tasks WHERE server_id = ? "
+            "AND remote_id_sha256 = ?",
+            (selected_server, selected_digest),
+        )
+        if len(rows) > 1:
+            raise ValidationError("MCP remote task remote id binding is ambiguous")
+        return self._row_to_mcp_remote_task(rows[0]) if rows else None
+
+    def list_mcp_remote_tasks(
+        self,
+        *,
+        owner_id: str | None = None,
+        server_id: str | None = None,
+        server_generation: int | None = None,
+        status: str | None = None,
+        expired_before: str | None = None,
+        limit: int = 100,
+    ) -> tuple[McpRemoteTaskRecord, ...]:
+        return tuple(
+            self._row_to_mcp_remote_task(row)
+            for row in self._query_mcp_v7_rows(
+                table="mcp_remote_tasks",
+                id_column="task_ref",
+                owner_id=owner_id,
+                server_id=server_id,
+                server_generation=server_generation,
+                status=status,
+                expired_before=expired_before,
+                limit=limit,
+            )
+        )
+
+    def count_mcp_remote_tasks(self, *, owner_id: str | None = None) -> int:
+        params: tuple[Any, ...] = ()
+        sql = "SELECT COUNT(*) AS total FROM mcp_remote_tasks"
+        if owner_id is not None:
+            selected_owner = self._mcp_v7_filter_text(owner_id, "MCP owner id")
+            sql += " WHERE owner_id = ?"
+            params = (selected_owner,)
+        rows = self._query(sql, params)
+        if len(rows) != 1:
+            raise ValidationError("MCP remote task count is unavailable")
+        total = rows[0]["total"]
+        if type(total) is not int or total < 0:
+            raise ValidationError("persisted MCP remote task count is invalid")
+        return total
+
+    def count_active_mcp_remote_tasks(
+        self,
+        *,
+        owner_id: str | None = None,
+    ) -> int:
+        return self._count_active_mcp_operation_rows(
+            table="mcp_remote_tasks",
+            owner_id=owner_id,
+            terminal_statuses=(
+                "completed", "failed", "cancelled", "needs_attention",
+            ),
+        )
+
+    def list_terminal_mcp_remote_tasks(
+        self,
+        *,
+        owner_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[McpRemoteTaskRecord, ...]:
+        return tuple(
+            self._row_to_mcp_remote_task(row)
+            for row in self._list_terminal_mcp_operation_rows(
+                table="mcp_remote_tasks",
+                id_column="task_ref",
+                owner_id=owner_id,
+                terminal_statuses=(
+                    "completed", "failed", "cancelled", "needs_attention",
+                ),
+                limit=limit,
+            )
+        )
+
+    def delete_terminal_mcp_remote_task(
+        self,
+        task_ref: str,
+        *,
+        expected_revision: int,
+    ) -> bool:
+        return self._delete_terminal_mcp_operation_row(
+            table="mcp_remote_tasks",
+            id_column="task_ref",
+            operation_kind="remote_task",
+            operation_id=task_ref,
+            expected_revision=expected_revision,
+            terminal_statuses=(
+                "completed", "failed", "cancelled", "needs_attention",
+            ),
+        )
+
+    def compare_and_swap_mcp_remote_task(
+        self,
+        task_ref: str,
+        *,
+        expected_revision: int,
+        replacement: McpRemoteTaskRecord,
+        _preparation_id: str | None = None,
+    ) -> bool:
+        if not isinstance(replacement, McpRemoteTaskRecord):
+            raise ValidationError("MCP remote task CAS requires a typed replacement")
+        self._mcp_v7_filter_text(task_ref, "MCP remote task ref")
+        self._validate_mcp_v7_expected_revision(expected_revision, replacement.revision)
+        with self._join_or_begin_transaction() as cursor:
+            self._fence_mcp_human_bindings(cursor)
+            self._require_mcp_preparation_slot_owner(
+                cursor,
+                operation_kind="remote_task",
+                operation_id=task_ref,
+                human_request_id=replacement.human_request_id,
+                broker_ref=replacement.broker_ref,
+                result_ref=replacement.result_ref,
+                preparation_id=_preparation_id,
+            )
+            if replacement.human_request_id is not None:
+                self._require_mcp_human_request_binding_available(
+                    cursor,
+                    human_request_id=replacement.human_request_id,
+                    other_table="mcp_continuations",
+                )
+            row = cursor.execute(
+                "SELECT * FROM mcp_remote_tasks WHERE task_ref = ?", (task_ref,)
+            ).fetchone()
+            if row is None:
+                return False
+            current = self._row_to_mcp_remote_task(row)
+            if current.revision != expected_revision:
+                return False
+            self._require_mcp_remote_task_transition(current, replacement)
+            changed = cursor.execute(
+                "UPDATE mcp_remote_tasks SET human_request_id = ?, broker_ref = ?, "
+                "status = ?, revision = ?, "
+                "expires_at = ?, poll_interval_ms = ?, status_message_sha256 = ?, "
+                "result_ref = ?, result_sha256 = ?, metadata_json = ?, updated_at = ? "
+                "WHERE task_ref = ? AND revision = ? AND server_id = ? "
+                "AND server_spec_sha256 = ? AND server_generation = ? "
+                "AND owner_id = ? AND auth_principal_sha256 = ? "
+                "AND auth_scope_sha256 = ? AND origin_request_sha256 = ? "
+                "AND origin_effect_id = ? AND remote_id_sha256 = ?",
+                (
+                    replacement.human_request_id,
+                    replacement.broker_ref,
+                    replacement.status,
+                    replacement.revision,
+                    replacement.expires_at,
+                    replacement.poll_interval_ms,
+                    replacement.status_message_sha256,
+                    replacement.result_ref,
+                    replacement.result_sha256,
+                    canonical_mcp_v7_metadata_json(replacement.metadata),
+                    replacement.updated_at,
+                    task_ref,
+                    expected_revision,
+                    current.server_id,
+                    current.server_spec_sha256,
+                    current.server_generation,
+                    current.owner_id,
+                    current.auth_principal_sha256,
+                    current.auth_scope_sha256,
+                    current.origin_request_sha256,
+                    current.origin_effect_id,
+                    current.remote_id_sha256,
+                ),
+            ).rowcount
+            return changed == 1
+
+    @staticmethod
+    def _mcp_remote_task_values(record: McpRemoteTaskRecord) -> tuple[Any, ...]:
+        return (
+            record.task_ref, record.server_id, record.server_spec_sha256,
+            record.server_generation, record.owner_id,
+            record.auth_principal_sha256, record.auth_scope_sha256,
+            record.origin_request_sha256, record.origin_effect_id,
+            record.human_request_id, record.broker_ref,
+            record.remote_id_sha256, record.status,
+            record.revision, record.expires_at, record.poll_interval_ms,
+            record.status_message_sha256, record.result_ref, record.result_sha256,
+            canonical_mcp_v7_metadata_json(record.metadata), record.created_at,
+            record.updated_at,
+        )
+
+    @staticmethod
+    def _fence_mcp_human_bindings(cursor: Any) -> None:
+        # SQLite's no-op write acquires its writer lease; PostgreSQL acquires a
+        # row lock.  Reusing the always-present MCP generation row gives both
+        # continuation and task writers one lock order without advancing the
+        # public registry generation.
+        SQLRuntimeStore._fence_provider_registry_generation(
+            cursor,
+            "mcp_registry_generation",
+        )
+
+    @staticmethod
+    def _require_mcp_human_request_binding_available(
+        cursor: Any,
+        *,
+        human_request_id: str,
+        other_table: str,
+    ) -> None:
+        if other_table not in {"mcp_continuations", "mcp_remote_tasks"}:
+            raise ValidationError("invalid MCP Human binding table")
+        human = cursor.execute(
+            "SELECT 1 AS present FROM human_requests WHERE request_id = ? LIMIT 1",
+            (human_request_id,),
+        ).fetchone()
+        if human is None:
+            raise ValidationError(
+                "MCP Human request binding does not reference durable state"
+            )
+        row = cursor.execute(
+            f"SELECT 1 AS present FROM {other_table} "
+            "WHERE human_request_id = ? LIMIT 1",
+            (human_request_id,),
+        ).fetchone()
+        if row is not None:
+            raise ValidationError(
+                "MCP Human request is already bound to another durable operation"
+            )
+
+    @staticmethod
+    def _require_mcp_preparation_slot_owner(
+        cursor: Any,
+        *,
+        operation_kind: str,
+        operation_id: str,
+        human_request_id: str | None,
+        broker_ref: str | None,
+        result_ref: str | None,
+        preparation_id: str | None,
+    ) -> None:
+        if operation_kind not in {"continuation", "remote_task"}:
+            raise ValidationError("MCP side-effect operation kind is invalid")
+        if preparation_id is not None:
+            SQLRuntimeStore._mcp_v7_filter_text(
+                preparation_id,
+                "MCP side-effect preparation id",
+            )
+        owners: set[str] = set()
+        operation_owner = cursor.execute(
+            "SELECT preparation_id FROM mcp_side_effect_preparations "
+            "WHERE operation_kind = ? AND operation_id = ? LIMIT 1",
+            (operation_kind, operation_id),
+        ).fetchone()
+        if operation_owner is not None:
+            owners.add(str(operation_owner["preparation_id"]))
+        if human_request_id is not None:
+            owner = cursor.execute(
+                "SELECT preparation_id FROM mcp_side_effect_preparations "
+                "WHERE human_request_id = ? LIMIT 1",
+                (human_request_id,),
+            ).fetchone()
+            if owner is not None:
+                owners.add(str(owner["preparation_id"]))
+        for reference in (broker_ref, result_ref):
+            if reference is None:
+                continue
+            owner = cursor.execute(
+                "SELECT preparation_id FROM mcp_side_effect_preparations "
+                "WHERE broker_ref = ? OR result_ref = ? LIMIT 1",
+                (reference, reference),
+            ).fetchone()
+            if owner is not None:
+                owners.add(str(owner["preparation_id"]))
+        if owners and owners != {preparation_id}:
+            raise ValidationError(
+                "MCP operation attempted to use a reserved side-effect slot"
+            )
+        for reference in {
+            value for value in (broker_ref, result_ref) if value is not None
+        }:
+            continuation_sql = (
+                "SELECT 1 AS present FROM mcp_continuations WHERE broker_ref = ? "
+                "AND continuation_id <> ? LIMIT 1"
+                if operation_kind == "continuation"
+                else "SELECT 1 AS present FROM mcp_continuations "
+                "WHERE broker_ref = ? LIMIT 1"
+            )
+            continuation_params = (
+                (reference, operation_id)
+                if operation_kind == "continuation"
+                else (reference,)
+            )
+            task_sql = (
+                "SELECT 1 AS present FROM mcp_remote_tasks "
+                "WHERE (broker_ref = ? OR result_ref = ?) AND task_ref <> ? LIMIT 1"
+                if operation_kind == "remote_task"
+                else "SELECT 1 AS present FROM mcp_remote_tasks "
+                "WHERE broker_ref = ? OR result_ref = ? LIMIT 1"
+            )
+            task_params = (
+                (reference, reference, operation_id)
+                if operation_kind == "remote_task"
+                else (reference, reference)
+            )
+            if (
+                cursor.execute(
+                    continuation_sql,
+                    continuation_params,
+                ).fetchone()
+                is not None
+                or cursor.execute(task_sql, task_params).fetchone() is not None
+            ):
+                raise ValidationError(
+                    "MCP credential-broker slot is already bound to another operation"
+                )
+
+    @staticmethod
+    def _require_mcp_remote_task_transition(
+        current: McpRemoteTaskRecord,
+        target: McpRemoteTaskRecord,
+    ) -> None:
+        immutable = (
+            "task_ref", "server_id", "server_spec_sha256", "server_generation",
+            "owner_id", "auth_principal_sha256", "auth_scope_sha256",
+            "origin_request_sha256", "origin_effect_id", "remote_id_sha256",
+            "created_at",
+        )
+        SQLRuntimeStore._require_mcp_v7_identity(current, target, immutable)
+        active = {
+            "working", "input_required", "cancel_requested", "update_dispatching",
+            "cancel_dispatching", "needs_attention", "completed", "failed",
+            "cancelled",
+        }
+        allowed = {
+            "working": active,
+            "input_required": active,
+            "cancel_requested": {
+                "cancel_requested", "cancel_dispatching", "working", "completed",
+                "failed", "cancelled", "needs_attention",
+            },
+            "update_dispatching": {
+                "working", "input_required", "completed", "failed", "cancelled",
+                "needs_attention",
+            },
+            "cancel_dispatching": {
+                "cancel_requested", "working", "completed", "failed", "cancelled",
+                "needs_attention",
+            },
+            "needs_attention": {
+                "needs_attention", "update_dispatching", "cancel_dispatching",
+                "cancel_requested",
+            },
+            "completed": set(),
+            "failed": set(),
+            "cancelled": set(),
+        }
+        if target.status not in allowed[current.status]:
+            raise ValidationError("MCP remote task transition is invalid")
+        if (
+            current.human_request_id is None
+            and target.human_request_id is not None
+            and target.status != "input_required"
+        ):
+            raise ValidationError(
+                "MCP remote task Human request may be introduced only by input_required"
+            )
+        if (
+            current.human_request_id is not None
+            and target.human_request_id not in {None, current.human_request_id}
+            and target.status != "input_required"
+        ):
+            raise ValidationError(
+                "MCP remote task Human request may change only for a new input round"
+            )
+
+    def insert_mcp_subscription(
+        self,
+        record: McpSubscriptionRecord,
+    ) -> McpSubscriptionRecord:
+        if not isinstance(record, McpSubscriptionRecord):
+            raise ValidationError("MCP subscription insert requires a typed record")
+        if record.revision != 0:
+            raise ValidationError("initial MCP subscription revision must be zero")
+        with self._join_or_begin_transaction() as cursor:
+            changed = cursor.execute(
+                "INSERT INTO mcp_subscriptions ("
+                "subscription_id, server_id, server_spec_sha256, server_generation, "
+                "owner_id, auth_principal_sha256, auth_scope_sha256, "
+                "requested_filter_sha256, acknowledged_filter_sha256, status, "
+                "queue_limit, event_max_bytes, received_count, dropped_count, "
+                "revision, last_event_at, metadata_json, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
+                self._mcp_subscription_values(record),
+            ).rowcount
+            if changed == 1:
+                return record
+            row = cursor.execute(
+                "SELECT * FROM mcp_subscriptions WHERE subscription_id = ?",
+                (record.subscription_id,),
+            ).fetchone()
+            if row is not None and self._row_to_mcp_subscription(row) == record:
+                return record
+            raise ValidationError("MCP subscription identity conflicts with durable state")
+
+    def get_mcp_subscription(
+        self, subscription_id: str
+    ) -> McpSubscriptionRecord | None:
+        selected = self._mcp_v7_filter_text(subscription_id, "MCP subscription id")
+        rows = self._query(
+            "SELECT * FROM mcp_subscriptions WHERE subscription_id = ?", (selected,)
+        )
+        return self._row_to_mcp_subscription(rows[0]) if rows else None
+
+    def list_mcp_subscriptions(
+        self,
+        *,
+        owner_id: str | None = None,
+        server_id: str | None = None,
+        server_generation: int | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> tuple[McpSubscriptionRecord, ...]:
+        return tuple(
+            self._row_to_mcp_subscription(row)
+            for row in self._query_mcp_v7_rows(
+                table="mcp_subscriptions",
+                id_column="subscription_id",
+                owner_id=owner_id,
+                server_id=server_id,
+                server_generation=server_generation,
+                status=status,
+                expired_before=None,
+                limit=limit,
+            )
+        )
+
+    def compare_and_swap_mcp_subscription(
+        self,
+        subscription_id: str,
+        *,
+        expected_revision: int,
+        replacement: McpSubscriptionRecord,
+    ) -> bool:
+        if not isinstance(replacement, McpSubscriptionRecord):
+            raise ValidationError("MCP subscription CAS requires a typed replacement")
+        self._mcp_v7_filter_text(subscription_id, "MCP subscription id")
+        self._validate_mcp_v7_expected_revision(expected_revision, replacement.revision)
+        with self._join_or_begin_transaction() as cursor:
+            row = cursor.execute(
+                "SELECT * FROM mcp_subscriptions WHERE subscription_id = ?",
+                (subscription_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            current = self._row_to_mcp_subscription(row)
+            if current.revision != expected_revision:
+                return False
+            self._require_mcp_subscription_transition(current, replacement)
+            changed = cursor.execute(
+                "UPDATE mcp_subscriptions SET acknowledged_filter_sha256 = ?, "
+                "status = ?, queue_limit = ?, event_max_bytes = ?, "
+                "received_count = ?, dropped_count = ?, revision = ?, "
+                "last_event_at = ?, metadata_json = ?, updated_at = ? "
+                "WHERE subscription_id = ? AND revision = ? AND server_id = ? "
+                "AND server_spec_sha256 = ? AND server_generation = ? "
+                "AND owner_id = ? AND auth_principal_sha256 = ? "
+                "AND auth_scope_sha256 = ? AND requested_filter_sha256 = ?",
+                (
+                    replacement.acknowledged_filter_sha256, replacement.status,
+                    replacement.queue_limit, replacement.event_max_bytes,
+                    replacement.received_count, replacement.dropped_count,
+                    replacement.revision, replacement.last_event_at,
+                    canonical_mcp_v7_metadata_json(replacement.metadata),
+                    replacement.updated_at, subscription_id, expected_revision,
+                    current.server_id, current.server_spec_sha256,
+                    current.server_generation, current.owner_id,
+                    current.auth_principal_sha256, current.auth_scope_sha256,
+                    current.requested_filter_sha256,
+                ),
+            ).rowcount
+            return changed == 1
+
+    @staticmethod
+    def _mcp_subscription_values(record: McpSubscriptionRecord) -> tuple[Any, ...]:
+        return (
+            record.subscription_id, record.server_id, record.server_spec_sha256,
+            record.server_generation, record.owner_id,
+            record.auth_principal_sha256, record.auth_scope_sha256,
+            record.requested_filter_sha256, record.acknowledged_filter_sha256,
+            record.status, record.queue_limit, record.event_max_bytes,
+            record.received_count, record.dropped_count, record.revision,
+            record.last_event_at, canonical_mcp_v7_metadata_json(record.metadata),
+            record.created_at, record.updated_at,
+        )
+
+    @staticmethod
+    def _require_mcp_subscription_transition(
+        current: McpSubscriptionRecord,
+        target: McpSubscriptionRecord,
+    ) -> None:
+        immutable = (
+            "subscription_id", "server_id", "server_spec_sha256",
+            "server_generation", "owner_id", "auth_principal_sha256",
+            "auth_scope_sha256", "requested_filter_sha256", "created_at",
+        )
+        SQLRuntimeStore._require_mcp_v7_identity(current, target, immutable)
+        allowed = {
+            "starting": {"starting", "active", "stopping", "stopped", "lost", "needs_attention"},
+            "active": {"active", "stopping", "stopped", "lost", "needs_attention"},
+            "stopping": {"stopping", "stopped", "lost", "needs_attention"},
+            "needs_attention": {"needs_attention", "stopping", "stopped", "lost"},
+            "stopped": set(),
+            "lost": set(),
+        }
+        if target.status not in allowed[current.status]:
+            raise ValidationError("MCP subscription transition is invalid")
+        if target.received_count < current.received_count or target.dropped_count < current.dropped_count:
+            raise ValidationError("MCP subscription counters cannot decrease")
+
+    def insert_mcp_auth_metadata(
+        self,
+        record: McpAuthMetadataRecord,
+    ) -> McpAuthMetadataRecord:
+        if not isinstance(record, McpAuthMetadataRecord):
+            raise ValidationError("MCP auth metadata insert requires a typed record")
+        if record.revision != 0:
+            raise ValidationError("initial MCP auth metadata revision must be zero")
+        with self._join_or_begin_transaction() as cursor:
+            changed = cursor.execute(
+                "INSERT INTO mcp_auth_metadata ("
+                "profile_id, server_id, server_spec_sha256, server_generation, "
+                "status, issuer_sha256, resource_sha256, audience_sha256, "
+                "scopes_sha256, principal_sha256, expires_at, credential_generation, "
+                "revision, metadata_json, created_at, updated_at) VALUES ("
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
+                self._mcp_auth_values(record),
+            ).rowcount
+            if changed == 1:
+                return record
+            row = cursor.execute(
+                "SELECT * FROM mcp_auth_metadata WHERE profile_id = ?",
+                (record.profile_id,),
+            ).fetchone()
+            if row is not None and self._row_to_mcp_auth_metadata(row) == record:
+                return record
+            raise ValidationError("MCP auth profile identity conflicts with durable state")
+
+    def get_mcp_auth_metadata(
+        self, profile_id: str
+    ) -> McpAuthMetadataRecord | None:
+        selected = self._mcp_v7_filter_text(profile_id, "MCP auth profile id")
+        rows = self._query(
+            "SELECT * FROM mcp_auth_metadata WHERE profile_id = ?", (selected,)
+        )
+        return self._row_to_mcp_auth_metadata(rows[0]) if rows else None
+
+    def list_mcp_auth_metadata(
+        self,
+        *,
+        server_id: str | None = None,
+        server_generation: int | None = None,
+        status: str | None = None,
+        expired_before: str | None = None,
+        limit: int = 100,
+    ) -> tuple[McpAuthMetadataRecord, ...]:
+        return tuple(
+            self._row_to_mcp_auth_metadata(row)
+            for row in self._query_mcp_v7_rows(
+                table="mcp_auth_metadata",
+                id_column="profile_id",
+                owner_id=None,
+                server_id=server_id,
+                server_generation=server_generation,
+                status=status,
+                expired_before=expired_before,
+                limit=limit,
+            )
+        )
+
+    def compare_and_swap_mcp_auth_metadata(
+        self,
+        profile_id: str,
+        *,
+        expected_revision: int,
+        replacement: McpAuthMetadataRecord,
+    ) -> bool:
+        if not isinstance(replacement, McpAuthMetadataRecord):
+            raise ValidationError("MCP auth metadata CAS requires a typed replacement")
+        self._mcp_v7_filter_text(profile_id, "MCP auth profile id")
+        self._validate_mcp_v7_expected_revision(expected_revision, replacement.revision)
+        with self._join_or_begin_transaction() as cursor:
+            row = cursor.execute(
+                "SELECT * FROM mcp_auth_metadata WHERE profile_id = ?", (profile_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            current = self._row_to_mcp_auth_metadata(row)
+            if current.revision != expected_revision:
+                return False
+            self._require_mcp_v7_identity(
+                current,
+                replacement,
+                ("profile_id", "server_id", "server_spec_sha256", "server_generation", "created_at"),
+            )
+            if replacement.credential_generation < current.credential_generation:
+                raise ValidationError("MCP auth credential generation cannot decrease")
+            changed = cursor.execute(
+                "UPDATE mcp_auth_metadata SET status = ?, issuer_sha256 = ?, "
+                "resource_sha256 = ?, audience_sha256 = ?, scopes_sha256 = ?, "
+                "principal_sha256 = ?, expires_at = ?, credential_generation = ?, "
+                "revision = ?, metadata_json = ?, updated_at = ? "
+                "WHERE profile_id = ? AND revision = ? AND server_id = ? "
+                "AND server_spec_sha256 = ? AND server_generation = ?",
+                (
+                    replacement.status, replacement.issuer_sha256,
+                    replacement.resource_sha256, replacement.audience_sha256,
+                    replacement.scopes_sha256, replacement.principal_sha256,
+                    replacement.expires_at, replacement.credential_generation,
+                    replacement.revision,
+                    canonical_mcp_v7_metadata_json(replacement.metadata),
+                    replacement.updated_at, profile_id, expected_revision,
+                    current.server_id, current.server_spec_sha256,
+                    current.server_generation,
+                ),
+            ).rowcount
+            return changed == 1
+
+    @staticmethod
+    def _mcp_auth_values(record: McpAuthMetadataRecord) -> tuple[Any, ...]:
+        return (
+            record.profile_id, record.server_id, record.server_spec_sha256,
+            record.server_generation, record.status, record.issuer_sha256,
+            record.resource_sha256, record.audience_sha256, record.scopes_sha256,
+            record.principal_sha256, record.expires_at,
+            record.credential_generation, record.revision,
+            canonical_mcp_v7_metadata_json(record.metadata), record.created_at,
+            record.updated_at,
+        )
+
+    def insert_mcp_side_effect_preparation(
+        self,
+        record: McpSideEffectPreparationRecord,
+    ) -> McpSideEffectPreparationRecord:
+        if not isinstance(record, McpSideEffectPreparationRecord):
+            raise ValidationError(
+                "MCP side-effect preparation insert requires a typed record"
+            )
+        if record.revision != 0 or record.status != "prepared":
+            raise ValidationError(
+                "initial MCP side-effect preparation must be prepared at revision zero"
+            )
+        with self._join_or_begin_transaction() as cursor:
+            self._fence_mcp_human_bindings(cursor)
+            existing = cursor.execute(
+                "SELECT * FROM mcp_side_effect_preparations "
+                "WHERE preparation_id = ?",
+                (record.preparation_id,),
+            ).fetchone()
+            if existing is not None:
+                decoded = self._row_to_mcp_side_effect_preparation(existing)
+                if decoded == record:
+                    return record
+                raise ValidationError(
+                    "MCP side-effect preparation identity conflicts with durable state"
+                )
+            self._require_mcp_side_effect_operation_snapshot(cursor, record)
+            self._require_mcp_side_effect_slots_available(cursor, record)
+            changed = cursor.execute(
+                "INSERT INTO mcp_side_effect_preparations ("
+                "preparation_id, operation_kind, operation_id, operation_revision, "
+                "server_id, server_spec_sha256, server_generation, owner_id, "
+                "auth_principal_sha256, auth_scope_sha256, human_request_id, "
+                "human_preview_sha256, broker_ref, broker_value_sha256, result_ref, "
+                "result_sha256, status, revision, expires_at, metadata_json, "
+                "created_at, updated_at) VALUES ("
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
+                self._mcp_side_effect_preparation_values(record),
+            ).rowcount
+            if changed == 1:
+                return record
+            raise ValidationError(
+                "MCP side-effect preparation identity conflicts with durable state"
+            )
+
+    def get_mcp_side_effect_preparation(
+        self,
+        preparation_id: str,
+    ) -> McpSideEffectPreparationRecord | None:
+        selected = self._mcp_v7_filter_text(
+            preparation_id,
+            "MCP side-effect preparation id",
+        )
+        rows = self._query(
+            "SELECT * FROM mcp_side_effect_preparations WHERE preparation_id = ?",
+            (selected,),
+        )
+        return self._row_to_mcp_side_effect_preparation(rows[0]) if rows else None
+
+    def list_mcp_side_effect_preparations(
+        self,
+        *,
+        owner_id: str | None = None,
+        operation_kind: str | None = None,
+        status: str | None = None,
+        expired_before: str | None = None,
+        limit: int = 100,
+    ) -> tuple[McpSideEffectPreparationRecord, ...]:
+        return tuple(
+            self._row_to_mcp_side_effect_preparation(row)
+            for row in self._query_mcp_v7_rows(
+                table="mcp_side_effect_preparations",
+                id_column="preparation_id",
+                owner_id=owner_id,
+                server_id=None,
+                server_generation=None,
+                status=status,
+                expired_before=expired_before,
+                limit=limit,
+                operation_kind=operation_kind,
+            )
+        )
+
+    def compare_and_swap_mcp_side_effect_preparation(
+        self,
+        preparation_id: str,
+        *,
+        expected_revision: int,
+        replacement: McpSideEffectPreparationRecord,
+    ) -> bool:
+        if not isinstance(replacement, McpSideEffectPreparationRecord):
+            raise ValidationError(
+                "MCP side-effect preparation CAS requires a typed replacement"
+            )
+        self._mcp_v7_filter_text(preparation_id, "MCP side-effect preparation id")
+        self._validate_mcp_v7_expected_revision(
+            expected_revision,
+            replacement.revision,
+        )
+        with self._join_or_begin_transaction() as cursor:
+            self._fence_mcp_human_bindings(cursor)
+            row = cursor.execute(
+                "SELECT * FROM mcp_side_effect_preparations "
+                "WHERE preparation_id = ?",
+                (preparation_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            current = self._row_to_mcp_side_effect_preparation(row)
+            if current.revision != expected_revision:
+                return False
+            self._require_mcp_side_effect_preparation_transition(
+                current,
+                replacement,
+            )
+            changed = cursor.execute(
+                "UPDATE mcp_side_effect_preparations SET status = ?, revision = ?, "
+                "metadata_json = ?, updated_at = ? WHERE preparation_id = ? "
+                "AND revision = ? AND status = 'prepared'",
+                (
+                    replacement.status,
+                    replacement.revision,
+                    canonical_mcp_v7_side_effect_metadata_json(
+                        replacement.metadata
+                    ),
+                    replacement.updated_at,
+                    preparation_id,
+                    expected_revision,
+                ),
+            ).rowcount
+            return changed == 1
+
+    def delete_mcp_side_effect_preparation(
+        self,
+        preparation_id: str,
+        *,
+        expected_revision: int,
+    ) -> bool:
+        selected = self._mcp_v7_filter_text(
+            preparation_id,
+            "MCP side-effect preparation id",
+        )
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValidationError(
+                "MCP side-effect preparation revision must be non-negative"
+            )
+        with self._join_or_begin_transaction() as cursor:
+            self._fence_mcp_human_bindings(cursor)
+            changed = cursor.execute(
+                "DELETE FROM mcp_side_effect_preparations "
+                "WHERE preparation_id = ? AND revision = ? AND status = 'cleaning'",
+                (selected, expected_revision),
+            ).rowcount
+            return changed == 1
+
+    def commit_mcp_side_effect_preparation(
+        self,
+        preparation_id: str,
+        *,
+        expected_revision: int,
+        replacement: McpContinuationRecord | McpRemoteTaskRecord,
+    ) -> bool:
+        if not isinstance(replacement, (McpContinuationRecord, McpRemoteTaskRecord)):
+            raise ValidationError(
+                "MCP side-effect preparation commit requires a typed operation record"
+            )
+        self._mcp_v7_filter_text(preparation_id, "MCP side-effect preparation id")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValidationError(
+                "MCP side-effect preparation revision must be non-negative"
+            )
+        with self._join_or_begin_transaction() as cursor:
+            self._fence_mcp_human_bindings(cursor)
+            row = cursor.execute(
+                "SELECT * FROM mcp_side_effect_preparations "
+                "WHERE preparation_id = ?",
+                (preparation_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            preparation = self._row_to_mcp_side_effect_preparation(row)
+            if (
+                preparation.revision != expected_revision
+                or preparation.status != "prepared"
+            ):
+                return False
+            if not self._require_mcp_side_effect_commit_binding(
+                cursor,
+                preparation,
+                replacement,
+            ):
+                return False
+            expected_retire_refs = self._mcp_side_effect_retire_refs(
+                cursor,
+                preparation,
+                replacement,
+            )
+            retire_refs = tuple(preparation.metadata.get("retire_refs", ()))
+            if retire_refs != expected_retire_refs:
+                raise ValidationError("MCP side-effect retired broker binding changed")
+            if preparation.operation_revision is None:
+                if isinstance(replacement, McpContinuationRecord):
+                    self.insert_mcp_continuation(
+                        replacement,
+                        _preparation_id=preparation_id,
+                    )
+                else:
+                    self.insert_mcp_remote_task(
+                        replacement,
+                        _preparation_id=preparation_id,
+                    )
+            else:
+                changed = (
+                    self.compare_and_swap_mcp_continuation(
+                        replacement.continuation_id,
+                        expected_revision=preparation.operation_revision,
+                        replacement=replacement,
+                        _preparation_id=preparation_id,
+                    )
+                    if isinstance(replacement, McpContinuationRecord)
+                    else self.compare_and_swap_mcp_remote_task(
+                        replacement.task_ref,
+                        expected_revision=preparation.operation_revision,
+                        replacement=replacement,
+                        _preparation_id=preparation_id,
+                    )
+                )
+                if not changed:
+                    return False
+            retirement_metadata: dict[str, Any] = {
+                "automatic_retry_disabled": True,
+                "cleanup_mode": "retire",
+                "retire_refs": retire_refs,
+            }
+            for key in (
+                "retire_human_request_id",
+                "retire_human_preview_sha256",
+            ):
+                if key in preparation.metadata:
+                    retirement_metadata[key] = preparation.metadata[key]
+            retirement = replace(
+                preparation,
+                status="cleaning",
+                revision=preparation.revision + 1,
+                metadata=retirement_metadata,
+                updated_at=max(preparation.updated_at, replacement.updated_at),
+            )
+            changed = cursor.execute(
+                "UPDATE mcp_side_effect_preparations SET status = ?, revision = ?, "
+                "metadata_json = ?, updated_at = ? WHERE preparation_id = ? "
+                "AND revision = ? AND status = 'prepared'",
+                (
+                    retirement.status,
+                    retirement.revision,
+                    canonical_mcp_v7_side_effect_metadata_json(
+                        retirement.metadata
+                    ),
+                    retirement.updated_at,
+                    preparation_id,
+                    expected_revision,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise ValidationError(
+                    "MCP side-effect preparation changed during atomic commit"
+                )
+            return True
+
+    def commit_terminal_mcp_side_effect_preparation(
+        self,
+        preparation_id: str,
+        *,
+        expected_revision: int,
+    ) -> bool:
+        selected = self._mcp_v7_filter_text(
+            preparation_id,
+            "MCP side-effect preparation id",
+        )
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValidationError(
+                "MCP side-effect preparation revision must be non-negative"
+            )
+        with self._join_or_begin_transaction() as cursor:
+            self._fence_mcp_human_bindings(cursor)
+            row = cursor.execute(
+                "SELECT * FROM mcp_side_effect_preparations "
+                "WHERE preparation_id = ?",
+                (selected,),
+            ).fetchone()
+            if row is None:
+                return False
+            preparation = self._row_to_mcp_side_effect_preparation(row)
+            if (
+                preparation.revision != expected_revision
+                or preparation.status != "prepared"
+                or preparation.operation_revision is None
+            ):
+                return False
+            operation_row = self._mcp_side_effect_operation_row(cursor, preparation)
+            if operation_row is None:
+                return False
+            current = self._mcp_side_effect_operation_record(
+                operation_row,
+                preparation.operation_kind,
+            )
+            if current.revision != preparation.operation_revision:
+                return False
+            self._require_mcp_side_effect_fences(preparation, current)
+            self._require_mcp_terminal_retirement(preparation, current)
+            table, id_column, operation_id, terminal_statuses = (
+                (
+                    "mcp_continuations",
+                    "continuation_id",
+                    current.continuation_id,
+                    ("complete", "cancelled", "expired", "needs_attention"),
+                )
+                if isinstance(current, McpContinuationRecord)
+                else (
+                    "mcp_remote_tasks",
+                    "task_ref",
+                    current.task_ref,
+                    ("completed", "failed", "cancelled", "needs_attention"),
+                )
+            )
+            if current.status not in terminal_statuses:
+                raise ValidationError("MCP operation is not retention-eligible")
+            placeholders = ", ".join("?" for _ in terminal_statuses)
+            deleted = cursor.execute(
+                f"DELETE FROM {table} WHERE {id_column} = ? AND revision = ? "
+                f"AND status IN ({placeholders})",
+                (operation_id, current.revision, *terminal_statuses),
+            ).rowcount
+            if deleted != 1:
+                return False
+            retirement_metadata = dict(preparation.metadata)
+            retirement_metadata["cleanup_mode"] = "retire"
+            retirement = replace(
+                preparation,
+                status="cleaning",
+                revision=preparation.revision + 1,
+                metadata=retirement_metadata,
+            )
+            changed = cursor.execute(
+                "UPDATE mcp_side_effect_preparations SET status = ?, revision = ?, "
+                "metadata_json = ? WHERE preparation_id = ? AND revision = ? "
+                "AND status = 'prepared'",
+                (
+                    retirement.status,
+                    retirement.revision,
+                    canonical_mcp_v7_side_effect_metadata_json(
+                        retirement.metadata
+                    ),
+                    selected,
+                    expected_revision,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise ValidationError(
+                    "MCP terminal retirement changed during atomic commit"
+                )
+            return True
+
+    @staticmethod
+    def _mcp_side_effect_preparation_values(
+        record: McpSideEffectPreparationRecord,
+    ) -> tuple[Any, ...]:
+        return (
+            record.preparation_id, record.operation_kind, record.operation_id,
+            record.operation_revision, record.server_id,
+            record.server_spec_sha256, record.server_generation, record.owner_id,
+            record.auth_principal_sha256, record.auth_scope_sha256,
+            record.human_request_id, record.human_preview_sha256,
+            record.broker_ref, record.broker_value_sha256, record.result_ref,
+            record.result_sha256, record.status, record.revision,
+            record.expires_at,
+            canonical_mcp_v7_side_effect_metadata_json(record.metadata),
+            record.created_at, record.updated_at,
+        )
+
+    @staticmethod
+    def _mcp_side_effect_operation_row(
+        cursor: Any,
+        record: McpSideEffectPreparationRecord,
+    ) -> Any | None:
+        if record.operation_kind == "continuation":
+            return cursor.execute(
+                "SELECT * FROM mcp_continuations WHERE continuation_id = ?",
+                (record.operation_id,),
+            ).fetchone()
+        if record.operation_kind == "remote_task":
+            return cursor.execute(
+                "SELECT * FROM mcp_remote_tasks WHERE task_ref = ?",
+                (record.operation_id,),
+            ).fetchone()
+        raise ValidationError("MCP side-effect operation kind is invalid")
+
+    @staticmethod
+    def _mcp_side_effect_operation_record(
+        row: Any,
+        operation_kind: str,
+    ) -> McpContinuationRecord | McpRemoteTaskRecord:
+        if operation_kind == "continuation":
+            return SQLRuntimeStore._row_to_mcp_continuation(row)
+        if operation_kind == "remote_task":
+            return SQLRuntimeStore._row_to_mcp_remote_task(row)
+        raise ValidationError("MCP side-effect operation kind is invalid")
+
+    def _mcp_side_effect_retire_refs(
+        self,
+        cursor: Any,
+        preparation: McpSideEffectPreparationRecord,
+        replacement: McpContinuationRecord | McpRemoteTaskRecord,
+    ) -> tuple[str, ...]:
+        row = self._mcp_side_effect_operation_row(cursor, preparation)
+        if row is None:
+            return ()
+        current = self._mcp_side_effect_operation_record(
+            row,
+            preparation.operation_kind,
+        )
+        previous = {
+            reference
+            for reference in (
+                self._mcp_operation_broker_binding(current)[0],
+                self._mcp_operation_result_binding(current)[0],
+            )
+            if reference is not None
+        }
+        retained = {
+            reference
+            for reference in (
+                self._mcp_operation_broker_binding(replacement)[0],
+                self._mcp_operation_result_binding(replacement)[0],
+            )
+            if reference is not None
+        }
+        return tuple(sorted(previous - retained))
+
+    def _require_mcp_terminal_retirement(
+        self,
+        preparation: McpSideEffectPreparationRecord,
+        current: McpContinuationRecord | McpRemoteTaskRecord,
+    ) -> None:
+        if any(
+            value is not None
+            for value in (
+                preparation.human_request_id,
+                preparation.broker_ref,
+                preparation.result_ref,
+            )
+        ):
+            raise ValidationError(
+                "MCP terminal retirement cannot allocate new side-effect slots"
+            )
+        expected_refs = tuple(
+            sorted(
+                reference
+                for reference in (
+                    self._mcp_operation_broker_binding(current)[0],
+                    self._mcp_operation_result_binding(current)[0],
+                )
+                if reference is not None
+            )
+        )
+        if tuple(preparation.metadata.get("retire_refs", ())) != expected_refs:
+            raise ValidationError("MCP terminal retired broker binding changed")
+        retired_human = preparation.metadata.get("retire_human_request_id")
+        retired_preview = preparation.metadata.get(
+            "retire_human_preview_sha256"
+        )
+        if retired_human != current.human_request_id:
+            raise ValidationError("MCP terminal retired Human binding changed")
+        if (retired_human is None) != (retired_preview is None):
+            raise ValidationError("MCP terminal retired Human binding is incomplete")
+
+    @staticmethod
+    def _require_mcp_side_effect_fences(
+        preparation: McpSideEffectPreparationRecord,
+        operation: McpContinuationRecord | McpRemoteTaskRecord,
+    ) -> None:
+        operation_id = (
+            operation.continuation_id
+            if isinstance(operation, McpContinuationRecord)
+            else operation.task_ref
+        )
+        expected_kind = (
+            "continuation"
+            if isinstance(operation, McpContinuationRecord)
+            else "remote_task"
+        )
+        if preparation.operation_kind != expected_kind or operation_id != preparation.operation_id:
+            raise ValidationError("MCP side-effect operation binding changed")
+        for name in (
+            "server_id",
+            "server_spec_sha256",
+            "server_generation",
+            "owner_id",
+            "auth_principal_sha256",
+            "auth_scope_sha256",
+        ):
+            if getattr(preparation, name) != getattr(operation, name):
+                raise ValidationError("MCP side-effect authority binding changed")
+
+    def _require_mcp_side_effect_operation_snapshot(
+        self,
+        cursor: Any,
+        record: McpSideEffectPreparationRecord,
+    ) -> None:
+        conflict = cursor.execute(
+            "SELECT 1 AS present FROM mcp_side_effect_preparations "
+            "WHERE operation_kind = ? AND operation_id = ? LIMIT 1",
+            (record.operation_kind, record.operation_id),
+        ).fetchone()
+        if conflict is not None:
+            raise ValidationError(
+                "MCP operation already has a side-effect preparation"
+            )
+        row = self._mcp_side_effect_operation_row(cursor, record)
+        if record.operation_revision is None:
+            if row is not None:
+                raise ValidationError(
+                    "initial MCP side-effect preparation operation already exists"
+                )
+            return
+        if row is None:
+            raise ValidationError(
+                "MCP side-effect preparation operation snapshot is unavailable"
+            )
+        current = self._mcp_side_effect_operation_record(
+            row,
+            record.operation_kind,
+        )
+        if current.revision != record.operation_revision:
+            raise ValidationError(
+                "MCP side-effect preparation operation revision changed"
+            )
+        terminal_statuses = (
+            {"complete", "cancelled", "expired"}
+            if isinstance(current, McpContinuationRecord)
+            else {"completed", "failed", "cancelled"}
+        )
+        has_planned_slots = any(
+            value is not None
+            for value in (
+                record.human_request_id,
+                record.broker_ref,
+                record.result_ref,
+            )
+        )
+        if current.status in terminal_statuses and has_planned_slots:
+            raise ValidationError(
+                "terminal MCP operation cannot prepare new side-effect slots"
+            )
+        self._require_mcp_side_effect_fences(record, current)
+
+    @staticmethod
+    def _require_mcp_side_effect_slots_available(
+        cursor: Any,
+        record: McpSideEffectPreparationRecord,
+    ) -> None:
+        if record.human_request_id is not None:
+            for table in (
+                "human_requests",
+                "mcp_continuations",
+                "mcp_remote_tasks",
+                "mcp_side_effect_preparations",
+            ):
+                column = (
+                    "request_id" if table == "human_requests" else "human_request_id"
+                )
+                present = cursor.execute(
+                    f"SELECT 1 AS present FROM {table} WHERE {column} = ? LIMIT 1",
+                    (record.human_request_id,),
+                ).fetchone()
+                if present is not None:
+                    raise ValidationError(
+                        "MCP side-effect Human request slot is already owned"
+                    )
+        references = tuple(
+            value
+            for value in (record.broker_ref, record.result_ref)
+            if value is not None
+        )
+        for reference in references:
+            statements = (
+                "SELECT 1 AS present FROM mcp_continuations "
+                "WHERE broker_ref = ? LIMIT 1",
+                "SELECT 1 AS present FROM mcp_remote_tasks "
+                "WHERE broker_ref = ? OR result_ref = ? LIMIT 1",
+                "SELECT 1 AS present FROM mcp_side_effect_preparations "
+                "WHERE broker_ref = ? OR result_ref = ? LIMIT 1",
+            )
+            params = ((reference,), (reference, reference), (reference, reference))
+            if any(
+                cursor.execute(statement, selected).fetchone() is not None
+                for statement, selected in zip(statements, params, strict=True)
+            ):
+                raise ValidationError(
+                    "MCP side-effect broker slot is already owned"
+                )
+
+    @staticmethod
+    def _require_mcp_side_effect_preparation_transition(
+        current: McpSideEffectPreparationRecord,
+        target: McpSideEffectPreparationRecord,
+    ) -> None:
+        immutable = tuple(
+            name
+            for name in (
+                "preparation_id", "operation_kind", "operation_id",
+                "operation_revision", "server_id", "server_spec_sha256",
+                "server_generation", "owner_id", "auth_principal_sha256",
+                "auth_scope_sha256", "human_request_id",
+                "human_preview_sha256", "broker_ref", "broker_value_sha256",
+                "result_ref", "result_sha256", "expires_at", "created_at",
+            )
+        )
+        SQLRuntimeStore._require_mcp_v7_identity(current, target, immutable)
+        if current.status != "prepared" or target.status != "cleaning":
+            raise ValidationError(
+                "MCP side-effect preparation may only be claimed for cleanup once"
+            )
+        if target.metadata.get("cleanup_mode") != "abort":
+            raise ValidationError(
+                "MCP side-effect cleanup claim cannot forge retirement"
+            )
+        for key in (
+            "retire_refs",
+            "retire_human_request_id",
+            "retire_human_preview_sha256",
+        ):
+            if current.metadata.get(key) != target.metadata.get(key):
+                raise ValidationError(
+                    "MCP side-effect cleanup claim changed retirement ownership"
+                )
+
+    def _require_mcp_side_effect_commit_binding(
+        self,
+        cursor: Any,
+        preparation: McpSideEffectPreparationRecord,
+        replacement: McpContinuationRecord | McpRemoteTaskRecord,
+    ) -> bool:
+        self._require_mcp_side_effect_fences(preparation, replacement)
+        row = self._mcp_side_effect_operation_row(cursor, preparation)
+        current: McpContinuationRecord | McpRemoteTaskRecord | None = None
+        if preparation.operation_revision is None:
+            if replacement.revision != 0:
+                raise ValidationError(
+                    "initial MCP side-effect commit revision is invalid"
+                )
+            if row is not None:
+                return False
+        else:
+            if replacement.revision != preparation.operation_revision + 1:
+                raise ValidationError(
+                    "MCP side-effect commit replacement revision is invalid"
+                )
+            if row is None:
+                return False
+            current = self._mcp_side_effect_operation_record(
+                row,
+                preparation.operation_kind,
+            )
+            if current.revision != preparation.operation_revision:
+                return False
+            self._require_mcp_side_effect_fences(preparation, current)
+        previous_human = current.human_request_id if current is not None else None
+        planned_human = (
+            replacement.human_request_id
+            if replacement.human_request_id != previous_human
+            else None
+        )
+        if preparation.human_request_id != planned_human:
+            raise ValidationError("MCP side-effect planned Human binding changed")
+        retire_human_request_id = preparation.metadata.get(
+            "retire_human_request_id"
+        )
+        retire_human_preview_sha256 = preparation.metadata.get(
+            "retire_human_preview_sha256"
+        )
+        retention_statuses = (
+            {"complete", "cancelled", "expired", "needs_attention"}
+            if isinstance(replacement, McpContinuationRecord)
+            else {"completed", "failed", "cancelled", "needs_attention"}
+        )
+        expected_retire_human = (
+            previous_human
+            if previous_human is not None
+            and (
+                previous_human != replacement.human_request_id
+                or replacement.status in retention_statuses
+            )
+            else None
+        )
+        if retire_human_request_id != expected_retire_human:
+            raise ValidationError("MCP side-effect retired Human binding changed")
+        if (retire_human_request_id is None) != (
+            retire_human_preview_sha256 is None
+        ):
+            raise ValidationError("MCP side-effect retired Human binding is incomplete")
+        previous_broker = self._mcp_operation_broker_binding(current)
+        target_broker = self._mcp_operation_broker_binding(replacement)
+        planned_broker = target_broker if target_broker != previous_broker else (None, None)
+        if (
+            preparation.broker_ref,
+            preparation.broker_value_sha256,
+        ) != planned_broker:
+            raise ValidationError("MCP side-effect planned broker binding changed")
+        previous_result = self._mcp_operation_result_binding(current)
+        target_result = self._mcp_operation_result_binding(replacement)
+        planned_result = target_result if target_result != previous_result else (None, None)
+        if (preparation.result_ref, preparation.result_sha256) != planned_result:
+            raise ValidationError("MCP side-effect planned result binding changed")
+        return True
+
+    @staticmethod
+    def _mcp_operation_broker_binding(
+        record: McpContinuationRecord | McpRemoteTaskRecord | None,
+    ) -> tuple[str | None, str | None]:
+        if record is None or record.broker_ref is None:
+            return (None, None)
+        if isinstance(record, McpContinuationRecord):
+            return (record.broker_ref, record.broker_value_sha256)
+        return (record.broker_ref, record.remote_id_sha256)
+
+    @staticmethod
+    def _mcp_operation_result_binding(
+        record: McpContinuationRecord | McpRemoteTaskRecord | None,
+    ) -> tuple[str | None, str | None]:
+        if not isinstance(record, McpRemoteTaskRecord):
+            return (None, None)
+        return (record.result_ref, record.result_sha256)
+
+    @staticmethod
+    def _require_mcp_operation_table(
+        table: str,
+        id_column: str,
+    ) -> None:
+        if (table, id_column) not in {
+            ("mcp_continuations", "continuation_id"),
+            ("mcp_remote_tasks", "task_ref"),
+        }:
+            raise ValidationError("MCP operation retention table is invalid")
+
+    def _count_active_mcp_operation_rows(
+        self,
+        *,
+        table: str,
+        owner_id: str | None,
+        terminal_statuses: tuple[str, ...],
+    ) -> int:
+        id_column = (
+            "continuation_id" if table == "mcp_continuations" else "task_ref"
+        )
+        self._require_mcp_operation_table(table, id_column)
+        placeholders = ", ".join("?" for _ in terminal_statuses)
+        clauses = [f"status NOT IN ({placeholders})"]
+        params: list[Any] = list(terminal_statuses)
+        if owner_id is not None:
+            clauses.append("owner_id = ?")
+            params.append(self._mcp_v7_filter_text(owner_id, "MCP owner id"))
+        rows = self._query(
+            f"SELECT COUNT(*) AS total FROM {table} WHERE "
+            + " AND ".join(clauses),
+            params,
+        )
+        if len(rows) != 1:
+            raise ValidationError("MCP active operation count is unavailable")
+        total = rows[0]["total"]
+        if type(total) is not int or total < 0:
+            raise ValidationError("persisted MCP active operation count is invalid")
+        return total
+
+    def _list_terminal_mcp_operation_rows(
+        self,
+        *,
+        table: str,
+        id_column: str,
+        owner_id: str | None,
+        terminal_statuses: tuple[str, ...],
+        limit: int,
+    ) -> list[Any]:
+        self._require_mcp_operation_table(table, id_column)
+        placeholders = ", ".join("?" for _ in terminal_statuses)
+        clauses = [f"status IN ({placeholders})"]
+        params: list[Any] = list(terminal_statuses)
+        if owner_id is not None:
+            clauses.append("owner_id = ?")
+            params.append(self._mcp_v7_filter_text(owner_id, "MCP owner id"))
+        params.append(self._mcp_v7_limit(limit))
+        return self._query(
+            f"SELECT * FROM {table} WHERE "
+            + " AND ".join(clauses)
+            + f" ORDER BY updated_at COLLATE BINARY, {id_column} COLLATE BINARY "
+            "LIMIT ?",
+            params,
+        )
+
+    def _delete_terminal_mcp_operation_row(
+        self,
+        *,
+        table: str,
+        id_column: str,
+        operation_kind: str,
+        operation_id: str,
+        expected_revision: int,
+        terminal_statuses: tuple[str, ...],
+    ) -> bool:
+        self._require_mcp_operation_table(table, id_column)
+        if operation_kind not in {"continuation", "remote_task"}:
+            raise ValidationError("MCP operation retention kind is invalid")
+        selected_id = self._mcp_v7_filter_text(operation_id, "MCP operation id")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValidationError("MCP terminal delete revision must be non-negative")
+        with self._join_or_begin_transaction() as cursor:
+            self._fence_mcp_human_bindings(cursor)
+            row = cursor.execute(
+                f"SELECT * FROM {table} WHERE {id_column} = ?",
+                (selected_id,),
+            ).fetchone()
+            if row is None or row["revision"] != expected_revision:
+                return False
+            if row["status"] not in terminal_statuses:
+                raise ValidationError("MCP operation is not terminal and cannot be deleted")
+            current = self._mcp_side_effect_operation_record(row, operation_kind)
+            if any(
+                value is not None
+                for value in (
+                    current.human_request_id,
+                    self._mcp_operation_broker_binding(current)[0],
+                    self._mcp_operation_result_binding(current)[0],
+                )
+            ):
+                raise ValidationError(
+                    "MCP terminal operation requires durable side-effect retirement"
+                )
+            prepared = cursor.execute(
+                "SELECT 1 AS present FROM mcp_side_effect_preparations "
+                "WHERE operation_kind = ? AND operation_id = ? LIMIT 1",
+                (operation_kind, selected_id),
+            ).fetchone()
+            if prepared is not None:
+                raise ValidationError(
+                    "MCP terminal operation still owns a side-effect preparation"
+                )
+            placeholders = ", ".join("?" for _ in terminal_statuses)
+            changed = cursor.execute(
+                f"DELETE FROM {table} WHERE {id_column} = ? AND revision = ? "
+                f"AND status IN ({placeholders})",
+                (selected_id, expected_revision, *terminal_statuses),
+            ).rowcount
+            return changed == 1
+
+    def _query_mcp_v7_rows(
+        self,
+        *,
+        table: str,
+        id_column: str,
+        owner_id: str | None,
+        server_id: str | None,
+        server_generation: int | None,
+        status: str | None,
+        expired_before: str | None,
+        limit: int,
+        operation_kind: str | None = None,
+    ) -> list[Any]:
+        if table not in {
+            "mcp_continuations", "mcp_remote_tasks", "mcp_subscriptions",
+            "mcp_auth_metadata", "mcp_side_effect_preparations",
+        }:
+            raise ValidationError("unsupported MCP v7 query table")
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value, label in (
+            ("owner_id", owner_id, "MCP owner id"),
+            ("server_id", server_id, "MCP server id"),
+            ("status", status, "MCP state status"),
+        ):
+            if value is not None:
+                if column == "owner_id" and table == "mcp_auth_metadata":
+                    raise ValidationError("MCP auth metadata has no owner filter")
+                clauses.append(f"{column} = ?")
+                params.append(self._mcp_v7_filter_text(value, label))
+        if operation_kind is not None:
+            if table != "mcp_side_effect_preparations":
+                raise ValidationError("MCP operation kind filter is unsupported")
+            if operation_kind not in {"continuation", "remote_task"}:
+                raise ValidationError("MCP side-effect operation kind is invalid")
+            clauses.append("operation_kind = ?")
+            params.append(operation_kind)
+        if server_generation is not None:
+            if type(server_generation) is not int or server_generation < 0:
+                raise ValidationError("MCP server generation must be non-negative")
+            clauses.append("server_generation = ?")
+            params.append(server_generation)
+        if expired_before is not None:
+            from agent_libos.storage.mcp_v7 import _timestamp as _mcp_v7_timestamp
+
+            clauses.append("expires_at IS NOT NULL AND expires_at <= ?")
+            params.append(_mcp_v7_timestamp(expired_before, "MCP expiry bound"))
+        sql = f"SELECT * FROM {table}"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += f" ORDER BY created_at COLLATE BINARY, {id_column} COLLATE BINARY LIMIT ?"
+        params.append(self._mcp_v7_limit(limit))
+        return self._query(sql, params)
+
+    @staticmethod
+    def _validate_mcp_v7_expected_revision(expected: int, target: int) -> None:
+        if type(expected) is not int or expected < 0 or target != expected + 1:
+            raise ValidationError("MCP v7 CAS revision is invalid")
+
+    @staticmethod
+    def _require_mcp_v7_identity(
+        current: Any,
+        target: Any,
+        fields: tuple[str, ...],
+    ) -> None:
+        if any(getattr(current, name) != getattr(target, name) for name in fields):
+            raise ValidationError("MCP v7 CAS cannot change its fenced identity")
+        if target.updated_at < current.updated_at:
+            raise ValidationError("MCP v7 CAS updated_at cannot move backwards")
+
+    @staticmethod
+    def _row_to_mcp_continuation(row: Any) -> McpContinuationRecord:
+        with _persisted_model_decode(f"MCP continuation {row['continuation_id']}"):
+            return McpContinuationRecord(
+                continuation_id=row["continuation_id"], server_id=row["server_id"],
+                server_spec_sha256=row["server_spec_sha256"],
+                server_generation=row["server_generation"], owner_id=row["owner_id"],
+                auth_principal_sha256=row["auth_principal_sha256"],
+                auth_scope_sha256=row["auth_scope_sha256"],
+                request_sha256=row["request_sha256"], effect_id=row["effect_id"],
+                capability_sha256=row["capability_sha256"],
+                data_flow_sha256=row["data_flow_sha256"],
+                human_request_id=row["human_request_id"], broker_ref=row["broker_ref"],
+                broker_value_sha256=row["broker_value_sha256"], status=row["status"],
+                revision=row["revision"], expires_at=row["expires_at"],
+                metadata=parse_mcp_v7_metadata_json(row["metadata_json"]),
+                created_at=row["created_at"], updated_at=row["updated_at"],
+            )
+
+    @staticmethod
+    def _row_to_mcp_remote_task(row: Any) -> McpRemoteTaskRecord:
+        with _persisted_model_decode(f"MCP remote task {row['task_ref']}"):
+            return McpRemoteTaskRecord(
+                task_ref=row["task_ref"], server_id=row["server_id"],
+                server_spec_sha256=row["server_spec_sha256"],
+                server_generation=row["server_generation"], owner_id=row["owner_id"],
+                auth_principal_sha256=row["auth_principal_sha256"],
+                auth_scope_sha256=row["auth_scope_sha256"],
+                origin_request_sha256=row["origin_request_sha256"],
+                origin_effect_id=row["origin_effect_id"],
+                human_request_id=row["human_request_id"], broker_ref=row["broker_ref"],
+                remote_id_sha256=row["remote_id_sha256"], status=row["status"],
+                revision=row["revision"], expires_at=row["expires_at"],
+                poll_interval_ms=row["poll_interval_ms"],
+                status_message_sha256=row["status_message_sha256"],
+                result_ref=row["result_ref"], result_sha256=row["result_sha256"],
+                metadata=parse_mcp_v7_metadata_json(row["metadata_json"]),
+                created_at=row["created_at"], updated_at=row["updated_at"],
+            )
+
+    @staticmethod
+    def _row_to_mcp_subscription(row: Any) -> McpSubscriptionRecord:
+        with _persisted_model_decode(f"MCP subscription {row['subscription_id']}"):
+            return McpSubscriptionRecord(
+                subscription_id=row["subscription_id"], server_id=row["server_id"],
+                server_spec_sha256=row["server_spec_sha256"],
+                server_generation=row["server_generation"], owner_id=row["owner_id"],
+                auth_principal_sha256=row["auth_principal_sha256"],
+                auth_scope_sha256=row["auth_scope_sha256"],
+                requested_filter_sha256=row["requested_filter_sha256"],
+                acknowledged_filter_sha256=row["acknowledged_filter_sha256"],
+                status=row["status"], queue_limit=row["queue_limit"],
+                event_max_bytes=row["event_max_bytes"],
+                received_count=row["received_count"], dropped_count=row["dropped_count"],
+                revision=row["revision"], last_event_at=row["last_event_at"],
+                metadata=parse_mcp_v7_metadata_json(row["metadata_json"]),
+                created_at=row["created_at"], updated_at=row["updated_at"],
+            )
+
+    @staticmethod
+    def _row_to_mcp_auth_metadata(row: Any) -> McpAuthMetadataRecord:
+        with _persisted_model_decode(f"MCP auth metadata {row['profile_id']}"):
+            return McpAuthMetadataRecord(
+                profile_id=row["profile_id"], server_id=row["server_id"],
+                server_spec_sha256=row["server_spec_sha256"],
+                server_generation=row["server_generation"], status=row["status"],
+                issuer_sha256=row["issuer_sha256"], resource_sha256=row["resource_sha256"],
+                audience_sha256=row["audience_sha256"], scopes_sha256=row["scopes_sha256"],
+                principal_sha256=row["principal_sha256"], expires_at=row["expires_at"],
+                credential_generation=row["credential_generation"], revision=row["revision"],
+                metadata=parse_mcp_v7_metadata_json(row["metadata_json"]),
+                created_at=row["created_at"], updated_at=row["updated_at"],
+            )
+
+    @staticmethod
+    def _row_to_mcp_side_effect_preparation(
+        row: Any,
+    ) -> McpSideEffectPreparationRecord:
+        with _persisted_model_decode(
+            f"MCP side-effect preparation {row['preparation_id']}"
+        ):
+            return McpSideEffectPreparationRecord(
+                preparation_id=row["preparation_id"],
+                operation_kind=row["operation_kind"],
+                operation_id=row["operation_id"],
+                operation_revision=row["operation_revision"],
+                server_id=row["server_id"],
+                server_spec_sha256=row["server_spec_sha256"],
+                server_generation=row["server_generation"],
+                owner_id=row["owner_id"],
+                auth_principal_sha256=row["auth_principal_sha256"],
+                auth_scope_sha256=row["auth_scope_sha256"],
+                human_request_id=row["human_request_id"],
+                human_preview_sha256=row["human_preview_sha256"],
+                broker_ref=row["broker_ref"],
+                broker_value_sha256=row["broker_value_sha256"],
+                result_ref=row["result_ref"],
+                result_sha256=row["result_sha256"],
+                status=row["status"],
+                revision=row["revision"],
+                expires_at=row["expires_at"],
+                metadata=parse_mcp_v7_side_effect_metadata_json(
+                    row["metadata_json"]
+                ),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
 
     def _dict_to_jsonrpc_endpoint(self, data: dict[str, Any]) -> JsonRpcEndpointSpec:
         with _persisted_model_decode(

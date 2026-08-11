@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import math
+import os
 import re
 import sys
 import threading
+import time
 import uuid
 from collections import Counter
 from pathlib import Path
@@ -44,7 +47,7 @@ from agent_libos.models.exceptions import ValidationError as LibOSValidationErro
 from agent_libos.modules import ModuleLoader
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import display_store_target
-from agent_libos.utils.serde import bounded_json_loads, to_jsonable
+from agent_libos.utils.serde import bounded_json_loads, dumps, to_jsonable
 from agent_libos.api.semantic_public import (
     REVIEW_OUTCOMES,
     project_assessment_detail,
@@ -416,7 +419,10 @@ def _parse_cli_args(
     _add_jsonrpc_parser_args(jsonrpc_parser)
     mcp_parser = sub.add_parser(
         "mcp",
-        help="Register, list, inspect, discover, enumerate tools, call, or unregister MCP servers",
+        help=(
+            "Operate MCP Tools and Host-only 2026-07-28 Resources, Prompts, "
+            "OAuth, Elicitation, Tasks, subscriptions, and manifest DX"
+        ),
     )
     _add_mcp_parser_args(mcp_parser)
     modules_parser = sub.add_parser("modules", help="List, inspect, or verify startup runtime modules")
@@ -656,7 +662,7 @@ def _add_store_parser_args(parser: argparse.ArgumentParser) -> None:
         "--to",
         dest="store_schema_version",
         type=int,
-        choices=(5, 6),
+        choices=(5, 6, 7),
         required=True,
     )
     mode = migrate.add_mutually_exclusive_group(required=True)
@@ -1069,7 +1075,7 @@ def _run_store_command(
 ) -> dict[str, Any]:
     if args.store_command != "migrate":
         raise AssertionError(f"unsupported store command: {args.store_command}")
-    if args.store_schema_version not in {5, 6}:
+    if args.store_schema_version not in {5, 6, 7}:
         raise AssertionError("argparse admitted an unsupported store migration target")
     if args.apply and args.expected_plan_sha256 is None:
         parser.error("store migrate --apply requires --expected-plan-sha256")
@@ -1108,7 +1114,7 @@ def _run_store_command(
             if args.apply
             else plan_store_v5_migration(target, **common)
         )
-    else:
+    elif args.store_schema_version == 6:
         from agent_libos.storage.semantic_v6_migration import (
             apply_store_v6_migration,
             plan_store_v6_migration,
@@ -1122,6 +1128,21 @@ def _run_store_command(
             )
             if args.apply
             else plan_store_v6_migration(target, **common)
+        )
+    else:
+        from agent_libos.storage.mcp_v7_migration import (
+            apply_store_v7_migration,
+            plan_store_v7_migration,
+        )
+
+        result = (
+            apply_store_v7_migration(
+                target,
+                expected_plan_sha256=args.expected_plan_sha256,
+                **common,
+            )
+            if args.apply
+            else plan_store_v7_migration(target, **common)
         )
     return _semantic_mapping(result, label="store migration result")
 
@@ -1247,7 +1268,10 @@ def _run_management_cli_command(runtime: Runtime, args: argparse.Namespace) -> N
         _print_json(_run_jsonrpc_command(runtime, args))
         return
     if args.command == "mcp":
-        _print_json(_run_mcp_command(runtime, args))
+        result = _run_mcp_command(runtime, args)
+        _print_json(result)
+        if _mcp_cli_result_failed(result):
+            raise SystemExit(1)
         return
     if args.command == "modules":
         _print_json(_run_modules_command(runtime, args))
@@ -1261,6 +1285,12 @@ def _run_management_cli_command(runtime: Runtime, args: argparse.Namespace) -> N
         _print_json(_run_semantic_command(runtime, args))
         return
     raise AssertionError(f"unsupported management command: {args.command}")
+
+
+def _mcp_cli_result_failed(result: dict[str, Any]) -> bool:
+    """Map a structured MCP operation failure to the CLI process status."""
+
+    return result.get("ok") is False
 
 
 def _dispatch_cli_command(
@@ -1313,6 +1343,10 @@ def main(argv: list[str] | None = None) -> None:
         return _print_json(_verify_module_manifest(selected_config, args))
     if args.command == "store":
         return _print_json(_run_store_command(selected_config, args, parser))
+    if _mcp_cli_offline_command(args):
+        runtime = Runtime.open(":memory:", config=selected_config)
+        _dispatch_cli_command_with_shutdown(runtime, args, ":memory:")
+        return
     try:
         selected_db_display = display_store_target(args.db, config=selected_config)
     except LibOSValidationError as exc:
@@ -1325,6 +1359,13 @@ def main(argv: list[str] | None = None) -> None:
         trusted_module_sha256=args.trusted_module_sha256,
     )
     _dispatch_cli_command_with_shutdown(runtime, args, selected_db_display)
+
+
+def _mcp_cli_offline_command(args: argparse.Namespace) -> bool:
+    return (
+        args.command == "mcp"
+        and args.mcp_command in {"validate", "doctor", "scaffold"}
+    )
 
 
 def cli(argv: list[str] | None = None) -> None:
@@ -2366,11 +2407,37 @@ def _parse_json_value(value: str) -> Any:
         return {"content": value}
 
 
-def _parse_strict_json_value(value: str, label: str) -> Any:
+def _parse_strict_json_value(
+    value: str,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+) -> Any:
     try:
-        return bounded_json_loads(value)
+        return bounded_json_loads(value, max_bytes=max_bytes)
     except ValueError as exc:
         raise SystemExit(f"{label} must be valid JSON: {exc}") from exc
+
+
+def _read_bounded_utf8_file(
+    path: Path,
+    *,
+    max_bytes: int,
+    label: str,
+) -> str:
+    """Read at most one byte beyond a Host CLI file limit before decoding."""
+
+    try:
+        with path.open("rb") as stream:
+            payload = stream.read(max_bytes + 1)
+    except OSError as exc:
+        raise SystemExit(f"{label} cannot be read: {path}") from exc
+    if len(payload) > max_bytes:
+        raise SystemExit(f"{label} exceeds max_bytes={max_bytes}")
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SystemExit(f"{label} must be valid UTF-8") from exc
 
 
 def _add_message_parser_args(parser: argparse.ArgumentParser, *, include_kind: bool = True) -> None:
@@ -2925,7 +2992,30 @@ def _add_mcp_parser_args(parser: argparse.ArgumentParser) -> None:
         "--actor-pid",
         help="If set, execute registry operations as this process and enforce MCP server capabilities.",
     )
+    parser.add_argument(
+        "--oauth-profile-file",
+        help=(
+            "Bounded strict Host OAuth profile JSON to bind or rehydrate before "
+            "this command. Place this option before the MCP subcommand."
+        ),
+    )
+    parser.add_argument(
+        "--oauth-client-secret-fd",
+        type=int,
+        help=(
+            "Read a bounded OAuth client secret from this already-open fd (fd >= 3) "
+            "while binding --oauth-profile-file; never accepts a secret in argv."
+        ),
+    )
     sub = parser.add_subparsers(dest="mcp_command", required=True)
+    _add_mcp_registry_parser_args(sub)
+    _add_mcp_resource_prompt_parser_args(sub)
+    _add_mcp_auth_continuation_parser_args(sub)
+    _add_mcp_task_subscription_parser_args(sub)
+    _add_mcp_dx_parser_args(sub)
+
+
+def _add_mcp_registry_parser_args(sub: Any) -> None:
     register = sub.add_parser("register", help="Register an MCP server manifest from YAML or JSON")
     register.add_argument("path")
     register.add_argument("--replace", action="store_true")
@@ -2954,9 +3044,384 @@ def _add_mcp_parser_args(parser: argparse.ArgumentParser) -> None:
     unregister.add_argument("server_id")
 
 
-def _run_mcp_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any] | list[dict[str, Any]]:
+def _add_mcp_resource_prompt_parser_args(sub: Any) -> None:
+    resources = sub.add_parser(
+        "resources",
+        help="Host-only Resource and Resource Template operations for Manifest v3 servers",
+    )
+    resource_sub = resources.add_subparsers(
+        dest="mcp_resources_command",
+        required=True,
+    )
+    resource_list = resource_sub.add_parser(
+        "list",
+        help="List one bounded page of manifest-allowed Resources",
+    )
+    resource_list.add_argument("server_id")
+    resource_list.add_argument("--cursor")
+    resource_templates = resource_sub.add_parser(
+        "templates",
+        help="List one bounded page of manifest-allowed Resource Templates",
+    )
+    resource_templates.add_argument("server_id")
+    resource_templates.add_argument("--cursor")
+    resource_read = resource_sub.add_parser(
+        "read",
+        help="Read a logical Resource; remote URI values remain inert selectors",
+    )
+    resource_read.add_argument("server_id")
+    resource_read.add_argument("resource_id")
+    resource_read.add_argument(
+        "--variables-json",
+        help="Strict JSON object whose keys and values are strings.",
+    )
+
+    prompts = sub.add_parser(
+        "prompts",
+        help="Host-only Prompt preview and Completion operations",
+    )
+    prompt_sub = prompts.add_subparsers(dest="mcp_prompts_command", required=True)
+    prompt_list = prompt_sub.add_parser("list", help="List one bounded Prompt page")
+    prompt_list.add_argument("server_id")
+    prompt_list.add_argument("--cursor")
+    prompt_get = prompt_sub.add_parser(
+        "get",
+        help=(
+            "Preview an untrusted Prompt. Output requires explicit user review and "
+            "is never system/developer context."
+        ),
+    )
+    prompt_get.add_argument("server_id")
+    prompt_get.add_argument("prompt_id")
+    prompt_get.add_argument(
+        "--arguments-json",
+        help="Strict JSON object whose keys and values are strings.",
+    )
+    prompt_complete = prompt_sub.add_parser(
+        "complete",
+        help="Request completion suggestions for a Prompt or Resource Template reference",
+    )
+    prompt_complete.add_argument("server_id")
+    prompt_complete.add_argument(
+        "reference_type",
+        choices=("prompt", "resource-template"),
+    )
+    prompt_complete.add_argument("reference_id")
+    prompt_complete.add_argument("argument_name")
+    prompt_complete.add_argument("argument_value")
+    prompt_complete.add_argument(
+        "--context-json",
+        help="Optional strict JSON object used only as untrusted completion context.",
+    )
+
+
+def _add_mcp_auth_continuation_parser_args(sub: Any) -> None:
+    auth = sub.add_parser(
+        "auth",
+        help="Host-only OAuth lifecycle for configured credential profiles (DCR unsupported)",
+    )
+    auth_sub = auth.add_subparsers(dest="mcp_auth_command", required=True)
+    auth_status = auth_sub.add_parser("status", help="Inspect non-secret OAuth status")
+    auth_status.add_argument("profile_id")
+    auth_login = auth_sub.add_parser(
+        "login",
+        help=(
+            "Run profile registration, authorization, and callback completion in "
+            "one foreground Runtime"
+        ),
+    )
+    auth_login.add_argument("profile_id")
+    auth_login.add_argument(
+        "--profile-file",
+        required=True,
+        help="Bounded strict JSON for one pre-registered or CIMD Host profile.",
+    )
+    auth_login.add_argument("--scope", action="append", default=[])
+    auth_login.add_argument(
+        "--client-secret-fd",
+        type=int,
+        help=(
+            "Read a bounded client secret from this already-open file descriptor "
+            "(fd >= 3); never accepts the secret as an argv value."
+        ),
+    )
+    auth_login.add_argument(
+        "--callback-stdin",
+        action="store_true",
+        help=(
+            "Explicitly read one callback URL line from non-interactive stdin; "
+            "without this flag stdin must be a TTY."
+        ),
+    )
+    auth_logout = auth_sub.add_parser(
+        "logout",
+        help="Rebind one strict Host profile and explicitly purge its local token",
+    )
+    auth_logout.add_argument("profile_id")
+    auth_logout.add_argument(
+        "--profile-file",
+        required=True,
+        help="Bounded strict JSON for the exact Host profile whose token is purged.",
+    )
+
+    continuations = sub.add_parser(
+        "continuations",
+        help="Host-only inspection and single-use response of local Elicitation continuations",
+    )
+    continuation_sub = continuations.add_subparsers(
+        dest="mcp_continuations_command",
+        required=True,
+    )
+    continuation_inspect = continuation_sub.add_parser(
+        "inspect",
+        help="Inspect one sanitized local continuation",
+    )
+    continuation_inspect.add_argument("continuation_id")
+    continuation_respond = continuation_sub.add_parser(
+        "respond",
+        help="CAS-submit responses keyed only by local input request id",
+    )
+    continuation_respond.add_argument("continuation_id")
+    continuation_respond.add_argument("--expected-revision", type=int, required=True)
+    continuation_respond.add_argument(
+        "--human-request-id",
+        required=True,
+        help="Local HumanRequest id from the sanitized continuation view.",
+    )
+    continuation_respond.add_argument(
+        "--human-expected-revision",
+        type=int,
+        required=True,
+    )
+    continuation_respond.add_argument(
+        "--human-preview-sha256",
+        required=True,
+    )
+    continuation_respond.add_argument("--responses-json", required=True)
+    continuation_cancel = continuation_sub.add_parser(
+        "cancel",
+        help="CAS-cancel one local continuation without replaying the original request",
+    )
+    continuation_cancel.add_argument("continuation_id")
+    continuation_cancel.add_argument("--expected-revision", type=int, required=True)
+
+
+def _add_mcp_task_subscription_parser_args(sub: Any) -> None:
+    remote_tasks = sub.add_parser(
+        "remote-tasks",
+        help="Host-only operations on a local remote-task reference (no remote tasks/list)",
+    )
+    remote_task_sub = remote_tasks.add_subparsers(
+        dest="mcp_remote_tasks_command",
+        required=True,
+    )
+    remote_task_get = remote_task_sub.add_parser("get", help="Refresh one local task reference")
+    remote_task_get.add_argument("task_ref")
+    remote_task_get.add_argument("--expected-revision", type=int)
+    remote_task_update = remote_task_sub.add_parser(
+        "update",
+        help="CAS-submit local input responses to one remote task",
+    )
+    remote_task_update.add_argument("task_ref")
+    remote_task_update.add_argument("--expected-revision", type=int, required=True)
+    remote_task_update.add_argument(
+        "--human-request-id",
+        required=True,
+        help="Local HumanRequest id from the sanitized remote-task view.",
+    )
+    remote_task_update.add_argument(
+        "--human-expected-revision",
+        type=int,
+        required=True,
+    )
+    remote_task_update.add_argument(
+        "--human-preview-sha256",
+        required=True,
+    )
+    remote_task_update.add_argument("--responses-json", required=True)
+    remote_task_cancel = remote_task_sub.add_parser(
+        "cancel",
+        help="Request cancellation; acknowledgement does not mean the task stopped",
+    )
+    remote_task_cancel.add_argument("task_ref")
+    remote_task_cancel.add_argument("--expected-revision", type=int, required=True)
+
+    subscriptions = sub.add_parser(
+        "subscriptions",
+        help=(
+            "Host-only foreground subscriptions/listen; events never trigger "
+            "automatic actions"
+        ),
+    )
+    subscription_sub = subscriptions.add_subparsers(
+        dest="mcp_subscriptions_command",
+        required=True,
+    )
+    subscription_listen = subscription_sub.add_parser(
+        "listen",
+        help=(
+            "Start, observe, and stop one listener in this foreground Runtime; "
+            "Ctrl-C performs explicit stop"
+        ),
+    )
+    subscription_listen.add_argument("server_id")
+    subscription_listen.add_argument("--filter", action="append", required=True)
+    subscription_listen.add_argument(
+        "--max-events",
+        type=int,
+        help="Optional positive bound for deterministic foreground completion.",
+    )
+    subscription_listen.add_argument(
+        "--max-seconds",
+        type=float,
+        help="Optional positive foreground lifetime bound.",
+    )
+
+
+def _add_mcp_dx_parser_args(sub: Any) -> None:
+    validate = sub.add_parser(
+        "validate",
+        help="Offline-validate a manifest without provider effects",
+    )
+    validate.add_argument("manifest")
+    doctor = sub.add_parser(
+        "doctor",
+        help="Check a manifest, dependencies and named environment references offline",
+    )
+    doctor.add_argument("manifest")
+    probe = sub.add_parser(
+        "probe",
+        help="Collect all four catalogs from an unregistered v3 candidate through the governed primitive",
+    )
+    probe.add_argument("manifest")
+    _add_mcp_confirmation_args(probe, flag="--confirm-probe")
+
+    scaffold = sub.add_parser(
+        "scaffold",
+        help="Create or approve a conservative Host-reviewed manifest candidate",
+    )
+    scaffold_sub = scaffold.add_subparsers(dest="mcp_scaffold_command", required=True)
+    scaffold_create = scaffold_sub.add_parser(
+        "create",
+        help="Create a non-registerable candidate from a complete probe report",
+    )
+    scaffold_create.add_argument("base_manifest")
+    scaffold_create.add_argument("catalog_json")
+    _add_mcp_confirmation_args(scaffold_create, flag="--confirm-scaffold")
+    scaffold_approve = scaffold_sub.add_parser(
+        "approve",
+        help="Extract and validate a manually reviewed candidate manifest",
+    )
+    scaffold_approve.add_argument("candidate_json")
+    _add_mcp_confirmation_args(scaffold_approve, flag="--confirm-review")
+
+    export = sub.add_parser(
+        "export",
+        help="Export canonical manifests with references but never secret values",
+    )
+    export.add_argument("--server", action="append", dest="servers")
+    import_parser = sub.add_parser(
+        "import",
+        help="Plan or CAS-apply a bounded registry export",
+    )
+    import_sub = import_parser.add_subparsers(dest="mcp_import_command", required=True)
+    import_plan = import_sub.add_parser("plan", help="Validate and show create/replace actions")
+    import_plan.add_argument("bundle_json")
+    import_apply = import_sub.add_parser(
+        "apply",
+        help="CAS-import exactly one explicitly selected server",
+    )
+    import_apply.add_argument("bundle_json")
+    import_apply.add_argument("server_id")
+    _add_mcp_confirmation_args(import_apply, flag="--confirm-import")
+
+
+def _add_mcp_confirmation_args(
+    parser: argparse.ArgumentParser,
+    *,
+    flag: str,
+) -> None:
+    parser.add_argument(
+        flag,
+        action="store_true",
+        dest="mcp_confirmed",
+        help="Explicitly confirm this Host operation after reviewing its scope.",
+    )
+    parser.add_argument("--reviewer", required=True)
+    parser.add_argument("--reason", required=True)
+
+
+def _run_mcp_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any]:
     actor = args.actor_pid or "cli"
     require_capability = args.actor_pid is not None
+    command = args.mcp_command
+    if require_capability and command in {
+        "resources",
+        "prompts",
+        "auth",
+        "continuations",
+        "remote-tasks",
+        "subscriptions",
+        "validate",
+        "doctor",
+        "probe",
+        "scaffold",
+        "export",
+        "import",
+    }:
+        raise LibOSValidationError(
+            f"mcp {command} is a Host-only surface and does not accept --actor-pid"
+        )
+    if command in {
+        "list",
+        "inspect",
+        "unregister",
+        "validate",
+        "doctor",
+        "scaffold",
+        "export",
+        "import",
+    }:
+        _bind_mcp_cli_oauth_profile(runtime, args)
+    if command in {
+        "register",
+        "list",
+        "inspect",
+        "discover",
+        "tools",
+        "call",
+        "unregister",
+    }:
+        return _run_mcp_registry_command(
+            runtime,
+            args,
+            actor=actor,
+            require_capability=require_capability,
+        )
+    if command == "resources":
+        return _run_mcp_resources_command(runtime, args, actor=actor)
+    if command == "prompts":
+        return _run_mcp_prompts_command(runtime, args, actor=actor)
+    if command == "auth":
+        return _run_mcp_auth_command(runtime, args, actor=actor)
+    if command == "continuations":
+        return _run_mcp_continuations_command(runtime, args, actor=actor)
+    if command == "remote-tasks":
+        return _run_mcp_remote_tasks_command(runtime, args, actor=actor)
+    if command == "subscriptions":
+        return _run_mcp_subscriptions_command(runtime, args, actor=actor)
+    if command in {"validate", "doctor", "probe", "scaffold", "export", "import"}:
+        return _run_mcp_dx_command(runtime, args)
+    raise SystemExit(f"unknown mcp command: {command}")
+
+
+def _run_mcp_registry_command(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    *,
+    actor: str,
+    require_capability: bool,
+) -> dict[str, Any]:
     command = args.mcp_command
     if command == "register":
         if require_capability:
@@ -2967,33 +3432,38 @@ def _run_mcp_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, An
                 max_bytes=runtime.config.mcp.manifest_max_bytes,
                 cwd=cwd,
             )
-            return runtime.mcp.register_server_from_yaml_text(
-                read.content,
-                actor=actor,
-                replace=args.replace,
-                require_capability=True,
-                source=read.path,
+            manifest_text = read.content
+            source = read.path
+        else:
+            path = Path(args.path).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            path = path.resolve()
+            if not path.exists() or not path.is_file():
+                raise SystemExit(f"MCP server manifest does not exist: {path}")
+            manifest_text = _read_bounded_utf8_file(
+                path,
+                max_bytes=runtime.config.mcp.manifest_max_bytes,
+                label="MCP server manifest",
             )
-        path = Path(args.path).expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        path = path.resolve()
-        if not path.exists() or not path.is_file():
-            raise SystemExit(f"MCP server manifest does not exist: {path}")
+            source = str(path)
+        _preflight_mcp_cli_oauth_manifest(runtime, args, manifest_text)
+        _bind_mcp_cli_oauth_profile(runtime, args)
         return runtime.mcp.register_server_from_yaml_text(
-            path.read_text(encoding="utf-8"),
+            manifest_text,
             actor=actor,
             replace=args.replace,
-            require_capability=False,
-            source=str(path),
+            require_capability=require_capability,
+            source=source,
         )
     if command == "list":
-        return runtime.mcp.list_servers(
+        servers, has_more = runtime.mcp.list_servers_window(
             actor=actor if require_capability else None,
             require_capability=require_capability,
             text=args.text,
             limit=args.limit,
         )
+        return {"servers": servers, "has_more": has_more}
     if command == "inspect":
         return runtime.mcp.inspect_server(
             args.server_id,
@@ -3002,6 +3472,7 @@ def _run_mcp_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, An
             include_sensitive_fields=not require_capability,
         )
     if command == "discover":
+        _bind_mcp_cli_oauth_profile(runtime, args)
         return to_jsonable(
             runtime.mcp.discover(
                 args.server_id,
@@ -3010,6 +3481,7 @@ def _run_mcp_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, An
             )
         )
     if command == "tools":
+        _bind_mcp_cli_oauth_profile(runtime, args)
         return runtime.mcp.list_tools(
             args.server_id,
             actor=actor,
@@ -3019,13 +3491,27 @@ def _run_mcp_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, An
     if command == "call":
         if args.actor_pid is not None and args.actor_pid != args.pid:
             raise SystemExit("mcp call --actor-pid must match the target process pid")
+        mcp_config = getattr(
+            getattr(runtime, "config", DEFAULT_CONFIG),
+            "mcp",
+            DEFAULT_CONFIG.mcp,
+        )
         arguments = (
-            _parse_strict_json_value(args.arguments_json, "--arguments-json")
+            _parse_strict_json_value(
+                args.arguments_json,
+                "--arguments-json",
+                max_bytes=getattr(
+                    mcp_config,
+                    "max_request_hard_limit_bytes",
+                    DEFAULT_CONFIG.mcp.max_request_hard_limit_bytes,
+                ),
+            )
             if args.arguments_json is not None
             else {}
         )
         if not isinstance(arguments, dict):
             raise SystemExit("--arguments-json must be a JSON object")
+        _bind_mcp_cli_oauth_profile(runtime, args)
         return to_jsonable(runtime.mcp.call_tool(args.pid, args.server_id, args.tool_id, arguments))
     if command == "unregister":
         return runtime.mcp.unregister_server(
@@ -3033,7 +3519,1852 @@ def _run_mcp_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, An
             actor=actor,
             require_capability=require_capability,
         )
-    raise SystemExit(f"unknown mcp command: {command}")
+    raise SystemExit(f"unknown mcp registry command: {command}")
+
+
+def _run_mcp_resources_command(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    *,
+    actor: str,
+) -> dict[str, Any]:
+    selected = args.mcp_resources_command
+    if selected == "list":
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_page(
+            _invoke_mcp_client(
+                runtime,
+                "list_resources",
+                args.server_id,
+                cursor=args.cursor,
+                actor=actor,
+            ),
+            item_key="resources",
+            item_contract="resource",
+            operation="resources/list",
+        )
+    if selected == "templates":
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_page(
+            _invoke_mcp_client(
+                runtime,
+                "list_resource_templates",
+                args.server_id,
+                cursor=args.cursor,
+                actor=actor,
+            ),
+            item_key="resource_templates",
+            item_contract="resource_template",
+            operation="resources/templates",
+        )
+    if selected == "read":
+        variables = _parse_mcp_cli_string_mapping(
+            runtime,
+            args.variables_json,
+            label="--variables-json",
+            default={},
+        )
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_operation_result(
+            _invoke_mcp_client(
+                runtime,
+                "read_resource",
+                args.server_id,
+                args.resource_id,
+                variables=variables,
+                actor=actor,
+            ),
+            operation="resources/read",
+            allowed_kinds=("complete", "input_required", "remote_task"),
+            complete_contract="resource_contents",
+        )
+    raise LibOSValidationError(f"unknown mcp resources command: {selected}")
+
+
+def _run_mcp_prompts_command(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    *,
+    actor: str,
+) -> dict[str, Any]:
+    selected = args.mcp_prompts_command
+    if selected == "list":
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_page(
+            _invoke_mcp_client(
+                runtime,
+                "list_prompts",
+                args.server_id,
+                cursor=args.cursor,
+                actor=actor,
+            ),
+            item_key="prompts",
+            item_contract="prompt",
+            operation="prompts/list",
+        )
+    if selected == "get":
+        arguments = _parse_mcp_cli_string_mapping(
+            runtime,
+            args.arguments_json,
+            label="--arguments-json",
+            default={},
+        )
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_operation_result(
+            _invoke_mcp_client(
+                runtime,
+                "get_prompt",
+                args.server_id,
+                args.prompt_id,
+                arguments=arguments,
+                actor=actor,
+            ),
+            operation="prompts/get",
+            allowed_kinds=("complete", "input_required", "remote_task"),
+            complete_contract="prompt_result",
+            prompt_preview=True,
+        )
+    if selected == "complete":
+        context = _parse_mcp_cli_string_mapping(
+            runtime,
+            args.context_json,
+            label="--context-json",
+            default=None,
+        )
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_operation_result(
+            _invoke_mcp_client(
+                runtime,
+                "complete_prompt",
+                args.server_id,
+                (
+                    "resource_template"
+                    if args.reference_type == "resource-template"
+                    else "prompt"
+                ),
+                args.reference_id,
+                {
+                    "name": args.argument_name,
+                    "value": args.argument_value,
+                },
+                context=context,
+                actor=actor,
+            ),
+            operation="prompts/complete",
+            allowed_kinds=("complete",),
+            complete_contract="completion_result",
+            prompt_preview=True,
+        )
+    raise LibOSValidationError(f"unknown mcp prompts command: {selected}")
+
+
+def _run_mcp_auth_command(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    *,
+    actor: str,
+) -> dict[str, Any]:
+    selected = args.mcp_auth_command
+    if selected == "status":
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_auth_result(
+            _invoke_mcp_client(
+                runtime,
+                "auth_status",
+                args.profile_id,
+                actor=actor,
+            ),
+            operation="auth/status",
+        )
+    if selected == "login":
+        scopes = _validated_mcp_cli_strings(
+            args.scope,
+            label="OAuth scope",
+            allow_empty=True,
+        )
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        challenge = _mcp_cli_auth_result(
+            _invoke_mcp_client(
+                runtime,
+                "auth_begin",
+                args.profile_id,
+                scopes=scopes,
+                actor=actor,
+                redact_error=True,
+            ),
+            operation="auth/login/begin",
+        )
+        _show_mcp_cli_oauth_challenge(challenge)
+        callback_url = _read_mcp_cli_oauth_callback()
+        try:
+            return _mcp_cli_auth_result(
+                _invoke_mcp_client(
+                    runtime,
+                    "auth_complete",
+                    challenge["challenge_id"],
+                    callback_url,
+                    actor=actor,
+                    redact_error=True,
+                ),
+                operation="auth/login/complete",
+            )
+        finally:
+            callback_url = ""
+    if selected == "logout":
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_auth_result(
+            _invoke_mcp_client(
+                runtime,
+                "auth_logout",
+                args.profile_id,
+                actor=actor,
+                redact_error=True,
+            ),
+            operation="auth/logout",
+        )
+    raise LibOSValidationError(f"unknown mcp auth command: {selected}")
+
+
+def _bind_mcp_cli_oauth_profile(runtime: Runtime, args: argparse.Namespace) -> None:
+    path = _select_mcp_cli_oauth_option(
+        getattr(args, "oauth_profile_file", None),
+        getattr(args, "profile_file", None),
+        label="profile file",
+    )
+    secret_fd = _select_mcp_cli_oauth_option(
+        getattr(args, "oauth_client_secret_fd", None),
+        getattr(args, "client_secret_fd", None),
+        label="client secret fd",
+    )
+    auth_command = getattr(args, "mcp_auth_command", None)
+    is_login = (
+        args.mcp_command == "auth"
+        and auth_command == "login"
+    )
+    if path is None:
+        if secret_fd is not None:
+            raise LibOSValidationError(
+                "MCP OAuth client secret fd requires an OAuth profile file"
+            )
+        if is_login:
+            raise LibOSValidationError(
+                "MCP OAuth foreground login requires a strict profile file"
+            )
+        if args.mcp_command == "auth" and auth_command == "logout":
+            raise LibOSValidationError(
+                "MCP OAuth logout requires a strict profile file"
+            )
+        return
+    if is_login and not args.callback_stdin and not _mcp_cli_stdin_is_tty():
+        raise LibOSValidationError(
+            "MCP OAuth foreground login requires a TTY or explicit --callback-stdin"
+        )
+    if args.actor_pid is not None:
+        raise LibOSValidationError(
+            "MCP OAuth profile binding is a Host-only surface"
+        )
+    if args.mcp_command in {
+        "list",
+        "inspect",
+        "unregister",
+        "validate",
+        "doctor",
+        "scaffold",
+        "export",
+        "import",
+    }:
+        raise LibOSValidationError(
+            f"mcp {args.mcp_command} does not perform an OAuth-bound remote operation"
+        )
+    profile = getattr(args, "_mcp_cli_prevalidated_oauth_profile", None)
+    if profile is None:
+        profile = _mcp_cli_oauth_profile(path)
+    if (
+        args.mcp_command == "auth"
+        and auth_command in {"login", "logout"}
+        and profile.profile_id != args.profile_id
+    ):
+        raise LibOSValidationError(
+            "MCP OAuth profile file identity does not match profile_id"
+        )
+    client_secret = _read_mcp_cli_secret_fd(secret_fd)
+    _invoke_mcp_client(
+        runtime,
+        "add_oauth_profile",
+        profile,
+        client_secret=client_secret,
+        actor="cli",
+        redact_error=True,
+    )
+
+
+def _preflight_mcp_cli_oauth_manifest(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    manifest_text: str,
+) -> None:
+    path = _select_mcp_cli_oauth_option(
+        getattr(args, "oauth_profile_file", None),
+        getattr(args, "profile_file", None),
+        label="profile file",
+    )
+    if path is None:
+        return
+    if args.actor_pid is not None:
+        raise LibOSValidationError(
+            "MCP OAuth profile binding is a Host-only surface"
+        )
+    from agent_libos.mcp.manifest import parse_mcp_v3_manifest_yaml_text
+
+    manifest = parse_mcp_v3_manifest_yaml_text(
+        manifest_text,
+        tasks_extension_sha256=runtime.config.mcp.tasks_extension_spec_sha256,
+        enforce_host_policy=False,
+    )
+    profile = _mcp_cli_oauth_profile(path)
+    if (
+        manifest.auth_profile_id != profile.profile_id
+        or manifest.server_id != profile.server_id
+        or manifest.http is None
+        or manifest.http.url != profile.resource_uri
+    ):
+        raise LibOSValidationError(
+            "MCP OAuth profile does not match the candidate v3 manifest"
+        )
+    setattr(args, "_mcp_cli_prevalidated_oauth_profile", profile)
+
+
+def _select_mcp_cli_oauth_option(
+    global_value: Any,
+    local_value: Any,
+    *,
+    label: str,
+) -> Any:
+    if global_value is not None and local_value is not None:
+        raise LibOSValidationError(
+            f"MCP OAuth {label} must be supplied at most once"
+        )
+    return global_value if global_value is not None else local_value
+
+
+def _mcp_cli_oauth_profile(path: str) -> Any:
+    from agent_libos.mcp import mcp_oauth_profile_from_mapping
+
+    selected = _read_mcp_cli_json_file(
+        path,
+        max_bytes=_MCP_CLI_OAUTH_PROFILE_MAX_BYTES,
+        label="MCP OAuth profile",
+    )
+    if not isinstance(selected, dict):
+        raise LibOSValidationError("MCP OAuth profile must be a strict JSON object")
+    try:
+        return mcp_oauth_profile_from_mapping(selected)
+    except LibOSError:
+        raise
+    except Exception:
+        raise LibOSValidationError("MCP OAuth profile is invalid") from None
+
+
+def _read_mcp_cli_secret_fd(fd: int | None) -> bytes | None:
+    if fd is None:
+        return None
+    if type(fd) is not int or fd < 3:
+        raise LibOSValidationError("MCP OAuth --client-secret-fd must be an integer >= 3")
+    try:
+        duplicate = os.dup(fd)
+        with os.fdopen(duplicate, "rb", closefd=True) as stream:
+            value = stream.read(_MCP_CLI_OAUTH_CLIENT_SECRET_MAX_BYTES + 1)
+    except OSError:
+        raise LibOSValidationError("MCP OAuth client secret input is unavailable") from None
+    if value.endswith(b"\n"):
+        value = value[:-1]
+        if value.endswith(b"\r"):
+            value = value[:-1]
+    if (
+        not value
+        or len(value) > _MCP_CLI_OAUTH_CLIENT_SECRET_MAX_BYTES
+        or b"\x00" in value
+        or b"\r" in value
+        or b"\n" in value
+    ):
+        raise LibOSValidationError("MCP OAuth client secret input is invalid or oversized")
+    return value
+
+
+def _mcp_cli_stdin_is_tty() -> bool:
+    isatty = getattr(sys.stdin, "isatty", None)
+    return bool(isatty()) if callable(isatty) else False
+
+
+def _show_mcp_cli_oauth_challenge(challenge: dict[str, Any]) -> None:
+    print(
+        "MCP OAuth authorization URL (open manually; never opened automatically):",
+        file=sys.stderr,
+        flush=True,
+    )
+    print(challenge["authorization_url"], file=sys.stderr, flush=True)
+    print("Paste the full callback URL and press Enter:", file=sys.stderr, flush=True)
+
+
+def _read_mcp_cli_oauth_callback() -> str:
+    try:
+        value = sys.stdin.readline(_MCP_CLI_OAUTH_CALLBACK_MAX_BYTES + 2)
+    except (OSError, UnicodeError):
+        raise LibOSValidationError("MCP OAuth callback input is unavailable") from None
+    if value.endswith("\n"):
+        value = value[:-1]
+        if value.endswith("\r"):
+            value = value[:-1]
+    return _bounded_mcp_cli_secret(value, label="OAuth callback URL")
+
+
+def _run_mcp_continuations_command(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    *,
+    actor: str,
+) -> dict[str, Any]:
+    selected = args.mcp_continuations_command
+    if selected == "inspect":
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_operation_result(
+            _invoke_mcp_client(
+                runtime,
+                "get_continuation",
+                args.continuation_id,
+                actor=actor,
+            ),
+            operation="continuations/inspect",
+            allowed_kinds=("input_required",),
+        )
+    revision = _validated_mcp_cli_revision(args.expected_revision)
+    if selected == "respond":
+        human_request_id = _validated_mcp_cli_string(
+            args.human_request_id,
+            label="HumanRequest id",
+        )
+        human_revision = _validated_mcp_cli_revision(args.human_expected_revision)
+        human_preview_sha256 = _validated_mcp_cli_sha256(
+            args.human_preview_sha256,
+            label="HumanRequest preview SHA-256",
+        )
+        responses = _parse_mcp_cli_json_object(
+            runtime,
+            args.responses_json,
+            label="--responses-json",
+        )
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_operation_result(
+            _invoke_mcp_client(
+                runtime,
+                "respond_continuation",
+                args.continuation_id,
+                expected_revision=revision,
+                responses=responses,
+                human_request_id=human_request_id,
+                human_expected_revision=human_revision,
+                human_preview_sha256=human_preview_sha256,
+                actor=actor,
+                redact_error=True,
+            ),
+            operation="continuations/respond",
+            allowed_kinds=("complete", "input_required", "remote_task"),
+        )
+    if selected == "cancel":
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_operation_result(
+            _invoke_mcp_client(
+                runtime,
+                "cancel_continuation",
+                args.continuation_id,
+                expected_revision=revision,
+                actor=actor,
+                redact_error=True,
+            ),
+            operation="continuations/cancel",
+            allowed_kinds=("complete",),
+        )
+    raise LibOSValidationError(f"unknown mcp continuations command: {selected}")
+
+
+def _run_mcp_remote_tasks_command(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    *,
+    actor: str,
+) -> dict[str, Any]:
+    selected = args.mcp_remote_tasks_command
+    if selected == "get":
+        revision = (
+            None
+            if args.expected_revision is None
+            else _validated_mcp_cli_revision(args.expected_revision)
+        )
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_operation_result(
+            _invoke_mcp_client(
+                runtime,
+                "get_remote_task",
+                args.task_ref,
+                expected_revision=revision,
+                actor=actor,
+            ),
+            operation="remote-tasks/get",
+            allowed_kinds=("remote_task",),
+        )
+    revision = _validated_mcp_cli_revision(args.expected_revision)
+    if selected == "update":
+        human_request_id = _validated_mcp_cli_string(
+            args.human_request_id,
+            label="HumanRequest id",
+        )
+        human_revision = _validated_mcp_cli_revision(args.human_expected_revision)
+        human_preview_sha256 = _validated_mcp_cli_sha256(
+            args.human_preview_sha256,
+            label="HumanRequest preview SHA-256",
+        )
+        responses = _parse_mcp_cli_json_object(
+            runtime,
+            args.responses_json,
+            label="--responses-json",
+        )
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_operation_result(
+            _invoke_mcp_client(
+                runtime,
+                "update_remote_task",
+                args.task_ref,
+                expected_revision=revision,
+                responses=responses,
+                human_request_id=human_request_id,
+                human_expected_revision=human_revision,
+                human_preview_sha256=human_preview_sha256,
+                actor=actor,
+                redact_error=True,
+            ),
+            operation="remote-tasks/update",
+            allowed_kinds=("remote_task",),
+        )
+    if selected == "cancel":
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return _mcp_cli_operation_result(
+            _invoke_mcp_client(
+                runtime,
+                "cancel_remote_task",
+                args.task_ref,
+                expected_revision=revision,
+                actor=actor,
+                redact_error=True,
+            ),
+            operation="remote-tasks/cancel",
+            allowed_kinds=("remote_task",),
+        )
+    raise LibOSValidationError(f"unknown mcp remote-tasks command: {selected}")
+
+
+def _run_mcp_subscriptions_command(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    *,
+    actor: str,
+) -> dict[str, Any]:
+    selected = args.mcp_subscriptions_command
+    if selected == "listen":
+        return _run_mcp_subscription_listener(runtime, args, actor=actor)
+    raise LibOSValidationError(f"unknown mcp subscriptions command: {selected}")
+
+
+def _run_mcp_subscription_listener(
+    runtime: Runtime,
+    args: argparse.Namespace,
+    *,
+    actor: str,
+) -> dict[str, Any]:
+    filters = _validated_mcp_cli_strings(
+        args.filter,
+        label="subscription filter",
+    )
+    max_events = args.max_events
+    if max_events is not None and (
+        type(max_events) is not int or not 1 <= max_events <= 100_000
+    ):
+        raise LibOSValidationError(
+            "MCP subscriptions listen requires 1 <= --max-events <= 100000"
+        )
+    max_seconds = args.max_seconds
+    if max_seconds is not None and (
+        type(max_seconds) not in {int, float}
+        or not math.isfinite(float(max_seconds))
+        or not 0 < float(max_seconds) <= 86_400
+    ):
+        raise LibOSValidationError(
+            "MCP subscriptions listen requires 0 < --max-seconds <= 86400"
+        )
+    _bind_mcp_cli_oauth_profile(runtime, args)
+    opened = _mcp_cli_subscription_result(
+        _invoke_mcp_client(
+            runtime,
+            "start_subscription",
+            args.server_id,
+            filters=filters,
+            actor=actor,
+        ),
+        operation="subscriptions/listen/start",
+    )
+    subscription_id = _validated_mcp_cli_string(
+        opened.get("subscription_id"),
+        label="subscription id",
+    )
+    print(
+        dumps({"mcp_subscription": "opened", "value": opened}),
+        file=sys.stderr,
+        flush=True,
+    )
+    started = time.monotonic()
+    after = 0
+    seen = 0
+    interrupted = False
+    terminal_status: str | None = None
+    stopped: dict[str, Any] | None = None
+    try:
+        while max_events is None or seen < max_events:
+            if max_seconds is not None and time.monotonic() - started >= max_seconds:
+                break
+            events = _mcp_cli_subscription_event_batch(
+                runtime,
+                subscription_id,
+                after=after,
+                actor=actor,
+            )
+            for event in events:
+                sequence = event["sequence"]
+                if sequence <= after:
+                    raise LibOSValidationError(
+                        "MCP subscription event sequence did not advance"
+                    )
+                after = sequence
+                seen += 1
+                print(
+                    dumps({"mcp_subscription_event": event}),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if max_events is not None and seen >= max_events:
+                    break
+            if max_events is not None and seen >= max_events:
+                break
+            status = _mcp_cli_subscription_result(
+                _invoke_mcp_client(
+                    runtime,
+                    "subscription_status",
+                    subscription_id,
+                    actor=actor,
+                ),
+                operation="subscriptions/listen/status",
+            )
+            terminal_status = status.get("status")
+            if terminal_status in {"lost", "closed"}:
+                break
+            time.sleep(_MCP_CLI_SUBSCRIPTION_POLL_S)
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        stopped = _mcp_cli_subscription_result(
+            _invoke_mcp_client(
+                runtime,
+                "stop_subscription",
+                subscription_id,
+                actor=actor,
+            ),
+            operation="subscriptions/listen/stop",
+        )
+    return {
+        "subscription_id": subscription_id,
+        "events_seen": seen,
+        "last_sequence": after,
+        "interrupted": interrupted,
+        "terminal_status": terminal_status,
+        "stopped": stopped,
+    }
+
+
+def _mcp_cli_subscription_event_batch(
+    runtime: Runtime,
+    subscription_id: str,
+    *,
+    after: int,
+    actor: str,
+) -> list[dict[str, Any]]:
+    selected = to_jsonable(
+        _invoke_mcp_client(
+            runtime,
+            "subscription_events",
+            subscription_id,
+            after=after,
+            limit=_MCP_CLI_SUBSCRIPTION_EVENT_BATCH,
+            actor=actor,
+        )
+    )
+    if not isinstance(selected, list):
+        raise LibOSValidationError(
+            "MCP subscriptions/listen returned an invalid event batch"
+        )
+    events: list[dict[str, Any]] = []
+    for event in selected:
+        if (
+            not isinstance(event, dict)
+            or set(event) != _MCP_CLI_SUBSCRIPTION_EVENT_KEYS
+            or type(event.get("sequence")) is not int
+            or event["sequence"] < 0
+            or type(event.get("event_type")) is not str
+            or not event["event_type"]
+            or type(event.get("received_at")) is not str
+            or not event["received_at"]
+            or event.get("provenance") != "untrusted_mcp_notification"
+        ):
+            raise LibOSValidationError(
+                "MCP subscriptions/listen returned an invalid event"
+            )
+        events.append(event)
+    return events
+
+
+def _mcp_cli_subscription_result(value: Any, *, operation: str) -> dict[str, Any]:
+    selected = _mcp_cli_mapping_result(value, operation=operation)
+    if (
+        set(selected) != _MCP_CLI_SUBSCRIPTION_KEYS
+        or type(selected.get("subscription_id")) is not str
+        or not selected["subscription_id"]
+        or type(selected.get("server_id")) is not str
+        or not selected["server_id"]
+        or selected.get("status") not in {"opening", "active", "lost", "closed"}
+        or not _mcp_cli_string_array(selected.get("requested_filters"))
+        or not _mcp_cli_string_array(selected.get("acknowledged_filters"))
+        or any(
+            item is not None and type(item) is not str
+            for item in (
+                selected.get("opened_at"),
+                selected.get("closed_at"),
+                selected.get("lost_reason"),
+            )
+        )
+    ):
+        raise LibOSValidationError(f"MCP {operation} returned an invalid subscription")
+    return selected
+
+
+def _mcp_cli_string_array(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) <= _MCP_CLI_STRING_LIST_MAX_ITEMS
+        and all(type(item) is str and bool(item) for item in value)
+        and len(set(value)) == len(value)
+    )
+
+
+_MCP_CLI_MISSING = object()
+_MCP_CLI_OAUTH_CALLBACK_MAX_BYTES = 16 * 1024
+_MCP_CLI_OAUTH_PROFILE_MAX_BYTES = 64 * 1024
+_MCP_CLI_OAUTH_CLIENT_SECRET_MAX_BYTES = 16 * 1024
+_MCP_CLI_STRING_MAX_BYTES = 2 * 1024
+_MCP_CLI_STRING_LIST_MAX_ITEMS = 128
+_MCP_CLI_SUBSCRIPTION_EVENT_BATCH = 100
+_MCP_CLI_SUBSCRIPTION_POLL_S = 0.05
+_MCP_CLI_SUBSCRIPTION_KEYS = frozenset(
+    {
+        "subscription_id",
+        "server_id",
+        "status",
+        "requested_filters",
+        "acknowledged_filters",
+        "opened_at",
+        "closed_at",
+        "lost_reason",
+    }
+)
+_MCP_CLI_SUBSCRIPTION_EVENT_KEYS = frozenset(
+    {"sequence", "event_type", "payload", "received_at", "provenance"}
+)
+_MCP_CLI_OAUTH_STATUS_KEYS = frozenset(
+    {
+        "profile_id",
+        "status",
+        "issuer",
+        "resource",
+        "scopes",
+        "principal_sha256",
+        "expires_at",
+    }
+)
+_MCP_CLI_OAUTH_STATUS_VALUES = frozenset(
+    {
+        "unconfigured",
+        "authorization_required",
+        "authorized",
+        "expired",
+        "revoked",
+        "needs_attention",
+    }
+)
+_MCP_CLI_OAUTH_CHALLENGE_KEYS = frozenset(
+    {"challenge_id", "authorization_url", "expires_at"}
+)
+_MCP_CLI_PAGE_KEYS = frozenset({"items", "next_cursor", "cache_hint"})
+_MCP_CLI_CACHE_HINT_KEYS = frozenset({"ttl_ms", "scope"})
+_MCP_CLI_RESOURCE_KEYS = frozenset(
+    {
+        "resource_id",
+        "name",
+        "title",
+        "description",
+        "mime_type",
+        "size",
+        "icons",
+        "annotations",
+        "metadata",
+    }
+)
+_MCP_CLI_RESOURCE_TEMPLATE_KEYS = frozenset(
+    {
+        "template_id",
+        "name",
+        "title",
+        "description",
+        "mime_type",
+        "icons",
+        "annotations",
+        "metadata",
+    }
+)
+_MCP_CLI_PROMPT_KEYS = frozenset(
+    {
+        "prompt_id",
+        "name",
+        "title",
+        "description",
+        "arguments",
+        "icons",
+        "metadata",
+    }
+)
+_MCP_CLI_ICON_KEYS = frozenset({"src", "mime_type", "sizes"})
+_MCP_CLI_ANNOTATION_KEYS = frozenset(
+    {"audience", "priority", "last_modified"}
+)
+_MCP_CLI_PROMPT_ARGUMENT_KEYS = frozenset(
+    {"name", "title", "description", "required"}
+)
+_MCP_CLI_COMPLETE_KEYS = frozenset({"kind", "value", "preview_sha256"})
+_MCP_CLI_INPUT_REQUIRED_KEYS = frozenset(
+    {
+        "kind",
+        "continuation_id",
+        "input_requests",
+        "expires_at",
+        "revision",
+        "respondable",
+        "human_request_id",
+        "human_revision",
+        "human_preview_sha256",
+    }
+)
+_MCP_CLI_REMOTE_TASK_KEYS = frozenset(
+    {
+        "kind",
+        "task_ref",
+        "status",
+        "status_message",
+        "result",
+        "input_requests",
+        "created_at",
+        "updated_at",
+        "ttl_ms",
+        "poll_interval_ms",
+        "revision",
+        "human_request_id",
+        "human_revision",
+        "human_preview_sha256",
+    }
+)
+_MCP_CLI_INPUT_REQUEST_KEYS = frozenset(
+    {"request_id", "kind", "mode", "prompt", "schema", "inert_url"}
+)
+_MCP_CLI_RESOURCE_CONTENTS_KEYS = frozenset(
+    {"resource_id", "contents", "provenance"}
+)
+_MCP_CLI_TEXT_CONTENT_KEYS = frozenset(
+    {"kind", "text", "annotations", "metadata"}
+)
+_MCP_CLI_BLOB_CONTENT_KEYS = frozenset(
+    {"kind", "artifact", "annotations", "metadata"}
+)
+_MCP_CLI_RESOURCE_LINK_KEYS = frozenset(
+    {
+        "kind",
+        "resource_handle",
+        "name",
+        "title",
+        "description",
+        "mime_type",
+        "annotations",
+        "metadata",
+    }
+)
+_MCP_CLI_ARTIFACT_RECEIPT_KEYS = frozenset(
+    {"artifact_id", "byte_length", "sha256", "mime_type"}
+)
+_MCP_CLI_PROMPT_RESULT_KEYS = frozenset(
+    {"prompt_id", "messages", "description", "user_confirmation_required"}
+)
+_MCP_CLI_PROMPT_MESSAGE_KEYS = frozenset(
+    {"role", "content", "provenance"}
+)
+_MCP_CLI_COMPLETION_RESULT_KEYS = frozenset({"values", "total", "has_more"})
+_MCP_CLI_REMOTE_TASK_STATUSES = frozenset(
+    {
+        "working",
+        "input_required",
+        "completed",
+        "failed",
+        "cancelled",
+        "cancel_requested",
+        "needs_attention",
+    }
+)
+_MCP_CLI_INPUT_REQUEST_KINDS = frozenset(
+    {"elicitation", "sampling_unsupported", "roots_unsupported"}
+)
+
+
+def _mcp_cli_request_limit(runtime: Runtime) -> int:
+    mcp_config = getattr(
+        getattr(runtime, "config", DEFAULT_CONFIG),
+        "mcp",
+        DEFAULT_CONFIG.mcp,
+    )
+    return int(
+        getattr(
+            mcp_config,
+            "max_request_hard_limit_bytes",
+            DEFAULT_CONFIG.mcp.max_request_hard_limit_bytes,
+        )
+    )
+
+
+def _parse_mcp_cli_json_object(
+    runtime: Runtime,
+    value: str | None,
+    *,
+    label: str,
+    default: Any = _MCP_CLI_MISSING,
+) -> dict[str, Any] | None:
+    if value is None:
+        if default is _MCP_CLI_MISSING:
+            raise LibOSValidationError(f"{label} is required")
+        return default
+    try:
+        selected = bounded_json_loads(
+            value,
+            max_bytes=_mcp_cli_request_limit(runtime),
+        )
+    except ValueError as exc:
+        raise LibOSValidationError(f"{label} must be valid bounded JSON: {exc}") from None
+    if not isinstance(selected, dict):
+        raise LibOSValidationError(f"{label} must be a JSON object; null is not accepted")
+    return selected
+
+
+def _parse_mcp_cli_string_mapping(
+    runtime: Runtime,
+    value: str | None,
+    *,
+    label: str,
+    default: dict[str, str] | None,
+) -> dict[str, str] | None:
+    selected = _parse_mcp_cli_json_object(
+        runtime,
+        value,
+        label=label,
+        default=default,
+    )
+    if selected is None:
+        return None
+    if any(type(item) is not str for item in selected.values()):
+        raise LibOSValidationError(f"{label} values must all be strings")
+    return {str(key): item for key, item in selected.items()}
+
+
+def _validated_mcp_cli_strings(
+    values: Any,
+    *,
+    label: str,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    if allow_empty and values == []:
+        return ()
+    if not isinstance(values, list) or not values:
+        raise LibOSValidationError(f"MCP {label} requires at least one value")
+    if len(values) > _MCP_CLI_STRING_LIST_MAX_ITEMS:
+        raise LibOSValidationError(
+            f"MCP {label} exceeds maximum items={_MCP_CLI_STRING_LIST_MAX_ITEMS}"
+        )
+    selected: list[str] = []
+    for value in values:
+        if type(value) is not str or not value or "\x00" in value:
+            raise LibOSValidationError(f"MCP {label} values must be non-empty strings")
+        if len(value.encode("utf-8")) > _MCP_CLI_STRING_MAX_BYTES:
+            raise LibOSValidationError(
+                f"MCP {label} value exceeds max bytes={_MCP_CLI_STRING_MAX_BYTES}"
+            )
+        selected.append(value)
+    if len(set(selected)) != len(selected):
+        raise LibOSValidationError(f"MCP {label} values must be unique")
+    return tuple(selected)
+
+
+def _bounded_mcp_cli_secret(value: Any, *, label: str) -> str:
+    if type(value) is not str or not value or "\x00" in value:
+        raise LibOSValidationError(f"{label} must be a non-empty string")
+    if len(value.encode("utf-8")) > _MCP_CLI_OAUTH_CALLBACK_MAX_BYTES:
+        raise LibOSValidationError(
+            f"{label} exceeds max bytes={_MCP_CLI_OAUTH_CALLBACK_MAX_BYTES}"
+        )
+    return value
+
+
+def _validated_mcp_cli_public_string(value: Any, *, label: str) -> str:
+    if type(value) is not str or not value or "\x00" in value:
+        raise LibOSValidationError(f"MCP {label} must be a non-empty string")
+    if len(value.encode("utf-8")) > _MCP_CLI_OAUTH_CALLBACK_MAX_BYTES:
+        raise LibOSValidationError(
+            f"MCP {label} exceeds max bytes={_MCP_CLI_OAUTH_CALLBACK_MAX_BYTES}"
+        )
+    return value
+
+
+def _validated_mcp_cli_string(value: Any, *, label: str) -> str:
+    if type(value) is not str or not value or "\x00" in value:
+        raise LibOSValidationError(f"MCP {label} must be a non-empty string")
+    if len(value.encode("utf-8")) > _MCP_CLI_STRING_MAX_BYTES:
+        raise LibOSValidationError(
+            f"MCP {label} exceeds max bytes={_MCP_CLI_STRING_MAX_BYTES}"
+        )
+    return value
+
+
+def _validated_mcp_cli_revision(value: Any) -> int:
+    if type(value) is not int or value < 0:
+        raise LibOSValidationError("MCP expected revision must be a non-negative integer")
+    return value
+
+
+def _validated_mcp_cli_sha256(value: Any, *, label: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise LibOSValidationError(f"MCP {label} must be lowercase SHA-256")
+    return value
+
+
+def _invoke_mcp_client(
+    runtime: Runtime,
+    method_name: str,
+    *arguments: Any,
+    redact_error: bool = True,
+    **keywords: Any,
+) -> Any:
+    """Invoke one explicit Runtime MCP facade method and fail closed if absent.
+
+    This deliberately does not guess aliases or call a provider directly.  A
+    partially integrated build therefore exits non-zero instead of printing a
+    plausible-looking success.  Unknown implementation exceptions are reduced
+    to their type so provider or callback secrets cannot reach the terminal.
+    """
+
+    manager = getattr(runtime, "mcp", None)
+    method = getattr(manager, method_name, None) if manager is not None else None
+    if not callable(method):
+        raise LibOSValidationError(
+            f"MCP client operation is unavailable in this Runtime: {method_name}"
+        )
+    try:
+        result = method(*arguments, **keywords)
+        if inspect.isawaitable(result):
+            result = asyncio.run(result)
+    except LibOSError as exc:
+        if redact_error:
+            raise LibOSValidationError(
+                f"MCP {method_name} failed; sensitive request details were omitted"
+            ) from None
+        raise exc
+    except Exception as exc:
+        suffix = (
+            "sensitive request details were omitted"
+            if redact_error
+            else f"implementation error type={type(exc).__name__}"
+        )
+        raise LibOSValidationError(f"MCP {method_name} failed; {suffix}") from None
+    if result is None:
+        raise LibOSValidationError(
+            f"MCP client operation returned no result: {method_name}"
+        )
+    return result
+
+
+def _mcp_cli_mapping_result(value: Any, *, operation: str) -> dict[str, Any]:
+    selected = to_jsonable(value)
+    if not isinstance(selected, dict):
+        raise LibOSValidationError(f"MCP {operation} returned an invalid result")
+    return selected
+
+
+def _mcp_cli_page(
+    value: Any,
+    *,
+    item_key: str,
+    item_contract: str,
+    operation: str,
+) -> dict[str, Any]:
+    selected = _mcp_cli_mapping_result(value, operation=operation)
+    _require_mcp_cli_exact_keys(
+        selected,
+        _MCP_CLI_PAGE_KEYS,
+        label=f"MCP {operation} page",
+    )
+    items = selected.get("items")
+    cursor = selected.get("next_cursor")
+    if not isinstance(items, list) or (cursor is not None and type(cursor) is not str):
+        raise LibOSValidationError(f"MCP {operation} returned an invalid bounded page")
+    for item in items:
+        _validate_mcp_cli_catalog_item(item, contract=item_contract)
+    _validate_mcp_cli_cache_hint(selected.get("cache_hint"))
+    return {
+        item_key: items,
+        "next_cursor": cursor,
+        "has_more": cursor is not None,
+        "cache_hint": selected.get("cache_hint"),
+    }
+
+
+def _mcp_cli_operation_result(
+    value: Any,
+    *,
+    operation: str,
+    allowed_kinds: tuple[str, ...],
+    complete_contract: str | None = None,
+    prompt_preview: bool = False,
+) -> dict[str, Any]:
+    selected = _mcp_cli_mapping_result(value, operation=operation)
+    kind = selected.get("kind")
+    if type(kind) is not str or kind not in allowed_kinds:
+        raise LibOSValidationError(f"MCP {operation} returned an invalid result kind")
+    if kind == "complete":
+        _validate_mcp_cli_complete(selected, contract=complete_contract)
+    elif kind == "input_required":
+        _validate_mcp_cli_input_required(selected)
+    else:
+        _validate_mcp_cli_remote_task(selected)
+    if prompt_preview:
+        projected = dict(selected)
+        projected.update(
+            {
+                "preview_only": True,
+                "user_confirmation_required": True,
+                "context_trust": "untrusted_user_context",
+                "system_or_developer_injection_allowed": False,
+            }
+        )
+        return projected
+    return selected
+
+
+def _require_mcp_cli_exact_keys(
+    value: Any,
+    expected: frozenset[str],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != expected:
+        raise LibOSValidationError(f"{label} contains unsupported fields")
+    return value
+
+
+def _validate_mcp_cli_cache_hint(value: Any) -> None:
+    if value is None:
+        return
+    selected = _require_mcp_cli_exact_keys(
+        value,
+        _MCP_CLI_CACHE_HINT_KEYS,
+        label="MCP cache hint",
+    )
+    ttl_ms = selected.get("ttl_ms")
+    if type(ttl_ms) is not int or ttl_ms < 0 or selected.get("scope") not in {
+        "private",
+        "public",
+    }:
+        raise LibOSValidationError("MCP cache hint is invalid")
+
+
+def _validate_mcp_cli_catalog_item(value: Any, *, contract: str) -> None:
+    contracts = {
+        "resource": _MCP_CLI_RESOURCE_KEYS,
+        "resource_template": _MCP_CLI_RESOURCE_TEMPLATE_KEYS,
+        "prompt": _MCP_CLI_PROMPT_KEYS,
+    }
+    expected = contracts.get(contract)
+    if expected is None:
+        raise LibOSValidationError("MCP catalog item contract is invalid")
+    selected = _require_mcp_cli_exact_keys(
+        value,
+        expected,
+        label="MCP catalog item",
+    )
+    identity_key = {
+        "resource": "resource_id",
+        "resource_template": "template_id",
+        "prompt": "prompt_id",
+    }[contract]
+    _validated_mcp_cli_string(selected.get(identity_key), label="catalog item id")
+    _validated_mcp_cli_string(selected.get("name"), label="catalog item name")
+    _validate_mcp_cli_optional_strings(
+        selected,
+        ("title", "description"),
+        label="catalog item",
+    )
+    _validate_mcp_cli_icons(selected.get("icons"))
+    if not isinstance(selected.get("metadata"), dict):
+        raise LibOSValidationError("MCP catalog item metadata is invalid")
+    if contract == "prompt":
+        _validate_mcp_cli_prompt_arguments(selected.get("arguments"))
+        return
+    _validate_mcp_cli_optional_strings(selected, ("mime_type",), label="catalog item")
+    if contract == "resource":
+        size = selected.get("size")
+        if size is not None and (type(size) is not int or size < 0):
+            raise LibOSValidationError("MCP Resource size is invalid")
+        _validate_mcp_cli_annotations(selected.get("annotations"))
+    elif selected.get("annotations") is not None:
+        _validate_mcp_cli_annotations(selected.get("annotations"))
+
+
+def _validate_mcp_cli_optional_strings(
+    value: dict[str, Any],
+    keys: tuple[str, ...],
+    *,
+    label: str,
+) -> None:
+    for key in keys:
+        item = value.get(key)
+        if item is not None and type(item) is not str:
+            raise LibOSValidationError(f"MCP {label} is invalid")
+
+
+def _validate_mcp_cli_icons(value: Any) -> None:
+    if not isinstance(value, list):
+        raise LibOSValidationError("MCP icons are invalid")
+    for item in value:
+        selected = _require_mcp_cli_exact_keys(
+            item,
+            _MCP_CLI_ICON_KEYS,
+            label="MCP icon",
+        )
+        _validated_mcp_cli_public_string(selected.get("src"), label="icon source")
+        _validate_mcp_cli_optional_strings(selected, ("mime_type",), label="icon")
+        if not _mcp_cli_string_array(selected.get("sizes")) and selected.get("sizes") != []:
+            raise LibOSValidationError("MCP icon sizes are invalid")
+
+
+def _validate_mcp_cli_annotations(value: Any) -> None:
+    if value is None:
+        return
+    selected = _require_mcp_cli_exact_keys(
+        value,
+        _MCP_CLI_ANNOTATION_KEYS,
+        label="MCP annotations",
+    )
+    audience = selected.get("audience")
+    if not isinstance(audience, list) or any(
+        item not in {"user", "assistant"} for item in audience
+    ):
+        raise LibOSValidationError("MCP annotations audience is invalid")
+    priority = selected.get("priority")
+    if priority is not None and (
+        type(priority) not in {int, float} or not math.isfinite(float(priority))
+    ):
+        raise LibOSValidationError("MCP annotations priority is invalid")
+    _validate_mcp_cli_optional_strings(
+        selected,
+        ("last_modified",),
+        label="annotations",
+    )
+
+
+def _validate_mcp_cli_prompt_arguments(value: Any) -> None:
+    if not isinstance(value, list):
+        raise LibOSValidationError("MCP Prompt arguments are invalid")
+    for item in value:
+        selected = _require_mcp_cli_exact_keys(
+            item,
+            _MCP_CLI_PROMPT_ARGUMENT_KEYS,
+            label="MCP Prompt argument",
+        )
+        _validated_mcp_cli_string(selected.get("name"), label="Prompt argument name")
+        _validate_mcp_cli_optional_strings(
+            selected,
+            ("title", "description"),
+            label="Prompt argument",
+        )
+        if type(selected.get("required")) is not bool:
+            raise LibOSValidationError("MCP Prompt argument required flag is invalid")
+
+
+def _validate_mcp_cli_complete(
+    selected: dict[str, Any],
+    *,
+    contract: str | None,
+) -> None:
+    _require_mcp_cli_exact_keys(
+        selected,
+        _MCP_CLI_COMPLETE_KEYS,
+        label="MCP Complete result",
+    )
+    preview = selected.get("preview_sha256")
+    if preview is not None:
+        _validated_mcp_cli_sha256(preview, label="preview SHA-256")
+    value = selected.get("value")
+    if contract == "resource_contents":
+        _validate_mcp_cli_resource_contents(value)
+    elif contract == "prompt_result":
+        _validate_mcp_cli_prompt_result(value)
+    elif contract == "completion_result":
+        _validate_mcp_cli_completion_result(value)
+    elif contract is not None:
+        raise LibOSValidationError("MCP Complete result contract is invalid")
+
+
+def _validate_mcp_cli_input_required(selected: dict[str, Any]) -> None:
+    _require_mcp_cli_exact_keys(
+        selected,
+        _MCP_CLI_INPUT_REQUIRED_KEYS,
+        label="MCP InputRequired result",
+    )
+    _validate_mcp_cli_input_requests(selected.get("input_requests"))
+    revision = selected.get("revision")
+    respondable = selected.get("respondable")
+    if type(revision) is not int or revision < 0 or type(respondable) is not bool:
+        raise LibOSValidationError("MCP InputRequired result is invalid")
+    _validate_mcp_cli_optional_strings(selected, ("expires_at",), label="InputRequired")
+    human = (
+        selected.get("human_request_id"),
+        selected.get("human_revision"),
+        selected.get("human_preview_sha256"),
+    )
+    if respondable:
+        _validated_mcp_cli_string(
+            selected.get("continuation_id"),
+            label="continuation id",
+        )
+        _validate_mcp_cli_human_receipt(human)
+    elif selected.get("continuation_id") != "" or human != (None, None, None):
+        raise LibOSValidationError("MCP unsupported InputRequired result is invalid")
+
+
+def _validate_mcp_cli_remote_task(selected: dict[str, Any]) -> None:
+    _require_mcp_cli_exact_keys(
+        selected,
+        _MCP_CLI_REMOTE_TASK_KEYS,
+        label="MCP RemoteTask result",
+    )
+    _validated_mcp_cli_string(selected.get("task_ref"), label="remote Task ref")
+    if selected.get("status") not in _MCP_CLI_REMOTE_TASK_STATUSES:
+        raise LibOSValidationError("MCP RemoteTask status is invalid")
+    _validate_mcp_cli_optional_strings(
+        selected,
+        ("status_message", "created_at", "updated_at"),
+        label="RemoteTask",
+    )
+    _validate_mcp_cli_input_requests(selected.get("input_requests"))
+    for key in ("ttl_ms", "poll_interval_ms"):
+        item = selected.get(key)
+        if item is not None and (type(item) is not int or item < 0):
+            raise LibOSValidationError("MCP RemoteTask timing is invalid")
+    revision = selected.get("revision")
+    if type(revision) is not int or revision < 0:
+        raise LibOSValidationError("MCP RemoteTask revision is invalid")
+    human = (
+        selected.get("human_request_id"),
+        selected.get("human_revision"),
+        selected.get("human_preview_sha256"),
+    )
+    if selected.get("status") == "input_required":
+        _validate_mcp_cli_human_receipt(human)
+    elif human != (None, None, None):
+        _validate_mcp_cli_human_receipt(human)
+
+
+def _validate_mcp_cli_human_receipt(value: tuple[Any, Any, Any]) -> None:
+    request_id, revision, preview = value
+    _validated_mcp_cli_string(request_id, label="HumanRequest id")
+    _validated_mcp_cli_revision(revision)
+    _validated_mcp_cli_sha256(preview, label="Human preview SHA-256")
+
+
+def _validate_mcp_cli_input_requests(value: Any) -> None:
+    if not isinstance(value, list):
+        raise LibOSValidationError("MCP input requests are invalid")
+    for item in value:
+        selected = _require_mcp_cli_exact_keys(
+            item,
+            _MCP_CLI_INPUT_REQUEST_KEYS,
+            label="MCP input request",
+        )
+        _validated_mcp_cli_string(selected.get("request_id"), label="input request id")
+        if selected.get("kind") not in _MCP_CLI_INPUT_REQUEST_KINDS:
+            raise LibOSValidationError("MCP input request kind is invalid")
+        if selected.get("mode") not in {None, "form", "url"}:
+            raise LibOSValidationError("MCP input request mode is invalid")
+        _validate_mcp_cli_optional_strings(
+            selected,
+            ("prompt", "inert_url"),
+            label="input request",
+        )
+        if not isinstance(selected.get("schema"), dict):
+            raise LibOSValidationError("MCP input request schema is invalid")
+
+
+def _validate_mcp_cli_resource_contents(value: Any) -> None:
+    selected = _require_mcp_cli_exact_keys(
+        value,
+        _MCP_CLI_RESOURCE_CONTENTS_KEYS,
+        label="MCP Resource contents",
+    )
+    _validated_mcp_cli_string(selected.get("resource_id"), label="Resource id")
+    if selected.get("provenance") != "untrusted_mcp_resource":
+        raise LibOSValidationError("MCP Resource provenance is invalid")
+    contents = selected.get("contents")
+    if not isinstance(contents, list):
+        raise LibOSValidationError("MCP Resource contents are invalid")
+    for content in contents:
+        _validate_mcp_cli_content(content)
+
+
+def _validate_mcp_cli_prompt_result(value: Any) -> None:
+    selected = _require_mcp_cli_exact_keys(
+        value,
+        _MCP_CLI_PROMPT_RESULT_KEYS,
+        label="MCP Prompt result",
+    )
+    _validated_mcp_cli_string(selected.get("prompt_id"), label="Prompt id")
+    _validate_mcp_cli_optional_strings(selected, ("description",), label="Prompt result")
+    if selected.get("user_confirmation_required") is not True:
+        raise LibOSValidationError("MCP Prompt result waived user confirmation")
+    messages = selected.get("messages")
+    if not isinstance(messages, list):
+        raise LibOSValidationError("MCP Prompt messages are invalid")
+    for message in messages:
+        projected = _require_mcp_cli_exact_keys(
+            message,
+            _MCP_CLI_PROMPT_MESSAGE_KEYS,
+            label="MCP Prompt message",
+        )
+        if projected.get("role") not in {"user", "assistant"}:
+            raise LibOSValidationError("MCP Prompt role is invalid")
+        if projected.get("provenance") != "untrusted_mcp_prompt":
+            raise LibOSValidationError("MCP Prompt provenance is invalid")
+        _validate_mcp_cli_content(projected.get("content"))
+
+
+def _validate_mcp_cli_completion_result(value: Any) -> None:
+    selected = _require_mcp_cli_exact_keys(
+        value,
+        _MCP_CLI_COMPLETION_RESULT_KEYS,
+        label="MCP Completion result",
+    )
+    values = selected.get("values")
+    if not isinstance(values, list) or any(type(item) is not str for item in values):
+        raise LibOSValidationError("MCP Completion values are invalid")
+    total = selected.get("total")
+    if total is not None and (type(total) is not int or total < 0):
+        raise LibOSValidationError("MCP Completion total is invalid")
+    if type(selected.get("has_more")) is not bool:
+        raise LibOSValidationError("MCP Completion has_more is invalid")
+
+
+def _validate_mcp_cli_content(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise LibOSValidationError("MCP content block is invalid")
+    kind = value.get("kind")
+    if kind == "text":
+        selected = _require_mcp_cli_exact_keys(
+            value,
+            _MCP_CLI_TEXT_CONTENT_KEYS,
+            label="MCP text content",
+        )
+        if type(selected.get("text")) is not str:
+            raise LibOSValidationError("MCP text content is invalid")
+    elif kind == "blob":
+        selected = _require_mcp_cli_exact_keys(
+            value,
+            _MCP_CLI_BLOB_CONTENT_KEYS,
+            label="MCP blob content",
+        )
+        _validate_mcp_cli_artifact(selected.get("artifact"))
+    elif kind == "resource_link":
+        selected = _require_mcp_cli_exact_keys(
+            value,
+            _MCP_CLI_RESOURCE_LINK_KEYS,
+            label="MCP ResourceLink content",
+        )
+        _validated_mcp_cli_string(
+            selected.get("resource_handle"),
+            label="ResourceLink handle",
+        )
+        _validated_mcp_cli_string(selected.get("name"), label="ResourceLink name")
+        _validate_mcp_cli_optional_strings(
+            selected,
+            ("title", "description", "mime_type"),
+            label="ResourceLink",
+        )
+    else:
+        raise LibOSValidationError("MCP content kind is invalid")
+    _validate_mcp_cli_annotations(selected.get("annotations"))
+    if not isinstance(selected.get("metadata"), dict):
+        raise LibOSValidationError("MCP content metadata is invalid")
+
+
+def _validate_mcp_cli_artifact(value: Any) -> None:
+    if value is None:
+        return
+    selected = _require_mcp_cli_exact_keys(
+        value,
+        _MCP_CLI_ARTIFACT_RECEIPT_KEYS,
+        label="MCP artifact receipt",
+    )
+    _validated_mcp_cli_string(selected.get("artifact_id"), label="artifact id")
+    byte_length = selected.get("byte_length")
+    if type(byte_length) is not int or byte_length < 0:
+        raise LibOSValidationError("MCP artifact byte length is invalid")
+    _validated_mcp_cli_sha256(selected.get("sha256"), label="artifact SHA-256")
+    _validate_mcp_cli_optional_strings(selected, ("mime_type",), label="artifact")
+
+
+def _mcp_cli_auth_result(value: Any, *, operation: str) -> dict[str, Any]:
+    selected = _mcp_cli_mapping_result(value, operation=operation)
+    _reject_mcp_cli_auth_secret_fields(selected)
+    keys = set(selected)
+    if {"profile_id", "status"} <= keys:
+        if not keys <= _MCP_CLI_OAUTH_STATUS_KEYS:
+            raise LibOSValidationError(
+                f"MCP {operation} returned unsupported OAuth status fields"
+            )
+        _validate_mcp_cli_oauth_status(selected, operation=operation)
+        return selected
+    if _MCP_CLI_OAUTH_CHALLENGE_KEYS <= keys:
+        if keys != _MCP_CLI_OAUTH_CHALLENGE_KEYS:
+            raise LibOSValidationError(
+                f"MCP {operation} returned unsupported OAuth challenge fields"
+            )
+        _validate_mcp_cli_oauth_challenge(selected, operation=operation)
+        return selected
+    raise LibOSValidationError(f"MCP {operation} returned an invalid OAuth result")
+
+
+def _validate_mcp_cli_oauth_status(
+    selected: dict[str, Any],
+    *,
+    operation: str,
+) -> None:
+    _validated_mcp_cli_string(selected.get("profile_id"), label="OAuth profile id")
+    status = selected.get("status")
+    if type(status) is not str or status not in _MCP_CLI_OAUTH_STATUS_VALUES:
+        raise LibOSValidationError(f"MCP {operation} returned an invalid OAuth status")
+    for key in ("issuer", "resource", "expires_at"):
+        item = selected.get(key)
+        if item is not None:
+            _validated_mcp_cli_public_string(item, label=f"OAuth {key}")
+    scopes = selected.get("scopes", [])
+    if not isinstance(scopes, list):
+        raise LibOSValidationError(f"MCP {operation} returned invalid OAuth scopes")
+    _validated_mcp_cli_strings(scopes, label="OAuth scope", allow_empty=True)
+    principal_sha256 = selected.get("principal_sha256")
+    if principal_sha256 is not None:
+        _validated_mcp_cli_sha256(
+            principal_sha256,
+            label="OAuth principal SHA-256",
+        )
+
+
+def _validate_mcp_cli_oauth_challenge(
+    selected: dict[str, Any],
+    *,
+    operation: str,
+) -> None:
+    for key in _MCP_CLI_OAUTH_CHALLENGE_KEYS:
+        try:
+            _validated_mcp_cli_public_string(
+                selected[key],
+                label=f"OAuth {key}",
+            )
+        except LibOSValidationError:
+            raise LibOSValidationError(
+                f"MCP {operation} returned an invalid OAuth challenge"
+            ) from None
+
+
+def _reject_mcp_cli_auth_secret_fields(value: Any) -> None:
+    forbidden = {
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "token",
+        "clientsecret",
+        "secret",
+        "authorizationcode",
+        "codeverifier",
+        "pkceverifier",
+        "callbackurl",
+        "rawstate",
+        "state",
+        "clientassertion",
+    }
+    pending = [value]
+    while pending:
+        selected = pending.pop()
+        if isinstance(selected, dict):
+            for key, item in selected.items():
+                normalized = str(key).casefold().replace("_", "").replace("-", "")
+                if normalized in forbidden:
+                    raise LibOSValidationError(
+                        "MCP OAuth result contained a forbidden secret field"
+                    )
+                pending.append(item)
+        elif isinstance(selected, list):
+            pending.extend(selected)
+
+
+def _run_mcp_dx_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, Any]:
+    from agent_libos.mcp.dx import (
+        MCP_DX_IMPORT_MAX_BYTES,
+        CandidateMcpProbeAdapter,
+        McpDxConfirmation,
+        McpDxManagerAdapter,
+        approve_scaffold_candidate,
+        doctor_manifest_text,
+        export_registry_bundle,
+        import_one_from_bundle,
+        plan_import_bundle,
+        probe_manifest,
+        scaffold_manifest_candidate,
+        validate_manifest_text,
+    )
+    from agent_libos.utils.yaml_loader import load_yaml_mapping
+
+    adapter = McpDxManagerAdapter(runtime.mcp)
+    command = args.mcp_command
+    if command == "validate":
+        return validate_manifest_text(
+            adapter,
+            _read_mcp_cli_text(
+                args.manifest,
+                max_bytes=adapter.manifest_max_bytes,
+                label="MCP manifest",
+            ),
+        ).to_jsonable()
+    if command == "doctor":
+        return doctor_manifest_text(
+            adapter,
+            _read_mcp_cli_text(
+                args.manifest,
+                max_bytes=adapter.manifest_max_bytes,
+                label="MCP manifest",
+            ),
+        ).to_jsonable()
+    if command == "probe":
+        confirmation = McpDxConfirmation(
+            confirmed=args.mcp_confirmed is True,
+            actor=args.reviewer,
+            reason=args.reason,
+        )
+        manifest_text = _read_mcp_cli_text(
+            args.manifest,
+            max_bytes=adapter.manifest_max_bytes,
+            label="MCP candidate probe manifest",
+        )
+        _preflight_mcp_cli_oauth_manifest(runtime, args, manifest_text)
+        _bind_mcp_cli_oauth_profile(runtime, args)
+        return probe_manifest(
+            adapter,
+            manifest_text,
+            probe_adapter=CandidateMcpProbeAdapter(adapter),
+            confirmation=confirmation,
+        ).to_jsonable()
+    if command == "scaffold":
+        confirmation = McpDxConfirmation(
+            confirmed=args.mcp_confirmed is True,
+            actor=args.reviewer,
+            reason=args.reason,
+        )
+        if args.mcp_scaffold_command == "create":
+            base = load_yaml_mapping(
+                _read_mcp_cli_text(
+                    args.base_manifest,
+                    max_bytes=adapter.manifest_max_bytes,
+                    label="MCP scaffold base manifest",
+                )
+            )
+            catalog = _read_mcp_cli_json_file(
+                args.catalog_json,
+                max_bytes=MCP_DX_IMPORT_MAX_BYTES,
+                label="MCP scaffold catalog",
+            )
+            (
+                tools,
+                resources,
+                resource_templates,
+                prompts,
+                manifest_sha256,
+                scope,
+                complete,
+            ) = _mcp_cli_catalog_fields(catalog)
+            return scaffold_manifest_candidate(
+                adapter,
+                base,
+                tools,
+                live_resources=resources,
+                live_resource_templates=resource_templates,
+                live_prompts=prompts,
+                probe_manifest_sha256=manifest_sha256,
+                confirmation=confirmation,
+                catalog_scope=scope,
+                complete=complete,
+            )
+        if args.mcp_scaffold_command == "approve":
+            candidate = _read_mcp_cli_json_file(
+                args.candidate_json,
+                max_bytes=MCP_DX_IMPORT_MAX_BYTES,
+                label="MCP scaffold candidate",
+            )
+            if not isinstance(candidate, dict):
+                raise LibOSValidationError("MCP scaffold candidate must be an object")
+            return approve_scaffold_candidate(
+                adapter,
+                candidate,
+                confirmation=confirmation,
+            )
+        raise LibOSValidationError(
+            f"unknown mcp scaffold command: {args.mcp_scaffold_command}"
+        )
+    if command == "export":
+        return export_registry_bundle(adapter, server_ids=args.servers)
+    if command == "import":
+        raw = _read_mcp_cli_bytes(
+            args.bundle_json,
+            max_bytes=MCP_DX_IMPORT_MAX_BYTES,
+            label="MCP import bundle",
+        )
+        if args.mcp_import_command == "plan":
+            return plan_import_bundle(adapter, raw).to_jsonable()
+        if args.mcp_import_command == "apply":
+            confirmation = McpDxConfirmation(
+                confirmed=args.mcp_confirmed is True,
+                actor=args.reviewer,
+                reason=args.reason,
+            )
+            return import_one_from_bundle(
+                adapter,
+                raw,
+                server_id=args.server_id,
+                confirmation=confirmation,
+                actor="mcp-cli-import",
+                require_capability=False,
+            )
+        raise LibOSValidationError(
+            f"unknown mcp import command: {args.mcp_import_command}"
+        )
+    raise LibOSValidationError(f"unknown MCP DX command: {command}")
+
+
+def _mcp_cli_path(value: str) -> Path:
+    selected = Path(value).expanduser()
+    if not selected.is_absolute():
+        selected = Path.cwd() / selected
+    return selected.resolve()
+
+
+def _read_mcp_cli_bytes(path: str, *, max_bytes: int, label: str) -> bytes:
+    selected = _mcp_cli_path(path)
+    try:
+        with selected.open("rb") as stream:
+            payload = stream.read(max_bytes + 1)
+    except OSError:
+        raise LibOSValidationError(f"{label} cannot be read") from None
+    if len(payload) > max_bytes:
+        raise LibOSValidationError(f"{label} exceeds max bytes={max_bytes}")
+    return payload
+
+
+def _read_mcp_cli_text(path: str, *, max_bytes: int, label: str) -> str:
+    payload = _read_mcp_cli_bytes(path, max_bytes=max_bytes, label=label)
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError:
+        raise LibOSValidationError(f"{label} must be valid UTF-8") from None
+
+
+def _read_mcp_cli_json_file(path: str, *, max_bytes: int, label: str) -> Any:
+    try:
+        return bounded_json_loads(
+            _read_mcp_cli_bytes(path, max_bytes=max_bytes, label=label),
+            max_bytes=max_bytes,
+        )
+    except ValueError:
+        raise LibOSValidationError(f"{label} must be strict bounded JSON") from None
+
+
+def _mcp_cli_catalog_fields(
+    value: Any,
+) -> tuple[
+    list[Any],
+    list[Any],
+    list[Any],
+    list[Any],
+    str,
+    str,
+    bool,
+]:
+    if not isinstance(value, dict):
+        raise LibOSValidationError(
+            "MCP scaffold catalog must be a probe report object with completeness evidence"
+        )
+    tools = value.get("tools")
+    if not isinstance(tools, list):
+        raise LibOSValidationError("MCP scaffold catalog tools must be an array")
+    catalogs: list[list[Any]] = []
+    for name in ("resources", "resource_templates", "prompts"):
+        selected = value.get(name, [])
+        if not isinstance(selected, list):
+            raise LibOSValidationError(
+                f"MCP scaffold catalog {name} must be an array"
+            )
+        catalogs.append(selected)
+    manifest_sha256 = _validated_mcp_cli_sha256(
+        value.get("manifest_sha256"),
+        label="scaffold probe manifest SHA-256",
+    )
+    scope = value.get("catalog_scope")
+    if type(scope) is not str:
+        raise LibOSValidationError("MCP scaffold catalog scope must be a string")
+    return (
+        tools,
+        catalogs[0],
+        catalogs[1],
+        catalogs[2],
+        manifest_sha256,
+        scope,
+        value.get("complete") is True,
+    )
 
 
 def _add_modules_parser_args(parser: argparse.ArgumentParser) -> None:

@@ -8,7 +8,7 @@ from typing import Annotated, Final, Literal
 from urllib.parse import SplitResult, unquote_plus, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BeforeValidator, ConfigDict, StrictFloat, StrictInt
+from pydantic import BeforeValidator, ConfigDict, StrictBool, StrictFloat, StrictInt
 from pydantic.dataclasses import dataclass
 
 from agent_libos.models.capability import AuthorityRule
@@ -20,16 +20,23 @@ from agent_libos.models.data_flow import (
     sensitivity_rank,
 )
 from agent_libos.models.semantic import SemanticPolicyEpochV1
+from agent_libos.utils.yaml_loader import YAML_MAX_UTF8_BYTES
 
 _PYDANTIC_CONFIG = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 _TIMEZONE_KEY_PATTERN = re.compile(
     r"[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*\Z"
 )
+_ENVIRONMENT_VARIABLE_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _FIXED_TIMEZONE_FALLBACK_KEYS = frozenset({"Asia/Shanghai"})
 
 # The current MCP release contract allows automatic modern discovery to consume no more
 # than five seconds, even when the enclosing operation has a longer deadline.
 MCP_PROTOCOL_PROBE_TIMEOUT_MAX_S: Final[float] = 5.0
+MCP_LIST_MAX_PAGES_HARD: Final[int] = 16
+MCP_TOOL_CATALOG_HARD_LIMIT: Final[int] = 100
+MCP_COMPLETION_VALUES_HARD_LIMIT: Final[int] = 100
+MCP_V3_CATALOG_HARD_LIMIT: Final[int] = 1_000
+MCP_LEGACY_LIST_LIMIT_DEFAULT: Final[int] = 100
 
 ShellPolicyLevel = Literal[
     "always_deny",
@@ -817,13 +824,55 @@ class McpDefaults:
     max_response_bytes: int = 1_048_576
     max_request_hard_limit_bytes: int = 1_048_576
     max_response_hard_limit_bytes: int = 8_388_608
-    list_limit: int = 100
+    list_limit: int = MCP_LEGACY_LIST_LIMIT_DEFAULT
+    # Deprecated legacy v1/v2 Tools-only compatibility limit. New surfaces use
+    # purpose-specific limits so changing one catalog cannot silently expand
+    # another authority or resource boundary.
+    server_page_limit: StrictInt = 100
+    tool_catalog_limit: StrictInt = MCP_TOOL_CATALOG_HARD_LIMIT
+    resource_catalog_limit: StrictInt = 200
+    resource_template_limit: StrictInt = 200
+    prompt_catalog_limit: StrictInt = 200
+    provider_capability_limit: StrictInt = 64
+    max_content_blocks: StrictInt = 256
+    max_prompt_messages: StrictInt = 128
+    max_completion_values: StrictInt = MCP_COMPLETION_VALUES_HARD_LIMIT
     protocol_probe_timeout_s: float = MCP_PROTOCOL_PROBE_TIMEOUT_MAX_S
     list_max_pages: int = 16
     schema_max_depth: int = 64
     schema_max_nodes: int = 10_000
     schema_max_ref_hops: int = 128
     schema_max_composition_expansions: int = 1_024
+    schema_regex_pattern_max_bytes: StrictInt = 1_024
+    schema_regex_max_evaluations: StrictInt = 4_096
+    schema_regex_match_timeout_s: StrictFloat = 0.05
+    connection_idle_ttl_s: StrictFloat = 30.0
+    connection_absolute_ttl_s: StrictFloat = 300.0
+    connection_max_open: StrictInt = 64
+    mrtr_max_rounds: StrictInt = 8
+    mrtr_max_input_requests: StrictInt = 16
+    mrtr_request_state_max_bytes: StrictInt = 65_536
+    continuation_ttl_s: StrictFloat = 3_600.0
+    continuation_max_records: StrictInt = 1_000
+    continuation_terminal_records: StrictInt = 256
+    subscription_max_open: StrictInt = 8
+    subscription_queue_events: StrictInt = 256
+    subscription_event_max_bytes: StrictInt = 65_536
+    subscription_max_lifetime_s: StrictFloat = 3_600.0
+    remote_task_poll_min_interval_s: StrictFloat = 0.25
+    remote_task_max_wait_s: StrictFloat = 3_600.0
+    remote_task_max_records: StrictInt = 1_000
+    remote_task_terminal_records: StrictInt = 256
+    # Modern Resources/Prompts do not retain response bodies.  These bounds
+    # cover only the explicitly implemented opaque cursor vault, durable
+    # subscription terminal diagnostics, and untrusted provider cache hints.
+    cursor_handle_limit: StrictInt = 256
+    subscription_terminal_records: StrictInt = 256
+    cache_hint_ttl_cap_ms: StrictInt = 3_600_000
+    oauth_enabled: StrictBool = False
+    oauth_state_ttl_s: StrictFloat = 600.0
+    tasks_extension_enabled: StrictBool = False
+    tasks_extension_spec_sha256: str | None = None
     audit_preview_chars: int = 512
     header_env_allowlist: tuple[str, ...] = ("AGENT_LIBOS_MCP_*",)
     stdio_env_allowlist: tuple[str, ...] = ("AGENT_LIBOS_MCP_*",)
@@ -1354,15 +1403,54 @@ def _validate_mcp_config(mcp: McpDefaults) -> None:
         "max_request_hard_limit_bytes",
         "max_response_hard_limit_bytes",
         "list_limit",
+        "server_page_limit",
+        "tool_catalog_limit",
+        "resource_catalog_limit",
+        "resource_template_limit",
+        "prompt_catalog_limit",
+        "provider_capability_limit",
+        "max_content_blocks",
+        "max_prompt_messages",
+        "max_completion_values",
         "protocol_probe_timeout_s",
         "list_max_pages",
         "schema_max_depth",
         "schema_max_nodes",
         "schema_max_ref_hops",
         "schema_max_composition_expansions",
+        "schema_regex_pattern_max_bytes",
+        "schema_regex_max_evaluations",
+        "schema_regex_match_timeout_s",
+        "connection_idle_ttl_s",
+        "connection_absolute_ttl_s",
+        "connection_max_open",
+        "mrtr_max_rounds",
+        "mrtr_max_input_requests",
+        "mrtr_request_state_max_bytes",
+        "continuation_ttl_s",
+        "continuation_max_records",
+        "continuation_terminal_records",
+        "subscription_max_open",
+        "subscription_queue_events",
+        "subscription_event_max_bytes",
+        "subscription_max_lifetime_s",
+        "remote_task_poll_min_interval_s",
+        "remote_task_max_wait_s",
+        "remote_task_max_records",
+        "remote_task_terminal_records",
+        "cursor_handle_limit",
+        "subscription_terminal_records",
+        "cache_hint_ttl_cap_ms",
+        "oauth_state_ttl_s",
         "audit_preview_chars",
     ):
         _positive_or_non_empty(f"mcp.{name}", getattr(mcp, name))
+    for name in (
+        "continuation_terminal_records",
+        "remote_task_terminal_records",
+    ):
+        if getattr(mcp, name) > 499:
+            raise ValueError(f"mcp.{name} must be <= 499")
     _require_at_least("mcp.timeout_hard_limit_s", mcp.timeout_hard_limit_s, "mcp.timeout_s", mcp.timeout_s)
     _require_at_least("mcp.max_request_hard_limit_bytes", mcp.max_request_hard_limit_bytes, "mcp.max_request_bytes", mcp.max_request_bytes)
     _require_at_least("mcp.max_response_hard_limit_bytes", mcp.max_response_hard_limit_bytes, "mcp.max_response_bytes", mcp.max_response_bytes)
@@ -1371,8 +1459,56 @@ def _validate_mcp_config(mcp: McpDefaults) -> None:
             "mcp.protocol_probe_timeout_s must be <= release maximum "
             f"{MCP_PROTOCOL_PROBE_TIMEOUT_MAX_S}"
         )
-    _require_non_empty_items("mcp.header_env_allowlist", mcp.header_env_allowlist)
-    _require_non_empty_items("mcp.stdio_env_allowlist", mcp.stdio_env_allowlist)
+    if mcp.list_max_pages > MCP_LIST_MAX_PAGES_HARD:
+        raise ValueError(
+            f"mcp.list_max_pages must be <= {MCP_LIST_MAX_PAGES_HARD}"
+        )
+    if mcp.tool_catalog_limit > MCP_TOOL_CATALOG_HARD_LIMIT:
+        raise ValueError(
+            "mcp.tool_catalog_limit must be <= "
+            f"{MCP_TOOL_CATALOG_HARD_LIMIT}"
+        )
+    for name in (
+        "resource_catalog_limit",
+        "resource_template_limit",
+        "prompt_catalog_limit",
+    ):
+        if getattr(mcp, name) > MCP_V3_CATALOG_HARD_LIMIT:
+            raise ValueError(f"mcp.{name} must be <= {MCP_V3_CATALOG_HARD_LIMIT}")
+    if mcp.max_completion_values > MCP_COMPLETION_VALUES_HARD_LIMIT:
+        raise ValueError(
+            "mcp.max_completion_values must be <= "
+            f"{MCP_COMPLETION_VALUES_HARD_LIMIT}"
+        )
+    if mcp.connection_absolute_ttl_s < mcp.connection_idle_ttl_s:
+        raise ValueError(
+            "mcp.connection_absolute_ttl_s must be >= connection_idle_ttl_s"
+        )
+    tasks_digest = mcp.tasks_extension_spec_sha256
+    if tasks_digest is not None and (
+        type(tasks_digest) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", tasks_digest) is None
+    ):
+        raise ValueError(
+            "mcp.tasks_extension_spec_sha256 must be a lowercase SHA-256"
+        )
+    if mcp.tasks_extension_enabled and tasks_digest is None:
+        raise ValueError(
+            "mcp.tasks_extension_enabled requires tasks_extension_spec_sha256"
+        )
+    if mcp.manifest_max_bytes > YAML_MAX_UTF8_BYTES:
+        raise ValueError(
+            "mcp.manifest_max_bytes must be <= YAML_MAX_UTF8_BYTES="
+            f"{YAML_MAX_UTF8_BYTES}"
+        )
+    _require_mcp_env_allowlist(
+        "mcp.header_env_allowlist",
+        mcp.header_env_allowlist,
+    )
+    _require_mcp_env_allowlist(
+        "mcp.stdio_env_allowlist",
+        mcp.stdio_env_allowlist,
+    )
 
 
 def _validate_config(config: AgentLibOSConfig) -> None:
@@ -2138,6 +2274,27 @@ def _optional_max_chars(name: str, value: object | None, max_chars: int) -> None
 def _require_non_empty_items(name: str, values: tuple[str, ...]) -> None:
     for index, value in enumerate(values):
         _require_non_empty(f"{name}[{index}]", value)
+
+
+def _require_mcp_env_allowlist(name: str, values: tuple[str, ...]) -> None:
+    """Validate exact names or one non-empty name prefix plus trailing ``*``."""
+
+    for index, value in enumerate(values):
+        candidate = (
+            value[:-1]
+            if isinstance(value, str) and value.endswith("*")
+            else value
+        )
+        if (
+            not isinstance(value, str)
+            or _ENVIRONMENT_VARIABLE_NAME_PATTERN.fullmatch(candidate) is None
+            or ("*" in value and not value.endswith("*"))
+            or value.count("*") > 1
+        ):
+            raise ValueError(
+                f"{name}[{index}] must be a valid environment variable name "
+                "or a non-empty valid prefix followed by one trailing '*'"
+            )
 
 
 def _require_at_least(max_name: str, max_value: int | float, min_name: str, min_value: int | float) -> None:

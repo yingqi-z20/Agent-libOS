@@ -12,6 +12,14 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.mcp import (
+    McpComplete,
+    McpPage,
+    McpResource,
+    McpResourceContents,
+    McpResourceTemplate,
+    McpTextContent,
+)
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.runtime.syscall_descriptors import BUILTIN_SYSCALL_DESCRIPTORS
 from agent_libos.runtime.syscalls import (
@@ -20,6 +28,7 @@ from agent_libos.runtime.syscalls import (
     LibOSSyscallSession,
 )
 from agent_libos.substrate import LocalResourceProviderSubstrate
+from agent_libos.utils.serde import dumps, to_jsonable
 
 
 _SINK_CASES = [
@@ -728,5 +737,510 @@ def test_builtin_alias_uses_same_argument_contract_before_primitive(
             )
 
         assert called is False
+    finally:
+        runtime.close()
+
+
+def test_mcp_syscalls_reject_unknown_arguments_before_primitive_and_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = "opaque-mcp-unknown-field-value-48291"
+    runtime = Runtime.open("local")
+    calls: list[str] = []
+
+    def unexpected_sync(*_args: Any, **_kwargs: Any) -> Any:
+        calls.append("sync")
+        raise AssertionError("unknown MCP syscall fields reached the primitive")
+
+    async def unexpected_async(*_args: Any, **_kwargs: Any) -> Any:
+        calls.append("async")
+        raise AssertionError("unknown MCP syscall fields reached the primitive")
+
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="reject unknown MCP syscall arguments",
+        )
+        monkeypatch.setattr(runtime.mcp, "list_servers", unexpected_sync)
+        monkeypatch.setattr(runtime.mcp, "inspect_server", unexpected_sync)
+        monkeypatch.setattr(runtime.mcp, "alist_tools", unexpected_async)
+        monkeypatch.setattr(runtime.mcp, "acall_tool", unexpected_async)
+        monkeypatch.setattr(
+            runtime.mcp,
+            "alist_resources",
+            unexpected_async,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            runtime.mcp,
+            "alist_resource_templates",
+            unexpected_async,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            runtime.mcp,
+            "aread_resource",
+            unexpected_async,
+            raising=False,
+        )
+        session = LibOSSyscallSession(runtime, pid)
+
+        cases = (
+            ("mcp.list", {}),
+            ("mcp.inspect", {"server_id": "registered"}),
+            (
+                "mcp.tools",
+                {"server_id": "registered", "refresh": False},
+            ),
+            (
+                "mcp.call",
+                {
+                    "server_id": "registered",
+                    "tool_id": "allowed",
+                    "arguments": {},
+                },
+            ),
+            (
+                "mcp.resources",
+                {"server_id": "registered", "kind": "resource"},
+            ),
+            (
+                "mcp.resource_read",
+                {
+                    "server_id": "registered",
+                    "resource_id": "status",
+                    "variables": {},
+                },
+            ),
+        )
+        for name, valid_args in cases:
+            with pytest.raises(
+                ValidationError,
+                match="MCP syscall arguments contain unknown fields",
+            ) as raised:
+                asyncio.run(
+                    session.handle(
+                        name,
+                        {
+                            **valid_args,
+                            "ad_hoc_transport_material": sentinel,
+                        },
+                    )
+                )
+            assert sentinel not in str(raised.value)
+
+        assert calls == []
+        assert runtime.store.list_external_effects(pid=pid) == []
+        request_audits = [
+            record
+            for record in runtime.audit.trace(actor=pid)
+            if record.action == "syscall.request"
+            and record.target.startswith("mcp.")
+        ]
+        assert len(request_audits) == len(cases)
+        assert all(
+            record.decision == {
+                "args": {
+                    "redacted": True,
+                    "argument_count": len(valid_args) + 1,
+                },
+                "validation": "rejected",
+            }
+            for record, (_name, valid_args) in zip(request_audits, cases)
+        )
+        persisted = dumps(
+            {
+                "audit": [to_jsonable(record) for record in runtime.audit.trace()],
+                "events": [to_jsonable(event) for event in runtime.events.list()],
+                "effects": [
+                    to_jsonable(effect)
+                    for effect in runtime.store.list_external_effects(pid=pid)
+                ],
+            }
+        )
+        assert sentinel not in persisted
+    finally:
+        runtime.close()
+
+
+def test_mcp_call_syscall_keeps_nested_tool_arguments_schema_owned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Runtime.open("local")
+    observed: list[dict[str, Any]] = []
+
+    async def capture_call(
+        _pid: str,
+        *,
+        server_id: str,
+        tool_id: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        assert server_id == "registered"
+        assert tool_id == "allowed"
+        observed.append(arguments)
+        return {"ok": True}
+
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="preserve nested MCP tool arguments",
+        )
+        monkeypatch.setattr(runtime.mcp, "acall_tool", capture_call)
+        result = asyncio.run(
+            LibOSSyscallSession(runtime, pid).handle(
+                "mcp.call",
+                {
+                    "server_id": "registered",
+                    "tool_id": "allowed",
+                    "arguments": {"server_defined_field": {"nested": True}},
+                },
+            )
+        )
+
+        assert result == {"ok": True}
+        assert observed == [{"server_defined_field": {"nested": True}}]
+    finally:
+        runtime.close()
+
+
+def test_mcp_call_syscall_rejects_explicit_null_arguments_before_primitive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Runtime.open("local")
+    called = False
+
+    async def unexpected_call(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal called
+        called = True
+        raise AssertionError("explicit null MCP arguments reached the primitive")
+
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="reject explicit null MCP syscall arguments",
+        )
+        monkeypatch.setattr(runtime.mcp, "acall_tool", unexpected_call)
+        with pytest.raises(
+            ValidationError,
+            match="syscall argument 'arguments' must be an object",
+        ):
+            asyncio.run(
+                LibOSSyscallSession(runtime, pid).handle(
+                    "mcp.call",
+                    {
+                        "server_id": "registered",
+                        "tool_id": "allowed",
+                        "arguments": None,
+                    },
+                )
+            )
+        assert called is False
+        assert runtime.store.list_external_effects(pid=pid) == []
+    finally:
+        runtime.close()
+
+
+def test_mcp_list_syscall_preserves_truncation_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="observe bounded MCP registry list",
+        )
+        monkeypatch.setattr(
+            runtime.mcp,
+            "list_servers_window",
+            lambda **_kwargs: ([{"server_id": "visible"}], True),
+        )
+
+        result = asyncio.run(
+            LibOSSyscallSession(runtime, pid).handle("mcp.list", {})
+        )
+
+        assert result == {
+            "servers": [{"server_id": "visible"}],
+            "has_more": True,
+        }
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "message"),
+    [
+        (
+            "mcp.resources",
+            {"server_id": "https://attacker.invalid"},
+            "logical id is invalid",
+        ),
+        (
+            "mcp.resources",
+            {"server_id": "registered", "cursor": "provider-raw-cursor"},
+            "cursor must be opaque",
+        ),
+        (
+            "mcp.resources",
+            {"server_id": "registered", "kind": "prompt"},
+            "kind is invalid",
+        ),
+        (
+            "mcp.resource_read",
+            {
+                "server_id": "registered",
+                "resource_id": "file:///host-secret",
+            },
+            "logical id is invalid",
+        ),
+        (
+            "mcp.resource_read",
+            {
+                "server_id": "registered",
+                "resource_id": "status",
+                "variables": {"name": 7},
+            },
+            "logical string names and values",
+        ),
+        (
+            "mcp.resource_read",
+            {
+                "server_id": "registered",
+                "resource_id": "status",
+                "variables": {"bad/key": "value"},
+            },
+            "logical string names and values",
+        ),
+        (
+            "mcp.resource_read",
+            {
+                "server_id": "registered",
+                "resource_id": "status",
+                "actor": "attacker",
+            },
+            "unknown fields",
+        ),
+    ],
+    ids=(
+        "server-url",
+        "raw-provider-cursor",
+        "prompt-kind",
+        "raw-resource-uri",
+        "non-string-variable-value",
+        "non-logical-variable-name",
+        "caller-supplied-actor",
+    ),
+)
+def test_mcp_resource_syscalls_reject_nonlogical_inputs_before_facade(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    arguments: dict[str, Any],
+    message: str,
+) -> None:
+    runtime = Runtime.open("local")
+    called = False
+
+    async def unexpected(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal called
+        called = True
+        raise AssertionError("invalid MCP Resource input reached facade")
+
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="reject nonlogical MCP Resource input",
+        )
+        for method_name in (
+            "alist_resources",
+            "alist_resource_templates",
+            "aread_resource",
+        ):
+            monkeypatch.setattr(
+                runtime.mcp,
+                method_name,
+                unexpected,
+                raising=False,
+            )
+
+        with pytest.raises(ValidationError, match=message):
+            asyncio.run(LibOSSyscallSession(runtime, pid).handle(name, arguments))
+
+        assert called is False
+        assert runtime.store.list_external_effects(pid=pid) == []
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        (
+            "mcp.resources",
+            {"server_id": "registered", "kind": "resource"},
+        ),
+        (
+            "mcp.resource_read",
+            {"server_id": "registered", "resource_id": "status"},
+        ),
+    ],
+    ids=("list", "read"),
+)
+def test_mcp_resource_syscalls_fail_closed_without_protected_facade(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    arguments: dict[str, Any],
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="reject an unprotected MCP Resource call",
+        )
+        for method_name in (
+            "alist_resources",
+            "alist_resource_templates",
+            "aread_resource",
+        ):
+            monkeypatch.setattr(runtime.mcp, method_name, None, raising=False)
+
+        with pytest.raises(
+            ValidationError,
+            match="MCP Resources protected facade is unavailable",
+        ):
+            asyncio.run(
+                LibOSSyscallSession(runtime, pid).handle(name, arguments)
+            )
+
+        assert runtime.store.list_external_effects(pid=pid) == []
+    finally:
+        runtime.close()
+
+
+def test_mcp_resource_syscalls_route_only_to_model_protected_facade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Runtime.open("local")
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def list_resources(
+        server_id: str,
+        **kwargs: Any,
+    ) -> McpPage[McpResource]:
+        calls.append(("resources", {"server_id": server_id, **kwargs}))
+        return McpPage(items=(McpResource(resource_id="status", name="Status"),))
+
+    async def list_templates(
+        server_id: str,
+        **kwargs: Any,
+    ) -> McpPage[McpResourceTemplate]:
+        calls.append(("templates", {"server_id": server_id, **kwargs}))
+        return McpPage(
+            items=(McpResourceTemplate(template_id="greeting", name="Greeting"),)
+        )
+
+    async def read_resource(
+        server_id: str,
+        resource_id: str,
+        **kwargs: Any,
+    ) -> McpComplete[McpResourceContents]:
+        calls.append(
+            (
+                "read",
+                {
+                    "server_id": server_id,
+                    "resource_id": resource_id,
+                    **kwargs,
+                },
+            )
+        )
+        return McpComplete(
+            value=McpResourceContents(
+                resource_id=resource_id,
+                contents=(McpTextContent(text="safe"),),
+            )
+        )
+
+    try:
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="use protected MCP Resource facade",
+        )
+        monkeypatch.setattr(
+            runtime.mcp,
+            "alist_resources",
+            list_resources,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            runtime.mcp,
+            "alist_resource_templates",
+            list_templates,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            runtime.mcp,
+            "aread_resource",
+            read_resource,
+            raising=False,
+        )
+        session = LibOSSyscallSession(runtime, pid)
+
+        resources = asyncio.run(
+            session.handle(
+                "mcp.resources",
+                {"server_id": "modern", "kind": "resource"},
+            )
+        )
+        templates = asyncio.run(
+            session.handle(
+                "mcp.resources",
+                {"server_id": "modern", "kind": "template"},
+            )
+        )
+        read = asyncio.run(
+            session.handle(
+                "mcp.resource_read",
+                {
+                    "server_id": "modern",
+                    "resource_id": "greeting",
+                    "variables": {"name": "Ada"},
+                },
+            )
+        )
+
+        assert resources["items"][0]["resource_id"] == "status"
+        assert templates["items"][0]["template_id"] == "greeting"
+        assert read["result"]["kind"] == "complete"
+        assert calls == [
+            (
+                "resources",
+                {
+                    "server_id": "modern",
+                    "cursor": None,
+                    "actor": pid,
+                    "model_visible_only": True,
+                },
+            ),
+            (
+                "templates",
+                {
+                    "server_id": "modern",
+                    "cursor": None,
+                    "actor": pid,
+                    "model_visible_only": True,
+                },
+            ),
+            (
+                "read",
+                {
+                    "server_id": "modern",
+                    "resource_id": "greeting",
+                    "variables": {"name": "Ada"},
+                    "actor": pid,
+                    "for_model": True,
+                },
+            ),
+        ]
     finally:
         runtime.close()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import threading
 from collections.abc import Mapping
@@ -2889,6 +2890,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             config=host.config,
             resources=host.resources,
         )
+        RuntimeBuilder._configure_modern_mcp(host)
 
     @staticmethod
     def _configure_semantic(host: Runtime) -> None:
@@ -4617,6 +4619,687 @@ class RuntimeBuilder(Generic[RuntimeT]):
         )
 
     @staticmethod
+    def _configure_modern_mcp(host: Runtime) -> None:
+        """Compose v3 clients from governed built-ins or explicit Host SPIs.
+
+        This step deliberately performs no Capability admission and opens no
+        transport.  ``McpPrimitive`` remains the ProtectedOperation facade;
+        the SDK session factory can only be entered from its provider phase.
+        """
+
+        from agent_libos.mcp.client import (
+            McpModernClient,
+            McpModernClientLimits,
+        )
+        from agent_libos.mcp.oauth import (
+            McpOAuthManager,
+            SystemKeyringMcpCredentialBroker,
+        )
+        from agent_libos.mcp.runtime_bridge import McpRuntimeBindingResolver
+        from agent_libos.mcp.supervisor import McpConnectionSupervisor
+
+        broker = RuntimeBuilder._modern_mcp_credential_broker(
+            host,
+            default_type=SystemKeyringMcpCredentialBroker,
+        )
+        oauth_transport = RuntimeBuilder._optional_mcp_substrate_spi(
+            host,
+            "mcp_oauth_transport",
+            ("request",),
+        )
+        supervisor = McpConnectionSupervisor(
+            idle_ttl_s=host.config.mcp.connection_idle_ttl_s,
+            absolute_ttl_s=host.config.mcp.connection_absolute_ttl_s,
+            max_connections=host.config.mcp.connection_max_open,
+        )
+        oauth_manager = McpOAuthManager(
+            broker=broker,
+            transport=oauth_transport,
+            challenge_ttl_s=host.config.mcp.oauth_state_ttl_s,
+            default_timeout_s=host.config.mcp.timeout_s,
+            connection_invalidator=supervisor.invalidate_server_nowait,
+        )
+        resolver = McpRuntimeBindingResolver(
+            host.uow.extensions,
+            host.mcp,
+            oauth_manager=oauth_manager,
+        )
+
+        (
+            artifact_writer,
+            resource_provider,
+            prompt_provider,
+            subscription_provider,
+            tasks_provider,
+            tool_provider,
+            continuation_provider,
+        ) = RuntimeBuilder._modern_mcp_custom_providers(host)
+
+        (
+            sdk_result_adapter,
+            governed_sdk_session_factory,
+            sdk_session_factory,
+            resource_provider,
+            prompt_provider,
+            tool_provider,
+            continuation_provider,
+            tasks_provider,
+            subscription_provider,
+        ) = RuntimeBuilder._modern_mcp_sdk_providers(
+            host,
+            supervisor=supervisor,
+            oauth_manager=oauth_manager,
+            artifact_writer=artifact_writer,
+            resource_provider=resource_provider,
+            prompt_provider=prompt_provider,
+            tool_provider=tool_provider,
+            continuation_provider=continuation_provider,
+            tasks_provider=tasks_provider,
+            subscription_provider=subscription_provider,
+        )
+
+        modern_client = McpModernClient(
+            resolver,
+            resource_provider=resource_provider,
+            prompt_provider=prompt_provider,
+            limits=McpModernClientLimits(
+                max_resource_items=host.config.mcp.resource_catalog_limit,
+                max_resource_template_items=host.config.mcp.resource_template_limit,
+                max_prompt_items=host.config.mcp.prompt_catalog_limit,
+                max_content_blocks=host.config.mcp.max_content_blocks,
+                max_prompt_messages=host.config.mcp.max_prompt_messages,
+                max_completion_values=host.config.mcp.max_completion_values,
+                max_cursor_handles=host.config.mcp.cursor_handle_limit,
+                max_cache_ttl_ms=host.config.mcp.cache_hint_ttl_cap_ms,
+            ),
+        )
+        RuntimeBuilder._bind_modern_mcp_runtime(
+            host,
+            modern_client=modern_client,
+            broker=broker,
+            sdk_result_adapter=sdk_result_adapter,
+            oauth_manager=oauth_manager,
+            oauth_transport=oauth_transport,
+            supervisor=supervisor,
+            governed_sdk_session_factory=governed_sdk_session_factory,
+            sdk_session_factory=sdk_session_factory,
+            artifact_writer=artifact_writer,
+            resource_provider=resource_provider,
+            prompt_provider=prompt_provider,
+            tool_provider=tool_provider,
+            continuation_provider=continuation_provider,
+            tasks_provider=tasks_provider,
+            subscription_provider=subscription_provider,
+        )
+
+    @staticmethod
+    def _bind_modern_mcp_runtime(
+        host: Runtime,
+        **components: Any,
+    ) -> None:
+        """Bind durable modern managers without opening a transport."""
+
+        from agent_libos.mcp.continuations import (
+            McpContinuationManager,
+            McpSdkContinuationCaptureAdapter,
+        )
+        from agent_libos.mcp.human import HumanObjectManagerMcpBridge
+        from agent_libos.mcp.sdk_subscriptions import McpSdkV2SubscriptionProvider
+        from agent_libos.mcp.subscriptions import (
+            McpSubscriptionManager,
+            McpSubscriptionPolicy,
+        )
+        from agent_libos.mcp.tasks import (
+            McpContinuationRemoteTaskCaptureAdapter,
+            McpRemoteTaskManager,
+            McpSdkRemoteTaskCaptureAdapter,
+        )
+        from agent_libos.primitives.mcp import (
+            McpPrimitiveContinuationBoundary,
+            McpPrimitiveRemoteTaskBoundary,
+        )
+
+        supervisor = components["supervisor"]
+        subscription_manager = RuntimeBuilder._modern_subscription_manager(
+            host,
+            supervisor,
+            manager_type=McpSubscriptionManager,
+            policy_type=McpSubscriptionPolicy,
+            local_cache_invalidator=components["modern_client"].invalidate_server,
+        )
+        continuation_manager, remote_task_manager = (
+            RuntimeBuilder._modern_mcp_durable_managers(
+                host,
+                broker=components["broker"],
+                result_adapter=components["sdk_result_adapter"],
+                tasks_provider=components["tasks_provider"],
+                continuation_manager_type=McpContinuationManager,
+                continuation_capture_type=McpSdkContinuationCaptureAdapter,
+                continuation_boundary_type=McpPrimitiveContinuationBoundary,
+                remote_task_manager_type=McpRemoteTaskManager,
+                remote_task_capture_type=McpSdkRemoteTaskCaptureAdapter,
+                continuation_task_capture_type=(
+                    McpContinuationRemoteTaskCaptureAdapter
+                ),
+                remote_task_boundary_type=McpPrimitiveRemoteTaskBoundary,
+                human_bridge_type=HumanObjectManagerMcpBridge,
+            )
+        )
+        subscription_provider = components["subscription_provider"]
+        if remote_task_manager is not None:
+            subscription_manager.bind_task_event_projector(remote_task_manager)
+            if type(subscription_provider) is McpSdkV2SubscriptionProvider:
+                subscription_provider.bind_task_subscriptions_resolver(
+                    remote_task_manager.subscription_targets
+                )
+        host.mcp._bind_modern_client(components["modern_client"])  # noqa: SLF001
+        host.mcp._bind_modern_managers(  # noqa: SLF001
+            continuations=continuation_manager,
+            remote_tasks=remote_task_manager,
+            subscriptions=subscription_manager,
+            subscription_provider=subscription_provider,
+            oauth=components["oauth_manager"],
+            invalidator=supervisor,
+        )
+        host.mcp._bind_modern_wire_providers(  # noqa: SLF001
+            tool_provider=components["tool_provider"],
+            continuation_provider=components["continuation_provider"],
+            tasks_provider=components["tasks_provider"],
+        )
+        RuntimeBuilder._publish_modern_mcp_components(
+            host,
+            components["modern_client"],
+            components["broker"],
+            components["oauth_manager"],
+            components["oauth_transport"],
+            supervisor,
+            components["governed_sdk_session_factory"],
+            components["sdk_session_factory"],
+            components["artifact_writer"],
+            components["resource_provider"],
+            components["prompt_provider"],
+            components["tool_provider"],
+            subscription_provider,
+            subscription_manager,
+            components["tasks_provider"],
+        )
+        host._mcp_continuation_manager = continuation_manager
+        host._mcp_remote_task_manager = remote_task_manager
+        host._mcp_continuation_provider = components["continuation_provider"]
+        host.bind_shutdown_finalizer(
+            partial(RuntimeBuilder._close_modern_mcp, host),
+            recovery_safe=True,
+        )
+
+    @staticmethod
+    def _modern_mcp_custom_providers(host: Runtime) -> tuple[Any, ...]:
+        """Resolve explicit exact-v3 Host SPIs without dispatching them."""
+
+        optional = RuntimeBuilder._optional_modern_mcp_substrate_spi
+        artifact_writer = RuntimeBuilder._optional_mcp_substrate_spi(
+            host,
+            "mcp_artifact_writer",
+            ("write_mcp_artifact",),
+        )
+        resource_provider = optional(
+            host,
+            "mcp_resource_provider",
+            {
+                "list_resources": (2, ("deadline",)),
+                "list_resource_templates": (2, ("deadline",)),
+                "read_resource": (3, ("deadline",)),
+            },
+        )
+        prompt_provider = optional(
+            host,
+            "mcp_prompt_provider",
+            {
+                "list_prompts": (2, ("deadline",)),
+                "get_prompt": (3, ("deadline",)),
+                "complete": (4, ("deadline",)),
+            },
+        )
+        subscription_provider = optional(
+            host,
+            "mcp_subscription_provider",
+            {
+                "listen": (2, ("deadline",)),
+                "receive": (1, ("deadline",)),
+                "close": (1, ()),
+            },
+        )
+        tasks_provider = optional(
+            host,
+            "mcp_tasks_provider",
+            {
+                "get_remote_task": (2, ("deadline",)),
+                "update_remote_task": (3, ("deadline",)),
+                "cancel_remote_task": (2, ("deadline",)),
+            },
+        )
+        tool_provider = optional(
+            host,
+            "mcp_v3_tool_provider",
+            {"call_tool": (3, ("deadline", "sensitive_values"))},
+        )
+        continuation_provider = optional(
+            host,
+            "mcp_continuation_provider",
+            {
+                "continue_tool": (5, ("deadline",)),
+                "continue_resource": (5, ("deadline",)),
+                "continue_prompt": (6, ("deadline",)),
+            },
+        )
+        return (
+            artifact_writer,
+            resource_provider,
+            prompt_provider,
+            subscription_provider,
+            tasks_provider,
+            tool_provider,
+            continuation_provider,
+        )
+
+    @staticmethod
+    def _modern_mcp_sdk_providers(
+        host: Runtime,
+        *,
+        supervisor: Any,
+        oauth_manager: Any,
+        artifact_writer: Any,
+        resource_provider: Any,
+        prompt_provider: Any,
+        tool_provider: Any,
+        continuation_provider: Any,
+        tasks_provider: Any,
+        subscription_provider: Any,
+    ) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
+        """Compose the built-in exact-modern SDK adapters without dispatch."""
+
+        from agent_libos.mcp.client import (
+            McpSdkV2ResultAdapter,
+            McpSdkV2SessionProvider,
+        )
+        from agent_libos.mcp.runtime_bridge import (
+            McpGovernedSdkSessionFactory,
+            McpSupervisedSdkSessionFactory,
+        )
+        from agent_libos.mcp.sdk_subscriptions import (
+            McpSdkV2SubscriptionLimits,
+            McpSdkV2SubscriptionProvider,
+        )
+        from agent_libos.mcp.wire import (
+            McpSdkV3ContinuationProvider,
+            McpSdkV3TasksProvider,
+            McpSdkV3ToolProvider,
+        )
+
+        result_adapter = McpSdkV2ResultAdapter(
+            artifact_writer=artifact_writer,
+            max_cache_ttl_ms=host.config.mcp.cache_hint_ttl_cap_ms,
+            max_content_blocks=host.config.mcp.max_content_blocks,
+            max_prompt_messages=host.config.mcp.max_prompt_messages,
+            max_completion_values=host.config.mcp.max_completion_values,
+        )
+        governed_factory = None
+        sdk_factory = None
+        # Custom v1/v2 providers retain their original SPI.  Only the exact
+        # released built-in gains implicit modern wire adapters.
+        if type(host.mcp.provider) is SdkMcpProvider:
+            governed_factory = McpGovernedSdkSessionFactory(
+                host.mcp._modern_session_factory_context,  # noqa: SLF001
+                oauth_manager=oauth_manager,
+            )
+            sdk_factory = McpSupervisedSdkSessionFactory(
+                supervisor,
+                governed_factory,
+            )
+            sdk_adapter = McpSdkV2SessionProvider(
+                sdk_factory,
+                result_adapter=result_adapter,
+                sensitive_values_resolver=sdk_factory.sensitive_values,
+            )
+            resource_provider = resource_provider or sdk_adapter
+            prompt_provider = prompt_provider or sdk_adapter
+            if tool_provider is None:
+                tool_provider = McpSdkV3ToolProvider(
+                    sdk_factory,
+                    result_adapter=result_adapter,
+                    host_policy=host.mcp._v3_host_policy(),  # noqa: SLF001
+                    host_tasks_extension_sha256=(
+                        host.config.mcp.tasks_extension_spec_sha256
+                        if host.config.mcp.tasks_extension_enabled
+                        else None
+                    ),
+                    sensitive_values_resolver=sdk_factory.sensitive_values,
+                )
+            if continuation_provider is None:
+                continuation_provider = McpSdkV3ContinuationProvider(
+                    sdk_factory,
+                    result_adapter=result_adapter,
+                    host_policy=host.mcp._v3_host_policy(),  # noqa: SLF001
+                    host_tasks_extension_sha256=(
+                        host.config.mcp.tasks_extension_spec_sha256
+                        if host.config.mcp.tasks_extension_enabled
+                        else None
+                    ),
+                    sensitive_values_resolver=sdk_factory.sensitive_values,
+                )
+            if (
+                tasks_provider is None
+                and host.config.mcp.tasks_extension_enabled
+                and host.config.mcp.tasks_extension_spec_sha256 is not None
+            ):
+                tasks_provider = McpSdkV3TasksProvider(
+                    sdk_factory,
+                    host_tasks_extension_sha256=(
+                        host.config.mcp.tasks_extension_spec_sha256
+                    ),
+                    sensitive_values_resolver=sdk_factory.sensitive_values,
+                )
+            if subscription_provider is None:
+                subscription_provider = McpSdkV2SubscriptionProvider(
+                    governed_factory,
+                    sensitive_values_resolver=governed_factory.sensitive_values,
+                    limits=McpSdkV2SubscriptionLimits(
+                        queue_events=host.config.mcp.subscription_queue_events,
+                        event_max_bytes=host.config.mcp.subscription_event_max_bytes,
+                        max_resource_subscriptions=(
+                            host.config.mcp.resource_catalog_limit
+                        ),
+                        max_task_subscriptions=(
+                            host.config.mcp.remote_task_max_records
+                        ),
+                    ),
+                )
+        return (
+            result_adapter,
+            governed_factory,
+            sdk_factory,
+            resource_provider,
+            prompt_provider,
+            tool_provider,
+            continuation_provider,
+            tasks_provider,
+            subscription_provider,
+        )
+
+    @staticmethod
+    def _publish_modern_mcp_components(
+        host: Runtime,
+        modern_client: Any,
+        broker: Any,
+        oauth_manager: Any,
+        oauth_transport: Any,
+        supervisor: Any,
+        governed_sdk_session_factory: Any,
+        sdk_session_factory: Any,
+        artifact_writer: Any,
+        resource_provider: Any,
+        prompt_provider: Any,
+        tool_provider: Any,
+        subscription_provider: Any,
+        subscription_manager: Any,
+        tasks_provider: Any,
+    ) -> None:
+        """Publish private, explicitly declared MCP composition evidence."""
+
+        host._mcp_modern_client = modern_client
+        host._mcp_credential_broker = broker
+        host._mcp_oauth_manager = oauth_manager
+        host._mcp_oauth_transport = oauth_transport
+        host._mcp_connection_supervisor = supervisor
+        host._mcp_governed_sdk_session_factory = governed_sdk_session_factory
+        host._mcp_sdk_session_factory = sdk_session_factory
+        host._mcp_artifact_writer = artifact_writer
+        host._mcp_resource_provider = resource_provider
+        host._mcp_prompt_provider = prompt_provider
+        host._mcp_v3_tool_provider = tool_provider
+        host._mcp_subscription_provider = subscription_provider
+        host._mcp_subscription_manager = subscription_manager
+        host._mcp_tasks_provider = tasks_provider
+
+    @staticmethod
+    def _modern_subscription_manager(
+        host: Runtime,
+        supervisor: Any,
+        *,
+        manager_type: Any,
+        policy_type: Any,
+        local_cache_invalidator: Callable[[str], None],
+    ) -> Any:
+        return manager_type(
+            supervisor,
+            policy=policy_type(
+                max_open=host.config.mcp.subscription_max_open,
+                queue_events=host.config.mcp.subscription_queue_events,
+                event_max_bytes=host.config.mcp.subscription_event_max_bytes,
+                max_lifetime_s=host.config.mcp.subscription_max_lifetime_s,
+                exchange_timeout_s=host.config.mcp.timeout_s,
+                terminal_status_records=host.config.mcp.subscription_terminal_records,
+            ),
+            store=host.uow.mcp_subscriptions,
+            admission=host.lifecycle,
+            local_cache_invalidator=local_cache_invalidator,
+            reconcile_on_start=False,
+        )
+
+    @staticmethod
+    def _modern_mcp_durable_managers(
+        host: Runtime,
+        *,
+        broker: Any,
+        result_adapter: Any,
+        tasks_provider: Any,
+        continuation_manager_type: Any,
+        continuation_capture_type: Any,
+        continuation_boundary_type: Any,
+        remote_task_manager_type: Any,
+        remote_task_capture_type: Any,
+        continuation_task_capture_type: Any,
+        remote_task_boundary_type: Any,
+        human_bridge_type: Any,
+    ) -> tuple[Any, Any | None]:
+        """Build durable MRTR/Tasks state machines before Runtime OPEN."""
+
+        human_bridge = human_bridge_type(
+            host.human,
+            host_question_authorizer=host.mcp.authorize_mcp_host_question,
+        )
+        task_manager = None
+        initial_task_capture = None
+        continuation_task_capture = None
+        tasks_pin = host.config.mcp.tasks_extension_spec_sha256
+        if host.config.mcp.tasks_extension_enabled:
+            if tasks_provider is None or type(tasks_pin) is not str:
+                raise ValidationError(
+                    "MCP Tasks extension requires a pinned Tasks provider"
+                )
+            task_manager = remote_task_manager_type(
+                repository=host.uow.mcp_remote_tasks,
+                side_effects=host.uow.mcp_side_effects,
+                broker=broker,
+                human_requests=human_bridge,
+                boundary=remote_task_boundary_type(host.mcp),
+                max_input_requests=host.config.mcp.mrtr_max_input_requests,
+                poll_min_interval_s=(
+                    host.config.mcp.remote_task_poll_min_interval_s
+                ),
+                max_wait_s=host.config.mcp.remote_task_max_wait_s,
+                max_records=host.config.mcp.remote_task_max_records,
+                terminal_records=host.config.mcp.remote_task_terminal_records,
+                reconcile_on_start=False,
+            )
+            initial_task_capture = remote_task_capture_type(
+                task_manager,
+                host.mcp.capture_remote_task_binding,
+            )
+            continuation_task_capture = continuation_task_capture_type(
+                task_manager,
+                host.mcp.resolve_continuation_task_binding,
+            )
+        continuation_manager = continuation_manager_type(
+            repository=host.uow.mcp_continuations,
+            side_effects=host.uow.mcp_side_effects,
+            broker=broker,
+            human_requests=human_bridge,
+            boundary=continuation_boundary_type(host.mcp),
+            max_rounds=host.config.mcp.mrtr_max_rounds,
+            max_input_requests=host.config.mcp.mrtr_max_input_requests,
+            request_state_max_bytes=(
+                host.config.mcp.mrtr_request_state_max_bytes
+            ),
+            continuation_ttl_s=host.config.mcp.continuation_ttl_s,
+            max_records=host.config.mcp.continuation_max_records,
+            terminal_records=host.config.mcp.continuation_terminal_records,
+            remote_task_capture=continuation_task_capture,
+            reconcile_on_start=False,
+        )
+        result_adapter.input_required_handler = continuation_capture_type(
+            continuation_manager,
+            host.mcp.capture_continuation_binding,
+        )
+        result_adapter.remote_task_handler = initial_task_capture
+        return continuation_manager, task_manager
+
+    @staticmethod
+    def _modern_mcp_credential_broker(
+        host: Runtime,
+        *,
+        default_type: Any,
+    ) -> Any:
+        broker = RuntimeBuilder._optional_mcp_substrate_spi(
+            host,
+            "mcp_credential_broker",
+            ("reserve_secret_ref", "put_secret_at", "put_secret", "get_secret", "delete_secret", "available"),
+        )
+        if broker is not None:
+            return broker
+        # Construction does not touch the keyring backend.  A headless Runtime
+        # without OAuth opens normally; auth registration/use checks available.
+        return default_type()
+
+    @staticmethod
+    def _optional_mcp_substrate_spi(
+        host: Runtime,
+        attribute: str,
+        methods: tuple[str, ...],
+    ) -> Any | None:
+        selected = getattr(host.substrate, attribute, None)
+        if selected is None:
+            return None
+        missing = tuple(
+            method for method in methods if not callable(getattr(selected, method, None))
+        )
+        if missing:
+            raise TypeError(
+                f"substrate.{attribute} must implement callable "
+                + ", ".join(missing)
+            )
+        return selected
+
+    @staticmethod
+    def _optional_modern_mcp_substrate_spi(
+        host: Runtime,
+        attribute: str,
+        methods: Mapping[str, tuple[int, tuple[str, ...]]],
+    ) -> Any | None:
+        selected = getattr(host.substrate, attribute, None)
+        if selected is None:
+            return None
+        if (
+            getattr(selected, "mcp_manifest_schema_version", None) != 3
+            or getattr(selected, "mcp_protocol_revision", None) != "2026-07-28"
+        ):
+            raise TypeError(
+                f"substrate.{attribute} must declare the exact MCP v3 identity"
+            )
+        for method_name, (positional_count, keyword_names) in methods.items():
+            RuntimeBuilder._validate_modern_mcp_spi_method(
+                attribute,
+                method_name,
+                getattr(selected, method_name, None),
+                positional_count=positional_count,
+                keyword_names=keyword_names,
+            )
+        return selected
+
+    @staticmethod
+    def _validate_modern_mcp_spi_method(
+        attribute: str,
+        method_name: str,
+        method: Any,
+        *,
+        positional_count: int,
+        keyword_names: tuple[str, ...],
+    ) -> None:
+        label = f"substrate.{attribute}.{method_name}"
+        if not inspect.iscoroutinefunction(method):
+            raise TypeError(f"{label} must be declared with async def")
+        try:
+            parameters = tuple(inspect.signature(method).parameters.values())
+        except (TypeError, ValueError) as exc:
+            raise TypeError(f"{label} must expose its modern MCP signature") from exc
+        positional = parameters[:positional_count]
+        tail = parameters[positional_count:]
+        if len(positional) != positional_count or any(
+            item.kind
+            not in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            }
+            for item in positional
+        ):
+            raise TypeError(f"{label} has an incompatible positional signature")
+        if tuple(item.name for item in tail) != keyword_names or any(
+            item.kind is not inspect.Parameter.KEYWORD_ONLY for item in tail
+        ):
+            raise TypeError(f"{label} has an incompatible keyword signature")
+
+    @staticmethod
+    async def _close_modern_mcp(host: Runtime) -> None:
+        """Close streams before transport supervisor and OAuth handles."""
+
+        selected: list[Any] = []
+        subscription_runner = getattr(
+            host.mcp, "_modern_subscription_runner", None
+        )
+        subscriptions = getattr(host.mcp, "_modern_subscriptions", None)
+        if subscription_runner is not None:
+            selected.append(subscription_runner)
+        elif subscriptions is not None:
+            selected.append(subscriptions)
+        session_factory = getattr(host, "_mcp_sdk_session_factory", None)
+        if session_factory is not None:
+            selected.append(session_factory)
+        else:
+            supervisor = getattr(host, "_mcp_connection_supervisor", None)
+            if supervisor is not None:
+                selected.append(supervisor)
+        oauth = getattr(host, "_mcp_oauth_manager", None)
+        if oauth is not None:
+            selected.append(oauth)
+
+        failures: list[BaseException] = []
+        closed: set[int] = set()
+        for target in selected:
+            if id(target) in closed:
+                continue
+            closed.add(id(target))
+            close = getattr(target, "close", None)
+            if not callable(close):
+                continue
+            try:
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
+            except BaseException as exc:
+                failures.append(exc)
+        if failures:
+            raise ExceptionGroup("MCP Runtime cleanup failed", failures)
+
+    @staticmethod
     def _configure_execution_services(host: Runtime) -> None:
         host.tools = ToolBroker(
             host.uow,
@@ -4635,6 +5318,9 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 pid,
                 config=host.config,
                 transitions=host.process_transitions,
+                audit=host.audit,
+                mcp=host.mcp,
+                syscall_registry=host.syscalls,
             ),
             tool_context_host=host,
             images=host.images,
@@ -4979,6 +5665,21 @@ class RuntimeBuilder(Generic[RuntimeT]):
             # without dispatch.  Durable recovery effects run only after this
             # read-only preflight has classified missing/corrupt payloads.
             host.task_runs.validate_recoverable_payloads()
+            # MCP continuations, remote Tasks, and subscriptions interrupted by
+            # a crash reach their durable restart state exactly once.
+            # Constructors are read-only; these CAS transitions occur only
+            # after TaskRun plaintext/integrity preflight and under this lease.
+            host.recovered_mcp_continuations = (
+                host._mcp_continuation_manager.reconcile_after_restart()
+            )
+            host.recovered_mcp_remote_tasks = (
+                host._mcp_remote_task_manager.reconcile_after_restart()
+                if host._mcp_remote_task_manager is not None
+                else 0
+            )
+            host.recovered_mcp_subscriptions = (
+                host._mcp_subscription_manager.reconcile_after_restart()
+            )
             recovery_page_size = (
                 host.config.runtime.external_effect_recovery_page_size
             )

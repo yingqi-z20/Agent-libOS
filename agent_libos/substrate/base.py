@@ -326,41 +326,87 @@ def _executable_stat_identity(value: os.stat_result) -> tuple[int, int, int, int
     )
 
 
-def executable_content_sha256(executable: str | Path) -> str:
-    """Hash one stable regular-file executable without following a final link."""
+def _check_executable_absolute_deadline(
+    deadline: float | None,
+    *,
+    stage: str,
+) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(
+            f"executable operation absolute deadline exhausted during {stage}"
+        )
+
+
+def executable_content_sha256(
+    executable: str | Path,
+    *,
+    deadline: float | None = None,
+) -> str:
+    """Hash one stable regular-file executable within an optional deadline."""
 
     selected = Path(executable)
+    _check_executable_absolute_deadline(deadline, stage="fingerprint setup")
+    try:
+        path_before = os.stat(selected, follow_symlinks=False)
+    except OSError:
+        _check_executable_absolute_deadline(deadline, stage="fingerprint path stat")
+        raise
+    if stat.S_ISLNK(path_before.st_mode) or not stat.S_ISREG(path_before.st_mode):
+        raise ValidationError(f"executable identity is not a regular file: {selected}")
+    _check_executable_absolute_deadline(deadline, stage="fingerprint source open")
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    # A path that was a regular file at resolution time can be swapped for a
+    # FIFO/device before open.  O_NONBLOCK makes that adversarial race return
+    # a descriptor (or an error) instead of waiting forever; fstat below then
+    # rejects every non-regular target before a read is attempted.
+    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(selected, flags)
     except FileNotFoundError:
         raise
     except OSError as exc:
+        _check_executable_absolute_deadline(deadline, stage="fingerprint source open")
         raise ValidationError(
             f"executable identity cannot be opened without following links: {selected}"
         ) from exc
     try:
+        _check_executable_absolute_deadline(deadline, stage="fingerprint source stat")
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise ValidationError(f"executable identity is not a regular file: {selected}")
+        if _executable_stat_identity(path_before) != _executable_stat_identity(before):
+            raise ValidationError(
+                f"executable identity changed while it was fingerprinted: {selected}"
+            )
         digest = hashlib.sha256()
         while True:
-            chunk = os.read(descriptor, 1024 * 1024)
+            _check_executable_absolute_deadline(deadline, stage="fingerprint read")
+            try:
+                chunk = os.read(descriptor, 1024 * 1024)
+            finally:
+                _check_executable_absolute_deadline(
+                    deadline,
+                    stage="fingerprint read",
+                )
             if not chunk:
                 break
             digest.update(chunk)
+        _check_executable_absolute_deadline(deadline, stage="fingerprint source stat")
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
 
+    _check_executable_absolute_deadline(deadline, stage="fingerprint path stat")
     try:
         current = os.stat(selected, follow_symlinks=False)
     except OSError as exc:
+        _check_executable_absolute_deadline(deadline, stage="fingerprint path stat")
         raise ValidationError(
             f"executable identity changed while it was fingerprinted: {selected}"
         ) from exc
+    _check_executable_absolute_deadline(deadline, stage="fingerprint path stat")
     if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
         raise ValidationError(f"executable identity changed to a non-regular file: {selected}")
 
@@ -397,11 +443,16 @@ class ExecutableSnapshot:
         self._directory = directory
         self._closed = False
 
-    def verify(self) -> None:
+    def verify(self, *, deadline: float | None = None) -> None:
         if self._closed:
             raise ValidationError("executable snapshot is already closed")
         try:
-            actual = executable_content_sha256(self.executable_path)
+            actual = executable_content_sha256(
+                self.executable_path,
+                deadline=deadline,
+            )
+        except TimeoutError:
+            raise
         except (OSError, ValidationError) as exc:
             raise ValidationError("Host executable snapshot is no longer available") from exc
         if actual != self.content_sha256:
@@ -433,11 +484,17 @@ class ExecutableSnapshot:
 def _copy_executable_snapshot_bytes(
     source_fd: int,
     destination_fd: int,
+    *,
+    deadline: float | None = None,
 ) -> tuple[str, bytes]:
     digest = hashlib.sha256()
     header = bytearray()
     while True:
-        chunk = os.read(source_fd, 1024 * 1024)
+        _check_executable_absolute_deadline(deadline, stage="snapshot read")
+        try:
+            chunk = os.read(source_fd, 1024 * 1024)
+        finally:
+            _check_executable_absolute_deadline(deadline, stage="snapshot read")
         if not chunk:
             break
         if len(header) < 2:
@@ -445,7 +502,11 @@ def _copy_executable_snapshot_bytes(
         digest.update(chunk)
         remaining = memoryview(chunk)
         while remaining:
-            written = os.write(destination_fd, remaining)
+            _check_executable_absolute_deadline(deadline, stage="snapshot write")
+            try:
+                written = os.write(destination_fd, remaining)
+            finally:
+                _check_executable_absolute_deadline(deadline, stage="snapshot write")
             if written <= 0:
                 raise OSError("executable snapshot write made no progress")
             remaining = remaining[written:]
@@ -456,14 +517,20 @@ def _validate_executable_snapshot_source_identity(
     selected: Path,
     source_fd: int,
     before: os.stat_result,
+    *,
+    deadline: float | None = None,
 ) -> None:
+    _check_executable_absolute_deadline(deadline, stage="snapshot source stat")
     after = os.fstat(source_fd)
+    _check_executable_absolute_deadline(deadline, stage="snapshot path stat")
     try:
         current = os.stat(selected, follow_symlinks=False)
     except OSError as exc:
+        _check_executable_absolute_deadline(deadline, stage="snapshot path stat")
         raise ValidationError(
             f"executable identity changed while it was snapshotted: {selected}"
         ) from exc
+    _check_executable_absolute_deadline(deadline, stage="snapshot path stat")
     if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
         raise ValidationError(
             f"executable identity changed to a non-regular file: {selected}"
@@ -485,8 +552,10 @@ def _mirror_executable_snapshot_siblings(
     sibling_limit: int,
     sibling_policy: str,
     header: bytes,
+    deadline: float | None = None,
 ) -> None:
     mirrored = 0
+    _check_executable_absolute_deadline(deadline, stage="snapshot sibling setup")
     should_mirror_direct = sibling_policy == "all" or (
         sibling_policy == "scripts" and header == b"#!"
     )
@@ -496,6 +565,7 @@ def _mirror_executable_snapshot_siblings(
             dispatch_directory,
             sibling_limit=sibling_limit,
             mirrored=mirrored,
+            deadline=deadline,
         )
     # Native launchers commonly resolve shared libraries through
     # ``$ORIGIN/../lib`` or ``@executable_path/../lib``. Keep the copied
@@ -513,6 +583,7 @@ def _mirror_executable_snapshot_siblings(
             snapshot_root,
             sibling_limit=sibling_limit,
             mirrored=mirrored,
+            deadline=deadline,
         )
 
 
@@ -521,6 +592,7 @@ def snapshot_executable(
     *,
     sibling_limit: int = _TOOL_DEFAULTS.executable_snapshot_sibling_limit,
     sibling_policy: str = "all",
+    deadline: float | None = None,
 ) -> ExecutableSnapshot:
     """Copy one stable executable into a private Host-owned dispatch object.
 
@@ -533,6 +605,7 @@ def snapshot_executable(
     if sibling_policy not in {"all", "scripts", "none"}:
         raise ValidationError("executable snapshot sibling policy is invalid")
 
+    _check_executable_absolute_deadline(deadline, stage="snapshot setup")
     selected = Path(executable)
     source_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     source_flags |= getattr(os, "O_CLOEXEC", 0)
@@ -542,34 +615,51 @@ def snapshot_executable(
     except FileNotFoundError:
         raise
     except OSError as exc:
+        _check_executable_absolute_deadline(deadline, stage="snapshot source open")
         raise ValidationError(
             f"executable snapshot cannot open source without following links: {selected}"
         ) from exc
 
-    directory = Path(tempfile.mkdtemp(prefix="agent-libos-executable-"))
-    dispatch_directory = directory / (selected.parent.name or "bin")
-    dispatch_directory.mkdir(mode=0o700)
-    destination = dispatch_directory / (selected.name or "executable")
+    directory: Path | None = None
     destination_fd: int | None = None
     try:
+        _check_executable_absolute_deadline(deadline, stage="snapshot directory creation")
+        directory = Path(tempfile.mkdtemp(prefix="agent-libos-executable-"))
+        dispatch_directory = directory / (selected.parent.name or "bin")
+        _check_executable_absolute_deadline(deadline, stage="snapshot directory creation")
+        dispatch_directory.mkdir(mode=0o700)
+        _check_executable_absolute_deadline(deadline, stage="snapshot directory creation")
+        destination = dispatch_directory / (selected.name or "executable")
+        _check_executable_absolute_deadline(deadline, stage="snapshot source stat")
         before = os.fstat(source_fd)
         if not stat.S_ISREG(before.st_mode):
             raise ValidationError(f"executable snapshot source is not a regular file: {selected}")
         destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         destination_flags |= getattr(os, "O_BINARY", 0)
         destination_flags |= getattr(os, "O_CLOEXEC", 0)
+        _check_executable_absolute_deadline(deadline, stage="snapshot destination open")
         destination_fd = os.open(destination, destination_flags, 0o700)
         digest, header = _copy_executable_snapshot_bytes(
             source_fd,
             destination_fd,
+            deadline=deadline,
         )
+        _check_executable_absolute_deadline(deadline, stage="snapshot fsync")
         os.fsync(destination_fd)
+        _check_executable_absolute_deadline(deadline, stage="snapshot fsync")
         executable_mode = stat.S_IMODE(before.st_mode) & 0o555
+        _check_executable_absolute_deadline(deadline, stage="snapshot mode pinning")
         if hasattr(os, "fchmod"):
             os.fchmod(destination_fd, executable_mode)
         else:  # pragma: no cover - Windows has no descriptor chmod.
             os.chmod(destination, executable_mode)
-        _validate_executable_snapshot_source_identity(selected, source_fd, before)
+        _check_executable_absolute_deadline(deadline, stage="snapshot mode pinning")
+        _validate_executable_snapshot_source_identity(
+            selected,
+            source_fd,
+            before,
+            deadline=deadline,
+        )
         os.close(destination_fd)
         destination_fd = None
         _mirror_executable_snapshot_siblings(
@@ -579,15 +669,21 @@ def snapshot_executable(
             sibling_limit=sibling_limit,
             sibling_policy=sibling_policy,
             header=header,
+            deadline=deadline,
         )
+        _check_executable_absolute_deadline(deadline, stage="snapshot finalization")
         os.chmod(directory, 0o500)
+        _check_executable_absolute_deadline(deadline, stage="snapshot path resolution")
+        source_path = selected.resolve(strict=True)
+        _check_executable_absolute_deadline(deadline, stage="snapshot path resolution")
         snapshot = ExecutableSnapshot(
-            source_path=selected.resolve(strict=True),
+            source_path=source_path,
             executable_path=destination,
             content_sha256=digest,
             directory=directory,
         )
-        snapshot.verify()
+        snapshot.verify(deadline=deadline)
+        _check_executable_absolute_deadline(deadline, stage="snapshot finalization")
         return snapshot
     except BaseException:
         if destination_fd is not None:
@@ -595,14 +691,39 @@ def snapshot_executable(
                 os.close(destination_fd)
             except OSError:
                 pass
-        try:
-            os.chmod(directory, 0o700)
-        except OSError:
-            pass
-        shutil.rmtree(directory, ignore_errors=True)
+        if directory is not None:
+            try:
+                os.chmod(directory, 0o700)
+            except OSError:
+                pass
+            shutil.rmtree(directory, ignore_errors=True)
         raise
     finally:
         os.close(source_fd)
+
+
+def _validate_executable_sibling_progress(
+    *,
+    sibling_limit: int,
+    mirrored: int,
+) -> None:
+    if (
+        isinstance(sibling_limit, bool)
+        or not isinstance(sibling_limit, int)
+        or sibling_limit <= 0
+    ):
+        raise ValidationError(
+            "executable snapshot sibling limit must be a positive integer"
+        )
+    if (
+        isinstance(mirrored, bool)
+        or not isinstance(mirrored, int)
+        or mirrored < 0
+        or mirrored > sibling_limit
+    ):
+        raise ValidationError(
+            "executable snapshot mirrored sibling count is invalid"
+        )
 
 
 def _mirror_executable_siblings(
@@ -611,6 +732,7 @@ def _mirror_executable_siblings(
     *,
     sibling_limit: int,
     mirrored: int = 0,
+    deadline: float | None = None,
 ) -> int:
     """Expose sibling resources beside a private executable snapshot.
 
@@ -624,22 +746,27 @@ def _mirror_executable_siblings(
     failure aborts before final provider dispatch.
     """
 
-    if (
-        isinstance(sibling_limit, bool)
-        or not isinstance(sibling_limit, int)
-        or sibling_limit <= 0
-    ):
-        raise ValidationError("executable snapshot sibling limit must be a positive integer")
-    if (
-        isinstance(mirrored, bool)
-        or not isinstance(mirrored, int)
-        or mirrored < 0
-        or mirrored > sibling_limit
-    ):
-        raise ValidationError("executable snapshot mirrored sibling count is invalid")
+    _validate_executable_sibling_progress(
+        sibling_limit=sibling_limit,
+        mirrored=mirrored,
+    )
     siblings: list[Path] = []
+    _check_executable_absolute_deadline(deadline, stage="snapshot sibling enumeration")
     try:
-        for sibling in source.parent.iterdir():
+        iterator = iter(source.parent.iterdir())
+        while True:
+            _check_executable_absolute_deadline(
+                deadline,
+                stage="snapshot sibling enumeration",
+            )
+            try:
+                sibling = next(iterator)
+            except StopIteration:
+                break
+            _check_executable_absolute_deadline(
+                deadline,
+                stage="snapshot sibling enumeration",
+            )
             if sibling.name == source.name:
                 continue
             if mirrored + len(siblings) >= sibling_limit:
@@ -648,24 +775,47 @@ def _mirror_executable_siblings(
                     f"{sibling_limit}"
                 )
             siblings.append(sibling)
+    except TimeoutError:
+        raise
     except ValidationError:
         raise
     except OSError as exc:
+        _check_executable_absolute_deadline(
+            deadline,
+            stage="snapshot sibling enumeration",
+        )
         raise ValidationError(
             "executable snapshot cannot enumerate sibling resources"
         ) from exc
     for sibling in siblings:
+        _check_executable_absolute_deadline(deadline, stage="snapshot sibling mirror")
         mirror = snapshot_directory / sibling.name
+        is_directory = sibling.is_dir()
+        _check_executable_absolute_deadline(deadline, stage="snapshot sibling mirror")
         try:
             mirror.symlink_to(
                 sibling.absolute(),
-                target_is_directory=sibling.is_dir(),
+                target_is_directory=is_directory,
             )
         except OSError as symlink_error:
+            _check_executable_absolute_deadline(
+                deadline,
+                stage="snapshot sibling mirror",
+            )
             # Windows may not permit unprivileged symlink creation. A hard
             # link preserves ordinary sibling-file access without copying
             # content; directory mirroring instead fails closed on that Host.
-            if os.name != "nt" or not sibling.is_file():
+            if os.name != "nt" or is_directory:
+                raise ValidationError(
+                    "executable snapshot cannot expose sibling resource "
+                    f"{sibling.name!r}"
+                ) from symlink_error
+            is_file = sibling.is_file()
+            _check_executable_absolute_deadline(
+                deadline,
+                stage="snapshot sibling mirror",
+            )
+            if not is_file:
                 raise ValidationError(
                     "executable snapshot cannot expose sibling resource "
                     f"{sibling.name!r}"
@@ -673,10 +823,15 @@ def _mirror_executable_siblings(
             try:
                 os.link(sibling, mirror)
             except OSError as link_error:
+                _check_executable_absolute_deadline(
+                    deadline,
+                    stage="snapshot sibling mirror",
+                )
                 raise ValidationError(
                     "executable snapshot cannot expose sibling resource "
                     f"{sibling.name!r}"
                 ) from link_error
+        _check_executable_absolute_deadline(deadline, stage="snapshot sibling mirror")
     return mirrored + len(siblings)
 
 
@@ -1220,6 +1375,18 @@ class McpModernProtocolProvider(Protocol):
         runtime_environment: Mapping[str, str] | None = None,
         limits: SubprocessLimits | None = None,
     ) -> McpProviderDiscoveryResult: ...
+
+
+@runtime_checkable
+class McpAbsoluteDeadlineProvider(Protocol):
+    """Opt-in MCP SPI whose dispatch methods accept ``deadline=``.
+
+    The absolute monotonic deadline is shared with primitive DNS, executable
+    snapshotting, negotiation, pagination, and the final Tool call. Providers
+    exposing this exact marker must not replace it with a fresh relative timer.
+    """
+
+    supports_mcp_absolute_deadline: Literal[True]
 
 
 @runtime_checkable

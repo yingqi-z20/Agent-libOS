@@ -1,0 +1,44 @@
+schema_version: 3
+server_id: demo-http-v3
+transport: streamable_http
+protocol_mode: "2026-07-28"
+http:
+  url: http://127.0.0.1:8765/mcp
+tools:
+  - tool_id: echo
+    mcp_name: demo.echo
+    right: read
+    rollback_class: no_rollback_required
+    rollback_status: not_required
+    state_mutation: false
+    information_flow: true
+    input_schema: {}
+resources:
+  - resource_id: status
+    remote_uri: demo://status
+    right: read
+    information_flow: true
+    model_visible: false
+    mime_types:
+      - application/json
+resource_templates:
+  - template_id: greeting
+    remote_uri_template: demo://greeting/{name}
+    variables:
+      - name
+    right: read
+    information_flow: true
+    model_visible: false
+    mime_types:
+      - text/plain
+prompts:
+  - prompt_id: review
+    mcp_name: demo.review
+    argument_names:
+      - subject
+subscriptions: []
+timeout_s: 10
+max_request_bytes: 65536
+max_response_bytes: 1048576
+metadata:
+  example: deterministic-loopback-http

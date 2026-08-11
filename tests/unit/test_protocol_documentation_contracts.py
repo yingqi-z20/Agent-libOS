@@ -43,6 +43,7 @@ def test_mcp_docs_keep_transport_and_provider_bounds_distinct() -> None:
         "maximum node count is `min(100,000, max_response_bytes)`",
         "aggregate UTF-8 bytes across all string values and mapping keys",
         "`config.mcp.list_limit` tools",
+        "Manifest v3 Tool catalogs use `config.mcp.tool_catalog_limit`",
         "cannot exceed `max_response_bytes` or under-report",
         "`McpSubprocessLimitsProvider`",
         "`supports_runtime_environment_snapshots = True`",
@@ -60,6 +61,57 @@ def test_mcp_docs_keep_transport_and_provider_bounds_distinct() -> None:
     )
     assert "depth 128" in skill
     assert "`SubprocessLimits`" in skill
+
+
+def test_mcp_oauth_docs_distinguish_transient_code_from_broker_storage() -> None:
+    mcp = _words(_read("docs/mcp.md"))
+    cli = _words(_read("docs/cli.md"))
+    gui = _words(_read("docs/gui.md"))
+    example = _words(_read("examples/mcp/README.md"))
+
+    assert "authorization code necessarily exists transiently" in mcp
+    assert "never written to RuntimeStore or credential-broker storage" in mcp
+    assert "Python or JavaScript immutable values are released" in mcp
+    assert "CLI releases its application-owned callback reference" in cli
+    assert (
+        "authorization code exists transiently in renderer, HTTP, and Runtime memory"
+        in gui
+    )
+    assert "callback authorization code only in transient Host memory" in example
+    for documentation in (mcp, example):
+        assert "authorization codes, PKCE verifier, state, refresh/access tokens" not in documentation
+        assert "keeps codes/PKCE/tokens inside the injected credential broker" not in documentation
+
+
+def test_mcp_oauth_docs_define_exact_default_keyring_trust_matrix() -> None:
+    mcp = _words(_read("docs/mcp.md"))
+    support = _words(_read("docs/support_matrix.md"))
+    configuration = _words(_read("docs/configuration.md"))
+
+    assert "locked `keyring==25.7.0` build" in mcp
+    assert "positive keyring priority or a `keyring.*` module name is not evidence" in mcp
+    for identity in (
+        "keyring.backends.macOS.Keyring",
+        "keyring.backends.Windows.WinVaultKeyring",
+        "keyring.backends.SecretService.Keyring",
+        "keyring.backends.libsecret.Keyring",
+        "keyring.backends.kwallet.DBusKeyring",
+        "keyring.backends.kwallet.DBusKeyringKWallet4",
+    ):
+        assert identity in support
+    assert "every plugin/third-party backend" in support
+    assert "unreviewed versions fail closed" in configuration
+
+
+def test_mcp_oauth_docs_bound_cooperative_transport_and_late_challenge_cleanup() -> None:
+    mcp = _words(_read("docs/mcp.md"))
+
+    assert "`substrate.mcp_oauth_transport` is a trusted" in mcp
+    assert "cannot forcibly stop arbitrary Host code that blocks forever" in mcp
+    assert "rechecks the deadline immediately after every returned transport" in mcp
+    assert "can never publish success" in mcp
+    assert "challenge that is not returned" in mcp
+    assert "discarded" in mcp
 
 
 def test_workspace_skills_keep_canonical_path_and_readback_contracts() -> None:
@@ -168,8 +220,10 @@ def test_remote_skills_keep_deadline_pagination_and_phase_local_contracts() -> N
     assert "Do not apply the v1 single-page recovery rule to v2" in mcp
     assert "`input_required_unsupported`" in mcp
     assert "never authorize fallback" in mcp
-    assert "a non-empty MCP `nextCursor` is rejected as an incomplete catalog" in _words(
-        _read("docs/mcp.md")
+    assert (
+        "any present, non-null MCP `nextCursor`, including the empty string, "
+        "is rejected as an incomplete catalog"
+        in _words(_read("docs/mcp.md"))
     )
     assert "one absolute deadline across the live exchange" in mcp
     assert "certificate is phase-local" in mcp

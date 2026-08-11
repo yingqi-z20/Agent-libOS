@@ -180,6 +180,17 @@ def _ensure_json_size(value: Any, limit_bytes: int, label: str) -> int:
     return size
 
 
+def _validated_reserved_human_request_id(value: Any) -> str:
+    if (
+        type(value) is not str
+        or not value.startswith("hreq_")
+        or len(value) != 21
+        or any(character not in "0123456789abcdef" for character in value[5:])
+    ):
+        raise ValidationError("invalid reserved Human request id")
+    return value
+
+
 def _ensure_json_node_budget(
     nodes: int,
     max_nodes: int,
@@ -665,6 +676,7 @@ class HumanObjectManager:
         *,
         _trusted_data_release: bool = False,
         source_oids: Iterable[str] | None = None,
+        _request_id: str | None = None,
     ) -> str:
         request = self._admit_query_payload(
             request,
@@ -686,8 +698,11 @@ class HumanObjectManager:
         )
         _ensure_json_size(request, self.config.tools.human_request_payload_max_bytes, "human request payload")
         now = utc_now()
+        selected_request_id = _validated_reserved_human_request_id(
+            _request_id or new_id("hreq")
+        )
         human_request = HumanRequest(
-            request_id=new_id("hreq"),
+            request_id=selected_request_id,
             pid=pid,
             human=human,
             payload=request,
@@ -705,6 +720,29 @@ class HumanObjectManager:
                 > sensitivity_rank(DataSensitivity.NORMAL)
             ),
         )
+        self._persist_query(
+            pid=pid,
+            human=human,
+            request=request,
+            blocking=blocking,
+            trusted_data_release=_trusted_data_release,
+            human_request=human_request,
+            request_observation=request_observation,
+        )
+        self._capture_persisted_request(human_request.request_id)
+        return human_request.request_id
+
+    def _persist_query(
+        self,
+        *,
+        pid: str,
+        human: str,
+        request: dict[str, Any],
+        blocking: bool,
+        trusted_data_release: bool,
+        human_request: HumanRequest,
+        request_observation: dict[str, Any],
+    ) -> None:
         # Request persistence, scheduler suspension, and observability are one
         # commit. Callers may also enclose this transaction in the same Store
         # unit that reserves and settles one-shot authority.
@@ -715,57 +753,12 @@ class HumanObjectManager:
                     f"terminal process cannot create human requests: {pid} status={process.status.value}"
                 )
             self.requests.insert(human_request)
-            release_parent_id = request.get(_DATA_RELEASE_FOR_REQUEST_KEY)
-            if _trusted_data_release and isinstance(release_parent_id, str):
-                release_parent = self.requests.get(release_parent_id)
-                if release_parent is None:
-                    raise ValidationError(
-                        f"data release parent Human request not found: {release_parent_id}"
-                    )
-                presentation = request.get(_DATA_RELEASE_PRESENTATION_KEY)
-                presentation_release = isinstance(presentation, str) and bool(presentation)
-                if (
-                    release_parent.pid != pid
-                    or release_parent.human != human
-                    or (
-                        release_parent.status != HumanRequestStatus.PENDING
-                        and not presentation_release
-                    )
-                ):
-                    raise ValidationError(
-                        "data release parent Human request is not eligible for this release"
-                    )
-                parent_payload = dict(release_parent.payload)
-                parent_payload[_DATA_RELEASE_REQUEST_KEY] = human_request.request_id
-                if isinstance(presentation, str) and presentation:
-                    raw_links = parent_payload.get(_DATA_RELEASE_REQUESTS_KEY)
-                    links = dict(raw_links) if isinstance(raw_links, Mapping) else {}
-                    previous_id = links.get(presentation)
-                    if isinstance(previous_id, str) and previous_id != human_request.request_id:
-                        previous = self.requests.get(previous_id)
-                        if previous is not None and previous.status == HumanRequestStatus.PENDING:
-                            self.requests.replace_current(
-                                previous,
-                                status=HumanRequestStatus.CANCELLED,
-                                decision={
-                                    "data_release_outcome": "superseded",
-                                    "automatic_retry_disabled": True,
-                                },
-                                updated_at=utc_now(),
-                            )
-                    links[presentation] = human_request.request_id
-                    parent_payload[_DATA_RELEASE_REQUESTS_KEY] = links
-                # A presentation release is internal gate state.  It must not
-                # mutate the public view whose exact hash the release binds,
-                # otherwise creating the release would invalidate itself.
-                release_parent = self.requests.replace_current(
-                    release_parent,
-                    payload=parent_payload,
-                    updated_at=(
-                        release_parent.updated_at
-                        if isinstance(presentation, str) and presentation
-                        else utc_now()
-                    ),
+            if trusted_data_release:
+                self._link_data_release_query(
+                    pid=pid,
+                    human=human,
+                    request=request,
+                    human_request=human_request,
                 )
             self.operations.expect("approval")
             self.operations.link_evidence(
@@ -774,26 +767,23 @@ class HumanObjectManager:
                 "approval",
                 metadata={"status": human_request.status.value, "blocking": blocking},
             )
-            if blocking:
-                # Blocking human requests suspend scheduling for this process until
-                # a terminal queue decision moves it back to RUNNABLE.
-                if process is not None:
-                    request_ids = tuple(
-                        pending.request_id
-                        for pending in self.requests.list(
-                            pid=pid,
-                            status=HumanRequestStatus.PENDING,
-                        )
-                        if pending.blocking
+            if blocking and process is not None:
+                request_ids = tuple(
+                    pending.request_id
+                    for pending in self.requests.list(
+                        pid=pid,
+                        status=HumanRequestStatus.PENDING,
                     )
-                    self._transitions.transition(
-                        process.pid,
-                        ProcessStatus.WAITING_HUMAN,
-                        expected_revision=process.revision,
-                        expected_status=process.status,
-                        expected_state_generation=process.state_generation,
-                        wait_state=HumanProcessWait(request_ids=request_ids),
-                    )
+                    if pending.blocking
+                )
+                self._transitions.transition(
+                    process.pid,
+                    ProcessStatus.WAITING_HUMAN,
+                    expected_revision=process.revision,
+                    expected_status=process.status,
+                    expected_state_generation=process.state_generation,
+                    wait_state=HumanProcessWait(request_ids=request_ids),
+                )
             self.events.emit(
                 EventType.HUMAN_QUERY,
                 source=pid,
@@ -815,8 +805,80 @@ class HumanObjectManager:
                     "request": request_observation,
                 },
             )
-        self._capture_persisted_request(human_request.request_id)
-        return human_request.request_id
+
+    def _link_data_release_query(
+        self,
+        *,
+        pid: str,
+        human: str,
+        request: dict[str, Any],
+        human_request: HumanRequest,
+    ) -> None:
+        release_parent_id = request.get(_DATA_RELEASE_FOR_REQUEST_KEY)
+        if not isinstance(release_parent_id, str):
+            return
+        release_parent = self.requests.get(release_parent_id)
+        if release_parent is None:
+            raise ValidationError(
+                f"data release parent Human request not found: {release_parent_id}"
+            )
+        presentation = request.get(_DATA_RELEASE_PRESENTATION_KEY)
+        presentation_release = isinstance(presentation, str) and bool(presentation)
+        if (
+            release_parent.pid != pid
+            or release_parent.human != human
+            or (
+                release_parent.status != HumanRequestStatus.PENDING
+                and not presentation_release
+            )
+        ):
+            raise ValidationError(
+                "data release parent Human request is not eligible for this release"
+            )
+        parent_payload = dict(release_parent.payload)
+        parent_payload[_DATA_RELEASE_REQUEST_KEY] = human_request.request_id
+        if isinstance(presentation, str) and presentation:
+            self._supersede_data_release_presentation(
+                parent_payload=parent_payload,
+                presentation=presentation,
+                request_id=human_request.request_id,
+            )
+        # A presentation release is internal gate state.  It must not mutate
+        # the public view whose exact hash the release binds.
+        self.requests.replace_current(
+            release_parent,
+            payload=parent_payload,
+            updated_at=(
+                release_parent.updated_at
+                if isinstance(presentation, str) and presentation
+                else utc_now()
+            ),
+        )
+
+    def _supersede_data_release_presentation(
+        self,
+        *,
+        parent_payload: dict[str, Any],
+        presentation: str,
+        request_id: str,
+    ) -> None:
+        raw_links = parent_payload.get(_DATA_RELEASE_REQUESTS_KEY)
+        links = dict(raw_links) if isinstance(raw_links, Mapping) else {}
+        previous_id = links.get(presentation)
+        if isinstance(previous_id, str) and previous_id != request_id:
+            previous = self.requests.get(previous_id)
+            if previous is not None and previous.status == HumanRequestStatus.PENDING:
+                self.requests.replace_current(
+                    previous,
+                    status=HumanRequestStatus.CANCELLED,
+                    decision={
+                        "data_release_outcome": "superseded",
+                        "automatic_retry_disabled": True,
+                    },
+                    updated_at=utc_now(),
+                )
+        links[presentation] = request_id
+        parent_payload[_DATA_RELEASE_REQUESTS_KEY] = links
 
     def _admit_query_payload(
         self,
@@ -1214,6 +1276,7 @@ class HumanObjectManager:
         blocking: bool = True,
         *,
         source_oids: Iterable[str] | None = None,
+        _request_id: str | None = None,
     ) -> str:
         selected_human = human or self.config.runtime.default_human
         resource = f"human:{selected_human}"
@@ -1230,6 +1293,7 @@ class HumanObjectManager:
                 },
                 blocking=blocking,
                 source_oids=source_oids,
+                _request_id=_request_id,
             )
             self._require_one_time_decision_commit(reservation_id)
         return request_id
@@ -2871,6 +2935,14 @@ class HumanObjectManager:
         expected_revision: int | None,
         preview_sha256: str | None,
     ) -> dict[str, Any] | None:
+        mcp_preview_sha256 = self._mcp_question_preview_sha256(request)
+        if mcp_preview_sha256 is not None:
+            return self._require_mcp_human_response_fence(
+                request,
+                mcp_preview_sha256=mcp_preview_sha256,
+                expected_revision=expected_revision,
+                preview_sha256=preview_sha256,
+            )
         if request.payload.get("type") != "external_operation_approval":
             return None
         enforcement_active = self._semantic_enforcement_active()
@@ -2910,6 +2982,52 @@ class HumanObjectManager:
             if enforcement_active
             else None
         )
+
+    @staticmethod
+    def _mcp_question_preview_sha256(request: HumanRequest) -> Any | None:
+        if request.payload.get("type") != "question":
+            return None
+        context = request.payload.get("context")
+        if not isinstance(context, Mapping):
+            return None
+        return context.get("_agent_libos_mcp_preview_sha256")
+
+    @staticmethod
+    def _require_mcp_human_response_fence(
+        request: HumanRequest,
+        *,
+        mcp_preview_sha256: Any,
+        expected_revision: int | None,
+        preview_sha256: str | None,
+    ) -> dict[str, Any]:
+        if (
+            type(mcp_preview_sha256) is not str
+            or len(mcp_preview_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in mcp_preview_sha256
+            )
+        ):
+            raise ValidationError("MCP Human question preview binding is invalid")
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+            or expected_revision != request.revision
+        ):
+            raise ValidationError(
+                "MCP Human question revision conflict: "
+                f"expected {expected_revision}, found {request.revision}"
+            )
+        if not isinstance(preview_sha256, str) or not hmac.compare_digest(
+            preview_sha256,
+            mcp_preview_sha256,
+        ):
+            raise ValidationError("MCP Human question preview changed")
+        return {
+            "request_revision": request.revision,
+            "preview_sha256": mcp_preview_sha256,
+        }
 
     def _semantic_response_fence_args(
         self,

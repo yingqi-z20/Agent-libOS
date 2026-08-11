@@ -411,15 +411,19 @@ def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() 
     documentation = _words(_read("docs/storage.md"))
     readme = _words(_read("README.md"))
 
-    assert "Agent libOS 1.4.2 stores durable runtime state" in documentation
-    assert "## Strict store schema v6" in documentation
+    assert "Agent libOS 1.5.0 stores durable runtime state" in documentation
+    assert "## Strict store schema v7" in documentation
     assert "Product version and store schema version are independent" in documentation
-    assert "The only supported migrations are the explicit, offline, operator-invoked canonical v4-to-v5 and v5-to-v6 procedures" in documentation
+    assert "The only supported migrations are the explicit, offline, operator-invoked canonical v4-to-v5, v5-to-v6, and v6-to-v7 procedures" in documentation
     assert "There are no automatic migrations, backfills, read-only compatibility modes, or dual runtime schema paths" in documentation
     assert "must be opened with Agent libOS 1.0.1" in documentation
-    assert "creates and opens only RuntimeStore schema v6" in readme
-    assert "offline, digest-bound v5-to-v6 migration" in readme
+    assert "creates and opens only RuntimeStore schema v7" in readme
+    assert "offline, digest-bound v6-to-v7 migration" in readme
     for required in (
+        "## Offline v6 to v7 migration",
+        "creates the five MCP v7 tables",
+        "compare-and-swaps the singleton marker `6 -> 7`",
+        "complete canonical v7 catalog",
         "## Offline v5 to v6 migration",
         "`semantic_flow_entities`, `semantic_flow_activities`, `semantic_flow_edges`, and `semantic_flow_label_assertions`",
         "`semantic_policy_epochs` is immutable",
@@ -458,8 +462,8 @@ def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() 
         "`--no-privileges`",
         "do not pre-create it",
         "Restore into the new target in one",
-        "The expected output includes `ok` and `6`",
-        "store schema version to equal `6` before opening the Runtime",
+        "The expected output includes `ok` and `7`",
+        "store schema version to equal `7` before opening the Runtime",
         "restored `server_version_num` to have major version 17",
         "server must be major version 17",
         "`SHOW server_version_num`",
@@ -482,7 +486,7 @@ def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() 
     assert _read("docs/storage.md").count("SHOW server_version_num") >= 3
 
 
-def test_current_evaluation_artifacts_name_schema_v6_runtime_databases() -> None:
+def test_current_evaluation_artifacts_do_not_name_stale_schema_v6_databases() -> None:
     for path in (
         "experiments/run_durable_task_run_evaluation.py",
         "experiments/run_knowledge_workflow_evaluation.py",
@@ -493,11 +497,13 @@ def test_current_evaluation_artifacts_name_schema_v6_runtime_databases() -> None
             for node in ast.walk(ast.parse(_read(path)))
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
         }
-        assert any("v6 Runtime databases" in value for value in string_constants)
+        assert any("Runtime databases" in value for value in string_constants)
+        assert not any("v6 Runtime databases" in value for value in string_constants)
         assert not any("v4 Runtime databases" in value for value in string_constants)
 
     benchmark_docs = _words(_read("benchmarks/durable_task_runs/README.md"))
-    assert "retention v6 databases" in benchmark_docs
+    assert "retention v7 databases" in benchmark_docs
+    assert "retention v6 databases" not in benchmark_docs
     assert "retention v4 databases" not in benchmark_docs
 
 

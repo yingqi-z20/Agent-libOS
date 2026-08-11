@@ -1336,7 +1336,7 @@ status, timestamps, and audit linkage.
 
 If a primitive or human tool blocks on human approval, the process enters
 `waiting_human`. Human requests are terminally decided once: only pending
-requests can be approved or rejected. Store schema v6 gives every request a
+requests can be approved or rejected. Store schema v7 gives every request a
 durable non-negative `revision`. Response, cancellation, claim/delivery, and
 retryable delivery-state updates compare the expected revision and status; a
 winner increments the revision, so a stale response cannot exploit a

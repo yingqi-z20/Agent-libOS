@@ -9,6 +9,7 @@ import ctypes
 import errno
 import hashlib
 import http.client
+import inspect
 import ipaddress
 import json
 import math
@@ -30,7 +31,7 @@ from itertools import islice
 from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 from urllib import error as urlerror
 from urllib import request as urlrequest
 from urllib.parse import urlsplit
@@ -90,6 +91,7 @@ _SHELL_DEFAULTS = DEFAULT_CONFIG.shell
 _MCP_LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _MCP_FORBIDDEN_HOSTS = {"metadata.google.internal"}
 _MCP_MODERN_PROTOCOL_REVISION = "2026-07-28"
+_MCP_TASKS_EXTENSION_ID = "io.modelcontextprotocol/tasks"
 _MCP_SUPPORTED_MODERN_PROTOCOL_REVISIONS = (_MCP_MODERN_PROTOCOL_REVISION,)
 _MCP_LEGACY_PROTOCOL_REVISION = "2025-11-25"
 _MCP_SUPPORTED_LEGACY_PROTOCOL_REVISIONS = (
@@ -105,6 +107,24 @@ _MCP_WINDOWS_EXECUTABLE_SUFFIXES = {".com", ".exe"}
 _MCP_STABLE_CWD_SUPPORTED = sys.platform.startswith("linux") and Path(
     "/proc/self/fd"
 ).is_dir()
+
+
+async def _mcp_reject_reverse_elicitation(_context: Any, _params: Any) -> Any:
+    """Advertise modern Elicitation while rejecting reverse server requests.
+
+    Agent libOS handles MRTR only from operation results at its durable Host
+    boundary.  A server-initiated client callback is never a HumanRequest and
+    must not acquire model, GUI, or continuation authority.
+    """
+
+    try:
+        import mcp.types as mcp_types
+    except ModuleNotFoundError as exc:  # pragma: no cover - optional extra guard
+        raise ValidationError("MCP Python SDK v2 is unavailable") from exc
+    return mcp_types.ErrorData(
+        code=mcp_types.INVALID_REQUEST,
+        message="Server-initiated Elicitation is unsupported",
+    )
 _JSONRPC_DEADLINE_THREAD_PREFIX = "agent-libos-jsonrpc-deadline"
 _DARWIN_F_GETPATH = 50
 _DARWIN_F_GETPATH_BUFFER_BYTES = 1024
@@ -3019,6 +3039,48 @@ class _McpToolsOnlyReadStream:
         await self.stream.aclose()
 
 
+_MCP_SUBSCRIPTION_NOTIFICATION_METHODS = frozenset(
+    {
+        "notifications/cancelled",
+        "notifications/subscriptions/acknowledged",
+        "notifications/tools/list_changed",
+        "notifications/prompts/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/resources/updated",
+    }
+)
+_MCP_TASK_STATUS_NOTIFICATION_METHOD = "notifications/tasks/status"
+
+
+class _McpSubscriptionReadStream(_McpToolsOnlyReadStream):
+    """Pass only the released 2026-07-28 listen-stream notifications."""
+
+    def __init__(self, stream: Any) -> None:
+        super().__init__(stream)
+        # Tasks notifications remain closed during negotiation.  The SDK
+        # session owner opens this one-way latch only after the exact local
+        # Tasks pin and the server-advertised extension have both been checked.
+        self._allow_task_status_notifications = False
+
+    def enable_task_status_notifications(self) -> None:
+        self._allow_task_status_notifications = True
+
+    async def receive(self) -> Any:
+        while True:
+            item = await self.stream.receive()
+            message = getattr(item, "message", None)
+            if type(message).__name__ != "JSONRPCNotification":
+                return item
+            method = getattr(message, "method", None)
+            if method in _MCP_SUBSCRIPTION_NOTIFICATION_METHODS:
+                return item
+            if (
+                self._allow_task_status_notifications
+                and method == _MCP_TASK_STATUS_NOTIFICATION_METHOD
+            ):
+                return item
+
+
 @contextlib.asynccontextmanager
 async def _mcp_tools_only_streamable_http_client(
     url: str,
@@ -3505,6 +3567,236 @@ def _mcp_sanitized_otel_context() -> Iterator[None]:
             detach(token)
 
 
+def _mcp_v3_tasks_client_contract(
+    mcp_types: Any,
+    tasks_extension_sha256: str | None,
+) -> tuple[dict[str, dict[str, Any]] | None, Mapping[str, Any] | None]:
+    """Build the strict claimed Task result only for one exact Host pin."""
+
+    if tasks_extension_sha256 is None:
+        return None, None
+    if (
+        type(tasks_extension_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", tasks_extension_sha256) is None
+    ):
+        raise ValidationError("MCP Tasks extension pin is invalid")
+    try:
+        from mcp.client.extension import ResultClaim
+        from pydantic import ConfigDict, Field
+    except ImportError as exc:  # pragma: no cover - optional MCP extra guard
+        raise ValidationError("MCP Python SDK v2 Tasks support is unavailable") from exc
+
+    class _McpTaskClaim(mcp_types.Result):
+        # The tools/call claim is Task creation metadata only.  Elicitation
+        # input is observed later through the fixed tasks/get adapter, whose
+        # durable manager creates the real HumanRequest.  In particular, do
+        # not bypass the SDK guard reserving inputRequests/requestState for the
+        # core InputRequiredResult surface.
+        model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+        result_type: Literal["task"] = Field(default="task", alias="resultType")
+        task_id: str = Field(alias="taskId", min_length=1, max_length=8192)
+        status: Literal["working"]
+        status_message: str | None = Field(
+            default=None,
+            alias="statusMessage",
+            max_length=8192,
+        )
+        created_at: str = Field(alias="createdAt", min_length=1, max_length=128)
+        last_updated_at: str = Field(
+            alias="lastUpdatedAt",
+            min_length=1,
+            max_length=128,
+        )
+        ttl_ms: int | None = Field(default=None, alias="ttlMs", ge=0)
+        poll_interval_ms: int | None = Field(
+            default=None,
+            alias="pollIntervalMs",
+            ge=0,
+        )
+
+    async def reject_automatic_resolution(_value: Any, _context: Any) -> Any:
+        raise ValidationError(
+            "MCP remote Tasks require explicit Host get/update/cancel"
+        )
+
+    claim = ResultClaim(
+        result_type="task",
+        model=_McpTaskClaim,
+        resolve=reject_automatic_resolution,
+        protocol_versions=frozenset({_MCP_MODERN_PROTOCOL_REVISION}),
+    )
+    return (
+        {_MCP_TASKS_EXTENSION_ID: {}},
+        {_MCP_TASKS_EXTENSION_ID: (claim,)},
+    )
+
+
+def _mcp_require_server_tasks_extension(
+    session: Any,
+    tasks_extension_sha256: str | None,
+) -> None:
+    if tasks_extension_sha256 is None:
+        return
+    capabilities = getattr(session, "server_capabilities", None)
+    extensions = getattr(capabilities, "extensions", None)
+    selected = (
+        extensions.get(_MCP_TASKS_EXTENSION_ID)
+        if type(extensions) is dict
+        else None
+    )
+    # The extension digest is a Host-local review/manifest authority fence;
+    # MCP's official client/server capability advertisement carries only the
+    # extension identifier and its standardized empty settings object.
+    if selected != {}:
+        raise ValidationError(
+            "MCP server Tasks extension does not match the registered Host pin"
+        )
+
+
+def _mcp_client_info(
+    mcp_types: Any,
+    server: McpServerSpec,
+    *,
+    governed_modern: bool,
+) -> Any:
+    if server.schema_version == 1:
+        return mcp_types.Implementation(name="mcp", version="0.1.0")
+    return mcp_types.Implementation(
+        name="agent-libos",
+        version="1.5.0" if governed_modern else "1.4.2",
+    )
+
+
+def _mcp_governed_v3_dispatcher(
+    read: Any,
+    write: Any,
+    *,
+    request_id_allocator: Callable[[], str | int],
+) -> Any:
+    """Build an SDK dispatcher whose ids remain unique across v3 sessions."""
+
+    try:
+        from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
+    except ModuleNotFoundError as exc:  # pragma: no cover - optional extra guard
+        raise ValidationError("MCP Python SDK v2 is unavailable") from exc
+
+    class _GovernedV3Dispatcher(JSONRPCDispatcher[Any]):
+        def _allocate_id(self) -> str | int:
+            request_id = request_id_allocator()
+            if isinstance(request_id, bool) or not isinstance(request_id, str | int):
+                raise ValidationError("MCP governed v3 request id is invalid")
+            if isinstance(request_id, str) and not request_id:
+                raise ValidationError("MCP governed v3 request id is invalid")
+            return request_id
+
+    return _GovernedV3Dispatcher(read, write)
+
+
+def _mcp_task_aware_client_session_type(
+    client_session_type: Any,
+    *,
+    task_notification_ingress: Callable[[Mapping[str, Any] | None], None]
+    | None,
+    allow_server_notifications: bool,
+    enable_modern_mrtr: bool,
+    tasks_extension_sha256: str | None,
+) -> Any:
+    """Install one synchronous, bounded Tasks notification ingress.
+
+    The official SDK intentionally keeps Tasks notifications out of its core
+    notification table.  A generic ``NotificationBinding`` is unsuitable here
+    because its overflow policy drops the oldest item.  Subscriptions must
+    instead fail closed on flood, so the exact built-in adapter receives each
+    frame synchronously on the SDK dispatcher's owner task and performs only a
+    bounded in-memory enqueue.
+    """
+
+    if task_notification_ingress is None:
+        return client_session_type
+    if (
+        not allow_server_notifications
+        or not enable_modern_mrtr
+        or tasks_extension_sha256 is None
+    ):
+        raise ValidationError(
+            "MCP Tasks notification ingress requires an exact governed subscription"
+        )
+    if not callable(task_notification_ingress) or inspect.iscoroutinefunction(
+        task_notification_ingress
+    ):
+        raise ValidationError("MCP Tasks notification ingress must be synchronous")
+
+    class _TaskAwareClientSession(client_session_type):
+        def _intercept_notification(
+            self,
+            method: str,
+            params: Mapping[str, Any] | None,
+        ) -> bool:
+            if method == "notifications/tasks/status":
+                outcome = task_notification_ingress(params)
+                if inspect.isawaitable(outcome):
+                    close = getattr(outcome, "close", None)
+                    if callable(close):
+                        close()
+                    raise TypeError(
+                        "MCP Tasks notification ingress returned an awaitable"
+                    )
+                if outcome is not None:
+                    raise TypeError(
+                        "MCP Tasks notification ingress returned an invalid value"
+                    )
+                return True
+            return super()._intercept_notification(method, params)
+
+    return _TaskAwareClientSession
+
+
+def _mcp_validated_sdk_v2_protocol(
+    session: Any,
+    read: Any,
+    *,
+    mode: McpProtocolMode,
+    task_notification_ingress: Callable[[Mapping[str, Any] | None], None]
+    | None,
+) -> tuple[McpProtocolEra, str]:
+    """Validate the release-locked revision and open an exact Tasks latch."""
+
+    protocol_revision = str(session.protocol_version)
+    if protocol_revision in _MCP_SUPPORTED_MODERN_PROTOCOL_REVISIONS:
+        protocol_era = McpProtocolEra.MODERN
+    elif protocol_revision in _MCP_SUPPORTED_LEGACY_PROTOCOL_REVISIONS:
+        protocol_era = McpProtocolEra.LEGACY
+    else:
+        # ClientSession.adopt() follows the installed SDK's supported revision
+        # set.  A future SDK minor must not silently widen this release surface.
+        raise ValidationError(
+            "MCP negotiation selected a protocol revision outside the "
+            "release-locked supported set"
+        )
+    if (
+        mode is McpProtocolMode.REVISION_2026_07_28
+        and protocol_revision != _MCP_MODERN_PROTOCOL_REVISION
+    ):
+        raise ValidationError(
+            "MCP server does not support required protocol revision 2026-07-28"
+        )
+    if task_notification_ingress is not None:
+        # The session-type helper already required subscription mode,
+        # governed-v3 dispatch, a synchronous ingress, and the local Tasks pin.
+        # Open this raw-stream latch only after exact-revision negotiation and
+        # server capability validation; v1/v2/unpinned sessions never do.
+        if (
+            protocol_revision != _MCP_MODERN_PROTOCOL_REVISION
+            or not isinstance(read, _McpSubscriptionReadStream)
+        ):
+            raise ValidationError(
+                "MCP Tasks notification ingress requires an exact governed subscription stream"
+            )
+        read.enable_task_status_notifications()
+    return protocol_era, protocol_revision
+
+
 @contextlib.asynccontextmanager
 async def _mcp_sdk_v2_client(
     client_session_type: Any,
@@ -3519,6 +3811,12 @@ async def _mcp_sdk_v2_client(
     wire_ledger: _McpWireLedger | None = None,
     mcp_config: Any = None,
     sensitive_values: tuple[str, ...] = (),
+    allow_server_notifications: bool = False,
+    enable_modern_mrtr: bool = False,
+    tasks_extension_sha256: str | None = None,
+    request_id_allocator: Callable[[], str | int] | None = None,
+    task_notification_ingress: Callable[[Mapping[str, Any] | None], None]
+    | None = None,
 ):
     """Enter one SDK v2 client session with fail-closed era negotiation."""
 
@@ -3528,9 +3826,14 @@ async def _mcp_sdk_v2_client(
         raise ValidationError("MCP Python SDK v2 is unavailable") from exc
 
     del sdk_mode
-    client_info = mcp_types.Implementation(
-        name=("mcp" if server.schema_version == 1 else "agent-libos"),
-        version=("0.1.0" if server.schema_version == 1 else "1.4.2"),
+    client_info = _mcp_client_info(
+        mcp_types,
+        server,
+        governed_modern=enable_modern_mrtr,
+    )
+    extensions, result_claims = _mcp_v3_tasks_client_contract(
+        mcp_types,
+        tasks_extension_sha256,
     )
     negotiation_started = time.monotonic()
     session: Any = None
@@ -3542,17 +3845,51 @@ async def _mcp_sdk_v2_client(
             streams = await transport.__aenter__()
             entered_transport = True
             read, write = streams[:2]
-            read = _McpToolsOnlyReadStream(read)
-            session = client_session_type(
-                read,
-                write,
+            # Released Manifest-v1/v2 sessions are Tools-only and must never
+            # turn unsolicited notifications into Runtime actions or queues.
+            # The primitive-governed Manifest-v3 ``modern_session`` is the one
+            # narrow exception: the exact 2026-07-28 subscription protocol
+            # acknowledges and delivers events as JSON-RPC notifications.
+            read = (
+                _McpSubscriptionReadStream(read)
+                if allow_server_notifications
+                else _McpToolsOnlyReadStream(read)
+            )
+            session_streams: tuple[Any, Any] = (read, write)
+            session_dispatcher: Any = None
+            if enable_modern_mrtr:
+                if request_id_allocator is None:
+                    raise ValidationError(
+                        "MCP governed v3 request-id allocator is unavailable"
+                    )
+                session_streams = (None, None)
+                session_dispatcher = _mcp_governed_v3_dispatcher(
+                    read,
+                    write,
+                    request_id_allocator=request_id_allocator,
+                )
+            selected_session_type = _mcp_task_aware_client_session_type(
+                client_session_type,
+                task_notification_ingress=task_notification_ingress,
+                allow_server_notifications=allow_server_notifications,
+                enable_modern_mrtr=enable_modern_mrtr,
+                tasks_extension_sha256=tasks_extension_sha256,
+            )
+            session = selected_session_type(
+                *session_streams,
                 sampling_callback=None,
-                elicitation_callback=None,
+                elicitation_callback=(
+                    _mcp_reject_reverse_elicitation
+                    if enable_modern_mrtr
+                    else None
+                ),
                 list_roots_callback=None,
                 logging_callback=None,
                 client_info=client_info,
                 log_level=None,
-                extensions=None,
+                extensions=extensions,
+                result_claims=result_claims,
+                dispatcher=session_dispatcher,
             )
             if server.schema_version == 1:
                 dispatcher = getattr(session, "_dispatcher", None)
@@ -3576,34 +3913,31 @@ async def _mcp_sdk_v2_client(
                     else mcp_config.protocol_probe_timeout_s
                 ),
             )
-
-            protocol_revision = str(session.protocol_version)
-            if protocol_revision in _MCP_SUPPORTED_MODERN_PROTOCOL_REVISIONS:
-                protocol_era = McpProtocolEra.MODERN
-            elif protocol_revision in _MCP_SUPPORTED_LEGACY_PROTOCOL_REVISIONS:
-                protocol_era = McpProtocolEra.LEGACY
-            else:
-                # ClientSession.adopt() follows the installed SDK's supported
-                # revision set.  A future SDK minor must not silently widen the
-                # product's release-locked protocol surface.
-                raise ValidationError(
-                    "MCP negotiation selected a protocol revision outside the "
-                    "release-locked supported set"
-                )
-            if (
-                mode is McpProtocolMode.REVISION_2026_07_28
-                and protocol_revision != _MCP_MODERN_PROTOCOL_REVISION
-            ):
-                raise ValidationError(
-                    "MCP server does not support required protocol revision 2026-07-28"
-                )
-            connected = _McpSdkV2ClientAdapter(session)
+            _mcp_require_server_tasks_extension(
+                session,
+                tasks_extension_sha256,
+            )
+            protocol_era, protocol_revision = _mcp_validated_sdk_v2_protocol(
+                session,
+                read,
+                mode=mode,
+                task_notification_ingress=task_notification_ingress,
+            )
+            connected = _McpSdkV2ClientAdapter(
+                session,
+                governed_modern=enable_modern_mrtr,
+            )
             connection = _mcp_connection_info(
                 connected,
                 mode=mode,
                 protocol_era=protocol_era,
                 protocol_revision=protocol_revision,
                 sensitive_values=sensitive_values,
+                capability_limit=(
+                    DEFAULT_CONFIG.mcp.provider_capability_limit
+                    if mcp_config is None
+                    else mcp_config.provider_capability_limit
+                ),
             )
             connection_evidence = connection
             receipts = (
@@ -3792,8 +4126,9 @@ async def _mcp_initialize_locked(session: Any, mcp_types: Any) -> Any:
 class _McpSdkV2ClientAdapter:
     """Minimal Tools-only view over the official SDK v2 ClientSession."""
 
-    def __init__(self, session: Any) -> None:
+    def __init__(self, session: Any, *, governed_modern: bool = False) -> None:
         self.session = session
+        self.governed_modern = governed_modern
 
     @property
     def protocol_version(self) -> Any:
@@ -3823,7 +4158,17 @@ class _McpSdkV2ClientAdapter:
             params = mcp_types.PaginatedRequestParams(cursor=cursor)
         return await self.session.list_tools(params=params)
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        read_timeout_seconds: float | None = None,
+        *,
+        input_responses: dict[str, Any] | None = None,
+        request_state: str | None = None,
+        allow_input_required: bool = False,
+        allow_claimed: bool = False,
+    ) -> Any:
         """Issue tools/call without SDK outputSchema enforcement.
 
         Server-provided outputSchema is diagnostic-only in Agent libOS.  Use
@@ -3832,20 +4177,113 @@ class _McpSdkV2ClientAdapter:
         diagnostic schema into an execution gate.
         """
 
+        result = await _mcp_sdk_v2_call_tool_without_output_schema(
+            self.session,
+            name=name,
+            arguments=arguments,
+            read_timeout_seconds=read_timeout_seconds,
+            input_responses=input_responses,
+            request_state=request_state,
+            governed_modern=self.governed_modern,
+        )
         try:
             import mcp.types as mcp_types
-            from pydantic import TypeAdapter
         except ModuleNotFoundError as exc:  # pragma: no cover
             raise ValidationError("MCP Python SDK v2 is unavailable") from exc
-        return await self.session.send_request(
-            mcp_types.CallToolRequest(
-                params=mcp_types.CallToolRequestParams(
-                    name=name,
-                    arguments=arguments,
-                )
-            ),
-            TypeAdapter(mcp_types.CallToolResult | mcp_types.InputRequiredResult),
+        if isinstance(result, mcp_types.InputRequiredResult) and not allow_input_required:
+            raise ValidationError("MCP input-required Tool result was not enabled")
+        if not isinstance(
+            result,
+            mcp_types.CallToolResult | mcp_types.InputRequiredResult,
+        ) and not allow_claimed:
+            raise ValidationError("MCP claimed Tool result was not enabled")
+        return result
+
+
+async def _mcp_sdk_v2_call_tool_without_output_schema(
+    session: Any,
+    *,
+    name: str,
+    arguments: dict[str, Any],
+    read_timeout_seconds: float | None,
+    input_responses: dict[str, Any] | None,
+    request_state: str | None,
+    governed_modern: bool,
+) -> Any:
+    """Send one typed Tool request without executing Provider outputSchema.
+
+    The pinned SDK validates a 2026 Tool result before its TypeAdapter and
+    currently rejects both the compatible omitted ``resultType`` spelling and
+    extension-owned claimed results.  Only the exact governed-v3 path bypasses
+    that overly narrow pre-validator.  It still uses the SDK's request stamp,
+    dispatcher, inbound-TTL clamp, and dynamically composed claim adapter;
+    Manifest-v1/v2 retain the released ``send_request`` behavior unchanged.
+    """
+
+    try:
+        import mcp.types as mcp_types
+        from mcp.client.session import _clamp_inbound_ttl
+        from pydantic import TypeAdapter
+    except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover
+        raise ValidationError("MCP Python SDK v2 is unavailable") from exc
+    request = mcp_types.CallToolRequest(
+        params=mcp_types.CallToolRequestParams(
+            name=name,
+            arguments=arguments,
+            input_responses=input_responses,
+            request_state=request_state,
         )
+    )
+    if not governed_modern:
+        return await session.send_request(
+            request,
+            TypeAdapter(mcp_types.CallToolResult | mcp_types.InputRequiredResult),
+            request_read_timeout_seconds=read_timeout_seconds,
+        )
+    data = request.model_dump(by_alias=True, mode="json", exclude_none=True)
+    options: dict[str, Any] = {}
+    session._stamp(data, options)  # noqa: SLF001 - pinned audited SDK seam
+    timeout = (
+        read_timeout_seconds
+        if read_timeout_seconds is not None
+        else session._session_read_timeout_seconds  # noqa: SLF001
+    )
+    if timeout is not None:
+        options["timeout"] = timeout
+    raw = await session._dispatcher.send_raw_request(  # noqa: SLF001
+        "tools/call",
+        data.get("params"),
+        options,
+    )
+    _clamp_inbound_ttl(raw)
+    raw = _mcp_normalize_governed_claim_result(raw)
+    return session._call_tool_adapter.validate_python(  # noqa: SLF001
+        raw,
+        by_name=False,
+    )
+
+
+def _mcp_normalize_governed_claim_result(raw: Any) -> Any:
+    """Remove only the pinned SDK's empty core Tool compatibility field.
+
+    The independent TypeScript SDK v2 validates every open-union Tool result
+    through its core CallToolResult schema and consequently appends exactly
+    ``content: []`` to an extension claim.  Keep every non-empty or additional
+    core Tool field invalid, then let the Python SDK's dynamically composed
+    ResultClaim adapter strictly validate the remaining extension object.
+    """
+
+    if type(raw) is not dict or raw.get("resultType") != "task":
+        return raw
+    if "content" not in raw:
+        return raw
+    if raw.get("content") != [] or any(
+        key in raw for key in ("structuredContent", "isError")
+    ):
+        raise ValidationError("MCP claimed Task result carries core Tool payload")
+    selected = dict(raw)
+    selected.pop("content")
+    return selected
 
 
 def _mcp_auto_fallback_allowed(
@@ -3951,7 +4389,10 @@ def _mcp_connection_info(
     protocol_era: McpProtocolEra,
     protocol_revision: str,
     sensitive_values: tuple[str, ...] = (),
+    capability_limit: int = DEFAULT_CONFIG.mcp.provider_capability_limit,
 ) -> McpConnectionInfo:
+    if type(capability_limit) is not int or capability_limit <= 0:
+        raise ValidationError("MCP provider capability limit is invalid")
     server_info = getattr(client, "server_info", None)
     capabilities_value = _jsonable_mcp_value(
         getattr(client, "server_capabilities", None)
@@ -3962,6 +4403,11 @@ def _mcp_connection_info(
             str(name)
             for name, value in capabilities_value.items()
             if value not in (None, False, {}, [])
+        )
+    if len(advertised) > capability_limit:
+        raise ValidationError(
+            "MCP server advertised capabilities exceed "
+            f"provider_capability_limit={capability_limit}"
         )
     sanitized_capabilities = tuple(
         dict.fromkeys(
@@ -4055,6 +4501,7 @@ class SdkMcpProvider:
     supports_runtime_environment_snapshots = True
     supports_subprocess_limits = True
     supports_mcp_modern_protocol = True
+    supports_mcp_absolute_deadline = True
 
     def __init__(
         self,
@@ -4070,6 +4517,7 @@ class SdkMcpProvider:
         server: McpServerSpec,
         *,
         timeout_s: float,
+        deadline: float | None = None,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
@@ -4082,17 +4530,20 @@ class SdkMcpProvider:
             raise ValidationError(
                 "MCP discovery requires a Manifest v2 server in auto or 2026-07-28 mode"
             )
-        deadline = time.monotonic() + timeout_s
+        selected_deadline = (
+            time.monotonic() + timeout_s if deadline is None else deadline
+        )
         started = time.monotonic()
         with self._stdio_dispatch_snapshot(
             server,
             executable_snapshot,
             runtime_environment=runtime_environment,
+            deadline=selected_deadline,
         ) as selected_snapshot:
             async def run() -> McpProviderDiscoveryResult:
                 async with self._session(
                     server,
-                    deadline=deadline,
+                    deadline=selected_deadline,
                     max_response_bytes=max_response_bytes,
                     executable_snapshot=selected_snapshot,
                     runtime_environment=runtime_environment,
@@ -4114,7 +4565,7 @@ class SdkMcpProvider:
                 return _run_mcp_async(
                     _mcp_await_with_deadline(
                         run(),
-                        deadline=deadline,
+                        deadline=selected_deadline,
                         stage="server/discover",
                     )
                 )
@@ -4127,29 +4578,33 @@ class SdkMcpProvider:
         server: McpServerSpec,
         *,
         timeout_s: float,
+        deadline: float | None = None,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
         limits: SubprocessLimits | None = None,
     ) -> McpToolListResult:
-        deadline = time.monotonic() + timeout_s
+        selected_deadline = (
+            time.monotonic() + timeout_s if deadline is None else deadline
+        )
         with self._stdio_dispatch_snapshot(
             server,
             executable_snapshot,
             runtime_environment=runtime_environment,
+            deadline=selected_deadline,
         ) as selected_snapshot:
             try:
                 return _run_mcp_async(
                     _mcp_await_with_deadline(
                         self._alist_tools(
                             server,
-                            deadline=deadline,
+                            deadline=selected_deadline,
                             max_response_bytes=max_response_bytes,
                             executable_snapshot=selected_snapshot,
                             runtime_environment=runtime_environment,
                             limits=limits,
                         ),
-                        deadline=deadline,
+                        deadline=selected_deadline,
                         stage="tools/list",
                     )
                 )
@@ -4164,16 +4619,20 @@ class SdkMcpProvider:
         arguments: dict[str, Any],
         *,
         timeout_s: float,
+        deadline: float | None = None,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
         limits: SubprocessLimits | None = None,
     ) -> McpProviderCallResult:
-        deadline = time.monotonic() + timeout_s
+        selected_deadline = (
+            time.monotonic() + timeout_s if deadline is None else deadline
+        )
         with self._stdio_dispatch_snapshot(
             server,
             executable_snapshot,
             runtime_environment=runtime_environment,
+            deadline=selected_deadline,
         ) as selected_snapshot:
             try:
                 return _run_mcp_async(
@@ -4182,13 +4641,13 @@ class SdkMcpProvider:
                             server,
                             tool,
                             arguments,
-                            deadline=deadline,
+                            deadline=selected_deadline,
                             max_response_bytes=max_response_bytes,
                             executable_snapshot=selected_snapshot,
                             runtime_environment=runtime_environment,
                             limits=limits,
                         ),
-                        deadline=deadline,
+                        deadline=selected_deadline,
                         stage=f"tools/call {tool.mcp_name}",
                     )
                 )
@@ -4203,6 +4662,7 @@ class SdkMcpProvider:
         arguments: dict[str, Any],
         *,
         timeout_s: float,
+        deadline: float | None = None,
         max_response_bytes: int,
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
@@ -4210,11 +4670,15 @@ class SdkMcpProvider:
     ) -> McpProviderCallResult:
         """Validate and invoke through one MCP session and one wall-clock deadline."""
 
-        deadline = time.monotonic() + timeout_s
+        selected_deadline = (
+            time.monotonic() + timeout_s if deadline is None else deadline
+        )
+        dispatch_started_at = time.monotonic()
         with self._stdio_dispatch_snapshot(
             server,
             executable_snapshot,
             runtime_environment=runtime_environment,
+            deadline=selected_deadline,
         ) as selected_snapshot:
             try:
                 return _run_mcp_async(
@@ -4223,13 +4687,13 @@ class SdkMcpProvider:
                             server,
                             tool,
                             arguments,
-                            deadline=deadline,
+                            deadline=selected_deadline,
                             max_response_bytes=max_response_bytes,
                             executable_snapshot=selected_snapshot,
                             runtime_environment=runtime_environment,
                             limits=limits,
                         ),
-                        deadline=deadline,
+                        deadline=selected_deadline,
                         stage=f"validated tools/call {tool.mcp_name}",
                     )
                 )
@@ -4237,7 +4701,7 @@ class SdkMcpProvider:
                 pre_call = self._mcp_v2_pre_call_exception_result(
                     server,
                     error=exc,
-                    started_at=deadline - timeout_s,
+                    started_at=dispatch_started_at,
                 )
                 if pre_call is not None:
                     return pre_call
@@ -4249,7 +4713,7 @@ class SdkMcpProvider:
                         tool,
                         arguments,
                         message=message,
-                        started_at=deadline - timeout_s,
+                        started_at=dispatch_started_at,
                         max_response_bytes=max_response_bytes,
                         receipts=receipts,
                         connection=connection,
@@ -4259,7 +4723,7 @@ class SdkMcpProvider:
                 pre_call = self._mcp_v2_pre_call_exception_result(
                     server,
                     error=exc,
-                    started_at=deadline - timeout_s,
+                    started_at=dispatch_started_at,
                 )
                 if pre_call is not None:
                     return pre_call
@@ -4272,7 +4736,7 @@ class SdkMcpProvider:
                     tool,
                     arguments,
                     message=message,
-                    started_at=deadline - timeout_s,
+                    started_at=dispatch_started_at,
                     max_response_bytes=max_response_bytes,
                     receipts=receipts,
                     connection=connection,
@@ -4281,7 +4745,7 @@ class SdkMcpProvider:
                 pre_call = self._mcp_v2_pre_call_exception_result(
                     server,
                     error=exc,
-                    started_at=deadline - timeout_s,
+                    started_at=dispatch_started_at,
                 )
                 if pre_call is not None:
                     return pre_call
@@ -4366,9 +4830,15 @@ class SdkMcpProvider:
         executable_snapshot: ExecutableSnapshot | None,
         *,
         runtime_environment: Mapping[str, str] | None = None,
+        deadline: float | None = None,
     ) -> Iterator[ExecutableSnapshot | None]:
         if executable_snapshot is not None:
-            executable_snapshot.verify()
+            try:
+                executable_snapshot.verify(deadline=deadline)
+            except TimeoutError as error:
+                raise ProviderEffectNotStarted(
+                    "MCP deadline exhausted before executable snapshot dispatch"
+                ) from error
             yield executable_snapshot
             return
         if server.transport != "stdio" or server.stdio is None:
@@ -4385,11 +4855,20 @@ class SdkMcpProvider:
         ):
             yield None
             return
-        with snapshot_executable(
-            resolved,
-            sibling_policy="scripts",
-        ) as owned_snapshot:
+        try:
+            owned_snapshot = snapshot_executable(
+                resolved,
+                sibling_policy="scripts",
+                deadline=deadline,
+            )
+        except TimeoutError as error:
+            raise ProviderEffectNotStarted(
+                "MCP deadline exhausted before executable snapshot dispatch"
+            ) from error
+        try:
             yield owned_snapshot
+        finally:
+            owned_snapshot.close()
 
     @staticmethod
     def _raise_mcp_transport_limit_error(error: BaseException) -> None:
@@ -4953,6 +5432,42 @@ class SdkMcpProvider:
         )
 
     @contextlib.asynccontextmanager
+    async def modern_session(
+        self,
+        server: McpServerSpec,
+        *,
+        deadline: float | None = None,
+        timeout_s: float | None = None,
+        max_response_bytes: int,
+        executable_snapshot: ExecutableSnapshot | None = None,
+        runtime_environment: Mapping[str, str] | None = None,
+        limits: SubprocessLimits | None = None,
+        allow_server_notifications: bool = False,
+        enable_modern_mrtr: bool = False,
+        tasks_extension_sha256: str | None = None,
+        request_id_allocator: Callable[[], str | int] | None = None,
+        task_notification_ingress: Callable[[Mapping[str, Any] | None], None]
+        | None = None,
+    ):
+        """Public narrow bridge for primitive-governed modern SDK sessions."""
+
+        async with self._session(
+            server,
+            deadline=deadline,
+            timeout_s=timeout_s,
+            max_response_bytes=max_response_bytes,
+            executable_snapshot=executable_snapshot,
+            runtime_environment=runtime_environment,
+            limits=limits,
+            allow_server_notifications=allow_server_notifications,
+            enable_modern_mrtr=enable_modern_mrtr,
+            tasks_extension_sha256=tasks_extension_sha256,
+            request_id_allocator=request_id_allocator,
+            task_notification_ingress=task_notification_ingress,
+        ) as selected:
+            yield selected
+
+    @contextlib.asynccontextmanager
     async def _session(
         self,
         server: McpServerSpec,
@@ -4963,6 +5478,12 @@ class SdkMcpProvider:
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
         limits: SubprocessLimits | None = None,
+        allow_server_notifications: bool = False,
+        enable_modern_mrtr: bool = False,
+        tasks_extension_sha256: str | None = None,
+        request_id_allocator: Callable[[], str | int] | None = None,
+        task_notification_ingress: Callable[[Mapping[str, Any] | None], None]
+        | None = None,
     ):
         if deadline is None:
             deadline = time.monotonic() + (
@@ -4983,7 +5504,12 @@ class SdkMcpProvider:
             if server.stdio is None:
                 raise RuntimeError("MCP stdio transport is missing stdio configuration")
             if executable_snapshot is not None:
-                executable_snapshot.verify()
+                try:
+                    executable_snapshot.verify(deadline=deadline)
+                except TimeoutError as error:
+                    raise ProviderEffectNotStarted(
+                        "MCP deadline exhausted before stdio provider dispatch"
+                    ) from error
                 command = str(executable_snapshot.executable_path)
             else:
                 resolved_executable = Path(
@@ -5055,6 +5581,11 @@ class SdkMcpProvider:
                         server,
                         stdio_environment,
                     ),
+                    allow_server_notifications=allow_server_notifications,
+                    enable_modern_mrtr=enable_modern_mrtr,
+                    tasks_extension_sha256=tasks_extension_sha256,
+                    request_id_allocator=request_id_allocator,
+                    task_notification_ingress=task_notification_ingress,
                 ) as client:
                     yield client
             return
@@ -5111,6 +5642,11 @@ class SdkMcpProvider:
                             "_agent_libos_sensitive_values",
                             (),
                         ),
+                        allow_server_notifications=allow_server_notifications,
+                        enable_modern_mrtr=enable_modern_mrtr,
+                        tasks_extension_sha256=tasks_extension_sha256,
+                        request_id_allocator=request_id_allocator,
+                        task_notification_ingress=task_notification_ingress,
                     ) as client:
                         yield client
             return
@@ -5665,7 +6201,7 @@ async def _mcp_collect_tools(
                 )
             seen_names.add(item.name)
             tools.append(item)
-            if is_v2 and len(tools) > max_items:
+            if len(tools) > max_items:
                 raise _McpToolCatalogValidationError(
                     f"MCP tools/list exceeded maximum tool count={max_items}"
                 )

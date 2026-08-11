@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import ipaddress
 import json
 import math
@@ -9,20 +11,78 @@ import re
 import threading
 import time
 from collections import deque
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import Context, ContextVar
+from dataclasses import replace as dataclass_replace
 from functools import partial
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+import regex as bounded_regex
 from jsonschema import ValidationError as JsonSchemaValidationError
 from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
-from jsonschema.validators import validator_for as jsonschema_validator_for
+from jsonschema.validators import (
+    extend as extend_jsonschema_validator,
+    validator_for as jsonschema_validator_for,
+)
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.human.manager import HumanObjectManager
+from agent_libos.mcp._input import json_sha256
+from agent_libos.mcp.manifest import (
+    MCP_TASKS_EXTENSION_ID,
+    MCP_V3_SUBSCRIPTION_FILTERS,
+    McpManifestV3HostPolicy,
+    McpServerManifestV3,
+    canonical_mcp_v3_manifest_json,
+    parse_mcp_v3_manifest_mapping,
+    validate_mcp_v3_tool_arguments,
+    validate_mcp_v3_manifest,
+)
+from agent_libos.mcp.subscriptions import (
+    McpSubscriptionStartSettlement,
+    McpTasksSubscriptionFence,
+)
+from agent_libos.mcp.environment import McpTransportEnvironmentSnapshot
+from agent_libos.mcp.client import (
+    McpCatalogCollectionLimits,
+    McpClientBinding,
+    McpCollectedCatalog,
+    McpContinuationSurfaceUnsupported,
+    bind_mcp_client_binding,
+    collect_catalog,
+    current_mcp_client_binding,
+    mcp_transport_spec_from_v3,
+    safe_mcp_provider_error,
+    sanitize_mcp_operation_result,
+)
+from agent_libos.mcp.continuations import (
+    McpContinuationBinding,
+    McpContinuationDispatchNotStarted,
+)
+from agent_libos.mcp.oauth import McpOAuthProfile
+from agent_libos.mcp.resources import bounded_public_size, sanitize_provider_json
+from agent_libos.mcp.tasks import (
+    McpRemoteTaskBinding,
+    McpRemoteTaskDispatchNotStarted,
+)
+from agent_libos.mcp.runtime_bridge import mcp_connection_fence
+from agent_libos.mcp.types import (
+    McpAuthorizationChallenge,
+    McpComplete,
+    McpInputRequestKind,
+    McpInputRequired,
+    McpOAuthStatus,
+    McpOAuthStatusKind,
+    McpPromptResult,
+    McpRemoteTask,
+    McpSubscription,
+    McpSubscriptionEvent,
+)
 from agent_libos.models import (
     canonical_mcp_server_spec_json,
     CapabilityEffect,
@@ -37,6 +97,7 @@ from agent_libos.models import (
     McpCallResult,
     McpCallStatus,
     McpConnectionInfo,
+    McpDispatchState,
     McpDiscoveryResult,
     McpExchangePhase,
     McpExchangeReceipt,
@@ -44,6 +105,7 @@ from agent_libos.models import (
     McpHttpTransportSpec,
     McpProtocolEra,
     McpProtocolMode,
+    McpRetryClass,
     McpProviderCallResult,
     McpProviderDiscoveryResult,
     McpProviderTool,
@@ -65,10 +127,11 @@ from agent_libos.models.exceptions import (
 from agent_libos.models.external_effect import default_external_effect_rollback_status
 from agent_libos.models.mcp import mcp_runtime_secret_values
 from agent_libos.ports import AuditPort, EventPort
-from agent_libos.storage import UnitOfWork
+from agent_libos.storage import McpAuthMetadataRecord, UnitOfWork
 from agent_libos.substrate import (
     ExecutableSnapshot,
     executable_content_sha256,
+    McpAbsoluteDeadlineProvider,
     McpModernProtocolProvider,
     McpProvider,
     McpSubprocessLimitsProvider,
@@ -101,9 +164,17 @@ _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@+-]*$")
 _ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _HEADER_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _LEGACY_FORBIDDEN_HEADERS = {
+    "baggage",
     "connection",
     "content-length",
     "host",
+    "last-event-id",
+    "mcp-method",
+    "mcp-name",
+    "mcp-protocol-version",
+    "mcp-session-id",
+    "traceparent",
+    "tracestate",
     "transfer-encoding",
     "upgrade",
 }
@@ -112,17 +183,9 @@ _MODERN_FORBIDDEN_HEADERS = _LEGACY_FORBIDDEN_HEADERS | {
     "accept-charset",
     "accept-encoding",
     "accept-language",
-    "baggage",
     "content-encoding",
     "content-language",
     "content-type",
-    "last-event-id",
-    "mcp-method",
-    "mcp-name",
-    "mcp-protocol-version",
-    "mcp-session-id",
-    "traceparent",
-    "tracestate",
 }
 _FORBIDDEN_MCP_HOSTS = {"metadata.google.internal"}
 _LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -134,6 +197,7 @@ _MCP_WINDOWS = os.name == "nt"
 _MCP_WINDOWS_EXECUTABLE_SUFFIXES = {".com", ".exe"}
 _MCP_PLATFORM_ENV_KEYS = ("SYSTEMROOT", "WINDIR") if os.name == "nt" else ()
 _STDIO_EXECUTABLE_IDENTITY_UNSET = object()
+_MCP_IMPORT_CAS_UNSET = object()
 _PROVIDER_RESULT_RETURNED_ATTR = "_agent_libos_provider_result_returned"
 _INVALID_MCP_TEXT_JSON = object()
 _MCP_PROVIDER_JSON_MAX_DEPTH = 128
@@ -179,6 +243,8 @@ _TOOL_FIELDS = {
     "metadata",
 }
 _HEADER_FIELDS = {"env", "prefix", "suffix"}
+
+McpRegisteredServer = McpServerSpec | McpServerManifestV3
 
 
 def _reject_unknown_fields(
@@ -365,6 +431,528 @@ def _strict_provider_json_value(
     raise TypeError(f"provider JSON contains a non-JSON value at {path}")
 
 
+def _canonical_mcp_arguments(
+    arguments: Any,
+    *,
+    max_bytes: int,
+) -> dict[str, Any]:
+    """Return one detached, exact-JSON argument snapshot for all boundaries.
+
+    ``None`` remains a compatibility shorthand for the empty object on the
+    trusted Python API. Agent-facing adapters reject explicit JSON null before
+    reaching this helper. Exact container types prevent mapping subclasses and
+    iterable coercions from running code or changing after authorization.
+    """
+
+    if arguments is None:
+        return {}
+    if type(arguments) is not dict:
+        raise ValidationError("MCP tool arguments must be a strict JSON object")
+    try:
+        selected = _strict_provider_json_value(
+            arguments,
+            path="$.arguments",
+            active_containers=set(),
+            budget=_ProviderJsonBudget(max_bytes),
+        )
+        encoded = dumps(selected).encode("utf-8")
+        if len(encoded) > max_bytes:
+            raise ValueError("MCP arguments exceed the canonical byte budget")
+        canonical = bounded_json_loads(encoded, max_bytes=max_bytes)
+    except (TypeError, ValueError, RecursionError, UnicodeEncodeError) as error:
+        raise ValidationError(
+            "MCP tool arguments must be a strict JSON object"
+        ) from error
+    if type(canonical) is not dict:  # pragma: no cover - encoded root is exact dict
+        raise ValidationError("MCP tool arguments must be a strict JSON object")
+    return canonical
+
+
+def _redact_mcp_provider_json(
+    value: Any,
+    *,
+    sensitive_values: tuple[str, ...],
+) -> Any:
+    """Recursively project an already-detached provider JSON tree safely."""
+
+    value_type = type(value)
+    if value_type is str:
+        return redact_sensitive_text(value, sensitive_values=sensitive_values)
+    if value_type is list:
+        return [
+            _redact_mcp_provider_json(
+                item,
+                sensitive_values=sensitive_values,
+            )
+            for item in value
+        ]
+    if value_type is dict:
+        selected: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            public_key = redact_sensitive_text(
+                raw_key,
+                sensitive_values=sensitive_values,
+            )
+            candidate = public_key
+            suffix = 2
+            while candidate in selected:
+                candidate = f"{public_key}#{suffix}"
+                suffix += 1
+            selected[candidate] = _redact_mcp_provider_json(
+                item,
+                sensitive_values=sensitive_values,
+            )
+        return selected
+    return value
+
+
+def _redact_mcp_provider_tools(
+    tools: list[McpProviderTool],
+    *,
+    sensitive_values: tuple[str, ...],
+) -> list[McpProviderTool]:
+    selected: list[McpProviderTool] = []
+    public_names: set[str] = set()
+    for tool in tools:
+        public_name = redact_sensitive_text(
+            tool.name,
+            sensitive_values=sensitive_values,
+        )
+        candidate = public_name
+        suffix = 2
+        while candidate in public_names:
+            candidate = f"{public_name}#{suffix}"
+            suffix += 1
+        public_names.add(candidate)
+        input_schema = _redact_mcp_provider_json(
+            tool.input_schema,
+            sensitive_values=sensitive_values,
+        )
+        metadata = _redact_mcp_provider_json(
+            tool.metadata,
+            sensitive_values=sensitive_values,
+        )
+        selected.append(
+            McpProviderTool(
+                name=candidate,
+                description=(
+                    redact_sensitive_text(
+                        tool.description,
+                        sensitive_values=sensitive_values,
+                    )
+                    if tool.description is not None
+                    else None
+                ),
+                input_schema=input_schema,
+                metadata=metadata,
+            )
+        )
+    return selected
+
+
+class _McpSchemaRegexBudget:
+    """Bound all regex work performed by one JSON Schema validation."""
+
+    __slots__ = (
+        "_compiled",
+        "_deadline",
+        "_evaluations",
+        "_max_evaluations",
+        "_operation_deadline",
+        "_pattern_max_bytes",
+    )
+
+    def __init__(
+        self,
+        *,
+        pattern_max_bytes: int,
+        max_evaluations: int,
+        timeout_s: float,
+        operation_deadline: float | None = None,
+    ) -> None:
+        self._pattern_max_bytes = pattern_max_bytes
+        self._max_evaluations = max_evaluations
+        self._evaluations = 0
+        self._deadline = time.monotonic() + timeout_s
+        self._operation_deadline = operation_deadline
+        self._compiled: dict[str, Any] = {}
+
+    def compile(self, pattern: Any, *, field: str) -> Any:
+        if type(pattern) is not str:
+            raise ValidationError(f"MCP {field} regex pattern is invalid")
+        try:
+            pattern_bytes = len(pattern.encode("utf-8"))
+        except UnicodeEncodeError as error:
+            raise ValidationError(
+                f"MCP {field} regex pattern is invalid"
+            ) from error
+        if pattern_bytes > self._pattern_max_bytes:
+            raise ValidationError(
+                f"MCP {field} regex pattern exceeds maximum bytes="
+                f"{self._pattern_max_bytes}"
+            )
+        compiled = self._compiled.get(pattern)
+        if compiled is not None:
+            return compiled
+        self._remaining_timeout()
+        try:
+            compiled = bounded_regex.compile(pattern)
+        except bounded_regex.error as error:
+            raise ValidationError(
+                f"MCP {field} regex pattern is invalid"
+            ) from error
+        self._remaining_timeout()
+        self._compiled[pattern] = compiled
+        return compiled
+
+    def search(self, pattern: Any, value: str, *, field: str) -> bool:
+        if self._evaluations >= self._max_evaluations:
+            raise ValidationError("MCP schema regex evaluation budget exhausted")
+        self._evaluations += 1
+        compiled = self.compile(pattern, field=field)
+        remaining = self._remaining_timeout()
+        try:
+            return compiled.search(value, timeout=remaining) is not None
+        except TimeoutError as error:
+            self._require_operation_time_remaining()
+            raise ValidationError(
+                "MCP schema regex validation timed out"
+            ) from error
+
+    def _remaining_timeout(self) -> float:
+        now = time.monotonic()
+        if self._operation_deadline is not None and now >= self._operation_deadline:
+            raise ProviderEffectNotStarted(
+                "MCP deadline exhausted during schema preflight"
+            )
+        remaining = self._deadline - now
+        if self._operation_deadline is not None:
+            remaining = min(remaining, self._operation_deadline - now)
+        if remaining <= 0:
+            raise ValidationError("MCP schema regex validation timed out")
+        return remaining
+
+    def checkpoint(self) -> None:
+        """Reject an exhausted operation budget even when no regex is evaluated."""
+
+        self._remaining_timeout()
+
+    def _require_operation_time_remaining(self) -> None:
+        if (
+            self._operation_deadline is not None
+            and time.monotonic() >= self._operation_deadline
+        ):
+            raise ProviderEffectNotStarted(
+                "MCP deadline exhausted during schema preflight"
+            )
+
+
+class _McpBoundedSchemaCallbacks:
+    """jsonschema keyword callbacks sharing one regex time/evaluation budget."""
+
+    def __init__(self, budget: _McpSchemaRegexBudget, *, field: str) -> None:
+        self._budget = budget
+        self._field = field
+
+    def validate_pattern(
+        self,
+        validator: Any,
+        pattern: Any,
+        instance: Any,
+        _schema: Any,
+    ) -> Any:
+        if validator.is_type(instance, "string") and not self._budget.search(
+            pattern,
+            instance,
+            field=self._field,
+        ):
+            yield JsonSchemaValidationError(
+                "string does not match schema pattern"
+            )
+
+    def validate_pattern_properties(
+        self,
+        validator: Any,
+        pattern_properties: Any,
+        instance: Any,
+        _schema: Any,
+    ) -> Any:
+        if not validator.is_type(instance, "object"):
+            return
+        for pattern, subschema in pattern_properties.items():
+            for key, value in instance.items():
+                if self._budget.search(
+                    pattern,
+                    key,
+                    field=self._field,
+                ):
+                    yield from validator.descend(
+                        value,
+                        subschema,
+                        path=key,
+                        schema_path=pattern,
+                    )
+
+    def validate_additional_properties(
+        self,
+        validator: Any,
+        additional: Any,
+        instance: Any,
+        current_schema: Any,
+    ) -> Any:
+        if not validator.is_type(instance, "object"):
+            return
+        extras = self._additional_property_keys(instance, current_schema)
+        if validator.is_type(additional, "object"):
+            for key in extras:
+                yield from validator.descend(
+                    instance[key],
+                    additional,
+                    path=key,
+                )
+        elif additional is False and extras:
+            yield JsonSchemaValidationError(
+                "additional properties are not allowed"
+            )
+
+    def _additional_property_keys(
+        self,
+        instance: dict[str, Any],
+        current_schema: dict[str, Any],
+    ) -> list[str]:
+        properties = current_schema.get("properties", {})
+        patterns = current_schema.get("patternProperties", {})
+        return [
+            key
+            for key in instance
+            if key not in properties
+            and not self._matches_any_pattern(key, patterns)
+        ]
+
+    def _matches_any_pattern(self, key: str, patterns: Any) -> bool:
+        return any(
+            self._budget.search(pattern, key, field=self._field)
+            for pattern in patterns
+        )
+
+    @staticmethod
+    def _descend_is_valid(
+        validator: Any,
+        instance: Any,
+        subschema: Any,
+    ) -> bool:
+        return next(validator.descend(instance, subschema), None) is None
+
+    def evaluated_property_keys(
+        self,
+        validator: Any,
+        instance: dict[str, Any],
+        current_schema: Any,
+    ) -> list[str]:
+        if validator.is_type(current_schema, "boolean"):
+            return []
+        return [
+            *self._evaluated_reference_keys(
+                validator,
+                instance,
+                current_schema,
+            ),
+            *self._evaluated_direct_keys(
+                validator,
+                instance,
+                current_schema,
+            ),
+            *self._evaluated_dependent_keys(
+                validator,
+                instance,
+                current_schema,
+            ),
+            *self._evaluated_combinator_keys(
+                validator,
+                instance,
+                current_schema,
+            ),
+            *self._evaluated_conditional_keys(
+                validator,
+                instance,
+                current_schema,
+            ),
+        ]
+
+    def _evaluated_reference_keys(
+        self,
+        validator: Any,
+        instance: dict[str, Any],
+        current_schema: dict[str, Any],
+    ) -> list[str]:
+        evaluated: list[str] = []
+        for keyword in ("$ref", "$dynamicRef"):
+            reference = current_schema.get(keyword)
+            if reference is None:
+                continue
+            resolved = validator._resolver.lookup(reference)
+            evaluated.extend(
+                self.evaluated_property_keys(
+                    validator.evolve(
+                        schema=resolved.contents,
+                        _resolver=resolved.resolver,
+                    ),
+                    instance,
+                    resolved.contents,
+                )
+            )
+        return evaluated
+
+    def _evaluated_direct_keys(
+        self,
+        validator: Any,
+        instance: dict[str, Any],
+        current_schema: dict[str, Any],
+    ) -> list[str]:
+        evaluated: list[str] = []
+        properties = current_schema.get("properties")
+        if validator.is_type(properties, "object"):
+            evaluated.extend(properties.keys() & instance.keys())
+        for keyword in ("additionalProperties", "unevaluatedProperties"):
+            subschema = current_schema.get(keyword)
+            if subschema is None:
+                continue
+            evaluated.extend(
+                key
+                for key, value in instance.items()
+                if self._descend_is_valid(validator, value, subschema)
+            )
+        patterns = current_schema.get("patternProperties", {})
+        evaluated.extend(
+            key
+            for key in instance
+            if self._matches_any_pattern(key, patterns)
+        )
+        return evaluated
+
+    def _evaluated_dependent_keys(
+        self,
+        validator: Any,
+        instance: dict[str, Any],
+        current_schema: dict[str, Any],
+    ) -> list[str]:
+        evaluated: list[str] = []
+        for key, subschema in current_schema.get(
+            "dependentSchemas",
+            {},
+        ).items():
+            if key in instance:
+                evaluated.extend(
+                    self.evaluated_property_keys(
+                        validator,
+                        instance,
+                        subschema,
+                    )
+                )
+        return evaluated
+
+    def _evaluated_combinator_keys(
+        self,
+        validator: Any,
+        instance: dict[str, Any],
+        current_schema: dict[str, Any],
+    ) -> list[str]:
+        evaluated: list[str] = []
+        for keyword in ("allOf", "oneOf", "anyOf"):
+            for subschema in current_schema.get(keyword, []):
+                if self._descend_is_valid(validator, instance, subschema):
+                    evaluated.extend(
+                        self.evaluated_property_keys(
+                            validator,
+                            instance,
+                            subschema,
+                        )
+                    )
+        return evaluated
+
+    def _evaluated_conditional_keys(
+        self,
+        validator: Any,
+        instance: dict[str, Any],
+        current_schema: dict[str, Any],
+    ) -> list[str]:
+        conditional = current_schema.get("if")
+        if conditional is None:
+            return []
+        if not validator.evolve(schema=conditional).is_valid(instance):
+            return self._evaluated_optional_subschema(
+                validator,
+                instance,
+                current_schema.get("else"),
+            )
+        return [
+            *self.evaluated_property_keys(
+                validator,
+                instance,
+                conditional,
+            ),
+            *self._evaluated_optional_subschema(
+                validator,
+                instance,
+                current_schema.get("then"),
+            ),
+        ]
+
+    def _evaluated_optional_subschema(
+        self,
+        validator: Any,
+        instance: dict[str, Any],
+        subschema: Any,
+    ) -> list[str]:
+        if subschema is None:
+            return []
+        return self.evaluated_property_keys(
+            validator,
+            instance,
+            subschema,
+        )
+
+    def validate_unevaluated_properties(
+        self,
+        validator: Any,
+        unevaluated: Any,
+        instance: Any,
+        current_schema: Any,
+    ) -> Any:
+        if not validator.is_type(instance, "object"):
+            return
+        evaluated = set(
+            self.evaluated_property_keys(
+                validator,
+                instance,
+                current_schema,
+            )
+        )
+        invalid = any(
+            key not in evaluated
+            and not self._descend_is_valid(validator, value, unevaluated)
+            for key, value in instance.items()
+        )
+        if invalid:
+            yield JsonSchemaValidationError(
+                "unevaluated properties are not allowed"
+                if unevaluated is False
+                else "unevaluated properties are invalid"
+            )
+
+    def overrides(self, base_validator: Any) -> dict[str, Any]:
+        validators = {
+            "additionalProperties": self.validate_additional_properties,
+            "pattern": self.validate_pattern,
+            "patternProperties": self.validate_pattern_properties,
+        }
+        if "unevaluatedProperties" in base_validator.VALIDATORS:
+            validators["unevaluatedProperties"] = (
+                self.validate_unevaluated_properties
+            )
+        return validators
+
+
 def _model_facing_mcp_call_payload(
     content: Any,
     structured_content: Any,
@@ -463,6 +1051,386 @@ def _json_values_equivalent(left: Any, right: Any) -> bool:
         return False
 
 
+_MCP_SUBSCRIPTION_CANCEL_DRAIN_S = 1.0
+_MCP_PROVIDER_CANCEL_DRAIN_S = 0.01
+_MCP_SUBSCRIPTION_SETTLEMENT_DRAIN_S = 30.0
+
+
+class _McpPreparedSubscriptionResult:
+    __slots__ = ("effect_settlement", "public", "settlement")
+
+    def __init__(
+        self,
+        public: McpSubscription,
+        settlement: McpSubscriptionStartSettlement,
+        effect_settlement: "_McpSubscriptionEffectSettlement",
+    ) -> None:
+        self.public = public
+        self.settlement = settlement
+        self.effect_settlement = effect_settlement
+
+
+class _McpSubscriptionEffectSettlement:
+    """Synchronous protected-effect adapter for an owner-loop settlement."""
+
+    fail_closed_on_finalize_error = True
+    abort_on_base_exception = True
+
+    def __init__(
+        self,
+        *,
+        runner: "_McpSubscriptionLoopRunner",
+        settlement: McpSubscriptionStartSettlement,
+        binding: McpClientBinding,
+        dispatch_context_var: ContextVar[dict[str, Any] | None],
+        dispatch_context: dict[str, Any],
+        public: McpSubscription,
+    ) -> None:
+        self._runner = runner
+        self._settlement = settlement
+        self._binding = binding
+        self._dispatch_context_var = dispatch_context_var
+        self._dispatch_context = dispatch_context
+        self._public = public
+
+    def commit_deferred(self) -> None:
+        self._settlement.commit_deferred()
+
+    def finalize(self) -> None:
+        selected = self._run_owned(self._settlement.finalize)
+        if selected != self._public:
+            raise ValidationError("MCP subscription start publication changed")
+
+    def abort(self, *, reason: str = "subscription_publication_failed") -> None:
+        self._run_owned(lambda: self._settlement.abort(reason=reason))
+
+    def _run_owned(self, operation: Any) -> Any:
+        token = self._dispatch_context_var.set(self._dispatch_context)
+        try:
+            return self._runner.run(
+                operation,
+                deadline=time.monotonic() + _MCP_SUBSCRIPTION_SETTLEMENT_DRAIN_S,
+                binding=self._binding,
+            )
+        finally:
+            self._dispatch_context_var.reset(token)
+
+
+class _McpSubscriptionLoopRunner:
+    """Keep long-lived subscription tasks on one Runtime-owned event loop."""
+
+    def __init__(
+        self,
+        manager: Any,
+        *,
+        dispatch_context_var: ContextVar[dict[str, Any] | None],
+    ) -> None:
+        self._manager = manager
+        self._dispatch_context_var = dispatch_context_var
+        self._loop = asyncio.new_event_loop()
+        self._ready = threading.Event()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="agent-libos-mcp-subscriptions",
+            daemon=True,
+        )
+        self._thread.start()
+        if not self._ready.wait(timeout=5.0):
+            raise RuntimeError("MCP subscription event loop did not start")
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._ready.set()
+        try:
+            self._loop.run_forever()
+        finally:
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+            self._loop.close()
+
+    @property
+    def manager(self) -> Any:
+        return self._manager
+
+    def run(
+        self,
+        operation: Any,
+        *,
+        deadline: float,
+        binding: McpClientBinding,
+    ) -> Any:
+        if not callable(operation):
+            raise TypeError("MCP subscription operation must be callable")
+        if not isinstance(binding, McpClientBinding):
+            raise TypeError("MCP subscription operation binding is invalid")
+        dispatch_context = self._dispatch_context_var.get()
+        if not isinstance(dispatch_context, dict):
+            raise RuntimeError("MCP subscription dispatch context is unavailable")
+
+        settled = threading.Event()
+
+        async def invoke() -> Any:
+            # ``run_coroutine_threadsafe`` otherwise copies the caller's full
+            # Context, including a ProtectedOperation/lifecycle admission lease
+            # which becomes inactive as soon as the synchronous facade returns.
+            # Start from an empty Context and restore only the two exact MCP
+            # provider-phase bindings needed by the governed SDK session.
+            token = self._dispatch_context_var.set(dispatch_context)
+            try:
+                with bind_mcp_client_binding(binding):
+                    return await operation()
+            finally:
+                self._dispatch_context_var.reset(token)
+                settled.set()
+
+        if self._closed or self._loop.is_closed():
+            raise RuntimeError("MCP subscription event loop is closed")
+        if threading.current_thread() is self._thread:
+            raise RuntimeError("MCP subscription facade cannot block its owner loop")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("MCP subscription deadline exceeded")
+        # Calling the submission helper inside a fresh Context controls the
+        # Context copied by ``loop.call_soon_threadsafe`` into the new Task.
+        submitted = invoke()
+        try:
+            future = Context().run(
+                asyncio.run_coroutine_threadsafe,
+                submitted,
+                self._loop,
+            )
+        except BaseException:
+            submitted.close()
+            raise
+        try:
+            return future.result(timeout=remaining)
+        except TimeoutError as exc:
+            future.cancel()
+            # Cancellation is part of the deadline failure path. Give the
+            # owner-loop coroutine one small, fixed cleanup window and consume
+            # the concurrent Future state before returning the stable public
+            # error. A hostile coroutine can still exceed this window, but it
+            # cannot block the synchronous facade indefinitely.
+            settled.wait(timeout=_MCP_SUBSCRIPTION_CANCEL_DRAIN_S)
+            try:
+                future.exception(timeout=0)
+            except BaseException:
+                pass
+            raise TimeoutError("MCP subscription deadline exceeded") from exc
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        failures: list[BaseException] = []
+        if not self._loop.is_closed():
+            # Manager shutdown must run on the same Runtime-owned loop as its
+            # listener/receive tasks and must not inherit the shutdown caller's
+            # stale admission or tracing Context.
+            shutdown = self._manager.close()
+            try:
+                close = Context().run(
+                    asyncio.run_coroutine_threadsafe,
+                    shutdown,
+                    self._loop,
+                )
+            except BaseException:
+                shutdown.close()
+                raise
+            try:
+                close.result(timeout=30.0)
+            except BaseException as exc:
+                close.cancel()
+                failures.append(exc)
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=35.0)
+        if self._thread.is_alive():
+            failures.append(RuntimeError("MCP subscription event loop did not stop"))
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup(
+                "MCP subscription runner cleanup failed",
+                failures,
+            )
+
+
+class McpPrimitiveContinuationBoundary:
+    """Async manager adapter whose dispatch remains inside McpPrimitive."""
+
+    def __init__(self, primitive: "McpPrimitive") -> None:
+        self.primitive = primitive
+
+    async def continue_request(self, **kwargs: Any) -> Any:
+        try:
+            return await self.primitive.dispatch_continuation_boundary(
+                "respond", **kwargs
+            )
+        except ProviderEffectNotStarted as error:
+            raise McpContinuationDispatchNotStarted(str(error)) from (
+                _mcp_pre_provider_cause(error)
+            )
+
+    async def cancel_continuation(self, **kwargs: Any) -> None:
+        try:
+            await self.primitive.dispatch_continuation_boundary("cancel", **kwargs)
+        except ProviderEffectNotStarted as error:
+            raise McpContinuationDispatchNotStarted(str(error)) from (
+                _mcp_pre_provider_cause(error)
+            )
+
+
+class McpPrimitiveRemoteTaskBoundary:
+    """Async Tasks manager adapter backed by protected primitive kernels."""
+
+    def __init__(self, primitive: "McpPrimitive") -> None:
+        self.primitive = primitive
+
+    async def get_remote_task(self, **kwargs: Any) -> Mapping[str, Any]:
+        return await self._dispatch("get", **kwargs)
+
+    async def update_remote_task(self, **kwargs: Any) -> Mapping[str, Any]:
+        return await self._dispatch("update", **kwargs)
+
+    async def cancel_remote_task(self, **kwargs: Any) -> Mapping[str, Any]:
+        return await self._dispatch("cancel", **kwargs)
+
+    async def _dispatch(self, operation: str, **kwargs: Any) -> Mapping[str, Any]:
+        try:
+            result = await self.primitive.dispatch_remote_task_boundary(
+                operation,
+                **kwargs,
+            )
+        except ProviderEffectNotStarted as error:
+            raise McpRemoteTaskDispatchNotStarted(str(error)) from (
+                _mcp_pre_provider_cause(error)
+            )
+        if operation != "get":
+            return result
+        remote_task_id = kwargs.get("remote_task_id")
+        if type(remote_task_id) is not str or not remote_task_id:
+            raise ValidationError("MCP remote Task identity is unavailable")
+        # The primitive validates the provider's exact identity and redacts it
+        # before protected settlement. Reintroduce it only across this private
+        # manager boundary so the durable manager can bind its broker secret;
+        # no public/evidence observer sees the bearer-like id.
+        return {**dict(result), "taskId": remote_task_id}
+
+
+def _mcp_pre_provider_cause(error: ProviderEffectNotStarted) -> Exception:
+    """Recover the exact local denial/preflight cause from its certificate."""
+
+    cause = error.__cause__
+    return cause if isinstance(cause, Exception) else error
+
+
+class _McpProviderEntry:
+    """Mutable phase witness shared across a protected synchronous dispatch."""
+
+    __slots__ = ("entered",)
+
+    def __init__(self) -> None:
+        self.entered = False
+
+
+@contextmanager
+def _certify_mcp_pre_provider(
+    entry: _McpProviderEntry,
+    *,
+    operation: str,
+) -> Any:
+    """Certify only failures raised before the Provider callable is entered."""
+
+    try:
+        yield
+    except ProviderEffectNotStarted:
+        # This branch is reserved for primitive-owned pre-provider checks. A
+        # Provider-raised instance is normalized inside
+        # ``_await_modern_provider_result`` before it can reach this boundary.
+        raise
+    except Exception as error:
+        if entry.entered:
+            raise
+        raise ProviderEffectNotStarted(
+            f"MCP {operation} failed before provider dispatch"
+        ) from error
+
+
+async def _cancel_and_drain_mcp_provider_task(
+    task: asyncio.Future[Any],
+) -> None:
+    """Bound cleanup of one entered exact-v3 custom Provider awaitable."""
+
+    if not task.done():
+        task.cancel()
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=_MCP_PROVIDER_CANCEL_DRAIN_S,
+        )
+    except BaseException:
+        pass
+    if task.done():
+        _consume_mcp_provider_task(task)
+        return
+    task.cancel()
+    task.add_done_callback(_consume_mcp_provider_task)
+
+
+def _consume_mcp_provider_task(task: asyncio.Future[Any]) -> None:
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
+def _run_mcp_provider_awaitable(awaitable: Any) -> Any:
+    """Run one cooperative custom-provider exchange on an operation-local loop.
+
+    This loop contains a yielding Provider that mishandles cancellation, but it
+    cannot preempt Python code that blocks the event-loop thread.  Custom Host
+    SPIs are therefore an explicitly trusted, cooperative composition surface;
+    the built-in SDK/transport path owns the hard I/O deadline.
+    """
+
+    if not inspect.isawaitable(awaitable):
+        raise ValidationError("MCP modern Provider awaitable is invalid")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(awaitable)
+    finally:
+        # `_await_modern_provider_result` already offers a small bounded
+        # cooperative cancellation/drain window. A contract-violating SPI may
+        # still swallow CancelledError while yielding; asyncio.run() would then
+        # gather it forever during shutdown. This operation-local loop is
+        # instead disposed after the bounded attempt. Suppress only asyncio's
+        # pending-task destructor diagnostic; provider failure is already
+        # recorded as UNKNOWN by ProtectedOperation.
+        for task in asyncio.all_tasks(loop):
+            if task.done():
+                _consume_mcp_provider_task(task)
+                continue
+            task.cancel()
+            setattr(task, "_log_destroy_pending", False)
+            coroutine = task.get_coro()
+            close = getattr(coroutine, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except BaseException:
+                    pass
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
 class McpPrimitive:
     """Capability-controlled MCP client primitive for registered external servers."""
 
@@ -492,6 +1460,5108 @@ class McpPrimitive:
         self.provider = provider
         self.resources = resources
         self._registry_phase_lock = threading.RLock()
+        self._oauth_phase_lock = threading.RLock()
+        self._modern_client: Any | None = None
+        self._modern_continuations: Any | None = None
+        self._modern_remote_tasks: Any | None = None
+        self._modern_subscriptions: Any | None = None
+        self._modern_subscription_provider: Any | None = None
+        self._modern_subscription_runner: _McpSubscriptionLoopRunner | None = None
+        self._modern_subscription_lock = threading.RLock()
+        self._modern_oauth: Any | None = None
+        self._modern_invalidator: Any | None = None
+        self._modern_tool_provider: Any | None = None
+        self._modern_continuation_provider: Any | None = None
+        self._modern_tasks_provider: Any | None = None
+        self._modern_request_id_scope = new_id("mcp_request_scope")
+        self._modern_request_id_lock = threading.Lock()
+        self._modern_request_id_next = 0
+        self._modern_dispatch_context: ContextVar[dict[str, Any] | None] = (
+            ContextVar(f"agent_libos_mcp_modern_dispatch_{id(self)}", default=None)
+        )
+
+    def _bind_modern_client(self, client: Any) -> None:
+        """Bind the Host-composed v3 client exactly once before Runtime OPEN."""
+
+        if client is None:
+            raise ValidationError("MCP modern client binding cannot be null")
+        if self._modern_client is not None and self._modern_client is not client:
+            raise ValidationError("MCP modern client is already bound")
+        self._modern_client = client
+
+    def _bind_modern_managers(
+        self,
+        *,
+        continuations: Any | None = None,
+        remote_tasks: Any | None = None,
+        subscriptions: Any | None = None,
+        subscription_provider: Any | None = None,
+        oauth: Any | None = None,
+        invalidator: Any | None = None,
+    ) -> None:
+        """Attach optional v3 state managers without replacing live bindings."""
+
+        for attribute, value in (
+            ("_modern_continuations", continuations),
+            ("_modern_remote_tasks", remote_tasks),
+            ("_modern_subscriptions", subscriptions),
+            ("_modern_subscription_provider", subscription_provider),
+            ("_modern_oauth", oauth),
+            ("_modern_invalidator", invalidator),
+        ):
+            if value is None:
+                continue
+            current = getattr(self, attribute)
+            if current is not None and current is not value:
+                raise ValidationError(
+                    f"MCP modern manager is already bound: {attribute.removeprefix('_modern_')}"
+                )
+            setattr(self, attribute, value)
+
+    def _bind_modern_wire_providers(
+        self,
+        *,
+        tool_provider: Any | None = None,
+        continuation_provider: Any | None = None,
+        tasks_provider: Any | None = None,
+    ) -> None:
+        """Bind exact-2026-07-28 wire adapters without exposing raw SPI calls."""
+
+        for attribute, value in (
+            ("_modern_tool_provider", tool_provider),
+            ("_modern_continuation_provider", continuation_provider),
+            ("_modern_tasks_provider", tasks_provider),
+        ):
+            if value is None:
+                continue
+            current = getattr(self, attribute)
+            if current is not None and current is not value:
+                raise ValidationError(
+                    f"MCP modern wire provider is already bound: "
+                    f"{attribute.removeprefix('_modern_')}"
+                )
+            setattr(self, attribute, value)
+
+    def _invalidate_modern_server(self, server_id: str) -> None:
+        """Synchronously invalidate all exact-server ephemeral modern state."""
+
+        if not isinstance(server_id, str) or not _ID_PATTERN.fullmatch(server_id):
+            raise ValidationError("MCP server_id is invalid")
+        delegates = (
+            self._modern_client,
+            self._modern_subscriptions,
+            self._modern_oauth,
+            self._modern_invalidator,
+        )
+        for delegate in delegates:
+            if delegate is None:
+                continue
+            method = getattr(delegate, "invalidate_server_nowait", None)
+            if not callable(method):
+                method = getattr(delegate, "invalidate_server", None)
+            if not callable(method):
+                method = getattr(delegate, "close_server", None)
+            if not callable(method):
+                continue
+            try:
+                result = method(server_id)
+                if hasattr(result, "__await__"):
+                    close = getattr(result, "close", None)
+                    if callable(close):
+                        close()
+            except BaseException:
+                # Registry replacement/unregister is already committed.  A
+                # local cleanup failure must not be surfaced as a false
+                # rollback; each released manager keeps its own revocation
+                # latch and performs Provider cleanup best effort.
+                continue
+
+    # ------------------------------------------------------------------
+    # Manifest-v3 Runtime facade
+    # ------------------------------------------------------------------
+
+    def probe_candidate_manifest(
+        self,
+        server: McpServerManifestV3 | Mapping[str, Any],
+        *,
+        expected_manifest_sha256: str,
+        confirmed: bool,
+        reviewer: str,
+        reason: str,
+    ) -> McpCollectedCatalog:
+        """Collect one unregistered v3 server's complete bounded catalogs.
+
+        This is a trusted Host onboarding operation, never a model or process
+        tool.  It validates the exact candidate against active Host policy,
+        creates pending-first external-read evidence before DNS/session I/O,
+        and uses one transport snapshot and absolute deadline for all four
+        catalogs.  It deliberately does not read or mutate the MCP registry.
+        """
+
+        manifest = self.validate_server_manifest(server)
+        if not isinstance(manifest, McpServerManifestV3):
+            raise ValidationError("MCP candidate probe requires Manifest v3")
+        selected_reviewer, selected_reason = self._candidate_probe_confirmation(
+            confirmed=confirmed,
+            reviewer=reviewer,
+            reason=reason,
+        )
+        manifest_sha256 = self._server_spec_sha256(manifest)
+        if (
+            type(expected_manifest_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", expected_manifest_sha256) is None
+            or expected_manifest_sha256 != manifest_sha256
+        ):
+            raise ValidationError("MCP candidate probe manifest digest does not match")
+        if manifest.auth_profile_id is not None:
+            raise ValidationError(
+                "MCP unregistered candidate probe cannot use an OAuth profile; "
+                "review static transport discovery first"
+            )
+        return self._probe_candidate_catalogs(
+            manifest,
+            manifest_sha256=manifest_sha256,
+            reviewer=selected_reviewer,
+            reason=selected_reason,
+        )
+
+    async def aprobe_candidate_manifest(
+        self,
+        server: McpServerManifestV3 | Mapping[str, Any],
+        *,
+        expected_manifest_sha256: str,
+        confirmed: bool,
+        reviewer: str,
+        reason: str,
+    ) -> McpCollectedCatalog:
+        return await self._data_flow().run_sync_in_worker(
+            self.probe_candidate_manifest,
+            server,
+            expected_manifest_sha256=expected_manifest_sha256,
+            confirmed=confirmed,
+            reviewer=reviewer,
+            reason=reason,
+        )
+
+    @staticmethod
+    def _candidate_probe_confirmation(
+        *,
+        confirmed: bool,
+        reviewer: str,
+        reason: str,
+    ) -> tuple[str, str]:
+        if confirmed is not True:
+            raise ValidationError("MCP candidate probe requires explicit confirmation")
+        if type(reviewer) is not str or not reviewer.strip() or len(reviewer) > 128:
+            raise ValidationError("MCP candidate probe reviewer is invalid")
+        if type(reason) is not str or not reason.strip() or len(reason) > 512:
+            raise ValidationError("MCP candidate probe reason is invalid")
+        if any(ord(character) < 32 for character in reviewer + reason):
+            raise ValidationError("MCP candidate probe review text contains controls")
+        return reviewer.strip(), reason.strip()
+
+    def _probe_candidate_catalogs(
+        self,
+        manifest: McpServerManifestV3,
+        *,
+        manifest_sha256: str,
+        reviewer: str,
+        reason: str,
+    ) -> McpCollectedCatalog:
+        server = mcp_transport_spec_from_v3(manifest)
+        environment = self.snapshot_modern_transport_environment(server)
+        binding = McpClientBinding(
+            manifest=manifest,
+            registry_generation=0,
+            owner_id="mcp-dx-probe",
+            sensitive_values=environment.sensitive_values,
+            runtime_environment=environment.runtime_environment,
+        )
+        deadline = time.monotonic() + manifest.timeout_s
+        request_payload = {
+            "method": "catalogs/probe",
+            "server_id": manifest.server_id,
+            "manifest_sha256": manifest_sha256,
+            "catalogs": ["tools", "resources", "resource_templates", "prompts"],
+            "reviewer": reviewer,
+            "reason": reason,
+        }
+        request_bytes = len(dumps(request_payload).encode("utf-8"))
+        if request_bytes > manifest.max_request_bytes:
+            raise ValidationError(
+                "MCP candidate probe request exceeds "
+                f"max_request_bytes={manifest.max_request_bytes}"
+            )
+        operation_context = {
+            "pid": "mcp-dx-probe",
+            "primitive": "runtime.mcp.probe_candidate_manifest",
+            "operation": "mcp.probe_candidate",
+            "authority_operation": "mcp.probe_candidate",
+            "server_id": manifest.server_id,
+            "logical_id": "full_catalog",
+            "tool_id": "full_catalog",
+            "right": CapabilityRight.READ.value,
+            "registry_spec_sha256": manifest_sha256,
+            "registry_generation": 0,
+            "request_sha256": hashlib.sha256(
+                dumps(request_payload).encode("utf-8")
+            ).hexdigest(),
+            "arguments_sha256": manifest_sha256,
+            "request_bytes": request_bytes,
+            "transport": manifest.transport,
+            "auth_generation": 0,
+            "auth_principal_sha256": None,
+            "auth_scope_sha256": None,
+            "confirmed": True,
+            "reviewer": reviewer,
+            "reason": reason,
+        }
+        plan: dict[str, Any] = {
+            "client": None,
+            "usage_pid": None,
+            "binding": binding,
+            "manifest": manifest,
+            "deadline": deadline,
+            "registry_binding": {
+                "registry_spec_sha256": manifest_sha256,
+                "registry_generation": 0,
+            },
+            "request_bytes": request_bytes,
+            "operation_context": operation_context,
+            "decisions": [],
+            "server": server,
+        }
+        self._prepare_modern_transport(
+            plan,
+            operation="probe_candidate",
+            logical_id="full_catalog",
+            actor="mcp-dx-probe",
+        )
+        target = f"mcp_candidate:{manifest_sha256}"
+        plan["invocation"] = self._candidate_probe_invocation(
+            plan,
+            target=target,
+            payload=request_payload,
+        )
+        return self._execute_modern_operation(
+            plan,
+            operation="probe_candidate",
+            server_id=manifest.server_id,
+            logical_id="full_catalog",
+            actor="mcp-dx-probe",
+            target=target,
+            payload=request_payload,
+            invoke=self._invoke_candidate_catalog_probe,
+            state_mutation=False,
+            rollback_class=ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+            rollback_status=ExternalEffectRollbackStatus.NOT_REQUIRED,
+            contract_name="primitive.mcp.probe_candidate",
+            result_settler=None,
+        )
+
+    def _candidate_probe_invocation(
+        self,
+        plan: Mapping[str, Any],
+        *,
+        target: str,
+        payload: Mapping[str, Any],
+    ) -> ProtectedOperationInvocation:
+        manifest = plan["manifest"]
+        context = plan["operation_context"]
+        effect_context = {
+            **context,
+            "rollback_class": ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED.value,
+            "rollback_status": ExternalEffectRollbackStatus.NOT_REQUIRED.value,
+            "state_mutation": False,
+            "information_flow": True,
+        }
+        return ProtectedOperationInvocation(
+            pid="mcp-dx-probe",
+            actor="mcp-dx-probe",
+            target=target,
+            decisions=(),
+            canonical_args=context,
+            observation=effect_context,
+            resource_source="primitive.mcp.probe_candidate",
+            resource_context={
+                "server_id": manifest.server_id,
+                "logical_id": "full_catalog",
+                "request_bytes": plan["request_bytes"],
+            },
+            failure_evidence=lambda error, phase: self._modern_failure_evidence(
+                actor="mcp-dx-probe",
+                target=target,
+                operation="probe_candidate",
+                context=context,
+                error=error,
+                phase=phase,
+            ),
+            data_sink=plan["sink"],
+            data_sink_revalidator=lambda: self._modern_data_sink(
+                manifest,
+                operation="probe_candidate",
+                logical_id="full_catalog",
+                stdio_identity=self._stdio_executable_identity(
+                    plan["server"],
+                    runtime_environment=plan["runtime_environment"],
+                    deadline=plan["deadline"],
+                    fail_closed=True,
+                ),
+            ),
+            data_flow_context=plan["flow_context"],
+            data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
+                plan["flow_context"],
+                origin="external:mcp",
+            ),
+            data_flow_payload=dict(payload),
+            data_flow_operation="mcp.probe_candidate",
+        )
+
+    def _invoke_candidate_catalog_probe(
+        self,
+        _client: Any,
+        deadline: float,
+    ) -> McpCollectedCatalog:
+        context = self._modern_dispatch_context.get()
+        binding = context.get("binding") if isinstance(context, dict) else None
+        server = context.get("server") if isinstance(context, dict) else None
+        if not isinstance(binding, McpClientBinding) or not isinstance(
+            server, McpServerSpec
+        ):
+            raise ProviderEffectNotStarted(
+                "MCP candidate probe is outside a protected provider phase"
+            )
+        limits = McpCatalogCollectionLimits(
+            max_pages_per_catalog=self.config.mcp.list_max_pages,
+            max_tools=self.config.mcp.tool_catalog_limit,
+            max_resources=self.config.mcp.resource_catalog_limit,
+            max_resource_templates=self.config.mcp.resource_template_limit,
+            max_prompts=self.config.mcp.prompt_catalog_limit,
+            max_cursor_bytes=min(4096, binding.manifest.max_response_bytes),
+            max_identifier_bytes=min(8192, binding.manifest.max_response_bytes),
+            max_cache_ttl_ms=self.config.mcp.cache_hint_ttl_cap_ms,
+            max_public_bytes=binding.manifest.max_response_bytes,
+        )
+
+        async def collect_once() -> McpCollectedCatalog:
+            with bind_mcp_client_binding(binding):
+                async with self._modern_session_factory_context(
+                    server,
+                    deadline=deadline,
+                    binding=binding,
+                ) as session:
+                    return await collect_catalog(
+                        session,
+                        limits,
+                        deadline,
+                        sensitive_values=binding.sensitive_values,
+                    )
+
+        result = _run_mcp_provider_awaitable(collect_once())
+        if not isinstance(result, McpCollectedCatalog):
+            raise ValidationError("MCP candidate probe returned an invalid catalog")
+        return result
+
+    def list_resources(
+        self,
+        server_id: str,
+        *,
+        cursor: str | None = None,
+        actor: str = "runtime",
+        model_visible_only: bool = False,
+    ) -> Any:
+        self._validate_modern_cursor(cursor)
+        if type(model_visible_only) is not bool:
+            raise ValidationError("MCP model_visible_only must be a boolean")
+        payload = {
+            "method": "resources/list",
+            "server_id": server_id,
+            "cursor_present": cursor is not None,
+            "model_visible_only": model_visible_only,
+        }
+        return self._run_modern_read(
+            operation="resources.list",
+            server_id=server_id,
+            logical_id="catalog",
+            actor=actor,
+            target=self.server_resource(server_id),
+            right=CapabilityRight.READ,
+            payload=payload,
+            invoke=lambda client, deadline: client.list_resources(
+                server_id,
+                cursor=cursor,
+                deadline=deadline,
+                owner_id=actor,
+                model_visible_only=model_visible_only,
+            ),
+        )
+
+    async def alist_resources(
+        self,
+        server_id: str,
+        *,
+        cursor: str | None = None,
+        actor: str = "runtime",
+        model_visible_only: bool = False,
+    ) -> Any:
+        return await self._data_flow().run_sync_in_worker(
+            self.list_resources,
+            server_id,
+            cursor=cursor,
+            actor=actor,
+            model_visible_only=model_visible_only,
+        )
+
+    def list_resource_templates(
+        self,
+        server_id: str,
+        *,
+        cursor: str | None = None,
+        actor: str = "runtime",
+        model_visible_only: bool = False,
+    ) -> Any:
+        self._validate_modern_cursor(cursor)
+        if type(model_visible_only) is not bool:
+            raise ValidationError("MCP model_visible_only must be a boolean")
+        payload = {
+            "method": "resources/templates/list",
+            "server_id": server_id,
+            "cursor_present": cursor is not None,
+            "model_visible_only": model_visible_only,
+        }
+        return self._run_modern_read(
+            operation="resource_templates.list",
+            server_id=server_id,
+            logical_id="catalog",
+            actor=actor,
+            target=self.server_resource(server_id),
+            right=CapabilityRight.READ,
+            payload=payload,
+            invoke=lambda client, deadline: client.list_resource_templates(
+                server_id,
+                cursor=cursor,
+                deadline=deadline,
+                owner_id=actor,
+                model_visible_only=model_visible_only,
+            ),
+        )
+
+    async def alist_resource_templates(
+        self,
+        server_id: str,
+        *,
+        cursor: str | None = None,
+        actor: str = "runtime",
+        model_visible_only: bool = False,
+    ) -> Any:
+        return await self._data_flow().run_sync_in_worker(
+            self.list_resource_templates,
+            server_id,
+            cursor=cursor,
+            actor=actor,
+            model_visible_only=model_visible_only,
+        )
+
+    def read_resource(
+        self,
+        server_id: str,
+        resource_id: str,
+        *,
+        variables: Mapping[str, str] | None = None,
+        actor: str = "runtime",
+        for_model: bool = False,
+    ) -> Any:
+        selected_variables = self._modern_string_mapping(
+            variables,
+            label="Resource variables",
+        )
+        if type(for_model) is not bool:
+            raise ValidationError("MCP for_model must be a boolean")
+        self._validate_identifier(
+            resource_id,
+            "resource_id",
+            self.config.mcp.tool_id_max_chars,
+        )
+        payload = {
+            "method": "resources/read",
+            "server_id": server_id,
+            "resource_id": resource_id,
+            "variables": selected_variables,
+            "for_model": for_model,
+        }
+        return self._run_modern_read(
+            operation="resources.read",
+            server_id=server_id,
+            logical_id=resource_id,
+            actor=actor,
+            target=f"mcp:{server_id}:resource:{resource_id}",
+            right=CapabilityRight.READ,
+            payload=payload,
+            invoke=lambda client, deadline: client.read_resource(
+                server_id,
+                resource_id,
+                variables=selected_variables,
+                deadline=deadline,
+                owner_id=actor,
+                for_model=for_model,
+            ),
+        )
+
+    async def aread_resource(
+        self,
+        server_id: str,
+        resource_id: str,
+        *,
+        variables: Mapping[str, str] | None = None,
+        actor: str = "runtime",
+        for_model: bool = False,
+    ) -> Any:
+        return await self._data_flow().run_sync_in_worker(
+            self.read_resource,
+            server_id,
+            resource_id,
+            variables=variables,
+            actor=actor,
+            for_model=for_model,
+        )
+
+    def list_prompts(
+        self,
+        server_id: str,
+        *,
+        cursor: str | None = None,
+        actor: str = "runtime",
+    ) -> Any:
+        self._validate_modern_cursor(cursor)
+        payload = {
+            "method": "prompts/list",
+            "server_id": server_id,
+            "cursor_present": cursor is not None,
+        }
+        return self._run_modern_read(
+            operation="prompts.list",
+            server_id=server_id,
+            logical_id="catalog",
+            actor=actor,
+            target=self.server_resource(server_id),
+            right=CapabilityRight.READ,
+            payload=payload,
+            invoke=lambda client, deadline: client.list_prompts(
+                server_id,
+                cursor=cursor,
+                deadline=deadline,
+                owner_id=actor,
+            ),
+        )
+
+    async def alist_prompts(
+        self,
+        server_id: str,
+        *,
+        cursor: str | None = None,
+        actor: str = "runtime",
+    ) -> Any:
+        return await self._data_flow().run_sync_in_worker(
+            self.list_prompts,
+            server_id,
+            cursor=cursor,
+            actor=actor,
+        )
+
+    def get_prompt(
+        self,
+        server_id: str,
+        prompt_id: str,
+        *,
+        arguments: Mapping[str, str] | None = None,
+        confirmed: bool = False,
+        expected_preview_sha256: str | None = None,
+        actor: str = "runtime",
+    ) -> Any:
+        selected_arguments = self._modern_string_mapping(
+            arguments,
+            label="Prompt arguments",
+        )
+        self._validate_identifier(
+            prompt_id,
+            "prompt_id",
+            self.config.mcp.tool_id_max_chars,
+        )
+        if type(confirmed) is not bool:
+            raise ValidationError("MCP Prompt confirmed must be a boolean")
+        self._validate_prompt_preview_request(
+            confirmed=confirmed,
+            expected_preview_sha256=expected_preview_sha256,
+        )
+        payload = {
+            "method": "prompts/get",
+            "server_id": server_id,
+            "prompt_id": prompt_id,
+            "arguments": selected_arguments,
+            "confirmed": confirmed,
+        }
+
+        def invoke(client: Any, deadline: float) -> Any:
+            result = client.get_prompt(
+                server_id,
+                prompt_id,
+                arguments=selected_arguments,
+                deadline=deadline,
+                owner_id=actor,
+            )
+            if not isinstance(result, McpComplete) or not isinstance(
+                result.value,
+                McpPromptResult,
+            ):
+                if confirmed:
+                    raise ValidationError(
+                        "confirmed MCP Prompt did not return a Complete preview"
+                    )
+                return result
+            digest = result.preview_sha256
+            if not isinstance(digest, str) or len(digest) != 64:
+                raise ValidationError("MCP Prompt preview digest is unavailable")
+            if confirmed and digest != expected_preview_sha256:
+                raise CapabilityDenied(
+                    "MCP Prompt preview changed before confirmation"
+                )
+            return result
+
+        return self._run_modern_read(
+            operation="prompts.get",
+            server_id=server_id,
+            logical_id=prompt_id,
+            actor=actor,
+            target=f"mcp:{server_id}:prompt:{prompt_id}",
+            right=CapabilityRight.READ,
+            payload=payload,
+            invoke=invoke,
+        )
+
+    async def aget_prompt(
+        self,
+        server_id: str,
+        prompt_id: str,
+        *,
+        arguments: Mapping[str, str] | None = None,
+        confirmed: bool = False,
+        expected_preview_sha256: str | None = None,
+        actor: str = "runtime",
+    ) -> Any:
+        return await self._data_flow().run_sync_in_worker(
+            self.get_prompt,
+            server_id,
+            prompt_id,
+            arguments=arguments,
+            confirmed=confirmed,
+            expected_preview_sha256=expected_preview_sha256,
+            actor=actor,
+        )
+
+    def complete_prompt(
+        self,
+        server_id: str,
+        reference_type: str,
+        reference_id: str,
+        argument: Mapping[str, str],
+        *,
+        context: Mapping[str, str] | None = None,
+        actor: str = "runtime",
+    ) -> Any:
+        if reference_type not in {"prompt", "resource_template"}:
+            raise ValidationError("MCP completion reference_type is invalid")
+        self._validate_identifier(
+            reference_id,
+            "reference_id",
+            self.config.mcp.tool_id_max_chars,
+        )
+        selected_argument = self._modern_string_mapping(
+            argument,
+            label="Completion argument",
+            required=True,
+        )
+        selected_context = (
+            None
+            if context is None
+            else self._modern_string_mapping(
+                context,
+                label="Completion context",
+                required=True,
+            )
+        )
+        payload = {
+            "method": "completion/complete",
+            "server_id": server_id,
+            "reference_type": reference_type,
+            "reference_id": reference_id,
+            "argument": selected_argument,
+            "context": selected_context,
+        }
+        return self._run_modern_read(
+            operation="completion.complete",
+            server_id=server_id,
+            logical_id=f"{reference_type}:{reference_id}",
+            actor=actor,
+            target=f"mcp:{server_id}:completion:{reference_type}:{reference_id}",
+            right=CapabilityRight.READ,
+            payload=payload,
+            invoke=lambda client, deadline: client.complete_prompt(
+                server_id,
+                reference_type,
+                reference_id,
+                selected_argument,
+                context=selected_context,
+                deadline=deadline,
+                owner_id=actor,
+            ),
+        )
+
+    async def acomplete_prompt(
+        self,
+        server_id: str,
+        reference_type: str,
+        reference_id: str,
+        argument: Mapping[str, str],
+        *,
+        context: Mapping[str, str] | None = None,
+        actor: str = "runtime",
+    ) -> Any:
+        return await self._data_flow().run_sync_in_worker(
+            self.complete_prompt,
+            server_id,
+            reference_type,
+            reference_id,
+            argument,
+            context=context,
+            actor=actor,
+        )
+
+    def start_subscription(
+        self,
+        server_id: str,
+        *,
+        filters: tuple[str, ...],
+        actor: str = "runtime",
+    ) -> McpSubscription:
+        selected_filters = self._validate_subscription_filters(filters)
+        target = f"mcp:{server_id}:subscription:catalog"
+        payload = {
+            "method": "subscriptions/listen",
+            "server_id": server_id,
+            "filters": list(selected_filters),
+        }
+
+        def invoke(_client: Any, deadline: float) -> _McpPreparedSubscriptionResult:
+            return self._prepare_subscription_start_result(
+                selected_filters,
+                deadline=deadline,
+            )
+
+        def settle_result(
+            result: Any,
+            effect_id: str,
+        ) -> tuple[McpSubscription, _McpSubscriptionEffectSettlement]:
+            if type(result) is not _McpPreparedSubscriptionResult:
+                raise ValidationError("MCP subscription prepared result changed")
+            try:
+                opening = result.settlement.opening
+                context = self._modern_dispatch_context.get()
+                binding = context.get("binding") if isinstance(context, dict) else None
+                if (
+                    opening.origin_effect_id != effect_id
+                    or not isinstance(context, dict)
+                    or context.get("effect_id") != effect_id
+                    or not isinstance(binding, McpClientBinding)
+                    or binding is not result.effect_settlement._binding
+                ):
+                    raise ValidationError("MCP subscription settlement binding changed")
+                return result.public, result.effect_settlement
+            except BaseException as error:
+                try:
+                    result.effect_settlement.abort(
+                        reason="protected_result_settlement_failed"
+                    )
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        "MCP subscription result settlement cleanup failed",
+                        [error, cleanup_error],
+                    )
+                raise
+
+        return self._run_modern_read(
+            operation="subscriptions.start",
+            server_id=server_id,
+            logical_id="catalog",
+            actor=actor,
+            target=target,
+            right=CapabilityRight.WRITE,
+            payload=payload,
+            invoke=invoke,
+            state_mutation=True,
+            rollback_class=ExternalEffectRollbackClass.ROLLBACKABLE,
+            rollback_status=ExternalEffectRollbackStatus.NOT_APPLIED,
+            result_settler=settle_result,
+        )
+
+    async def astart_subscription(
+        self,
+        server_id: str,
+        *,
+        filters: tuple[str, ...],
+        actor: str = "runtime",
+    ) -> McpSubscription:
+        return await self._data_flow().run_sync_in_worker(
+            self.start_subscription,
+            server_id,
+            filters=filters,
+            actor=actor,
+        )
+
+    def subscription_status(
+        self,
+        subscription_id: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpSubscription:
+        record, target = self._subscription_record_for_operation(
+            subscription_id,
+            actor=actor,
+            right=CapabilityRight.READ,
+            operation="subscriptions.status",
+        )
+        payload = {
+            "method": "subscriptions/status",
+            "subscription_id": subscription_id,
+        }
+
+        def invoke(_client: Any, deadline: float) -> McpSubscription:
+            binding, _server = self._subscription_dispatch_binding()
+            self._require_subscription_record_binding(record, binding, actor=actor)
+            manager = self._subscription_manager()
+            result = self._subscription_runner(manager).run(
+                lambda: manager.status(subscription_id),
+                deadline=deadline,
+                binding=binding,
+            )
+            if (
+                not isinstance(result, McpSubscription)
+                or result.subscription_id != subscription_id
+                or result.server_id != record.server_id
+            ):
+                raise ValidationError(
+                    "MCP subscription manager returned an invalid status"
+                )
+            return result
+
+        return self._run_modern_read(
+            operation="subscriptions.status",
+            server_id=record.server_id,
+            logical_id=subscription_id,
+            actor=actor,
+            target=target,
+            right=CapabilityRight.READ,
+            payload=payload,
+            invoke=invoke,
+        )
+
+    async def asubscription_status(
+        self,
+        subscription_id: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpSubscription:
+        return await self._data_flow().run_sync_in_worker(
+            self.subscription_status,
+            subscription_id,
+            actor=actor,
+        )
+
+    def subscription_events(
+        self,
+        subscription_id: str,
+        *,
+        after: int = 0,
+        limit: int = 100,
+        actor: str = "runtime",
+    ) -> tuple[McpSubscriptionEvent, ...]:
+        """Consume a batch; ``after`` must equal this owner's last sequence."""
+
+        if (
+            type(after) is not int
+            or after < 0
+            or type(limit) is not int
+            or not 1 <= limit <= 1000
+        ):
+            raise ValidationError("invalid MCP subscription event window")
+        record, target = self._subscription_record_for_operation(
+            subscription_id,
+            actor=actor,
+            right=CapabilityRight.READ,
+            operation="subscriptions.events",
+        )
+        payload = {
+            "method": "subscriptions/events",
+            "subscription_id": subscription_id,
+            "after": after,
+            "limit": limit,
+        }
+
+        def invoke(_client: Any, deadline: float) -> tuple[McpSubscriptionEvent, ...]:
+            binding, _server = self._subscription_dispatch_binding()
+            self._require_subscription_record_binding(record, binding, actor=actor)
+            manager = self._subscription_manager()
+            try:
+                result = self._subscription_runner(manager).run(
+                    lambda: manager.events(
+                        subscription_id,
+                        after=after,
+                        limit=limit,
+                    ),
+                    deadline=deadline,
+                    binding=binding,
+                )
+            except KeyError as error:
+                if error.args != (subscription_id,):
+                    raise
+                # Event payloads are intentionally memory-only.  A durable
+                # LOST record after restart proves the local handle existed,
+                # but it must not be projected as an empty event history and
+                # the manager's raw mapping key must not escape the facade.
+                raise NotFound(
+                    f"MCP subscription events unavailable: {subscription_id}"
+                ) from None
+            if type(result) is not tuple or any(
+                not isinstance(item, McpSubscriptionEvent) for item in result
+            ):
+                raise ValidationError(
+                    "MCP subscription manager returned invalid events"
+                )
+            return result
+
+        return self._run_modern_read(
+            operation="subscriptions.events",
+            server_id=record.server_id,
+            logical_id=subscription_id,
+            actor=actor,
+            target=target,
+            right=CapabilityRight.READ,
+            payload=payload,
+            invoke=invoke,
+        )
+
+    async def asubscription_events(
+        self,
+        subscription_id: str,
+        *,
+        after: int = 0,
+        limit: int = 100,
+        actor: str = "runtime",
+    ) -> tuple[McpSubscriptionEvent, ...]:
+        return await self._data_flow().run_sync_in_worker(
+            self.subscription_events,
+            subscription_id,
+            after=after,
+            limit=limit,
+            actor=actor,
+        )
+
+    def stop_subscription(
+        self,
+        subscription_id: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpSubscription:
+        record, target = self._subscription_record_for_operation(
+            subscription_id,
+            actor=actor,
+            right=CapabilityRight.WRITE,
+            operation="subscriptions.stop",
+        )
+        payload = {
+            "method": "subscriptions/stop",
+            "subscription_id": subscription_id,
+        }
+
+        def invoke(_client: Any, deadline: float) -> McpSubscription:
+            binding, _server = self._subscription_dispatch_binding()
+            self._require_subscription_record_binding(record, binding, actor=actor)
+            manager = self._subscription_manager()
+            result = self._subscription_runner(manager).run(
+                lambda: manager.stop(subscription_id),
+                deadline=deadline,
+                binding=binding,
+            )
+            if (
+                not isinstance(result, McpSubscription)
+                or result.subscription_id != subscription_id
+                or result.server_id != record.server_id
+            ):
+                raise ValidationError(
+                    "MCP subscription manager returned an invalid stop result"
+                )
+            return result
+
+        return self._run_modern_read(
+            operation="subscriptions.stop",
+            server_id=record.server_id,
+            logical_id=subscription_id,
+            actor=actor,
+            target=target,
+            right=CapabilityRight.WRITE,
+            payload=payload,
+            invoke=invoke,
+            state_mutation=True,
+            rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+            rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+        )
+
+    async def astop_subscription(
+        self,
+        subscription_id: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpSubscription:
+        return await self._data_flow().run_sync_in_worker(
+            self.stop_subscription,
+            subscription_id,
+            actor=actor,
+        )
+
+    def get_continuation(
+        self,
+        continuation_id: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpInputRequired:
+        """Inspect a durable Elicitation round without provider dispatch."""
+
+        self._validate_durable_host_actor(actor)
+        manager = self._continuation_manager()
+        binding = manager.binding_material(continuation_id)
+        result = manager.get(continuation_id, binding=binding)
+        if not isinstance(result, McpInputRequired):
+            raise ValidationError("MCP continuation manager returned an invalid view")
+        return result
+
+    async def aget_continuation(
+        self,
+        continuation_id: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpInputRequired:
+        return await self._data_flow().run_sync_in_worker(
+            self.get_continuation,
+            continuation_id,
+            actor=actor,
+        )
+
+    def recover_durable_result(
+        self,
+        effect_id: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpInputRequired | McpRemoteTask:
+        """Recover one exact local ref from a committed MCP effect receipt.
+
+        This Host-only lookup is deliberately not a Tasks/continuations list.
+        It accepts the pending-first local effect id and returns only the safe
+        durable projection atomically published with that effect.
+        """
+
+        self._validate_durable_host_actor(actor)
+        if type(effect_id) is not str or not effect_id or len(effect_id) > 512:
+            raise ValidationError("MCP durable result effect id is invalid")
+        effect = self.unit_of_work.evidence.get_external_effect(effect_id)
+        if (
+            effect is None
+            or effect.provider != "mcp"
+            or effect.effect_state != "finalized"
+            or effect.transaction_state != "committed"
+        ):
+            raise NotFound("MCP durable result receipt was not found")
+        selected = effect.provider_receipt.get("mcp_durable_result")
+        if not isinstance(selected, Mapping):
+            raise NotFound("MCP durable result receipt was not found")
+        kind = selected.get("kind")
+        if kind == "input_required" and set(selected) == {
+            "kind",
+            "continuation_id",
+        }:
+            continuation_id = selected.get("continuation_id")
+            if type(continuation_id) is not str:
+                raise ValidationError("MCP continuation receipt is invalid")
+            manager = self._continuation_manager()
+            if not manager.accepts_recovery_effect(continuation_id, effect_id):
+                raise CapabilityDenied("MCP continuation effect receipt changed")
+            recovered = manager.recover_local_result(continuation_id)
+            if isinstance(recovered, McpInputRequired):
+                return recovered
+            task_ref, response_effect_id = manager.completed_remote_task_handoff(
+                continuation_id
+            )
+            if recovered != task_ref:
+                raise ValidationError("MCP continuation Task receipt changed")
+            task_manager = self._remote_task_manager()
+            task_binding = self._remote_task_binding(task_manager, task_ref)
+            if task_binding.origin_effect_id != response_effect_id:
+                raise CapabilityDenied("MCP continuation Task effect receipt changed")
+            self._require_remote_task_effect_receipt(response_effect_id, task_ref)
+            return task_manager.inspect(task_ref, binding=task_binding)
+        if kind == "remote_task" and set(selected) == {"kind", "task_ref"}:
+            task_ref = selected.get("task_ref")
+            if type(task_ref) is not str:
+                raise ValidationError("MCP remote Task receipt is invalid")
+            manager = self._remote_task_manager()
+            binding = self._remote_task_binding(manager, task_ref)
+            if binding.origin_effect_id != effect_id:
+                raise CapabilityDenied("MCP remote Task effect receipt changed")
+            self._require_remote_task_effect_receipt(effect_id, task_ref)
+            return manager.inspect(task_ref, binding=binding)
+        raise ValidationError("MCP durable result receipt is invalid")
+
+    def _require_remote_task_effect_receipt(
+        self,
+        effect_id: str,
+        task_ref: str,
+    ) -> None:
+        effect = self.unit_of_work.evidence.get_external_effect(effect_id)
+        selected = (
+            effect.provider_receipt.get("mcp_durable_result")
+            if effect is not None
+            else None
+        )
+        if (
+            effect is None
+            or effect.provider != "mcp"
+            or effect.effect_state != "finalized"
+            or effect.transaction_state != "committed"
+            or not isinstance(selected, Mapping)
+            or dict(selected) != {"kind": "remote_task", "task_ref": task_ref}
+        ):
+            raise CapabilityDenied("MCP remote Task effect receipt changed")
+
+    async def arecover_durable_result(
+        self,
+        effect_id: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpInputRequired | McpRemoteTask:
+        return await self._data_flow().run_sync_in_worker(
+            self.recover_durable_result,
+            effect_id,
+            actor=actor,
+        )
+
+    def respond_continuation(
+        self,
+        continuation_id: str,
+        *,
+        expected_revision: int,
+        responses: dict[str, Any],
+        human_request_id: str,
+        human_expected_revision: int,
+        human_preview_sha256: str,
+        actor: str = "runtime",
+    ) -> McpComplete[Any] | McpInputRequired | McpRemoteTask:
+        """Settle one real Human answer, then dispatch the dedicated MRTR path."""
+
+        self._validate_durable_host_actor(actor)
+        selected_responses = _canonical_mcp_arguments(
+            responses,
+            max_bytes=self.config.mcp.max_request_hard_limit_bytes,
+        )
+        deadline = self._durable_mcp_deadline()
+        manager = self._continuation_manager()
+        binding = manager.binding_material(continuation_id)
+        pending = manager.get(continuation_id, binding=binding)
+        self._require_durable_human_fence(
+            pending,
+            expected_revision=expected_revision,
+            human_request_id=human_request_id,
+            human_expected_revision=human_expected_revision,
+            human_preview_sha256=human_preview_sha256,
+        )
+        manager.prevalidate_response(
+            continuation_id,
+            expected_revision=expected_revision,
+            binding=binding,
+            human_request_id=human_request_id,
+            human_expected_revision=human_expected_revision,
+            human_preview_sha256=human_preview_sha256,
+            responses=selected_responses,
+        )
+        manager.human_requests.settle_answer(
+            human_request_id,
+            selected_responses,
+            expected_revision=human_expected_revision,
+            preview_sha256=human_preview_sha256,
+            responder=actor,
+        )
+        return asyncio.run(
+            manager.respond(
+                continuation_id,
+                expected_revision=expected_revision,
+                binding=binding,
+                human_request_id=human_request_id,
+                human_expected_revision=human_expected_revision,
+                human_preview_sha256=human_preview_sha256,
+                deadline=deadline,
+            )
+        )
+
+    async def arespond_continuation(
+        self,
+        continuation_id: str,
+        *,
+        expected_revision: int,
+        responses: dict[str, Any],
+        human_request_id: str,
+        human_expected_revision: int,
+        human_preview_sha256: str,
+        actor: str = "runtime",
+    ) -> McpComplete[Any] | McpInputRequired | McpRemoteTask:
+        return await self._data_flow().run_sync_in_worker(
+            self.respond_continuation,
+            continuation_id,
+            expected_revision=expected_revision,
+            responses=responses,
+            human_request_id=human_request_id,
+            human_expected_revision=human_expected_revision,
+            human_preview_sha256=human_preview_sha256,
+            actor=actor,
+        )
+
+    def cancel_continuation(
+        self,
+        continuation_id: str,
+        *,
+        expected_revision: int,
+        actor: str = "runtime",
+    ) -> McpComplete[None]:
+        self._validate_durable_host_actor(actor)
+        manager = self._continuation_manager()
+        binding = manager.binding_material(continuation_id)
+        result = asyncio.run(
+            manager.cancel(
+                continuation_id,
+                expected_revision=expected_revision,
+                binding=binding,
+                deadline=self._durable_mcp_deadline(),
+            )
+        )
+        if not isinstance(result, McpComplete) or result.value is not None:
+            raise ValidationError("MCP continuation cancel result is invalid")
+        return result
+
+    async def acancel_continuation(
+        self,
+        continuation_id: str,
+        *,
+        expected_revision: int,
+        actor: str = "runtime",
+    ) -> McpComplete[None]:
+        return await self._data_flow().run_sync_in_worker(
+            self.cancel_continuation,
+            continuation_id,
+            expected_revision=expected_revision,
+            actor=actor,
+        )
+
+    def get_remote_task(
+        self,
+        task_ref: str,
+        *,
+        expected_revision: int | None = None,
+        actor: str = "runtime",
+    ) -> McpRemoteTask:
+        """Explicitly re-observe one local Task ref; never list or auto-poll."""
+
+        self._validate_durable_host_actor(actor)
+        manager = self._remote_task_manager()
+        binding = self._remote_task_binding(manager, task_ref)
+        local = manager.inspect(task_ref, binding=binding)
+        selected_revision = local.revision if expected_revision is None else expected_revision
+        return asyncio.run(
+            manager.get(
+                task_ref,
+                expected_revision=selected_revision,
+                binding=binding,
+                deadline=self._durable_mcp_deadline(),
+            )
+        )
+
+    async def aget_remote_task(
+        self,
+        task_ref: str,
+        *,
+        expected_revision: int | None = None,
+        actor: str = "runtime",
+    ) -> McpRemoteTask:
+        return await self._data_flow().run_sync_in_worker(
+            self.get_remote_task,
+            task_ref,
+            expected_revision=expected_revision,
+            actor=actor,
+        )
+
+    def update_remote_task(
+        self,
+        task_ref: str,
+        *,
+        expected_revision: int,
+        responses: dict[str, Any],
+        human_request_id: str,
+        human_expected_revision: int,
+        human_preview_sha256: str,
+        actor: str = "runtime",
+    ) -> McpRemoteTask:
+        self._validate_durable_host_actor(actor)
+        selected_responses = _canonical_mcp_arguments(
+            responses,
+            max_bytes=self.config.mcp.max_request_hard_limit_bytes,
+        )
+        deadline = self._durable_mcp_deadline()
+        manager = self._remote_task_manager()
+        binding = self._remote_task_binding(manager, task_ref)
+        pending = manager.inspect(task_ref, binding=binding)
+        self._require_durable_human_fence(
+            pending,
+            expected_revision=expected_revision,
+            human_request_id=human_request_id,
+            human_expected_revision=human_expected_revision,
+            human_preview_sha256=human_preview_sha256,
+        )
+        manager.prevalidate_update(
+            task_ref,
+            expected_revision=expected_revision,
+            binding=binding,
+            human_request_id=human_request_id,
+            human_expected_revision=human_expected_revision,
+            human_preview_sha256=human_preview_sha256,
+            responses=selected_responses,
+        )
+        manager.human_requests.settle_answer(
+            human_request_id,
+            selected_responses,
+            expected_revision=human_expected_revision,
+            preview_sha256=human_preview_sha256,
+            responder=actor,
+        )
+        return asyncio.run(
+            manager.update(
+                task_ref,
+                expected_revision=expected_revision,
+                binding=binding,
+                human_request_id=human_request_id,
+                human_expected_revision=human_expected_revision,
+                human_preview_sha256=human_preview_sha256,
+                deadline=deadline,
+            )
+        )
+
+    async def aupdate_remote_task(
+        self,
+        task_ref: str,
+        *,
+        expected_revision: int,
+        responses: dict[str, Any],
+        human_request_id: str,
+        human_expected_revision: int,
+        human_preview_sha256: str,
+        actor: str = "runtime",
+    ) -> McpRemoteTask:
+        return await self._data_flow().run_sync_in_worker(
+            self.update_remote_task,
+            task_ref,
+            expected_revision=expected_revision,
+            responses=responses,
+            human_request_id=human_request_id,
+            human_expected_revision=human_expected_revision,
+            human_preview_sha256=human_preview_sha256,
+            actor=actor,
+        )
+
+    def cancel_remote_task(
+        self,
+        task_ref: str,
+        *,
+        expected_revision: int,
+        actor: str = "runtime",
+    ) -> McpRemoteTask:
+        self._validate_durable_host_actor(actor)
+        manager = self._remote_task_manager()
+        binding = self._remote_task_binding(manager, task_ref)
+        return asyncio.run(
+            manager.cancel(
+                task_ref,
+                expected_revision=expected_revision,
+                binding=binding,
+                deadline=self._durable_mcp_deadline(),
+            )
+        )
+
+    async def acancel_remote_task(
+        self,
+        task_ref: str,
+        *,
+        expected_revision: int,
+        actor: str = "runtime",
+    ) -> McpRemoteTask:
+        return await self._data_flow().run_sync_in_worker(
+            self.cancel_remote_task,
+            task_ref,
+            expected_revision=expected_revision,
+            actor=actor,
+        )
+
+    def add_oauth_profile(
+        self,
+        profile: McpOAuthProfile,
+        *,
+        client_secret: bytes | None = None,
+        actor: str = "runtime",
+    ) -> McpOAuthStatus:
+        """Add Host OAuth configuration without projecting its secret input."""
+
+        self._validate_oauth_actor(actor)
+        self._require_oauth_enabled()
+        if not isinstance(profile, McpOAuthProfile):
+            raise ValidationError("MCP OAuth profile must be a typed McpOAuthProfile")
+        manager = self._oauth_manager()
+        with self._oauth_phase_lock:
+            status = manager.add_profile(profile, client_secret=client_secret)
+            try:
+                found = self.extensions.get_mcp_v3_server(profile.server_id)
+                if found is not None:
+                    manifest, _metadata = found
+                    binding = self._validate_oauth_profile_manifest(profile, manifest)
+                    self._restore_oauth_generation(manager, profile, binding)
+                    status = manager.status(profile.profile_id)
+                    with self.unit_of_work.transaction():
+                        self._sync_oauth_metadata(
+                            manager,
+                            profile,
+                            manifest,
+                            binding,
+                            status,
+                        )
+                        self._record_oauth_profile_change(
+                            "add", profile, status, actor=actor, bound=True
+                        )
+                else:
+                    # A provisional profile lets a Host atomically admit a
+                    # manifest that references it.  It cannot begin OAuth or
+                    # produce durable authority until that exact v3 server is
+                    # registered and bound below in _register_server.
+                    with self.unit_of_work.transaction():
+                        self._record_oauth_profile_change(
+                            "add", profile, status, actor=actor, bound=False
+                        )
+            except BaseException:
+                manager.remove_profile(profile.profile_id, missing_ok=True)
+                raise
+            return status
+
+    def replace_oauth_profile(
+        self,
+        profile: McpOAuthProfile,
+        *,
+        client_secret: bytes | None = None,
+        actor: str = "runtime",
+    ) -> McpOAuthStatus:
+        """Replace one exact Host profile and revoke its prior local fence."""
+
+        self._validate_oauth_actor(actor)
+        self._require_oauth_enabled()
+        if not isinstance(profile, McpOAuthProfile):
+            raise ValidationError("MCP OAuth profile must be a typed McpOAuthProfile")
+        manager = self._oauth_manager()
+        with self._oauth_phase_lock:
+            if not manager.has_profile(profile.profile_id):
+                raise ValidationError("MCP OAuth profile is unavailable")
+            found = self.extensions.get_mcp_v3_server(profile.server_id)
+            manifest: McpServerManifestV3 | None = None
+            binding: dict[str, Any] | None = None
+            if found is not None:
+                selected, _metadata = found
+                binding = self._validate_oauth_profile_manifest(profile, selected)
+                manifest = selected
+                self._require_oauth_record_identity(profile, binding)
+            status = manager.replace_profile(profile, client_secret=client_secret)
+            if manifest is not None and binding is not None:
+                with self.unit_of_work.transaction():
+                    status = manager.status(profile.profile_id)
+                    self._sync_oauth_metadata(
+                        manager,
+                        profile,
+                        manifest,
+                        binding,
+                        status,
+                    )
+                    self._record_oauth_profile_change(
+                        "replace", profile, status, actor=actor, bound=True
+                    )
+            else:
+                with self.unit_of_work.transaction():
+                    self._record_oauth_profile_change(
+                        "replace", profile, status, actor=actor, bound=False
+                    )
+            return status
+
+    def remove_oauth_profile(
+        self,
+        profile_id: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpOAuthStatus:
+        """Remove broker handles; retain only a revoked non-secret Store row."""
+
+        self._validate_oauth_actor(actor)
+        manager = self._oauth_manager()
+        with self._oauth_phase_lock:
+            profile = manager.profile_snapshot(profile_id)
+            found = self.extensions.get_mcp_v3_server(profile.server_id)
+            manifest: McpServerManifestV3 | None = None
+            binding: dict[str, Any] | None = None
+            if found is not None:
+                selected, _metadata = found
+                binding = self._validate_oauth_profile_manifest(profile, selected)
+                manifest = selected
+            manager.remove_profile(profile_id)
+            status = McpOAuthStatus(
+                profile_id=profile_id,
+                status=McpOAuthStatusKind.REVOKED,
+                issuer=profile.expected_issuer,
+                resource=profile.resource_uri,
+            )
+            with self.unit_of_work.transaction():
+                if manifest is not None and binding is not None:
+                    self._sync_oauth_metadata(
+                        manager=None,
+                        profile=profile,
+                        manifest=manifest,
+                        binding=binding,
+                        status=status,
+                    )
+                self._record_oauth_profile_change(
+                    "remove", profile, status, actor=actor, bound=manifest is not None
+                )
+            return status
+
+    def list_oauth_profiles(self, *, actor: str = "runtime") -> tuple[McpOAuthStatus, ...]:
+        self._validate_oauth_actor(actor)
+        manager = self._oauth_manager()
+        return manager.list_profiles()
+
+    def auth_status(
+        self,
+        profile_id: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpOAuthStatus:
+        """Return non-secret status without implicitly reconfiguring a profile.
+
+        After restart the Host must explicitly add the same exact profile; only
+        that registration may rebind a deterministic secure-broker token slot.
+        A status read by itself never loads or revives credential material.
+        """
+
+        self._validate_oauth_actor(actor)
+        manager = self._oauth_manager()
+        with self._oauth_phase_lock:
+            if not manager.has_profile(profile_id):
+                return self._restarted_oauth_status(profile_id)
+            profile, manifest, binding = self._bound_oauth_context(profile_id)
+            status = manager.status(profile_id)
+            with self.unit_of_work.transaction():
+                self._sync_oauth_metadata(
+                    manager, profile, manifest, binding, status
+                )
+            return status
+
+    def auth_begin(
+        self,
+        profile_id: str,
+        *,
+        scopes: tuple[str, ...] = (),
+        actor: str = "runtime",
+    ) -> McpAuthorizationChallenge:
+        self._validate_oauth_actor(actor)
+        if type(scopes) is not tuple or any(type(item) is not str for item in scopes):
+            raise ValidationError("MCP OAuth scopes must be a tuple of strings")
+        with self._oauth_phase_lock:
+            profile, manifest, binding = self._bound_oauth_context(profile_id)
+            manager = self._oauth_manager()
+            issued_challenge: McpAuthorizationChallenge | None = None
+
+            def invoke(deadline: float) -> McpAuthorizationChallenge:
+                nonlocal issued_challenge
+                challenge = manager.begin(profile_id, scopes=scopes, deadline=deadline)
+                issued_challenge = challenge
+                self._sync_oauth_metadata(
+                    manager,
+                    profile,
+                    manifest,
+                    binding,
+                    manager.status(profile_id),
+                )
+                return challenge
+
+            try:
+                return self._run_oauth_provider_operation(
+                    operation="auth.begin",
+                    profile=profile,
+                    manifest=manifest,
+                    binding=binding,
+                    actor=actor,
+                    payload={
+                        "profile_id": profile_id,
+                        "scopes": list(sorted(scopes)),
+                    },
+                    mutation=False,
+                    invoke=invoke,
+                )
+            except BaseException:
+                self._discard_oauth_challenge_quietly(manager, issued_challenge)
+                raise
+
+    def auth_authorize_for_challenge(
+        self,
+        profile_id: str,
+        www_authenticate: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpAuthorizationChallenge:
+        self._validate_oauth_actor(actor)
+        if type(www_authenticate) is not str or not www_authenticate:
+            raise ValidationError("MCP OAuth challenge header is invalid")
+        with self._oauth_phase_lock:
+            profile, manifest, binding = self._bound_oauth_context(profile_id)
+            manager = self._oauth_manager()
+            header_sha256 = hashlib.sha256(www_authenticate.encode("utf-8")).hexdigest()
+            issued_challenge: McpAuthorizationChallenge | None = None
+
+            def invoke(deadline: float) -> McpAuthorizationChallenge:
+                nonlocal issued_challenge
+                challenge = manager.authorize_for_challenge(
+                    profile_id,
+                    www_authenticate,
+                    deadline=deadline,
+                )
+                issued_challenge = challenge
+                self._sync_oauth_metadata(
+                    manager,
+                    profile,
+                    manifest,
+                    binding,
+                    manager.status(profile_id),
+                )
+                return challenge
+
+            try:
+                return self._run_oauth_provider_operation(
+                    operation="auth.challenge",
+                    profile=profile,
+                    manifest=manifest,
+                    binding=binding,
+                    actor=actor,
+                    payload={
+                        "profile_id": profile_id,
+                        "www_authenticate_sha256": header_sha256,
+                    },
+                    mutation=False,
+                    invoke=invoke,
+                )
+            except BaseException:
+                self._discard_oauth_challenge_quietly(manager, issued_challenge)
+                raise
+
+    def auth_complete(
+        self,
+        challenge_id: str,
+        callback_url: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpOAuthStatus:
+        self._validate_oauth_actor(actor)
+        manager = self._oauth_manager()
+        with self._oauth_phase_lock:
+            profile_id = manager.challenge_profile_id(challenge_id)
+            profile, manifest, binding = self._bound_oauth_context(profile_id)
+
+            def invoke(deadline: float) -> McpOAuthStatus:
+                try:
+                    status = manager.complete(
+                        challenge_id,
+                        callback_url,
+                        deadline=deadline,
+                    )
+                except Exception:
+                    self._sync_oauth_failure_status(
+                        manager, profile, manifest, binding
+                    )
+                    raise
+                self._sync_oauth_metadata(
+                    manager, profile, manifest, binding, status
+                )
+                return status
+
+            return self._run_oauth_provider_operation(
+                operation="auth.complete",
+                profile=profile,
+                manifest=manifest,
+                binding=binding,
+                actor=actor,
+                payload={
+                    "profile_id": profile_id,
+                    "challenge_sha256": hashlib.sha256(
+                        challenge_id.encode("utf-8")
+                    ).hexdigest(),
+                },
+                mutation=True,
+                invoke=invoke,
+            )
+
+    def auth_revoke(
+        self,
+        profile_id: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpOAuthStatus:
+        self._validate_oauth_actor(actor)
+        manager = self._oauth_manager()
+        with self._oauth_phase_lock:
+            profile, manifest, binding = self._bound_oauth_context(profile_id)
+
+            def invoke(deadline: float) -> McpOAuthStatus:
+                try:
+                    status = manager.revoke(profile_id, deadline=deadline)
+                except Exception:
+                    self._sync_oauth_failure_status(
+                        manager, profile, manifest, binding
+                    )
+                    raise
+                self._sync_oauth_metadata(
+                    manager, profile, manifest, binding, status
+                )
+                return status
+
+            return self._run_oauth_provider_operation(
+                operation="auth.revoke",
+                profile=profile,
+                manifest=manifest,
+                binding=binding,
+                actor=actor,
+                payload={"profile_id": profile_id},
+                mutation=True,
+                invoke=invoke,
+            )
+
+    def auth_logout(
+        self,
+        profile_id: str,
+        *,
+        actor: str = "runtime",
+    ) -> McpOAuthStatus:
+        self._validate_oauth_actor(actor)
+        manager = self._oauth_manager()
+        with self._oauth_phase_lock:
+            profile, manifest, binding = self._bound_oauth_context(profile_id)
+            status = manager.logout(profile_id)
+            with self.unit_of_work.transaction():
+                self._sync_oauth_metadata(
+                    manager, profile, manifest, binding, status
+                )
+                self._record_oauth_profile_change(
+                    "logout", profile, status, actor=actor, bound=True
+                )
+            return status
+
+    def _oauth_manager(self) -> Any:
+        manager = self._modern_oauth
+        required = (
+            "add_profile",
+            "replace_profile",
+            "remove_profile",
+            "profile_snapshot",
+            "status",
+            "begin",
+            "complete",
+            "revoke",
+            "logout",
+            "credential_generation",
+        )
+        if manager is None or any(
+            not callable(getattr(manager, name, None)) for name in required
+        ):
+            raise ValidationError("MCP OAuth manager is unavailable")
+        return manager
+
+    def _require_oauth_enabled(self) -> None:
+        if self.config.mcp.oauth_enabled is not True:
+            raise ValidationError("MCP OAuth is disabled by Host policy")
+
+    @staticmethod
+    def _validate_oauth_actor(actor: str) -> None:
+        if type(actor) is not str or not actor or len(actor) > 512 or "\x00" in actor:
+            raise ValidationError("MCP OAuth actor is invalid")
+
+    def _validate_oauth_profile_manifest(
+        self,
+        profile: McpOAuthProfile,
+        manifest: Any,
+    ) -> dict[str, Any]:
+        self._validate_oauth_profile_manifest_fields(profile, manifest)
+        return self._registry_binding_for_server_spec(manifest)
+
+    def _validate_oauth_profile_manifest_fields(
+        self,
+        profile: McpOAuthProfile,
+        manifest: Any,
+    ) -> None:
+        self._require_oauth_enabled()
+        if not isinstance(manifest, McpServerManifestV3):
+            raise ValidationError("MCP OAuth requires a Manifest v3 server")
+        if (
+            manifest.transport != "streamable_http"
+            or manifest.http is None
+            or manifest.auth_profile_id != profile.profile_id
+            or manifest.server_id != profile.server_id
+            or manifest.http.url != profile.resource_uri
+        ):
+            raise ValidationError(
+                "MCP OAuth profile does not match the exact v3 server binding"
+            )
+
+    def _bound_oauth_context(
+        self,
+        profile_id: str,
+    ) -> tuple[McpOAuthProfile, McpServerManifestV3, dict[str, Any]]:
+        if type(profile_id) is not str or not profile_id or "\x00" in profile_id:
+            raise ValidationError("MCP OAuth profile_id is invalid")
+        manager = self._oauth_manager()
+        profile = manager.profile_snapshot(profile_id)
+        found = self.extensions.get_mcp_v3_server(profile.server_id)
+        if found is None:
+            raise ValidationError("MCP OAuth profile is not bound to a registered server")
+        manifest, _metadata = found
+        binding = self._validate_oauth_profile_manifest(profile, manifest)
+        self._require_oauth_record_identity(profile, binding)
+        return profile, manifest, binding
+
+    def _restore_oauth_generation(
+        self,
+        manager: Any,
+        profile: McpOAuthProfile,
+        binding: Mapping[str, Any],
+    ) -> None:
+        existing = self.unit_of_work.mcp_auth.get(profile.profile_id)
+        if existing is None:
+            return
+        self._require_oauth_record_identity(profile, binding, record=existing)
+        manager.set_minimum_credential_generation(
+            profile.profile_id,
+            existing.credential_generation,
+        )
+
+    def _require_oauth_record_identity(
+        self,
+        profile: McpOAuthProfile,
+        binding: Mapping[str, Any],
+        *,
+        record: McpAuthMetadataRecord | None = None,
+    ) -> None:
+        selected = record or self.unit_of_work.mcp_auth.get(profile.profile_id)
+        if selected is None:
+            return
+        if (
+            selected.server_id != profile.server_id
+            or selected.server_spec_sha256 != binding.get("registry_spec_sha256")
+        ):
+            raise ValidationError(
+                "MCP OAuth profile binding changed; configure a new profile_id"
+            )
+
+    @staticmethod
+    def _oauth_digest(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _oauth_scope_digest(scopes: tuple[str, ...]) -> str:
+        return hashlib.sha256(
+            dumps(list(sorted(scopes))).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _oauth_reason_code(status: McpOAuthStatusKind) -> str | None:
+        return {
+            McpOAuthStatusKind.UNCONFIGURED: "credential_missing",
+            McpOAuthStatusKind.AUTHORIZATION_REQUIRED: "authorization_required",
+            McpOAuthStatusKind.AUTHORIZED: None,
+            McpOAuthStatusKind.EXPIRED: "credential_expired",
+            McpOAuthStatusKind.REVOKED: "credential_revoked",
+            McpOAuthStatusKind.NEEDS_ATTENTION: "needs_attention",
+        }[status]
+
+    def _sync_oauth_metadata(
+        self,
+        manager: Any | None,
+        profile: McpOAuthProfile,
+        manifest: McpServerManifestV3,
+        binding: Mapping[str, Any],
+        status: McpOAuthStatus,
+    ) -> McpAuthMetadataRecord:
+        if status.profile_id != profile.profile_id:
+            raise ValidationError("MCP OAuth status belongs to another profile")
+        self._validate_oauth_profile_manifest(profile, manifest)
+        repository = self.unit_of_work.mcp_auth
+        existing = repository.get(profile.profile_id)
+        self._require_oauth_record_identity(
+            profile,
+            binding,
+            record=existing,
+        )
+        current_generation = (
+            manager.credential_generation(profile.profile_id)
+            if manager is not None
+            else ((existing.credential_generation + 1) if existing is not None else 0)
+        )
+        if (
+            existing is not None
+            and current_generation < existing.credential_generation
+        ):
+            raise ValidationError("MCP OAuth credential generation regressed")
+        now = utc_now()
+        reason = self._oauth_reason_code(status.status)
+        metadata = {} if reason is None else {"reason_code": reason}
+        record = McpAuthMetadataRecord(
+            profile_id=profile.profile_id,
+            server_id=profile.server_id,
+            server_spec_sha256=(
+                existing.server_spec_sha256
+                if existing is not None
+                else str(binding["registry_spec_sha256"])
+            ),
+            server_generation=(
+                existing.server_generation
+                if existing is not None
+                else int(binding["registry_generation"])
+            ),
+            status=status.status.value,
+            issuer_sha256=self._oauth_digest(profile.expected_issuer),
+            resource_sha256=self._oauth_digest(profile.resource_uri),
+            audience_sha256=self._oauth_digest(
+                profile.audience or profile.resource_uri
+            ),
+            scopes_sha256=self._oauth_scope_digest(status.scopes),
+            principal_sha256=status.principal_sha256,
+            expires_at=status.expires_at,
+            credential_generation=current_generation,
+            revision=0 if existing is None else existing.revision + 1,
+            metadata=metadata,
+            created_at=now if existing is None else existing.created_at,
+            updated_at=now,
+        )
+        if existing is None:
+            return repository.insert(record)
+        if not repository.compare_and_swap(
+            profile.profile_id,
+            expected_revision=existing.revision,
+            replacement=record,
+        ):
+            raise ValidationError("MCP OAuth metadata changed concurrently")
+        return record
+
+    def _sync_oauth_failure_status(
+        self,
+        manager: Any,
+        profile: McpOAuthProfile,
+        manifest: McpServerManifestV3,
+        binding: Mapping[str, Any],
+    ) -> None:
+        """Persist only a sanitized status after a one-shot OAuth failure."""
+
+        try:
+            status = manager.status(profile.profile_id)
+            with self.unit_of_work.transaction():
+                self._sync_oauth_metadata(
+                    manager,
+                    profile,
+                    manifest,
+                    binding,
+                    status,
+                )
+        except BaseException:
+            # The original remote mutation is already unknown and must remain
+            # the surfaced failure. Store diagnostics are not authority and a
+            # projection failure must never tempt a caller to replay it.
+            pass
+
+    def _restarted_oauth_status(self, profile_id: str) -> McpOAuthStatus:
+        if type(profile_id) is not str or not profile_id or "\x00" in profile_id:
+            raise ValidationError("MCP OAuth profile_id is invalid")
+        repository = self.unit_of_work.mcp_auth
+        existing = repository.get(profile_id)
+        if existing is None:
+            raise ValidationError("MCP OAuth profile is unavailable")
+        selected_status = (
+            McpOAuthStatusKind.REVOKED
+            if existing.status == McpOAuthStatusKind.REVOKED.value
+            else McpOAuthStatusKind.NEEDS_ATTENTION
+        )
+        if existing.status != selected_status.value:
+            now = utc_now()
+            replacement = dataclass_replace(
+                existing,
+                status=selected_status.value,
+                revision=existing.revision + 1,
+                metadata={
+                    "reason_code": (
+                        "credential_revoked"
+                        if selected_status is McpOAuthStatusKind.REVOKED
+                        else "credential_missing"
+                    )
+                },
+                updated_at=now,
+            )
+            with self.unit_of_work.transaction():
+                if not repository.compare_and_swap(
+                    profile_id,
+                    expected_revision=existing.revision,
+                    replacement=replacement,
+                ):
+                    raise ValidationError("MCP OAuth metadata changed concurrently")
+        return McpOAuthStatus(profile_id=profile_id, status=selected_status)
+
+    def _record_oauth_profile_change(
+        self,
+        action: str,
+        profile: McpOAuthProfile,
+        status: McpOAuthStatus,
+        *,
+        actor: str,
+        bound: bool,
+    ) -> None:
+        payload = {
+            "adapter": "mcp",
+            "operation": f"oauth_profile_{action}",
+            "profile_id": profile.profile_id,
+            "server_id": profile.server_id,
+            "status": status.status.value,
+            "bound": bound,
+        }
+        self.events.emit(
+            EventType.EXTERNAL_WRITE,
+            source=actor,
+            target=f"mcp_oauth_profile:{profile.profile_id}",
+            payload=payload,
+        )
+        self.audit.record(
+            actor=actor,
+            action=f"mcp.oauth.profile.{action}",
+            target=f"mcp_oauth_profile:{profile.profile_id}",
+            decision=payload,
+        )
+
+    def _run_oauth_provider_operation(
+        self,
+        *,
+        operation: str,
+        profile: McpOAuthProfile,
+        manifest: McpServerManifestV3,
+        binding: dict[str, Any],
+        actor: str,
+        payload: Mapping[str, Any],
+        mutation: bool,
+        invoke: Any,
+    ) -> Any:
+        request_json = dumps(dict(payload))
+        request_bytes = len(request_json.encode("utf-8"))
+        request_sha256 = hashlib.sha256(request_json.encode("utf-8")).hexdigest()
+        target = f"mcp:{manifest.server_id}:oauth:{profile.profile_id}"
+        context = {
+            "server_id": manifest.server_id,
+            "logical_id": profile.profile_id,
+            "operation": operation,
+            "request_sha256": request_sha256,
+            "request_bytes": request_bytes,
+            **binding,
+        }
+        rollback_class = (
+            ExternalEffectRollbackClass.IRREVERSIBLE
+            if mutation
+            else ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+        )
+        rollback_status = (
+            ExternalEffectRollbackStatus.NOT_SUPPORTED
+            if mutation
+            else ExternalEffectRollbackStatus.NOT_REQUIRED
+        )
+        observation = {
+            **context,
+            "state_mutation": mutation,
+            "information_flow": True,
+            "rollback_class": rollback_class.value,
+            "rollback_status": rollback_status.value,
+            "automatic_retry_disabled": mutation,
+        }
+        flow_context = DataFlowContext(
+            labels=DataLabels(
+                sensitivity="public",
+                trust_level="verified",
+                integrity="verified",
+                origin=f"runtime:mcp-oauth:{actor}",
+            )
+        )
+        sink = self._modern_data_sink(
+            manifest,
+            operation=operation,
+            logical_id=profile.profile_id,
+            stdio_identity=None,
+        )
+        invocation = ProtectedOperationInvocation(
+            pid=actor,
+            actor=actor,
+            target=target,
+            decisions=(),
+            canonical_args=context,
+            observation=observation,
+            **self._protected_registry_guard(binding, manifest.server_id),
+            data_sink=sink,
+            data_sink_revalidator=lambda: self._modern_data_sink(
+                manifest,
+                operation=operation,
+                logical_id=profile.profile_id,
+                stdio_identity=None,
+            ),
+            data_flow_context=flow_context,
+            data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
+                flow_context,
+                origin="external:mcp-oauth",
+            ),
+            data_flow_payload=dict(payload),
+            data_flow_operation=f"mcp.{operation}",
+            failure_evidence=lambda error, phase: self._oauth_operation_evidence(
+                actor=actor,
+                target=target,
+                context=context,
+                operation=operation,
+                ok=False,
+                mutation=mutation,
+                phase=phase,
+                result_kind=type(error).__name__,
+                response_bytes=0,
+            ),
+        )
+        deadline = time.monotonic() + manifest.timeout_s
+        contract = f"primitive.mcp.{operation}.internal"
+        with self._protected().start(
+            contract,
+            invocation,
+            provider=self.provider,
+        ) as protected:
+            result = protected.call(
+                ProviderPhase(
+                    "oauth_provider_operation",
+                    state_mutation=mutation,
+                    information_flow=True,
+                ),
+                invoke,
+                deadline,
+            )
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "MCP OAuth provider exceeded the absolute deadline"
+                )
+            response_bytes = len(dumps(to_jsonable(result)).encode("utf-8"))
+            classification = ExternalEffectClassification(
+                rollback_class=rollback_class,
+                rollback_status=rollback_status,
+                state_mutation=mutation,
+                information_flow=True,
+                metadata={
+                    "outcome": "succeeded",
+                    "operation": operation,
+                    "automatic_retry_disabled": mutation,
+                },
+            )
+            return protected.complete(
+                result,
+                self._oauth_operation_evidence(
+                    actor=actor,
+                    target=target,
+                    context=context,
+                    operation=operation,
+                    ok=True,
+                    mutation=mutation,
+                    phase="complete",
+                    result_kind=type(result).__name__,
+                    response_bytes=response_bytes,
+                ),
+                classification_override=classification,
+            )
+
+    @staticmethod
+    def _discard_oauth_challenge_quietly(
+        manager: Any,
+        challenge: McpAuthorizationChallenge | None,
+    ) -> None:
+        if challenge is None:
+            return
+        try:
+            manager.discard_challenge(challenge.challenge_id)
+        except BaseException:
+            # Preserve the original protected-operation failure. The manager
+            # retains an ambiguous deletion for close/expiry/next-begin retry.
+            pass
+
+    @staticmethod
+    def _oauth_operation_evidence(
+        *,
+        actor: str,
+        target: str,
+        context: Mapping[str, Any],
+        operation: str,
+        ok: bool,
+        mutation: bool,
+        phase: str,
+        result_kind: str,
+        response_bytes: int,
+    ) -> ProtectedOperationEvidence:
+        payload = {
+            "adapter": "mcp",
+            "operation": operation,
+            "server_id": context["server_id"],
+            "profile_id": context["logical_id"],
+            "ok": ok,
+            "phase": phase,
+            "result_kind": result_kind,
+            "request_bytes": context["request_bytes"],
+            "response_bytes": response_bytes,
+            "automatic_retry_disabled": mutation,
+        }
+        return ProtectedOperationEvidence(
+            event_type=(EventType.EXTERNAL_WRITE if mutation else EventType.EXTERNAL_READ),
+            event_source=actor,
+            event_target=target,
+            event_payload=payload,
+            audit_action=f"primitive.mcp.{operation}",
+            audit_actor=actor,
+            audit_target=target,
+            audit_decision={
+                **payload,
+                "request_sha256": context["request_sha256"],
+                "registry_spec_sha256": context["registry_spec_sha256"],
+                "registry_generation": context["registry_generation"],
+            },
+            effect_metadata=payload,
+            provider_receipt={
+                "request_bytes": context["request_bytes"],
+                "response_bytes": response_bytes,
+            },
+        )
+
+    @asynccontextmanager
+    async def _modern_session_factory_context(
+        self,
+        server: McpServerSpec,
+        *,
+        deadline: float,
+        binding: McpClientBinding,
+        task_notification_ingress: Callable[[Mapping[str, Any] | None], None]
+        | None = None,
+    ):
+        """Enter the existing strict SDK transport inside one protected phase."""
+
+        context, base_server = self._validate_modern_session_binding(
+            server,
+            binding=binding,
+            deadline=deadline,
+        )
+        runtime_environment, snapshot, limits, session = (
+            self._prepare_modern_session_dispatch(
+                server,
+                binding=binding,
+                context=context,
+                base_server=base_server,
+                deadline=deadline,
+            )
+        )
+        try:
+            tasks_extension_sha256 = self._modern_session_tasks_pin(binding)
+            async with session(
+                server,
+                deadline=deadline,
+                max_response_bytes=server.max_response_bytes,
+                executable_snapshot=snapshot,
+                runtime_environment=runtime_environment,
+                limits=limits,
+                allow_server_notifications=(
+                    context.get("operation") == "subscriptions.start"
+                ),
+                enable_modern_mrtr=True,
+                tasks_extension_sha256=tasks_extension_sha256,
+                request_id_allocator=self._next_modern_request_id,
+                task_notification_ingress=task_notification_ingress,
+            ) as selected:
+                yield selected
+        finally:
+            if snapshot is not None:
+                snapshot.close()
+
+    def _next_modern_request_id(self) -> str:
+        """Mint a Runtime-scoped JSON-RPC id for an exact-v3 exchange.
+
+        Modern operations deliberately use independent task-affine SDK
+        sessions.  A session-local integer counter would therefore reuse the
+        same Tool request id when a durable MRTR continuation is resumed.
+        The random Runtime scope also avoids reuse after a Runtime reopen;
+        the locked suffix makes concurrent operations deterministic within
+        that scope.  Manifest-v1/v2 never receive this allocator and retain
+        their released numeric wire identity.
+        """
+
+        with self._modern_request_id_lock:
+            self._modern_request_id_next += 1
+            sequence = self._modern_request_id_next
+        return f"{self._modern_request_id_scope}:{sequence}"
+
+    def _modern_session_tasks_pin(
+        self,
+        binding: McpClientBinding,
+    ) -> str | None:
+        """Return the current local Tasks review pin for one exact v3 binding."""
+
+        extension = binding.manifest.tasks_extension
+        if extension is None:
+            return None
+        host_pin = self.config.mcp.tasks_extension_spec_sha256
+        if (
+            not self.config.mcp.tasks_extension_enabled
+            or extension.extension_id != MCP_TASKS_EXTENSION_ID
+            or type(host_pin) is not str
+            or extension.spec_sha256 != host_pin
+        ):
+            raise ProviderEffectNotStarted(
+                "MCP Tasks extension binding changed before provider dispatch"
+            )
+        return host_pin
+
+    def _validate_modern_session_binding(
+        self,
+        server: McpServerSpec,
+        *,
+        binding: McpClientBinding,
+        deadline: float,
+    ) -> tuple[dict[str, Any], McpServerSpec]:
+        context = self._modern_dispatch_context.get()
+        if not isinstance(context, dict):
+            raise ProviderEffectNotStarted(
+                "MCP modern session is outside a protected provider phase"
+            )
+        if not isinstance(binding, McpClientBinding):
+            raise ProviderEffectNotStarted("MCP modern session binding is invalid")
+        active_binding = current_mcp_client_binding()
+        expected_binding = context.get("binding")
+        if (
+            not isinstance(expected_binding, McpClientBinding)
+            or binding.fence != expected_binding.fence
+            or active_binding.fence != binding.fence
+            or binding.manifest.server_id != server.server_id
+        ):
+            raise ProviderEffectNotStarted(
+                "MCP modern session binding changed before provider dispatch"
+            )
+        expected_deadline = context.get("deadline")
+        if (
+            type(deadline) not in {int, float}
+            or type(expected_deadline) not in {int, float}
+            or deadline > float(expected_deadline)
+        ):
+            raise ProviderEffectNotStarted("MCP modern deadline binding is invalid")
+        self._remaining_timeout(deadline)
+        base_server = context.get("server")
+        if not isinstance(base_server, McpServerSpec):
+            raise ProviderEffectNotStarted("MCP modern transport binding is invalid")
+        if self._modern_transport_identity(base_server) != self._modern_transport_identity(
+            server
+        ):
+            raise ProviderEffectNotStarted(
+                "MCP modern transport changed before provider dispatch"
+            )
+        return context, base_server
+
+    @staticmethod
+    def _modern_transport_identity(server: McpServerSpec) -> tuple[Any, ...]:
+        return (
+            server.server_id,
+            server.transport,
+            server.max_request_bytes,
+            server.max_response_bytes,
+            server.protocol_mode,
+        )
+
+    def _prepare_modern_session_dispatch(
+        self,
+        server: McpServerSpec,
+        *,
+        binding: McpClientBinding,
+        context: Mapping[str, Any],
+        base_server: McpServerSpec,
+        deadline: float,
+    ) -> tuple[Mapping[str, str], ExecutableSnapshot | None, SubprocessLimits | None, Any]:
+        if base_server.transport == "streamable_http":
+            self._validate_runtime_resolution(base_server, deadline=deadline)
+        host_environment = binding.runtime_environment
+        if not isinstance(host_environment, Mapping):
+            raise ProviderEffectNotStarted(
+                "MCP modern runtime environment snapshot is unavailable"
+            )
+        runtime_environment = self._require_runtime_environment(
+            server,
+            host_environment=host_environment,
+        )
+        snapshot = self._stdio_snapshot_for_dispatch(
+            pid=str(context["actor"]),
+            spec=base_server,
+            expected_identity=context.get("stdio_identity"),
+            sink=context["sink"],
+            context=context["flow_context"],
+            payload=context["payload"],
+            runtime_environment=runtime_environment,
+            deadline=deadline,
+        )
+        usage_pid = context.get("usage_pid")
+        limits = self._subprocess_limits(usage_pid) if usage_pid is not None else None
+        session = getattr(self.provider, "modern_session", None)
+        if not callable(session):
+            if snapshot is not None:
+                snapshot.close()
+            raise ProviderEffectNotStarted(
+                "MCP Runtime provider cannot create a governed SDK session"
+            )
+        return runtime_environment, snapshot, limits, session
+
+    def _run_modern_read(
+        self,
+        *,
+        operation: str,
+        server_id: str,
+        logical_id: str,
+        actor: str,
+        target: str,
+        right: CapabilityRight,
+        payload: Mapping[str, Any],
+        invoke: Any,
+        manifest_preflight: Any | None = None,
+        binding_preflight: Any | None = None,
+        expected_registry_binding: Mapping[str, Any] | None = None,
+        absolute_deadline: float | None = None,
+        state_mutation: bool = False,
+        rollback_class: ExternalEffectRollbackClass = (
+            ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+        ),
+        rollback_status: ExternalEffectRollbackStatus = (
+            ExternalEffectRollbackStatus.NOT_REQUIRED
+        ),
+        contract_name: str | None = None,
+        result_settler: Any | None = None,
+    ) -> Any:
+        plan = self._prepare_modern_operation(
+            operation=operation,
+            server_id=server_id,
+            logical_id=logical_id,
+            actor=actor,
+            target=target,
+            right=right,
+            payload=payload,
+            manifest_preflight=manifest_preflight,
+            binding_preflight=binding_preflight,
+            expected_registry_binding=expected_registry_binding,
+            absolute_deadline=absolute_deadline,
+        )
+        self._prepare_modern_transport(
+            plan,
+            operation=operation,
+            logical_id=logical_id,
+            actor=actor,
+        )
+        plan["invocation"] = self._modern_protected_invocation(
+            plan,
+            operation=operation,
+            server_id=server_id,
+            logical_id=logical_id,
+            actor=actor,
+            target=target,
+            payload=payload,
+            state_mutation=state_mutation,
+            rollback_class=rollback_class,
+            rollback_status=rollback_status,
+        )
+        return self._execute_modern_operation(
+            plan,
+            operation=operation,
+            server_id=server_id,
+            logical_id=logical_id,
+            actor=actor,
+            target=target,
+            payload=payload,
+            invoke=invoke,
+            state_mutation=state_mutation,
+            rollback_class=rollback_class,
+            rollback_status=rollback_status,
+            contract_name=contract_name,
+            result_settler=result_settler,
+        )
+
+    def _prepare_modern_operation(
+        self,
+        *,
+        operation: str,
+        server_id: str,
+        logical_id: str,
+        actor: str,
+        target: str,
+        right: CapabilityRight,
+        payload: Mapping[str, Any],
+        manifest_preflight: Any | None,
+        binding_preflight: Any | None,
+        expected_registry_binding: Mapping[str, Any] | None,
+        absolute_deadline: float | None,
+    ) -> dict[str, Any]:
+        self._validate_identifier(
+            server_id,
+            "server_id",
+            self.config.mcp.server_id_max_chars,
+        )
+        if type(actor) is not str or not actor:
+            raise ValidationError("MCP modern operation actor is invalid")
+        client = self._modern_client
+        if client is None:
+            raise ValidationError("MCP modern client is unavailable")
+        usage_pid = self._resource_usage_pid(actor)
+        visibility = {
+            "pid": actor,
+            "primitive": f"runtime.mcp.{operation}",
+            "operation": f"mcp.{operation}",
+            "authority_operation": f"mcp.{operation}",
+            "server_id": server_id,
+            "logical_id": logical_id,
+            # Reuse the released exact-request condition vocabulary.  These
+            # aliases bind a modern logical selector and its full canonical
+            # request without widening the authority-rule language.
+            "tool_id": logical_id,
+            "right": right.value,
+        }
+        if usage_pid is not None:
+            self._precheck_modern_authority(actor, target, right, visibility)
+            self._precheck_modern_authority(
+                actor,
+                self.server_resource(server_id),
+                CapabilityRight.EXECUTE,
+                visibility,
+            )
+
+        binding = self._resolve_modern_binding(server_id, owner_id=actor)
+        if binding_preflight is not None:
+            binding_preflight(binding)
+        manifest = binding.manifest
+        if not isinstance(manifest, McpServerManifestV3):
+            raise ValidationError("MCP modern operation requires Manifest v3")
+        if absolute_deadline is not None and (
+            type(absolute_deadline) not in {int, float}
+            or not math.isfinite(float(absolute_deadline))
+        ):
+            raise ValidationError("MCP modern absolute deadline is invalid")
+        manifest_deadline = time.monotonic() + manifest.timeout_s
+        deadline = (
+            manifest_deadline
+            if absolute_deadline is None
+            else min(float(absolute_deadline), manifest_deadline)
+        )
+        self._remaining_timeout(deadline)
+        if manifest_preflight is not None:
+            manifest_preflight(manifest, deadline)
+        registry_binding = self._registry_binding_for_server_spec(manifest)
+        if expected_registry_binding is not None and any(
+            registry_binding.get(key) != expected_registry_binding.get(key)
+            for key in ("registry_spec_sha256", "registry_generation")
+        ):
+            raise CapabilityDenied(
+                "MCP registry changed before modern protected operation"
+            )
+        if (
+            binding.registry_generation != registry_binding["registry_generation"]
+            or binding.manifest_sha256 != registry_binding["registry_spec_sha256"]
+        ):
+            raise CapabilityDenied("MCP registry changed before modern authorization")
+        try:
+            request_json = dumps(dict(payload))
+        except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as error:
+            raise ValidationError("MCP modern request is not canonical JSON") from error
+        request_bytes = len(request_json.encode("utf-8"))
+        if request_bytes > manifest.max_request_bytes:
+            raise ValidationError(
+                "MCP modern request exceeds "
+                f"max_request_bytes={manifest.max_request_bytes}"
+            )
+        request_sha256 = hashlib.sha256(request_json.encode("utf-8")).hexdigest()
+        operation_context = {
+            **visibility,
+            **registry_binding,
+            "authority_mode": self._modern_authority_mode(usage_pid),
+            "request_sha256": request_sha256,
+            "arguments_sha256": request_sha256,
+            "request_bytes": request_bytes,
+            "transport": manifest.transport,
+            "auth_generation": binding.auth_generation,
+            "auth_principal_sha256": binding.auth_principal_sha256,
+            "auth_scope_sha256": binding.auth_scope_sha256,
+        }
+        decisions: list[Any] = []
+        if usage_pid is not None:
+            decisions.append(
+                self._authorize_modern_operation(
+                    actor,
+                    target,
+                    right,
+                    operation_context,
+                )
+            )
+            decisions.append(
+                self._authorize_modern_operation(
+                    actor,
+                    self.server_resource(server_id),
+                    CapabilityRight.EXECUTE,
+                    operation_context,
+                )
+            )
+        server = mcp_transport_spec_from_v3(manifest)
+        return {
+            "client": client,
+            "usage_pid": usage_pid,
+            "binding": binding,
+            "manifest": manifest,
+            "deadline": deadline,
+            "registry_binding": registry_binding,
+            "request_bytes": request_bytes,
+            "operation_context": operation_context,
+            "decisions": decisions,
+            "server": server,
+        }
+
+    def _prepare_modern_transport(
+        self,
+        plan: dict[str, Any],
+        *,
+        operation: str,
+        logical_id: str,
+        actor: str,
+    ) -> None:
+        deadline = plan["deadline"]
+        self._remaining_timeout(deadline)
+        usage_pid = plan["usage_pid"]
+        server = plan["server"]
+        binding = plan["binding"]
+        manifest = plan["manifest"]
+        decisions = plan["decisions"]
+        if usage_pid is not None:
+            decisions.extend(
+                self._require_stdio_process_spawn(actor, server, consume=False)
+            )
+        host_environment = binding.runtime_environment
+        if not isinstance(host_environment, Mapping):
+            raise ValidationError("MCP modern runtime environment is unavailable")
+        runtime_environment = self._require_runtime_environment(
+            server,
+            host_environment=host_environment,
+        )
+        self._remaining_timeout(deadline)
+        stdio_identity = self._stdio_executable_identity(
+            server,
+            runtime_environment=runtime_environment,
+            deadline=deadline,
+            fail_closed=True,
+        )
+        self._remaining_timeout(deadline)
+        sink = self._modern_data_sink(
+            manifest,
+            operation=operation,
+            logical_id=logical_id,
+            stdio_identity=stdio_identity,
+        )
+        flow_context = (
+            self._data_flow().current_context()
+            if usage_pid is not None
+            else DataFlowContext(
+                labels=DataLabels(
+                    sensitivity="public",
+                    trust_level="verified",
+                    integrity="verified",
+                    origin=f"runtime:mcp-modern:{actor}",
+                )
+            )
+        )
+        plan.update(
+            runtime_environment=runtime_environment,
+            stdio_identity=stdio_identity,
+            sink=sink,
+            flow_context=flow_context,
+        )
+
+    def _modern_protected_invocation(
+        self,
+        plan: Mapping[str, Any],
+        *,
+        operation: str,
+        server_id: str,
+        logical_id: str,
+        actor: str,
+        target: str,
+        payload: Mapping[str, Any],
+        state_mutation: bool,
+        rollback_class: ExternalEffectRollbackClass,
+        rollback_status: ExternalEffectRollbackStatus,
+    ) -> ProtectedOperationInvocation:
+        manifest = plan["manifest"]
+        operation_context = plan["operation_context"]
+        request_bytes = plan["request_bytes"]
+        usage_pid = plan["usage_pid"]
+        registry_binding = plan["registry_binding"]
+        sink = plan["sink"]
+        flow_context = plan["flow_context"]
+        server = plan["server"]
+        runtime_environment = plan["runtime_environment"]
+        canonical_args = self._modern_protected_canonical_args(plan)
+        effect_context = {
+            **operation_context,
+            "rollback_class": rollback_class.value,
+            "rollback_status": rollback_status.value,
+            "state_mutation": state_mutation,
+            "information_flow": True,
+        }
+        reservation = (
+            ResourceUsage(
+                mcp_request_bytes=manifest.max_request_bytes,
+                mcp_response_bytes=manifest.max_response_bytes,
+            )
+            if usage_pid is not None
+            else None
+        )
+        return ProtectedOperationInvocation(
+            pid=actor,
+            actor=actor,
+            target=target,
+            decisions=tuple(plan["decisions"]),
+            canonical_args=canonical_args,
+            observation=effect_context,
+            reservation_usage=reservation,
+            resource_source=f"primitive.mcp.{operation}",
+            resource_context={
+                "server_id": server_id,
+                "logical_id": logical_id,
+                "request_bytes": request_bytes,
+            },
+            **self._protected_registry_guard(registry_binding, server_id),
+            failure_evidence=lambda error, phase: self._modern_failure_evidence(
+                actor=actor,
+                target=target,
+                operation=operation,
+                context=operation_context,
+                error=error,
+                phase=phase,
+                state_mutation=state_mutation,
+            ),
+            data_sink=sink,
+            data_sink_revalidator=lambda: self._modern_data_sink(
+                manifest,
+                operation=operation,
+                logical_id=logical_id,
+                stdio_identity=self._stdio_executable_identity(
+                    server,
+                    runtime_environment=runtime_environment,
+                    deadline=plan["deadline"],
+                    fail_closed=True,
+                ),
+            ),
+            data_flow_context=flow_context,
+            data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
+                flow_context,
+                origin="external:mcp",
+            ),
+            data_flow_payload=dict(payload),
+            data_flow_operation=f"mcp.{operation}",
+        )
+
+    @staticmethod
+    def _modern_protected_canonical_args(
+        plan: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Use the exact Human-bound args when one approved grant is active."""
+
+        decisions = plan.get("decisions")
+        if not isinstance(decisions, list):
+            raise ValidationError("MCP modern authority decisions are invalid")
+        approval_key = CapabilityManager.APPROVAL_BINDING_KEY
+        approved_contexts = []
+        for decision in decisions:
+            results = getattr(decision, "constraint_results", None)
+            binding = results.get(approval_key) if isinstance(results, dict) else None
+            if (
+                bool(getattr(decision, "allowed", False))
+                and getattr(decision, "consume_capability_id", None) is not None
+                and isinstance(binding, dict)
+                and binding.get("ok") is True
+                and isinstance(getattr(decision, "context", None), dict)
+            ):
+                approved_contexts.append(dict(decision.context))
+        if len(approved_contexts) > 1:
+            raise CapabilityDenied(
+                "MCP modern operation has conflicting Human approval bindings"
+            )
+        if approved_contexts:
+            return approved_contexts[0]
+        context = plan.get("operation_context")
+        if not isinstance(context, dict):
+            raise ValidationError("MCP modern operation context is invalid")
+        return dict(context)
+
+    def _execute_modern_operation(
+        self,
+        plan: Mapping[str, Any],
+        *,
+        operation: str,
+        server_id: str,
+        logical_id: str,
+        actor: str,
+        target: str,
+        payload: Mapping[str, Any],
+        invoke: Any,
+        state_mutation: bool,
+        rollback_class: ExternalEffectRollbackClass,
+        rollback_status: ExternalEffectRollbackStatus,
+        contract_name: str | None,
+        result_settler: Any | None,
+    ) -> Any:
+        usage_pid = plan["usage_pid"]
+        if contract_name is not None:
+            contract = (
+                contract_name
+                if usage_pid is not None
+                else f"{contract_name}.internal"
+            )
+        else:
+            contract = (
+                f"primitive.mcp.{operation}"
+                if usage_pid is not None
+                else f"primitive.mcp.{operation}.internal"
+            )
+        invocation = plan["invocation"]
+        with self._protected().start(
+            contract,
+            invocation,
+            provider=self.provider,
+        ) as protected:
+            capture_settlement: Any | None = None
+            dispatch_context = {
+                "actor": actor,
+                "usage_pid": usage_pid,
+                "binding": plan["binding"],
+                "server": plan["server"],
+                "deadline": plan["deadline"],
+                "effect_id": protected.effect_id,
+                "operation": operation,
+                "logical_id": logical_id,
+                "operation_context": plan["operation_context"],
+                "decisions": tuple(plan["decisions"]),
+                "sink": plan["sink"],
+                "flow_context": plan["flow_context"],
+                "payload": dict(payload),
+                "stdio_identity": plan["stdio_identity"],
+            }
+
+            def dispatch() -> Any:
+                nonlocal capture_settlement
+                self._remaining_timeout(plan["deadline"])
+                token = self._modern_dispatch_context.set(dispatch_context)
+                try:
+                    result = invoke(plan["client"], plan["deadline"])
+                    result, capture_settlement = self._settle_modern_dispatch_result(
+                        result,
+                        result_settler=result_settler,
+                        server_id=server_id,
+                        logical_id=logical_id,
+                        payload=payload,
+                        effect_id=protected.effect_id,
+                    )
+                    return result
+                finally:
+                    self._modern_dispatch_context.reset(token)
+
+            try:
+                result = protected.call(
+                    ProviderPhase(
+                        "modern_provider_operation",
+                        state_mutation=state_mutation,
+                        information_flow=True,
+                    ),
+                    dispatch,
+                )
+            except BaseException as error:
+                if capture_settlement is None:
+                    if isinstance(error, Exception):
+                        self._abort_modern_prepared_capture(protected.effect_id)
+                else:
+                    self._abort_modern_capture_after_error(
+                        capture_settlement,
+                        error,
+                        reason="protected_dispatch_failed",
+                        group_label="MCP modern dispatch cleanup failed",
+                    )
+                raise
+            try:
+                response_bytes, classification = self._modern_response_classification(
+                    plan,
+                    result,
+                    operation=operation,
+                    state_mutation=state_mutation,
+                    rollback_class=rollback_class,
+                    rollback_status=rollback_status,
+                )
+            except BaseException as error:
+                self._abort_modern_capture_after_error(
+                    capture_settlement,
+                    error,
+                    reason="protected_projection_failed",
+                    group_label="MCP modern projection cleanup failed",
+                )
+                raise
+            try:
+                completed = protected.complete(
+                    result,
+                    self._modern_success_evidence(
+                        actor=actor,
+                        target=target,
+                        operation=operation,
+                        context=plan["operation_context"],
+                        response_bytes=response_bytes,
+                        result=result,
+                        decisions=plan["decisions"],
+                        state_mutation=state_mutation,
+                    ),
+                    classification_override=classification,
+                    settle_success=(
+                        capture_settlement.commit_deferred
+                        if capture_settlement is not None
+                        else None
+                    ),
+                    resource=self._modern_resource_settlement(
+                        plan,
+                        operation=operation,
+                        server_id=server_id,
+                        logical_id=logical_id,
+                        response_bytes=response_bytes,
+                        enabled=usage_pid is not None,
+                    ),
+                )
+            except BaseException as error:
+                self._abort_modern_capture_after_error(
+                    capture_settlement,
+                    error,
+                    reason="protected_settlement_failed",
+                    group_label="MCP modern settlement cleanup failed",
+                )
+                raise
+            self._finalize_modern_capture(capture_settlement)
+            return completed
+
+    def _settle_modern_dispatch_result(
+        self,
+        result: Any,
+        *,
+        result_settler: Any | None,
+        server_id: str,
+        logical_id: str,
+        payload: Mapping[str, Any],
+        effect_id: str,
+    ) -> tuple[Any, Any | None]:
+        if result_settler is None:
+            settlement = self._require_modern_durable_result_provenance(
+                result,
+                server_id=server_id,
+                logical_id=logical_id,
+                payload=payload,
+                effect_id=effect_id,
+            )
+            return result, settlement
+        settled = result_settler(result, effect_id)
+        if type(settled) is not tuple or len(settled) != 2:
+            raise ValidationError("MCP modern result settlement is invalid")
+        public, settlement = settled
+        if settlement is None:
+            raise ValidationError("MCP modern result lacks durable settlement")
+        return public, settlement
+
+    def _modern_response_classification(
+        self,
+        plan: Mapping[str, Any],
+        result: Any,
+        *,
+        operation: str,
+        state_mutation: bool,
+        rollback_class: ExternalEffectRollbackClass,
+        rollback_status: ExternalEffectRollbackStatus,
+    ) -> tuple[int, ExternalEffectClassification]:
+        self._remaining_timeout(plan["deadline"])
+        response_bytes = len(dumps(to_jsonable(result)).encode("utf-8"))
+        self._remaining_timeout(plan["deadline"])
+        if response_bytes > plan["manifest"].max_response_bytes:
+            raise ValidationError(
+                "MCP modern public result exceeds "
+                f"max_response_bytes={plan['manifest'].max_response_bytes}"
+            )
+        return response_bytes, ExternalEffectClassification(
+            rollback_class=rollback_class,
+            rollback_status=rollback_status,
+            state_mutation=state_mutation,
+            information_flow=True,
+            metadata={
+                "outcome": "succeeded",
+                "operation": operation,
+                "request_bytes": plan["request_bytes"],
+                "response_bytes": response_bytes,
+            },
+        )
+
+    @staticmethod
+    def _abort_modern_capture_after_error(
+        settlement: Any | None,
+        error: BaseException,
+        *,
+        reason: str,
+        group_label: str,
+    ) -> None:
+        should_abort = settlement is not None and (
+            isinstance(error, Exception)
+            or getattr(settlement, "abort_on_base_exception", False) is True
+        )
+        if not should_abort:
+            return
+        try:
+            settlement.abort(reason=reason)
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(group_label, [error, cleanup_error])
+
+    @staticmethod
+    def _modern_resource_settlement(
+        plan: Mapping[str, Any],
+        *,
+        operation: str,
+        server_id: str,
+        logical_id: str,
+        response_bytes: int,
+        enabled: bool,
+    ) -> ResourceSettlement | None:
+        if not enabled:
+            return None
+        return ResourceSettlement(
+            usage=ResourceUsage(
+                mcp_request_bytes=plan["request_bytes"],
+                mcp_response_bytes=response_bytes,
+            ),
+            source=f"primitive.mcp.{operation}",
+            context={
+                "server_id": server_id,
+                "logical_id": logical_id,
+                "request_bytes": plan["request_bytes"],
+                "response_bytes": response_bytes,
+            },
+        )
+
+    @staticmethod
+    def _finalize_modern_capture(settlement: Any | None) -> None:
+        if settlement is None:
+            return
+        try:
+            settlement.finalize()
+        except BaseException as error:
+            if getattr(settlement, "fail_closed_on_finalize_error", False) is True:
+                try:
+                    settlement.abort(reason="protected_finalize_failed")
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        "MCP modern finalization cleanup failed",
+                        [error, cleanup_error],
+                    )
+                raise
+            if not isinstance(error, Exception):
+                raise
+            # RuntimeStore is authoritative; restart reconciles its durable
+            # cleaning receipt without turning a committed ref ambiguous.
+
+    def _require_modern_durable_result_provenance(
+        self,
+        result: Any,
+        *,
+        server_id: str,
+        logical_id: str,
+        payload: Mapping[str, Any],
+        effect_id: str,
+    ) -> Any | None:
+        """Reject public non-Complete refs without exact durable backing.
+
+        A custom modern Provider can construct the public dataclasses directly.
+        Treating those values as proof of Host capture would expose a
+        continuation/task reference that cannot be resumed, or let Completion
+        bypass its non-respondable protocol boundary.  This postcondition runs
+        inside the same protected Provider phase used by the capture adapters,
+        before result bytes, evidence, GUI, or model projection.
+        """
+
+        if isinstance(result, McpComplete):
+            self._require_no_prepared_modern_capture(effect_id)
+            return
+        method = payload.get("method")
+        if type(method) is not str or not method:
+            raise ValidationError("MCP modern result method binding is invalid")
+        if method == "completion/complete":
+            raise McpContinuationSurfaceUnsupported(
+                "MCP completion/complete cannot return a non-Complete result"
+            )
+        if isinstance(result, McpInputRequired):
+            if not result.respondable:
+                self._require_typed_unsupported_input_result(result, effect_id)
+                return None
+            return self._require_modern_continuation_provenance(
+                result,
+                server_id=server_id,
+                operation=method,
+                logical_id=logical_id,
+            )
+        elif isinstance(result, McpRemoteTask):
+            return self._require_modern_task_provenance(
+                result,
+                server_id=server_id,
+                operation=method,
+                logical_id=logical_id,
+            )
+
+    def _require_typed_unsupported_input_result(
+        self,
+        result: McpInputRequired,
+        effect_id: str,
+    ) -> None:
+        if (
+            result.continuation_id
+            or result.expires_at is not None
+            or result.revision != 0
+            or result.human_request_id is not None
+            or result.human_revision is not None
+            or result.human_preview_sha256 is not None
+            or not result.input_requests
+            or any(
+                request.kind
+                not in {
+                    McpInputRequestKind.SAMPLING_UNSUPPORTED,
+                    McpInputRequestKind.ROOTS_UNSUPPORTED,
+                }
+                for request in result.input_requests
+            )
+        ):
+            raise ValidationError("MCP nonrespondable input result is invalid")
+        self._require_no_prepared_modern_capture(effect_id)
+
+    def _require_modern_continuation_provenance(
+        self,
+        result: McpInputRequired,
+        *,
+        server_id: str,
+        operation: str,
+        logical_id: str,
+    ) -> Any:
+        if operation not in {"tools/call", "resources/read", "prompts/get"}:
+            raise McpContinuationSurfaceUnsupported(
+                "MCP operation does not support durable input-required continuation"
+            )
+        expected = self._capture_continuation_binding(
+            server_id,
+            operation,
+            logical_id,
+        )
+        try:
+            manager = self._continuation_manager()
+            return manager.claim_initial_capture(result, binding=expected)
+        except Exception:
+            raise ValidationError(
+                "MCP continuation lacks exact durable provenance"
+            ) from None
+
+    def _require_modern_task_provenance(
+        self,
+        result: McpRemoteTask,
+        *,
+        server_id: str,
+        operation: str,
+        logical_id: str,
+    ) -> Any:
+        try:
+            manager = self._remote_task_manager()
+            expected = self._capture_remote_task_binding(
+                server_id,
+                operation,
+                logical_id,
+            )
+            return manager.claim_initial_capture(result, binding=expected)
+        except Exception:
+            raise ValidationError(
+                "MCP remote Task lacks exact durable provenance"
+            ) from None
+
+    def _require_no_prepared_modern_capture(self, effect_id: str) -> None:
+        for manager in (self._modern_continuations, self._modern_remote_tasks):
+            checker = getattr(manager, "has_prepared_effect", None)
+            if callable(checker) and checker(effect_id):
+                raise ValidationError("MCP Provider changed its prepared result")
+
+    def _abort_modern_prepared_capture(self, effect_id: str) -> None:
+        for manager in (self._modern_continuations, self._modern_remote_tasks):
+            abort = getattr(manager, "abort_prepared_effect", None)
+            if callable(abort):
+                abort(effect_id)
+
+    def _resolve_modern_binding(
+        self,
+        server_id: str,
+        *,
+        owner_id: str,
+    ) -> McpClientBinding:
+        client = self._modern_client
+        resolver = getattr(client, "binding_resolver", None) if client is not None else None
+        resolve = getattr(resolver, "resolve", None)
+        if callable(resolve):
+            binding = resolve(server_id, owner_id=owner_id)
+        elif callable(resolver):
+            binding = resolver(server_id)
+        else:
+            raise ValidationError("MCP modern binding resolver is unavailable")
+        if not isinstance(binding, McpClientBinding):
+            raise ValidationError("MCP modern binding resolver returned an invalid binding")
+        if binding.owner_id != owner_id:
+            raise CapabilityDenied("MCP modern binding belongs to another owner")
+        return binding
+
+    def _capture_continuation_binding(
+        self,
+        server_id: str,
+        operation: str,
+        logical_id: str,
+    ) -> McpContinuationBinding:
+        """Capture real initial-call authority/effect state for durable MRTR."""
+
+        context, binding = self._active_modern_capture_context(
+            server_id,
+            operation,
+            logical_id,
+        )
+        return McpContinuationBinding(
+            server_id=server_id,
+            server_spec_sha256=binding.manifest_sha256,
+            server_generation=binding.registry_generation,
+            owner_id=str(binding.owner_id),
+            auth_principal_sha256=self._modern_optional_fence_sha256(
+                binding.auth_principal_sha256,
+                empty_value=None,
+            ),
+            auth_scope_sha256=self._modern_optional_fence_sha256(
+                binding.auth_scope_sha256,
+                empty_value=[],
+            ),
+            canonical_request=dict(context["payload"]),
+            effect_id=str(context["effect_id"]),
+            capability_sha256=self._modern_capability_binding_sha256(context),
+            data_flow_sha256=self._modern_flow_binding_sha256(context),
+        )
+
+    def capture_continuation_binding(
+        self,
+        server_id: str,
+        operation: str,
+        logical_id: str,
+    ) -> McpContinuationBinding:
+        """Composition port for durable capture inside an active provider phase."""
+
+        return self._capture_continuation_binding(server_id, operation, logical_id)
+
+    def authorize_mcp_host_question(
+        self,
+        *,
+        owner_id: str,
+        server_id: str,
+        operation: str,
+        local_ref: str,
+        preview: Mapping[str, Any],
+        preview_sha256: str,
+    ) -> None:
+        """Authorize the narrow Host Human-question composition seam.
+
+        This port is callable only while an exact Runtime/GUI MCP provider
+        result is being captured inside its ProtectedOperation.  It does not
+        mint or emulate a process Capability; it proves the Host-internal
+        admission marker and binds the sanitized Human preview to that active
+        server/method/effect context.
+        """
+
+        if owner_id not in {"runtime", "gui", "cli"}:
+            raise CapabilityDenied("MCP Host Human question actor is invalid")
+        self._require_active_mcp_host_question_context(
+            owner_id=owner_id,
+            server_id=server_id,
+            operation=operation,
+        )
+        self._require_mcp_host_question_preview(
+            server_id=server_id,
+            operation=operation,
+            local_ref=local_ref,
+            preview=preview,
+            preview_sha256=preview_sha256,
+        )
+
+    def _require_active_mcp_host_question_context(
+        self,
+        *,
+        owner_id: str,
+        server_id: str,
+        operation: str,
+    ) -> None:
+        context = self._modern_dispatch_context.get()
+        binding = context.get("binding") if isinstance(context, dict) else None
+        operation_context = (
+            context.get("operation_context") if isinstance(context, dict) else None
+        )
+        if (
+            not isinstance(context, dict)
+            or context.get("actor") != owner_id
+            or context.get("usage_pid") is not None
+            or type(context.get("effect_id")) is not str
+            or not context["effect_id"]
+            or not isinstance(binding, McpClientBinding)
+            or binding.owner_id != owner_id
+            or binding.manifest.server_id != server_id
+            or not isinstance(operation_context, Mapping)
+            or operation_context.get("authority_mode")
+            != "host_protected_operation"
+            or type(context.get("decisions")) is not tuple
+            or context["decisions"]
+            or not isinstance(context.get("payload"), Mapping)
+            or context["payload"].get("method") != operation
+        ):
+            raise CapabilityDenied(
+                "MCP Host Human question is outside protected capture"
+            )
+
+    @staticmethod
+    def _require_mcp_host_question_preview(
+        *,
+        server_id: str,
+        operation: str,
+        local_ref: str,
+        preview: Mapping[str, Any],
+        preview_sha256: str,
+    ) -> None:
+        if (
+            type(local_ref) is not str
+            or not local_ref
+            or not isinstance(preview, Mapping)
+            or preview.get("contract") != "agent-libos.mcp.elicitation.v1"
+            or preview.get("serverId") != server_id
+            or preview.get("operation") != operation
+            or preview.get("localRef") != local_ref
+            or type(preview_sha256) is not str
+            or json_sha256(
+                dict(preview),
+                label="MCP Host Human question preview",
+            )
+            != preview_sha256
+        ):
+            raise CapabilityDenied("MCP Host Human question preview changed")
+
+    def _capture_remote_task_binding(
+        self,
+        server_id: str,
+        operation: str,
+        logical_id: str,
+    ) -> McpRemoteTaskBinding:
+        """Capture the exact Host Tasks pin and initial protected effect."""
+
+        context, binding = self._active_modern_capture_context(
+            server_id,
+            operation,
+            logical_id,
+        )
+        extension, host_pin = self._require_modern_tasks_manifest_pin(
+            binding.manifest
+        )
+        request_sha256 = self._modern_dispatch_request_sha256(context)
+        return McpRemoteTaskBinding(
+            server_id=server_id,
+            server_spec_sha256=binding.manifest_sha256,
+            server_generation=binding.registry_generation,
+            owner_id=str(binding.owner_id),
+            auth_principal_sha256=self._modern_optional_fence_sha256(
+                binding.auth_principal_sha256,
+                empty_value=None,
+            ),
+            auth_scope_sha256=self._modern_optional_fence_sha256(
+                binding.auth_scope_sha256,
+                empty_value=[],
+            ),
+            origin_request_sha256=request_sha256,
+            origin_effect_id=str(context["effect_id"]),
+            extension_id=extension.extension_id,
+            tasks_extension_sha256=extension.spec_sha256,
+            host_tasks_extension_sha256=host_pin,
+        )
+
+    def capture_remote_task_binding(
+        self,
+        server_id: str,
+        operation: str,
+        logical_id: str,
+    ) -> McpRemoteTaskBinding:
+        """Composition port for Task capture inside an active provider phase."""
+
+        return self._capture_remote_task_binding(server_id, operation, logical_id)
+
+    def resolve_continuation_task_binding(
+        self,
+        binding: McpContinuationBinding,
+        *,
+        origin_effect_id: str,
+    ) -> McpRemoteTaskBinding:
+        """Bind a continuation-created Task to its current protected effect."""
+
+        if not isinstance(binding, McpContinuationBinding):
+            raise TypeError("MCP continuation binding is required")
+        context = self._modern_dispatch_context.get()
+        current_binding = context.get("binding") if isinstance(context, dict) else None
+        payload = context.get("payload") if isinstance(context, dict) else None
+        if (
+            type(origin_effect_id) is not str
+            or not origin_effect_id
+            or not isinstance(context, dict)
+            or context.get("effect_id") != origin_effect_id
+            or context.get("operation") != "continuation.respond"
+            or not isinstance(current_binding, McpClientBinding)
+            or not isinstance(payload, dict)
+        ):
+            raise CapabilityDenied(
+                "MCP continuation Task protected-effect binding changed"
+            )
+        self._require_stored_modern_binding(current_binding, binding)
+        manifest, _metadata = self._load_server(binding.server_id)
+        if not isinstance(manifest, McpServerManifestV3):
+            raise ValidationError("MCP continuation Task requires Manifest v3")
+        registry = self._registry_binding_for_server_spec(manifest)
+        if (
+            registry["registry_spec_sha256"] != binding.server_spec_sha256
+            or registry["registry_generation"] != binding.server_generation
+        ):
+            raise CapabilityDenied(
+                "MCP continuation Task registry binding changed"
+            )
+        extension, host_pin = self._require_modern_tasks_manifest_pin(manifest)
+        return McpRemoteTaskBinding(
+            server_id=binding.server_id,
+            server_spec_sha256=binding.server_spec_sha256,
+            server_generation=binding.server_generation,
+            owner_id=binding.owner_id,
+            auth_principal_sha256=binding.auth_principal_sha256,
+            auth_scope_sha256=binding.auth_scope_sha256,
+            origin_request_sha256=self._modern_dispatch_request_sha256(context),
+            origin_effect_id=origin_effect_id,
+            extension_id=extension.extension_id,
+            tasks_extension_sha256=extension.spec_sha256,
+            host_tasks_extension_sha256=host_pin,
+        )
+
+    def _require_modern_tasks_manifest_pin(
+        self,
+        manifest: McpServerManifestV3,
+    ) -> tuple[Any, str]:
+        extension = manifest.tasks_extension
+        host_pin = self.config.mcp.tasks_extension_spec_sha256
+        if (
+            extension is None
+            or extension.extension_id != MCP_TASKS_EXTENSION_ID
+            or not self.config.mcp.tasks_extension_enabled
+            or type(host_pin) is not str
+            or extension.spec_sha256 != host_pin
+        ):
+            raise ValidationError(
+                "MCP Tasks extension is not enabled with the exact Host pin"
+            )
+        return extension, host_pin
+
+    async def dispatch_continuation_boundary(
+        self,
+        operation: str,
+        **kwargs: Any,
+    ) -> Any:
+        """Composition port used only by the durable continuation manager."""
+
+        if operation == "respond":
+            function = self._continue_v3_sync
+        elif operation == "cancel":
+            function = self._cancel_continuation_v3_sync
+        else:
+            raise ValidationError("MCP continuation boundary operation is invalid")
+        return await self._data_flow().run_sync_in_worker(function, **kwargs)
+
+    async def dispatch_remote_task_boundary(
+        self,
+        operation: str,
+        **kwargs: Any,
+    ) -> Mapping[str, Any]:
+        """Composition port used only by the durable remote-Task manager."""
+
+        return await self._data_flow().run_sync_in_worker(
+            self._remote_task_v3_sync,
+            operation,
+            **kwargs,
+        )
+
+    def _continue_v3_sync(
+        self,
+        *,
+        record: Any,
+        binding: McpContinuationBinding,
+        original_request: dict[str, Any],
+        input_responses: dict[str, Any],
+        request_state: str | None,
+        deadline: float,
+        result_settler: Any,
+    ) -> Any:
+        provider_entry = _McpProviderEntry()
+        with _certify_mcp_pre_provider(
+            provider_entry,
+            operation="continuation respond",
+        ):
+            return self._continue_v3_sync_inner(
+                record=record,
+                binding=binding,
+                original_request=original_request,
+                input_responses=input_responses,
+                request_state=request_state,
+                deadline=deadline,
+                result_settler=result_settler,
+                provider_entry=provider_entry,
+            )
+
+    def _continue_v3_sync_inner(
+        self,
+        *,
+        record: Any,
+        binding: McpContinuationBinding,
+        original_request: dict[str, Any],
+        input_responses: dict[str, Any],
+        request_state: str | None,
+        deadline: float,
+        result_settler: Any,
+        provider_entry: _McpProviderEntry,
+    ) -> Any:
+        request = self._continuation_request_parts(
+            record,
+            binding,
+            original_request,
+        )
+        actor = request["actor"]
+        server_id = request["server_id"]
+        provider = self._modern_continuation_provider
+        if provider is None:
+            raise ValidationError("MCP continuation provider is unavailable")
+        selected_responses = _canonical_mcp_arguments(
+            input_responses,
+            max_bytes=self.config.mcp.max_request_hard_limit_bytes,
+        )
+        manifest, _metadata = self._load_server(server_id)
+        if not isinstance(manifest, McpServerManifestV3):
+            raise ValidationError("MCP continuation requires Manifest v3")
+        surface = self._continuation_surface_plan(manifest, request)
+        provider_method = getattr(provider, surface["provider_method"], None)
+        if not callable(provider_method):
+            raise ValidationError("MCP continuation provider surface is unavailable")
+        payload = {
+            **dict(original_request),
+            "input_responses": selected_responses,
+            "request_state": request_state,
+        }
+
+        def invoke(_client: Any, selected_deadline: float) -> Mapping[str, Any]:
+            with _certify_mcp_pre_provider(
+                provider_entry,
+                operation="continuation respond",
+            ):
+                context = self._require_modern_dispatch_binding(binding)
+
+                async def call_once() -> Mapping[str, Any]:
+                    with bind_mcp_client_binding(context):
+                        return await self._continue_v3_provider_call(
+                            provider_method,
+                            context,
+                            request,
+                            surface,
+                            selected_responses,
+                            request_state,
+                            selected_deadline,
+                            provider_entry=provider_entry,
+                        )
+
+                result = _run_mcp_provider_awaitable(call_once())
+                if not isinstance(result, Mapping):
+                    raise ValidationError("MCP continuation provider result is invalid")
+                return dict(result)
+
+        return self._run_modern_read(
+            operation="continuation.respond",
+            server_id=server_id,
+            logical_id=surface["logical_id"],
+            actor=actor,
+            target=surface["target"],
+            right=surface["right"],
+            payload=payload,
+            invoke=invoke,
+            binding_preflight=lambda current: self._require_stored_modern_binding(
+                current,
+                binding,
+            ),
+            expected_registry_binding=self._stored_registry_binding(binding),
+            absolute_deadline=deadline,
+            state_mutation=surface["state_mutation"],
+            rollback_class=surface["rollback_class"],
+            rollback_status=surface["rollback_status"],
+            contract_name="primitive.mcp.continuation.respond",
+            result_settler=result_settler,
+        )
+
+    async def _continue_v3_provider_call(
+        self,
+        provider_method: Any,
+        binding: McpClientBinding,
+        request: Mapping[str, Any],
+        surface: Mapping[str, Any],
+        input_responses: dict[str, Any],
+        request_state: str | None,
+        deadline: float,
+        *,
+        provider_entry: _McpProviderEntry | None = None,
+    ) -> Mapping[str, Any]:
+        server = mcp_transport_spec_from_v3(binding.manifest)
+        method = request["method"]
+        sensitive_values = self._modern_provider_sensitive_values(
+            binding,
+            request_state,
+        )
+        if method == "tools/call":
+            provider_call = lambda: provider_method(
+                server,
+                surface["remote_name"],
+                request["arguments"],
+                input_responses,
+                request_state,
+                deadline=deadline,
+            )
+        elif method == "resources/read":
+            provider_call = lambda: provider_method(
+                server,
+                surface["remote_name"],
+                surface["logical_id"],
+                input_responses,
+                request_state,
+                deadline=deadline,
+            )
+        elif method == "prompts/get":
+            provider_call = lambda: provider_method(
+                server,
+                surface["remote_name"],
+                surface["logical_id"],
+                request["arguments"],
+                input_responses,
+                request_state,
+                deadline=deadline,
+            )
+        else:
+            raise ValidationError("MCP continuation surface is unsupported")
+        raw = await self._await_modern_provider_result(
+            provider_call,
+            deadline=deadline,
+            sensitive_values=sensitive_values,
+            provider_entry=provider_entry,
+        )
+        if not isinstance(raw, Mapping):
+            raise ValidationError("MCP continuation Provider result is invalid")
+        bounded_public_size(
+            raw,
+            maximum=server.max_response_bytes,
+            label="MCP continuation Provider result",
+        )
+        sanitized = sanitize_provider_json(
+            dict(raw),
+            sensitive_values=sensitive_values,
+        )
+        if type(sanitized) is not dict:
+            raise ValidationError("MCP continuation Provider result is invalid")
+        if sanitized.get("resultType") == "task":
+            # A continuation binding by itself does not carry Tasks extension
+            # authority. Recheck the current exact Manifest and Host digest
+            # before any durable Task capture/sidecar can observe this result.
+            self._require_modern_tasks_manifest_pin(binding.manifest)
+        return sanitized
+
+    @staticmethod
+    def _modern_provider_sensitive_values(
+        binding: McpClientBinding,
+        *dynamic_values: str | None,
+    ) -> tuple[str, ...]:
+        if not isinstance(binding, McpClientBinding):
+            raise ValidationError("MCP modern Provider binding is invalid")
+        selected = list(binding.sensitive_values)
+        for value in dynamic_values:
+            if value is None:
+                continue
+            if type(value) is not str:
+                raise ValidationError("MCP modern Provider dynamic secret is invalid")
+            if value:
+                selected.append(value)
+        return tuple(dict.fromkeys(selected))
+
+    @staticmethod
+    async def _await_modern_provider_result(
+        provider_call: Any,
+        *,
+        deadline: float,
+        sensitive_values: tuple[str, ...],
+        provider_entry: _McpProviderEntry | None = None,
+    ) -> Any:
+        if (
+            type(deadline) not in {int, float}
+            or not math.isfinite(float(deadline))
+        ):
+            raise ValidationError("MCP provider absolute deadline is invalid")
+        remaining = float(deadline) - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("MCP absolute deadline exhausted before provider")
+        if provider_entry is not None:
+            provider_entry.entered = True
+        try:
+            pending = provider_call()
+        except McpContinuationSurfaceUnsupported:
+            raise
+        except Exception as error:
+            # Once the Provider callable is entered, even a same-named
+            # ProviderEffectNotStarted is untrusted. A custom Provider must
+            # not be able to manufacture a replay certificate.
+            raise safe_mcp_provider_error(error, sensitive_values) from None
+        if not inspect.isawaitable(pending):
+            raise safe_mcp_provider_error(
+                ValidationError("MCP modern Provider method must be asynchronous"),
+                sensitive_values,
+            ) from None
+        remaining = float(deadline) - time.monotonic()
+        if remaining <= 0:
+            if inspect.iscoroutine(pending):
+                pending.close()
+            raise safe_mcp_provider_error(
+                TimeoutError("MCP provider exceeded the absolute deadline"),
+                sensitive_values,
+            ) from None
+        task = asyncio.ensure_future(pending)
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError:
+            await _cancel_and_drain_mcp_provider_task(task)
+            raise
+        if not done:
+            await _cancel_and_drain_mcp_provider_task(task)
+            raise safe_mcp_provider_error(
+                TimeoutError("MCP provider exceeded the absolute deadline"),
+                sensitive_values,
+            ) from None
+        try:
+            result = task.result()
+        except McpContinuationSurfaceUnsupported:
+            raise
+        except asyncio.CancelledError as error:
+            raise safe_mcp_provider_error(error, sensitive_values) from None
+        except Exception as error:
+            raise safe_mcp_provider_error(error, sensitive_values) from None
+        if time.monotonic() >= float(deadline):
+            raise safe_mcp_provider_error(
+                TimeoutError("MCP provider exceeded the absolute deadline"),
+                sensitive_values,
+            ) from None
+        return result
+
+    def _cancel_continuation_v3_sync(
+        self,
+        *,
+        record: Any,
+        binding: McpContinuationBinding,
+        deadline: float,
+    ) -> None:
+        provider_entry = _McpProviderEntry()
+        with _certify_mcp_pre_provider(
+            provider_entry,
+            operation="continuation cancel",
+        ):
+            self._cancel_continuation_v3_sync_inner(
+                record=record,
+                binding=binding,
+                deadline=deadline,
+            )
+
+    def _cancel_continuation_v3_sync_inner(
+        self,
+        *,
+        record: Any,
+        binding: McpContinuationBinding,
+        deadline: float,
+    ) -> None:
+        request = binding.detached_request()
+        request_parts = self._continuation_request_parts(
+            record,
+            binding,
+            request,
+        )
+        actor = request_parts["actor"]
+        server_id = request_parts["server_id"]
+        manifest, _metadata = self._load_server(server_id)
+        if not isinstance(manifest, McpServerManifestV3):
+            raise ValidationError("MCP continuation requires Manifest v3")
+        surface = self._continuation_surface_plan(manifest, request_parts)
+        self._run_modern_read(
+            operation="continuation.cancel",
+            server_id=server_id,
+            logical_id=surface["logical_id"],
+            actor=actor,
+            target=surface["target"],
+            right=surface["right"],
+            payload={
+                "method": "continuation/cancel",
+                "server_id": server_id,
+                "initial_method": request_parts["method"],
+                "logical_id": surface["logical_id"],
+                "request_sha256": binding.request_sha256,
+            },
+            invoke=lambda _client, _deadline: None,
+            binding_preflight=lambda current: self._require_stored_modern_binding(
+                current,
+                binding,
+            ),
+            expected_registry_binding=self._stored_registry_binding(binding),
+            absolute_deadline=deadline,
+            state_mutation=False,
+            rollback_class=surface["rollback_class"],
+            rollback_status=surface["rollback_status"],
+            contract_name="primitive.mcp.continuation.cancel",
+        )
+
+    def _remote_task_v3_sync(
+        self,
+        operation: str,
+        *,
+        record: Any,
+        binding: McpRemoteTaskBinding,
+        remote_task_id: str,
+        deadline: float,
+        input_responses: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        provider_entry = _McpProviderEntry()
+        with _certify_mcp_pre_provider(
+            provider_entry,
+            operation=f"remote Task {operation}",
+        ):
+            return self._remote_task_v3_sync_inner(
+                operation,
+                record=record,
+                binding=binding,
+                remote_task_id=remote_task_id,
+                deadline=deadline,
+                input_responses=input_responses,
+                provider_entry=provider_entry,
+            )
+
+    def _remote_task_v3_sync_inner(
+        self,
+        operation: str,
+        *,
+        record: Any,
+        binding: McpRemoteTaskBinding,
+        remote_task_id: str,
+        deadline: float,
+        input_responses: Mapping[str, Any] | None,
+        provider_entry: _McpProviderEntry,
+    ) -> Mapping[str, Any]:
+        if operation not in {"get", "update", "cancel"}:
+            raise ValidationError("MCP remote Task operation is invalid")
+        actor = binding.owner_id
+        if (
+            getattr(record, "owner_id", None) != actor
+            or getattr(record, "server_id", None) != binding.server_id
+        ):
+            raise CapabilityDenied("MCP remote Task owner binding changed")
+        provider = self._modern_tasks_provider
+        if provider is None:
+            raise ValidationError("MCP Tasks provider is unavailable")
+        selected_responses = (
+            None
+            if input_responses is None
+            else _canonical_mcp_arguments(
+                input_responses,
+                max_bytes=self.config.mcp.max_request_hard_limit_bytes,
+            )
+        )
+        right = CapabilityRight.READ if operation == "get" else CapabilityRight.WRITE
+        mutation = operation != "get"
+        rollback_class = (
+            ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+            if not mutation
+            else ExternalEffectRollbackClass.IRREVERSIBLE
+        )
+        rollback_status = (
+            ExternalEffectRollbackStatus.NOT_REQUIRED
+            if not mutation
+            else ExternalEffectRollbackStatus.NOT_SUPPORTED
+        )
+
+        def invoke(_client: Any, selected_deadline: float) -> Mapping[str, Any]:
+            with _certify_mcp_pre_provider(
+                provider_entry,
+                operation=f"remote Task {operation}",
+            ):
+                client_binding = self._require_modern_dispatch_binding(binding)
+                server = mcp_transport_spec_from_v3(client_binding.manifest)
+                sensitive_values = self._modern_provider_sensitive_values(
+                    client_binding,
+                    remote_task_id,
+                )
+
+                async def call_once() -> Mapping[str, Any]:
+                    with bind_mcp_client_binding(client_binding):
+                        if operation == "get":
+                            provider_call = lambda: provider.get_remote_task(
+                                server,
+                                remote_task_id,
+                                deadline=selected_deadline,
+                            )
+                        elif operation == "update":
+                            provider_call = lambda: provider.update_remote_task(
+                                server,
+                                remote_task_id,
+                                selected_responses,
+                                deadline=selected_deadline,
+                            )
+                        else:
+                            provider_call = lambda: provider.cancel_remote_task(
+                                server,
+                                remote_task_id,
+                                deadline=selected_deadline,
+                            )
+                        return await self._await_modern_provider_result(
+                            provider_call,
+                            deadline=selected_deadline,
+                            sensitive_values=sensitive_values,
+                            provider_entry=provider_entry,
+                        )
+
+                result = _run_mcp_provider_awaitable(call_once())
+                if not isinstance(result, Mapping):
+                    raise ValidationError("MCP Tasks provider result is invalid")
+                if operation == "get" and result.get("taskId") != remote_task_id:
+                    raise ValidationError(
+                        "MCP Tasks provider returned another task identity"
+                    )
+                provider_payload = dict(result)
+                provider_task_id = provider_payload.pop("taskId", None)
+                sanitized = sanitize_provider_json(
+                    provider_payload,
+                    sensitive_values=sensitive_values,
+                )
+                if type(sanitized) is not dict:
+                    raise ValidationError("MCP Tasks provider result is invalid")
+                if operation == "get":
+                    # The manager needs the exact broker-only identity to verify
+                    # the durable local ref.  It is never projected publicly; all
+                    # provider-controlled siblings were sanitized with that
+                    # bearer in the exact-sensitive set above.
+                    sanitized["taskId"] = provider_task_id
+                return sanitized
+
+        return self._run_modern_read(
+            operation=f"tasks.{operation}",
+            server_id=binding.server_id,
+            logical_id=str(getattr(record, "task_ref", "")),
+            actor=actor,
+            target=f"mcp_task:{getattr(record, 'task_ref', '')}",
+            right=right,
+            payload={
+                "method": f"tasks/{operation}",
+                "server_id": binding.server_id,
+                "task_ref": getattr(record, "task_ref", ""),
+                **(
+                    {"input_responses": selected_responses}
+                    if selected_responses is not None
+                    else {}
+                ),
+            },
+            invoke=invoke,
+            binding_preflight=lambda current: self._require_stored_modern_binding(
+                current,
+                binding,
+            ),
+            expected_registry_binding=self._stored_registry_binding(binding),
+            absolute_deadline=deadline,
+            state_mutation=mutation,
+            rollback_class=rollback_class,
+            rollback_status=rollback_status,
+            contract_name=f"primitive.mcp.tasks.{operation}",
+        )
+
+    def _continuation_request_parts(
+        self,
+        record: Any,
+        binding: McpContinuationBinding,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(binding, McpContinuationBinding):
+            raise TypeError("MCP continuation binding is required")
+        if not isinstance(request, Mapping):
+            raise ValidationError("MCP continuation original request is invalid")
+        method = request.get("method")
+        server_id = request.get("server_id")
+        if (
+            type(method) is not str
+            or server_id != binding.server_id
+            or getattr(record, "server_id", None) != server_id
+            or getattr(record, "owner_id", None) != binding.owner_id
+            or getattr(record, "request_sha256", None) != binding.request_sha256
+            or getattr(record, "effect_id", None) != binding.effect_id
+            or json_sha256(
+                dict(request),
+                label="MCP continuation original request",
+            )
+            != binding.request_sha256
+        ):
+            raise CapabilityDenied("MCP continuation durable binding changed")
+        self._require_continuation_authority_binding(binding, method)
+        if method == "tools/call":
+            if set(request) != {"method", "server_id", "tool_id", "arguments"}:
+                raise ValidationError("MCP Tool continuation request is invalid")
+            logical_id = request.get("tool_id")
+            arguments = _canonical_mcp_arguments(
+                request.get("arguments"),
+                max_bytes=self.config.mcp.max_request_hard_limit_bytes,
+            )
+            selected: dict[str, Any] = {"arguments": arguments}
+        elif method == "resources/read":
+            if set(request) != {
+                "method",
+                "server_id",
+                "resource_id",
+                "variables",
+                "for_model",
+            }:
+                raise ValidationError("MCP Resource continuation request is invalid")
+            logical_id = request.get("resource_id")
+            selected = {
+                "variables": self._modern_string_mapping(
+                    request.get("variables"),
+                    label="Resource continuation variables",
+                ),
+                "for_model": request.get("for_model"),
+            }
+            if type(selected["for_model"]) is not bool:
+                raise ValidationError("MCP Resource continuation visibility is invalid")
+        elif method == "prompts/get":
+            if set(request) != {
+                "method",
+                "server_id",
+                "prompt_id",
+                "arguments",
+                "confirmed",
+            }:
+                raise ValidationError("MCP Prompt continuation request is invalid")
+            logical_id = request.get("prompt_id")
+            selected = {
+                "arguments": self._modern_string_mapping(
+                    request.get("arguments"),
+                    label="Prompt continuation arguments",
+                )
+            }
+            if request.get("confirmed") is not False:
+                raise ValidationError(
+                    "confirmed MCP Prompt cannot become a continuation"
+                )
+        else:
+            raise ValidationError("MCP continuation surface is unsupported")
+        if type(logical_id) is not str or not logical_id:
+            raise ValidationError("MCP continuation logical id is invalid")
+        return {
+            "actor": binding.owner_id,
+            "server_id": binding.server_id,
+            "method": method,
+            "logical_id": logical_id,
+            **selected,
+        }
+
+    def _require_continuation_authority_binding(
+        self,
+        binding: McpContinuationBinding,
+        initial_method: str,
+    ) -> None:
+        host_digest = self._modern_host_authority_binding_sha256(
+            binding.owner_id,
+            initial_method,
+        )
+        current_process = self._resource_usage_pid(binding.owner_id)
+        if binding.capability_sha256 == host_digest:
+            if current_process is not None:
+                raise CapabilityDenied("MCP Host continuation owner changed")
+            return
+        if current_process is None:
+            raise CapabilityDenied("MCP process continuation owner is unavailable")
+
+    def _continuation_surface_plan(
+        self,
+        manifest: McpServerManifestV3,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        method = request["method"]
+        server_id = request["server_id"]
+        logical_id = request["logical_id"]
+        if method == "tools/call":
+            tool = manifest.tool_by_id(logical_id)
+            if tool is None:
+                raise NotFound(f"MCP tool not found: {server_id}/{logical_id}")
+            visibility = self._visibility_operation_context(
+                request["actor"],
+                server_id,
+                logical_id,
+                request["arguments"],
+            )
+            self._authorize_call_visibility(
+                request["actor"],
+                self.tool_resource(server_id, logical_id),
+                visibility,
+            )
+            right, rollback_class, rollback_status = self._modern_tool_effect(tool)
+            return {
+                "logical_id": logical_id,
+                "target": self.tool_resource(server_id, logical_id),
+                "right": right,
+                "state_mutation": tool.state_mutation,
+                "rollback_class": rollback_class,
+                "rollback_status": rollback_status,
+                "provider_method": "continue_tool",
+                "remote_name": tool.mcp_name,
+            }
+        if method == "resources/read":
+            resolver = getattr(self._modern_client, "resolve_resource_selector", None)
+            if not callable(resolver):
+                raise ValidationError("MCP Resource selector resolver is unavailable")
+            remote_name = resolver(
+                manifest,
+                logical_id,
+                request["variables"],
+                for_model=request["for_model"],
+            )
+            provider_method = "continue_resource"
+            target = f"mcp:{server_id}:resource:{logical_id}"
+        elif method == "prompts/get":
+            prompt = next(
+                (item for item in manifest.prompts if item.prompt_id == logical_id),
+                None,
+            )
+            if prompt is None:
+                raise NotFound(f"MCP prompt not found: {logical_id}")
+            if not set(request["arguments"]).issubset(prompt.argument_names):
+                raise ValidationError(
+                    "MCP Prompt continuation argument is not manifest-authorized"
+                )
+            remote_name = prompt.mcp_name
+            provider_method = "continue_prompt"
+            target = f"mcp:{server_id}:prompt:{logical_id}"
+        else:  # pragma: no cover - parsed before this helper
+            raise ValidationError("MCP continuation surface is unsupported")
+        return {
+            "logical_id": logical_id,
+            "target": target,
+            "right": CapabilityRight.READ,
+            "state_mutation": False,
+            "rollback_class": ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED,
+            "rollback_status": ExternalEffectRollbackStatus.NOT_REQUIRED,
+            "provider_method": provider_method,
+            "remote_name": remote_name,
+        }
+
+    @staticmethod
+    def _modern_tool_effect(
+        tool: McpToolSpec,
+    ) -> tuple[
+        CapabilityRight,
+        ExternalEffectRollbackClass,
+        ExternalEffectRollbackStatus,
+    ]:
+        try:
+            right = CapabilityRight(tool.right)
+            rollback_class = ExternalEffectRollbackClass(tool.rollback_class)
+            rollback_status = (
+                ExternalEffectRollbackStatus(tool.rollback_status)
+                if tool.rollback_status is not None
+                else default_external_effect_rollback_status(rollback_class)
+            )
+        except (TypeError, ValueError) as error:
+            raise ValidationError("MCP Tool effect declaration is invalid") from error
+        return right, rollback_class, rollback_status
+
+    def _require_modern_dispatch_binding(
+        self,
+        stored: McpContinuationBinding | McpRemoteTaskBinding,
+    ) -> McpClientBinding:
+        context = self._modern_dispatch_context.get()
+        selected = context.get("binding") if isinstance(context, dict) else None
+        if not isinstance(selected, McpClientBinding):
+            raise ProviderEffectNotStarted("MCP modern dispatch binding is unavailable")
+        self._require_stored_modern_binding(selected, stored)
+        return selected
+
+    def _require_stored_modern_binding(
+        self,
+        current: McpClientBinding,
+        stored: McpContinuationBinding | McpRemoteTaskBinding,
+    ) -> None:
+        if (
+            current.manifest.server_id != stored.server_id
+            or current.manifest_sha256 != stored.server_spec_sha256
+            or current.registry_generation != stored.server_generation
+            or current.owner_id != stored.owner_id
+            or self._modern_optional_fence_sha256(
+                current.auth_principal_sha256,
+                empty_value=None,
+            )
+            != stored.auth_principal_sha256
+            or self._modern_optional_fence_sha256(
+                current.auth_scope_sha256,
+                empty_value=[],
+            )
+            != stored.auth_scope_sha256
+        ):
+            raise CapabilityDenied("MCP durable operation fence changed")
+        if isinstance(stored, McpRemoteTaskBinding):
+            extension = current.manifest.tasks_extension
+            if (
+                extension is None
+                or extension.extension_id != stored.extension_id
+                or extension.spec_sha256 != stored.tasks_extension_sha256
+                or stored.host_tasks_extension_sha256
+                != self.config.mcp.tasks_extension_spec_sha256
+            ):
+                raise CapabilityDenied("MCP Tasks extension fence changed")
+
+    @staticmethod
+    def _stored_registry_binding(
+        stored: McpContinuationBinding | McpRemoteTaskBinding,
+    ) -> dict[str, Any]:
+        return {
+            "registry_spec_sha256": stored.server_spec_sha256,
+            "registry_generation": stored.server_generation,
+        }
+
+    def _active_modern_capture_context(
+        self,
+        server_id: str,
+        operation: str,
+        logical_id: str,
+    ) -> tuple[dict[str, Any], McpClientBinding]:
+        context = self._modern_dispatch_context.get()
+        if not isinstance(context, dict):
+            raise ValidationError(
+                "MCP durable result capture is outside the protected provider phase"
+            )
+        binding = context.get("binding")
+        payload = context.get("payload")
+        effect_id = context.get("effect_id")
+        if (
+            not isinstance(binding, McpClientBinding)
+            or binding.owner_id is None
+            or binding.manifest.server_id != server_id
+            or context.get("logical_id") != logical_id
+            or not isinstance(payload, dict)
+            or payload.get("method") != operation
+            or type(effect_id) is not str
+            or not effect_id
+        ):
+            raise CapabilityDenied("MCP durable result capture binding changed")
+        return context, binding
+
+    @staticmethod
+    def _modern_dispatch_request_sha256(context: Mapping[str, Any]) -> str:
+        """Reuse the exact hash authorized by the active protected operation."""
+
+        operation_context = context.get("operation_context")
+        request_sha256 = (
+            operation_context.get("request_sha256")
+            if isinstance(operation_context, Mapping)
+            else None
+        )
+        if (
+            type(request_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None
+        ):
+            raise CapabilityDenied("MCP protected request digest is unavailable")
+        return request_sha256
+
+    @staticmethod
+    def _modern_optional_fence_sha256(
+        value: str | None,
+        *,
+        empty_value: Any,
+    ) -> str:
+        if value is not None:
+            if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValidationError("MCP auth fence digest is invalid")
+            return value
+        return hashlib.sha256(dumps(empty_value).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _modern_capability_binding_sha256(context: Mapping[str, Any]) -> str:
+        decisions = context.get("decisions")
+        if type(decisions) is not tuple:
+            raise CapabilityDenied("MCP durable capture lacks Capability evidence")
+        if not decisions:
+            if context.get("usage_pid") is not None:
+                raise CapabilityDenied(
+                    "MCP durable capture lacks process Capability evidence"
+                )
+            operation_context = context.get("operation_context")
+            payload = context.get("payload")
+            actor = context.get("actor")
+            if (
+                not isinstance(operation_context, Mapping)
+                or operation_context.get("authority_mode")
+                != "host_protected_operation"
+                or operation_context.get("pid") != actor
+                or not isinstance(payload, Mapping)
+                or type(payload.get("method")) is not str
+            ):
+                raise CapabilityDenied(
+                    "MCP durable capture lacks Host authority evidence"
+                )
+            return McpPrimitive._modern_host_authority_binding_sha256(
+                actor,
+                payload["method"],
+            )
+        payload = [
+            {
+                "allowed": bool(getattr(decision, "allowed", False)),
+                "matched_capability_ids": list(
+                    getattr(decision, "matched_capability_ids", ())
+                ),
+                "selected_capability_id": getattr(
+                    decision,
+                    "selected_capability_id",
+                    None,
+                ),
+            }
+            for decision in decisions
+        ]
+        if any(item["allowed"] is not True for item in payload):
+            raise CapabilityDenied("MCP durable capture authority is not allowed")
+        return hashlib.sha256(dumps(payload).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _modern_authority_mode(usage_pid: str | None) -> str:
+        return (
+            "process_capability"
+            if usage_pid is not None
+            else "host_protected_operation"
+        )
+
+    @staticmethod
+    def _modern_host_authority_binding_sha256(actor: Any, method: Any) -> str:
+        if type(actor) is not str or not actor or type(method) is not str or not method:
+            raise CapabilityDenied("MCP durable Host authority binding is invalid")
+        marker = {
+            "authority_mode": "host_protected_operation",
+            "actor": actor,
+            "initial_method": method,
+            "process_capability_ids": [],
+        }
+        return hashlib.sha256(dumps(marker).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _modern_flow_binding_sha256(context: Mapping[str, Any]) -> str:
+        payload = {
+            "context": to_jsonable(context.get("flow_context")),
+            "sink": to_jsonable(context.get("sink")),
+        }
+        return hashlib.sha256(dumps(payload).encode("utf-8")).hexdigest()
+
+    def _precheck_modern_authority(
+        self,
+        actor: str,
+        resource: str,
+        right: CapabilityRight,
+        context: Mapping[str, Any],
+    ) -> None:
+        decision = self.capabilities.authorize(
+            actor,
+            resource,
+            right,
+            dict(context),
+        )
+        if decision.allowed or decision.policy == CapabilityManager.ASK_EACH_TIME:
+            return
+        raise CapabilityDenied(decision.reason)
+
+    def _authorize_modern_operation(
+        self,
+        actor: str,
+        resource: str,
+        right: CapabilityRight,
+        context: Mapping[str, Any],
+    ) -> Any:
+        selected_context = {
+            **dict(context),
+            "resource": resource,
+            "right": right.value,
+        }
+        decision = self.capabilities.authorize(
+            actor,
+            resource,
+            right,
+            selected_context,
+            audit=True,
+        )
+        if decision.allowed:
+            return decision
+        if decision.policy != CapabilityManager.ASK_EACH_TIME:
+            raise CapabilityDenied(decision.reason)
+        if self.human is None:
+            raise CapabilityDenied(
+                f"{actor} requires human approval for MCP operation on {resource}"
+            )
+        operation = str(selected_context["operation"])
+        logical_id = str(selected_context["logical_id"])
+        profile = self.capabilities.profiles.mcp(
+            resource=resource,
+            effect=CapabilityEffect.ASK,
+            server_id=str(selected_context["server_id"]),
+            tool_id=logical_id,
+        )
+        constraints = {
+            AUTHORITY_RULES_KEY: [
+                {
+                    "rule_id": (
+                        f"mcp.modern.approval.{selected_context['server_id']}."
+                        f"{hashlib.sha256(resource.encode('utf-8')).hexdigest()[:16]}"
+                    ),
+                    "operation": operation,
+                    "effect": CapabilityEffect.ALLOW.value,
+                    "risk": "high",
+                    "conditions": {
+                        "server_id": selected_context["server_id"],
+                        "tool_id": logical_id,
+                        "registry_spec_sha256": selected_context[
+                            "registry_spec_sha256"
+                        ],
+                        "registry_generation": selected_context[
+                            "registry_generation"
+                        ],
+                        "arguments_sha256": selected_context[
+                            "arguments_sha256"
+                        ],
+                    },
+                    "description": "one-shot approval for exact MCP modern request",
+                }
+            ]
+        }
+        request_id = self.human.query_authority_request(
+            pid=actor,
+            human=self.config.runtime.default_human,
+            request={
+                "type": "external_operation_approval",
+                "question": f"Allow this process to perform {operation} on {resource}?",
+                "requested_once_capability": {
+                    "subject": actor,
+                    "resource": resource,
+                    "rights": [right.value],
+                    "constraints": constraints,
+                },
+                "context": {
+                    **selected_context,
+                    "sandbox_profile": self._profile_json(profile),
+                },
+            },
+            blocking=True,
+            authority_origin="external_operation",
+        )
+        raise HumanApprovalRequired(
+            request_id=request_id,
+            message=f"{actor} is waiting for approval to perform {operation}",
+        )
+
+    @staticmethod
+    def _modern_string_mapping(
+        value: Mapping[str, str] | None,
+        *,
+        label: str,
+        required: bool = False,
+    ) -> dict[str, str]:
+        if value is None:
+            if required:
+                raise ValidationError(f"MCP {label} must be an object")
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValidationError(f"MCP {label} must be an object")
+        selected: dict[str, str] = {}
+        for key, item in value.items():
+            if type(key) is not str or type(item) is not str:
+                raise ValidationError(f"MCP {label} must contain string values")
+            selected[key] = item
+        return selected
+
+    @staticmethod
+    def _validate_modern_cursor(cursor: str | None) -> None:
+        if cursor is not None and type(cursor) is not str:
+            raise ValidationError("MCP cursor must be a string or null")
+
+    @staticmethod
+    def _validate_prompt_preview_request(
+        *,
+        confirmed: bool,
+        expected_preview_sha256: str | None,
+    ) -> None:
+        valid_digest = bool(
+            isinstance(expected_preview_sha256, str)
+            and len(expected_preview_sha256) == 64
+            and all(
+                character in "0123456789abcdef"
+                for character in expected_preview_sha256
+            )
+        )
+        if confirmed and not valid_digest:
+            raise ValidationError(
+                "confirmed MCP Prompt requires expected_preview_sha256"
+            )
+        if not confirmed and expected_preview_sha256 is not None:
+            raise ValidationError(
+                "MCP Prompt preview must not supply expected_preview_sha256"
+            )
+
+    @staticmethod
+    def _validate_subscription_filters(filters: Any) -> tuple[str, ...]:
+        if type(filters) is not tuple or not filters or any(
+            type(item) is not str for item in filters
+        ):
+            raise ValidationError(
+                "MCP subscription filters must be a non-empty string tuple"
+            )
+        if len(filters) > len(MCP_V3_SUBSCRIPTION_FILTERS):
+            raise ValidationError("MCP subscription filters exceed the maximum count")
+        if len(set(filters)) != len(filters):
+            raise ValidationError("MCP subscription filters must be unique")
+        unknown = sorted(set(filters) - MCP_V3_SUBSCRIPTION_FILTERS)
+        if unknown:
+            raise ValidationError(
+                f"unsupported MCP subscription filters: {unknown}"
+            )
+        return filters
+
+    def _tasks_subscription_fence(
+        self,
+        manifest: McpServerManifestV3,
+        filters: tuple[str, ...],
+    ) -> McpTasksSubscriptionFence | None:
+        if "taskIds" not in filters:
+            return None
+        extension = manifest.tasks_extension
+        host_pin = self.config.mcp.tasks_extension_spec_sha256
+        if (
+            manifest.schema_version != 3
+            or manifest.protocol_mode is not McpProtocolMode.REVISION_2026_07_28
+            or self.config.mcp.tasks_extension_enabled is not True
+            or extension is None
+            or extension.extension_id != MCP_TASKS_EXTENSION_ID
+            or type(host_pin) is not str
+            or extension.spec_sha256 != host_pin
+        ):
+            raise ValidationError(
+                "MCP taskIds subscription requires the exact Host-pinned Tasks extension"
+            )
+        return McpTasksSubscriptionFence(
+            extension_id=extension.extension_id,
+            manifest_spec_sha256=extension.spec_sha256,
+            host_spec_sha256=host_pin,
+        )
+
+    def _prepare_subscription_start_result(
+        self,
+        filters: tuple[str, ...],
+        *,
+        deadline: float,
+    ) -> _McpPreparedSubscriptionResult:
+        binding, server = self._subscription_dispatch_binding()
+        if not set(filters).issubset(binding.manifest.subscriptions):
+            raise ValidationError(
+                "MCP subscription filters are not declared by the manifest"
+            )
+        context = self._modern_dispatch_context.get()
+        effect_id = context.get("effect_id") if isinstance(context, dict) else None
+        if type(effect_id) is not str or not effect_id:
+            raise ValidationError("MCP subscription protected effect is unavailable")
+        manager = self._subscription_manager()
+        runner = self._subscription_runner(manager)
+        prepared = runner.run(
+            lambda: manager.prepare_start(
+                server,
+                mcp_connection_fence(binding),
+                self._subscription_provider(),
+                filters,
+                sensitive_values=binding.sensitive_values,
+                tasks_extension_fence=self._tasks_subscription_fence(
+                    binding.manifest,
+                    filters,
+                ),
+                deadline=deadline,
+                origin_effect_id=effect_id,
+            ),
+            deadline=deadline,
+            binding=binding,
+        )
+        return self._coerce_prepared_subscription_start(
+            prepared,
+            manager=manager,
+            runner=runner,
+            binding=binding,
+            dispatch_context=context,
+        )
+
+    def _coerce_prepared_subscription_start(
+        self,
+        prepared: Any,
+        *,
+        manager: Any,
+        runner: _McpSubscriptionLoopRunner,
+        binding: McpClientBinding,
+        dispatch_context: Any,
+    ) -> _McpPreparedSubscriptionResult:
+        selected = self._subscription_start_settlement(
+            prepared,
+            manager=manager,
+            runner=runner,
+            binding=binding,
+            dispatch_context=dispatch_context,
+        )
+        public = prepared[0] if type(prepared) is tuple and prepared else None
+        valid = (
+            isinstance(public, McpSubscription)
+            and selected is not None
+            and selected[0].subscription_id == public.subscription_id
+        )
+        if not valid:
+            self._reject_prepared_subscription_start(
+                selected[1] if selected is not None else None
+            )
+        assert isinstance(public, McpSubscription) and selected is not None
+        return _McpPreparedSubscriptionResult(public, selected[0], selected[1])
+
+    def _subscription_start_settlement(
+        self,
+        prepared: Any,
+        *,
+        manager: Any,
+        runner: _McpSubscriptionLoopRunner,
+        binding: McpClientBinding,
+        dispatch_context: Any,
+    ) -> tuple[
+        McpSubscriptionStartSettlement,
+        _McpSubscriptionEffectSettlement,
+    ] | None:
+        if type(prepared) is not tuple or len(prepared) != 2:
+            return None
+        settlement = prepared[1]
+        if (
+            type(settlement) is not McpSubscriptionStartSettlement
+            or settlement.manager is not manager
+        ):
+            return None
+        live = settlement.opening.prepared
+        public = prepared[0] if isinstance(prepared[0], McpSubscription) else None
+        cleanup_public = public if public is not None else live.public if live else None
+        if cleanup_public is None or not isinstance(dispatch_context, dict):
+            return None
+        effect = _McpSubscriptionEffectSettlement(
+            runner=runner,
+            settlement=settlement,
+            binding=binding,
+            dispatch_context_var=self._modern_dispatch_context,
+            dispatch_context=dict(dispatch_context),
+            public=cleanup_public,
+        )
+        return settlement, effect
+
+    @staticmethod
+    def _reject_prepared_subscription_start(
+        settlement: _McpSubscriptionEffectSettlement | None,
+    ) -> None:
+        error = ValidationError(
+            "MCP subscription manager returned an invalid prepared start"
+        )
+        if settlement is None:
+            raise error
+        try:
+            settlement.abort(reason="protected_result_validation_failed")
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "MCP subscription result validation cleanup failed",
+                [error, cleanup_error],
+            )
+        raise error
+
+    def _subscription_manager(self) -> Any:
+        manager = self._modern_subscriptions
+        required = ("prepare_start", "start", "status", "events", "stop", "close")
+        if manager is None or any(
+            not callable(getattr(manager, name, None)) for name in required
+        ):
+            raise ValidationError("MCP subscription manager is unavailable")
+        return manager
+
+    def _subscription_provider(self) -> Any:
+        provider = self._modern_subscription_provider
+        required = ("listen", "receive", "close")
+        if provider is None or any(
+            not callable(getattr(provider, name, None)) for name in required
+        ):
+            raise ValidationError("MCP subscription provider is unavailable")
+        return provider
+
+    def _subscription_runner(self, manager: Any) -> _McpSubscriptionLoopRunner:
+        with self._modern_subscription_lock:
+            runner = self._modern_subscription_runner
+            if runner is None:
+                runner = _McpSubscriptionLoopRunner(
+                    manager,
+                    dispatch_context_var=self._modern_dispatch_context,
+                )
+                self._modern_subscription_runner = runner
+            elif runner.manager is not manager:
+                raise ValidationError("MCP subscription manager binding changed")
+            return runner
+
+    def _continuation_manager(self) -> Any:
+        manager = self._modern_continuations
+        required = (
+            "binding_material",
+            "get",
+            "respond",
+            "cancel",
+        )
+        if manager is None or any(
+            not callable(getattr(manager, name, None)) for name in required
+        ):
+            raise ValidationError("MCP continuation manager is unavailable")
+        return manager
+
+    def _remote_task_manager(self) -> Any:
+        manager = self._modern_remote_tasks
+        required = (
+            "binding_material",
+            "inspect",
+            "get",
+            "update",
+            "cancel",
+        )
+        if manager is None or any(
+            not callable(getattr(manager, name, None)) for name in required
+        ):
+            raise ValidationError("MCP remote Task manager is unavailable")
+        return manager
+
+    def _remote_task_binding(self, manager: Any, task_ref: str) -> McpRemoteTaskBinding:
+        pin = self.config.mcp.tasks_extension_spec_sha256
+        if self.config.mcp.tasks_extension_enabled is not True or type(pin) is not str:
+            raise ValidationError("MCP Tasks extension is disabled or unpinned")
+        return manager.binding_material(
+            task_ref,
+            tasks_extension_sha256=pin,
+            host_tasks_extension_sha256=pin,
+        )
+
+    def _durable_mcp_deadline(self) -> float:
+        timeout_s = self.config.mcp.timeout_s
+        if (
+            type(timeout_s) not in {int, float}
+            or isinstance(timeout_s, bool)
+            or not math.isfinite(float(timeout_s))
+            or timeout_s <= 0
+        ):
+            raise ValidationError("MCP durable operation timeout is invalid")
+        return time.monotonic() + float(timeout_s)
+
+    @staticmethod
+    def _validate_durable_host_actor(actor: str) -> None:
+        if (
+            type(actor) is not str
+            or not actor
+            or len(actor) > 512
+            or actor != actor.strip()
+            or "\x00" in actor
+        ):
+            raise ValidationError("MCP Host responder actor is invalid")
+
+    @staticmethod
+    def _require_durable_human_fence(
+        pending: McpInputRequired | McpRemoteTask,
+        *,
+        expected_revision: int,
+        human_request_id: str,
+        human_expected_revision: int,
+        human_preview_sha256: str,
+    ) -> None:
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValidationError("MCP durable expected_revision is invalid")
+        if (
+            pending.revision != expected_revision
+            or pending.human_request_id != human_request_id
+            or pending.human_revision != human_expected_revision
+            or pending.human_preview_sha256 != human_preview_sha256
+        ):
+            raise CapabilityDenied("MCP Human response binding changed")
+
+    def _subscription_dispatch_binding(
+        self,
+    ) -> tuple[McpClientBinding, McpServerSpec]:
+        context = self._modern_dispatch_context.get()
+        if not isinstance(context, dict):
+            raise ValidationError("MCP subscription dispatch context is unavailable")
+        binding = context.get("binding")
+        server = context.get("server")
+        if not isinstance(binding, McpClientBinding) or not isinstance(
+            server, McpServerSpec
+        ):
+            raise ValidationError("MCP subscription dispatch binding is invalid")
+        if binding.manifest.server_id != server.server_id:
+            raise ValidationError("MCP subscription dispatch server changed")
+        return binding, server
+
+    def _subscription_record_for_operation(
+        self,
+        subscription_id: str,
+        *,
+        actor: str,
+        right: CapabilityRight,
+        operation: str,
+    ) -> tuple[Any, str]:
+        self._validate_identifier(subscription_id, "subscription_id", 512)
+        if type(actor) is not str or not actor:
+            raise ValidationError("MCP subscription actor is invalid")
+        target = f"mcp_subscription:{subscription_id}"
+        if self._resource_usage_pid(actor) is not None:
+            self._precheck_modern_authority(
+                actor,
+                target,
+                right,
+                {
+                    "pid": actor,
+                    "primitive": f"runtime.mcp.{operation}",
+                    "operation": f"mcp.{operation}",
+                    "authority_operation": f"mcp.{operation}",
+                    "logical_id": subscription_id,
+                    "tool_id": subscription_id,
+                    "right": right.value,
+                },
+            )
+        record = self.unit_of_work.mcp_subscriptions.get(subscription_id)
+        if record is None:
+            raise NotFound(f"MCP subscription not found: {subscription_id}")
+        if record.owner_id != actor:
+            raise CapabilityDenied("MCP subscription belongs to another owner")
+        return record, target
+
+    @staticmethod
+    def _require_subscription_record_binding(
+        record: Any,
+        binding: McpClientBinding,
+        *,
+        actor: str,
+    ) -> None:
+        empty_sha256 = hashlib.sha256(b"").hexdigest()
+        if (
+            record.server_id != binding.manifest.server_id
+            or record.server_spec_sha256 != binding.manifest_sha256
+            or record.server_generation != binding.registry_generation
+            or record.owner_id != actor
+            or binding.owner_id != actor
+            or record.auth_principal_sha256
+            != (binding.auth_principal_sha256 or empty_sha256)
+            or record.auth_scope_sha256
+            != (binding.auth_scope_sha256 or empty_sha256)
+        ):
+            raise CapabilityDenied("MCP subscription binding changed")
+
+    def _modern_data_sink(
+        self,
+        manifest: McpServerManifestV3,
+        *,
+        operation: str,
+        logical_id: str,
+        stdio_identity: dict[str, str] | None,
+    ) -> DataSink:
+        identity = f"mcp:{manifest.server_id}:{operation}:{logical_id}"
+        if manifest.transport == "stdio" and stdio_identity is None:
+            return DataSink(identity)
+        digest = hashlib.sha256(
+            dumps(
+                {
+                    "schema_version": 3,
+                    "server": json.loads(canonical_mcp_v3_manifest_json(manifest)),
+                    "operation": operation,
+                    "logical_id": logical_id,
+                    "stdio_executable": stdio_identity,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        return DataSink(identity, digest)
+
+    def _modern_success_evidence(
+        self,
+        *,
+        actor: str,
+        target: str,
+        operation: str,
+        context: Mapping[str, Any],
+        response_bytes: int,
+        result: Any,
+        decisions: list[Any],
+        state_mutation: bool,
+    ) -> ProtectedOperationEvidence:
+        kind = getattr(result, "kind", None)
+        if kind is None and hasattr(result, "items"):
+            kind = "page"
+        review = self._modern_review_evidence(context)
+        payload = {
+            "adapter": "mcp",
+            "operation": operation,
+            "server_id": context["server_id"],
+            "logical_id": context["logical_id"],
+            "ok": True,
+            "result_kind": str(kind or type(result).__name__),
+            "request_bytes": context["request_bytes"],
+            "response_bytes": response_bytes,
+            **review,
+        }
+        durable_receipt: dict[str, Any] = {}
+        if isinstance(result, McpInputRequired) and result.respondable:
+            durable_receipt = {
+                "kind": "input_required",
+                "continuation_id": result.continuation_id,
+            }
+        elif isinstance(result, McpRemoteTask):
+            durable_receipt = {
+                "kind": "remote_task",
+                "task_ref": result.task_ref,
+            }
+        return ProtectedOperationEvidence(
+            event_type=(
+                EventType.EXTERNAL_WRITE
+                if state_mutation
+                else EventType.EXTERNAL_READ
+            ),
+            event_source=actor,
+            event_target=target,
+            event_payload=payload,
+            audit_action=f"primitive.mcp.{operation}",
+            audit_actor=actor,
+            audit_target=target,
+            audit_decision={
+                **payload,
+                "request_sha256": context["request_sha256"],
+                "registry_spec_sha256": context["registry_spec_sha256"],
+                "registry_generation": context["registry_generation"],
+            },
+            capability_refs=tuple(
+                decision.selected_capability_id
+                for decision in decisions
+                if getattr(decision, "selected_capability_id", None)
+            ),
+            effect_metadata=payload,
+            provider_receipt={
+                "request_bytes": context["request_bytes"],
+                "response_bytes": response_bytes,
+                **(
+                    {"mcp_durable_result": durable_receipt}
+                    if durable_receipt
+                    else {}
+                ),
+            },
+        )
+
+    def _modern_failure_evidence(
+        self,
+        *,
+        actor: str,
+        target: str,
+        operation: str,
+        context: Mapping[str, Any],
+        error: BaseException,
+        phase: str,
+        state_mutation: bool = False,
+    ) -> ProtectedOperationEvidence:
+        review = self._modern_review_evidence(context)
+        payload = {
+            "adapter": "mcp",
+            "operation": operation,
+            "server_id": context["server_id"],
+            "logical_id": context["logical_id"],
+            "ok": False,
+            "error_type": type(error).__name__,
+            "phase": phase,
+            "request_bytes": context["request_bytes"],
+            "response_bytes": 0,
+            **review,
+        }
+        return ProtectedOperationEvidence(
+            event_type=(
+                EventType.EXTERNAL_WRITE
+                if state_mutation
+                else EventType.EXTERNAL_READ
+            ),
+            event_source=actor,
+            event_target=target,
+            event_payload=payload,
+            audit_action=f"primitive.mcp.{operation}",
+            audit_actor=actor,
+            audit_target=target,
+            audit_decision={
+                **payload,
+                "request_sha256": context["request_sha256"],
+                "registry_spec_sha256": context["registry_spec_sha256"],
+                "registry_generation": context["registry_generation"],
+            },
+            effect_metadata=payload,
+            provider_receipt={"request_bytes": 0, "response_bytes": 0},
+        )
+
+    @staticmethod
+    def _modern_review_evidence(context: Mapping[str, Any]) -> dict[str, Any]:
+        if context.get("confirmed") is not True:
+            return {}
+        reviewer = context.get("reviewer")
+        reason = context.get("reason")
+        if type(reviewer) is not str or type(reason) is not str:
+            raise ValidationError("MCP review evidence is invalid")
+        return {"confirmed": True, "reviewer": reviewer, "reason": reason}
 
     def server_resource(self, server_id: str) -> str:
         return f"mcp_server:{server_id}"
@@ -547,16 +6617,158 @@ class McpPrimitive:
             return None
         return "/".join(parts)
 
+    def validate_server_manifest(
+        self,
+        server: McpRegisteredServer | dict[str, Any],
+    ) -> McpRegisteredServer:
+        """Return the strict typed manifest accepted by this Host.
+
+        This public Host/DX bridge performs no registry or provider operation.
+        Manifest v3 validation includes the active Host attenuation policy.
+        """
+
+        return self._coerce_server(server)
+
+    def get_server_manifest(self, server_id: str) -> McpRegisteredServer:
+        """Return one validated registered manifest for trusted Host tooling."""
+
+        manifest, _metadata = self._load_server(server_id)
+        return manifest
+
+    def import_server_manifest(
+        self,
+        server: McpRegisteredServer | dict[str, Any],
+        *,
+        expected_current_sha256: str | None,
+        actor: str = "runtime",
+        replace: bool = False,
+        require_capability: bool = True,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply one reviewed import against the caller's registry observation.
+
+        Manifest v3 uses the Store's cross-Runtime atomic CAS. The legacy
+        compatibility schemas retain their Runtime-local registry phase fence.
+        """
+
+        self._validate_import_expected_digest(expected_current_sha256)
+        spec = self.validate_server_manifest(server)
+        if isinstance(spec, McpServerManifestV3):
+            return self.import_v3_manifest(
+                spec,
+                expected_current_sha256=expected_current_sha256,
+                actor=actor,
+                replace=replace,
+                require_capability=require_capability,
+                source=source,
+            )
+        with self._registry_phase_lock:
+            try:
+                current = self.get_server_manifest(spec.server_id)
+            except NotFound:
+                current = None
+            current_sha256 = (
+                self._server_spec_sha256(current) if current is not None else None
+            )
+            if current_sha256 != expected_current_sha256:
+                raise ValidationError(
+                    "MCP registry changed after import planning; create a new plan"
+                )
+            return self.register_server(
+                spec,
+                actor=actor,
+                replace=replace,
+                require_capability=require_capability,
+                source=source,
+            )
+
+    @staticmethod
+    def _validate_import_expected_digest(value: str | None) -> None:
+        if value is not None and (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValidationError(
+                "MCP import expected_current_sha256 must be lowercase SHA-256 or null"
+            )
+
     def register_server(
         self,
-        server: McpServerSpec | dict[str, Any],
+        server: McpRegisteredServer | dict[str, Any],
         *,
         actor: str = "runtime",
         replace: bool = False,
         require_capability: bool = True,
         source: str | None = None,
     ) -> dict[str, Any]:
+        return self._register_server(
+            server,
+            actor=actor,
+            replace=replace,
+            require_capability=require_capability,
+            source=source,
+            expected_current_sha256=_MCP_IMPORT_CAS_UNSET,
+        )
+
+    def import_v3_manifest(
+        self,
+        server: McpServerManifestV3 | dict[str, Any],
+        *,
+        actor: str = "runtime",
+        replace: bool = False,
+        require_capability: bool = True,
+        expected_current_sha256: str | None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        """CAS-bound Manifest-v3 import used by reviewed DX bundles.
+
+        ``None`` means that the caller observed no current registry row.  A
+        digest means that the caller observed that exact canonical manifest.
+        The comparison and write share the registry phase lock, so an import
+        plan can never silently overwrite a newer Host registration.
+        """
+
+        self._validate_import_expected_digest(expected_current_sha256)
         spec = self._coerce_server(server)
+        if not isinstance(spec, McpServerManifestV3):
+            raise ValidationError("MCP import_v3_manifest requires Manifest v3")
+        return self._register_server(
+            spec,
+            actor=actor,
+            replace=replace,
+            require_capability=require_capability,
+            source=source,
+            expected_current_sha256=expected_current_sha256,
+        )
+
+    def _register_server(
+        self,
+        server: McpRegisteredServer | dict[str, Any],
+        *,
+        actor: str,
+        replace: bool,
+        require_capability: bool,
+        source: str | None,
+        expected_current_sha256: str | None | object,
+    ) -> dict[str, Any]:
+        spec = self._coerce_server(server)
+        oauth_profile: McpOAuthProfile | None = None
+        if isinstance(spec, McpServerManifestV3) and spec.auth_profile_id is not None:
+            manager = self._oauth_manager()
+            if not manager.has_profile(spec.auth_profile_id):
+                raise ValidationError(
+                    "MCP Manifest v3 auth_profile_id is not Host-configured"
+                )
+            oauth_profile = manager.profile_snapshot(spec.auth_profile_id)
+            self._validate_oauth_profile_manifest_fields(oauth_profile, spec)
+            self._require_oauth_record_identity(
+                oauth_profile,
+                {
+                    "registry_spec_sha256": self._server_spec_sha256(spec),
+                    "registry_generation": 0,
+                },
+            )
         authority_decisions: list[Any] = []
         if require_capability:
             required_right = CapabilityRight.ADMIN if replace else CapabilityRight.WRITE
@@ -578,10 +6790,49 @@ class McpPrimitive:
             actor=actor,
             operation="MCP server register",
         ):
-            existing = self.extensions.get_mcp_server(spec.server_id)
+            existing = self.extensions.get_mcp_server_manifest(spec.server_id)
             if existing is not None and not replace:
                 raise ValidationError(f"MCP server already exists: {spec.server_id}")
-            self.extensions.upsert_mcp_server(spec, registered_by=actor, created_at=now)
+            if expected_current_sha256 is not _MCP_IMPORT_CAS_UNSET:
+                if not isinstance(spec, McpServerManifestV3):  # pragma: no cover
+                    raise ValidationError("MCP registry CAS import requires Manifest v3")
+                applied = self.extensions.compare_and_swap_mcp_v3_server(
+                    spec,
+                    expected_current_sha256=expected_current_sha256,
+                    registered_by=actor,
+                    created_at=now,
+                )
+                if not applied:
+                    raise ValidationError(
+                        "MCP registry changed after import planning; create a new plan"
+                    )
+            elif isinstance(spec, McpServerManifestV3):
+                self.extensions.upsert_mcp_v3_server(
+                    spec,
+                    registered_by=actor,
+                    created_at=now,
+                )
+            else:
+                self.extensions.upsert_mcp_server(
+                    spec,
+                    registered_by=actor,
+                    created_at=now,
+                )
+            if oauth_profile is not None:
+                oauth_binding = self._registry_binding_for_server_spec(spec)
+                manager = self._oauth_manager()
+                self._restore_oauth_generation(
+                    manager,
+                    oauth_profile,
+                    oauth_binding,
+                )
+                self._sync_oauth_metadata(
+                    manager,
+                    oauth_profile,
+                    spec,
+                    oauth_binding,
+                    manager.status(oauth_profile.profile_id),
+                )
             if existing is not None:
                 self._disable_replaced_server_tool_capabilities(spec.server_id, actor=actor)
             self.events.emit(
@@ -598,10 +6849,27 @@ class McpPrimitive:
                     "server_id": spec.server_id,
                     "transport": spec.transport,
                     "tools": [tool.tool_id for tool in spec.tools],
+                    "auth_profile_id": (
+                        spec.auth_profile_id
+                        if isinstance(spec, McpServerManifestV3)
+                        else None
+                    ),
                     "replaced": existing is not None,
                     "source": source,
                 },
             )
+        if existing is not None:
+            self._invalidate_modern_server(spec.server_id)
+            if oauth_profile is not None:
+                manager = self._oauth_manager()
+                with self.unit_of_work.transaction():
+                    self._sync_oauth_metadata(
+                        manager,
+                        oauth_profile,
+                        spec,
+                        self._registry_binding_for_server_spec(spec),
+                        manager.status(oauth_profile.profile_id),
+                    )
         return self.inspect_server(spec.server_id, actor=actor, require_capability=False)
 
     def register_server_from_yaml_text(
@@ -658,7 +6926,10 @@ class McpPrimitive:
             self.capabilities.require(actor, self.config.mcp.registry_resource, CapabilityRight.READ)
         selected_limit = self._bounded_list_limit(limit)
         servers: list[dict[str, Any]] = []
-        rows = self.extensions.list_mcp_servers(text=text, limit=selected_limit + 1)
+        rows = self.extensions.list_mcp_server_manifests(
+            text=text,
+            limit=selected_limit + 1,
+        )
         for spec, metadata in rows[:selected_limit]:
             self._validate_server(spec)
             servers.append(self._server_to_json(spec, metadata, include_sensitive_fields=False))
@@ -719,6 +6990,7 @@ class McpPrimitive:
                 "MCP discover requires Manifest v2 protocol_mode auto or 2026-07-28"
             )
         self._require_modern_protocol_provider(spec)
+        deadline = time.monotonic() + spec.timeout_s
         if require_capability and actor is not None:
             authority_decisions.append(
                 self.capabilities.require(
@@ -759,18 +7031,24 @@ class McpPrimitive:
                 )
             )
         )
-        runtime_environment = self._require_runtime_environment(spec)
+        runtime_environment = self._require_runtime_environment(
+            spec,
+            deadline=deadline,
+        )
         stdio_identity = self._stdio_executable_identity(
             spec,
             runtime_environment=runtime_environment,
+            deadline=deadline,
         )
         sink = DataSink(
             f"mcp:{server_id}:discover",
             self._discover_identity_sha256(
                 spec,
                 stdio_executable=stdio_identity,
+                deadline=deadline,
             ),
         )
+        self._remaining_timeout(deadline)
         contract_name = (
             "primitive.mcp.discover"
             if authority_decisions
@@ -789,13 +7067,14 @@ class McpPrimitive:
             runtime_environment=runtime_environment,
             sink=sink,
             registry_binding=registry_binding,
+            deadline=deadline,
         )
         with self._protected().start(
             contract_name,
             invocation,
             provider=self.provider,
         ) as protected:
-            deadline = time.monotonic() + spec.timeout_s
+            self._remaining_timeout(deadline)
             if spec.transport == "streamable_http":
                 observes_host = self._runtime_resolution_observes_host(spec)
                 protected.call(
@@ -816,6 +7095,7 @@ class McpPrimitive:
                 context=request_flow,
                 payload={"method": "server/discover", "server_id": server_id},
                 runtime_environment=runtime_environment,
+                deadline=deadline,
             )
             try:
                 provider_result = protected.call(
@@ -897,6 +7177,7 @@ class McpPrimitive:
         runtime_environment: Mapping[str, str],
         sink: DataSink,
         registry_binding: ProviderRegistryBinding,
+        deadline: float,
     ) -> ProtectedOperationInvocation:
         return ProtectedOperationInvocation(
             pid=effect_actor,
@@ -927,6 +7208,7 @@ class McpPrimitive:
                 server_id,
                 spec,
                 runtime_environment,
+                deadline=deadline,
             ),
             data_flow_context=request_flow,
             data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
@@ -1000,6 +7282,7 @@ class McpPrimitive:
             # its legacy mode. Fence an unmarked provider before the refresh
             # path can resolve DNS, snapshot/spawn stdio, or dispatch I/O.
             self._require_modern_protocol_provider(spec)
+            deadline = time.monotonic() + spec.timeout_s
         live_by_name: dict[str, McpProviderTool] = {}
         live_response_bytes = 0
         live_connection: McpConnectionInfo | None = None
@@ -1011,6 +7294,7 @@ class McpPrimitive:
                 require_capability=require_capability,
                 spec=spec,
                 authority_decisions=authority_decisions,
+                deadline=deadline,
             )
             live_response_bytes = result.response_bytes
             live_connection = result.connection
@@ -1045,7 +7329,9 @@ class McpPrimitive:
         require_capability: bool,
         spec: McpServerSpec,
         authority_decisions: list[Any],
+        deadline: float,
     ) -> McpToolListResult:
+        started = deadline - spec.timeout_s
         effect_actor = actor or "runtime"
         usage_pid = self._resource_usage_pid(actor)
         if require_capability and actor is not None:
@@ -1060,7 +7346,10 @@ class McpPrimitive:
             authority_decisions.extend(
                 self._require_stdio_process_spawn(actor, spec, consume=False)
             )
-        runtime_environment = self._require_runtime_environment(spec)
+        runtime_environment = self._require_runtime_environment(
+            spec,
+            deadline=deadline,
+        )
         request_payload = {"method": "tools/list", "server_id": spec.server_id}
         request_bytes = len(dumps(request_payload).encode("utf-8"))
         if request_bytes > spec.max_request_bytes:
@@ -1076,14 +7365,17 @@ class McpPrimitive:
         stdio_executable_identity = self._stdio_executable_identity(
             spec,
             runtime_environment=runtime_environment,
+            deadline=deadline,
         )
         list_sink = DataSink(
             f"mcp:{server_id}:list_tools",
             self._list_tools_identity_sha256(
                 spec,
                 stdio_executable=stdio_executable_identity,
+                deadline=deadline,
             ),
         )
+        self._remaining_timeout(deadline)
         invocation = self._list_tools_invocation(
             server_id=server_id,
             effect_actor=effect_actor,
@@ -1097,6 +7389,7 @@ class McpPrimitive:
             request_flow=request_flow,
             list_sink=list_sink,
             request_payload=request_payload,
+            deadline=deadline,
         )
         contract_name = (
             "primitive.mcp.list_tools"
@@ -1108,11 +7401,11 @@ class McpPrimitive:
             invocation,
             provider=self.provider,
         ) as protected:
-            started = time.monotonic()
+            self._remaining_timeout(deadline)
             result, provider_error = self._dispatch_list_tools(
                 protected,
                 spec,
-                deadline=started + spec.timeout_s,
+                deadline=deadline,
                 pid=effect_actor,
                 expected_identity=stdio_executable_identity,
                 sink=list_sink,
@@ -1172,6 +7465,7 @@ class McpPrimitive:
         request_flow: DataFlowContext,
         list_sink: DataSink,
         request_payload: dict[str, str],
+        deadline: float,
     ) -> ProtectedOperationInvocation:
         reservation_usage = None
         if usage_pid is not None:
@@ -1202,6 +7496,7 @@ class McpPrimitive:
                 server_id,
                 spec,
                 runtime_environment,
+                deadline=deadline,
             ),
             data_flow_context=request_flow,
             data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
@@ -1360,6 +7655,7 @@ class McpPrimitive:
                 target=self.server_resource(server_id),
                 decision={"server_id": server_id},
             )
+        self._invalidate_modern_server(server_id)
         return {"server_id": server_id, "deleted": True}
 
     def call_tool(
@@ -1370,17 +7666,155 @@ class McpPrimitive:
         arguments: Any = None,
         *,
         source_oids: list[str] | tuple[str, ...] | None = None,
-    ) -> McpCallResult:
+    ) -> McpCallResult | McpComplete[Any] | McpInputRequired | McpRemoteTask:
         try:
+            selected_args = _canonical_mcp_arguments(
+                arguments,
+                max_bytes=self.config.mcp.max_request_hard_limit_bytes,
+            )
+            resource = self.tool_resource(server_id, tool_id)
+            self._authorize_call_visibility(
+                pid,
+                resource,
+                self._visibility_operation_context(
+                    pid,
+                    server_id,
+                    tool_id,
+                    selected_args,
+                ),
+                source_oids=source_oids,
+            )
+            registered, _metadata = self._load_server(server_id)
+            if isinstance(registered, McpServerManifestV3):
+                return self._call_tool_modern(
+                    pid,
+                    registered,
+                    tool_id,
+                    selected_args,
+                )
+            started = time.monotonic()
+            deadline = started + registered.timeout_s
             return self._call_tool(
                 pid,
                 server_id,
                 tool_id,
-                arguments,
+                selected_args,
                 source_oids=source_oids,
+                started=started,
+                deadline=deadline,
             )
         except ProviderEffectNotStarted as error:
             raise self._safe_not_started_error(error) from None
+
+    def _call_tool_modern(
+        self,
+        pid: str,
+        manifest: McpServerManifestV3,
+        tool_id: str,
+        selected_args: dict[str, Any],
+    ) -> McpComplete[Any] | McpInputRequired | McpRemoteTask:
+        """Dispatch one Manifest-v3 Tool exactly once through the modern wire.
+
+        Visibility admission has already happened before the manifest was read.
+        The protected operation below repeats exact authority admission against
+        the manifest-bound right and rejects a registry replacement between the
+        two phases.  The wire adapter is reachable only from its provider phase.
+        """
+
+        if self._resource_usage_pid(pid) is None:
+            raise NotFound(f"process not found: {pid}")
+        provider = self._modern_tool_provider
+        if provider is None or not callable(getattr(provider, "call_tool", None)):
+            raise ValidationError("MCP v3 Tool provider is unavailable")
+        tool = manifest.tool_by_id(tool_id)
+        if tool is None:
+            raise NotFound(f"MCP tool not found: {manifest.server_id}/{tool_id}")
+        try:
+            right = CapabilityRight(tool.right)
+            rollback_class = ExternalEffectRollbackClass(tool.rollback_class)
+            rollback_status = (
+                ExternalEffectRollbackStatus(tool.rollback_status)
+                if tool.rollback_status is not None
+                else default_external_effect_rollback_status(rollback_class)
+            )
+        except (TypeError, ValueError) as error:  # persisted rows fail closed
+            raise ValidationError("MCP v3 Tool effect declaration is invalid") from error
+        expected_registry_binding = self._registry_binding_for_server_spec(manifest)
+        payload = {
+            "method": "tools/call",
+            "server_id": manifest.server_id,
+            "tool_id": tool_id,
+            "arguments": selected_args,
+        }
+
+        def preflight(current: McpServerManifestV3, deadline: float) -> None:
+            current_tool = current.tool_by_id(tool_id)
+            if current_tool is None or current_tool != tool:
+                raise CapabilityDenied(
+                    "MCP Tool declaration changed before provider dispatch"
+                )
+            validate_mcp_v3_tool_arguments(
+                current_tool.input_schema,
+                selected_args,
+                host_policy=self._v3_host_policy(),
+                deadline=deadline,
+            )
+
+        def invoke(_client: Any, deadline: float) -> Any:
+            context = self._modern_dispatch_context.get()
+            if not isinstance(context, dict):  # pragma: no cover - boundary invariant
+                raise ProviderEffectNotStarted(
+                    "MCP v3 Tool dispatch is outside a protected provider phase"
+                )
+            binding = context.get("binding")
+            if not isinstance(binding, McpClientBinding):
+                raise ProviderEffectNotStarted("MCP v3 Tool binding is unavailable")
+            sensitive_values = self._modern_provider_sensitive_values(binding)
+
+            async def call_once() -> Any:
+                with bind_mcp_client_binding(binding):
+                    return await self._await_modern_provider_result(
+                        lambda: provider.call_tool(
+                            binding.manifest,
+                            tool_id,
+                            selected_args,
+                            deadline=deadline,
+                            sensitive_values=sensitive_values,
+                        ),
+                        deadline=deadline,
+                        sensitive_values=sensitive_values,
+                    )
+
+            result = _run_mcp_provider_awaitable(call_once())
+            if not isinstance(result, (McpComplete, McpInputRequired, McpRemoteTask)):
+                raise ValidationError("MCP v3 Tool provider returned an invalid result")
+            client = self._modern_client
+            limits = getattr(client, "limits", None)
+            return sanitize_mcp_operation_result(
+                result,
+                binding=binding,
+                logical_id=tool_id,
+                value_type=dict,
+                surface="tool",
+                limits=limits,
+            )
+
+        return self._run_modern_read(
+            operation="call",
+            server_id=manifest.server_id,
+            logical_id=tool_id,
+            actor=pid,
+            target=self.tool_resource(manifest.server_id, tool_id),
+            right=right,
+            payload=payload,
+            invoke=invoke,
+            manifest_preflight=preflight,
+            expected_registry_binding=expected_registry_binding,
+            state_mutation=tool.state_mutation,
+            rollback_class=rollback_class,
+            rollback_status=rollback_status,
+            contract_name="primitive.mcp.call",
+        )
 
     def _call_tool(
         self,
@@ -1390,6 +7824,7 @@ class McpPrimitive:
         arguments: Any = None,
         *,
         source_oids: list[str] | tuple[str, ...] | None = None,
+        started: float, deadline: float,
     ) -> McpCallResult:
         (
             resource,
@@ -1410,86 +7845,50 @@ class McpPrimitive:
             tool_id=tool_id,
             arguments=arguments,
             source_oids=source_oids,
+            deadline=deadline,
         )
-        request_bytes = len(dumps({"name": tool.mcp_name, "arguments": selected_args}).encode("utf-8"))
-        if request_bytes > spec.max_request_bytes:
-            raise ValidationError(f"MCP request exceeds max_request_bytes={spec.max_request_bytes}")
-        effect_context = self._effect_context(spec, tool, operation_context, request_bytes=request_bytes)
-        list_request_bytes = len(
-            dumps({"method": "tools/list", "server_id": spec.server_id}).encode("utf-8")
+        (
+            request_bytes,
+            effect_context,
+            list_request_bytes,
+            resource_context,
+            resource_progress,
+        ) = self._legacy_call_accounting(
+            spec,
+            tool,
+            selected_args,
+            operation_context,
         )
-        resource_context = {
-            "server_id": server_id,
-            "tool_id": tool_id,
-            "request_bytes": request_bytes,
-            "list_request_bytes": list_request_bytes,
-        }
-        resource_progress = {"list_response_bytes": 0}
         runtime_environment: Mapping[str, str] | None = None
 
-        failure_resource = partial(
-            self._mcp_call_failure_resource,
+        invocation = self._legacy_call_invocation(
+            pid=pid,
+            resource=resource,
             spec=spec,
+            tool=tool,
+            registry_binding=registry_binding,
+            operation_context=operation_context,
+            effect_context=effect_context,
+            decision=decision,
+            auxiliary_decisions=auxiliary_decisions,
             request_bytes=request_bytes,
             list_request_bytes=list_request_bytes,
             resource_context=resource_context,
             resource_progress=resource_progress,
-        )
-        invocation = ProtectedOperationInvocation(
-            pid=pid,
-            actor=pid,
-            target=resource,
-            decisions=tuple([decision, *auxiliary_decisions]),
-            canonical_args=operation_context,
-            observation=effect_context,
-            reservation_usage=ResourceUsage(
-                mcp_request_bytes=(
-                    spec.max_request_bytes
-                    if spec.schema_version == 2
-                    else list_request_bytes + request_bytes
-                ),
-                mcp_response_bytes=(
-                    spec.max_response_bytes
-                    if spec.schema_version == 2
-                    else spec.max_response_bytes * 2
-                ),
-            ),
-            resource_source="primitive.mcp.call",
-            resource_context=resource_context,
-            **self._protected_registry_guard(registry_binding, server_id),
-            failure_resource=failure_resource,
-            failure_evidence=lambda error, phase: self._protected_call_failure_evidence(pid, resource, tool, operation_context, error, phase),
-            data_sink=sink,
-            data_sink_revalidator=lambda: self._tool_data_sink_after_runtime_resolution(
-                server_id, spec, tool, runtime_environment, expected=sink
-            ),
-            data_flow_context=flow_context,
-            data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
-                flow_context,
-                origin="external:mcp",
-            ),
-            data_flow_payload=selected_args,
-            data_flow_operation="mcp.call_tool",
+            sink=sink,
+            flow_context=flow_context,
+            selected_args=selected_args,
+            runtime_environment_getter=lambda: runtime_environment,
+            deadline=deadline,
         )
         with self._protected().start("primitive.mcp.call", invocation, provider=self.provider) as protected:
-            started = time.monotonic()
-            deadline = started + spec.timeout_s
+            self._remaining_timeout(deadline)
             runtime_environment = self._require_runtime_environment(
                 spec,
                 pinned_stdio_environment=stdio_target_environment,
+                deadline=deadline,
             )
-            if spec.transport == "streamable_http":
-                observes_host = self._runtime_resolution_observes_host(spec)
-                protected.call(
-                    ProviderPhase(
-                        "dns_resolution",
-                        information_flow=observes_host,
-                        commits_authority=observes_host,
-                    ),
-                    self._validate_runtime_resolution,
-                    spec,
-                    deadline=deadline,
-                )
+            self._dispatch_legacy_runtime_resolution(protected, spec, deadline)
 
             validate_and_call = getattr(self.provider, "validate_and_call", None)
             if callable(validate_and_call):
@@ -1501,6 +7900,7 @@ class McpPrimitive:
                     context=flow_context,
                     payload=selected_args,
                     runtime_environment=runtime_environment,
+                    deadline=deadline,
                 )
 
                 invoke_validated_tool = partial(
@@ -1529,7 +7929,12 @@ class McpPrimitive:
                         provider_outcome.result,
                     )
                 provider_result = provider_outcome
-                result = self._call_result_from_provider(spec, tool, provider_result)
+                result = self._call_result_from_provider(
+                    spec,
+                    tool,
+                    provider_result,
+                    validated=True,
+                )
                 classification_override = self._pre_call_failure_classification_override(
                     spec,
                     tool,
@@ -1622,14 +8027,15 @@ class McpPrimitive:
                 tuple[McpProviderCallResult, ExternalEffectClassification | None]
                 | ProviderEffectNotStartedResult
             ):
+                provider_kwargs = self._provider_dispatch_kwargs(
+                    spec,
+                    deadline=deadline,
+                    pid=pid,
+                    runtime_environment=runtime_environment,
+                    executable_snapshot=executable_snapshot,
+                )
+                self._remaining_timeout(deadline)
                 try:
-                    provider_kwargs = self._provider_dispatch_kwargs(
-                        spec,
-                        deadline=deadline,
-                        pid=pid,
-                        runtime_environment=runtime_environment,
-                        executable_snapshot=executable_snapshot,
-                    )
                     raw_result = self.provider.call_tool(
                         spec,
                         tool,
@@ -1686,6 +8092,7 @@ class McpPrimitive:
                 context=flow_context,
                 payload=selected_args,
                 runtime_environment=runtime_environment,
+                deadline=deadline,
             )
             try:
                 provider_outcome = protected.call(
@@ -1703,7 +8110,12 @@ class McpPrimitive:
                 result = self._call_result_from_provider(spec, tool, provider_outcome.result)
                 return result
             provider_result, classification_override = provider_outcome
-            result = self._call_result_from_provider(spec, tool, provider_result)
+            result = self._call_result_from_provider(
+                spec,
+                tool,
+                provider_result,
+                validated=True,
+            )
             input_required_override = self._input_required_classification_override(
                 tool,
                 provider_result,
@@ -1730,6 +8142,140 @@ class McpPrimitive:
             )
             return completed
 
+    def _legacy_call_accounting(
+        self,
+        spec: McpServerSpec,
+        tool: McpToolSpec,
+        selected_args: Mapping[str, Any],
+        operation_context: Mapping[str, Any],
+    ) -> tuple[int, dict[str, Any], int, dict[str, Any], dict[str, int]]:
+        request_bytes = len(
+            dumps({"name": tool.mcp_name, "arguments": selected_args}).encode("utf-8")
+        )
+        if request_bytes > spec.max_request_bytes:
+            raise ValidationError(
+                f"MCP request exceeds max_request_bytes={spec.max_request_bytes}"
+            )
+        effect_context = self._effect_context(
+            spec,
+            tool,
+            dict(operation_context),
+            request_bytes=request_bytes,
+        )
+        list_request_bytes = len(
+            dumps({"method": "tools/list", "server_id": spec.server_id}).encode("utf-8")
+        )
+        return (
+            request_bytes,
+            effect_context,
+            list_request_bytes,
+            {
+                "server_id": spec.server_id,
+                "tool_id": tool.tool_id,
+                "request_bytes": request_bytes,
+                "list_request_bytes": list_request_bytes,
+            },
+            {"list_response_bytes": 0},
+        )
+
+    def _legacy_call_invocation(
+        self,
+        *,
+        pid: str,
+        resource: str,
+        spec: McpServerSpec,
+        tool: McpToolSpec,
+        registry_binding: ProviderRegistryBinding,
+        operation_context: dict[str, Any],
+        effect_context: dict[str, Any],
+        decision: Any,
+        auxiliary_decisions: list[Any],
+        request_bytes: int,
+        list_request_bytes: int,
+        resource_context: dict[str, Any],
+        resource_progress: dict[str, int],
+        sink: DataSink,
+        flow_context: DataFlowContext,
+        selected_args: dict[str, Any],
+        runtime_environment_getter: Any,
+        deadline: float,
+    ) -> ProtectedOperationInvocation:
+        return ProtectedOperationInvocation(
+            pid=pid,
+            actor=pid,
+            target=resource,
+            decisions=tuple([decision, *auxiliary_decisions]),
+            canonical_args=operation_context,
+            observation=effect_context,
+            reservation_usage=ResourceUsage(
+                mcp_request_bytes=(
+                    spec.max_request_bytes
+                    if spec.schema_version == 2
+                    else list_request_bytes + request_bytes
+                ),
+                mcp_response_bytes=(
+                    spec.max_response_bytes
+                    if spec.schema_version == 2
+                    else spec.max_response_bytes * 2
+                ),
+            ),
+            resource_source="primitive.mcp.call",
+            resource_context=resource_context,
+            **self._protected_registry_guard(registry_binding, spec.server_id),
+            failure_resource=partial(
+                self._mcp_call_failure_resource,
+                spec=spec,
+                request_bytes=request_bytes,
+                list_request_bytes=list_request_bytes,
+                resource_context=resource_context,
+                resource_progress=resource_progress,
+            ),
+            failure_evidence=lambda error, phase: self._protected_call_failure_evidence(
+                pid,
+                resource,
+                tool,
+                operation_context,
+                error,
+                phase,
+            ),
+            data_sink=sink,
+            data_sink_revalidator=lambda: self._tool_data_sink_after_runtime_resolution(
+                spec.server_id,
+                spec,
+                tool,
+                runtime_environment_getter(),
+                expected=sink,
+                deadline=deadline,
+            ),
+            data_flow_context=flow_context,
+            data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
+                flow_context,
+                origin="external:mcp",
+            ),
+            data_flow_payload=selected_args,
+            data_flow_operation="mcp.call_tool",
+        )
+
+    def _dispatch_legacy_runtime_resolution(
+        self,
+        protected: Any,
+        spec: McpServerSpec,
+        deadline: float,
+    ) -> None:
+        if spec.transport != "streamable_http":
+            return
+        observes_host = self._runtime_resolution_observes_host(spec)
+        protected.call(
+            ProviderPhase(
+                "dns_resolution",
+                information_flow=observes_host,
+                commits_authority=observes_host,
+            ),
+            self._validate_runtime_resolution,
+            spec,
+            deadline=deadline,
+        )
+
     def _prepare_tool_call(
         self,
         pid: str,
@@ -1738,6 +8284,7 @@ class McpPrimitive:
         tool_id: str,
         arguments: Any,
         source_oids: list[str] | tuple[str, ...] | None,
+        deadline: float,
     ) -> tuple[
         str,
         dict[str, Any],
@@ -1761,6 +8308,7 @@ class McpPrimitive:
                 source_oids=source_oids,
             )
         )
+        self._remaining_timeout(deadline)
         operation_context = self._operation_context(
             pid,
             spec,
@@ -1785,6 +8333,7 @@ class McpPrimitive:
             operation_context=operation_context,
             flow_context=flow_context,
             source_oids=source_oids,
+            deadline=deadline,
         )
         profile = self.capabilities.profiles.mcp(
             resource=resource,
@@ -1798,6 +8347,7 @@ class McpPrimitive:
             auxiliary_decisions=auxiliary_decisions,
             profile=profile,
         )
+        self._remaining_timeout(deadline)
         return (
             resource,
             selected_args,
@@ -1853,10 +8403,10 @@ class McpPrimitive:
         dict[str, Any],
     ]:
         resource = self.tool_resource(server_id, tool_id)
-        selected_args = {} if arguments is None else arguments
-        if not isinstance(selected_args, dict):
-            raise ValidationError("MCP tool arguments must be a JSON object or null")
-        self._validate_json_value(selected_args, "arguments")
+        selected_args = _canonical_mcp_arguments(
+            arguments,
+            max_bytes=self.config.mcp.max_request_hard_limit_bytes,
+        )
         visibility_context = self._visibility_operation_context(
             pid,
             server_id,
@@ -1893,7 +8443,7 @@ class McpPrimitive:
         arguments: Any = None,
         *,
         source_oids: list[str] | tuple[str, ...] | None = None,
-    ) -> McpCallResult:
+    ) -> McpCallResult | McpComplete[Any] | McpInputRequired | McpRemoteTask:
         return await self._data_flow().run_sync_in_worker(
             self.call_tool,
             pid,
@@ -1979,6 +8529,7 @@ class McpPrimitive:
         operation_context: dict[str, Any],
         flow_context: DataFlowContext,
         source_oids: list[str] | tuple[str, ...] | None,
+        deadline: float,
     ) -> tuple[DataSink, Any, list[Any], dict[str, str] | None, Mapping[str, str]]:
         precheck_sink = self._tool_data_sink_for_clearance_precheck(
             server_id,
@@ -2005,18 +8556,29 @@ class McpPrimitive:
             spec,
             consume=False,
         )
-        self._validate_arguments_against_schema(spec, tool, arguments)
-        stdio_environment = self._stdio_executable_resolution_environment(spec)
+        self._validate_arguments_against_schema(
+            spec,
+            tool,
+            arguments,
+            deadline=deadline,
+        )
+        stdio_environment = self._stdio_executable_resolution_environment(
+            spec,
+            deadline=deadline,
+        )
         stdio_identity = self._stdio_executable_identity(
             spec,
             runtime_environment=stdio_environment,
+            deadline=deadline,
         )
         sink = self._tool_data_sink_from_stdio_identity(
             server_id,
             spec,
             tool,
             stdio_identity,
+            deadline=deadline,
         )
+        self._remaining_timeout(deadline)
         self._data_flow().authorize_egress(
             pid=pid,
             sink=sink,
@@ -2024,6 +8586,7 @@ class McpPrimitive:
             payload=arguments,
             operation="mcp.call_tool",
         )
+        self._remaining_timeout(deadline)
         return (
             sink,
             decision,
@@ -2123,19 +8686,19 @@ class McpPrimitive:
         server: McpServerSpec,
         tool: McpToolSpec,
         *,
-        timeout_s: float | None = None,
+        deadline: float,
         pid: str | None = None,
         executable_snapshot: ExecutableSnapshot | None = None,
         runtime_environment: Mapping[str, str] | None = None,
     ) -> McpToolListResult:
-        selected_timeout = server.timeout_s if timeout_s is None else timeout_s
         provider_kwargs = self._provider_dispatch_kwargs(
             server,
-            deadline=time.monotonic() + selected_timeout,
+            deadline=deadline,
             pid=pid,
             runtime_environment=runtime_environment,
             executable_snapshot=executable_snapshot,
         )
+        self._remaining_timeout(deadline)
         try:
             raw_result = self.provider.list_tools(
                 server,
@@ -2194,6 +8757,7 @@ class McpPrimitive:
             runtime_environment=runtime_environment,
             executable_snapshot=executable_snapshot,
         )
+        self._remaining_timeout(deadline)
         try:
             raw_result = self.provider.discover(server, **provider_kwargs)  # type: ignore[attr-defined]
             return self._validated_discovery_result(
@@ -2306,14 +8870,18 @@ class McpPrimitive:
         executable_snapshot: ExecutableSnapshot | None,
         runtime_environment: Mapping[str, str],
     ) -> tuple[McpToolListResult | None, ProviderHostError | None]:
+        # Local deadline/resource/provider-compatibility checks are part of the
+        # primitive boundary, not untrusted provider execution. Keep them out of
+        # the provider exception mapper so their stable local error types survive.
+        provider_kwargs = self._provider_dispatch_kwargs(
+            server,
+            deadline=deadline,
+            pid=pid,
+            runtime_environment=runtime_environment,
+            executable_snapshot=executable_snapshot,
+        )
+        self._remaining_timeout(deadline)
         try:
-            provider_kwargs = self._provider_dispatch_kwargs(
-                server,
-                deadline=deadline,
-                pid=pid,
-                runtime_environment=runtime_environment,
-                executable_snapshot=executable_snapshot,
-            )
             raw_result = self.provider.list_tools(server, **provider_kwargs)
             return (
                 self._validated_tool_list_result(
@@ -2367,6 +8935,7 @@ class McpPrimitive:
             context=context,
             payload=payload,
             runtime_environment=runtime_environment,
+            deadline=deadline,
         )
         try:
             return protected.call(
@@ -2462,9 +9031,17 @@ class McpPrimitive:
                         "MCP tools/list exceeds maximum page receipts="
                         f"{getattr(self, 'config', DEFAULT_CONFIG).mcp.list_max_pages}"
                     )
+            sensitive_values = mcp_runtime_secret_values(
+                server,
+                runtime_environment,
+            )
+            public_tools = _redact_mcp_provider_tools(
+                selected_tools,
+                sensitive_values=sensitive_values,
+            )
             return McpToolListResult(
                 server_id=server_id,
-                tools=selected_tools,
+                tools=public_tools,
                 response_bytes=response_bytes,
                 duration_s=float(duration_s),
                 connection=connection,
@@ -2674,7 +9251,10 @@ class McpPrimitive:
         sensitive_values: tuple[str, ...] = (),
     ) -> tuple[str, ...]:
         mcp_config = getattr(self, "config", DEFAULT_CONFIG).mcp
-        if type(names) is not tuple or len(names) > mcp_config.list_limit:
+        if (
+            type(names) is not tuple
+            or len(names) > mcp_config.provider_capability_limit
+        ):
             raise TypeError(f"MCP provider {field} is invalid")
         selected: list[str] = []
         raw_names: list[str] = []
@@ -3145,12 +9725,21 @@ class McpPrimitive:
             )
             if server.schema_version == 2:
                 if connection is not None:
-                    self._validate_v2_call_receipts(
-                        server,
-                        result,
-                        connection,
-                        receipts,
+                    negotiated_pre_list_failure = (
+                        self._validate_v2_negotiated_pre_list_failure(
+                            server,
+                            result,
+                            connection,
+                            receipts,
+                        )
                     )
+                    if not negotiated_pre_list_failure:
+                        self._validate_v2_call_receipts(
+                            server,
+                            result,
+                            connection,
+                            receipts,
+                        )
             else:
                 if any(
                     receipt.phase
@@ -3173,16 +9762,49 @@ class McpPrimitive:
                     for receipt in receipts
                 ) > 1:
                     raise TypeError("MCP provider automatically retried tools/call")
+            sensitive_values = mcp_runtime_secret_values(
+                server,
+                runtime_environment,
+            )
+            public_content = _redact_mcp_provider_json(
+                selected_content,
+                sensitive_values=sensitive_values,
+            )
+            public_structured_content = _redact_mcp_provider_json(
+                selected_structured_content,
+                sensitive_values=sensitive_values,
+            )
             return McpProviderCallResult(
-                content=selected_content,
-                structured_content=selected_structured_content,
+                content=public_content,
+                structured_content=public_structured_content,
                 is_error=result.is_error,
-                error=result.error,
+                error=(
+                    redact_sensitive_text(
+                        result.error,
+                        sensitive_values=sensitive_values,
+                    )
+                    if result.error is not None
+                    else None
+                ),
                 response_bytes=result.response_bytes,
                 duration_s=float(result.duration_s),
                 too_large=result.too_large,
-                error_type=result.error_type,
-                correlation_id=result.correlation_id,
+                error_type=(
+                    redact_sensitive_text(
+                        result.error_type,
+                        sensitive_values=sensitive_values,
+                    )
+                    if result.error_type is not None
+                    else None
+                ),
+                correlation_id=(
+                    redact_sensitive_text(
+                        result.correlation_id,
+                        sensitive_values=sensitive_values,
+                    )
+                    if result.correlation_id is not None
+                    else None
+                ),
                 list_request_bytes=result.list_request_bytes,
                 list_response_bytes=result.list_response_bytes,
                 call_request_bytes=result.call_request_bytes,
@@ -3266,6 +9888,53 @@ class McpPrimitive:
             )
         return True
 
+    def _validate_v2_negotiated_pre_list_failure(
+        self,
+        server: McpServerSpec,
+        result: McpProviderCallResult,
+        connection: McpConnectionInfo,
+        receipts: tuple[McpExchangeReceipt, ...],
+    ) -> bool:
+        """Accept the built-in wire-certified prefix before first tools/list.
+
+        A custom provider cannot self-certify this narrower dispatch state. A
+        built-in failure after any list page is handled by the normal call
+        receipt grammar instead.
+        """
+
+        if (
+            type(getattr(self, "provider", None)) is not SdkMcpProvider
+            or result.error_type != "McpPreCallFailure"
+        ):
+            return False
+        negotiation_end = self._validated_v2_negotiation_prefix(
+            server,
+            connection,
+            receipts,
+        )
+        if negotiation_end != len(receipts):
+            return False
+        if (
+            not result.error
+            or result.content is not None
+            or result.structured_content is not None
+            or result.is_error
+            or result.too_large
+            or result.call_started
+            or any(
+                value != 0
+                for value in (
+                    result.response_bytes,
+                    result.list_request_bytes,
+                    result.list_response_bytes,
+                    result.call_request_bytes,
+                    result.call_response_bytes,
+                )
+            )
+        ):
+            raise TypeError("MCP negotiated pre-list failure is invalid")
+        return True
+
     def _validate_live_tool_for_call(
         self,
         server: McpServerSpec,
@@ -3282,7 +9951,7 @@ class McpPrimitive:
             result = self._validate_live_tool(
                 server,
                 tool,
-                timeout_s=self._remaining_timeout(deadline),
+                deadline=deadline,
                 pid=pid,
                 executable_snapshot=executable_snapshot,
                 runtime_environment=runtime_environment,
@@ -3317,6 +9986,7 @@ class McpPrimitive:
             context=context,
             payload=payload,
             runtime_environment=runtime_environment,
+            deadline=deadline,
         )
         try:
             return protected.call(
@@ -3360,6 +10030,11 @@ class McpPrimitive:
             "max_response_bytes": server.max_response_bytes,
             "runtime_environment": runtime_environment,
         }
+        if (
+            isinstance(self.provider, McpAbsoluteDeadlineProvider)
+            and self.provider.supports_mcp_absolute_deadline is True
+        ):
+            selected["deadline"] = deadline
         if executable_snapshot is not None:
             selected["executable_snapshot"] = executable_snapshot
         if server.transport == "stdio":
@@ -3472,8 +10147,21 @@ class McpPrimitive:
         server: McpServerSpec,
         tool: McpToolSpec,
         provider_result: McpProviderCallResult,
+        *,
+        validated: bool = False,
     ) -> McpCallResult:
-        provider_result = self._validated_provider_call_result(server, provider_result)
+        if not validated:
+            provider_result = self._validated_provider_call_result(
+                server,
+                provider_result,
+            )
+        dispatch_state = self._public_call_dispatch_state(server, provider_result)
+        retry_class = self._public_call_retry_class(
+            ok=not provider_result.error
+            and not provider_result.is_error
+            and not provider_result.too_large,
+            dispatch_state=dispatch_state,
+        )
         if provider_result.error_type == "mcp_input_required_unsupported":
             return McpCallResult(
                 server_id=server.server_id,
@@ -3497,6 +10185,8 @@ class McpPrimitive:
                 duration_s=provider_result.duration_s,
                 connection=provider_result.connection,
                 receipts=provider_result.receipts,
+                dispatch_state=McpDispatchState.STARTED,
+                retry_class=McpRetryClass.UNSAFE_OR_UNKNOWN,
             )
         if provider_result.error:
             safe_message = self._safe_transport_error_message(
@@ -3513,6 +10203,8 @@ class McpPrimitive:
                     "code": "mcp_provider_error",
                     "error_type": provider_result.error_type or "TransportError",
                     "correlation_id": provider_result.correlation_id or new_id("corr"),
+                    "retryable": False,
+                    "automatic_retry_disabled": True,
                     **(
                         {"message": safe_message}
                         if safe_message is not None
@@ -3523,6 +10215,8 @@ class McpPrimitive:
                 duration_s=provider_result.duration_s,
                 connection=provider_result.connection,
                 receipts=provider_result.receipts,
+                dispatch_state=dispatch_state,
+                retry_class=retry_class,
             )
         if provider_result.too_large:
             return self._failure(
@@ -3566,7 +10260,50 @@ class McpPrimitive:
             duration_s=provider_result.duration_s,
             connection=provider_result.connection,
             receipts=provider_result.receipts,
+            dispatch_state=McpDispatchState.STARTED,
+            retry_class=McpRetryClass.NOT_APPLICABLE,
         )
+
+    def _public_call_dispatch_state(
+        self,
+        server: McpServerSpec,
+        provider_result: McpProviderCallResult,
+    ) -> McpDispatchState:
+        """Project only dispatch evidence trusted by the effect classifier."""
+
+        if (
+            provider_result.call_started
+            or provider_result.error is None
+            or provider_result.is_error
+        ):
+            return McpDispatchState.STARTED
+        if server.schema_version == 1:
+            # Manifest v1 retains its released Provider SPI certificate.
+            return McpDispatchState.NOT_STARTED
+        if (
+            type(getattr(self, "provider", None)) is SdkMcpProvider
+            and provider_result.call_request_bytes == 0
+            and provider_result.call_response_bytes == 0
+            and provider_result.response_bytes == 0
+            and all(
+                receipt.phase is not McpExchangePhase.TOOLS_CALL
+                for receipt in provider_result.receipts
+            )
+        ):
+            return McpDispatchState.NOT_STARTED
+        return McpDispatchState.UNKNOWN
+
+    @staticmethod
+    def _public_call_retry_class(
+        *,
+        ok: bool,
+        dispatch_state: McpDispatchState,
+    ) -> McpRetryClass:
+        if ok:
+            return McpRetryClass.NOT_APPLICABLE
+        if dispatch_state is McpDispatchState.NOT_STARTED:
+            return McpRetryClass.REOBSERVE_REQUIRED
+        return McpRetryClass.UNSAFE_OR_UNKNOWN
 
     def _invoke_validated_provider_tool(
         self,
@@ -3581,14 +10318,17 @@ class McpPrimitive:
         executable_snapshot: ExecutableSnapshot | None,
         started: float,
     ) -> McpProviderCallResult | ProviderEffectNotStartedResult:
+        # Build kwargs before entering the untrusted provider boundary. Local
+        # resource/deadline/compatibility failures must not become provider errors.
+        provider_kwargs = self._provider_dispatch_kwargs(
+            server,
+            deadline=deadline,
+            pid=pid,
+            runtime_environment=runtime_environment,
+            executable_snapshot=executable_snapshot,
+        )
+        self._remaining_timeout(deadline)
         try:
-            provider_kwargs = self._provider_dispatch_kwargs(
-                server,
-                deadline=deadline,
-                pid=pid,
-                runtime_environment=runtime_environment,
-                executable_snapshot=executable_snapshot,
-            )
             raw_result = validate_and_call(
                 server,
                 tool,
@@ -3908,6 +10648,7 @@ class McpPrimitive:
             McpCallStatus.RESPONSE_TOO_LARGE: "mcp_response_too_large",
             McpCallStatus.TRANSPORT_ERROR: "mcp_provider_error",
         }.get(status, "mcp_call_failed")
+        dispatch_state = self._public_call_dispatch_state(server, provider_result)
         return McpCallResult(
             server_id=server.server_id,
             tool_id=tool.tool_id,
@@ -3919,12 +10660,19 @@ class McpPrimitive:
                 "error_type": provider_result.error_type or status.value,
                 "correlation_id": provider_result.correlation_id or new_id("corr"),
                 "message": message,
+                "retryable": False,
+                "automatic_retry_disabled": True,
                 **dict(extra or {}),
             },
             response_bytes=provider_result.response_bytes,
             duration_s=provider_result.duration_s,
             connection=provider_result.connection,
             receipts=provider_result.receipts,
+            dispatch_state=dispatch_state,
+            retry_class=self._public_call_retry_class(
+                ok=False,
+                dispatch_state=dispatch_state,
+            ),
         )
 
     def _protected(self) -> Any:
@@ -3958,57 +10706,75 @@ class McpPrimitive:
 
     def _server_identity_sha256(
         self,
-        spec: McpServerSpec,
+        spec: McpRegisteredServer,
         tool: McpToolSpec,
         *,
         stdio_executable: dict[str, str] | None | object = (
             _STDIO_EXECUTABLE_IDENTITY_UNSET
         ),
+        deadline: float | None = None,
     ) -> str | None:
+        if deadline is not None:
+            self._remaining_timeout(deadline)
         if stdio_executable is _STDIO_EXECUTABLE_IDENTITY_UNSET:
-            stdio_executable = self._stdio_executable_identity(spec)
+            stdio_executable = self._stdio_executable_identity(
+                spec,
+                deadline=deadline,
+            )
         if spec.transport == "stdio" and stdio_executable is None:
             # A stdio provider that cannot resolve the exact executable may
             # still handle normal data, but it cannot match Host clearance for
             # data above normal sensitivity.
             return None
-        return hashlib.sha256(
+        digest = hashlib.sha256(
             dumps(
                 to_jsonable(
                     {
                         "schema_version": spec.schema_version,
-                        "server": mcp_server_spec_to_jsonable(spec),
+                        "server": self._registered_server_to_jsonable(spec),
                         "tool": tool,
                         "stdio_executable": stdio_executable,
                     }
                 )
             ).encode("utf-8")
         ).hexdigest()
+        if deadline is not None:
+            self._remaining_timeout(deadline)
+        return digest
 
     def _list_tools_identity_sha256(
         self,
-        spec: McpServerSpec,
+        spec: McpRegisteredServer,
         *,
         stdio_executable: dict[str, str] | None | object = (
             _STDIO_EXECUTABLE_IDENTITY_UNSET
         ),
+        deadline: float | None = None,
     ) -> str | None:
+        if deadline is not None:
+            self._remaining_timeout(deadline)
         if stdio_executable is _STDIO_EXECUTABLE_IDENTITY_UNSET:
-            stdio_executable = self._stdio_executable_identity(spec)
+            stdio_executable = self._stdio_executable_identity(
+                spec,
+                deadline=deadline,
+            )
         if spec.transport == "stdio" and stdio_executable is None:
             return None
-        return hashlib.sha256(
+        digest = hashlib.sha256(
             dumps(
                 to_jsonable(
                     {
                         "schema_version": spec.schema_version,
-                        "server": mcp_server_spec_to_jsonable(spec),
+                        "server": self._registered_server_to_jsonable(spec),
                         "operation": "tools/list",
                         "stdio_executable": stdio_executable,
                     }
                 )
             ).encode("utf-8")
         ).hexdigest()
+        if deadline is not None:
+            self._remaining_timeout(deadline)
+        return digest
 
     def _discover_identity_sha256(
         self,
@@ -4017,29 +10783,40 @@ class McpPrimitive:
         stdio_executable: dict[str, str] | None | object = (
             _STDIO_EXECUTABLE_IDENTITY_UNSET
         ),
+        deadline: float | None = None,
     ) -> str | None:
+        if deadline is not None:
+            self._remaining_timeout(deadline)
         if stdio_executable is _STDIO_EXECUTABLE_IDENTITY_UNSET:
-            stdio_executable = self._stdio_executable_identity(spec)
+            stdio_executable = self._stdio_executable_identity(
+                spec,
+                deadline=deadline,
+            )
         if spec.transport == "stdio" and stdio_executable is None:
             return None
-        return hashlib.sha256(
+        digest = hashlib.sha256(
             dumps(
                 to_jsonable(
                     {
                         "schema_version": 2,
-                        "server": mcp_server_spec_to_jsonable(spec),
+                        "server": self._registered_server_to_jsonable(spec),
                         "operation": "server/discover",
                         "stdio_executable": stdio_executable,
                     }
                 )
             ).encode("utf-8")
         ).hexdigest()
+        if deadline is not None:
+            self._remaining_timeout(deadline)
+        return digest
 
     def _stdio_executable_identity(
         self,
         spec: McpServerSpec,
         *,
         runtime_environment: Mapping[str, str] | None = None,
+        deadline: float | None = None,
+        fail_closed: bool = False,
     ) -> dict[str, str] | None:
         if spec.transport != "stdio" or spec.stdio is None:
             return None
@@ -4047,6 +10824,8 @@ class McpPrimitive:
         if not callable(resolver):
             return None
         try:
+            if deadline is not None:
+                self._remaining_timeout(deadline)
             resolver_kwargs = (
                 {"runtime_environment": runtime_environment}
                 if runtime_environment is not None
@@ -4060,11 +10839,26 @@ class McpPrimitive:
                 else {}
             )
             resolved = Path(resolver(spec, **resolver_kwargs)).resolve(strict=True)
+            if deadline is not None:
+                self._remaining_timeout(deadline)
             return {
                 "path": resolved.as_posix(),
-                "content_sha256": executable_content_sha256(resolved),
+                "content_sha256": executable_content_sha256(
+                    resolved,
+                    deadline=deadline,
+                ),
             }
-        except (OSError, ValidationError):
+        except TimeoutError as exc:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ProviderEffectNotStarted(
+                    "MCP deadline exhausted during executable identity"
+                ) from exc
+            raise
+        except (OSError, ValidationError) as exc:
+            if fail_closed:
+                raise ValidationError(
+                    "MCP stdio executable identity is unavailable"
+                ) from exc
             # Preserve normal-sensitivity compatibility, but leave the Sink
             # unidentified so any Host rule above normal fails closed.
             return None
@@ -4096,7 +10890,11 @@ class McpPrimitive:
     def _stdio_executable_resolution_environment(
         self,
         spec: McpServerSpec,
+        *,
+        deadline: float | None = None,
     ) -> Mapping[str, str]:
+        if deadline is not None:
+            self._remaining_timeout(deadline)
         if spec.transport != "stdio" or spec.stdio is None:
             return MappingProxyType({})
         command = spec.stdio.command
@@ -4105,6 +10903,8 @@ class McpPrimitive:
         child_names = ("PATH", "PATHEXT") if _MCP_WINDOWS else ("PATH",)
         selected: dict[str, str] = {}
         for child_name in child_names:
+            if deadline is not None:
+                self._remaining_timeout(deadline)
             host_name = spec.stdio.env.get(child_name)
             if host_name is None:
                 if _MCP_WINDOWS:
@@ -4124,6 +10924,8 @@ class McpPrimitive:
                     f"MCP stdio env {child_name} contains NUL byte"
                 )
             selected[child_name] = resolved
+        if deadline is not None:
+            self._remaining_timeout(deadline)
         return MappingProxyType(selected)
 
     def _tool_data_sink_from_stdio_identity(
@@ -4132,6 +10934,8 @@ class McpPrimitive:
         spec: McpServerSpec,
         tool: McpToolSpec,
         stdio_identity: dict[str, str] | None,
+        *,
+        deadline: float | None = None,
     ) -> DataSink:
         return DataSink(
             f"mcp:{server_id}:{tool.tool_id}",
@@ -4139,6 +10943,7 @@ class McpPrimitive:
                 spec,
                 tool,
                 stdio_executable=stdio_identity,
+                deadline=deadline,
             ),
         )
 
@@ -4148,16 +10953,20 @@ class McpPrimitive:
         spec: McpServerSpec,
         tool: McpToolSpec,
         runtime_environment: Mapping[str, str],
+        *,
+        deadline: float | None = None,
     ) -> DataSink:
         stdio_identity = self._stdio_executable_identity(
             spec,
             runtime_environment=runtime_environment,
+            deadline=deadline,
         )
         return self._tool_data_sink_from_stdio_identity(
             server_id,
             spec,
             tool,
             stdio_identity,
+            deadline=deadline,
         )
 
     def _tool_data_sink_after_runtime_resolution(
@@ -4168,7 +10977,10 @@ class McpPrimitive:
         runtime_environment: Mapping[str, str] | None,
         *,
         expected: DataSink,
+        deadline: float | None = None,
     ) -> DataSink:
+        if deadline is not None:
+            self._remaining_timeout(deadline)
         if runtime_environment is None:
             return expected
         return self._tool_data_sink(
@@ -4176,6 +10988,7 @@ class McpPrimitive:
             spec,
             tool,
             runtime_environment,
+            deadline=deadline,
         )
 
     def _list_tools_data_sink(
@@ -4183,16 +10996,20 @@ class McpPrimitive:
         server_id: str,
         spec: McpServerSpec,
         runtime_environment: Mapping[str, str],
+        *,
+        deadline: float | None = None,
     ) -> DataSink:
         stdio_identity = self._stdio_executable_identity(
             spec,
             runtime_environment=runtime_environment,
+            deadline=deadline,
         )
         return DataSink(
             f"mcp:{server_id}:list_tools",
             self._list_tools_identity_sha256(
                 spec,
                 stdio_executable=stdio_identity,
+                deadline=deadline,
             ),
         )
 
@@ -4201,16 +11018,20 @@ class McpPrimitive:
         server_id: str,
         spec: McpServerSpec,
         runtime_environment: Mapping[str, str] | None,
+        *,
+        deadline: float | None = None,
     ) -> DataSink:
         stdio_identity = self._stdio_executable_identity(
             spec,
             runtime_environment=runtime_environment,
+            deadline=deadline,
         )
         return DataSink(
             f"mcp:{server_id}:discover",
             self._discover_identity_sha256(
                 spec,
                 stdio_executable=stdio_identity,
+                deadline=deadline,
             ),
         )
 
@@ -4224,6 +11045,7 @@ class McpPrimitive:
         context: DataFlowContext,
         payload: Any,
         runtime_environment: Mapping[str, str] | None = None,
+        deadline: float,
     ) -> ExecutableSnapshot | None:
         if spec.transport != "stdio" or spec.stdio is None:
             return None
@@ -4243,16 +11065,28 @@ class McpPrimitive:
             )
             else {}
         )
+        self._remaining_timeout(deadline)
         resolved = Path(resolver(spec, **resolver_kwargs)).resolve(strict=True)
+        self._remaining_timeout(deadline)
         snapshot_required = bool(
             checker(spec, str(resolved), **resolver_kwargs)
         )
+        self._remaining_timeout(deadline)
         if not snapshot_required:
             if expected_identity is None:
                 return None
+            try:
+                content_sha256 = executable_content_sha256(
+                    resolved,
+                    deadline=deadline,
+                )
+            except TimeoutError as error:
+                raise ProviderEffectNotStarted(
+                    "MCP deadline exhausted during final executable fingerprint"
+                ) from error
             actual = {
                 "path": resolved.as_posix(),
-                "content_sha256": executable_content_sha256(resolved),
+                "content_sha256": content_sha256,
             }
             if actual != expected_identity:
                 self._data_flow().reject_sink_identity_change(
@@ -4273,11 +11107,17 @@ class McpPrimitive:
                 reason="MCP provider cannot pin a mutable stdio executable",
             )
             raise AssertionError("data-flow Sink rejection must raise")
-        snapshot = snapshot_executable(
-            resolved,
-            sibling_limit=self.config.tools.executable_snapshot_sibling_limit,
-            sibling_policy="scripts",
-        )
+        try:
+            snapshot = snapshot_executable(
+                resolved,
+                sibling_limit=self.config.tools.executable_snapshot_sibling_limit,
+                sibling_policy="scripts",
+                deadline=deadline,
+            )
+        except TimeoutError as error:
+            raise ProviderEffectNotStarted(
+                "MCP deadline exhausted during final executable snapshot"
+            ) from error
         actual = {
             "path": snapshot.source_path.as_posix(),
             "content_sha256": snapshot.content_sha256,
@@ -4295,6 +11135,11 @@ class McpPrimitive:
                 ),
             )
             raise AssertionError("data-flow Sink rejection must raise")
+        try:
+            self._remaining_timeout(deadline)
+        except BaseException:
+            snapshot.close()
+            raise
         return snapshot
 
     def _protected_list_evidence(
@@ -4520,6 +11365,9 @@ class McpPrimitive:
             "ok": result.ok,
             "response_bytes": result.response_bytes,
             "duration_s": result.duration_s,
+            "dispatch_state": result.dispatch_state.value,
+            "retry_class": result.retry_class.value,
+            "automatic_retry_disabled": result.automatic_retry_disabled,
         }
         if result.receipts:
             payload["receipts"] = to_jsonable(result.receipts)
@@ -4547,14 +11395,21 @@ class McpPrimitive:
         duration_s: float,
     ) -> McpCallResult:
         if isinstance(error, ProviderHostError):
+            public_error = {
+                **error.to_dict(),
+                "retryable": False,
+                "automatic_retry_disabled": True,
+            }
             return McpCallResult(
                 server_id=server.server_id,
                 tool_id=tool.tool_id,
                 mcp_name=tool.mcp_name,
                 status=McpCallStatus.INVALID_RESPONSE,
                 ok=False,
-                error=error.to_dict(),
+                error=public_error,
                 duration_s=duration_s,
+                dispatch_state=McpDispatchState.NOT_STARTED,
+                retry_class=McpRetryClass.REOBSERVE_REQUIRED,
             )
         return self._failure(
             server,
@@ -4996,9 +11851,25 @@ class McpPrimitive:
         }
 
     @staticmethod
-    def _server_spec_sha256(server: McpServerSpec) -> str:
+    def _registered_server_to_jsonable(
+        server: McpRegisteredServer,
+    ) -> dict[str, Any]:
+        if isinstance(server, McpServerManifestV3):
+            selected = json.loads(canonical_mcp_v3_manifest_json(server))
+            if not isinstance(selected, dict):  # pragma: no cover - canonical invariant
+                raise ValidationError("canonical MCP Manifest v3 must be an object")
+            return selected
+        return mcp_server_spec_to_jsonable(server)
+
+    @staticmethod
+    def _server_spec_sha256(server: McpRegisteredServer) -> str:
+        canonical = (
+            canonical_mcp_v3_manifest_json(server)
+            if isinstance(server, McpServerManifestV3)
+            else canonical_mcp_server_spec_json(server)
+        )
         return hashlib.sha256(
-            canonical_mcp_server_spec_json(server).encode("utf-8")
+            canonical.encode("utf-8")
         ).hexdigest()
 
     def _registry_binding_context(self, server_id: str) -> dict[str, Any]:
@@ -5026,7 +11897,7 @@ class McpPrimitive:
 
     def _registry_binding_for_server_spec(
         self,
-        server: McpServerSpec,
+        server: McpRegisteredServer,
     ) -> dict[str, Any]:
         binding = self._registry_binding_context(server.server_id)
         if binding["registry_spec_sha256"] != self._server_spec_sha256(server):
@@ -5074,7 +11945,25 @@ class McpPrimitive:
             "request_bytes": request_bytes,
         }
 
-    def _coerce_server(self, value: McpServerSpec | dict[str, Any]) -> McpServerSpec:
+    def _coerce_server(
+        self,
+        value: McpRegisteredServer | dict[str, Any],
+    ) -> McpRegisteredServer:
+        if isinstance(value, McpServerManifestV3):
+            validate_mcp_v3_manifest(
+                value,
+                host_policy=self._v3_host_policy(),
+                enforce_host_policy=True,
+            )
+            return value
+        if isinstance(value, dict) and value.get("schema_version") == 3:
+            manifest = parse_mcp_v3_manifest_mapping(value)
+            validate_mcp_v3_manifest(
+                manifest,
+                host_policy=self._v3_host_policy(),
+                enforce_host_policy=True,
+            )
+            return manifest
         typed_input = isinstance(value, McpServerSpec)
         if typed_input:
             # Normalize typed and mapping/YAML inputs identically.  Runtime
@@ -5156,6 +12045,38 @@ class McpPrimitive:
         self._validate_server(spec)
         return spec
 
+    def _v3_host_policy(self) -> McpManifestV3HostPolicy:
+        selected = self.config.mcp
+        return McpManifestV3HostPolicy(
+            server_id_max_chars=selected.server_id_max_chars,
+            tool_id_max_chars=selected.tool_id_max_chars,
+            mcp_name_max_chars=selected.mcp_name_max_chars,
+            header_name_max_chars=selected.header_name_max_chars,
+            timeout_hard_limit_s=selected.timeout_hard_limit_s,
+            max_request_hard_limit_bytes=selected.max_request_hard_limit_bytes,
+            max_response_hard_limit_bytes=selected.max_response_hard_limit_bytes,
+            tool_catalog_limit=selected.tool_catalog_limit,
+            resource_catalog_limit=selected.resource_catalog_limit,
+            resource_template_limit=selected.resource_template_limit,
+            prompt_catalog_limit=selected.prompt_catalog_limit,
+            schema_max_depth=selected.schema_max_depth,
+            schema_max_nodes=selected.schema_max_nodes,
+            schema_max_ref_hops=selected.schema_max_ref_hops,
+            schema_max_composition_expansions=(
+                selected.schema_max_composition_expansions
+            ),
+            schema_regex_pattern_max_bytes=(
+                selected.schema_regex_pattern_max_bytes
+            ),
+            schema_regex_max_evaluations=selected.schema_regex_max_evaluations,
+            schema_regex_match_timeout_s=selected.schema_regex_match_timeout_s,
+            header_env_allowlist=tuple(selected.header_env_allowlist),
+            stdio_env_allowlist=tuple(selected.stdio_env_allowlist),
+            oauth_enabled=selected.oauth_enabled,
+            tasks_extension_enabled=selected.tasks_extension_enabled,
+            tasks_extension_spec_sha256=selected.tasks_extension_spec_sha256,
+        )
+
     def _stdio_spec(self, value: Any) -> McpStdioTransportSpec:
         if not isinstance(value, dict):
             raise ValidationError("MCP stdio transport requires stdio object")
@@ -5219,7 +12140,14 @@ class McpPrimitive:
             metadata=self._mapping_field(value, "metadata", "MCP tool"),
         )
 
-    def _validate_server(self, server: McpServerSpec) -> None:
+    def _validate_server(self, server: McpRegisteredServer) -> None:
+        if isinstance(server, McpServerManifestV3):
+            validate_mcp_v3_manifest(
+                server,
+                host_policy=self._v3_host_policy(),
+                enforce_host_policy=True,
+            )
+            return
         self._validate_server_protocol(server)
         self._validate_identifier(server.server_id, "server_id", self.config.mcp.server_id_max_chars)
         self._validate_server_transport(server)
@@ -5504,16 +12432,45 @@ class McpPrimitive:
         *,
         host_environment: Mapping[str, str] | None = None,
         pinned_stdio_environment: Mapping[str, str] | None = None,
+        deadline: float | None = None,
     ) -> Mapping[str, str]:
+        if deadline is not None:
+            self._remaining_timeout(deadline)
         selected_host_environment = self._runtime_environment_input_snapshot(
             server,
             host_environment=host_environment,
             pinned_stdio_environment=pinned_stdio_environment,
         )
-        return self._runtime_environment_from_host(
+        if deadline is not None:
+            self._remaining_timeout(deadline)
+        resolved = self._runtime_environment_from_host(
             server,
             selected_host_environment,
             pinned_stdio_environment=pinned_stdio_environment,
+        )
+        if deadline is not None:
+            self._remaining_timeout(deadline)
+        return resolved
+
+    def snapshot_modern_transport_environment(
+        self,
+        server: McpServerSpec,
+    ) -> McpTransportEnvironmentSnapshot:
+        """Capture one immutable Host input snapshot for modern composition.
+
+        This narrow bridge prevents the Runtime binding resolver from reaching
+        through the primitive's private environment normalization helpers.
+        It returns a repr-safe value object and performs no Provider I/O.
+        """
+
+        selected_input = self._runtime_environment_input_snapshot(server)
+        resolved = self._require_runtime_environment(
+            server,
+            host_environment=selected_input,
+        )
+        return McpTransportEnvironmentSnapshot(
+            runtime_environment=selected_input,
+            sensitive_values=mcp_runtime_secret_values(server, resolved),
         )
 
     def _runtime_environment_input_snapshot(
@@ -5744,6 +12701,7 @@ class McpPrimitive:
         self._validate_json_value(schema, field)
         if modern:
             self._validate_v2_json_schema_safety(schema, field)
+        self._validate_schema_regex_patterns(schema, field)
         try:
             jsonschema_validator_for(schema).check_schema(schema)
         except JsonSchemaSchemaError as exc:
@@ -5754,27 +12712,159 @@ class McpPrimitive:
         server: McpServerSpec,
         tool: McpToolSpec,
         arguments: dict[str, Any],
+        *,
+        deadline: float | None = None,
     ) -> None:
         if not tool.input_schema:
+            if deadline is not None:
+                self._remaining_timeout(deadline)
             return
+        if deadline is not None:
+            self._remaining_timeout(deadline)
         if server.schema_version == 2:
             self._validate_v2_json_schema_safety(
                 tool.input_schema,
                 "input_schema",
+                deadline=deadline,
             )
+        regex_budget = self._schema_regex_budget(deadline=deadline)
+        self._validate_schema_regex_patterns(
+            tool.input_schema,
+            "input_schema",
+            budget=regex_budget,
+        )
         try:
+            regex_budget.checkpoint()
             validator = jsonschema_validator_for(tool.input_schema)
             validator.check_schema(tool.input_schema)
-            validator(tool.input_schema).validate(arguments)
+            self._bounded_schema_validator(
+                tool.input_schema,
+                field="input_schema",
+                budget=regex_budget,
+            ).validate(arguments)
+            regex_budget.checkpoint()
         except JsonSchemaValidationError as exc:
             raise ValidationError(f"MCP tool arguments failed schema validation: {exc.message}") from exc
         except JsonSchemaSchemaError as exc:
             raise ValidationError("MCP tool input_schema is invalid") from exc
 
+    def _schema_regex_budget(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> _McpSchemaRegexBudget:
+        config = getattr(self, "config", DEFAULT_CONFIG).mcp
+        return _McpSchemaRegexBudget(
+            pattern_max_bytes=config.schema_regex_pattern_max_bytes,
+            max_evaluations=config.schema_regex_max_evaluations,
+            timeout_s=config.schema_regex_match_timeout_s,
+            operation_deadline=deadline,
+        )
+
+    @staticmethod
+    def _iter_schema_nodes(schema: dict[str, Any]) -> Any:
+        """Yield actual schema nodes without treating property names as keywords."""
+
+        single_schema_keywords = {
+            "additionalItems",
+            "additionalProperties",
+            "contains",
+            "contentSchema",
+            "else",
+            "if",
+            "items",
+            "not",
+            "propertyNames",
+            "then",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+        }
+        schema_array_keywords = {
+            "allOf",
+            "anyOf",
+            "oneOf",
+            "prefixItems",
+        }
+        schema_map_keywords = {
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+            "patternProperties",
+            "properties",
+        }
+        pending: list[Any] = [schema]
+        seen: set[int] = set()
+        while pending:
+            node = pending.pop()
+            if type(node) is not dict or id(node) in seen:
+                continue
+            seen.add(id(node))
+            yield node
+            for keyword in single_schema_keywords:
+                child = node.get(keyword)
+                if type(child) is dict:
+                    pending.append(child)
+                elif keyword == "items" and type(child) is list:
+                    pending.extend(child)
+            for keyword in schema_array_keywords:
+                children = node.get(keyword)
+                if type(children) is list:
+                    pending.extend(children)
+            for keyword in schema_map_keywords:
+                children = node.get(keyword)
+                if type(children) is dict:
+                    pending.extend(children.values())
+            dependencies = node.get("dependencies")
+            if type(dependencies) is dict:
+                pending.extend(
+                    child
+                    for child in dependencies.values()
+                    if type(child) is dict
+                )
+
+    def _validate_schema_regex_patterns(
+        self,
+        schema: dict[str, Any],
+        field: str,
+        *,
+        budget: _McpSchemaRegexBudget | None = None,
+    ) -> None:
+        selected_budget = budget or self._schema_regex_budget()
+        for node in self._iter_schema_nodes(schema):
+            selected_budget.checkpoint()
+            pattern = node.get("pattern")
+            if pattern is not None:
+                selected_budget.compile(pattern, field=field)
+            pattern_properties = node.get("patternProperties")
+            if type(pattern_properties) is dict:
+                for candidate in pattern_properties:
+                    selected_budget.compile(candidate, field=field)
+        selected_budget.checkpoint()
+
+    def _bounded_schema_validator(
+        self,
+        schema: dict[str, Any],
+        *,
+        field: str,
+        budget: _McpSchemaRegexBudget | None = None,
+    ) -> Any:
+        base_validator = jsonschema_validator_for(schema)
+        callbacks = _McpBoundedSchemaCallbacks(
+            budget or self._schema_regex_budget(),
+            field=field,
+        )
+        bounded_validator = extend_jsonschema_validator(
+            base_validator,
+            validators=callbacks.overrides(base_validator),
+        )
+        return bounded_validator(schema)
+
     def _validate_v2_json_schema_safety(
         self,
         schema: dict[str, Any],
         field: str,
+        *,
+        deadline: float | None = None,
     ) -> None:
         """Validate the bounded JSON Schema 2020-12 subset used by Manifest v2."""
 
@@ -5788,6 +12878,8 @@ class McpPrimitive:
 
         def walk(value: Any, *, depth: int, path: str) -> None:
             nonlocal node_count, combinator_expansion
+            if deadline is not None:
+                self._remaining_timeout(deadline)
             if depth > self.config.mcp.schema_max_depth:
                 raise ValidationError(
                     f"MCP {field} exceeds schema depth={self.config.mcp.schema_max_depth}"
@@ -5841,9 +12933,15 @@ class McpPrimitive:
                     walk(item, depth=depth + 1, path=f"{path}/{index}")
 
         walk(schema, depth=0, path="#")
+        if deadline is not None:
+            self._remaining_timeout(deadline)
         for _source, reference in local_refs:
+            if deadline is not None:
+                self._remaining_timeout(deadline)
             self._resolve_local_schema_ref(schema, reference, field)
         self._reject_cyclic_schema_refs(schema, local_refs, field)
+        if deadline is not None:
+            self._remaining_timeout(deadline)
 
     @staticmethod
     def _resolve_local_schema_ref(
@@ -5982,18 +13080,24 @@ class McpPrimitive:
             )
 
     def _bounded_list_limit(self, limit: int | None) -> int:
-        selected = self.config.mcp.list_limit if limit is None else limit
+        maximum = self.config.mcp.server_page_limit
+        selected = maximum if limit is None else limit
         if not isinstance(selected, int):
             raise ValidationError("MCP server list limit must be an integer")
         if selected < 1:
             raise ValidationError("MCP server list limit must be >= 1")
-        if selected > self.config.mcp.list_limit:
-            raise ValidationError(f"MCP server list limit exceeds configured maximum {self.config.mcp.list_limit}")
+        if selected > maximum:
+            raise ValidationError(
+                f"MCP server list limit exceeds configured maximum {maximum}"
+            )
         return selected
 
-    def _load_server(self, server_id: str) -> tuple[McpServerSpec, dict[str, Any]]:
+    def _load_server(
+        self,
+        server_id: str,
+    ) -> tuple[McpRegisteredServer, dict[str, Any]]:
         self._validate_identifier(server_id, "server_id", self.config.mcp.server_id_max_chars)
-        found = self.extensions.get_mcp_server(server_id)
+        found = self.extensions.get_mcp_server_manifest(server_id)
         if found is None:
             raise NotFound(f"MCP server not found: {server_id}")
         spec, metadata = found
@@ -6002,7 +13106,7 @@ class McpPrimitive:
 
     def _server_to_json(
         self,
-        server: McpServerSpec,
+        server: McpRegisteredServer,
         metadata: dict[str, Any],
         *,
         include_sensitive_fields: bool,
@@ -6031,7 +13135,7 @@ class McpPrimitive:
             }
         else:
             transport = {"type": server.transport}
-        return {
+        payload = {
             "schema_version": server.schema_version,
             "server_id": server.server_id,
             "protocol_mode": self._effective_protocol_mode(server).value,
@@ -6044,6 +13148,26 @@ class McpPrimitive:
             "metadata": server.metadata,
             **metadata,
         }
+        if isinstance(server, McpServerManifestV3):
+            payload["manifest_sha256"] = self._server_spec_sha256(server)
+            if include_sensitive_fields:
+                payload.update(
+                    {
+                        "resources": [to_jsonable(item) for item in server.resources],
+                        "resource_templates": [
+                            to_jsonable(item) for item in server.resource_templates
+                        ],
+                        "prompts": [to_jsonable(item) for item in server.prompts],
+                        "auth_profile_id": server.auth_profile_id,
+                        "subscriptions": list(server.subscriptions),
+                        "tasks_extension": (
+                            to_jsonable(server.tasks_extension)
+                            if server.tasks_extension is not None
+                            else None
+                        ),
+                    }
+                )
+        return payload
 
     def _tool_to_json(self, server_id: str, tool: McpToolSpec, *, live: McpProviderTool | None = None) -> dict[str, Any]:
         payload = {

@@ -262,7 +262,7 @@ export type McpToolSummary = Record<string, unknown> & {
 };
 
 export type McpServerSummary = Record<string, unknown> & {
-  schema_version: 1 | 2;
+  schema_version: 1 | 2 | 3;
   server_id: string;
   protocol_mode: McpProtocolMode;
   transport: Record<string, unknown> & { type: string };
@@ -270,12 +270,13 @@ export type McpServerSummary = Record<string, unknown> & {
   timeout_s: number;
   max_request_bytes: number;
   max_response_bytes: number;
+  auth_profile_id?: string | null;
   metadata: Record<string, unknown>;
 };
 
 export type McpToolListResult = {
   server_id: string;
-  schema_version: 1 | 2;
+  schema_version: 1 | 2 | 3;
   transport: string;
   protocol_mode: McpProtocolMode;
   tools: McpToolSummary[];
@@ -306,6 +307,214 @@ export type McpCallResult = {
   duration_s: number;
   connection?: McpConnectionInfo | null;
   receipts?: McpExchangeReceipt[];
+};
+
+export type McpUnregisterResult = {
+  server_id: string;
+  deleted: true;
+};
+
+export type McpCacheHint = {
+  ttl_ms: number;
+  scope: "private" | "public";
+};
+
+export type McpPage<T> = {
+  items: T[];
+  next_cursor: string | null;
+  cache_hint: McpCacheHint | null;
+  has_more?: boolean;
+};
+
+export type McpResource = {
+  resource_id: string;
+  name: string;
+  title?: string | null;
+  description?: string | null;
+  mime_type?: string | null;
+  size?: number | null;
+  metadata?: Record<string, unknown>;
+};
+
+export type McpResourceTemplate = {
+  template_id: string;
+  name: string;
+  title?: string | null;
+  description?: string | null;
+  mime_type?: string | null;
+  metadata?: Record<string, unknown>;
+};
+
+export type McpArtifactReceipt = {
+  artifact_id: string;
+  byte_length: number;
+  sha256: string;
+  mime_type?: string | null;
+};
+
+export type McpContentBlock =
+  | { kind: "text"; text: string; metadata?: Record<string, unknown> }
+  | { kind: "blob"; artifact: McpArtifactReceipt | null; metadata?: Record<string, unknown> }
+  | {
+      kind: "resource_link";
+      resource_handle: string;
+      name: string;
+      title?: string | null;
+      description?: string | null;
+      mime_type?: string | null;
+      metadata?: Record<string, unknown>;
+    };
+
+export type McpResourceContents = {
+  resource_id: string;
+  contents: McpContentBlock[];
+  provenance: "untrusted_mcp_resource";
+};
+
+export type McpPrompt = {
+  prompt_id: string;
+  name: string;
+  title?: string | null;
+  description?: string | null;
+  arguments: Array<{
+    name: string;
+    title?: string | null;
+    description?: string | null;
+    required: boolean;
+  }>;
+  metadata?: Record<string, unknown>;
+};
+
+export type McpPromptResult = {
+  prompt_id: string;
+  messages: Array<{
+    role: "user" | "assistant";
+    content: McpContentBlock;
+    provenance: "untrusted_mcp_prompt";
+  }>;
+  description?: string | null;
+  user_confirmation_required: true;
+};
+
+export type McpCompletionResult = {
+  values: string[];
+  total?: number | null;
+  has_more: boolean;
+};
+
+export type McpHumanReceipt = {
+  human_request_id: string;
+  human_revision: number;
+  human_preview_sha256: string;
+};
+
+export type McpInputRequest = {
+  request_id: string;
+  kind: "elicitation" | "sampling_unsupported" | "roots_unsupported";
+  mode?: "form" | "url" | null;
+  prompt?: string | null;
+  schema: Record<string, unknown>;
+  inert_url?: string | null;
+};
+
+type McpInputRequiredBase = {
+  kind: "input_required";
+  revision: number;
+  input_requests: McpInputRequest[];
+  expires_at?: string | null;
+};
+
+export type McpInputRequired = McpInputRequiredBase & (
+  | (McpHumanReceipt & {
+    continuation_id: string;
+    respondable: true;
+  })
+  | {
+    continuation_id: "";
+    respondable: false;
+    human_request_id?: null;
+    human_revision?: null;
+    human_preview_sha256?: null;
+  }
+);
+
+export type McpRemoteTask = {
+  kind: "remote_task";
+  task_ref: string;
+  revision: number;
+  status: "working" | "input_required" | "completed" | "failed" | "cancelled" | "cancel_requested" | "needs_attention";
+  status_message?: string | null;
+  result?: unknown;
+  input_requests: McpInputRequest[];
+  human_request_id?: string | null;
+  human_revision?: number | null;
+  human_preview_sha256?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  ttl_ms?: number | null;
+  poll_interval_ms?: number | null;
+};
+
+export type McpOperationResult<T> =
+  | { kind: "complete"; value: T | null; preview_sha256?: string }
+  | McpInputRequired
+  | McpRemoteTask;
+
+export type McpOAuthStatus = {
+  profile_id: string;
+  status: "unconfigured" | "authorization_required" | "authorized" | "expired" | "revoked" | "needs_attention";
+  issuer?: string | null;
+  resource?: string | null;
+  scopes: string[];
+  principal_sha256?: string | null;
+  expires_at?: string | null;
+};
+
+export type McpOAuthProfileInput = {
+  profile_id: string;
+  server_id: string;
+  resource_uri: string;
+  expected_issuer: string;
+  redirect_uri: string;
+  client_id: string;
+  registration_mode: "preregistered" | "cimd";
+  token_endpoint_auth_method?: "none" | "client_secret_basic" | "client_secret_post";
+  allowed_scopes?: string[];
+  default_scopes?: string[];
+  audience?: string | null;
+  protected_resource_metadata_url?: string | null;
+  authorization_server_metadata_url?: string | null;
+  protected_resource_metadata_sha256?: string | null;
+  authorization_server_metadata_sha256?: string | null;
+  allowed_endpoint_origins?: string[];
+  allow_loopback_http?: boolean;
+  protocol_revision?: "2026-07-28";
+  transport?: "streamable_http";
+};
+
+export type McpAuthorizationChallenge = {
+  challenge_id: string;
+  authorization_url: string;
+  expires_at: string;
+};
+
+export type McpSubscription = {
+  subscription_id: string;
+  server_id: string;
+  status: "opening" | "active" | "lost" | "closed";
+  requested_filters: string[];
+  acknowledged_filters: string[];
+  opened_at?: string | null;
+  closed_at?: string | null;
+  lost_reason?: string | null;
+};
+
+export type McpSubscriptionEvent = {
+  sequence: number;
+  event_type: string;
+  payload: unknown;
+  received_at: string;
+  provenance: "untrusted_mcp_notification";
 };
 
 export type ModuleSummary = Record<string, unknown> & {
@@ -2813,14 +3022,16 @@ const mcpConnectionKeys = new Set([
 ]);
 const mcpReceiptKeys = new Set(["phase", "request_bytes", "response_bytes", "duration_s", "call_started"]);
 const mcpDiscoveryKeys = new Set(["server_id", "connection", "request_bytes", "response_bytes", "duration_s", "receipts"]);
+const mcpUnregisterKeys = new Set(["server_id", "deleted"]);
 
 export function assertMcpServerSummary(value: unknown): asserts value is McpServerSummary {
   if (!isRecord(value)
-      || (value.schema_version !== 1 && value.schema_version !== 2)
+      || (value.schema_version !== 1 && value.schema_version !== 2 && value.schema_version !== 3)
       || typeof value.server_id !== "string"
       || !value.server_id
       || !isMcpProtocolMode(value.protocol_mode)
       || (value.schema_version === 1 && value.protocol_mode !== "legacy")
+      || (value.schema_version === 3 && value.protocol_mode !== "2026-07-28")
       || !isRecord(value.transport)
       || typeof value.transport.type !== "string"
       || !value.transport.type
@@ -2830,6 +3041,7 @@ export function assertMcpServerSummary(value: unknown): asserts value is McpServ
       || value.timeout_s <= 0
       || !isNonNegativeSafeInteger(value.max_request_bytes)
       || !isNonNegativeSafeInteger(value.max_response_bytes)
+      || !isOptionalNullableString(value.auth_profile_id)
       || !isRecord(value.metadata)) {
     throw new Error("GUI MCP server summary is malformed.");
   }
@@ -2875,11 +3087,12 @@ export function assertMcpToolListResult(value: unknown): asserts value is McpToo
   if (!isRecord(value)
       || typeof value.server_id !== "string"
       || !value.server_id
-      || (value.schema_version !== 1 && value.schema_version !== 2)
+      || (value.schema_version !== 1 && value.schema_version !== 2 && value.schema_version !== 3)
       || typeof value.transport !== "string"
       || !value.transport
       || !isMcpProtocolMode(value.protocol_mode)
       || (value.schema_version === 1 && value.protocol_mode !== "legacy")
+      || (value.schema_version === 3 && value.protocol_mode !== "2026-07-28")
       || !Array.isArray(value.tools)
       || typeof value.refreshed !== "boolean"
       || !isNonNegativeSafeInteger(value.response_bytes)) {
@@ -2906,6 +3119,651 @@ export function assertMcpCallResult(value: unknown): asserts value is McpCallRes
     throw new Error("GUI MCP call result is malformed.");
   }
   assertOptionalMcpOperationMetadata(value);
+}
+
+export function assertMcpUnregisterResult(value: unknown): asserts value is McpUnregisterResult {
+  if (!isRecord(value)
+      || Object.keys(value).some((key) => !mcpUnregisterKeys.has(key))
+      || typeof value.server_id !== "string"
+      || !value.server_id
+      || value.deleted !== true) {
+    throw new Error("GUI MCP unregister result is malformed.");
+  }
+}
+
+const forbiddenMcpPublicKeys = new Set([
+  "access_token",
+  "refresh_token",
+  "id_token",
+  "client_secret",
+  "authorization_code",
+  "code_verifier",
+  "pkce_verifier",
+  "remote_task_id"
+]);
+const forbiddenMcpPublicKeysCompact = new Set([
+  "accesstoken",
+  "refreshtoken",
+  "idtoken",
+  "clientsecret",
+  "authorizationcode",
+  "codeverifier",
+  "pkceverifier",
+  "remotetaskid"
+]);
+
+const mcpPageKeys = new Set(["items", "next_cursor", "cache_hint", "has_more"]);
+const mcpCacheHintKeys = new Set(["ttl_ms", "scope"]);
+const mcpResourceKeys = new Set([
+  "resource_id", "name", "title", "description", "mime_type", "size", "metadata"
+]);
+const mcpResourceTemplateKeys = new Set([
+  "template_id", "name", "title", "description", "mime_type", "metadata"
+]);
+const mcpPromptKeys = new Set([
+  "prompt_id", "name", "title", "description", "arguments", "metadata"
+]);
+const mcpPromptArgumentKeys = new Set(["name", "title", "description", "required"]);
+const mcpResourceContentsKeys = new Set(["resource_id", "contents", "provenance"]);
+const mcpPromptResultKeys = new Set([
+  "prompt_id", "messages", "description", "user_confirmation_required"
+]);
+const mcpPromptMessageKeys = new Set(["role", "content", "provenance"]);
+const mcpCompletionResultKeys = new Set(["values", "total", "has_more"]);
+const mcpCompleteResultKeys = new Set(["kind", "value", "preview_sha256"]);
+const mcpInputRequiredKeys = new Set([
+  "kind", "continuation_id", "revision", "respondable", "input_requests",
+  "expires_at", "human_request_id", "human_revision", "human_preview_sha256"
+]);
+const mcpRemoteTaskKeys = new Set([
+  "kind", "task_ref", "revision", "status", "status_message", "result",
+  "input_requests", "human_request_id", "human_revision", "human_preview_sha256",
+  "created_at", "updated_at", "ttl_ms", "poll_interval_ms"
+]);
+const mcpInputRequestKeys = new Set([
+  "request_id", "kind", "mode", "prompt", "schema", "inert_url"
+]);
+const mcpTextContentKeys = new Set(["kind", "text", "metadata"]);
+const mcpBlobContentKeys = new Set(["kind", "artifact", "metadata"]);
+const mcpResourceLinkKeys = new Set([
+  "kind", "resource_handle", "name", "title", "description", "mime_type", "metadata"
+]);
+const mcpArtifactReceiptKeys = new Set([
+  "artifact_id", "byte_length", "sha256", "mime_type"
+]);
+const mcpOAuthStatusKeys = new Set([
+  "profile_id", "status", "issuer", "resource", "scopes", "principal_sha256", "expires_at"
+]);
+const mcpOAuthProfileInputKeys = new Set([
+  "profile_id",
+  "server_id",
+  "resource_uri",
+  "expected_issuer",
+  "redirect_uri",
+  "client_id",
+  "registration_mode",
+  "token_endpoint_auth_method",
+  "allowed_scopes",
+  "default_scopes",
+  "audience",
+  "protected_resource_metadata_url",
+  "authorization_server_metadata_url",
+  "protected_resource_metadata_sha256",
+  "authorization_server_metadata_sha256",
+  "allowed_endpoint_origins",
+  "allow_loopback_http",
+  "protocol_revision",
+  "transport"
+]);
+const mcpAuthorizationChallengeKeys = new Set([
+  "challenge_id", "authorization_url", "expires_at"
+]);
+const mcpSubscriptionKeys = new Set([
+  "subscription_id", "server_id", "status", "requested_filters", "acknowledged_filters",
+  "opened_at", "closed_at", "lost_reason"
+]);
+const mcpSubscriptionEventKeys = new Set([
+  "sequence", "event_type", "payload", "received_at", "provenance"
+]);
+
+export function assertMcpResourcePage(value: unknown): asserts value is McpPage<McpResource> {
+  assertMcpPage(value, assertMcpResource);
+}
+
+export function assertMcpResourceTemplatePage(value: unknown): asserts value is McpPage<McpResourceTemplate> {
+  assertMcpPage(value, assertMcpResourceTemplate);
+}
+
+export function assertMcpPromptPage(value: unknown): asserts value is McpPage<McpPrompt> {
+  assertMcpPage(value, assertMcpPrompt);
+}
+
+export function assertMcpResourceOperationResult(
+  value: unknown
+): asserts value is McpOperationResult<McpResourceContents> {
+  assertMcpOperationResult(value, assertMcpResourceContents);
+}
+
+export function assertMcpPromptOperationResult(
+  value: unknown
+): asserts value is McpOperationResult<McpPromptResult> {
+  assertMcpOperationResult(value, assertMcpPromptResult);
+  if (value.kind === "complete" && (
+    typeof value.preview_sha256 !== "string"
+    || !canonicalSha256.test(value.preview_sha256)
+  )) {
+    throw new Error("GUI MCP prompt preview binding is missing or malformed.");
+  }
+}
+
+export function assertMcpCompletionOperationResult(
+  value: unknown
+): asserts value is McpOperationResult<McpCompletionResult> {
+  assertMcpOperationResult(value, assertMcpCompletionResult);
+}
+
+export function assertMcpContinuationResult(
+  value: unknown
+): asserts value is McpOperationResult<unknown> {
+  assertMcpOperationResult(value, assertUnknownMcpCompleteValue);
+}
+
+export function assertMcpInputRequired(value: unknown): asserts value is McpInputRequired {
+  assertNoForbiddenMcpFields(value);
+  if (!isRecord(value)
+      || value.kind !== "input_required"
+      || !hasOnlyMcpKeys(value, mcpInputRequiredKeys)
+      || !isNonNegativeSafeInteger(value.revision)
+      || typeof value.respondable !== "boolean"
+      || !Array.isArray(value.input_requests)
+      || !isOptionalNullableString(value.expires_at)) {
+    throw new Error("GUI MCP input-required result is malformed.");
+  }
+  for (const request of value.input_requests) assertMcpInputRequest(request);
+  const hasHumanReceipt = isNonEmptyString(value.human_request_id)
+    && isNonNegativeSafeInteger(value.human_revision)
+    && typeof value.human_preview_sha256 === "string"
+    && canonicalSha256.test(value.human_preview_sha256);
+  const hasNoHumanReceipt = (value.human_request_id === undefined || value.human_request_id === null)
+    && (value.human_revision === undefined || value.human_revision === null)
+    && (value.human_preview_sha256 === undefined || value.human_preview_sha256 === null);
+  if (value.respondable) {
+    if (!isNonEmptyString(value.continuation_id) || !hasHumanReceipt) {
+      throw new Error("GUI MCP respondable input-required result is malformed.");
+    }
+    return;
+  }
+  if (value.continuation_id !== ""
+      || !hasNoHumanReceipt
+      || value.input_requests.length === 0
+      || value.input_requests.some((request) => (
+        request.kind !== "sampling_unsupported" && request.kind !== "roots_unsupported"
+      ))) {
+    throw new Error("GUI MCP unsupported input-required result is malformed.");
+  }
+}
+
+export function assertMcpRemoteTask(value: unknown): asserts value is McpRemoteTask {
+  assertNoForbiddenMcpFields(value);
+  if (!isRecord(value)
+      || !hasOnlyMcpKeys(value, mcpRemoteTaskKeys)
+      || value.kind !== "remote_task"
+      || !isNonEmptyString(value.task_ref)
+      || !["working", "input_required", "completed", "failed", "cancelled", "cancel_requested", "needs_attention"].includes(String(value.status))
+      || !isNonNegativeSafeInteger(value.revision)
+      || !Array.isArray(value.input_requests)
+      || !isOptionalNullableString(value.status_message)
+      || !isOptionalNullableString(value.created_at)
+      || !isOptionalNullableString(value.updated_at)
+      || !(value.ttl_ms === undefined || value.ttl_ms === null || isNonNegativeSafeInteger(value.ttl_ms))
+      || !(value.poll_interval_ms === undefined || value.poll_interval_ms === null || isNonNegativeSafeInteger(value.poll_interval_ms))) {
+    throw new Error("GUI MCP remote task projection is malformed.");
+  }
+  for (const request of value.input_requests) assertMcpInputRequest(request);
+  const hasHumanReceipt = isNonEmptyString(value.human_request_id)
+    && isNonNegativeSafeInteger(value.human_revision)
+    && typeof value.human_preview_sha256 === "string"
+    && canonicalSha256.test(value.human_preview_sha256);
+  const hasNoHumanReceipt = (value.human_request_id === undefined || value.human_request_id === null)
+    && (value.human_revision === undefined || value.human_revision === null)
+    && (value.human_preview_sha256 === undefined || value.human_preview_sha256 === null);
+  if ((value.status === "input_required" && (!hasHumanReceipt || value.input_requests.length === 0))
+      || (value.status !== "input_required" && !hasNoHumanReceipt)) {
+    throw new Error("GUI MCP remote task Human request receipt is malformed.");
+  }
+}
+
+export function assertMcpOAuthStatus(value: unknown): asserts value is McpOAuthStatus {
+  assertNoForbiddenMcpFields(value);
+  if (!isRecord(value)
+      || !hasOnlyMcpKeys(value, mcpOAuthStatusKeys)
+      || !isNonEmptyString(value.profile_id)
+      || !["unconfigured", "authorization_required", "authorized", "expired", "revoked", "needs_attention"].includes(String(value.status))
+      || !isOptionalNullableString(value.issuer)
+      || !isOptionalNullableString(value.resource)
+      || !isUniqueStringArrayAllowEmpty(value.scopes)
+      || !(value.principal_sha256 === undefined || value.principal_sha256 === null || (typeof value.principal_sha256 === "string" && canonicalSha256.test(value.principal_sha256)))
+      || !isOptionalNullableString(value.expires_at)) {
+    throw new Error("GUI MCP OAuth status is malformed.");
+  }
+}
+
+export function assertMcpOAuthStatuses(
+  value: unknown
+): asserts value is McpOAuthStatus[] {
+  assertNoForbiddenMcpFields(value);
+  if (!Array.isArray(value) || value.length > 1_000) {
+    throw new Error("GUI MCP OAuth profile list is malformed.");
+  }
+  for (const item of value) assertMcpOAuthStatus(item);
+}
+
+export function assertMcpOAuthProfileInput(
+  value: unknown
+): asserts value is McpOAuthProfileInput {
+  if (!isRecord(value)
+      || !hasOnlyMcpKeys(value, mcpOAuthProfileInputKeys)
+      || !isNonEmptyString(value.profile_id)
+      || !isNonEmptyString(value.server_id)
+      || !isNonEmptyString(value.resource_uri)
+      || !isNonEmptyString(value.expected_issuer)
+      || !isNonEmptyString(value.redirect_uri)
+      || !isNonEmptyString(value.client_id)
+      || (value.registration_mode !== "preregistered" && value.registration_mode !== "cimd")
+      || !(value.token_endpoint_auth_method === undefined
+        || value.token_endpoint_auth_method === "none"
+        || value.token_endpoint_auth_method === "client_secret_basic"
+        || value.token_endpoint_auth_method === "client_secret_post")
+      || !(value.allowed_scopes === undefined || isUniqueStringArrayAllowEmpty(value.allowed_scopes))
+      || !(value.default_scopes === undefined || isUniqueStringArrayAllowEmpty(value.default_scopes))
+      || !isOptionalNullableNonEmptyString(value.audience)
+      || !isOptionalNullableNonEmptyString(value.protected_resource_metadata_url)
+      || !isOptionalNullableNonEmptyString(value.authorization_server_metadata_url)
+      || !isOptionalNullableSha256(value.protected_resource_metadata_sha256)
+      || !isOptionalNullableSha256(value.authorization_server_metadata_sha256)
+      || !(value.allowed_endpoint_origins === undefined || isUniqueStringArrayAllowEmpty(value.allowed_endpoint_origins))
+      || !(value.allow_loopback_http === undefined || typeof value.allow_loopback_http === "boolean")
+      || !(value.protocol_revision === undefined || value.protocol_revision === "2026-07-28")
+      || !(value.transport === undefined || value.transport === "streamable_http")) {
+    throw new Error("GUI MCP OAuth profile input is malformed.");
+  }
+}
+
+export function assertMcpAuthorizationChallenge(
+  value: unknown
+): asserts value is McpAuthorizationChallenge {
+  assertNoForbiddenMcpFields(value);
+  if (!isRecord(value)
+      || !hasOnlyMcpKeys(value, mcpAuthorizationChallengeKeys)
+      || !isNonEmptyString(value.challenge_id)
+      || !isNonEmptyString(value.authorization_url)
+      || !isNonEmptyString(value.expires_at)) {
+    throw new Error("GUI MCP OAuth challenge is malformed.");
+  }
+}
+
+export function assertMcpSubscription(value: unknown): asserts value is McpSubscription {
+  assertNoForbiddenMcpFields(value);
+  if (!isRecord(value)
+      || !hasOnlyMcpKeys(value, mcpSubscriptionKeys)
+      || !isNonEmptyString(value.subscription_id)
+      || !isNonEmptyString(value.server_id)
+      || !["opening", "active", "lost", "closed"].includes(String(value.status))
+      || !isUniqueStringArrayAllowEmpty(value.requested_filters)
+      || !isUniqueStringArrayAllowEmpty(value.acknowledged_filters)
+      || !isOptionalNullableString(value.opened_at)
+      || !isOptionalNullableString(value.closed_at)
+      || !isOptionalNullableString(value.lost_reason)) {
+    throw new Error("GUI MCP subscription projection is malformed.");
+  }
+}
+
+export function assertMcpSubscriptionEvents(
+  value: unknown
+): asserts value is McpSubscriptionEvent[] {
+  assertNoForbiddenMcpFields(value);
+  if (!Array.isArray(value)) throw new Error("GUI MCP subscription events are malformed.");
+  for (const event of value) {
+    if (!isRecord(event)
+        || !hasOnlyMcpKeys(event, mcpSubscriptionEventKeys)
+        || !isNonNegativeSafeInteger(event.sequence)
+        || !isNonEmptyString(event.event_type)
+        || !isNonEmptyString(event.received_at)
+        || event.provenance !== "untrusted_mcp_notification") {
+      throw new Error("GUI MCP subscription event is malformed.");
+    }
+  }
+}
+
+function assertMcpPage<T>(
+  value: unknown,
+  itemValidator: (item: unknown) => asserts item is T
+): asserts value is McpPage<T> {
+  assertNoForbiddenMcpFields(value);
+  if (!isRecord(value)
+      || !hasOnlyMcpKeys(value, mcpPageKeys)
+      || !Array.isArray(value.items)
+      || !(value.next_cursor === null || typeof value.next_cursor === "string")
+      || !(value.has_more === undefined || typeof value.has_more === "boolean")
+      || !(value.cache_hint === null || isMcpCacheHint(value.cache_hint))) {
+    throw new Error("GUI MCP page is malformed.");
+  }
+  if (value.has_more !== undefined && value.has_more !== (value.next_cursor !== null)) {
+    throw new Error("GUI MCP page truncation signal is inconsistent.");
+  }
+  for (const item of value.items) itemValidator(item);
+}
+
+function isMcpCacheHint(value: unknown): value is McpCacheHint {
+  return isRecord(value)
+    && hasOnlyMcpKeys(value, mcpCacheHintKeys)
+    && isNonNegativeSafeInteger(value.ttl_ms)
+    && (value.scope === "private" || value.scope === "public");
+}
+
+function assertMcpResource(value: unknown): asserts value is McpResource {
+  if (!isRecord(value)
+      || !hasOnlyMcpKeys(value, mcpResourceKeys)
+      || !isSafeMcpSelector(value.resource_id)
+      || !isNonEmptyString(value.name)
+      || !isOptionalNullableString(value.title)
+      || !isOptionalNullableString(value.description)
+      || !isSafeMcpMime(value.mime_type)
+      || !(value.size === undefined || value.size === null || isNonNegativeSafeInteger(value.size))
+      || !isOptionalMcpMetadata(value.metadata)) {
+    throw new Error("GUI MCP resource is malformed or is an unsupported MCP App.");
+  }
+}
+
+function assertMcpResourceTemplate(value: unknown): asserts value is McpResourceTemplate {
+  if (!isRecord(value)
+      || !hasOnlyMcpKeys(value, mcpResourceTemplateKeys)
+      || !isSafeMcpSelector(value.template_id)
+      || !isNonEmptyString(value.name)
+      || !isOptionalNullableString(value.title)
+      || !isOptionalNullableString(value.description)
+      || !isSafeMcpMime(value.mime_type)
+      || !isOptionalMcpMetadata(value.metadata)) {
+    throw new Error("GUI MCP resource template is malformed or is an unsupported MCP App.");
+  }
+}
+
+function assertMcpPrompt(value: unknown): asserts value is McpPrompt {
+  if (!isRecord(value)
+      || !hasOnlyMcpKeys(value, mcpPromptKeys)
+      || !isNonEmptyString(value.prompt_id)
+      || !isNonEmptyString(value.name)
+      || !isOptionalNullableString(value.title)
+      || !isOptionalNullableString(value.description)
+      || !Array.isArray(value.arguments)
+      || !isOptionalMcpMetadata(value.metadata)) {
+    throw new Error("GUI MCP prompt is malformed.");
+  }
+  for (const argument of value.arguments) {
+    if (!isRecord(argument)
+        || !hasOnlyMcpKeys(argument, mcpPromptArgumentKeys)
+        || !isNonEmptyString(argument.name)
+        || !isOptionalNullableString(argument.title)
+        || !isOptionalNullableString(argument.description)
+        || typeof argument.required !== "boolean") {
+      throw new Error("GUI MCP prompt argument is malformed.");
+    }
+  }
+}
+
+function assertMcpResourceContents(value: unknown): asserts value is McpResourceContents {
+  if (!isRecord(value)
+      || !hasOnlyMcpKeys(value, mcpResourceContentsKeys)
+      || !isNonEmptyString(value.resource_id)
+      || value.provenance !== "untrusted_mcp_resource"
+      || !Array.isArray(value.contents)) {
+    throw new Error("GUI MCP resource contents are malformed.");
+  }
+  for (const content of value.contents) assertMcpContentBlock(content);
+}
+
+function assertMcpPromptResult(value: unknown): asserts value is McpPromptResult {
+  if (!isRecord(value)
+      || !hasOnlyMcpKeys(value, mcpPromptResultKeys)
+      || !isNonEmptyString(value.prompt_id)
+      || value.user_confirmation_required !== true
+      || !isOptionalNullableString(value.description)
+      || !Array.isArray(value.messages)) {
+    throw new Error("GUI MCP prompt result is malformed.");
+  }
+  for (const message of value.messages) {
+    if (!isRecord(message)
+        || !hasOnlyMcpKeys(message, mcpPromptMessageKeys)
+        || (message.role !== "user" && message.role !== "assistant")
+        || message.provenance !== "untrusted_mcp_prompt") {
+      throw new Error("GUI MCP prompt message is malformed.");
+    }
+    assertMcpContentBlock(message.content);
+  }
+}
+
+function assertMcpCompletionResult(value: unknown): asserts value is McpCompletionResult {
+  if (!isRecord(value)
+      || !hasOnlyMcpKeys(value, mcpCompletionResultKeys)
+      || !Array.isArray(value.values)
+      || value.values.some((item) => typeof item !== "string")
+      || !(value.total === undefined || value.total === null || isNonNegativeSafeInteger(value.total))
+      || typeof value.has_more !== "boolean") {
+    throw new Error("GUI MCP completion result is malformed.");
+  }
+}
+
+function assertMcpOperationResult<T>(
+  value: unknown,
+  completeValidator: (item: unknown) => asserts item is T
+): asserts value is McpOperationResult<T> {
+  assertNoForbiddenMcpFields(value);
+  if (!isRecord(value) || typeof value.kind !== "string") {
+    throw new Error("GUI MCP operation result is malformed.");
+  }
+  if (value.kind === "complete") {
+    if (!hasOnlyMcpKeys(value, mcpCompleteResultKeys) || !("value" in value)) {
+      throw new Error("GUI MCP complete result is malformed or is missing value.");
+    }
+    if (!(value.preview_sha256 === undefined
+      || (typeof value.preview_sha256 === "string" && canonicalSha256.test(value.preview_sha256)))) {
+      throw new Error("GUI MCP preview binding is malformed.");
+    }
+    if (value.value !== null) completeValidator(value.value);
+    return;
+  }
+  if (value.kind === "remote_task") {
+    assertMcpRemoteTask(value);
+    return;
+  }
+  assertMcpInputRequired(value);
+}
+
+function assertMcpInputRequest(value: unknown): asserts value is McpInputRequest {
+  if (!isRecord(value)
+      || !hasOnlyMcpKeys(value, mcpInputRequestKeys)
+      || !isNonEmptyString(value.request_id)
+      || !["elicitation", "sampling_unsupported", "roots_unsupported"].includes(String(value.kind))
+      || !(value.mode === undefined || value.mode === null || value.mode === "form" || value.mode === "url")
+      || !isOptionalNullableString(value.prompt)
+      || !isRecord(value.schema)
+      || !isOptionalNullableString(value.inert_url)) {
+    throw new Error("GUI MCP input request is malformed.");
+  }
+}
+
+function assertUnknownMcpCompleteValue(_value: unknown): asserts _value is unknown {
+  // The continuation facade may complete any original protected operation.
+}
+
+function assertMcpContentBlock(value: unknown): asserts value is McpContentBlock {
+  if (!isRecord(value) || typeof value.kind !== "string") {
+    throw new Error("GUI MCP content block is malformed.");
+  }
+  if (value.kind === "text"
+      && hasOnlyMcpKeys(value, mcpTextContentKeys)
+      && isOptionalMcpMetadata(value.metadata)
+      && typeof value.text === "string") return;
+  if (value.kind === "blob") {
+    if (!hasOnlyMcpKeys(value, mcpBlobContentKeys)
+        || !isOptionalMcpMetadata(value.metadata)) {
+      throw new Error("GUI MCP content block is malformed or is an unsupported MCP App.");
+    }
+    if (value.artifact === null) return;
+    const artifact = value.artifact;
+    if (isRecord(artifact)
+        && hasOnlyMcpKeys(artifact, mcpArtifactReceiptKeys)
+        && isNonEmptyString(artifact.artifact_id)
+        && isNonNegativeSafeInteger(artifact.byte_length)
+        && typeof artifact.sha256 === "string"
+        && canonicalSha256.test(artifact.sha256)
+        && isSafeMcpMime(artifact.mime_type)) return;
+  }
+  if (value.kind === "resource_link"
+      && hasOnlyMcpKeys(value, mcpResourceLinkKeys)
+      && isNonEmptyString(value.resource_handle)
+      && !value.resource_handle.toLowerCase().startsWith("ui:")
+      && isNonEmptyString(value.name)
+      && isSafeMcpMime(value.mime_type)
+      && isOptionalMcpMetadata(value.metadata)) return;
+  throw new Error("GUI MCP content block is malformed or is an unsupported MCP App.");
+}
+
+function assertNoForbiddenMcpFields(value: unknown): void {
+  const pending: unknown[] = [value];
+  const seen = new Set<object>();
+  while (pending.length) {
+    const current = pending.pop();
+    if (!current || typeof current !== "object") continue;
+    if (seen.has(current)) throw new Error("GUI MCP result contains a cycle.");
+    seen.add(current);
+    if (Array.isArray(current)) {
+      pending.push(...current);
+      continue;
+    }
+    for (const [key, item] of Object.entries(current as Record<string, unknown>)) {
+      const folded = key.toLowerCase();
+      const compact = folded.replace(/[^a-z0-9]/g, "");
+      if (folded.startsWith("ui/")
+          || forbiddenMcpPublicKeys.has(folded)
+          || forbiddenMcpPublicKeysCompact.has(compact)) {
+        throw new Error(
+          "GUI MCP result contains a private credential or remote task identifier, "
+          + "or unsupported MCP Apps metadata."
+        );
+      }
+      pending.push(item);
+    }
+  }
+}
+
+function hasOnlyMcpKeys(
+  value: Record<string, unknown>,
+  allowed: ReadonlySet<string>
+): boolean {
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function isOptionalMcpMetadata(value: unknown): value is Record<string, unknown> | undefined {
+  return value === undefined || isRecord(value);
+}
+
+function isSafeMcpSelector(value: unknown): value is string {
+  return isNonEmptyString(value) && !value.toLowerCase().startsWith("ui:");
+}
+
+function isSafeMcpMime(value: unknown): value is string | null | undefined {
+  if (!isOptionalNullableString(value)) return false;
+  if (!value) return true;
+  const parsed = parseMcpMime(value);
+  if (!parsed) return false;
+  return !(parsed.mediaType === "text/html" && parsed.parameters.some(
+    ([name, parameter]) => name === "profile" && parameter.toLowerCase() === "mcp-app"
+  ));
+}
+
+const mcpMimeToken = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+function parseMcpMime(
+  value: string
+): { mediaType: string; parameters: Array<[string, string]> } | null {
+  const sections: string[] = [];
+  let selected = "";
+  let quoted = false;
+  let escaped = false;
+  for (const character of value) {
+    if (escaped) {
+      selected += character;
+      escaped = false;
+      continue;
+    }
+    if (quoted && character === "\\") {
+      selected += character;
+      escaped = true;
+      continue;
+    }
+    if (character === '"') {
+      selected += character;
+      quoted = !quoted;
+      continue;
+    }
+    if (character === ";" && !quoted) {
+      sections.push(selected);
+      selected = "";
+      continue;
+    }
+    selected += character;
+  }
+  if (quoted || escaped) return null;
+  sections.push(selected);
+
+  const mediaParts = sections.shift()?.trim().split("/") ?? [];
+  if (mediaParts.length !== 2
+      || !mcpMimeToken.test(mediaParts[0] ?? "")
+      || !mcpMimeToken.test(mediaParts[1] ?? "")) return null;
+  const parameters: Array<[string, string]> = [];
+  for (const section of sections) {
+    const separator = section.indexOf("=");
+    if (separator <= 0) return null;
+    const name = section.slice(0, separator).trim();
+    const rawParameter = section.slice(separator + 1).trim();
+    if (!mcpMimeToken.test(name)) return null;
+    const parameter = parseMcpMimeParameter(rawParameter);
+    if (parameter === null) return null;
+    parameters.push([name.toLowerCase(), parameter]);
+  }
+  return {
+    mediaType: `${mediaParts[0]}/${mediaParts[1]}`.toLowerCase(),
+    parameters
+  };
+}
+
+function parseMcpMimeParameter(value: string): string | null {
+  if (!value.startsWith('"')) return mcpMimeToken.test(value) ? value : null;
+  if (value.length < 2 || !value.endsWith('"')) return null;
+  let decoded = "";
+  let escaped = false;
+  for (const character of value.slice(1, -1)) {
+    const code = character.charCodeAt(0);
+    if ((code < 0x20 && code !== 0x09) || code === 0x7f) return null;
+    if (escaped) {
+      decoded += character;
+      escaped = false;
+    } else if (character === "\\") {
+      escaped = true;
+    } else if (character === '"') {
+      return null;
+    } else {
+      decoded += character;
+    }
+  }
+  return escaped ? null : decoded;
+}
+
+function isUniqueStringArrayAllowEmpty(value: unknown): value is string[] {
+  return Array.isArray(value)
+    && value.every((item) => typeof item === "string" && Boolean(item))
+    && new Set(value).size === value.length;
 }
 
 function assertMcpToolSummary(value: unknown): asserts value is McpToolSummary {
@@ -2968,6 +3826,20 @@ function isMcpProtocolEra(value: unknown): value is McpProtocolEra {
 
 function isOptionalNullableString(value: unknown): value is string | null | undefined {
   return value === undefined || value === null || typeof value === "string";
+}
+
+function isOptionalNullableNonEmptyString(
+  value: unknown
+): value is string | null | undefined {
+  return value === undefined || value === null || isNonEmptyString(value);
+}
+
+function isOptionalNullableSha256(
+  value: unknown
+): value is string | null | undefined {
+  return value === undefined
+    || value === null
+    || (typeof value === "string" && canonicalSha256.test(value));
 }
 
 function isUniqueStringArray(value: unknown): value is string[] {

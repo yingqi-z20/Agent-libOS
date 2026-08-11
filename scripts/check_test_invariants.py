@@ -18,7 +18,13 @@ MANIFEST = ROOT / "tests" / "invariants.yaml"
 DOCUMENTATION = ROOT / "docs" / "invariants.md"
 VALID_LANES = {"unit", "runtime", "security", "self-evolution", "providers", "benchmark"}
 MANIFEST_SCHEMA_VERSION = 2
-DEFAULT_DETERMINISTIC_MARKER_EXPRESSION = "not postgres and not real_llm and not mcp"
+# The ordinary lane selector excludes the whole MCP product marker to avoid
+# running those nodes twice.  Invariant evidence is a different question:
+# deterministic MCP regressions that do not require a frozen SDK transport are
+# valid non-optional witnesses and must remain eligible here.
+DEFAULT_DETERMINISTIC_MARKER_EXPRESSION = (
+    "not postgres and not real_llm and not mcp_transport"
+)
 PLATFORM_MARKERS = {
     "darwin": "platform_darwin",
     "linux": "platform_linux",

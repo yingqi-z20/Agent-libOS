@@ -1069,13 +1069,16 @@ export function App() {
   }
 
   function queueConfirmation(request: ConfirmationRequest) {
-    setPendingConfirm({
-      ...request,
-      action: async () => {
-        await request.action();
-        setPendingConfirm(null);
-        await refresh();
-      }
+    setPendingConfirm((current) => {
+      current?.onCancel?.();
+      return {
+        ...request,
+        action: async () => {
+          await request.action();
+          setPendingConfirm(null);
+          await refresh();
+        }
+      };
     });
   }
 
@@ -1547,6 +1550,7 @@ export function App() {
           busy={confirmBusy}
           error={confirmError}
           onCancel={() => {
+            pendingConfirm.onCancel?.();
             setPendingConfirm(null);
             setConfirmError(null);
           }}

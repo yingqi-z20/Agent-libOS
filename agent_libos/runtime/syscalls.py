@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 import inspect
 import math
+import re
 from typing import Any, TYPE_CHECKING
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -39,6 +40,7 @@ from agent_libos.models.exceptions import (
     ValidationError,
 )
 from agent_libos.process_transition import ProcessTransitionService
+from agent_libos.ports import AuditPort
 from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.runtime.syscall_descriptors import (
     BUILTIN_SYSCALL_NAMES as _BUILTIN_SYSCALL_NAMES,
@@ -49,7 +51,9 @@ from agent_libos.utils.serde import to_jsonable
 BUILTIN_SYSCALL_NAMES = _BUILTIN_SYSCALL_NAMES
 
 if TYPE_CHECKING:
+    from agent_libos.primitives.mcp import McpPrimitive
     from agent_libos.runtime.runtime import Runtime
+    from agent_libos.runtime.syscall_router import SyscallRouter
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +83,8 @@ _NULLABLE_STRING_OR_OBJECT = _SyscallArgumentRule(
 _STRING_LIST = _SyscallArgumentRule("list of strings")
 _NULLABLE_STRING_LIST = _SyscallArgumentRule("list of strings", nullable=True)
 _OBJECT_LIST = _SyscallArgumentRule("list of objects")
+_MCP_LOGICAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@+-]*$")
+_MCP_OPAQUE_CURSOR_PATTERN = re.compile(r"^mcpcur_[A-Za-z0-9_-]+$")
 
 
 _BUILTIN_SYSCALL_ARGUMENT_RULES: dict[
@@ -216,6 +222,16 @@ _BUILTIN_SYSCALL_ARGUMENT_RULES: dict[
         "server_id": _REQUIRED_STRING,
         "tool_id": _REQUIRED_STRING,
         "arguments": _OBJECT,
+    },
+    "mcp.resources": {
+        "server_id": _REQUIRED_STRING,
+        "kind": _STRING,
+        "cursor": _NULLABLE_STRING,
+    },
+    "mcp.resource_read": {
+        "server_id": _REQUIRED_STRING,
+        "resource_id": _REQUIRED_STRING,
+        "variables": _OBJECT,
     },
     "process.cwd": {},
     "process.chdir": {"path": _REQUIRED_STRING},
@@ -510,6 +526,11 @@ def _validate_builtin_syscall_arguments(
     rules = _BUILTIN_SYSCALL_ARGUMENT_RULES.get(name)
     if rules is None:
         raise RuntimeError(f"missing built-in syscall argument contract: {name}")
+    if name.startswith("mcp.") and any(key not in rules for key in args):
+        # MCP is a closed Host-registered surface. Never silently retain an
+        # ad-hoc URL, transport, credential, or misspelled authority field for
+        # a future handler revision to begin consuming.
+        raise ValidationError("MCP syscall arguments contain unknown fields")
     for key, rule in rules.items():
         if key not in args:
             if rule.required:
@@ -524,6 +545,98 @@ def _validate_builtin_syscall_arguments(
                 f"syscall argument '{key}' must be {expected}"
             )
         _validate_syscall_argument_bounds(key, value, rule, config)
+    if name in {"mcp.resources", "mcp.resource_read"}:
+        _validate_mcp_resource_syscall_arguments(name, args, config)
+
+
+def _validate_mcp_resource_syscall_arguments(
+    name: str,
+    args: dict[str, Any],
+    config: AgentLibOSConfig,
+) -> None:
+    _validate_mcp_logical_syscall_argument(
+        args.get("server_id"),
+        maximum=config.mcp.server_id_max_chars,
+    )
+    if name == "mcp.resource_read":
+        _validate_mcp_logical_syscall_argument(
+            args.get("resource_id"),
+            maximum=config.mcp.tool_id_max_chars,
+        )
+        _validate_mcp_resource_syscall_variables(args, config)
+        return
+    _validate_mcp_resource_list_syscall_arguments(args)
+
+
+def _validate_mcp_logical_syscall_argument(
+    value: Any,
+    *,
+    maximum: int,
+) -> None:
+    if (
+        type(value) is not str
+        or len(value.encode("utf-8")) > maximum
+        or _MCP_LOGICAL_ID_PATTERN.fullmatch(value) is None
+    ):
+        raise ValidationError("MCP Resource syscall logical id is invalid")
+
+
+def _validate_mcp_resource_list_syscall_arguments(
+    args: dict[str, Any],
+) -> None:
+    kind = args.get("kind", "resource")
+    if type(kind) is not str or kind not in {"resource", "template"}:
+        raise ValidationError("MCP Resource syscall kind is invalid")
+    cursor = args.get("cursor")
+    if cursor is not None and (
+        type(cursor) is not str
+        or len(cursor) < 23
+        or len(cursor.encode("utf-8")) > 256
+        or _MCP_OPAQUE_CURSOR_PATTERN.fullmatch(cursor) is None
+    ):
+        raise ValidationError("MCP Resource syscall cursor must be opaque")
+
+
+def _validate_mcp_resource_syscall_variables(
+    args: dict[str, Any],
+    config: AgentLibOSConfig,
+) -> None:
+    variables = args.get("variables", {})
+    if type(variables) is not dict or len(variables) > 256:
+        raise ValidationError(
+            "MCP Resource variables must be a bounded string object"
+        )
+    total_bytes = 0
+    for key, value in variables.items():
+        variable_bytes = _validate_mcp_resource_syscall_variable(
+            key,
+            value,
+            maximum_name_bytes=config.mcp.tool_id_max_chars,
+        )
+        total_bytes += variable_bytes
+        if total_bytes > config.mcp.max_request_hard_limit_bytes:
+            raise ValidationError(
+                "MCP Resource variables exceed the request byte limit"
+            )
+
+
+def _validate_mcp_resource_syscall_variable(
+    key: Any,
+    value: Any,
+    *,
+    maximum_name_bytes: int,
+) -> int:
+    if (
+        type(key) is not str
+        or len(key.encode("utf-8")) > maximum_name_bytes
+        or _MCP_LOGICAL_ID_PATTERN.fullmatch(key) is None
+        or type(value) is not str
+        or len(value.encode("utf-8")) > 65_536
+    ):
+        raise ValidationError(
+            "MCP Resource variables must contain logical string names and values"
+        )
+    return len(key.encode("utf-8")) + len(value.encode("utf-8"))
 
 
 def _validate_builtin_argument_contract_inventory() -> None:
@@ -561,6 +674,9 @@ class LibOSSyscallSession:
         config: AgentLibOSConfig | None = None,
         *,
         transitions: ProcessTransitionService | None = None,
+        audit: AuditPort | None = None,
+        mcp: "McpPrimitive | None" = None,
+        syscall_registry: "SyscallRouter | None" = None,
     ) -> None:
         self.runtime = runtime
         self.pid = pid
@@ -574,6 +690,16 @@ class LibOSSyscallSession:
         self._processes = runtime.uow.processes
         self._transitions = transitions or ProcessTransitionService(
             self._processes
+        )
+        # The Runtime builder injects these cross-component facades. The
+        # fallbacks retain direct-session compatibility for Host Python/tests
+        # without making every syscall handler a Runtime service locator.
+        self._audit = audit if audit is not None else runtime.audit
+        self._mcp = mcp if mcp is not None else runtime.mcp
+        self._syscall_registry = (
+            syscall_registry
+            if syscall_registry is not None
+            else runtime.syscalls
         )
 
     async def handle(self, name: str, args: dict[str, Any]) -> Any:
@@ -621,7 +747,26 @@ class LibOSSyscallSession:
             raise ValidationError("syscall name must be non-empty")
         self._require_non_terminal_process()
         self._charge_syscall(normalized)
-        self.runtime.audit.record(
+        try:
+            self._validate_mcp_syscall_before_audit(normalized, args)
+        except ValidationError:
+            # Rejected MCP fields may themselves contain credentials or ad-hoc
+            # transport material. Preserve an auditable denial without storing
+            # attacker-controlled names or values.
+            self._audit.record(
+                actor=self.pid,
+                action="syscall.request",
+                target=normalized,
+                decision={
+                    "args": {
+                        "redacted": True,
+                        "argument_count": len(args),
+                    },
+                    "validation": "rejected",
+                },
+            )
+            raise
+        self._audit.record(
             actor=self.pid,
             action="syscall.request",
             target=normalized,
@@ -635,7 +780,7 @@ class LibOSSyscallSession:
             )
             if not preserve_wait:
                 self._cleanup_interrupted_wait(normalized)
-            self.runtime.audit.record(
+            self._audit.record(
                 actor=self.pid,
                 action="syscall.cancelled",
                 target=normalized,
@@ -655,13 +800,29 @@ class LibOSSyscallSession:
         except BaseException:
             self._cleanup_interrupted_wait(normalized)
             raise
-        self.runtime.audit.record(
+        self._audit.record(
             actor=self.pid,
             action="syscall.result",
             target=normalized,
             decision={"ok": True},
         )
         return to_jsonable(result)
+
+    def _validate_mcp_syscall_before_audit(
+        self,
+        name: str,
+        args: dict[str, Any],
+    ) -> None:
+        if self._syscall_registry.get(name) is not None:
+            return
+        descriptor = BUILTIN_SYSCALL_ROUTES.get(name)
+        if descriptor is None or not descriptor.name.startswith("mcp."):
+            return
+        _validate_builtin_syscall_arguments(
+            descriptor.name,
+            args,
+            self.config,
+        )
 
     def _charge_syscall(self, name: str) -> None:
         self.runtime.resources.charge(
@@ -768,7 +929,7 @@ class LibOSSyscallSession:
             control=False,
             reason=f"syscall {syscall_name} wait interrupted",
         )
-        self.runtime.audit.record(
+        self._audit.record(
             actor=self.pid,
             action="syscall.wait_interrupted",
             target=syscall_name,
@@ -823,7 +984,7 @@ class LibOSSyscallSession:
             await asyncio.sleep(self.runtime.scheduler.poll_interval_s)
 
     def _dispatch(self, name: str, args: dict[str, Any]) -> Any:
-        registered = self.runtime.syscalls.get(name)
+        registered = self._syscall_registry.get(name)
         if registered is not None:
             return registered.handler(self, args)
         descriptor = BUILTIN_SYSCALL_ROUTES.get(name)
@@ -929,17 +1090,73 @@ class LibOSSyscallSession:
 
     def _mcp_list(self, args: dict[str, Any]) -> dict[str, Any]:
         del args
-        return {"servers": self.runtime.mcp.list_servers(actor=self.pid)}
+        servers, has_more = self._mcp.list_servers_window(actor=self.pid)
+        return {"servers": servers, "has_more": has_more}
 
     def _mcp_inspect(self, args: dict[str, Any]) -> Any:
-        return self.runtime.mcp.inspect_server(str(args["server_id"]), actor=self.pid)
+        return self._mcp.inspect_server(str(args["server_id"]), actor=self.pid)
 
     async def _mcp_tools(self, args: dict[str, Any]) -> Any:
-        return await self.runtime.mcp.alist_tools(
+        return await self._mcp.alist_tools(
             str(args["server_id"]),
             actor=self.pid,
             refresh=bool(args.get("refresh", False)),
         )
+
+    async def _mcp_resources(self, args: dict[str, Any]) -> dict[str, Any]:
+        kind = str(args.get("kind", "resource"))
+        method_name = (
+            "alist_resources"
+            if kind == "resource"
+            else "alist_resource_templates"
+        )
+        method = getattr(self._mcp, method_name, None)
+        if not callable(method):
+            raise ValidationError("MCP Resources protected facade is unavailable")
+        page = await method(
+            str(args["server_id"]),
+            cursor=args.get("cursor"),
+            actor=self.pid,
+            model_visible_only=True,
+        )
+        payload = to_jsonable(page)
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("items"),
+            list,
+        ):
+            raise ValidationError(
+                "MCP Resources protected facade returned an invalid page"
+            )
+        return {
+            "server_id": str(args["server_id"]),
+            "kind": kind,
+            "items": payload["items"],
+            "next_cursor": payload.get("next_cursor"),
+            "has_more": payload.get("next_cursor") is not None,
+            "cache_hint": payload.get("cache_hint"),
+        }
+
+    async def _mcp_resource_read(self, args: dict[str, Any]) -> dict[str, Any]:
+        method = getattr(self._mcp, "aread_resource", None)
+        if not callable(method):
+            raise ValidationError("MCP Resources protected facade is unavailable")
+        result = await method(
+            str(args["server_id"]),
+            str(args["resource_id"]),
+            variables=dict(args.get("variables", {})),
+            actor=self.pid,
+            for_model=True,
+        )
+        payload = to_jsonable(result)
+        if not isinstance(payload, dict):
+            raise ValidationError(
+                "MCP Resources protected facade returned an invalid result"
+            )
+        return {
+            "server_id": str(args["server_id"]),
+            "resource_id": str(args["resource_id"]),
+            "result": payload,
+        }
 
     def _process_cwd(self, args: dict[str, Any]) -> dict[str, Any]:
         del args
@@ -1366,7 +1583,7 @@ class LibOSSyscallSession:
         return to_jsonable(result)
 
     async def _mcp_call(self, args: dict[str, Any]) -> dict[str, Any]:
-        result = await self.runtime.mcp.acall_tool(
+        result = await self._mcp.acall_tool(
             self.pid,
             server_id=str(args["server_id"]),
             tool_id=str(args["tool_id"]),

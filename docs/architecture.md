@@ -667,7 +667,7 @@ never automatically replayed. The general LLM process executor is not reused,
 so its full-I/O persistence path cannot capture the semantic prompt or
 response.
 
-Store schema v6 keeps mutable queue/control/rate state separate from append-only
+Store schema v7 keeps mutable queue/control/rate state separate from append-only
 assessment, FlowGraph, policy epoch, machine-settlement, health, and review
 evidence. Temporary safe projections are bounded and reduced to
 hash-only at terminalization, expiry, cancellation, failure, or kill-switch

@@ -14,6 +14,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from scripts.mcp_test_support import (
+    mcp_dependency_error,
+    missing_mcp_optional_dependencies,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 LANE_PATHS = {
     "unit": ("tests/unit",),
@@ -411,6 +416,10 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("pytest-xdist is required for --workers; run `uv sync --frozen` first")
     if args.lane == "gui" and args.keep_agent_outputs:
         parser.error("--keep-agent-outputs only applies to pytest lanes")
+    if getattr(args, "run_mcp", False):
+        missing_mcp = missing_mcp_optional_dependencies()
+        if missing_mcp:
+            parser.error(mcp_dependency_error(missing_mcp))
     if args.shard_index >= args.shard_count:
         parser.error("--shard-index must be less than --shard-count")
     if args.lane in {"gui", "all"} and (

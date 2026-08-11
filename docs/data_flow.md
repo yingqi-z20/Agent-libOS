@@ -498,7 +498,7 @@ incrementally by local Host DLP; hits persist only closed category/reason/
 evidence-digest findings and monotonically stricter advisory sensitivity, not
 the matched text or a label writeback.
 
-Store schema v6 separately records a payload-free FlowGraph of root goals,
+Store schema v7 separately records a payload-free FlowGraph of root goals,
 Object/file versions, provider/Tool/model results, materializations, and their
 Process/provider/Tool/LLM/Object/file activities. `direct`, `indirect`, and
 `control` edges are append-only. Model assertions may only raise sensitivity

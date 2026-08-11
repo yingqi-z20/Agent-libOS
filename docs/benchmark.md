@@ -638,7 +638,7 @@ input reports, and applies the exact `12/12`, `10/12`, and family-gate rules.
 
 Keep the report and any diagnostic artifacts outside the repository. Omitting
 `--artifacts-root` is recommended: synthetic workspaces and permanent-
-retention v6 databases are then temporary and are removed after the bounded,
+retention v7 databases are then temporary and are removed after the bounded,
 redacted report is written. A command documented here is a gate definition,
 not evidence that the real-provider repetitions have run or passed.
 

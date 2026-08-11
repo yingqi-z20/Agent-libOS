@@ -42,8 +42,10 @@ from agent_libos.tools.builtin.memory import (
 from agent_libos.tools.builtin.mcp import (
     CallMcpToolTool,
     InspectMcpServerTool,
+    ListMcpResourcesTool,
     ListMcpServersTool,
     ListMcpToolsTool,
+    ReadMcpResourceTool,
 )
 from agent_libos.tools.builtin.messages import ReadProcessMessagesTool, ReceiveProcessMessagesTool, SendProcessMessageTool
 from agent_libos.tools.builtin.object_files import CreateObjectFromFileTool, WriteObjectToFileTool
@@ -113,6 +115,7 @@ __all__ = [
     "ListCapabilitiesTool",
     "ListCheckpointsTool",
     "ListJsonRpcEndpointsTool",
+    "ListMcpResourcesTool",
     "ListMcpServersTool",
     "ListMcpToolsTool",
     "MergeChildMemoryTool",
@@ -121,6 +124,7 @@ __all__ = [
     "ProposeJitTool",
     "ReadDirectoryTool",
     "ReadMemoryObjectTool",
+    "ReadMcpResourceTool",
     "ReadSkillResourceTool",
     "ListMemoryNamespaceTool",
     "ListObjectTasksTool",

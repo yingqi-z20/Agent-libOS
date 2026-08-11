@@ -17,7 +17,12 @@ from agent_libos.storage.semantic_v6_migration import (
     apply_store_v6_migration,
     plan_store_v6_migration,
 )
+from agent_libos.storage.mcp_v7_migration import (
+    apply_store_v7_migration,
+    plan_store_v7_migration,
+)
 from agent_libos.storage.v6_schema_contract import V6_TABLES
+from agent_libos.storage.v7_schema_contract import V7_TABLES
 from tests.runtime.test_semantic_v5_postgres_migration import _postgres_schema_dsn
 
 
@@ -53,7 +58,7 @@ def test_postgres_v5_to_v6_migration_round_trip() -> None:
     with _postgres_schema_dsn() as dsn:
         PostgresStore(dsn).close()
         with psycopg.connect(dsn, autocommit=True) as connection:
-            for table in sorted(V6_TABLES):
+            for table in sorted(V7_TABLES | V6_TABLES):
                 connection.execute(
                     sql.SQL("DROP TABLE {}").format(sql.Identifier(table))
                 )
@@ -104,11 +109,21 @@ def test_postgres_v5_to_v6_migration_round_trip() -> None:
         )
 
         assert result.applied
+        with psycopg.connect(dsn, autocommit=True) as connection:
+            assert connection.execute(
+                "SELECT schema_version FROM runtime_schema WHERE singleton = 1"
+            ).fetchone() == (6,)
+        v7_plan = plan_store_v7_migration(dsn)
+        apply_store_v7_migration(
+            dsn,
+            expected_plan_sha256=v7_plan.plan_sha256,
+            postgres_snapshot_confirmed=True,
+        )
         reopened = PostgresStore(dsn)
         try:
             assert reopened.conn.execute(
                 "SELECT schema_version FROM runtime_schema WHERE singleton = 1"
-            ).fetchone() == {"schema_version": 6}
+            ).fetchone() == {"schema_version": 7}
             legacy = reopened.get_semantic_legacy_coverage()
             assert legacy is not None
             assert legacy.assessment_count == 1
@@ -144,7 +159,7 @@ def test_postgres_v5_to_v6_failure_rolls_back(
     with _postgres_schema_dsn() as dsn:
         PostgresStore(dsn).close()
         with psycopg.connect(dsn, autocommit=True) as connection:
-            for table in sorted(V6_TABLES):
+            for table in sorted(V7_TABLES | V6_TABLES):
                 connection.execute(
                     sql.SQL("DROP TABLE {}").format(sql.Identifier(table))
                 )
@@ -238,7 +253,7 @@ def test_postgres_v6_apply_requires_snapshot_and_exclusive_advisory_lock() -> No
     with _postgres_schema_dsn() as dsn:
         PostgresStore(dsn).close()
         with psycopg.connect(dsn, autocommit=True) as connection:
-            for table in sorted(V6_TABLES):
+            for table in sorted(V7_TABLES | V6_TABLES):
                 connection.execute(
                     sql.SQL("DROP TABLE {}").format(sql.Identifier(table))
                 )

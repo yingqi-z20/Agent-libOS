@@ -1627,7 +1627,7 @@ def _apply_registry_schema_overrides(
     limits = {
         "list_memory_namespace": (None, config.memory.query_limit),
         "list_jsonrpc_endpoints": (None, config.jsonrpc.list_limit),
-        "list_mcp_servers": (None, config.mcp.list_limit),
+        "list_mcp_servers": (None, config.mcp.server_page_limit),
         "list_capabilities": (
             config.capability.list_limit,
             config.capability.list_limit,
