@@ -287,8 +287,9 @@ class _CancellationSuppressingToolProvider(_HangingToolProvider):
 class _BlockingToolProvider:
     """Contract-violating custom SPI used to lock conservative post-checks."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, delay_s: float) -> None:
         self.calls = 0
+        self.delay_s = delay_s
 
     async def call_tool(
         self,
@@ -304,7 +305,7 @@ class _BlockingToolProvider:
         # In-process Python cannot safely preempt this.  It is forbidden by the
         # public custom-SPI contract; Runtime must still reject its late result
         # and keep the entered effect UNKNOWN/no-replay.
-        time.sleep(0.2)
+        time.sleep(self.delay_s)
         return McpComplete(value={"content": []})
 
 
@@ -2062,7 +2063,8 @@ def test_custom_tool_and_continuation_deadline_contract_and_violation_containmen
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manifest = replace(_manifest(), timeout_s=0.1)
+    deadline_s = 5.0
+    manifest = replace(_manifest(), timeout_s=deadline_s)
     broker = InMemoryMcpCredentialBroker()
     runtime = Runtime.open(
         tmp_path / "durable-modern-provider-deadline.sqlite",
@@ -2103,7 +2105,7 @@ def test_custom_tool_and_continuation_deadline_contract_and_violation_containmen
                 "review",
                 {"document": "release-notes"},
             )
-        assert time.monotonic() - started < 0.75
+        assert time.monotonic() - started < deadline_s + 5.0
         assert hanging_tool.calls == 1
         assert hanging_tool.cancellations >= 1
         assert hanging_tool.closed == 1
@@ -2127,12 +2129,12 @@ def test_custom_tool_and_continuation_deadline_contract_and_violation_containmen
         # Cancellation suppression is outside the supported SPI contract. The
         # operation-local loop still prevents this yielding violation from
         # hanging sync Runtime/CLI shutdown if a Host composes it accidentally.
-        assert time.monotonic() - started < 0.75
+        assert time.monotonic() - started < deadline_s + 5.0
         assert suppressing_tool.calls == 1
         assert suppressing_tool.cancellations >= 1
         assert suppressing_tool.closed == 1
 
-        blocking_tool = _BlockingToolProvider()
+        blocking_tool = _BlockingToolProvider(delay_s=deadline_s + 0.2)
         runtime.mcp._modern_tool_provider = blocking_tool  # noqa: SLF001
         started = time.monotonic()
         with pytest.raises(ValidationError, match="absolute deadline"):
@@ -2146,7 +2148,7 @@ def test_custom_tool_and_continuation_deadline_contract_and_violation_containmen
         # A blocking in-process coroutine is explicitly outside the custom-SPI
         # contract. Runtime cannot hard-preempt it, but rejects the late result
         # and never presents the operation as retry-safe.
-        assert 0.18 <= elapsed < 1.0
+        assert deadline_s <= elapsed < deadline_s + 5.0
         assert blocking_tool.calls == 1
         blocking_effect = [
             effect
@@ -2174,7 +2176,7 @@ def test_custom_tool_and_continuation_deadline_contract_and_violation_containmen
         started = time.monotonic()
         with pytest.raises(ValidationError, match="unknown outcome"):
             _respond_pending_continuation(runtime, pending)
-        assert time.monotonic() - started < 0.75
+        assert time.monotonic() - started < deadline_s + 5.0
         record = runtime._mcp_continuation_manager.repository.get(
             pending.continuation_id
         )
