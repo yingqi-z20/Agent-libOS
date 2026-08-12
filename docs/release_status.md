@@ -1,13 +1,13 @@
 # Agent libOS 1.5.0 Status
 
-Agent libOS 1.5.0 is a release candidate for the core Python runtime scope
-defined in `docs/support_matrix.md`. Release-ready status for any source tree is
+Agent libOS 1.5.0 is the current release line for the core Python runtime scope
+defined in `docs/support_matrix.md`. Release status for any source tree is
 conditional on that exact tree passing the checked-in CI workflow; local
 deterministic results do not substitute for its Python-version, PostgreSQL, and
 artifact gates. This is not a claim that every platform, desktop package, or
 real external-provider configuration has been release-validated.
 
-This page records the candidate scope and the checked-in validation contract;
+This page records the release scope and the checked-in validation contract;
 it is not itself a CI receipt. A release-pass claim must be bound to all of the
 following immutable locators:
 
@@ -18,7 +18,7 @@ following immutable locators:
 
 Without that complete binding, wording below such as “requires”, “gates”, or
 “checks” describes the workflow contract only, not an observed pass for a
-checkout or candidate artifact.
+checkout or release artifact.
 
 ## Implemented release safeguards
 
@@ -421,9 +421,9 @@ checkout or candidate artifact.
   contract files in the wheel, and requires the reviewed examples, scripts, and
   frozen Python/TypeScript fixture sources in the sdist. The build waits for its
   declared pre-build gates; these
-  smoke jobs run afterward, and the candidate is not release-validated until
+  smoke jobs run afterward, and the artifacts are not release-validated until
   the full downstream matrix succeeds. No workflow publishes or pushes
-  candidate distributions.
+  distributions.
 
 ## Unarchived real-LLM observation
 

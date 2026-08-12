@@ -22,5 +22,6 @@ material you are authorized to share under the repository's Apache-2.0 license.
 Ordinary bugs and feature proposals may use GitHub issues. Suspected security
 vulnerabilities, exploit details, secrets, and private data must follow the
 reporting guidance in [SECURITY.md](SECURITY.md), not a public issue or pull
-request. While no confidential intake is enabled, a public issue may contain
-only the non-sensitive coordination request that policy permits.
+request. Use the private-report form linked from that policy. If the form is
+unavailable, a public issue may contain only the non-sensitive coordination
+request that policy permits.

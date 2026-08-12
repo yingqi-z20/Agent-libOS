@@ -610,7 +610,7 @@ def test_release_status_requires_an_immutable_ci_receipt_binding() -> None:
         "the exact source commit locator",
         "the CI workflow run locator and the required job locators",
         "checksum-manifest artifact locators",
-        "not an observed pass for a checkout or candidate artifact",
+        "not an observed pass for a checkout or release artifact",
         "## Validation contract (CI receipt required)",
     ):
         assert required in normalized
@@ -1492,6 +1492,7 @@ def test_maintainer_governance_docs_match_current_release_boundaries() -> None:
     security_normalized = " ".join(security.split())
     contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    changelog_normalized = " ".join(changelog.split())
     releasing = (ROOT / "docs" / "releasing.md").read_text(encoding="utf-8")
     releasing_normalized = " ".join(releasing.split())
     version = tomllib.loads(
@@ -1500,13 +1501,16 @@ def test_maintainer_governance_docs_match_current_release_boundaries() -> None:
 
     for link in ("AGENTS.md", "docs/development.md", "SECURITY.md"):
         assert link in contributing
-    assert "only the non-sensitive coordination request" in contributing
+    assert "Use the private-report form linked from that policy" in contributing
+    assert "only the non-sensitive coordination" in contributing
 
     assert (
-        "private vulnerability reporting is currently **not enabled**"
+        "private vulnerability reporting is **enabled**"
         in security_normalized
     )
-    assert "is not presently a working intake channel" in security_normalized
+    assert "A repository owner confirmed the setting" in security_normalized
+    assert "Signed-in reporters should use the standard" in security_normalized
+    assert "private-report form" in security_normalized
     assert "only a non-sensitive request" in security_normalized
     assert "does not invent an email address" in security_normalized
     assert "No current validation or fix commitment" in security_normalized
@@ -1514,8 +1518,10 @@ def test_maintainer_governance_docs_match_current_release_boundaries() -> None:
     assert re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", security) is None
 
     assert "## Unreleased" in changelog
-    assert f"## {version} — release candidate" in changelog
-    assert "does not claim that a tag, PyPI upload, GitHub release" in changelog
+    assert f"## {version}\n" in changelog
+    assert f"## {version} — release candidate" not in changelog
+    assert "does not claim a PyPI upload" in changelog_normalized
+    assert "signed desktop distribution" in changelog_normalized
 
     for required in (
         "read-only repository permission and no PyPI, tag, or GitHub-release authority",

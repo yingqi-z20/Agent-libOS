@@ -185,7 +185,7 @@ The implementation currently includes:
 
 Start here, then read the deeper references as needed:
 
-- [docs/release_status.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/release_status.md): current-version candidate scope,
+- [docs/release_status.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/release_status.md): current-version release scope,
   validation contract, and remaining environment boundaries (not a CI receipt).
 - [docs/python_api.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/python_api.md): public Python imports, Runtime
   lifecycle, manager properties, sync/async usage, exceptions, and
@@ -287,7 +287,7 @@ Start here, then read the deeper references as needed:
   reporting availability, coordinated disclosure, and safe research guidance.
 - [CONTRIBUTING.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/CONTRIBUTING.md): contribution scope, testing expectations,
   pull-request evidence, and security-report routing.
-- [CHANGELOG.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/CHANGELOG.md): release-candidate history without implying an
+- [CHANGELOG.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/CHANGELOG.md): release history without implying an
   unverified tag, upload, or publication date.
 - [AGENTS.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/AGENTS.md): repository structure, testing, security, and
   contribution guidance for local agents and contributors.
