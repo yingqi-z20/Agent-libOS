@@ -7,7 +7,7 @@ npmRebuild: false
 buildDependenciesFromSource: false
 compression: maximum
 directories:
-  buildResources: build
+  buildResources: desktop-resources
   output: ../desktop-dist
 files:
   - dist-electron/**/*
@@ -27,7 +27,7 @@ extraResources:
     to: metadata
 mac:
   category: public.app-category.developer-tools
-  icon: build/icon.svg
+  icon: desktop-resources/icon.svg
   identity: '-'
   hardenedRuntime: false
   gatekeeperAssess: false
@@ -39,7 +39,7 @@ dmg:
   title: Agent libOS ${version} Internal
   sign: false
 win:
-  icon: build/icon.svg
+  icon: desktop-resources/icon.svg
   forceCodeSigning: false
   artifactName: Agent-libOS-${version}-windows-${arch}.${ext}
   target:
@@ -56,7 +56,7 @@ nsis:
 linux:
   category: Development
   executableName: agent-libos
-  icon: build/icon.svg
+  icon: desktop-resources/icon.svg
   artifactName: Agent-libOS-${version}-linux-${arch}.${ext}
   target:
     - AppImage

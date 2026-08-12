@@ -303,6 +303,9 @@ native runner: `macos-15` produces arm64, `windows-2025` produces x64, and
 `ubuntu-24.04` produces x64. The manual workflow is
 `.github/workflows/desktop-internal.yml`; it uploads Actions artifacts and does
 not create a tag, GitHub Release, public download, or auto-update channel.
+Source-controlled electron-builder inputs such as the application icon live in
+`gui/desktop-resources`; `gui/.desktop-stage` and `desktop-dist` remain generated
+staging and output directories.
 
 The packaged default store is
 `<Electron userData>/runtime/agent-libos.sqlite`. The optional overlay is

@@ -66,6 +66,10 @@ def test_desktop_build_metadata_and_scripts_use_exact_versions_and_no_publish() 
     assert lock["packages"]["node_modules/electron-builder"]["version"] == "26.15.3"
     assert "pyinstaller==6.21.0" in pyproject
     assert "appId: io.agentlibos.desktop" in config
+    assert "buildResources: desktop-resources" in config
+    assert config.count("icon: desktop-resources/icon.svg") == 3
+    assert (ROOT / "gui" / "desktop-resources" / "icon.svg").is_file()
+    assert "/gui/build/" in (ROOT / ".gitignore").read_text(encoding="utf-8")
     assert "identity: '-'" in config
     assert "publish: null" in config
     assert "--publish never" in package["scripts"]["desktop:dist"]

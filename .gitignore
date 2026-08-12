@@ -94,6 +94,7 @@ pnpm-debug.log*
 # Vite, Electron, and GUI test/build artifacts
 /gui/dist/
 /gui/dist-electron/
+/gui/build/
 /gui/.vite/
 /gui/coverage/
 /gui/.smoke-log.jsonl

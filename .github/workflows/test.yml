@@ -291,7 +291,7 @@ jobs:
           --lane ${{ matrix.lane }}
           ${{ matrix.shard_args }}
           --durations 25
-          --max-lane-seconds ${{ matrix.lane == 'runtime' && 480 || 360 }}
+          --max-lane-seconds ${{ (matrix.lane == 'runtime' || matrix.lane == 'benchmark') && 480 || 360 }}
 
   security:
     needs: static

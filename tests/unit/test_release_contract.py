@@ -2095,7 +2095,7 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         (
             "python",
             "Run pytest lane",
-            "${{ matrix.lane == 'runtime' && 480 || 360 }}",
+            "${{ (matrix.lane == 'runtime' || matrix.lane == 'benchmark') && 480 || 360 }}",
         ),
         ("security", "Run complete security lane", "360"),
     ):

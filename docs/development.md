@@ -210,9 +210,10 @@ GUI test, typecheck, and build commands each receive the full timeout
 independently. Timeout exits with status 124 after terminating the process
 group/tree. Standard lanes deselect `postgres` tests because the PostgreSQL CI
 service runs them separately with `pytest -m postgres --run-postgres`. Linux CI
-uses a 480-second process deadline for the runtime lane and 360 seconds for the
-other standard lanes, within a 15-minute step. The Windows matrix uses explicit
-file shards and a 1,400-second process deadline within a 25-minute step; those
+uses a 480-second process deadline for the runtime and benchmark lanes and 360
+seconds for the other standard lanes, within a 15-minute step. The Windows
+matrix uses explicit file shards and a 1,400-second process deadline within a
+25-minute step; those
 larger limits cover platform and runner variance rather than a different test
 contract. Run the `gui` lane separately; it cleans Electron output before
 production compilation, excludes generated `dist-electron` files from Vitest,
