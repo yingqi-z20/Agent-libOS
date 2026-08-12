@@ -8,7 +8,7 @@ corruption, containment failure, or vulnerable dependency are welcome.
 
 | Version | Current evidence and handling |
 | --- | --- |
-| Current `main` and the 1.5.0 release-candidate line | Target of current checked-in validation and best-effort fixes |
+| Current `main` and the 1.5.x release line | Target of current checked-in validation and best-effort fixes |
 | 1.4.x and older snapshots | No current validation or fix commitment; handling is decided per report |
 
 This table records repository evidence, not an owner-approved long-term support
@@ -19,25 +19,22 @@ range for the specific report.
 
 ## Confidential reporting status
 
-GitHub private vulnerability reporting is currently **not enabled** for this
-repository. Consequently, the standard
-[private-report URL](https://github.com/yingqi-z20/Agent-libOS/security/advisories/new)
-is not presently a working intake channel. This policy deliberately does not
-invent an email address or imply that another confidential channel exists.
+GitHub private vulnerability reporting is **enabled** for this repository. A
+repository owner confirmed the setting before the 1.5.0 release. Signed-in
+reporters should use the standard
+[private-report form](https://github.com/yingqi-z20/Agent-libOS/security/advisories/new)
+for vulnerability facts, exploit details, credentials, private data, or a
+proof of concept.
 
-Until a maintainer enables private reporting, do not put vulnerability facts,
-exploit details, credentials, private data, or a proof of concept in an issue,
-discussion, pull request, commit, or other public location. You may open a
+Do not put sensitive security-report content in an issue, discussion, pull
+request, commit, or other public location. If the private-report form becomes
+unavailable, retain the report privately and open a
 [GitHub issue](https://github.com/yingqi-z20/Agent-libOS/issues/new) containing
-only a non-sensitive request for the maintainers to establish a private
-security contact. The request must not identify the affected component,
-version, weakness, prerequisites, impact, or reproduction. Otherwise, retain
-the report privately and wait for a confidential channel.
-
-After the repository Security page visibly offers private vulnerability
-reporting, use the private-report URL above. Maintainers must update this status
-when they enable and verify that channel; enabling it is a release blocker in
-[the release runbook](docs/releasing.md).
+only a non-sensitive request for the maintainers to restore the confidential
+channel. The request must not identify the affected component, version,
+weakness, prerequisites, impact, or reproduction. This policy deliberately
+does not invent an email address or imply that another confidential channel
+exists.
 
 Include, when available:
 
