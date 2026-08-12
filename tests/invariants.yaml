@@ -373,7 +373,7 @@
         "tests/security/test_human_atomicity.py::test_human_decision_limits_reject_before_request_or_capability_side_effects[tool_overrides0-decision0-exceeds 64 bytes]",
         "tests/security/test_human_atomicity.py::test_human_decision_limits_reject_before_request_or_capability_side_effects[tool_overrides1-decision1-maximum JSON depth=2]",
         "tests/security/test_human_atomicity.py::test_human_decision_limits_reject_before_request_or_capability_side_effects[tool_overrides2-decision2-maximum JSON nodes=5]",
-        "tests/security/test_human_atomicity.py::test_bounded_human_decision_control_still_applies_approved_side_effects",
+        "tests/security/test_human_atomicity.py::test_bounded_human_decision_control_approves_without_authority_side_effects",
         "tests/security/test_human_atomicity.py::test_oversized_terminal_provider_answer_is_rejected_without_approval"
       ],
       "benchmark_attack_classes": []
@@ -391,13 +391,18 @@
     },
     {
       "id": "provider-usage-reservations-fail-closed",
-      "title": "MCP reserves the complete exchange before dispatch, settles known stage usage exactly, and charges only the current unknown stage upper bound.",
+      "title": "MCP uses one preflight-to-provider deadline, reserves the complete exchange before dispatch, settles known stage usage exactly, and charges only the current unknown stage upper bound.",
       "lane": "providers",
       "node_ids": [
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_validate_and_call_uses_one_provider_session_and_settles_all_stages",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_sdk_validate_and_call_uses_one_absolute_deadline",
+        "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_opt_in_provider_receives_one_absolute_deadline_across_list_and_call",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_legacy_provider_does_not_start_call_after_list_exhausts_deadline",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_deadline_exhausted_during_dispatch_setup_never_calls_provider",
+        "tests/providers/test_mcp_v2_contract.py::test_v2_read_surface_deadline_includes_environment_preflight_without_effect[discover]",
+        "tests/providers/test_mcp_v2_contract.py::test_v2_read_surface_deadline_includes_environment_preflight_without_effect[list]",
+        "tests/providers/test_mcp_v2_contract.py::test_v1_call_deadline_includes_schema_preflight_without_effect",
+        "tests/providers/test_mcp_v2_contract.py::test_v1_call_deadline_expires_during_protected_preflight_without_effect",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_total_mcp_budget_denial_does_not_start_provider",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_live_schema_mismatch_consumes_and_records_one_shot_attempt",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_list_tools_refresh_provider_failure_records_failed_attempt",
@@ -429,6 +434,17 @@
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_static_tool_preserves_public_provider_error_envelope_in_durable_failure[malformed]",
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_uncaught_deno_syscall_preserves_public_provider_error_envelope[malformed]",
         "tests/providers/test_jsonrpc_primitive.py::TestJsonRpcPrimitive::test_malformed_transport_result_is_sanitized_before_field_access"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "mcp-registry-search-exposes-only-public-identifiers",
+      "title": "MCP registry text search is a case-insensitive literal match over public server ids and cannot act as a boolean oracle over private canonical manifest fields.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_store_contract.py::test_mcp_registry_search_matches_only_public_server_id_as_literal_text[sqlite-memory]",
+        "tests/runtime/test_store_contract.py::test_mcp_registry_search_matches_only_public_server_id_as_literal_text[sqlite-file]",
+        "tests/runtime/test_store_contract.py::test_mcp_registry_search_matches_only_public_server_id_as_literal_text[postgres]"
       ],
       "benchmark_attack_classes": []
     },
@@ -814,13 +830,13 @@
       "benchmark_attack_classes": []
     },
     {
-      "id": "v5-persisted-state-is-strict-and-versioned",
-      "title": "Runtime startup accepts only the complete v5 schema and canonical security carriers; canonical v4 migration is explicit and older or malformed state is rejected without mutation.",
+      "id": "v7-persisted-state-is-strict-and-versioned",
+      "title": "Runtime startup accepts only the complete v7 schema and canonical security carriers; ordered canonical v4-to-v5, v5-to-v6, and v6-to-v7 migrations are explicit and older or malformed state is rejected without mutation.",
       "lane": "runtime",
       "node_ids": [
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_schema_v3_is_zero_write_rejected_with_101_archive_hint",
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_wrong_schema_marker_is_rejected_without_mutation",
-        "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_v5_schema_manifest_matches_fresh_store",
+        "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_v7_schema_manifest_matches_fresh_store",
         "tests/unit/test_v5_storage_schema_contract.py::test_tampered_v5_sqlite_human_primary_key_is_rejected_on_reopen",
         "tests/unit/test_v5_storage_schema_contract.py::test_tampered_v5_sqlite_action_tenant_index_is_rejected_on_reopen",
         "tests/unit/test_v5_storage_schema_contract.py::test_v4_migration_plan_rejects_missing_human_primary_key",
@@ -832,6 +848,45 @@
         "tests/unit/test_semantic_v5_migration.py::test_v5_plan_rejects_noncanonical_v4_without_writes",
         "tests/unit/test_semantic_v5_migration.py::test_v5_apply_requires_owner_only_self_contained_backup",
         "tests/runtime/test_semantic_v5_postgres_migration.py::test_postgres_v4_to_v5_migration_round_trip",
+        "tests/unit/test_semantic_v6_migration.py::test_v5_to_v6_dry_run_is_zero_write_and_apply_requires_digest",
+        "tests/unit/test_semantic_v6_migration.py::test_v6_plan_requires_and_validates_independent_backup",
+        "tests/unit/test_semantic_v6_migration.py::test_runtime_refuses_v5_without_automatic_migration",
+        "tests/unit/test_semantic_v6_migration.py::test_v5_to_v6_failure_rolls_back_ddl_and_marker",
+        "tests/runtime/test_semantic_v6_postgres_migration.py::test_postgres_v5_to_v6_migration_round_trip",
+        "tests/runtime/test_semantic_v6_postgres_migration.py::test_postgres_v5_to_v6_failure_rolls_back",
+        "tests/runtime/test_semantic_v6_postgres_migration.py::test_postgres_v6_apply_requires_snapshot_and_exclusive_advisory_lock",
+        "tests/unit/test_mcp_v7_migration.py::test_v6_to_v7_plan_is_zero_write_and_apply_reopens_canonical_v7",
+        "tests/unit/test_mcp_v7_migration.py::test_v7_plan_requires_an_independent_exact_v6_backup",
+        "tests/unit/test_mcp_v7_migration.py::test_runtime_refuses_v6_without_automatic_v7_migration",
+        "tests/unit/test_mcp_v7_migration.py::test_v6_to_v7_failure_rolls_back_ddl_and_marker",
+        "tests/unit/test_mcp_v7_storage.py::test_v7_records_reopen_and_keep_all_remote_secrets_out_of_store",
+        "tests/unit/test_mcp_v7_storage.py::test_malformed_persisted_metadata_fails_closed",
+        "tests/unit/test_mcp_v7_storage.py::test_v7_schema_has_no_payload_or_oauth_secret_columns",
+        "tests/unit/test_mcp_v7_storage.py::test_input_required_remote_task_requires_durable_human_request_binding",
+        "tests/unit/test_mcp_v7_storage.py::test_human_request_binding_is_unique_across_continuations_and_remote_tasks",
+        "tests/unit/test_mcp_v7_storage.py::test_credential_broker_slots_are_unique_across_all_mcp_operations",
+        "tests/unit/test_mcp_v7_storage.py::test_side_effect_preparation_reopens_before_side_effects_and_commits_atomically",
+        "tests/unit/test_mcp_v7_storage.py::test_side_effect_preparation_cleanup_claim_is_single_use_and_revision_fenced",
+        "tests/unit/test_mcp_v7_storage.py::test_side_effect_retirement_metadata_is_closed_paired_and_bounded",
+        "tests/unit/test_mcp_v7_storage.py::test_side_effect_preparation_followup_cas_rebinds_one_human_round",
+        "tests/unit/test_mcp_v7_storage.py::test_two_prepared_mcp_handoffs_join_one_sqlite_transaction_and_rollback",
+        "tests/unit/test_mcp_v7_storage.py::test_terminal_mcp_retention_is_bounded_revision_fenced_and_keeps_human_audit",
+        "tests/unit/test_mcp_v3_continuations.py::test_multi_round_response_atomically_rebinds_human_request_in_sql_store",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_initial_side_effect_preparation_is_aborted_on_sqlite_reopen[after_human_before_broker-continuation]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_initial_side_effect_preparation_is_aborted_on_sqlite_reopen[after_human_before_broker-remote_task]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_initial_side_effect_preparation_is_aborted_on_sqlite_reopen[after_broker_before_main_insert-continuation]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_initial_side_effect_preparation_is_aborted_on_sqlite_reopen[after_broker_before_main_insert-remote_task]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_followup_commit_failure_retires_only_old_refs_on_sqlite_reopen[post_commit_crash]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_followup_commit_failure_retires_only_old_refs_on_sqlite_reopen[broker_delete_failure]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_terminal_retirement_broker_failure_reopens_without_orphan_or_replay",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_interrupted_task_mutation_reopens_needs_attention_without_replay[update]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_interrupted_task_mutation_reopens_needs_attention_without_replay[cancel]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_real_sqlite_preparation_recovery_follows_taskrun_preflight_in_one_lease",
+        "tests/runtime/test_mcp_v7_postgres.py::test_postgres_v7_fresh_catalog_reopen_and_atomic_cas",
+        "tests/runtime/test_mcp_v7_postgres.py::test_postgres_side_effect_preparation_reopens_and_commits_atomically",
+        "tests/runtime/test_mcp_v7_postgres.py::test_postgres_two_prepared_handoffs_join_one_transaction_and_rollback",
+        "tests/runtime/test_mcp_v7_postgres.py::test_postgres_v6_to_v7_plan_apply_and_reopen",
+        "tests/runtime/test_mcp_v7_postgres.py::test_postgres_v6_to_v7_failure_rolls_back",
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_fresh_schema_rejects_a_second_schema_marker",
         "tests/runtime/test_postgres_store.py::TestPostgresStore::test_fresh_schema_rejects_a_second_schema_marker",
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_incomplete_v4_schema_is_rejected_without_mutation",
@@ -1109,7 +1164,7 @@
     },
     {
       "id": "jit-syscall-arguments-are-exactly-typed-and-bounded",
-      "title": "Built-in JIT syscalls validate consumed fields by exact JSON type and Host bound before primitives, lifecycle state, mailbox acknowledgement, destructive semantics, or success audit.",
+      "title": "Built-in JIT syscalls use closed argument contracts and validate consumed fields by exact JSON type and Host bound before primitives, lifecycle state, mailbox acknowledgement, destructive semantics, or success audit.",
       "lane": "security",
       "node_ids": [
         "tests/security/test_syscall_argument_validation.py::test_argument_contract_inventory_covers_every_builtin_except_delegate",
@@ -1117,7 +1172,21 @@
         "tests/security/test_syscall_argument_validation.py::test_recursive_string_false_cannot_delete_nonempty_directory",
         "tests/security/test_syscall_argument_validation.py::test_string_false_ack_cannot_ack_an_unread_message",
         "tests/security/test_syscall_argument_validation.py::test_integer_and_float_timeouts_remain_valid_json_numbers",
-        "tests/security/test_syscall_argument_validation.py::test_builtin_alias_uses_same_argument_contract_before_primitive"
+        "tests/security/test_syscall_argument_validation.py::test_builtin_alias_uses_same_argument_contract_before_primitive",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_syscalls_reject_unknown_arguments_before_primitive_and_persistence",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_call_syscall_keeps_nested_tool_arguments_schema_owned",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_call_syscall_rejects_explicit_null_arguments_before_primitive",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_list_syscall_preserves_truncation_signal",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_resource_syscalls_reject_nonlogical_inputs_before_facade[server-url]",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_resource_syscalls_reject_nonlogical_inputs_before_facade[raw-provider-cursor]",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_resource_syscalls_reject_nonlogical_inputs_before_facade[prompt-kind]",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_resource_syscalls_reject_nonlogical_inputs_before_facade[raw-resource-uri]",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_resource_syscalls_reject_nonlogical_inputs_before_facade[non-string-variable-value]",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_resource_syscalls_reject_nonlogical_inputs_before_facade[non-logical-variable-name]",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_resource_syscalls_reject_nonlogical_inputs_before_facade[caller-supplied-actor]",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_resource_syscalls_fail_closed_without_protected_facade[list]",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_resource_syscalls_fail_closed_without_protected_facade[read]",
+        "tests/security/test_syscall_argument_validation.py::test_mcp_resource_syscalls_route_only_to_model_protected_facade"
       ],
       "benchmark_attack_classes": []
     },
@@ -1135,11 +1204,44 @@
         "tests/security/test_builtin_tool_argument_validation.py::test_security_control_arguments_reject_type_coercion_before_execution[json-include-parent-roots]",
         "tests/security/test_builtin_tool_argument_validation.py::test_security_control_arguments_reject_type_coercion_before_execution[json-git-amend]",
         "tests/security/test_builtin_tool_argument_validation.py::test_workspace_filesystem_tools_reject_unknown_arguments_before_execution[mapping-write-text]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_mcp_tools_reject_unknown_top_level_arguments_before_execution[mapping-list-servers]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_mcp_tools_reject_unknown_top_level_arguments_before_execution[mapping-inspect-server]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_mcp_tools_reject_unknown_top_level_arguments_before_execution[mapping-list-tools]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_mcp_tools_reject_unknown_top_level_arguments_before_execution[mapping-call-tool]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_mcp_tools_reject_unknown_top_level_arguments_before_execution[mapping-list-resources]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_mcp_tools_reject_unknown_top_level_arguments_before_execution[mapping-read-resource]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_mcp_tools_reject_unknown_top_level_arguments_before_execution[json-list-servers]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_mcp_tools_reject_unknown_top_level_arguments_before_execution[json-inspect-server]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_mcp_tools_reject_unknown_top_level_arguments_before_execution[json-list-tools]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_mcp_tools_reject_unknown_top_level_arguments_before_execution[json-call-tool]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_mcp_tools_reject_unknown_top_level_arguments_before_execution[json-list-resources]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_mcp_tools_reject_unknown_top_level_arguments_before_execution[json-read-resource]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_call_mcp_tool_rejects_explicit_null_arguments_before_execution[mapping]",
+        "tests/security/test_builtin_tool_argument_validation.py::test_call_mcp_tool_rejects_explicit_null_arguments_before_execution[json]",
         "tests/security/test_filesystem_directory_tools.py::TestFilesystemDirectoryTool::test_misspelled_overwrite_flag_cannot_replace_existing_file",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_tool_rejects_unknown_timeout_field_before_dispatch",
         "tests/unit/test_llm_tool_protocol.py::TestToolProtocol::test_string_arguments_are_byte_limited_before_json_parsing",
         "tests/unit/test_llm_tool_protocol.py::TestToolProtocol::test_direct_object_arguments_enforce_size_and_depth",
         "tests/unit/test_llm_tool_protocol.py::TestToolProtocol::test_configured_protocol_limit_fails_before_echo_dispatch"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "mcp-model-resources-are-logical-allowlisted-and-protected",
+      "title": "Model-side MCP Resource list/read accept only Manifest v3 logical allowlisted IDs, opaque Host cursors, and exact string variables, while Tool v3 outcomes expose only sanitized Complete content or local continuation/Task and Human receipts; all calls use protected Runtime facades and expose no Prompt, OAuth, Human-response, subscription, or task control tool.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_mcp_model_resources.py::test_model_resource_tools_publish_closed_logical_only_schemas",
+        "tests/security/test_mcp_model_resources.py::test_model_resource_tools_route_only_through_protected_async_facade",
+        "tests/security/test_mcp_model_resources.py::test_model_resource_tools_fail_closed_without_protected_facade[list]",
+        "tests/security/test_mcp_model_resources.py::test_model_resource_tools_fail_closed_without_protected_facade[read]",
+        "tests/security/test_mcp_model_resources.py::test_model_server_list_preserves_bounded_registry_truncation_signal",
+        "tests/security/test_mcp_model_resources.py::test_model_call_tool_output_schema_is_a_closed_versioned_union",
+        "tests/security/test_mcp_model_resources.py::test_model_call_tool_preserves_legacy_payload_and_minimizes_v3_outcomes",
+        "tests/security/test_mcp_model_resources.py::test_model_call_tool_rejects_raw_or_incomplete_v3_control_state",
+        "tests/security/test_mcp_model_resources.py::test_runtime_v3_tool_facade_returns_only_sanitized_model_union",
+        "tests/security/test_mcp_model_resources.py::test_runtime_model_resources_enforce_authority_allowlist_and_safe_projection",
+        "tests/security/test_mcp_model_resources.py::test_mcp_builtin_module_exposes_no_other_modern_model_tools"
       ],
       "benchmark_attack_classes": []
     },
@@ -3167,7 +3269,7 @@
     },
     {
       "id": "mcp-provider-effects-are-registered-and-classified",
-      "title": "MCP tool calls require registered server/tool authority, immutable host-snapshotted transport inputs, ambient-environment isolation, and classified provider effects.",
+      "title": "MCP tool calls require registered server/tool authority, one detached exact-JSON argument snapshot, immutable Host-snapshotted transport inputs, bounded schema validation, provider credential redaction, ambient-environment isolation, and classified provider effects.",
       "lane": "providers",
       "node_ids": [
         "tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_manifest_validation_rejects_unsafe_server_shapes",
@@ -3263,7 +3365,20 @@
         "tests/providers/test_mcp_sdk_integration.py::TestMcpSdkIntegration::test_streamable_http_rejects_content_encoding_before_decode",
         "tests/providers/test_mcp_sdk_integration.py::TestMcpSdkIntegration::test_streamable_http_json_body_is_bounded_before_materialization",
         "tests/providers/test_gui_server.py::TestGuiServer::test_mcp_register_actor_mode_requires_server_write_capability",
-        "tests/providers/test_gui_server.py::TestGuiServer::test_mcp_call_preserves_invalid_arguments_for_primitive_validation"
+        "tests/providers/test_gui_server.py::TestGuiServer::test_mcp_unregister_actor_mode_requires_exact_server_admin_capability",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_mcp_tools_get_is_cache_only_and_live_refresh_requires_post",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_mcp_call_preserves_invalid_arguments_for_primitive_validation",
+        "tests/providers/test_mcp_security_hardening.py::test_call_uses_one_detached_canonical_argument_object_across_boundaries",
+        "tests/providers/test_mcp_security_hardening.py::test_python_none_arguments_remain_compatible_as_empty_canonical_object",
+        "tests/providers/test_mcp_security_hardening.py::test_noncanonical_arguments_fail_before_authority_effect_or_provider[integer-key]",
+        "tests/providers/test_mcp_security_hardening.py::test_noncanonical_arguments_fail_before_authority_effect_or_provider[tuple-value]",
+        "tests/providers/test_mcp_security_hardening.py::test_noncanonical_arguments_fail_before_authority_effect_or_provider[dict-subclass]",
+        "tests/providers/test_mcp_security_hardening.py::test_reflected_transport_credential_never_reaches_results_or_sqlite",
+        "tests/providers/test_mcp_security_hardening.py::test_short_reflected_credential_redaction_preserves_wire_byte_accounting",
+        "tests/providers/test_mcp_security_hardening.py::test_schema_regex_timeout_fails_closed_before_provider_or_effect",
+        "tests/providers/test_mcp_security_hardening.py::test_schema_pattern_length_and_evaluation_budget_fail_closed",
+        "tests/providers/test_mcp_security_hardening.py::test_bounded_schema_regex_preserves_legitimate_pattern_semantics",
+        "tests/providers/test_mcp_security_hardening.py::test_bounded_schema_regex_preserves_unevaluated_properties_semantics"
       ],
       "benchmark_attack_classes": []
     },
@@ -4213,7 +4328,11 @@
         "tests/providers/test_git_primitive.py::test_pull_request_metadata_failure_after_write_is_retained_as_unknown",
         "tests/providers/test_git_primitive.py::test_git_model_tools_are_visible_but_still_require_capability",
         "tests/providers/test_git_primitive.py::test_simulated_pull_request_create_review_close_and_merge_requires_approval",
-        "tests/providers/test_git_primitive.py::test_pull_request_create_reuses_generated_id_after_human_approval"
+        "tests/providers/test_git_primitive.py::test_pull_request_create_reuses_generated_id_after_human_approval",
+        "tests/providers/test_git_primitive.py::test_commit_flow_snapshot_approval_cannot_rebind_outer_args_after_reopen[message]",
+        "tests/providers/test_git_primitive.py::test_commit_flow_snapshot_approval_cannot_rebind_outer_args_after_reopen[state]",
+        "tests/providers/test_git_primitive.py::test_push_flow_snapshot_binds_normal_delete_and_ref_source_args",
+        "tests/providers/test_git_primitive.py::test_pull_request_flow_snapshot_approval_cannot_change_review_decision"
       ],
       "benchmark_attack_classes": ["git_remote_authority_bypass"]
     },
@@ -4327,6 +4446,8 @@
         "tests/runtime/test_process_completion_review.py::test_exit_review_fails_closed_when_human_message_set_exceeds_bound",
         "tests/runtime/test_process_completion_review.py::test_exit_review_survives_runtime_reopen",
         "tests/runtime/test_process_completion_review.py::test_exit_review_recovers_goal_from_persistent_context_prompt",
+        "tests/runtime/test_llm_executor_cache_semantics.py::test_missing_materialized_goal_is_recovered_from_retained_context",
+        "tests/runtime/test_llm_executor_cache_semantics.py::test_exec_goal_does_not_recover_prior_v2_goal_without_matching_binding",
         "tests/runtime/test_process_completion_review.py::test_exit_review_fails_closed_after_reopen_without_full_io_retention",
         "tests/runtime/test_task_run_completion_persistence.py::test_task_run_completion_review_token_survives_reopen_without_redispatch",
         "tests/runtime/test_process_completion_review.py::test_non_gated_image_keeps_single_phase_process_exit",
@@ -4515,7 +4636,7 @@
     },
     {
       "id": "runtime-safety-benchmark-is-deterministic",
-      "title": "Runtime-safety benchmark tasks and smoke runs remain deterministic and token-free by default.",
+      "title": "Runtime-safety benchmark tasks, smoke runs, and release-evidence gates remain deterministic and token-free by default.",
       "lane": "benchmark",
       "node_ids": [
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_loads_runtime_safety_task_suite",
@@ -4545,6 +4666,7 @@
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_metrics_reject_truncated_artifact_without_raising",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_interrupted_reuse_cannot_mix_new_manifest_with_old_results",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_deterministic_smoke_run_across_baselines_and_libos",
+        "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_release_evidence_gate_is_stricter_without_changing_oracle_flag",
         "tests/benchmarks/test_runtime_safety_benchmark.py::TestRuntimeSafetyBenchmark::test_self_evolution_smoke_run_across_wrapper_and_libos"
       ],
       "benchmark_attack_classes": []
@@ -4615,8 +4737,8 @@
       "benchmark_attack_classes": []
     },
     {
-      "id": "mcp-unsupported-modern-features-never-gain-runtime-authority",
-      "title": "Unsupported MCP modern capabilities and provider metadata remain bounded diagnostics and never grant Runtime authority or durable session state.",
+      "id": "mcp-v1-v2-unsupported-modern-features-never-gain-runtime-authority",
+      "title": "On the Manifest v1/v2 Tools compatibility path, unsupported modern capabilities and provider metadata remain bounded diagnostics and never grant Runtime authority or durable session state.",
       "lane": "providers",
       "node_ids": [
         "tests/providers/test_mcp_v2_contract.py::test_discovered_server_capabilities_never_grant_runtime_authority",
@@ -4627,15 +4749,164 @@
       "benchmark_attack_classes": []
     },
     {
+      "id": "mcp-v3-host-surfaces-are-closed-allowlisted-and-fenced",
+      "title": "Manifest v3 Host Resources, Resource Templates, Prompts, Completion, and OAuth use closed allowlists and pinned authority; provider content is untrusted, exact registry and credential fences are enforced, and TLS or OAuth secrets are never weakened for transport compatibility.",
+      "lane": "providers",
+      "node_ids": [
+        "tests/unit/test_mcp_v3_public_contracts.py::test_v3_can_register_resource_only_server_and_has_stable_identity",
+        "tests/providers/test_mcp_resources_prompts.py::test_resources_use_manifest_allowlist_redact_secrets_and_hide_raw_cursor",
+        "tests/providers/test_mcp_resources_prompts.py::test_model_resource_view_is_explicit_and_live_discovery_never_adds_authority",
+        "tests/providers/test_mcp_resources_prompts.py::test_apps_content_and_provider_system_prompt_roles_fail_closed",
+        "tests/providers/test_mcp_resources_prompts.py::test_prompts_are_allowlisted_untrusted_and_cannot_waive_confirmation",
+        "tests/providers/test_mcp_resources_prompts.py::test_sync_surface_cancellation_is_bounded_and_operation_local[resource-cooperative]",
+        "tests/providers/test_mcp_resources_prompts.py::test_sync_surface_cancellation_is_bounded_and_operation_local[prompt-cooperative]",
+        "tests/providers/test_mcp_resources_prompts.py::test_sync_surface_cancellation_is_bounded_and_operation_local[completion-cooperative]",
+        "tests/providers/test_mcp_resources_prompts.py::test_sync_surface_cancellation_is_bounded_and_operation_local[resource-resistant]",
+        "tests/providers/test_mcp_resources_prompts.py::test_sync_surface_cancellation_is_bounded_and_operation_local[prompt-resistant]",
+        "tests/providers/test_mcp_resources_prompts.py::test_sync_surface_cancellation_is_bounded_and_operation_local[completion-resistant]",
+        "tests/providers/test_mcp_resources_prompts.py::test_sync_surface_disposes_provider_spawned_task_after_success",
+        "tests/providers/test_mcp_resources_prompts.py::test_custom_completion_requires_the_sdk_public_shape[list-values]",
+        "tests/providers/test_mcp_resources_prompts.py::test_custom_completion_requires_the_sdk_public_shape[non-text-value]",
+        "tests/providers/test_mcp_resources_prompts.py::test_custom_completion_requires_the_sdk_public_shape[negative-total]",
+        "tests/providers/test_mcp_resources_prompts.py::test_custom_completion_requires_the_sdk_public_shape[bool-total]",
+        "tests/providers/test_mcp_resources_prompts.py::test_custom_completion_requires_the_sdk_public_shape[int-has-more]",
+        "tests/providers/test_mcp_resources_prompts.py::test_registry_and_auth_fence_change_discards_provider_result",
+        "tests/providers/test_mcp_cross_sdk_v2.py::test_real_sdk_v2_resources_and_prompts_use_runtime_protected_path[python-sdk-v2]",
+        "tests/providers/test_mcp_cross_sdk_v2.py::test_real_sdk_v2_resources_and_prompts_use_runtime_protected_path[typescript-sdk-v2]",
+        "tests/providers/test_mcp_oauth_runtime_tls.py::test_runtime_oauth_pkce_tls_and_bearer_transport_end_to_end",
+        "tests/unit/test_mcp_oauth.py::test_custom_transport_late_response_is_never_accepted_as_success",
+        "tests/runtime/test_mcp_oauth_runtime.py::test_runtime_rejects_late_oauth_success_and_discards_unreturned_challenge",
+        "tests/runtime/test_mcp_oauth_runtime.py::test_runtime_discards_unreturned_challenge_when_protected_commit_fails",
+        "tests/providers/test_mcp_official_conformance_gate.py::test_durable_official_evidence_drops_raw_details_logs_and_secrets",
+        "tests/providers/test_mcp_official_conformance_gate.py::test_failed_official_scenario_discards_every_raw_artifact",
+        "tests/providers/test_mcp_official_conformance_gate.py::test_scenario_subprocess_failure_omits_untrusted_output",
+        "tests/unit/test_mcp_oauth.py::test_system_keyring_fails_closed_for_innocent_positive_priority_plaintext_backend",
+        "tests/unit/test_mcp_oauth.py::test_system_keyring_rejects_exact_identity_lookalike_subclass",
+        "tests/unit/test_mcp_oauth.py::test_system_keyring_rejects_chainer_even_when_it_contains_os_backends",
+        "tests/unit/test_mcp_oauth.py::test_system_keyring_rejects_unreviewed_distribution_version",
+        "tests/unit/test_mcp_oauth.py::test_system_keyring_rejects_unreviewed_backend_source_digest",
+        "tests/providers/test_mcp_candidate_probe.py::test_candidate_probe_is_pending_first_single_session_and_authority_neutral",
+        "tests/providers/test_mcp_candidate_probe.py::test_candidate_probe_rejects_review_or_digest_before_transport[False-reviewer-reason-None]",
+        "tests/providers/test_mcp_candidate_probe.py::test_candidate_probe_rejects_review_or_digest_before_transport[True--reason-None]",
+        "tests/providers/test_mcp_candidate_probe.py::test_candidate_probe_rejects_review_or_digest_before_transport[True-reviewer--None]",
+        "tests/providers/test_mcp_candidate_probe.py::test_candidate_probe_rejects_review_or_digest_before_transport[True-reviewer-reason-0000000000000000000000000000000000000000000000000000000000000000]",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_resource_cannot_publish_unbacked_input_required",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_tool_cannot_publish_unbacked_input_required",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_tool_exception_redacts_active_header_secret_for_runtime_and_cli",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_prompt_cannot_publish_unbacked_remote_task_even_when_pinned",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_completion_cannot_bypass_nonrespondable_surface",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_completion_rejects_apps_values_before_public_sinks[selector-with-secret]",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_completion_rejects_apps_values_before_public_sinks[apps-mime]",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_continuation_result_is_sanitized_before_durable_settlement[complete]",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_continuation_result_is_sanitized_before_durable_settlement[input-required]",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_continuation_result_is_sanitized_before_durable_settlement[remote-task]",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_continuation_exception_redacts_binding_and_request_state",
+        "tests/runtime/test_mcp_v3_durable_facade.py::test_cli_resource_and_prompt_initial_elicitation_use_protected_host_questions",
+        "tests/runtime/test_mcp_v3_durable_facade.py::test_runtime_remote_task_facade_get_update_cancel_uses_only_local_refs",
+        "tests/runtime/test_mcp_v3_durable_facade.py::test_continuation_task_requires_current_manifest_and_host_pin_before_capture[missing-extension]",
+        "tests/runtime/test_mcp_v3_durable_facade.py::test_continuation_task_requires_current_manifest_and_host_pin_before_capture[wrong-host-pin]",
+        "tests/runtime/test_mcp_v3_durable_facade.py::test_custom_tool_and_continuation_deadline_contract_and_violation_containment",
+        "tests/runtime/test_mcp_v3_durable_facade.py::test_custom_task_deadlines_cancel_cooperatively_and_never_replay",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_mcp_v3_tool_exception_redacts_active_header_secret_from_gui_and_evidence",
+        "tests/unit/test_mcp_modern_cli.py::test_mcp_operation_envelopes_reject_unknown_top_level_fields[result0-allowed_kinds0]",
+        "tests/unit/test_mcp_modern_cli.py::test_mcp_operation_envelopes_reject_unknown_top_level_fields[result1-allowed_kinds1]",
+        "tests/unit/test_mcp_modern_cli.py::test_mcp_operation_envelopes_reject_unknown_top_level_fields[result2-allowed_kinds2]",
+        "tests/unit/test_mcp_modern_cli.py::test_mcp_input_requests_reject_unknown_fields_but_preserve_schema[input_required]",
+        "tests/unit/test_mcp_modern_cli.py::test_mcp_input_requests_reject_unknown_fields_but_preserve_schema[remote_task]",
+        "tests/unit/test_mcp_modern_cli.py::test_mcp_pages_reject_unknown_page_item_and_cache_fields[page]",
+        "tests/unit/test_mcp_modern_cli.py::test_mcp_pages_reject_unknown_page_item_and_cache_fields[item]",
+        "tests/unit/test_mcp_modern_cli.py::test_mcp_pages_reject_unknown_page_item_and_cache_fields[cache]",
+        "tests/unit/test_mcp_modern_cli.py::test_generic_complete_value_and_remote_task_result_remain_opaque_json",
+        "tests/unit/test_mcp_modern_cli.py::test_mcp_surface_kind_contract_rejects_generic_union_mismatch",
+        "tests/unit/test_mcp_modern_cli.py::test_completion_value_rejects_unknown_prompt_preview_fields",
+        "tests/unit/test_mcp_modern_cli.py::test_resource_and_prompt_content_envelopes_reject_unknown_fields",
+        "tests/unit/test_mcp_v3_wire.py::test_result_adapter_merges_active_binding_secrets_before_capture",
+        "tests/unit/test_mcp_v3_wire.py::test_sdk_completion_rejects_apps_values_before_secret_redaction"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "mcp-v3-subscription-events-are-consumed-bounded-and-inert",
+      "title": "Manifest v3 subscription notifications retain unread events under a single owner-fenced consumer cursor, reclaim acknowledged queue capacity, and only revoke local opaque catalog cursors for validated change events without dispatching remote or model work.",
+      "lane": "providers",
+      "node_ids": [
+        "tests/unit/test_mcp_v3_lifecycle.py::test_subscription_poll_acknowledges_batch_and_reclaims_queue_capacity",
+        "tests/unit/test_mcp_v3_lifecycle.py::test_subscription_event_cursor_rejects_stale_and_future_positions",
+        "tests/unit/test_mcp_v3_lifecycle.py::test_subscription_event_cursor_fails_closed_for_concurrent_readers",
+        "tests/unit/test_mcp_v3_lifecycle.py::test_projected_change_events_invalidate_only_local_server_state[toolsListChanged-toolsListChanged]",
+        "tests/unit/test_mcp_v3_lifecycle.py::test_projected_change_events_invalidate_only_local_server_state[promptsListChanged-promptsListChanged]",
+        "tests/unit/test_mcp_v3_lifecycle.py::test_projected_change_events_invalidate_only_local_server_state[resourcesListChanged-resourcesListChanged]",
+        "tests/unit/test_mcp_v3_lifecycle.py::test_projected_change_events_invalidate_only_local_server_state[resourceSubscriptions-resourceUpdated]",
+        "tests/unit/test_mcp_v3_lifecycle.py::test_unknown_and_apps_event_types_never_reach_local_invalidator[unknownChanged]",
+        "tests/unit/test_mcp_v3_lifecycle.py::test_unknown_and_apps_event_types_never_reach_local_invalidator[ui/resourceUpdated]",
+        "tests/runtime/test_mcp_v3_subscription_facade.py::test_runtime_poll_acknowledges_events_and_reclaims_single_slot_queue",
+        "tests/runtime/test_mcp_v3_subscription_facade.py::test_subscription_change_event_invalidates_opaque_catalog_cursors[toolsListChanged-toolsListChanged]",
+        "tests/runtime/test_mcp_v3_subscription_facade.py::test_subscription_change_event_invalidates_opaque_catalog_cursors[promptsListChanged-promptsListChanged]",
+        "tests/runtime/test_mcp_v3_subscription_facade.py::test_subscription_change_event_invalidates_opaque_catalog_cursors[resourcesListChanged-resourcesListChanged]",
+        "tests/runtime/test_mcp_v3_subscription_facade.py::test_subscription_change_event_invalidates_opaque_catalog_cursors[resourceSubscriptions-resourceUpdated]",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_mcp_subscription_event_route_preserves_single_reader_cursor",
+        "tests/providers/test_mcp_v2_adapter.py::test_task_status_notification_requires_exact_governed_subscription_pins",
+        "tests/providers/test_mcp_cross_sdk_v2.py::test_real_sdk_v2_task_subscription_projects_only_local_refs[python-sdk-v2]",
+        "tests/providers/test_mcp_cross_sdk_v2.py::test_real_sdk_v2_task_subscription_projects_only_local_refs[typescript-sdk-v2]"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "mcp-v3-side-effect-preparations-are-crash-atomic",
+      "title": "Manifest v3 continuation and remote-Task Human/keyring side effects are owned before materialization and their safe local refs are atomically receipted; restart aborts uncommitted slots, completes retirement, and never replays Provider dispatch.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_initial_side_effect_preparation_is_aborted_on_sqlite_reopen[after_human_before_broker-continuation]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_initial_side_effect_preparation_is_aborted_on_sqlite_reopen[after_human_before_broker-remote_task]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_initial_side_effect_preparation_is_aborted_on_sqlite_reopen[after_broker_before_main_insert-continuation]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_initial_side_effect_preparation_is_aborted_on_sqlite_reopen[after_broker_before_main_insert-remote_task]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_followup_commit_failure_retires_only_old_refs_on_sqlite_reopen[post_commit_crash]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_followup_commit_failure_retires_only_old_refs_on_sqlite_reopen[broker_delete_failure]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_terminal_transition_precommit_crash_preserves_active_refs_and_human",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_continuation_terminal_cap_prune_crash_reopens_exact_retirement",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_continuation_dispatch_claim_crash_reopens_attention_without_replay",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_continuation_expiry_broker_failure_reopens_exact_terminal_state",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_terminal_retirement_broker_failure_reopens_without_orphan_or_replay",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_expiry_commit_broker_failure_reopens_needs_attention_and_cleans_human",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_interrupted_task_mutation_reopens_needs_attention_without_replay[update]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_interrupted_task_mutation_reopens_needs_attention_without_replay[cancel]",
+        "tests/runtime/test_mcp_v3_side_effect_killpoints.py::test_real_sqlite_preparation_recovery_follows_taskrun_preflight_in_one_lease",
+        "tests/runtime/test_mcp_v3_capture_publication.py::test_initial_input_required_reopens_from_exact_effect_receipt_without_replay",
+        "tests/runtime/test_mcp_v3_capture_publication.py::test_initial_task_reopens_from_exact_effect_receipt_without_remote_id",
+        "tests/runtime/test_mcp_v3_capture_publication.py::test_continuation_task_raw_result_handoff_crash_recovers_without_replay",
+        "tests/runtime/test_mcp_v3_capture_publication.py::test_continuation_complete_postcommit_crash_is_terminal_without_replay",
+        "tests/runtime/test_mcp_v3_capture_publication.py::test_continuation_next_round_postcommit_crash_recovers_and_continues_once",
+        "tests/runtime/test_mcp_v3_capture_publication.py::test_continuation_task_protected_outer_rollback_never_publishes_partial_ref[exception]",
+        "tests/runtime/test_mcp_v3_capture_publication.py::test_continuation_task_protected_outer_rollback_never_publishes_partial_ref[base_exception]"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "mcp-input-required-is-never-automatically-replayed",
-      "title": "Unsupported MCP input-required results are terminal and non-retryable, with consequential mutation retained as unknown.",
+      "title": "Manifest v1/v2 input-required results are terminal and non-retryable; Manifest v3 keeps remote request state opaque and advances a continuation only after an explicit revision-fenced Host response, never by replaying the initial operation.",
       "lane": "providers",
       "node_ids": [
         "tests/providers/test_mcp_v2_contract.py::test_input_required_is_terminal_never_retried_and_mutation_is_unknown[False]",
         "tests/providers/test_mcp_v2_contract.py::test_input_required_is_terminal_never_retried_and_mutation_is_unknown[True]",
         "tests/providers/test_mcp_v2_contract.py::test_task_run_input_required_fences_unknown_mutation_without_replay[read-False-no_rollback_required-False]",
         "tests/providers/test_mcp_v2_contract.py::test_task_run_input_required_fences_unknown_mutation_without_replay[write-True-rollbackable-True]",
-        "tests/providers/test_mcp_v2_contract.py::test_task_run_input_required_fences_unknown_mutation_without_replay[rollback-unclear-False-unknown-True]"
+        "tests/providers/test_mcp_v2_contract.py::test_task_run_input_required_fences_unknown_mutation_without_replay[rollback-unclear-False-unknown-True]",
+        "tests/unit/test_mcp_v3_continuations.py::test_capture_creates_real_human_request_and_sanitizes_broker_state",
+        "tests/unit/test_mcp_v3_continuations.py::test_multi_round_response_uses_bound_continuation_and_never_initial_dispatch",
+        "tests/unit/test_mcp_v3_continuations.py::test_duplicate_or_stale_response_cannot_dispatch_twice",
+        "tests/unit/test_mcp_v3_continuations.py::test_restart_reconciles_dispatching_to_attention_without_replay",
+        "tests/providers/test_mcp_modern_mrtr_sdk.py::test_real_python_sdk_v2_resource_and_prompt_continuations_round_trip",
+        "tests/runtime/test_mcp_v3_durable_facade.py::test_cli_resource_and_prompt_initial_elicitation_use_protected_host_questions",
+        "tests/providers/test_gui_server.py::TestGuiServer::test_mcp_v3_gui_host_resource_and_prompt_mrtr_round_trip",
+        "tests/unit/test_mcp_human_bridge.py::test_mcp_process_question_still_requires_human_write_capability",
+        "tests/unit/test_mcp_human_bridge.py::test_mcp_host_authorizer_cannot_mutate_preview_before_persistence",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_resource_cannot_publish_unbacked_input_required",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_tool_cannot_publish_unbacked_input_required",
+        "tests/runtime/test_mcp_custom_modern_result_postconditions.py::test_custom_completion_cannot_bypass_nonrespondable_surface",
+        "tests/runtime/test_mcp_v3_durable_facade.py::test_continuation_pre_provider_denial_and_ask_restore_but_provider_forgery_does_not",
+        "tests/runtime/test_mcp_v3_durable_facade.py::test_remote_task_pre_provider_denial_and_ask_restore_without_dispatch",
+        "tests/runtime/test_mcp_v3_durable_facade.py::test_post_provider_continuation_settlement_failure_is_never_not_started[malformed]",
+        "tests/runtime/test_mcp_v3_durable_facade.py::test_post_provider_continuation_settlement_failure_is_never_not_started[round-limit]"
       ],
       "benchmark_attack_classes": []
     },
@@ -4652,17 +4923,121 @@
       "benchmark_attack_classes": []
     },
     {
-      "id": "semantic-shadow-has-no-machine-mutation-entry",
-      "title": "Semantic Shadow exposes evidence only and has no reachable machine settlement, Capability issuance, label/release mutation, or semantic HTTP write path.",
+      "id": "semantic-machine-mutation-is-host-private-and-closed",
+      "title": "Semantic enforcement is reachable only through the Runtime-composed private Host settlement port; public/model surfaces cannot settle requests, issue authority, mutate labels/release, or control policy.",
       "lane": "security",
       "node_ids": [
-        "tests/security/test_semantic_shadow_isolation.py::test_semantic_surface_has_no_machine_settlement_or_mutation_entrypoint",
+        "tests/security/test_semantic_shadow_isolation.py::test_shadow_surface_has_no_public_machine_mutation_entrypoint",
         "tests/runtime/test_semantic_authority_ceiling.py::test_semantic_auto_approval_candidate_is_read_only_host_ceiling_evidence",
-        "tests/runtime/test_semantic_runtime_wiring.py::test_semantic_protected_port_never_creates_data_release_request",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_semantic_protected_port_never_creates_data_release_request"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-model-never-supplies-allow-predicate",
+      "title": "Classifier output is closed veto/escalation evidence and cannot provide an allow predicate, terminal decision, policy rule, or Capability authority.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_enforcement.py::test_model_findings_ood_and_errors_cannot_terminalize_or_issue_authority[model-finding]",
+        "tests/security/test_semantic_enforcement.py::test_model_findings_ood_and_errors_cannot_terminalize_or_issue_authority[ood]",
+        "tests/security/test_semantic_enforcement.py::test_model_findings_ood_and_errors_cannot_terminalize_or_issue_authority[provider-error]",
+        "tests/security/test_semantic_enforcement.py::test_model_findings_ood_and_errors_cannot_terminalize_or_issue_authority[invalid-schema]",
+        "tests/security/test_semantic_enforcement.py::test_model_findings_ood_and_errors_cannot_terminalize_or_issue_authority[timeout]",
         "tests/unit/test_semantic_core.py::test_shadow_broker_requires_host_predicates_and_never_returns_a_permit",
-        "tests/providers/test_semantic_gui_api.py::test_semantic_status_rejects_nonzero_actual_auto_approval_metrics"
+        "tests/runtime/test_semantic_storage.py::test_successful_classifier_cannot_add_frozen_data_flow_allow_predicate"
       ],
       "benchmark_attack_classes": ["semantic_classifier_authority_injection"]
+    },
+    {
+      "id": "semantic-hard-deny-set-is-closed",
+      "title": "Real machine denial is limited to the closed deterministic Host reason set; model, uncertain, unsupported, and high-risk evidence remains Human-gated.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_enforcement.py::test_deterministic_machine_deny_reasons_are_a_closed_non_model_set"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-machine-terminalization-is-cas-atomic",
+      "title": "Human, cancel, machine deny, and canary approval share one revision/status CAS and one transactional terminal kernel with a single authority/evidence winner.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_enforcement.py::test_human_and_machine_terminalization_share_single_cas_winner"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-exact-once-authority-is-binding-and-epoch-fenced",
+      "title": "Machine authority is exact, short-lived, nondelegable, one-use, and revalidates its complete binding plus active durable policy epoch through dispatch.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_enforcement.py::test_epoch_revoke_and_binding_drift_block_unconsumed_machine_authority",
+        "tests/unit/test_semantic_authority_gate.py::test_live_authority_validator_stale_epoch_does_not_trip_rotated_classifier",
+        "tests/unit/test_semantic_authority_gate.py::test_live_authority_validator_trips_current_epoch_classifier_mismatch",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_approval_binding_tamper_is_fail_closed_without_authority_delta",
+        "tests/runtime/test_semantic_storage.py::test_reopened_worker_refuses_classifier_artifact_drift_before_call[profile-drift]",
+        "tests/runtime/test_semantic_storage.py::test_reopened_worker_refuses_classifier_artifact_drift_before_call[model-drift]",
+        "tests/unit/test_semantic_flow.py::test_root_goal_object_binding_is_exact_idempotent_and_rejects_ambiguity",
+        "tests/unit/test_semantic_v6_storage.py::test_v6_control_cas_outcome_idempotence_and_metrics",
+        "tests/runtime/test_semantic_v6_postgres_migration.py::test_postgres_control_fence_serializes_concurrent_rotation"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-canary-expansion-is-review-gated",
+      "title": "Canary cohort, rule, hard-deny weakening, classifier drift, or allow-parameter expansion requires seven days plus 1000 complete safe reviews per affected action; deny/threshold/budget narrowing remains immediate and any old-epoch unsafe review persists across off and trips current active authority.",
+      "lane": "unit",
+      "node_ids": [
+        "tests/unit/test_semantic_control_rollout.py::test_rollout_expansion_uses_real_sqlite_immutable_evidence",
+        "tests/unit/test_semantic_control_rollout.py::test_rollout_hard_deny_weakening_is_review_gated_after_sqlite_reopen[deleted]",
+        "tests/unit/test_semantic_control_rollout.py::test_rollout_allow_shaping_relaxation_is_review_gated_after_sqlite_reopen[confidence]",
+        "tests/unit/test_semantic_control_rollout.py::test_rollout_allow_shaping_tightening_and_new_wider_deny_are_immediate",
+        "tests/unit/test_semantic_review_import_control.py::test_off_imported_old_epoch_unsafe_evidence_blocks_rollout_expansion",
+        "tests/unit/test_semantic_review_import_control.py::test_old_epoch_unsafe_import_trips_new_active_epoch_and_retains_evidence"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-canary-budget-is-stable-and-cas",
+      "title": "Canary rate budgets are stable per tenant and logical rule across epoch rotation and reopen; origin epoch is provenance only, inflight release and reservation share revision CAS, and rollback cannot mint budget.",
+      "lane": "unit",
+      "node_ids": [
+        "tests/unit/test_semantic_authority_gate.py::test_host_rate_budget_cannot_reset_through_epoch_rotation_after_reopen",
+        "tests/unit/test_semantic_authority_gate.py::test_rotated_rate_budget_reservation_rolls_back_and_has_one_cas_winner",
+        "tests/unit/test_semantic_authority_gate.py::test_cross_epoch_inflight_is_released_before_one_new_reservation",
+        "tests/unit/test_semantic_v6_storage.py::test_v6_rate_budget_scope_is_unique_across_origin_epochs"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-unknown-flow-blocks-auto-authority",
+      "title": "Only complete current single-tenant FlowGraph coverage can satisfy auto approval; missing, partial, unknown, conflicting, stale, or mixed evidence fails closed to Human review.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_enforcement.py::test_unknown_flow_coverage_blocks_machine_authority_after_sqlite_reopen",
+        "tests/security/test_semantic_enforcement.py::test_flow_graph_never_persists_secret_payload_and_is_tenant_isolated",
+        "tests/unit/test_semantic_flow.py::test_unbucketed_identity_is_unknown_and_blocks_memory_influence",
+        "tests/unit/test_semantic_flow.py::test_effective_labels_fail_closed_when_assertion_page_is_truncated",
+        "tests/unit/test_semantic_flow.py::test_lineage_cycle_across_converging_branches_denies_approval",
+        "tests/runtime/test_semantic_flow_graph.py::test_sqlite_derived_lineage_and_memory_gate_are_bounded",
+        "tests/runtime/test_semantic_flow_graph.py::test_real_llm_provider_result_links_to_model_output_and_tightens_labels"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "semantic-high-risk-and-cross-tenant-authority-is-unreachable",
+      "title": "Only catalog-v1 exact reads for an explicitly allowlisted tenant can receive machine authority; high-risk, management, release, wildcard, and cross-tenant paths are structurally unreachable.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_enforcement.py::test_high_risk_actions_are_structurally_unreachable_from_machine_settlement[filesystem.write-write]",
+        "tests/security/test_semantic_enforcement.py::test_high_risk_actions_are_structurally_unreachable_from_machine_settlement[filesystem.delete-delete]",
+        "tests/security/test_semantic_enforcement.py::test_high_risk_actions_are_structurally_unreachable_from_machine_settlement[shell.run-execute]",
+        "tests/security/test_semantic_enforcement.py::test_high_risk_actions_are_structurally_unreachable_from_machine_settlement[jsonrpc.call-execute]",
+        "tests/security/test_semantic_enforcement.py::test_high_risk_actions_are_structurally_unreachable_from_machine_settlement[mcp.call-execute]",
+        "tests/security/test_semantic_enforcement.py::test_flow_graph_never_persists_secret_payload_and_is_tenant_isolated",
+        "tests/unit/test_semantic_flow.py::test_root_goal_object_binding_rejects_cross_tenant_target"
+      ],
+      "benchmark_attack_classes": []
     },
     {
       "id": "semantic-candidates-are-exact-and-attenuated",
@@ -4675,7 +5050,8 @@
         "tests/runtime/test_semantic_authority_ceiling.py::test_child_cannot_create_semantic_ceiling_from_ordinary_capability",
         "tests/runtime/test_semantic_authority_ceiling.py::test_checkpoint_fork_preserves_but_does_not_widen_semantic_ceiling",
         "tests/runtime/test_semantic_authority_ceiling.py::test_semantic_ceiling_and_legacy_manifest_hashes_survive_reopen",
-        "tests/runtime/test_semantic_runtime_wiring.py::test_approval_binding_tamper_is_fail_closed_without_authority_delta"
+        "tests/runtime/test_semantic_runtime_wiring.py::test_approval_binding_tamper_is_fail_closed_without_authority_delta",
+        "tests/unit/test_semantic_v6_storage.py::test_v6_git_diff_epoch_rollout_scope_is_digest_only_and_round_trips"
       ],
       "benchmark_attack_classes": []
     },
@@ -4685,7 +5061,7 @@
       "lane": "security",
       "node_ids": [
         "tests/security/test_semantic_shadow_isolation.py::test_default_off_has_zero_semantic_capture_and_preserves_human_authority",
-        "tests/security/test_semantic_shadow_isolation.py::test_shadow_and_off_have_identical_authority_business_and_label_outcomes",
+        "tests/security/test_semantic_shadow_isolation.py::test_off_and_shadow_have_zero_machine_authority_delta",
         "tests/security/test_semantic_shadow_isolation.py::test_classifier_failure_and_capture_failure_have_zero_authority_delta",
         "tests/security/test_semantic_shadow_isolation.py::test_mode_off_scrubs_legacy_unclaimed_projection_without_claiming",
         "tests/security/test_semantic_shadow_isolation.py::test_late_assessment_records_but_never_overwrites_human_outcome",
@@ -4703,6 +5079,11 @@
       "lane": "unit",
       "node_ids": [
         "tests/unit/test_semantic_core.py::test_data_finding_suggestion_is_monotonic_and_does_not_mutate_input",
+        "tests/unit/test_semantic_flow.py::test_flow_label_vector_is_identity_safe_and_tightens_monotonically",
+        "tests/unit/test_semantic_flow.py::test_effective_labels_marks_declassification_or_endorsement_conflict",
+        "tests/unit/test_semantic_flow.py::test_append_assessment_findings_is_monotonic_and_bounded",
+        "tests/unit/test_semantic_flow.py::test_effective_labels_fail_closed_when_assertion_page_is_truncated",
+        "tests/runtime/test_semantic_flow_graph.py::test_sqlite_flow_assertion_tightens_labels_after_reopen",
         "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_rejects_authority_or_label_upgrade_output[declassify]",
         "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_rejects_authority_or_label_upgrade_output[endorse-integrity]",
         "tests/providers/test_semantic_privacy.py::test_root_goal_and_provider_ingress_are_digest_bound_without_label_writeback",
@@ -4724,13 +5105,26 @@
       "lane": "providers",
       "node_ids": [
         "tests/unit/test_semantic_core.py::test_semantic_models_are_strict_payload_free_and_round_trip",
+        "tests/unit/test_semantic_flow.py::test_json_and_text_locators_persist_only_digests_and_coordinates",
+        "tests/unit/test_semantic_flow.py::test_root_and_provider_capture_are_payload_free_idempotent_bundles",
+        "tests/runtime/test_semantic_flow_graph.py::test_sqlite_flow_graph_reopens_without_raw_identity_or_payload",
+        "tests/runtime/test_semantic_flow_graph.py::test_real_llm_provider_result_links_to_model_output_and_tightens_labels",
         "tests/unit/test_semantic_core.py::test_external_projection_redacts_or_drops_sensitive_intent_and_raw_ids",
         "tests/runtime/test_semantic_storage.py::test_semantic_projection_rejects_content_fields_and_requires_terminal_hash_only",
         "tests/security/test_semantic_shadow_isolation.py::test_mode_off_scrubs_legacy_unclaimed_projection_without_claiming",
         "tests/runtime/test_semantic_runtime_wiring.py::test_semantic_protected_port_records_only_digests_and_suppresses_recursion",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_semantic_contract_rejects_caller_override_of_source_ref_redaction",
+        "tests/runtime/test_semantic_runtime_wiring.py::test_semantic_classifier_stale_source_ref_blocks_before_provider_and_stays_redacted",
+        "tests/runtime/test_semantic_storage.py::test_external_worker_without_same_process_transient_flow_is_egress_blocked[missing]",
+        "tests/runtime/test_semantic_storage.py::test_external_worker_without_same_process_transient_flow_is_egress_blocked[reopen]",
         "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_uses_safe_projection_and_protected_single_dispatch",
+        "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_never_sends_generic_secret_markers_for_any_capture_kind[root_goal]",
+        "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_never_sends_generic_secret_markers_for_any_capture_kind[provider_ingress]",
+        "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_never_sends_generic_secret_markers_for_any_capture_kind[approval]",
+        "tests/providers/test_semantic_assessment_provider.py::test_external_source_refs_require_nonserializable_host_invocation",
         "tests/providers/test_semantic_assessment_provider.py::test_external_assessor_sanitizes_provider_exception_and_context",
         "tests/providers/test_semantic_privacy.py::test_terminal_semantic_evidence_never_persists_secret_sentinel",
+        "tests/providers/test_semantic_privacy.py::test_external_approval_identifier_is_absent_from_public_terminal_and_gui_evidence",
         "tests/providers/test_semantic_gui_api.py::test_semantic_assessment_detail_is_typed_and_payload_free",
         "tests/providers/test_semantic_gui_api.py::test_semantic_assessment_projection_rejects_nested_payload_in_scalar_field",
         "tests/runtime/test_semantic_runtime_wiring.py::test_host_tenant_bucketer_is_keyed_optional_and_failure_isolated",
@@ -4767,6 +5161,55 @@
       "benchmark_attack_classes": []
     },
     {
+      "id": "human-approval-preview-is-host-bound-and-safe",
+      "title": "External-operation Human approvals use one Host-derived, digest-bound typed preview; requester risk/prose cannot shape authority presentation, sensitive values are redacted, terminal controls are encoded, and material operation arguments remain distinguishable.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_semantic_approval_preview_trust.py::test_preview_risk_uses_only_host_action_ontology_and_rights",
+        "tests/security/test_semantic_approval_preview_trust.py::test_resource_projection_keeps_safe_workspace_identity_and_redacts_secrets",
+        "tests/security/test_semantic_approval_preview_trust.py::test_filesystem_projection_rejects_stale_path_digest_and_normalizes_codec_alias",
+        "tests/security/test_semantic_approval_preview_trust.py::test_shell_projection_distinguishes_host_catalog_subcommands_without_values[status]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_shell_projection_distinguishes_host_catalog_subcommands_without_values[push]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_shell_projection_distinguishes_host_catalog_subcommands_without_values[reset]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_shell_projection_distinguishes_host_catalog_subcommands_without_values[clean]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_pty_projection_accepts_zero_startup_timeout",
+        "tests/security/test_semantic_approval_preview_trust.py::test_remote_git_and_unknown_projection_variants_are_closed",
+        "tests/security/test_semantic_approval_preview_trust.py::test_git_projection_exposes_material_enums_flags_counts_and_bound_digests",
+        "tests/security/test_semantic_approval_preview_trust.py::test_git_reference_projection_is_role_bound_readable_or_redacted",
+        "tests/security/test_semantic_approval_preview_trust.py::test_projection_from_dict_rejects_cross_variant_pollution[pollution0]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_projection_from_dict_rejects_cross_variant_pollution[pollution1]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_projection_from_dict_rejects_cross_variant_pollution[pollution2]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_projection_from_dict_rejects_cross_variant_pollution[pollution3]",
+        "tests/security/test_semantic_approval_preview_trust.py::test_preview_rejects_action_projection_substitution_and_line_controls",
+        "tests/security/test_human_terminal_safe_encoding.py::test_external_preview_and_host_evidence_use_the_same_safe_encoding",
+        "tests/security/test_human_terminal_safe_encoding.py::test_git_reference_terminal_rows_are_role_bound_and_do_not_echo_secret_refs",
+        "tests/security/test_human_terminal_safe_encoding.py::test_every_unicode_format_control_is_encoded",
+        "tests/providers/test_semantic_privacy.py::test_low_sensitivity_filesystem_approval_identity_remains_human_readable",
+        "tests/providers/test_semantic_privacy.py::test_remote_approval_identifiers_are_redacted_but_exactly_digest_bound",
+        "tests/providers/test_semantic_privacy.py::test_high_sensitivity_approval_resource_is_redacted_and_digest_bound",
+        "tests/providers/test_semantic_privacy.py::test_long_exact_resource_keeps_active_human_preview_fence_reachable"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "human-authority-request-shape-is-host-bound",
+      "title": "Generic Human queries cannot smuggle authority fields; only Host-typed and effect-bound requests may reach capability side effects, scoped grants remain Human-only, and malformed durable or reopened rows fail closed across every response surface.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_human_authority_request_shape.py::test_generic_human_question_rejects_smuggled_authority_at_admission",
+        "tests/security/test_human_authority_request_shape.py::test_generic_query_cannot_forge_host_authority_origin",
+        "tests/security/test_human_authority_request_shape.py::test_query_admission_uses_one_mapping_snapshot",
+        "tests/security/test_human_authority_request_shape.py::test_reentrant_capture_cannot_inherit_host_authority_origin",
+        "tests/security/test_human_authority_request_shape.py::test_forged_durable_question_never_applies_authority[direct]",
+        "tests/security/test_human_authority_request_shape.py::test_forged_durable_question_never_applies_authority[presentation]",
+        "tests/security/test_human_authority_request_shape.py::test_forged_durable_question_never_applies_authority[terminal]",
+        "tests/security/test_human_authority_request_shape.py::test_reopened_forged_durable_question_never_applies_authority",
+        "tests/security/test_human_authority_request_shape.py::test_exact_external_approval_remains_revision_and_preview_fenced",
+        "tests/security/test_human_authority_request_shape.py::test_active_scoped_approval_is_human_fenced_and_not_machine_denied"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "rating-mutations-are-audit-atomic",
       "title": "Rating updates and their required audit records commit or roll back in one transaction.",
       "lane": "runtime",
@@ -4795,6 +5238,6 @@
     "git_remote_authority_bypass": "git-mutations-require-authority-state-and-evidence",
     "git_patch_lineage": "git-patches-remotes-and-prs-preserve-cas-lineage",
     "prompt_injection_write": "protected-egress-enforces-minimum-integrity",
-    "semantic_classifier_authority_injection": "semantic-shadow-has-no-machine-mutation-entry"
+    "semantic_classifier_authority_injection": "semantic-model-never-supplies-allow-predicate"
   }
 }

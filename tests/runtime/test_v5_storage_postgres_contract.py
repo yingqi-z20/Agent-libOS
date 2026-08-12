@@ -13,9 +13,11 @@ from agent_libos.storage.postgres import PostgresStore
 from agent_libos.storage.postgres_schema_contract import (
     POSTGRES_V4_BASELINE_4B43CB7_CATALOG_SHA256,
     expected_postgres_catalog,
-    load_postgres_v5_manifest,
+    load_postgres_v6_manifest,
 )
 from agent_libos.storage.semantic_v5_migration import plan_store_v5_migration
+from agent_libos.storage.v6_schema_contract import V6_TABLES
+from agent_libos.storage.v7_schema_contract import V7_TABLES
 
 
 @contextlib.contextmanager
@@ -60,11 +62,11 @@ def _postgres_schema_dsn() -> Iterator[str]:
 @pytest.mark.parametrize(
     ("mutation", "error"),
     [
-        (
-            "ALTER TABLE human_requests "
-            "DROP CONSTRAINT human_requests_pkey",
-            "storage (?:column|key constraint) contract|human request index contract",
-        ),
+            (
+                "ALTER TABLE human_requests "
+                "DROP CONSTRAINT human_requests_pkey CASCADE",
+                "storage (?:column|key constraint) contract|human request index contract",
+            ),
         (
             "ALTER TABLE human_requests ALTER COLUMN status DROP NOT NULL",
             "storage column contract",
@@ -170,10 +172,15 @@ def test_tampered_v5_postgres_contract_is_rejected_on_reopen(
 @pytest.mark.postgres
 def test_postgres_v4_plan_rejects_noncanonical_human_contract() -> None:
     import psycopg
+    from psycopg import sql
 
     with _postgres_schema_dsn() as dsn:
         PostgresStore(dsn).close()
         with psycopg.connect(dsn, autocommit=True) as connection:
+            for table in sorted(V7_TABLES | V6_TABLES):
+                connection.execute(
+                    sql.SQL("DROP TABLE {}").format(sql.Identifier(table))
+                )
             connection.execute("DROP TABLE semantic_assessments")
             connection.execute("DROP TABLE semantic_assessment_jobs")
             connection.execute(
@@ -194,7 +201,7 @@ def test_postgres_v4_plan_rejects_noncanonical_human_contract() -> None:
 
 
 @pytest.mark.postgres
-def test_fresh_v5_postgres_catalog_manifest_reopens() -> None:
+def test_fresh_v7_postgres_catalog_manifest_reopens() -> None:
     with _postgres_schema_dsn() as dsn:
         PostgresStore(dsn).close()
         PostgresStore(dsn).close()
@@ -372,7 +379,7 @@ def test_full_postgres_catalog_tamper_is_rejected(
 
         with pytest.raises(
             UnsupportedStoreVersion,
-            match="schema v5",
+            match="schema v7",
         ):
             PostgresStore(dsn)
 
@@ -394,6 +401,6 @@ def test_v4_manifest_is_pinned_to_actual_baseline_4b43cb7_catalog() -> None:
 
 
 def test_committed_postgres_manifest_records_pinned_pg17_10_generator() -> None:
-    manifest = load_postgres_v5_manifest()
+    manifest = load_postgres_v6_manifest()
     assert manifest["generated_postgres_version_num"] == 170010
     assert manifest["catalog"]["postgres_major"] == 17

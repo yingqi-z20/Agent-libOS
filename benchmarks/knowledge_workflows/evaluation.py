@@ -30,6 +30,10 @@ from benchmarks.live_evaluation_provenance import (
     capture_source_provenance,
     valid_stable_source_provenance,
 )
+from benchmarks.prompt_cache_evidence import (
+    aggregate_prompt_cache_run_evidence,
+    collect_prompt_cache_call_evidence,
+)
 from benchmarks.long_horizon_agent.runner import (
     _action_sequence,
     _invalid_tool_call_count,
@@ -281,6 +285,9 @@ def run_evaluation(
         scenario.scenario_id: _scenario_metrics(runs, scenario.scenario_id)
         for scenario in _SCENARIOS
     }
+    prompt_cache_evidence = aggregate_prompt_cache_run_evidence(
+        run for run in runs if isinstance(run, dict)
+    )
     report = {
         "schema_version": 1,
         "evaluation": EVALUATION_ID,
@@ -289,6 +296,7 @@ def run_evaluation(
         "repetitions": repetitions,
         "phase_one_quanta": phase_one_quanta,
         "max_quanta": max_quanta,
+        "prompt_layout": selected_config.llm.prompt_layout,
         "scenario_ids": [scenario.scenario_id for scenario in _SCENARIOS],
         "runs": runs,
         "metrics": {
@@ -303,6 +311,7 @@ def run_evaluation(
             "mean_llm_calls": _mean(runs, "llm_calls"),
             "mean_external_effects": _mean(runs, "external_effect_count"),
             "by_scenario": metrics_by_scenario,
+            **prompt_cache_evidence,
         },
         "release_gate": {
             "required_evidence_mode": "llm-live",
@@ -731,6 +740,7 @@ def _run_once(
                 _nonnegative_int(call.usage.get("completion_tokens"))
                 for call in calls
             ),
+            **collect_prompt_cache_call_evidence(calls),
             "invalid_tool_calls": _invalid_tool_call_count(runtime, root_pid),
             "tool_failures": _redacted_tool_failures(tool_failures),
             "tool_failure_count": len(tool_failures),

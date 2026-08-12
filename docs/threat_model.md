@@ -184,17 +184,35 @@ negotiated revision and advertised server capabilities are untrusted
 operation-local observations and cannot grant authority. Automatic fallback is
 limited to protocol-recognized legacy signals, never authentication errors,
 server failures, malformed/oversized replies, or ambiguous transport failure.
-The client does not advertise Sampling, Roots, Elicitation, subscriptions,
-Tasks, or extensions, and rejects reverse requests without invoking Runtime
-behavior. An MRTR input request is non-retryable and preserves unknown mutation
-evidence rather than creating a model-controlled replay path.
+The v1/v2 Tool compatibility client advertises no Sampling, Roots, Elicitation,
+subscription, Task, or extension callback. An MRTR input result on that path is
+non-retryable and preserves unknown mutation evidence rather than creating a
+model-controlled replay path.
 
-MCP protocol/session/content-negotiation, trace, baggage, and reserved `_meta`
-fields are Host-generated. Manifest header matching is case-insensitive and
-cannot override them. Ambient OpenTelemetry context is cleared at this adapter
-boundary; the release installs no exporter and does not claim OTel propagation
-support. Static environment-backed Authorization values remain a Host transport
-choice, not an OAuth implementation or a source of Runtime capability.
+Manifest v3 is an exact `2026-07-28`, non-downgradable contract for governed
+Tools and the Host-owned Resources, Resource Templates, Prompts, Completion,
+bounded subscriptions, MRTR, digest-pinned Tasks extension, and
+Host-preconfigured OAuth surfaces. Logical
+manifest ids and post-operation registry/auth/owner fence validation prevent
+remote metadata or a concurrent replacement from becoming authority. Provider
+cursors, remote task ids, request-state, OAuth state/PKCE/codes/tokens, and
+subscription handles are opaque Host state, not model or durable Store
+payloads. Sanitized, revisioned continuation/Task/subscription projections may
+be durable; ambiguous mutation dispatch or restart becomes `needs_attention`
+or `lost` and is never replayed/reconnected automatically. Apps HTML/metadata,
+Roots, Sampling, Logging, an MCP server surface, OAuth DCR, and the deprecated
+standalone SSE transport remain excluded.
+
+MCP header matching is case-insensitive. Every manifest version rejects
+protocol/session/resume, trace, and baggage controls. Manifest v2/v3 strictly
+forbids the complete Host-reserved content-negotiation, `Mcp-Param-*`, and
+protocol `_meta` surface. Manifest v1 retains compatibility support for
+`Accept`, `Mcp-Param-*`, and application `_meta`, while still rejecting all
+common high-risk controls. Ambient OpenTelemetry context is cleared at this
+adapter boundary; the release installs no exporter and does not claim OTel
+propagation support. Static environment-backed Authorization values on the
+v1/v2 path are a Host transport choice, not OAuth. V3 OAuth uses an opaque Host
+profile and credential broker; it does not create Runtime capability.
 
 These controls reduce SSRF and DNS-rebinding risk; they are not a private
 network firewall or a substitute for TLS and resolver integrity. TLS relies on
@@ -249,12 +267,19 @@ OS-account, ACL, namespace, container, or VM isolation.
 - JIT code cannot use ambient Deno filesystem, network, environment, process,
   or FFI permission. Its mediated syscalls still require the caller's primitive
   authority.
-- Provider work has a durable intent and explicit phase/effect outcome. A
-  certified no-start can restore eligible authority while no completed phase
-  has mutated state, observed information, or committed authority. After such a
-  phase, or after an ambiguous provider start, uncertainty remains durable and
-  startup does not blindly replay an unknown effect. This is not a distributed
-  transaction with the provider.
+- Protected provider phases have a durable intent and explicit phase/effect
+  outcome. A certified no-start can restore eligible authority while no
+  completed phase has mutated state, observed information, or committed
+  authority. After such a phase, or after an ambiguous provider start,
+  uncertainty remains durable and startup does not blindly replay an unknown
+  effect. This is not a distributed transaction with the provider. The exact
+  Host-only `GitPrimitive._semantic_read_flow_snapshot` call graph is a
+  pre-intent exception used to revalidate canary FlowGraph eligibility: it may
+  perform only checker-pinned local read-only repository observations, returns
+  bounded digest/label/source-reference metadata, and creates no durable
+  external-effect intent of its own. It cannot perform remote or mutating work;
+  a later accepted Git read still creates an ordinary protected intent and
+  repeats the flow/state observation before returning payload.
 - A split-phase Task Run mutation commits a request- and generation-bound
   provisional command receipt before a lost response can be interpreted as a
   fresh dispatch. Its strict version-1 result has an exact variant schema,
@@ -365,15 +390,17 @@ Capability and Sink configuration should be reviewed as security policy, and
 Human approval UI must not be treated as protection against a compromised
 operator.
 
-### Semantic classifier and Shadow evidence
+### Semantic classifier, FlowGraph, and machine policy
 
 The semantic model, scripted adapter input, goal/provider content, and every
 classifier response are untrusted. Relevant attacks include prompt injection,
 fabricated confidence, malformed or duplicate-key JSON, model/profile/Sink
 drift, OOD evasion, sensitive projection exfiltration, lease replay, forged
-provenance, and attempts to turn a `would_*` record into real authority.
+provenance, omitted/malformed lineage, cross-tenant graph confusion, stale
+policy epochs, one-shot replay, and attempts to turn a `would_*` record into
+real authority.
 
-Phase 0+1 contains these attacks structurally. Approval and provider ingress
+Approval and provider ingress
 are metadata-only. Root-goal redacted intent is allowed only for bounded
 `public`/`normal`, non-mixed-identity text after local secret and path detection;
 the external projection is then DataFlow-gated, and conditional egress cannot
@@ -381,20 +408,48 @@ open a recursive release request. External startup freezes profile identity and
 model; assessment and dispatch revalidate profile resolution, client, and Sink
 identity. The provider schema is closed and the model supplies findings only.
 The deterministic broker requires Host-derived positive predicates and a
-strictly attenuated Task Authority ceiling. Human settlement, Capability
-issuance, permission policy, DataLabel/release mutation, and business provider
-dispatch have no semantic mutation entrypoint. The Host provider-result
-observer is one-shot bound, invocation observers are additive, and only a
-bounded canonical Host digest can create ingress evidence. The generic digest
-has a 4,096-node/256 KiB ceiling; the five core provider domains and Host-bound
-dataclasses may use a 500,000-node/64 MiB incremental path, while the persisted
-descriptor remains payload-free and at most 4 KiB. An unavailable digest is an
-isolated capture failure. Incremental local DLP over allowlisted Host result
-structures persists only closed finding codes/digests, never scanned text.
+strictly attenuated Task Authority ceiling. The model has no terminal decision
+or authority field and cannot fill a missing Host predicate. The Host
+provider-result observer is one-shot bound, invocation observers are additive,
+and only a bounded canonical Host digest can create ingress evidence. The
+generic digest accepts only exact `None`, `bool`, `int`, finite `float`, `str`,
+`bytes`, and `bytearray` values; `StrEnum`; exact `list`/`tuple`; exact `dict`
+with exact string keys; and allowlisted Host dataclasses under a 4,096-node/256
+KiB ceiling. Filesystem, Shell, Git, JSON-RPC, MCP, and LLM are the six core
+provider domains that may use the 500,000-node/64 MiB incremental path; that
+path accepts only exact built-in values, Host-owned module-bound string-valued
+enums, and Host-bound allowlisted dataclasses. The allowlisted `LLMCompletion`
+binds only normalized Runtime-consumed fields; raw provider objects, hidden
+reasoning, provider options/trace, and attempt state are outside this identity
+and local-DLP path.
+The persisted descriptor remains payload-free and at most 4 KiB. An unavailable
+digest is an isolated capture failure. Incremental local DLP over allowlisted
+Host result structures persists only closed finding codes/digests, never
+scanned text.
 Observer failure cannot change the original result, and an ambiguous external
 classifier request is never automatically replayed.
 
-Semantic assessment rows are append-only through the Runtime API and carry
+FlowGraph evidence is payload-free and append-only. Missing historical v5
+edges, capture failure, partial/conflicting/stale coverage, mixed identity, and
+unknown action provenance block auto approval rather than being interpreted as
+absence of risk. Model label assertions can only raise sensitivity or lower
+integrity/trust; they cannot remove Host edges, declassify, endorse, write
+ambient labels, or relax a Sink decision.
+
+`enforce_deny` reaches only the closed Host hard-deny set. `canary_auto` reaches
+only catalog-v1 exact reads under an immutable static Host epoch and exact
+tenant bucket. The private settlement port shares Human request revision/status
+CAS, rechecks all live Host facts, and can issue only a short-lived,
+nondelegable, revocable, one-use Capability. Protected Operation checks the
+versioned binding and durable control generation through dispatch. There is no
+Runtime/model/CLI/HTTP/GUI policy or settlement entrypoint, and no machine path
+to `always_allow`, data release, permission administration, writes, network,
+Shell, JSON-RPC, or MCP. `off`, revoke, or safety trip blocks every unconsumed
+or undispatched semantic grant; already dispatched external effects are
+evidence, not rollback claims.
+
+Semantic assessment, FlowGraph history, policy epoch, machine settlement,
+health, and review rows are append-only through the Runtime API and carry
 Host provenance digests, but they are not cryptographically tamper-proof
 against the database administrator. Hashes bind identity/content for comparison;
 they are not signatures or proof that a classifier was truthful. Real-provider
@@ -410,7 +465,9 @@ Tenant grouping is absent by default. A deployment that injects the Host-only
 semantic tenant bucketer adds that callback and its secret key to the TCB; it
 should return a keyed HMAC digest rather than an unsalted hash of a low-entropy
 tenant name. The raw tenant is not a semantic-table field, and no model- or
-HTTP-facing path can install the callback.
+HTTP-facing path can install the callback. `canary_auto` additionally requires
+an exact non-empty static Host tenant-bucket allowlist; a null bucket cannot
+receive machine authority.
 
 ### Data exfiltration and cross-domain flow
 
@@ -452,6 +509,13 @@ environment allowlists, schema checks, no redirects, absolute deadlines, and
 sanitized public errors. The protected-operation state machine preserves
 unknown outcomes rather than retrying them as definitely not started.
 
+The hard network/stdio deadline belongs to the built-in governed transport.
+An injected exact-v3 Python Provider is trusted Host composition, not an
+in-process sandbox: it must yield, bound CPU work, honor the supplied deadline,
+and propagate cancellation. Runtime pre/post checks keep a late entered result
+unknown and non-replayable, but arbitrary blocking Python cannot be safely
+preempted. Deploy untrusted custom code behind a separately killable process.
+
 Remote services may still return adversarial content, lie at the application
 layer, retain data, or become unavailable. Provider receipts and reconciliation
 are only as trustworthy as the selected provider/service; returned content is
@@ -479,8 +543,11 @@ Host-authorized.
 
 The RuntimeStore is also a confidentiality boundary. With the default
 `llm.persist_full_io: true`, it retains complete prompts, visible tools,
-reasoning metadata, outputs, tool calls, and raw provider responses. A database
-or backup reader can therefore see that material. Operators that do not need
+reasoning metadata, outputs, tool calls, and a bounded provider-response
+projection. The projection may retain readable provider content but hashes
+sensitive/opaque values and replaces oversized structures with omission
+metadata; it is not a byte-for-byte raw SDK response. A database or backup
+reader can therefore see the retained material. Operators that do not need
 lossless training/debugging records should disable full-I/O persistence and
 apply the separately documented payload-retention policy; neither setting is
 at-rest encryption.

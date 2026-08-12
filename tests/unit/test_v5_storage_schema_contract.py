@@ -9,6 +9,8 @@ import pytest
 from agent_libos.models.exceptions import UnsupportedStoreVersion
 from agent_libos.storage.semantic_v5_migration import plan_store_v5_migration
 from agent_libos.storage.sqlite import SQLiteStore
+from agent_libos.storage.v6_schema_contract import V6_TABLES
+from agent_libos.storage.v7_schema_contract import V7_TABLES
 
 
 def _replace_once(source: str, old: str, new: str) -> str:
@@ -49,6 +51,8 @@ def _make_v4_store(path: Path) -> None:
     SQLiteStore(path).close()
     connection = sqlite3.connect(path)
     try:
+        for table in sorted(V7_TABLES | V6_TABLES):
+            connection.execute(f'DROP TABLE "{table}"')
         connection.execute("DROP TABLE semantic_assessments")
         connection.execute("DROP TABLE semantic_assessment_jobs")
         connection.execute("ALTER TABLE human_requests DROP COLUMN revision")

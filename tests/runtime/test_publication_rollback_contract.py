@@ -2425,7 +2425,7 @@ def test_recovery_fence_revokes_candidate_admitted_before_registry_barrier(
 
             def pause_then_fail(*_args: object, **_kwargs: object) -> None:
                 exec_paused.set()
-                if not release_exec.wait(timeout=10):
+                if not release_exec.wait(timeout=THREAD_SYNC_TIMEOUT_S):
                     raise AssertionError("timed out waiting to fail exec")
                 raise RuntimeError("injected late exec failure after admission")
 
@@ -2479,13 +2479,13 @@ def test_recovery_fence_revokes_candidate_admitted_before_registry_barrier(
                 name=proposal_thread_name,
             )
             exec_thread.start()
-            assert exec_paused.wait(timeout=10)
+            assert exec_paused.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             proposal_thread.start()
-            assert proposal_reached_barrier.wait(timeout=10)
+            assert proposal_reached_barrier.wait(timeout=THREAD_SYNC_TIMEOUT_S)
             assert not proposal_finished.is_set()
             release_exec.set()
-            exec_thread.join(timeout=15)
-            proposal_thread.join(timeout=15)
+            exec_thread.join(timeout=THREAD_SYNC_TIMEOUT_S)
+            proposal_thread.join(timeout=THREAD_SYNC_TIMEOUT_S)
 
             assert not exec_thread.is_alive()
             assert not proposal_thread.is_alive()

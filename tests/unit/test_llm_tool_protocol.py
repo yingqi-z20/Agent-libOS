@@ -163,6 +163,8 @@ class TestToolProtocol:
             "params"
         ]["description"]
 
+        assert "object, array, or null" in description
+        assert "scalar" not in description
         assert "provider-stringified JSON object or array" in description
         assert CallJsonRpcMethodArgs(
             endpoint_id="portal",

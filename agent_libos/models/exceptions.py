@@ -13,6 +13,51 @@ class CapabilityDenied(LibOSError):
     pass
 
 
+class SemanticAuthorityTripDeferred(CapabilityDenied):
+    """Payload-free safety trip that must be persisted after UoW rollback.
+
+    Semantic authority is revalidated from inside protected-effect
+    transactions.  Persisting the durable kill switch in a nested savepoint
+    would be undone when the authority denial rolls back that outer
+    transaction.  This exception carries only Host-generated digests so the
+    boundary can retry the trip after the outer transaction has unwound.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        trip_code: str,
+        evidence_sha256: str,
+        tenant_bucket_sha256: str | None,
+    ) -> None:
+        if not isinstance(trip_code, str) or not trip_code:
+            raise TypeError("deferred semantic safety trip requires trip_code")
+        if (
+            not isinstance(evidence_sha256, str)
+            or len(evidence_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in evidence_sha256)
+        ):
+            raise TypeError(
+                "deferred semantic safety trip requires a SHA-256 evidence digest"
+            )
+        if tenant_bucket_sha256 is not None and (
+            not isinstance(tenant_bucket_sha256, str)
+            or len(tenant_bucket_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in tenant_bucket_sha256
+            )
+        ):
+            raise TypeError(
+                "deferred semantic safety trip tenant bucket must be a SHA-256 digest"
+            )
+        self.trip_code = trip_code
+        self.evidence_sha256 = evidence_sha256
+        self.tenant_bucket_sha256 = tenant_bucket_sha256
+        super().__init__(message)
+
+
 class HumanApprovalRequired(LibOSError):
     def __init__(self, request_id: str, message: str):
         super().__init__(message)

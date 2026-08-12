@@ -105,8 +105,12 @@ def test_cache_aggregate_reads_retained_raw_usage_only_when_needed() -> None:
 
     assert aggregate_cache_usage(calls) == {
         "cache_read_tokens": 60,
-        "cache_write_tokens": 10,
+        "cache_write_tokens": None,
+        "cache_total_calls": 2,
         "cache_reported_calls": 2,
+        "cache_read_reported_calls": 2,
+        "cache_write_reported_calls": 1,
+        "cache_metric_reported_calls": 2,
         "cache_metric_input_tokens": 150,
         "uncached_input_tokens": 90,
         "cache_hit_rate": 0.4,
@@ -119,6 +123,7 @@ def test_cache_hit_rate_is_null_when_provider_reports_no_cache_metrics() -> None
     )
 
     assert metrics["cache_reported_calls"] == 0
+    assert metrics["cache_total_calls"] == 1
     assert metrics["cache_hit_rate"] is None
 
 
@@ -139,6 +144,7 @@ def test_cache_hit_rate_uses_only_calls_with_reported_input_tokens() -> None:
     )
 
     assert metrics["cache_read_tokens"] == 130
+    assert metrics["cache_total_calls"] == 2
     assert metrics["cache_reported_calls"] == 2
     assert metrics["cache_metric_input_tokens"] == 100
     assert metrics["uncached_input_tokens"] == 60

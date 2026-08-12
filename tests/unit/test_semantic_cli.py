@@ -9,12 +9,15 @@ from typing import Any
 import pytest
 
 from agent_libos.api.cli import cli as cli_entrypoint
+from agent_libos.api.cli import _parse_cli_args
 from agent_libos.api.cli import main as cli_main
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models.exceptions import LibOSError
 
 
 def _assessment(**overrides: Any) -> dict[str, Any]:
     value: dict[str, Any] = {
+        "schema_version": 1,
         "assessment_id": "assessment-1",
         "job_id": "job-1",
         "kind": "approval",
@@ -26,7 +29,7 @@ def _assessment(**overrides: Any) -> dict[str, Any]:
         "operation_id": "operation-1",
         "effect_id": "effect-1",
         "shadow_outcome": "require_human",
-        "reason_codes": ["semantic.policy.no_matching_rule"],
+        "reason_codes": ["ceiling_miss"],
         "ood": False,
         "abstain": False,
         "confidence_bps": 8_750,
@@ -45,11 +48,19 @@ def _assessment(**overrides: Any) -> dict[str, Any]:
         "output_tokens": 8,
         "cost_microunits": 42,
         "human_outcome": "approved",
-        "findings": [{"code": "semantic.policy.no_matching_rule"}],
+        "findings": [
+            {
+                "code": "ceiling_miss",
+                "severity": "medium",
+                "confidence_bps": 8_750,
+                "evidence_sha256": "1" * 64,
+                "source": "deterministic",
+            }
+        ],
         "data_findings": [],
         "matched_rule_ids": [],
-        "proven_predicates": ["exact_binding"],
-        "missing_predicates": ["ceiling_rule"],
+        "proven_predicates": ["exact_external_operation"],
+        "missing_predicates": ["ceiling_matched"],
         "source_refs_sha256": "5" * 64,
         "data_labels_sha256": "6" * 64,
         "sink_identity_sha256": "7" * 64,
@@ -86,7 +97,7 @@ class _FakeSemantic:
 
     def status(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "mode": "shadow",
             "adapter": "scripted",
             "profile_id": "semantic-review",
@@ -129,10 +140,64 @@ class _FakeSemantic:
                     "unknown": 1,
                 },
             },
+            "control": {
+                "catalog_version": 1,
+                "active_epoch_id": "epoch-1",
+                "active_epoch_sha256": "b" * 64,
+                "generation": 1,
+                "state": "active",
+                "trip_reason_code": None,
+            },
+            "flow": {
+                "schema_version": 1,
+                "available": True,
+                "counts": {
+                    "entities": 1,
+                    "activities": 1,
+                    "edges": 1,
+                    "label_assertions": 0,
+                },
+                "coverage": {
+                    "complete": 1,
+                    "partial": 0,
+                    "unknown": 0,
+                    "conflict": 0,
+                    "stale": 0,
+                },
+                "capture_failures": 0,
+                "legacy_history": {
+                    "present": False,
+                    "source_schema_version": None,
+                    "assessment_count": 0,
+                    "coverage": None,
+                    "evidence_sha256": None,
+                    "created_at": None,
+                },
+            },
+            "machine": {
+                "eligible": 1,
+                "issued": 0,
+                "consumed": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "unknown": 0,
+                "expired": 0,
+                "revoked": 0,
+                "race_lost": 0,
+                "denied": 0,
+            },
             "actual_auto_approval": {
                 "numerator": 0,
-                "denominator": 0,
-                "rate": None,
+                "denominator": 1,
+                "rate": 0.0,
+            },
+            "review_metrics": {
+                "reviewed": 0,
+                "safe": 0,
+                "unsafe": 0,
+                "unsafe_rate": None,
+                "issued_reviewed": 0,
+                "issued_review_rate": None,
             },
             "prompt": "SECRET-SENTINEL",
         }
@@ -174,7 +239,7 @@ def _install_runtime(monkeypatch: pytest.MonkeyPatch) -> _FakeRuntime:
     return runtime
 
 
-def test_semantic_status_emits_exact_v2_contract(
+def test_semantic_status_emits_exact_v3_contract(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -183,55 +248,10 @@ def test_semantic_status_emits_exact_v2_contract(
     cli_main(["semantic", "status"])
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload == {
-        "schema_version": 2,
-        "mode": "shadow",
-        "adapter": "scripted",
-        "profile_id": "semantic-review",
-        "queue": {
-            "queued": 1,
-            "leased": 2,
-            "succeeded": 3,
-            "failed": 4,
-            "cancelled": 5,
-            "capture_failures": 6,
-        },
-        "assessments": {
-            "total": 7,
-            "success": 3,
-            "error": 4,
-            "ood": 1,
-            "would_issue_exact_once": 0,
-            "would_deny": 1,
-            "require_human": 6,
-            "by_status": {
-                "success": 3,
-                "skipped_policy": 0,
-                "egress_blocked": 0,
-                "timeout": 1,
-                "provider_error": 1,
-                "provider_outcome_unknown": 0,
-                "invalid_schema": 1,
-                "ood": 1,
-                "abstained": 0,
-                "stale_input": 0,
-            },
-            "by_domain": {
-                "filesystem": 2,
-                "shell": 1,
-                "git": 1,
-                "jsonrpc": 1,
-                "mcp": 0,
-                "runtime": 1,
-                "unknown": 1,
-            },
-        },
-        "actual_auto_approval": {
-            "numerator": 0,
-            "denominator": 0,
-            "rate": None,
-        },
-    }
+    expected = runtime.semantic.status()
+    expected.pop("prompt")
+    expected["queue"].pop("raw_projection")
+    assert payload == expected
     assert "SECRET-SENTINEL" not in json.dumps(payload)
     assert runtime.shutdown_calls == [("cli", "cli.command_complete")]
 
@@ -242,11 +262,18 @@ def test_semantic_status_uses_zero_counters_and_null_rate_for_empty_state(
 ) -> None:
     runtime = _install_runtime(monkeypatch)
     runtime.semantic.status = lambda: {  # type: ignore[method-assign]
-        "schema_version": 2,
+        "schema_version": 3,
         "mode": "off",
         "adapter": "deterministic",
         "profile_id": None,
-        "queue": {},
+        "queue": {
+            "queued": 0,
+            "leased": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "cancelled": 0,
+            "capture_failures": 0,
+        },
         "assessments": {
             "by_status": {
                 "success": 0,
@@ -270,7 +297,65 @@ def test_semantic_status_uses_zero_counters_and_null_rate_for_empty_state(
                 "unknown": 0,
             },
         },
-        "actual_auto_approval": {},
+        "control": {
+            "catalog_version": None,
+            "active_epoch_id": None,
+            "active_epoch_sha256": None,
+            "generation": 0,
+            "state": "inactive",
+            "trip_reason_code": None,
+        },
+        "flow": {
+            "schema_version": 1,
+            "available": True,
+            "counts": {
+                "entities": 0,
+                "activities": 0,
+                "edges": 0,
+                "label_assertions": 0,
+            },
+            "coverage": {
+                "complete": 0,
+                "partial": 0,
+                "unknown": 0,
+                "conflict": 0,
+                "stale": 0,
+            },
+            "capture_failures": 0,
+            "legacy_history": {
+                "present": False,
+                "source_schema_version": None,
+                "assessment_count": 0,
+                "coverage": None,
+                "evidence_sha256": None,
+                "created_at": None,
+            },
+        },
+        "machine": {
+            "eligible": 0,
+            "issued": 0,
+            "consumed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "unknown": 0,
+            "expired": 0,
+            "revoked": 0,
+            "race_lost": 0,
+            "denied": 0,
+        },
+        "actual_auto_approval": {
+            "numerator": 0,
+            "denominator": 0,
+            "rate": None,
+        },
+        "review_metrics": {
+            "reviewed": 0,
+            "safe": 0,
+            "unsafe": 0,
+            "unsafe_rate": None,
+            "issued_reviewed": 0,
+            "issued_review_rate": None,
+        },
     }
 
     cli_main(["semantic", "status"])
@@ -337,11 +422,11 @@ def test_semantic_status_uses_zero_counters_and_null_rate_for_empty_state(
         (("assessments", "by_status", "success"), True),
         (("assessments", "by_domain", "filesystem"), "2"),
         (("actual_auto_approval", "numerator"), 1),
-        (("actual_auto_approval", "denominator"), 1),
-        (("actual_auto_approval", "rate"), 0.0),
+        (("actual_auto_approval", "denominator"), 2),
+        (("actual_auto_approval", "rate"), 0.5),
     ],
 )
-def test_semantic_status_rejects_malformed_v2_fields(
+def test_semantic_status_rejects_malformed_v3_fields(
     monkeypatch: pytest.MonkeyPatch,
     path: tuple[str, ...],
     invalid: object,
@@ -532,11 +617,11 @@ def test_semantic_show_emits_detail_without_private_payloads(
     assert payload["assessment"]["assessment_id"] == "assessment-visible"
     assert payload["assessment"]["findings"] == [
         {
-            "code": "semantic.policy.no_matching_rule",
-            "severity": None,
-            "confidence_bps": None,
-            "evidence_sha256": None,
-            "source": None,
+            "code": "ceiling_miss",
+            "severity": "medium",
+            "confidence_bps": 8_750,
+            "evidence_sha256": "1" * 64,
+            "source": "deterministic",
         }
     ]
     assert payload["assessment"]["manifest_sha256"] == "b" * 64
@@ -555,6 +640,149 @@ def test_semantic_show_emits_detail_without_private_payloads(
     assert "content" not in payload["assessment"]
     assert "raw_content" not in payload["assessment"]
     assert "SECRET-SENTINEL" not in json.dumps(payload)
+
+
+def test_semantic_flow_entities_cli_forwards_bounded_filters_and_redacts(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _install_runtime(monkeypatch)
+    calls: list[dict[str, Any]] = []
+
+    def query_flow_entities(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "schema_version": 1,
+            "items": [
+                {
+                    "schema_version": 1,
+                    "entity_id": "entity-1",
+                    "kind": "provider_result",
+                    "pid": "pid-1",
+                    "tenant_bucket_sha256": "1" * 64,
+                    "content_sha256": "2" * 64,
+                    "version_sha256": "3" * 64,
+                    "provenance_sha256": "4" * 64,
+                    "baseline_labels": {
+                        "sensitivity": "normal",
+                        "trust_level": "verified",
+                        "integrity": "checked",
+                    },
+                    "identity_present": True,
+                    "identity_mixed": False,
+                    "coverage": "complete",
+                    "created_at": "2026-08-05T00:00:00Z",
+                    "raw_content": "SECRET-SENTINEL",
+                }
+            ],
+            "next_cursor": None,
+        }
+
+    runtime.semantic.query_flow_entities = query_flow_entities  # type: ignore[attr-defined]
+
+    cli_main(
+        [
+            "semantic",
+            "flow",
+            "entities",
+            "--pid",
+            "pid-1",
+            "--kind",
+            "provider_result",
+            "--tenant-bucket-sha256",
+            "1" * 64,
+            "--limit",
+            "1",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert calls == [
+        {
+            "pid": "pid-1",
+            "kind": "provider_result",
+            "tenant_bucket_sha256": "1" * 64,
+            "after": None,
+            "limit": 1,
+        }
+    ]
+    assert payload["items"][0]["entity_id"] == "entity-1"
+    assert "SECRET-SENTINEL" not in json.dumps(payload)
+
+
+def test_semantic_review_import_is_strict_append_only_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    runtime = _install_runtime(monkeypatch)
+    calls: list[dict[str, Any]] = []
+
+    def append_review_label(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "schema_version": 1,
+            "review_id": "review-1",
+            "settlement_id": kwargs["settlement_id"],
+            "outcome": kwargs["outcome"],
+            "reviewer_sha256": "a" * 64,
+            "evidence_sha256": kwargs["evidence_sha256"],
+            "created_at": "2026-08-05T00:00:00Z",
+        }
+
+    runtime.semantic.append_review_label = append_review_label  # type: ignore[attr-defined]
+    review_file = tmp_path / "review.json"
+    review_file.write_text(
+        json.dumps(
+            {
+                "settlement_id": "settlement-1",
+                "outcome": "safe",
+                "reviewer_id": "operator-1",
+                "evidence_sha256": "b" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cli_main(["semantic", "review", "import", "--file", str(review_file)])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["review"]["review_id"] == "review-1"
+    assert calls == [
+        {
+            "settlement_id": "settlement-1",
+            "outcome": "safe",
+            "reviewer_id": "operator-1",
+            "evidence_sha256": "b" * 64,
+            "reviewed_at": None,
+        }
+    ]
+
+
+def test_semantic_review_import_rejects_unknown_authority_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = _install_runtime(monkeypatch)
+    runtime.semantic.append_review_label = lambda **_kwargs: pytest.fail(  # type: ignore[attr-defined]
+        "invalid review input must not reach the service"
+    )
+    review_file = tmp_path / "review.json"
+    review_file.write_text(
+        json.dumps(
+            {
+                "settlement_id": "settlement-1",
+                "outcome": "safe",
+                "reviewer_id": "operator-1",
+                "evidence_sha256": "b" * 64,
+                "activate_policy": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LibOSError, match="must contain only"):
+        cli_main(["semantic", "review", "import", "--file", str(review_file)])
 
 
 @pytest.mark.parametrize(
@@ -726,6 +954,33 @@ def test_semantic_assessment_enums_are_rejected_before_runtime_open(
 @pytest.mark.parametrize(
     "argv",
     [
+        ["semantic", "flow", "entities", "--kind", "unknown"],
+        ["semantic", "flow", "edges", "--relation", "write"],
+        ["semantic", "settlements", "--outcome", "approved"],
+        ["semantic", "health", "--severity", "error"],
+        ["semantic", "metrics", "--risk", "unknown"],
+    ],
+)
+def test_semantic_phase_four_enums_are_rejected_before_runtime_open(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+) -> None:
+    monkeypatch.setattr(
+        "agent_libos.api.cli.Runtime.open",
+        lambda *_args, **_kwargs: pytest.fail("invalid filters must not open Runtime"),
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        cli_main(argv)
+
+    assert raised.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
         ["semantic", "assessments", "--pid", ""],
         ["semantic", "assessments", "--pid", "x" * 513],
         ["semantic", "assessments", "--request-id", "line\nbreak"],
@@ -745,6 +1000,91 @@ def test_semantic_text_inputs_are_bounded(
 
     assert raised.value.code == 2
     assert "must contain" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["semantic", "assessments", "--action-id", "Filesystem.read"],
+        ["semantic", "settlements", "--action-id", "filesystem"],
+        ["semantic", "metrics", "--action-id", "Read File"],
+    ],
+)
+def test_semantic_action_filters_require_dotted_lower_case_identifiers(
+    argv: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        _parse_cli_args(argv)
+
+    assert raised.value.code == 2
+    assert "dotted lower-case identifier" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["semantic", "assessments"],
+        ["semantic", "settlements"],
+        ["semantic", "metrics"],
+    ],
+)
+def test_semantic_action_filters_accept_exact_ontology_shape(
+    argv: list[str],
+) -> None:
+    _, args = _parse_cli_args([*argv, "--action-id", "filesystem.read"])
+
+    assert args.action_id == "filesystem.read"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["semantic", "assessments"],
+        ["semantic", "flow", "entities"],
+        ["semantic", "settlements"],
+        ["semantic", "metrics"],
+    ],
+)
+def test_semantic_tenant_filters_reject_upper_case_sha256(
+    argv: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        _parse_cli_args([*argv, "--tenant-bucket-sha256", "A" * 64])
+
+    assert raised.value.code == 2
+    assert "64 lower-case hexadecimal" in capsys.readouterr().err
+
+
+def test_semantic_assessment_tenant_filter_rejects_non_sha256_text(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        _parse_cli_args(
+            ["semantic", "assessments", "--tenant-bucket-sha256", "tenant-one"]
+        )
+
+    assert raised.value.code == 2
+    assert "64 lower-case hexadecimal" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["semantic", "assessments"],
+        ["semantic", "flow", "entities"],
+        ["semantic", "settlements"],
+        ["semantic", "metrics"],
+    ],
+)
+def test_semantic_tenant_filters_accept_exact_lower_case_sha256(
+    argv: list[str],
+) -> None:
+    digest = "a" * 64
+    _, args = _parse_cli_args([*argv, "--tenant-bucket-sha256", digest])
+
+    assert args.tenant_bucket_sha256 == digest
 
 
 class _MigrationPayload:
@@ -793,6 +1133,82 @@ def _install_migration_module(
     monkeypatch.setitem(sys.modules, module.__name__, module)
 
 
+def _install_v6_migration_module(
+    monkeypatch: pytest.MonkeyPatch,
+    calls: list[tuple[str, object, dict[str, Any]]],
+) -> None:
+    module = ModuleType("agent_libos.storage.semantic_v6_migration")
+
+    def plan(target: object, **kwargs: Any) -> _MigrationPayload:
+        calls.append(("plan-v6", target, kwargs))
+        return _MigrationPayload(
+            {
+                "schema_version": 1,
+                "backend": "sqlite",
+                "from_version": 5,
+                "to_version": 6,
+                "statements": ["CREATE TABLE semantic_flow_entities"],
+                "plan_sha256": "b" * 64,
+            }
+        )
+
+    def apply(target: object, **kwargs: Any) -> _MigrationPayload:
+        calls.append(("apply-v6", target, kwargs))
+        return _MigrationPayload(
+            {
+                "schema_version": 1,
+                "backend": "sqlite",
+                "from_version": 5,
+                "to_version": 6,
+                "plan_sha256": "b" * 64,
+                "applied": True,
+                "already_applied": False,
+            }
+        )
+
+    module.plan_store_v6_migration = plan  # type: ignore[attr-defined]
+    module.apply_store_v6_migration = apply  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+
+def _install_v7_migration_module(
+    monkeypatch: pytest.MonkeyPatch,
+    calls: list[tuple[str, object, dict[str, Any]]],
+) -> None:
+    module = ModuleType("agent_libos.storage.mcp_v7_migration")
+
+    def plan(target: object, **kwargs: Any) -> _MigrationPayload:
+        calls.append(("plan-v7", target, kwargs))
+        return _MigrationPayload(
+            {
+                "schema_version": 1,
+                "backend": "sqlite",
+                "from_version": 6,
+                "to_version": 7,
+                "statements": ["CREATE TABLE mcp_continuations"],
+                "plan_sha256": "c" * 64,
+            }
+        )
+
+    def apply(target: object, **kwargs: Any) -> _MigrationPayload:
+        calls.append(("apply-v7", target, kwargs))
+        return _MigrationPayload(
+            {
+                "schema_version": 1,
+                "backend": "sqlite",
+                "from_version": 6,
+                "to_version": 7,
+                "plan_sha256": "c" * 64,
+                "applied": True,
+                "already_applied": False,
+            }
+        )
+
+    module.plan_store_v7_migration = plan  # type: ignore[attr-defined]
+    module.apply_store_v7_migration = apply  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+
 def test_store_migration_dry_run_executes_before_runtime_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -822,6 +1238,110 @@ def test_store_migration_dry_run_executes_before_runtime_open(
     payload = json.loads(capsys.readouterr().out)
     assert payload["schema_version"] == 1
     assert payload["plan_sha256"] == "a" * 64
+
+
+def test_store_v6_migration_dry_run_uses_explicit_offline_migrator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[str, object, dict[str, Any]]] = []
+    _install_v6_migration_module(monkeypatch, calls)
+    monkeypatch.setattr(
+        "agent_libos.api.cli.load_config_from_project_root",
+        lambda: DEFAULT_CONFIG,
+    )
+    monkeypatch.setattr(
+        "agent_libos.api.cli.Runtime.open",
+        lambda *_args, **_kwargs: pytest.fail("migration must not open Runtime"),
+    )
+    database = tmp_path / "runtime.sqlite"
+
+    cli_main(["--db", str(database), "store", "migrate", "--to", "6", "--dry-run"])
+
+    assert calls == [
+        (
+            "plan-v6",
+            str(database),
+            {"sqlite_backup": None, "postgres_snapshot_confirmed": False},
+        )
+    ]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["from_version"] == 5
+    assert payload["to_version"] == 6
+    assert payload["plan_sha256"] == "b" * 64
+
+
+def test_store_v7_migration_dry_run_uses_explicit_offline_migrator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[str, object, dict[str, Any]]] = []
+    _install_v7_migration_module(monkeypatch, calls)
+    monkeypatch.setattr(
+        "agent_libos.api.cli.load_config_from_project_root",
+        lambda: DEFAULT_CONFIG,
+    )
+    monkeypatch.setattr(
+        "agent_libos.api.cli.Runtime.open",
+        lambda *_args, **_kwargs: pytest.fail("migration must not open Runtime"),
+    )
+    database = tmp_path / "runtime.sqlite"
+
+    cli_main(["--db", str(database), "store", "migrate", "--to", "7", "--dry-run"])
+
+    assert calls == [
+        (
+            "plan-v7",
+            str(database),
+            {"sqlite_backup": None, "postgres_snapshot_confirmed": False},
+        )
+    ]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["from_version"] == 6
+    assert payload["to_version"] == 7
+    assert payload["plan_sha256"] == "c" * 64
+
+
+def test_store_v7_migration_apply_forwards_digest_and_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[str, object, dict[str, Any]]] = []
+    _install_v7_migration_module(monkeypatch, calls)
+    monkeypatch.setattr(
+        "agent_libos.api.cli.load_config_from_project_root",
+        lambda: DEFAULT_CONFIG,
+    )
+    monkeypatch.setattr(
+        "agent_libos.api.cli.Runtime.open",
+        lambda *_args, **_kwargs: pytest.fail("migration must not open Runtime"),
+    )
+    database = tmp_path / "runtime.sqlite"
+    backup = tmp_path / "runtime-v6.sqlite.backup"
+
+    cli_main(
+        [
+            "--db", str(database), "store", "migrate", "--to", "7", "--apply",
+            "--expected-plan-sha256", "c" * 64,
+            "--sqlite-backup", str(backup),
+        ]
+    )
+
+    assert calls == [
+        (
+            "apply-v7",
+            str(database),
+            {
+                "expected_plan_sha256": "c" * 64,
+                "sqlite_backup": backup,
+                "postgres_snapshot_confirmed": False,
+            },
+        )
+    ]
+    assert json.loads(capsys.readouterr().out)["applied"] is True
 
 
 def test_store_migration_apply_forwards_digest_and_backup_before_runtime_open(

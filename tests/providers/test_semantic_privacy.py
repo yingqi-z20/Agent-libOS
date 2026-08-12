@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import hashlib
 import threading
@@ -11,10 +12,12 @@ from typing import Any
 import pytest
 
 from agent_libos import Runtime
+from agent_libos.api.gui.server import GuiHTTPServer, GuiRuntimeService
 from agent_libos.config import AgentLibOSConfig, SemanticDefaults
 from agent_libos.models import (
     CapabilityRight,
     DataLabels,
+    HumanRequestStatus,
     ObjectMetadata,
     ObjectType,
     SemanticAssessment,
@@ -22,6 +25,10 @@ from agent_libos.models import (
 )
 from agent_libos.storage import SQLiteStore, SemanticAssessmentJobStatus
 from agent_libos.substrate import LocalResourceProviderSubstrate
+from agent_libos.semantic.preview import (
+    build_host_argument_projection,
+    build_host_resource_projection,
+)
 from agent_libos.utils.serde import to_jsonable
 
 
@@ -36,6 +43,24 @@ _TERMINAL_JOB_STATUSES = tuple(
         SemanticAssessmentJobStatus.QUEUED,
         SemanticAssessmentJobStatus.CLAIMED,
     }
+)
+_SEMANTIC_V6_TABLES = (
+    "semantic_assessment_jobs",
+    "semantic_assessments",
+    "semantic_flow_entities",
+    "semantic_flow_activities",
+    "semantic_flow_edges",
+    "semantic_flow_label_assertions",
+    "semantic_legacy_coverage",
+    "semantic_policy_epochs",
+    "semantic_control_state",
+    "semantic_control_transitions",
+    "semantic_machine_settlements",
+    "semantic_review_labels",
+    "semantic_health_events",
+    "semantic_human_outcome_links",
+    "semantic_machine_outcomes",
+    "semantic_rate_budgets",
 )
 
 
@@ -114,6 +139,81 @@ def _query_all_assessments(runtime: Runtime) -> dict[str, Any]:
     )
     assert isinstance(value, dict)
     return value
+
+
+def _external_filesystem_request(
+    runtime: Runtime,
+    *,
+    pid: str,
+    resource: str,
+    path: str,
+    question: str = "Allow this exact read?",
+) -> str:
+    return runtime.human.query_authority_request(
+        pid,
+        runtime.config.runtime.default_human,
+        {
+            "type": "external_operation_approval",
+            "question": question,
+            "requested_once_capability": {
+                "subject": pid,
+                "resource": resource,
+                "rights": ["read"],
+                "constraints": {},
+            },
+            "context": {
+                "adapter": "filesystem",
+                "authority_operation": "filesystem.read",
+                "primitive": "runtime.filesystem.read_text",
+                "operation": "read_text",
+                "pid": pid,
+                "resource": resource,
+                "path": path,
+                "right": "read",
+                "target_state_version": None,
+            },
+        },
+        blocking=True,
+        authority_origin="external_operation",
+    )
+
+
+def _fetch_gui_human_request(
+    runtime: Runtime,
+    *,
+    request_id: str,
+    root: Path,
+) -> dict[str, Any]:
+    service = GuiRuntimeService(
+        runtime=runtime,
+        token="semantic-privacy-token",
+        auto_run=False,
+        llm_profiles_file=root / "llm-profiles.json",
+    )
+    server = GuiHTTPServer(("127.0.0.1", 0), service)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        host, port = server.server_address
+        connection = http.client.HTTPConnection(host, port, timeout=30)
+        try:
+            connection.request(
+                "GET",
+                f"/api/human-requests/{request_id}",
+                headers={"Authorization": "Bearer semantic-privacy-token"},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            selected = json.loads(response.read().decode("utf-8"))
+            assert isinstance(selected, dict)
+            return selected
+        finally:
+            connection.close()
+    finally:
+        server.shutdown()
+        server_thread.join(timeout=5)
+        server.server_close()
+        service.close()
 
 
 @pytest.mark.parametrize(
@@ -313,19 +413,8 @@ def test_terminal_semantic_evidence_never_persists_secret_sentinel() -> None:
                 for item in api_items
             ]
             raw_semantic_rows = {
-                "jobs": [
-                    dict(row)
-                    for row in runtime.store._query(  # noqa: SLF001 - privacy oracle
-                        "SELECT projection_json, bindings_json, error_code "
-                        "FROM semantic_assessment_jobs"
-                    )
-                ],
-                "assessments": [
-                    dict(row)
-                    for row in runtime.store._query(  # noqa: SLF001 - privacy oracle
-                        "SELECT record_json FROM semantic_assessments"
-                    )
-                ],
+                table: runtime.store.select_table_rows(table)
+                for table in _SEMANTIC_V6_TABLES
             }
             surfaces = {
                 "typed_jobs": jobs,
@@ -336,11 +425,284 @@ def test_terminal_semantic_evidence_never_persists_secret_sentinel() -> None:
                 "semantic_sql_rows": raw_semantic_rows,
                 "events": runtime.events.list(),
                 "audit": runtime.audit.trace(),
+                "external_effects": runtime.store.list_external_effects(pid=pid),
                 "llm_calls": runtime.store.list_llm_calls(limit=100),
             }
             assert _SECRET_SENTINEL not in _json_text(surfaces)
         finally:
             runtime.close()
+
+
+def test_external_approval_identifier_is_absent_from_public_terminal_and_gui_evidence() -> None:
+    sentinel = "SEMANTIC_HUMAN_RESOURCE_SECRET_SENTINEL_87ac"
+    config = AgentLibOSConfig(
+        semantic=SemanticDefaults(mode="shadow", adapter="deterministic")
+    )
+    with TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        runtime = Runtime.open(
+            "local",
+            config=config,
+            substrate=LocalResourceProviderSubstrate(workspace),
+        )
+        service: GuiRuntimeService | None = None
+        server: GuiHTTPServer | None = None
+        server_thread: threading.Thread | None = None
+        try:
+            assert runtime.semantic.shutdown()
+            pid = runtime.process.spawn(goal="approval preview privacy probe")
+            path = f"reports/{sentinel}.txt"
+            resource = f"filesystem:workspace:{path}"
+            request_id = _external_filesystem_request(
+                runtime,
+                pid=pid,
+                resource=resource,
+                path=path,
+                question=f"Allow {sentinel}?",
+            )
+            request = runtime.human.get(request_id)
+            assert {
+                "question",
+                "context",
+                "effect_binding",
+                "requested_once_capability",
+            }.issubset(request.payload)
+            assert sentinel in _json_text(request.payload)
+
+            public_view = runtime.human.public_request_view(request)
+            terminal_view = runtime.human.format_terminal_request(request)
+            resource_sha256 = hashlib.sha256(resource.encode("utf-8")).hexdigest()
+            assert public_view["payload"] == {
+                "type": "external_operation_approval"
+            }
+            assert public_view["approval_preview"]["resource_display"] == (
+                "<redacted>"
+            )
+            assert public_view["approval_preview"]["resource_sha256"] == (
+                resource_sha256
+            )
+            assert "<redacted>" in terminal_view
+            assert resource_sha256 in terminal_view
+
+            while runtime.semantic.process_one():
+                pass
+
+            service = GuiRuntimeService(
+                runtime=runtime,
+                token="semantic-privacy-token",
+                auto_run=False,
+                llm_profiles_file=root / "llm-profiles.json",
+            )
+            server = GuiHTTPServer(("127.0.0.1", 0), service)
+            server_thread = threading.Thread(
+                target=server.serve_forever,
+                daemon=True,
+            )
+            server_thread.start()
+            host, port = server.server_address
+            connection = http.client.HTTPConnection(host, port, timeout=30)
+            try:
+                connection.request(
+                    "GET",
+                    f"/api/human-requests/{request_id}",
+                    headers={
+                        "Authorization": "Bearer semantic-privacy-token",
+                    },
+                )
+                response = connection.getresponse()
+                assert response.status == 200
+                gui_api_view = json.loads(response.read().decode("utf-8"))
+            finally:
+                connection.close()
+
+            assert gui_api_view["payload"] == {
+                "type": "external_operation_approval"
+            }
+            assert gui_api_view["approval_preview"]["resource_display"] == (
+                "<redacted>"
+            )
+            assert gui_api_view["approval_preview"]["resource_sha256"] == (
+                resource_sha256
+            )
+
+            while runtime.semantic.process_one():
+                pass
+
+            semantic_rows = {
+                table: runtime.store.select_table_rows(table)
+                for table in _SEMANTIC_V6_TABLES
+            }
+            retained_surfaces = {
+                "public_view": public_view,
+                "terminal_view": terminal_view,
+                "gui_api_view": gui_api_view,
+                "semantic_rows": semantic_rows,
+                "events": runtime.events.list(),
+                "audit": runtime.audit.trace(),
+                "external_effects": runtime.store.list_external_effects(pid=pid),
+            }
+            assert sentinel not in _json_text(retained_surfaces)
+        finally:
+            if server is not None:
+                server.shutdown()
+                if server_thread is not None:
+                    server_thread.join(timeout=5)
+                server.server_close()
+            if service is not None:
+                service.close()
+            runtime.close()
+
+
+def test_low_sensitivity_filesystem_approval_identity_remains_human_readable() -> None:
+    resource = "filesystem:workspace:reports/report.txt"
+    with TemporaryDirectory() as temp_dir:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(goal="inspect a normal report")
+            request_id = _external_filesystem_request(
+                runtime,
+                pid=pid,
+                resource=resource,
+                path="reports/report.txt",
+            )
+            request = runtime.human.get(request_id)
+
+            public_view = runtime.human.public_request_view(request)
+            terminal_view = runtime.human.format_terminal_request(request)
+            gui_api_view = _fetch_gui_human_request(
+                runtime,
+                request_id=request_id,
+                root=Path(temp_dir),
+            )
+            resource_sha256 = hashlib.sha256(resource.encode("utf-8")).hexdigest()
+
+            assert public_view["payload"] == {
+                "type": "external_operation_approval"
+            }
+            assert public_view["approval_preview"]["resource_display"] == resource
+            assert public_view["approval_preview"]["resource_sha256"] == resource_sha256
+            assert gui_api_view["payload"] == {
+                "type": "external_operation_approval"
+            }
+            assert gui_api_view["approval_preview"]["resource_display"] == resource
+            assert gui_api_view["approval_preview"]["resource_sha256"] == resource_sha256
+            assert resource in terminal_view
+            assert resource_sha256 in terminal_view
+        finally:
+            runtime.close()
+
+
+def test_remote_approval_identifiers_are_redacted_but_exactly_digest_bound() -> None:
+    sentinel = "SEMANTIC_REMOTE_ID_SECRET_SENTINEL_91bd"
+    resource = f"jsonrpc:{sentinel}:{sentinel}"
+    resource_display, resource_sha256 = build_host_resource_projection(
+        resource=resource,
+        action_id="jsonrpc.call",
+        sensitivity="normal",
+    )
+    jsonrpc = build_host_argument_projection(
+        action_id="jsonrpc.call",
+        resource=resource,
+        context={
+            "operation": "jsonrpc.call",
+            "endpoint_id": sentinel,
+            "method_id": sentinel,
+            "params_sha256": "a" * 64,
+            "registry_spec_sha256": "c" * 64,
+            "registry_generation": 1,
+        },
+    )
+    mcp = build_host_argument_projection(
+        action_id="mcp.call",
+        resource=f"mcp:{sentinel}:{sentinel}",
+        context={
+            "operation": "mcp.call",
+            "server_id": sentinel,
+            "tool_id": sentinel,
+            "arguments_sha256": "b" * 64,
+            "registry_spec_sha256": "d" * 64,
+            "registry_generation": 2,
+        },
+    )
+
+    expected_identity_sha256 = hashlib.sha256(sentinel.encode("utf-8")).hexdigest()
+    assert resource_display == "<redacted>"
+    assert resource_sha256 == hashlib.sha256(resource.encode("utf-8")).hexdigest()
+    assert (jsonrpc.endpoint_id, jsonrpc.method_id) == (
+        "<redacted>",
+        "<redacted>",
+    )
+    assert (jsonrpc.endpoint_id_sha256, jsonrpc.method_id_sha256) == (
+        expected_identity_sha256,
+        expected_identity_sha256,
+    )
+    assert (mcp.server_id, mcp.tool_id) == ("<redacted>", "<redacted>")
+    assert (mcp.server_id_sha256, mcp.tool_id_sha256) == (
+        expected_identity_sha256,
+        expected_identity_sha256,
+    )
+    assert sentinel not in _json_text(
+        {
+            "resource_display": resource_display,
+            "resource_sha256": resource_sha256,
+            "jsonrpc": jsonrpc,
+            "mcp": mcp,
+        }
+    )
+
+
+def test_high_sensitivity_approval_resource_is_redacted_and_digest_bound() -> None:
+    resource = "filesystem:workspace:reports/report.txt"
+
+    resource_display, resource_sha256 = build_host_resource_projection(
+        resource=resource,
+        action_id="filesystem.read",
+        sensitivity="secret",
+    )
+
+    assert resource_display == "<redacted>"
+    assert resource_sha256 == hashlib.sha256(resource.encode("utf-8")).hexdigest()
+
+
+def test_long_exact_resource_keeps_active_human_preview_fence_reachable() -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(goal="approve a long exact resource")
+        path = "reports/" + ("a" * 1_700) + ".txt"
+        resource = f"filesystem:workspace:{path}"
+        request_id = _external_filesystem_request(
+            runtime,
+            pid=pid,
+            resource=resource,
+            path=path,
+        )
+        runtime.human._host_semantic_mode_reader = lambda: "enforce_deny"
+        runtime.human._host_semantic_policy_preflight = lambda _request: None
+
+        request = runtime.human.get(request_id)
+        view = runtime.human.public_request_view(request)
+        preview = view["approval_preview"]
+        assert preview["resource_display"] == "<redacted>"
+        assert preview["resource_sha256"] == hashlib.sha256(
+            resource.encode("utf-8")
+        ).hexdigest()
+
+        approved = runtime.human.approve(
+            request_id,
+            {"approved": True, "source": "test.human"},
+            expected_revision=view["revision"],
+            preview_sha256=view["preview_sha256"],
+        )
+
+        assert approved.status is HumanRequestStatus.APPROVED
+        assert any(
+            capability.resource == resource
+            for capability in runtime.capability.list_subject(pid)
+        )
+    finally:
+        runtime.close()
 
 
 def test_root_goal_and_provider_ingress_are_digest_bound_without_label_writeback() -> None:

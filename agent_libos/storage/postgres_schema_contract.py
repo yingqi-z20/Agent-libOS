@@ -17,6 +17,39 @@ _MANIFEST_PATH = Path(__file__).with_name("postgres_schema_manifest.json")
 _SEMANTIC_TABLES = frozenset(
     {"semantic_assessment_jobs", "semantic_assessments"}
 )
+_V6_SEMANTIC_TABLES = frozenset(
+    {
+        "semantic_flow_entities",
+        "semantic_flow_activities",
+        "semantic_flow_edges",
+        "semantic_flow_label_assertions",
+        "semantic_legacy_coverage",
+        "semantic_policy_epochs",
+        "semantic_control_state",
+        "semantic_control_transitions",
+        "semantic_machine_settlements",
+        "semantic_review_labels",
+        "semantic_health_events",
+        "semantic_human_outcome_links",
+        "semantic_machine_outcomes",
+        "semantic_rate_budgets",
+    }
+)
+_V7_MCP_TABLES = frozenset(
+    {
+        "mcp_continuations",
+        "mcp_remote_tasks",
+        "mcp_subscriptions",
+        "mcp_auth_metadata",
+        "mcp_side_effect_preparations",
+    }
+)
+POSTGRES_V6_CATALOG_SHA256 = (
+    "5945b66467704dcf5b38983017c5227bca1dd8ccf30ba5dd17674e04fa2573ed"
+)
+POSTGRES_V5_CATALOG_SHA256 = (
+    "6e5ee9463e5c998e2469064bd4b2049321170c4406f067722a431a78114f3a64"
+)
 _POSTGRES_USER_RELKINDS = ("r", "p", "v", "m", "S", "f", "c")
 # Captured from an actual PostgreSQL 17.10 schema initialized by clean baseline
 # commit 4b43cb7.  This makes the v4 migration admission contract independent of
@@ -548,7 +581,7 @@ def build_postgres_manifest(
 
 
 @lru_cache(maxsize=1)
-def load_postgres_v5_manifest() -> dict[str, Any]:
+def load_postgres_v7_manifest() -> dict[str, Any]:
     try:
         payload = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -570,18 +603,89 @@ def load_postgres_v5_manifest() -> dict[str, Any]:
     return copy.deepcopy(payload)
 
 
-def expected_postgres_catalog(store_version: int) -> dict[str, Any]:
-    manifest = load_postgres_v5_manifest()
-    catalog = copy.deepcopy(manifest["catalog"])
-    if store_version == 5:
-        return catalog
-    if store_version != 4:
-        raise ValueError(f"unsupported PostgreSQL catalog version: {store_version}")
+def load_postgres_v6_manifest() -> dict[str, Any]:
+    """Return the historical v6 projection from the current v7 artifact."""
+
+    payload = load_postgres_v7_manifest()
+    return build_postgres_manifest(
+        _derive_postgres_v6_catalog(payload["catalog"]),
+        generated_postgres_version_num=payload["generated_postgres_version_num"],
+    )
+
+
+def _catalog_without_tables(
+    source: Mapping[str, Any],
+    tables: frozenset[str],
+) -> dict[str, Any]:
+    """Return a detached catalog projection with whole tables removed."""
+
+    catalog = copy.deepcopy(dict(source))
     catalog["relations"] = [
-        item for item in catalog["relations"] if item["name"] not in _SEMANTIC_TABLES
+        item
+        for item in catalog["relations"]
+        if item["name"] not in tables
     ]
-    for table in _SEMANTIC_TABLES:
+    for table in tables:
         catalog["columns"].pop(table, None)
+    for section in (
+        "constraints",
+        "indexes",
+        "triggers",
+        "policies",
+        "rewrite_rules",
+    ):
+        catalog[section] = [
+            item
+            for item in catalog[section]
+            if item.get("table") not in tables
+        ]
+    catalog["inheritance"] = [
+        item
+        for item in catalog["inheritance"]
+        if item.get("child") not in tables
+        and item.get("parent") not in tables
+    ]
+    return catalog
+
+
+def _require_derived_catalog_digest(
+    catalog: Mapping[str, Any],
+    *,
+    expected_sha256: str,
+    version: int,
+    provenance: str,
+) -> None:
+    if _sha256(catalog) != expected_sha256:
+        raise UnsupportedStoreVersion(
+            "Agent libOS PostgreSQL canonical schema "
+            f"v{version} derivation no longer matches {provenance}"
+        )
+
+
+def _derive_postgres_v5_catalog(v6_catalog: Mapping[str, Any]) -> dict[str, Any]:
+    catalog = _catalog_without_tables(v6_catalog, _V6_SEMANTIC_TABLES)
+    _require_derived_catalog_digest(
+        catalog,
+        expected_sha256=POSTGRES_V5_CATALOG_SHA256,
+        version=5,
+        provenance="the released v5 contract",
+    )
+    return catalog
+
+
+def _derive_postgres_v6_catalog(v7_catalog: Mapping[str, Any]) -> dict[str, Any]:
+    catalog = _catalog_without_tables(v7_catalog, _V7_MCP_TABLES)
+    _require_derived_catalog_digest(
+        catalog,
+        expected_sha256=POSTGRES_V6_CATALOG_SHA256,
+        version=6,
+        provenance="the released v6 contract",
+    )
+    return catalog
+
+
+def _derive_postgres_v4_catalog(v5_catalog: Mapping[str, Any]) -> dict[str, Any]:
+    catalog = _catalog_without_tables(v5_catalog, _SEMANTIC_TABLES)
     catalog["columns"]["human_requests"] = [
         item
         for item in catalog["columns"]["human_requests"]
@@ -599,12 +703,28 @@ def expected_postgres_catalog(store_version: int) -> dict[str, Any]:
     catalog["indexes"] = [
         item for item in catalog["indexes"] if item["table"] not in _SEMANTIC_TABLES
     ]
-    if _sha256(catalog) != POSTGRES_V4_BASELINE_4B43CB7_CATALOG_SHA256:
-        raise UnsupportedStoreVersion(
-            "Agent libOS PostgreSQL canonical schema v4 derivation no longer "
-            "matches baseline 4b43cb7"
-        )
+    _require_derived_catalog_digest(
+        catalog,
+        expected_sha256=POSTGRES_V4_BASELINE_4B43CB7_CATALOG_SHA256,
+        version=4,
+        provenance="baseline 4b43cb7",
+    )
     return catalog
+
+
+def expected_postgres_catalog(store_version: int) -> dict[str, Any]:
+    v7_catalog = copy.deepcopy(load_postgres_v7_manifest()["catalog"])
+    if store_version == 7:
+        return v7_catalog
+    if store_version not in {4, 5, 6}:
+        raise ValueError(f"unsupported PostgreSQL catalog version: {store_version}")
+    v6_catalog = _derive_postgres_v6_catalog(v7_catalog)
+    if store_version == 6:
+        return v6_catalog
+    v5_catalog = _derive_postgres_v5_catalog(v6_catalog)
+    if store_version == 5:
+        return v5_catalog
+    return _derive_postgres_v4_catalog(v5_catalog)
 
 
 def require_postgres_catalog_contract(conn: Any, *, store_version: int) -> None:

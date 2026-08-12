@@ -1,6 +1,6 @@
 # Durable Task Runs
 
-Durable Task Runs, introduced in Agent libOS 1.1.0, remain the 1.4.0
+Durable Task Runs, introduced in Agent libOS 1.1.0, remain the 1.5.0
 Host-supervised unit for long-running
 agent work. One `TaskRun` owns one root `AgentProcess` and the child-process
 tree created from that root. The Run adds a durable goal, requirement ledger,
@@ -15,7 +15,7 @@ Durable Task Runs are not a distributed workflow service.
 
 ## Enabling durable payloads
 
-Run metadata and hashes are persisted in store schema v5. Resuming useful work
+Run metadata and hashes are persisted in store schema v7. Resuming useful work
 also requires readable goal, follow-up, transcript, and resume payloads. These
 payloads are plaintext at rest, so the Host must explicitly enable their
 persistence with `task_runs.plaintext_payloads_enabled: true`. Creation fails
@@ -30,7 +30,7 @@ task_runs:
 ```
 
 `enabled` controls admission of new Task Run creation. The manager and startup
-recovery remain assembled so an existing v5 store cannot evade reconciliation
+recovery remain assembled so an existing v7 store cannot evade reconciliation
 by toggling this setting. `enabled` does not imply consent to write readable
 payloads. Hosts should keep
 `plaintext_payloads_enabled` false unless their data-retention agreement covers
@@ -414,9 +414,16 @@ After a complete model action and all of its paired tool results have committed,
 Runtime may publish a local safe resume point. The resume point binds the
 process context generation, Image, tool table, provider identity, authority,
 payload hashes, and Runtime epoch. Reopen reconstructs prompts from locally
-persisted goal, requirements, transcript, and compacted context. A provider
-`previous_response_id` may be used only as a verified optimization; it is
-never the sole recovery record.
+persisted goal, requirements, transcript, and compacted context. The current
+full-snapshot AgentProcess executor always sends that complete locally rebuilt
+snapshot and never sends a provider `previous_response_id`, even when the
+low-level client setting is enabled. It leaves
+`previous_response_id_used=false` in the validated action/outcome manifest and
+rejects a durable resume record that claims otherwise. Provider response ids
+may remain in bounded call-observability records; they are not a Task Run
+optimization, resume source, or replay authority. The low-level `LLMClient`
+chaining support for explicitly supplied delta-style calls is outside the
+AgentProcess and Task Run recovery contract.
 
 Durable Task Runs v1 certifies one dynamic-binding transition: a validated
 `activate_skill` call that is the sole action in a non-parallel model response.
@@ -489,7 +496,7 @@ paged listing, optionally quantum-bounded execution, passive waiting,
 pause/resume, cancellation,
 follow-ups, evidence-constrained recovery, whole-Run rerun operations, and an
 audited `purge_payloads` operation for a terminal `permanent` Run. The explicit
-purge is a Python Host/admin surface in 1.4.0; it is not offered to ordinary
+purge is a Python Host/admin surface in 1.5.0; it is not offered to ordinary
 CLI or GUI users.
 Rerun creates a new Run id and links it to the prior Run; it never rewinds the
 old ledger. After either `purge_on_terminal` cleanup or an explicit Host purge
@@ -506,7 +513,7 @@ its stable client request id instead of an expected revision.
 ## CLI
 
 The `task-run` command group mirrors the ordinary Host controls (the
-Host/admin-only explicit payload purge remains Python-only in 1.4.0):
+Host/admin-only explicit payload purge remains Python-only in 1.5.0):
 
 ```text
 task-run start
@@ -549,7 +556,7 @@ The private local API provides `/api/task-runs` collection/detail routes,
 paged ledger and Human-request reads, and run, pause, resume, cancel, follow-up,
 recover, and rerun mutations. Collection, ledger, and Human pages accept an
 opaque `cursor` and return `next_cursor`; clients must not parse it. There is no
-separate Task Run requirements or wait HTTP route in 1.4.0: the detail response
+separate Task Run requirements or wait HTTP route in 1.5.0: the detail response
 embeds a bounded requirements page selected with `requirements_limit` and
 `requirements_cursor`, requirement changes are also ledger items, and waiting
 is ordinary state observation. Cancel/recover require the same explicit

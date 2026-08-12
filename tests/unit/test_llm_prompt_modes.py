@@ -14,9 +14,11 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion, LLMTransientError
 from agent_libos.llm.event_projection import project_prompt_events
 from agent_libos.llm.prompt import (
+    RETAINED_GOAL_CONTEXT_BINDING_KEY,
     build_system_prompt,
     build_user_prompt,
     recover_initial_goal_context,
+    retained_goal_context_binding,
 )
 from agent_libos.models import (
     CapabilityRight,
@@ -37,8 +39,15 @@ from agent_libos.models import (
     SinkTrustRule,
 )
 from agent_libos.models.exceptions import HumanApprovalRequired, ValidationError
+from agent_libos.skills import get_builtin_skill_catalog
 from agent_libos.tools.base import SyncAgentTool, ToolContext
 from tests.support.skills import write_skill_package
+
+
+_V2_CONFIG = replace(
+    DEFAULT_CONFIG,
+    llm=replace(DEFAULT_CONFIG.llm, prompt_layout="cache_optimized_v2"),
+)
 
 
 class _CaptureToolIdentityArgs(BaseModel):
@@ -77,7 +86,7 @@ class _WaitForToolIdentityApproval(_CaptureToolIdentity):
                 pid=ctx.pid,
                 human=ctx.runtime.config.runtime.default_human,
                 request={
-                    "type": "external_operation_approval",
+                    "type": "approval",
                     "question": "Approve the identity resume probe",
                     "context": {"operation": "identity_resume_probe"},
                 },
@@ -280,6 +289,80 @@ class TestLLMPromptModes:
             ).encode("utf-8")
         ).hexdigest()
         assert recovered_hash == expected_hash
+
+    def test_semantic_goal_recovery_requires_matching_host_binding(self) -> None:
+        old_goal_oid = "obj_old_semantic_goal"
+        new_goal_oid = "obj_new_semantic_goal"
+        old_payload = {"goal": "do not replay after exec"}
+        source_record = {
+            "content_trust": "untrusted_data",
+            "immutable": True,
+            "name": f"goal:{old_goal_oid}",
+            "namespace": "process:pid_test",
+            "object_oid": old_goal_oid,
+            "payload": old_payload,
+            "record_type": "object_memory_object",
+            "type": "goal",
+        }
+        semantic_record = json.dumps(
+            {
+                "content_trust": "untrusted_data",
+                "immutable": True,
+                "name": "goal",
+                "namespace": "process:self",
+                "payload": old_payload,
+                "semantic_role": "process_goal",
+                "type": "goal",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        old_call = SimpleNamespace(
+            messages=[{"role": "user", "content": semantic_record}],
+            request_options={
+                RETAINED_GOAL_CONTEXT_BINDING_KEY: retained_goal_context_binding(
+                    old_goal_oid,
+                    source_record,
+                )
+            },
+        )
+
+        assert recover_initial_goal_context([old_call], old_goal_oid) == semantic_record
+        assert recover_initial_goal_context([old_call], new_goal_oid) is None
+        assert (
+            recover_initial_goal_context(
+                [
+                    SimpleNamespace(
+                        messages=old_call.messages,
+                        request_options={},
+                    )
+                ],
+                old_goal_oid,
+            )
+            is None
+        )
+
+        visible_oid_record = json.dumps(
+            {
+                **json.loads(semantic_record),
+                "object_oid": old_goal_oid,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        recovered_visible = recover_initial_goal_context(
+            [
+                SimpleNamespace(
+                    messages=[{"role": "user", "content": visible_oid_record}],
+                    request_options=old_call.request_options,
+                )
+            ],
+            old_goal_oid,
+        )
+        assert recovered_visible == semantic_record
+        assert old_goal_oid not in recovered_visible
 
     @pytest.mark.parametrize("representation", ["repr", "memory_delta"])
     def test_goal_recovery_preserves_legacy_representations(
@@ -2060,6 +2143,532 @@ class TestLLMPromptModes:
         finally:
             runtime.close()
 
+    def test_cache_optimized_prompt_minimizes_host_ids_but_preserves_user_fields(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="minimize metadata")
+            process = runtime.process.get(pid)
+            capability = runtime.capability.grant(
+                pid,
+                f"process:{pid}",
+                [CapabilityRight.READ],
+                issued_by="test",
+                constraints={"inherited_from": "test-parent"},
+            )
+            checkpoint_capability = runtime.capability.grant(
+                pid,
+                "checkpoint:ckpt_internal_only_123",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            event = Event(
+                event_id="evt_internal_only_123",
+                type=EventType.PROCESS_SIGNAL,
+                source="runtime",
+                target=pid,
+                payload={
+                    "event_id": "evt_payload_internal_456",
+                    "run_id": "run_internal_123",
+                    "schema_version": 7,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "subtree_pids": [pid],
+                    "task": "inspect the report",
+                },
+                priority=EventPriority.NORMAL,
+                created_at="2026-01-01T00:00:00Z",
+            )
+            goal_oid = process.goal_oid
+            assert goal_oid is not None
+            context = MaterializedContext(
+                text=json.dumps(
+                    {
+                        "record_type": "object_memory_object",
+                        "object_oid": goal_oid,
+                        "qualified_name": f"process:{pid}/goal:{goal_oid}",
+                        "namespace": f"process:{pid}",
+                        "name": f"goal:{goal_oid}",
+                        "type": "goal",
+                        "schema_version": 1,
+                        "immutable": True,
+                        "payload": {"task": "inspect the report"},
+                    },
+                    sort_keys=True,
+                ),
+                object_refs=[goal_oid],
+                token_count=999,
+                omitted_objects=[],
+                policy_used="recency_first",
+            )
+
+            prompt = build_user_prompt(
+                process,
+                context,
+                [event],
+                [capability, checkpoint_capability],
+                [],
+                requestable_capabilities=[
+                    {"resource": f"process:{pid}", "rights": ["read"]}
+                ],
+                prompt_layout="cache_optimized_v2",
+            )
+
+            for forbidden in (
+                pid,
+                goal_oid,
+                capability.cap_id,
+                checkpoint_capability.cap_id,
+                "ckpt_internal_only_123",
+                event.event_id,
+                "evt_payload_internal_456",
+                "run_internal_123",
+                "schema_version",
+                "goal_oid",
+                "checkpoint_head",
+                "token_count",
+                "object_refs",
+                "created_at",
+            ):
+                assert forbidden not in prompt
+            assert '"constraints":{"inherited_from":"test-parent"}' in prompt
+            assert "process:self" in prompt
+            assert "checkpoint:available" in prompt
+            assert '"subtree_process_count":1' in prompt
+
+            business_payload = {
+                "run_id": "customer-run-42",
+                "requirement_id": "invoice-line-7",
+                "created_at": "customer-authored-date",
+            }
+            business_context = MaterializedContext(
+                text=json.dumps(
+                    {
+                        "record_type": "object_memory_object",
+                        "object_oid": goal_oid,
+                        "namespace": f"process:{pid}",
+                        "name": f"goal:{goal_oid}",
+                        "type": "artifact",
+                        "immutable": True,
+                        "payload": business_payload,
+                    },
+                    sort_keys=True,
+                ),
+                object_refs=[goal_oid],
+                token_count=10,
+                omitted_objects=[],
+                policy_used="recency_first",
+            )
+            business_prompt = build_user_prompt(
+                process,
+                business_context,
+                [],
+                [],
+                [],
+                prompt_layout="cache_optimized_v2",
+            )
+            for key, value in business_payload.items():
+                assert f'"{key}":"{value}"' in business_prompt
+        finally:
+            runtime.close()
+
+    def test_cache_optimized_prompt_exposes_conditional_ids_only_to_consuming_schema(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="select a target")
+            process = runtime.process.get(pid)
+            goal_oid = process.goal_oid
+            assert goal_oid is not None
+            capability = runtime.capability.grant(
+                pid,
+                f"object:{goal_oid}",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            event = Event(
+                event_id="evt_selectable_123",
+                type=EventType.PROCESS_SIGNAL,
+                source="runtime",
+                target=pid,
+                payload={"task": "select"},
+                priority=EventPriority.NORMAL,
+                created_at="2026-01-01T00:00:00Z",
+            )
+            tools = [
+                {
+                    "name": "select_internal_target",
+                    "spec_json": json.dumps(
+                        {
+                            "description": "Select an inspected Host target.",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {
+                                    "cap_id": {"type": "string"},
+                                    "object_oid": {"type": "string"},
+                                    "event_id": {"type": "string"},
+                                },
+                            },
+                        }
+                    ),
+                }
+            ]
+            context = MaterializedContext(
+                text=json.dumps(
+                    {
+                        "record_type": "object_memory_object",
+                        "object_oid": goal_oid,
+                        "namespace": f"process:{pid}",
+                        "name": "candidate",
+                        "type": "artifact",
+                        "immutable": True,
+                        "payload": {"task": "select"},
+                    },
+                    sort_keys=True,
+                ),
+                object_refs=[goal_oid],
+                token_count=5,
+                omitted_objects=[],
+                policy_used="recency_first",
+            )
+
+            prompt = build_user_prompt(
+                process,
+                context,
+                [event],
+                [capability],
+                tools,
+                prompt_layout="cache_optimized_v2",
+            )
+
+            assert capability.cap_id in prompt
+            assert goal_oid in prompt
+            assert event.event_id in prompt
+            schema = json.loads(tools[0]["spec_json"])["input_schema"]
+            assert {"cap_id", "object_oid", "event_id"} <= set(
+                schema["properties"]
+            )
+        finally:
+            runtime.close()
+
+    def test_cache_optimized_prompt_replays_persisted_tool_model_projection(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="resume a completion review without Host identifiers",
+            )
+            process = runtime.process.get(pid)
+            review_object_id = "obj_review_internal_123"
+            safe_review = {
+                "status": "completion_review_required",
+                "completion_review": {
+                    "review_token": "exitrev_one_time_token",
+                    "requirements": [
+                        {
+                            "order": 1,
+                            "kind": "goal",
+                            "requirement": "verify the requested result",
+                        }
+                    ],
+                },
+                "terminal_committed": False,
+            }
+            durable_review = {
+                "status": "completion_review_required",
+                "completion_review": {
+                    "goal_oid": review_object_id,
+                    "reviewed_message_ids": ["pmsg_internal_456"],
+                    "source_refs": [review_object_id],
+                    "schema_version": 2,
+                },
+            }
+            records = [
+                {
+                    "record_type": "object_memory_object",
+                    "object_oid": review_object_id,
+                    "namespace": f"process:{pid}",
+                    "name": f"tool_result:{review_object_id}",
+                    "type": "tool_result",
+                    "immutable": True,
+                    "payload": {
+                        "tool_id": "tool_process_exit_internal",
+                        "tool_name": "process_exit",
+                        "result": durable_review,
+                        "model_projection": safe_review,
+                        "metadata": {
+                            "call_id": "tcall_internal_789",
+                            "run_id": "run_internal_wrapper",
+                        },
+                    },
+                },
+                {
+                    "record_type": "object_memory_object",
+                    "object_oid": "obj_external_result_internal",
+                    "namespace": f"process:{pid}",
+                    "name": "external-result",
+                    "type": "tool_result",
+                    "immutable": True,
+                    "payload": {
+                        "tool_id": "tool_external_fetch_internal",
+                        "tool_name": "external_fetch",
+                        "result": {
+                            "run_id": "customer-run-42",
+                            "requirement_id": "invoice-line-7",
+                        },
+                        "metadata": {"call_id": "tcall_external_internal"},
+                    },
+                },
+            ]
+            context = MaterializedContext(
+                text="\n".join(
+                    json.dumps(record, sort_keys=True) for record in records
+                ),
+                object_refs=[],
+                token_count=50,
+                omitted_objects=[],
+                policy_used="recency_first",
+            )
+            first_capability = runtime.capability.grant(
+                pid,
+                "object:obj_duplicate_one",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            second_capability = runtime.capability.grant(
+                pid,
+                "object:obj_duplicate_two",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+
+            prompt = build_user_prompt(
+                process,
+                context,
+                [],
+                [first_capability, second_capability],
+                [],
+                prompt_layout="cache_optimized_v2",
+            )
+
+            assert "exitrev_one_time_token" in prompt
+            assert "verify the requested result" in prompt
+            assert '"run_id":"customer-run-42"' in prompt
+            assert '"requirement_id":"invoice-line-7"' in prompt
+            assert prompt.count('"resource":"object:materialized"') == 1
+            for forbidden in (
+                review_object_id,
+                "pmsg_internal_456",
+                "goal_oid",
+                "reviewed_message_ids",
+                "source_refs",
+                "schema_version",
+                "tool_process_exit_internal",
+                "tcall_internal_789",
+                "run_internal_wrapper",
+                "obj_external_result_internal",
+                "tcall_external_internal",
+            ):
+                assert forbidden not in prompt
+
+            legacy_prompt = build_user_prompt(
+                process,
+                context,
+                [],
+                [],
+                [],
+                prompt_layout="legacy_v1",
+            )
+            assert '"model_projection"' not in legacy_prompt
+            assert "exitrev_one_time_token" not in legacy_prompt
+            assert review_object_id in legacy_prompt
+        finally:
+            runtime.close()
+
+    def test_next_quantum_replays_compact_completion_review_not_durable_ids(self) -> None:
+        runtime = Runtime.open("local", config=_V2_CONFIG)
+        try:
+            pid = runtime.process.spawn(
+                image="coding-agent:v0",
+                goal="inspect capabilities and preserve compact completion evidence",
+            )
+            first_exit = runtime.llm.dispatch(
+                pid,
+                {"action": "process_exit", "payload": {"summary": "review"}},
+            )
+            assert first_exit["ok"] is True
+            compact_review = first_exit["payload"]["completion_review"]
+            review_token = compact_review["review_token"]
+            result_oid = first_exit["result_oid"]
+            stored = runtime.store.get_object(result_oid)
+            assert stored is not None
+            durable_review = stored.payload["result"]["completion_review"]
+            assert durable_review == compact_review
+            assert "model_projection" not in stored.payload
+            durable_goal_id = runtime.process.get(pid).goal_oid
+            assert durable_goal_id is not None
+
+            client = PromptRecordingClient(
+                tool_name="discover_skills",
+                arguments={"text": "capability inspection", "limit": 5},
+            )
+            runtime.llm.client = client
+            advanced = runtime.run_process_once(pid)
+
+            assert advanced["ok"] is True, advanced
+            prompt = client.user_prompts[0]
+            assert review_token in prompt
+            assert "inspect capabilities and preserve compact completion evidence" in prompt
+            for forbidden in (
+                durable_goal_id,
+                "goal_oid",
+                "reviewed_message_ids",
+                "source_refs",
+                "requirement_id",
+                "schema_version",
+            ):
+                assert forbidden not in prompt
+        finally:
+            runtime.close()
+
+    def test_capability_tool_projection_omits_host_provenance(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="coding-agent:v0",
+                goal="inspect effective authority",
+            )
+            goal_oid = runtime.process.get(pid).goal_oid
+            assert goal_oid is not None
+
+            listed = runtime.llm.dispatch(pid, {"action": "list_capabilities"})
+
+            assert listed["ok"] is True
+            encoded = json.dumps(listed["payload"], sort_keys=True)
+            assert pid not in encoded
+            assert goal_oid not in encoded
+            assert "process:self" in encoded
+            assert "object:goal" in encoded
+            for forbidden in (
+                "issued_at",
+                "issuer",
+                "issuer_cap_id",
+                "parent_cap_id",
+                "subject",
+                "lease",
+                "delegation_depth",
+            ):
+                assert forbidden not in encoded
+            stored = runtime.store.get_object(listed["result_oid"])
+            assert stored is not None
+            assert stored.payload["model_projection"] == listed["payload"]
+        finally:
+            runtime.close()
+
+    def test_skill_activation_projection_omits_current_process_and_binding_ids(
+        self,
+    ) -> None:
+        runtime = Runtime.open("local", config=_V2_CONFIG)
+        try:
+            pid = runtime.process.spawn(
+                image="coding-agent:v0",
+                goal="inspect the workspace",
+            )
+            package = get_builtin_skill_catalog().get(
+                "agent-libos-workspace-navigation"
+            )
+            assert package is not None
+
+            activated = runtime.llm.dispatch(
+                pid,
+                {
+                    "action": "activate_skill",
+                    "skill_id": package.skill_id,
+                    "expected_package_sha256": package.package_sha256,
+                },
+            )
+
+            assert activated["ok"] is True
+            encoded = json.dumps(activated["payload"], sort_keys=True)
+            for forbidden in (
+                pid,
+                "pid",
+                "tool_ids",
+                "jit_tool_ids",
+                "instructions_hash",
+                "package_sha256",
+            ):
+                assert forbidden not in encoded
+            stored = runtime.store.get_object(activated["result_oid"])
+            assert stored is not None
+            assert stored.payload["result"]["result"]["pid"] == pid
+            assert stored.payload["model_projection"] == activated["payload"]
+
+            client = PromptRecordingClient(
+                tool_name="discover_skills",
+                arguments={"text": "workspace", "limit": 5},
+            )
+            runtime.llm.client = client
+            advanced = runtime.run_process_once(pid)
+            assert advanced["ok"] is True, advanced
+            replay = client.user_prompts[0]
+            assert package.skill_id in replay
+            for forbidden in (
+                pid,
+                "tool_ids",
+                "jit_tool_ids",
+                "instructions_hash",
+            ):
+                assert forbidden not in replay
+        finally:
+            runtime.close()
+
+    def test_object_memory_projection_semanticizes_namespace_only(self) -> None:
+        runtime = Runtime.open("local", config=_V2_CONFIG)
+        try:
+            pid = runtime.process.spawn(
+                image="coding-agent:v0",
+                goal="preserve one business record",
+            )
+            package = get_builtin_skill_catalog().get(
+                "agent-libos-object-memory"
+            )
+            assert package is not None
+            runtime.llm.dispatch(
+                pid,
+                {
+                    "action": "activate_skill",
+                    "skill_id": package.skill_id,
+                    "expected_package_sha256": package.package_sha256,
+                },
+            )
+            created = runtime.llm.dispatch(
+                pid,
+                {
+                    "action": "create_memory_object",
+                    "type": "summary",
+                    "payload": {
+                        "run_id": "customer-run-42",
+                        "requirement_id": "invoice-line-7",
+                    },
+                },
+            )
+            assert created["ok"] is True
+            assert created["payload"]["namespace"] == f"process:{pid}"
+
+            client = PromptRecordingClient(
+                tool_name="discover_skills",
+                arguments={"text": "workspace", "limit": 5},
+            )
+            runtime.llm.client = client
+            advanced = runtime.run_process_once(pid)
+
+            assert advanced["ok"] is True, advanced
+            prompt = client.user_prompts[0]
+            assert pid not in prompt
+            assert "process:self" in prompt
+            assert "customer-run-42" in prompt
+            assert "invoice-line-7" in prompt
+        finally:
+            runtime.close()
+
     def test_prompt_renders_every_event_supplied_by_context_projection(self) -> None:
         runtime = Runtime.open("local")
         try:
@@ -2217,7 +2826,7 @@ class TestLLMPromptModes:
     ) -> None:
         database = tmp_path / f"completion-contract-{prompt_mode}.sqlite"
         image_id = f"completion-contract-{prompt_mode}:v0"
-        runtime = Runtime.open(database)
+        runtime = Runtime.open(database, config=_V2_CONFIG)
         try:
             runtime.register_image(
                 AgentImage(
@@ -2246,7 +2855,7 @@ class TestLLMPromptModes:
         finally:
             runtime.close()
 
-        reopened = Runtime.open(database)
+        reopened = Runtime.open(database, config=_V2_CONFIG)
         try:
             client = PromptRecordingClient()
             reopened.llm.client = client
@@ -2264,14 +2873,16 @@ class TestLLMPromptModes:
             assert "whole" in system_prompt
             assert "goal is complete" in system_prompt
             assert "Cumulative completion contract:" not in user_prompt
-            assert "identity anchor only; not an Object name or read capability" in user_prompt
-            assert "cumulative-review image uses nonterminal process_exit" in user_prompt
+            assert pid not in user_prompt
+            assert "Process facts:\n- working_directory:" in user_prompt
+            assert pid not in user_prompt
             # Startup rehydrates the integrity-bound root goal before context
             # materialization.  The older retained-LLM-evidence fallback is
             # therefore neither needed nor duplicated in this prompt.
             assert "Retained original goal contract" not in user_prompt
             assert "finish original requirement and final evidence step" in user_prompt
             goal_oid = reopened.process.get(pid).goal_oid
+            assert goal_oid not in user_prompt
             request_record = [
                 record
                 for record in reopened.audit.trace(actor=pid)

@@ -15,6 +15,7 @@ from agent_libos.runtime.descriptor_catalog import (
 from agent_libos.sdk import ProtectedOperationInvocation
 from scripts.check_protected_operations import (
     ALLOWED_LIFECYCLE_FILES,
+    SAFE_LOCAL_PROVIDER_PREFLIGHTS,
     check_tree,
     scan_source,
 )
@@ -172,6 +173,135 @@ def test_static_check_rejects_protected_provider_helper_called_directly(tmp_path
     )
     errors = scan_source(source, relative=Path("agent_libos/primitives/bad_helper.py"))
     assert any("provider helper provider_phase is called outside" in error for error in errors)
+
+
+def test_static_check_accepts_only_the_exact_host_local_security_preflight(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "git.py"
+    source.write_text(
+        "class GitPrimitive:\n"
+        "    def _read_state(self):\n"
+        "        return self.provider.repository_state()\n"
+        "    def _semantic_read_flow_snapshot(self):\n"
+        "        return self._read_state()\n",
+        encoding="utf-8",
+    )
+
+    relative, owner, method = next(iter(SAFE_LOCAL_PROVIDER_PREFLIGHTS))
+    assert (owner, method) == ("GitPrimitive", "_semantic_read_flow_snapshot")
+    assert scan_source(source, relative=relative) == []
+
+
+def test_static_check_rejects_other_callers_of_a_local_preflight_helper(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "git.py"
+    source.write_text(
+        "class GitPrimitive:\n"
+        "    def _read_state(self):\n"
+        "        return self.provider.repository_state()\n"
+        "    def _semantic_read_flow_snapshot(self):\n"
+        "        return self._read_state()\n"
+        "    def unsafe(self):\n"
+        "        return self._read_state()\n",
+        encoding="utf-8",
+    )
+
+    relative, _owner, _method = next(iter(SAFE_LOCAL_PROVIDER_PREFLIGHTS))
+    errors = scan_source(source, relative=relative)
+    assert any(
+        "provider helper _read_state is called outside" in error
+        for error in errors
+    )
+
+
+def test_static_check_rejects_remote_or_mutating_provider_calls_in_local_preflight(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "git.py"
+    source.write_text(
+        "class GitPrimitive:\n"
+        "    def _semantic_read_flow_snapshot(self):\n"
+        "        return self.provider.remote_fingerprint('origin')\n",
+        encoding="utf-8",
+    )
+
+    relative, _owner, _method = next(iter(SAFE_LOCAL_PROVIDER_PREFLIGHTS))
+    errors = scan_source(source, relative=relative)
+    assert any(
+        "local security preflight permits only reviewed read-only provider methods"
+        in error
+        for error in errors
+    )
+
+
+def test_static_check_rejects_direct_git_runner_in_local_preflight(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "git.py"
+    source.write_text(
+        "class GitPrimitive:\n"
+        "    def _semantic_read_flow_snapshot(self):\n"
+        "        return self.provider.run(['push'], read_only=False)\n",
+        encoding="utf-8",
+    )
+
+    relative, _owner, _method = next(iter(SAFE_LOCAL_PROVIDER_PREFLIGHTS))
+    errors = scan_source(source, relative=relative)
+    assert any(
+        "local security preflight permits only reviewed read-only provider methods"
+        in error
+        for error in errors
+    )
+
+
+def test_static_check_rejects_nonlocal_or_writable_git_runner_helper(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "git.py"
+    source.write_text(
+        "class GitPrimitive:\n"
+        "    def _run(self, args, *, read_only=True, remote=None, "
+        "expected_remote_fingerprint=None, stdin=None):\n"
+        "        return self.provider.run(args, read_only=read_only, "
+        "remote=remote, expected_remote_fingerprint=expected_remote_fingerprint, "
+        "stdin=stdin)\n"
+        "    def _semantic_read_flow_snapshot(self):\n"
+        "        return self._run(['status'], read_only=False)\n",
+        encoding="utf-8",
+    )
+
+    relative, _owner, _method = next(iter(SAFE_LOCAL_PROVIDER_PREFLIGHTS))
+    errors = scan_source(source, relative=relative)
+    assert any(
+        "local security preflight Git runner must freeze read_only=True" in error
+        for error in errors
+    )
+
+
+def test_static_check_rejects_git_runner_kwargs_in_local_preflight(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "git.py"
+    source.write_text(
+        "class GitPrimitive:\n"
+        "    def _run(self, args, *, read_only=True, remote=None, "
+        "expected_remote_fingerprint=None, stdin=None):\n"
+        "        return self.provider.run(args, read_only=read_only, "
+        "remote=remote, expected_remote_fingerprint=expected_remote_fingerprint, "
+        "stdin=stdin)\n"
+        "    def _semantic_read_flow_snapshot(self, options):\n"
+        "        return self._run(['status'], **options)\n",
+        encoding="utf-8",
+    )
+
+    relative, _owner, _method = next(iter(SAFE_LOCAL_PROVIDER_PREFLIGHTS))
+    errors = scan_source(source, relative=relative)
+    assert any(
+        "local security preflight Git runner forbids **kwargs" in error
+        for error in errors
+    )
 
 
 def test_static_check_accepts_callback_invoked_only_inside_sdk_phase(tmp_path: Path) -> None:
@@ -436,7 +566,42 @@ def test_contract_registry_declares_explicit_data_flow_directions() -> None:
             "primitive.mcp.list_tools": DataFlowDirection.BIDIRECTIONAL,
         "primitive.mcp.list_tools.internal": DataFlowDirection.BIDIRECTIONAL,
         "primitive.mcp.call": DataFlowDirection.BIDIRECTIONAL,
-        "primitive.llm.complete": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.resources.list": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.resource_templates.list": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.resources.read": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.prompts.list": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.prompts.get": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.completion.complete": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.subscriptions.start": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.subscriptions.status": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.subscriptions.events": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.subscriptions.stop": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.resources.list.internal": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.resource_templates.list.internal": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.resources.read.internal": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.prompts.list.internal": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.prompts.get.internal": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.completion.complete.internal": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.subscriptions.start.internal": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.mcp.subscriptions.status.internal": DataFlowDirection.BIDIRECTIONAL,
+            "primitive.mcp.subscriptions.events.internal": DataFlowDirection.BIDIRECTIONAL,
+            "primitive.mcp.subscriptions.stop.internal": DataFlowDirection.BIDIRECTIONAL,
+            "primitive.mcp.auth.begin.internal": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.auth.challenge.internal": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.auth.complete.internal": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.auth.revoke.internal": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.continuation.respond": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.continuation.cancel": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.tasks.get": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.tasks.update": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.tasks.cancel": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.continuation.respond.internal": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.continuation.cancel.internal": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.tasks.get.internal": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.tasks.update.internal": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.tasks.cancel.internal": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.mcp.probe_candidate.internal": DataFlowDirection.BIDIRECTIONAL,
+                "primitive.llm.complete": DataFlowDirection.BIDIRECTIONAL,
         "primitive.human.read": DataFlowDirection.BIDIRECTIONAL,
         "primitive.human.write": DataFlowDirection.EGRESS,
         "primitive.pty.spawn": DataFlowDirection.BIDIRECTIONAL,

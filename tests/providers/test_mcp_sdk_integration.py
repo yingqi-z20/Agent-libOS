@@ -34,7 +34,7 @@ from agent_libos.substrate.local import (
     _strict_stdio_client,
 )
 
-pytestmark = pytest.mark.mcp
+pytestmark = [pytest.mark.mcp, pytest.mark.mcp_transport]
 
 
 def _grant_stdio_spawn(
@@ -165,7 +165,9 @@ class TestMcpSdkIntegration:
             assert result.ok
             structured = result.result["structured_content"]
             assert Path(structured["cwd"]).resolve() == cwd.resolve()
-            assert structured["allowed"] == "allowed-token"
+            # The exact allowlisted value reached the child, then the MCP
+            # projection removed it from the public provider result.
+            assert structured["allowed"] == "[redacted]"
             assert structured["secret"] is None
         finally:
             runtime.close()

@@ -1002,6 +1002,7 @@ class ToolBroker:
             for row in self.extensions.list_tools()
             if row["tool_id"] in visible_ids
         ]
+        rows = self._model_projected_tool_rows(rows)
         if self._jit_exposure_for_process(pid) != JIT_TOOL_EXPOSURE_MULTIPLEXED:
             return rows
         static_rows = [
@@ -1011,6 +1012,24 @@ class ToolBroker:
         if any(self.registry.is_jit(str(row.get("tool_id"))) for row in rows):
             static_rows.append(self._jit_multiplexer_row())
         return static_rows
+
+    def _model_projected_tool_rows(
+        self,
+        rows: builtins.list[dict[str, Any]],
+    ) -> builtins.list[dict[str, Any]]:
+        projected: builtins.list[dict[str, Any]] = []
+        for row in rows:
+            selected = dict(row)
+            implementation = self.registry.implementation(str(row.get("tool_id")))
+            if implementation is not None:
+                selected["spec_json"] = dumps(
+                    implementation.spec(
+                        config=self.config,
+                        model_visible=True,
+                    )
+                )
+            projected.append(selected)
+        return projected
 
     def initial_tool_projection(self, image: Any) -> list[str]:
         metadata = getattr(image, "metadata", {})

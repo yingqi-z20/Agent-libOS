@@ -11,11 +11,18 @@ register, execute, or commit new images from checkpoints, fork children,
 checkpoint/fork state, and use registered remote resources, but these
 self-evolution mechanisms do not grant resource authority by themselves.
 
-The current contribution is the runtime authority boundary:
+The current contribution separates three boundaries that must not be
+collapsed into one another:
 
 ```text
-process identity + capability + data labels + Host Sink trust + primitive + audit
+authority        = process identity + Task Authority + Capability/effect constraints
+information flow = data labels + Host Sink trust + exact release
+evidence         = Operations + events + audit/settlement records
 ```
+
+Authority and information-flow checks decide whether an operation may proceed.
+Evidence records explain and settle that decision after the relevant check;
+an audit record, event, or receipt is never an authority credential.
 
 LLM-facing tools, Skills, JIT tools, image definitions, child processes,
 checkpoints, and remote endpoint visibility are ergonomic affordances. They are
@@ -99,6 +106,13 @@ The implementation currently includes:
   within sensitivity and tenant/principal clearance, while conditional
   high-sensitivity sends require an exact one-shot release. See
   [docs/data_flow.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/data_flow.md).
+- A default-off semantic approval/data-identification plane with payload-free
+  FlowGraph evidence, Host-only deterministic hard denial, and canary-only
+  exact one-use authority for the frozen low-risk read catalog. The classifier
+  can veto or escalate but cannot provide an allow predicate or act as a safety
+  oracle. Policy epochs are immutable static Host configuration; HTTP and GUI
+  expose no policy or settlement writes. See
+  [docs/semantic_shadow.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/semantic_shadow.md).
 - Durable Host-authored Task Authority Manifests that compile launch authority,
   budgets, approval policy, and effect ceilings while treating image
   `required_capabilities` as declarations only. See
@@ -129,7 +143,10 @@ The implementation currently includes:
   selection reasons, versions, token counts, and hashes without copying payloads.
 - Deno/TypeScript JIT tools that can access libOS only through `libos.syscall`.
   A dedicated supervisor establishes host-lifetime process-tree containment
-  before Deno starts, so hard host termination cannot orphan untrusted code.
+  before Deno starts. Native CI exercises the supported containment mechanisms
+  on Ubuntu and Windows; broader native macOS process behavior remains an
+  environment release gate. A Host must not treat an unvalidated platform as
+  carrying the same hard-termination evidence merely because Deno starts.
 - Declarative Skills that can add prompt instructions, visible tools, and JIT
   candidates without granting resource authority. The shipped base, coding,
   review, and toolmaker Images use `metadata.tool_projection: skills`: a fresh
@@ -144,15 +161,19 @@ The implementation currently includes:
   capabilities, provider-classified external effects, audit, and checkpoints.
   Per-item registry authority is checked before metadata lookup; registry row,
   stale-grant invalidation, event, and audit changes commit atomically.
-- Client-only MCP Tools through registered stdio or Streamable HTTP servers,
-  using Python MCP SDK v2 with explicit legacy/automatic/`2026-07-28`
-  negotiation. Tool capabilities, provider-classified external effects, audit,
-  and resource accounting retain the same authority-before-lookup and
-  transactional registry semantics.
-  The client surface introduced in 1.2.1 remains client-only and Tools-only:
-  MRTR/OAuth/listen,
-  Resources, Prompts, Tasks, Apps, Roots, Sampling, Logging, OpenTelemetry
-  product support, and an MCP server surface are intentionally excluded.
+- Client-only MCP through registered stdio or Streamable HTTP servers. Manifest
+  v1/v2 preserves the governed Tools compatibility contract and explicit
+  legacy/automatic/`2026-07-28` negotiation. Exact-`2026-07-28` Manifest v3
+  provides governed Tools with a closed modern result union and adds
+  Host-governed Resources, Resource Templates, Prompts, Completion, MRTR
+  continuations, bounded subscriptions, Host-preconfigured OAuth, and an
+  optional digest-pinned Tasks extension without weakening Tool capability,
+  data-flow, effect, audit, or resource accounting.
+  MCP Apps, Roots, Sampling, Logging, OpenTelemetry product integration, OAuth
+  Dynamic Client Registration, client-credentials, enterprise-managed
+  authorization, DPoP, workload identity, older OAuth backcompat modes, the
+  deprecated standalone SSE transport, and an MCP server surface remain
+  intentionally excluded.
 - A deterministic runtime-safety benchmark harness with 33 checked-in schema-v1
   tasks, including a self-evolution subset, baselines, evidence-backed
   side-effect oracle, fail-closed output validity, and explicit metric
@@ -196,9 +217,10 @@ Start here, then read the deeper references as needed:
 - [docs/data_flow.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/data_flow.md): label integrity, Host Sink trust,
   exact release, exit coverage, process identity domains, persistence, and
   guarantee boundaries.
-- [docs/semantic_shadow.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/semantic_shadow.md): default-off Phase 0+1
-  semantic approval/data-identification Shadow architecture, privacy contract,
-  read-only inspection surfaces, and explicit non-goals.
+- [docs/semantic_shadow.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/semantic_shadow.md): default-off Phase 0–4
+  semantic approval/data-identification architecture, payload-free FlowGraph,
+  deterministic hard denial, exact-once canary authority, privacy contract,
+  static Host epochs, and inspection/review surfaces.
 - [docs/object_memory.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/object_memory.md): namespaces, object rights,
   file/object bridge, context materialization, and payload persistence.
 - [docs/tools_and_jit.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/tools_and_jit.md): built-in tools,
@@ -207,16 +229,17 @@ Start here, then read the deeper references as needed:
   manifests, trust model, registration surfaces, CLI, and checkpoint behavior.
 - [docs/jsonrpc.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/jsonrpc.md): client-only JSON-RPC endpoint registry,
   capability resources, tools, syscalls, and checkpoint behavior.
-- [docs/mcp.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/mcp.md): client-only MCP server registry, Tools-only
-  Manifest v1/v2 scope, protocol negotiation, capability resources, and
-  checkpoint behavior.
+- [docs/mcp.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/mcp.md): client-only MCP registry, governed
+  Manifest v1/v2 compatibility plus exact-2026-07-28 Manifest v3 Tools and Host client,
+  OAuth/MRTR/Tasks/subscription lifecycle, DX, and recovery behavior.
 - [docs/skills.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/skills.md): standard `SKILL.md` packages,
   workspace/global sources, trust, activate/unload semantics, bundled JIT
   tools, and `swe-agent`.
 - [docs/checkpoints.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/checkpoints.md): scoped snapshots, restore, fork,
   replay diagnostics, retained runtime history, and external-effect reporting.
 - [docs/storage.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/storage.md): transaction rollback/poison semantics,
-  Object payload durability, schema-v5 validation, offline v4-to-v5 migration,
+  Object payload durability, schema-v7 validation, ordered offline v4-to-v5,
+  v5-to-v6, and v6-to-v7 migration,
   active-runtime leases, and the backup/restore runbook.
 - [docs/evidence_payload_retention.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/evidence_payload_retention.md):
   explicit, auditable LLM/external-effect payload retention tiers and safety
@@ -234,6 +257,8 @@ Start here, then read the deeper references as needed:
   `mini-swe-agent` image behavior and known interface differences.
 - [docs/development.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/development.md): setup, tests, real LLM smoke,
   configuration defaults, and contribution rules.
+- [docs/releasing.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/releasing.md): human-authorized release workflow,
+  canonical CI artifact binding, publication readback, and yank/recovery rules.
 - [docs/support_matrix.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/support_matrix.md): declared support, CI-covered
   environments, and explicit platform/provider release gates.
 - [docs/invariants.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/invariants.md): current invariant-to-test map.
@@ -258,6 +283,12 @@ Start here, then read the deeper references as needed:
 - [experiments/agentdojo/README.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/experiments/agentdojo/README.md): isolated
   AgentDojo harness, its frozen Python 3.11–3.12 environment, deterministic CI
   scope, and opt-in real-model evaluation workflow.
+- [SECURITY.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/SECURITY.md): supported-version evidence, current confidential
+  reporting availability, coordinated disclosure, and safe research guidance.
+- [CONTRIBUTING.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/CONTRIBUTING.md): contribution scope, testing expectations,
+  pull-request evidence, and security-report routing.
+- [CHANGELOG.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/CHANGELOG.md): release-candidate history without implying an
+  unverified tag, upload, or publication date.
 - [AGENTS.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/AGENTS.md): repository structure, testing, security, and
   contribution guidance for local agents and contributors.
 
@@ -272,6 +303,9 @@ infer current commands, interfaces, security guarantees, or release evidence:
   roadmap.
 - [docs/prelaunch_hardening_report.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/prelaunch_hardening_report.md):
   notice for the retired commit-bound prelaunch report.
+- [docs/semantic_permission_and_dataflow_research.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/semantic_permission_and_dataflow_research.md):
+  commit-bound pre-implementation research baseline; resolved risks and phased
+  proposals in that file are not current product status.
 
 ## Quick Start
 
@@ -283,9 +317,12 @@ development requires Node `^24.15.0 || >=26.0.0` and npm 11 or newer; CI uses
 the Node 24 LTS line. Deno is optional unless running real TypeScript/JIT
 coverage.
 
-Install dependencies:
+For a source checkout, clone the repository before installing its frozen
+development environment:
 
 ```bash
+git clone https://github.com/yingqi-z20/Agent-libOS.git
+cd Agent-libOS
 uv sync --frozen
 ```
 
@@ -296,13 +333,29 @@ In particular, a complete Windows test checkout needs
 `uv sync --frozen --extra pty` for native ConPTY coverage. The release group is
 installed explicitly only for release-artifact validation.
 
+To install a locally built release artifact instead of a source checkout,
+create an isolated environment and install the exact wheel (or sdist) that was
+verified by the release procedure:
+
+```bash
+uv venv .venv
+uv pip install --python .venv/bin/python \
+  ./dist/agent_libos-1.5.0-py3-none-any.whl
+.venv/bin/agent-libos --help
+```
+
+On Windows, the final executable is `.venv\\Scripts\\agent-libos.exe`. Installing
+an artifact provides the three console entry points directly; `uv run` in the
+examples below is the source-checkout workflow, not an implicit package
+download mechanism.
+
 ### Distribution artifacts
 
 The Python wheel contains the core `agent_libos` package, its immutable built-in
 Tool Skills, and the `agent-libos`, `agent-libos-gui-server`, and explicit
 offline `agent-libos-migrate-tool-groups` console entrypoints. Release
 validation parses all 26 built-in Skill packages and their
-99 uniquely owned tools from both the wheel and source archive. Repository-level
+101 uniquely owned tools from both the wheel and source archive. Repository-level
 assets such as the optional PTY Runtime Module, bundled example Skill and Image,
 benchmarks, tests, and documentation are distributed with the Python source
 archive and source checkout, not installed into the core wheel. The
@@ -317,9 +370,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.4.0-py3-none-any.whl dist/agent_libos-1.4.0.tar.gz
+  dist/agent_libos-1.5.0-py3-none-any.whl dist/agent_libos-1.5.0.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.4.0-py3-none-any.whl
+  dist/agent_libos-1.5.0-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 uv export --frozen --no-dev --no-emit-project --output-file runtime-requirements.txt
 uv export --frozen --only-group release --no-emit-project --output-file release-build-requirements.txt
@@ -333,7 +386,7 @@ uv venv /tmp/agent-libos-wheel-check
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
   --require-hashes -r runtime-requirements.txt
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
-  --no-deps dist/agent_libos-1.4.0-py3-none-any.whl
+  --no-deps dist/agent_libos-1.5.0-py3-none-any.whl
 uv pip check --python /tmp/agent-libos-wheel-check/bin/python
 /tmp/agent-libos-wheel-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-wheel-check/bin/agent-libos --help
@@ -346,7 +399,7 @@ uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
   --require-hashes -r release-build-requirements.txt
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
-  --no-deps --no-build-isolation dist/agent_libos-1.4.0.tar.gz
+  --no-deps --no-build-isolation dist/agent_libos-1.5.0.tar.gz
 uv pip check --python /tmp/agent-libos-sdist-check/bin/python
 /tmp/agent-libos-sdist-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-sdist-check/bin/agent-libos --help
@@ -426,6 +479,23 @@ The Electron launcher fills missing backend environment values from this
 checkout's `.env`; values already inherited by Electron take precedence. This
 GUI-specific launcher behavior does not apply to the generic CLI or library API.
 
+For the native self-contained **internal** desktop candidate, use the exact
+locked toolchains and build only on the target platform:
+
+```bash
+uv sync --frozen --group desktop --extra mcp
+npm --prefix gui ci
+npm --prefix gui run desktop:dist
+python scripts/check_desktop_artifacts.py desktop-dist
+```
+
+The packaged app includes Electron 43.2.0, CPython 3.11.15 with Agent libOS and
+the MCP extra, and verified Deno 2.9.4; it does not depend on system Python,
+Node, uv, or Deno. Git, external MCP servers, OS keychains, and OS certificate
+stores remain Host dependencies. These artifacts are `internal-unsigned`
+(macOS ad-hoc only; no notarization) and are not a public release or update
+channel. See [the GUI desktop build contract](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/gui.md#self-contained-internal-desktop-distribution).
+
 The demo does not call a real model. It exercises process spawn/fork, Object
 Memory, Deno/TypeScript JIT validation when Deno is available, checkpointing,
 capability denial before grant, human approval, filesystem write, final report
@@ -439,8 +509,12 @@ uv run python experiments/collect_metrics.py .benchmark_runs/smoke
 ```
 
 The benchmark defaults to mock/planned actions and does not spend model tokens.
-`--require-all-passed` is the release/smoke gate; without it, expected oracle
-failures are written for comparative analysis without forcing a non-zero exit.
+`--require-all-passed` is the success/safety oracle smoke gate; without it,
+expected oracle failures are written for comparative analysis without forcing
+a non-zero exit. The full deterministic release job additionally runs all 33
+tasks with `--require-release-evidence`, which requires audit completeness of
+1.0 and zero false denials for every selected runner. The two flags are
+independent so comparative callers retain the documented oracle-only behavior.
 Real-model benchmark smoke is opt-in, must select exactly one task after all
 filters, and supports only one or more Agent-libOS-family runners; wrapper and
 sandbox baselines cannot use `--llm real`.
@@ -521,12 +595,12 @@ uv sync --frozen --extra postgres
 uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" init
 ```
 
-Agent libOS 1.4.0 creates and opens only RuntimeStore schema v5. A canonical v4
-store is rejected by ordinary startup until an operator runs the explicit,
-offline, digest-bound v4-to-v5 migration. A schema-v3 store is rejected before
-initialization or any write; use Agent libOS 1.0.1 only to view or archive it.
-There is no automatic migration, read-only bridge, or dual-schema Runtime mode
-in 1.4.0.
+The current Runtime creates and opens only RuntimeStore schema v7. A canonical
+v6 store is rejected by ordinary startup until an operator runs the explicit,
+offline, digest-bound v6-to-v7 migration. Older supported stores must traverse
+the ordered v4-to-v5 and v5-to-v6 steps first; a schema-v3 store is rejected
+before initialization or any write. There is no automatic migration, read-only
+bridge, or dual-schema Runtime mode.
 
 Both backends implement the same runtime store contract. Process metadata,
 capabilities, audit/events, messages, human requests, LLM call records,
@@ -580,13 +654,16 @@ checks, resource budgets, human approval, or audit.
 Every LLM action-selection call is persisted as an `llm_calls` row with
 provider ids, model/API mode, token usage when available, errors, and bounded
 observability envelopes for prompts, visible tool schemas, model output, tool
-calls, reasoning metadata, and raw provider responses. Full prompts, visible
-tool schemas, model outputs, tool calls, reasoning metadata, and raw provider
-payloads are stored by default for self-evolution training and fine-tuning
-pipelines. Deployments that rely on this default should disclose that use in
-the user agreement because it may include sensitive prompt, tool, reasoning, and
-provider payload data; set `llm.persist_full_io: false` in the runtime config
-when a user or operator opts out of full LLM input/output retention. That
+calls, reasoning metadata, and provider-response projections. Full validated
+prompts, visible tool schemas, model outputs, and tool calls are stored by
+default for self-evolution training and fine-tuning pipelines. Reasoning and
+provider-response evidence is a bounded projection: sensitive or opaque fields
+are hashed, oversized structures are omitted with a digest, and the database
+cannot be assumed to reconstruct a byte-for-byte raw provider response.
+Deployments that rely on this default should disclose that use in the user
+agreement because it may still include sensitive prompt, tool, reasoning, and
+provider data; set `llm.persist_full_io: false` in the runtime config when a
+user or operator opts out of full LLM input/output retention. That
 opt-out cannot run an `image_only` Image (the default for custom packages),
 because transparent replay requires a lossless durable transcript; execution
 fails before provider dispatch. Use a Runtime-owned prompt mode when redacted
@@ -679,10 +756,27 @@ Optional knobs include `OPENAI_TIMEOUT`, `OPENAI_MAX_RETRIES`, `OPENAI_STORE`,
 `OPENAI_REASONING_EFFORT`, `OPENAI_VERBOSITY`, and provider-specific
 `OPENAI_ENABLE_THINKING`.
 
-When the SDK exhausts retries for a timeout, connection failure, rate limit, or
-retryable provider status, the Runtime records the failed call and pauses the
-process for explicit Host resume instead of discarding its durable progress.
-Configuration, protocol, and non-retryable provider errors still fail closed.
+The built-in client disables SDK-internal retries. `OPENAI_MAX_RETRIES` controls
+Agent libOS's explicit, attempt-traced transport retry loop for timeouts,
+connection failures, rate limits, and configured retryable provider statuses.
+After that loop is exhausted, the Runtime records the failed logical call and
+pauses the process for explicit Host resume instead of discarding durable
+progress. Configuration, protocol, and non-retryable provider errors still
+fail closed.
+
+Prompt layout and provider cache transport are separate controls. The release
+defaults remain `llm.prompt_layout: legacy_v1` and
+`llm.prompt_cache_mode: provider_default`, which sends no v2 cache options.
+`cache_optimized_v2` is an opt-in layout candidate. `implicit` and `explicit`
+cache modes require a Host-configured privacy-domain key; `explicit` adds one
+stable-text breakpoint. The only v2 TTL is `30m`, and it is mutually exclusive
+with legacy cache retention. A provider that rejects any v2 cache option causes
+one bounded compatibility attempt with the entire option group removed; the
+call trace distinguishes configured from effective options and records the
+content-free downgrade reason. Do not switch the default layout until the
+paired multi-provider release gate in
+[Provider Boundaries](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/providers.md#prompt-caching-v2-release-evidence)
+passes.
 
 Provider-side Responses storage/chaining policy is opt-in: the defaults remain
 `store=false` and `responses_previous_response_id=false`. The current
@@ -779,8 +873,10 @@ uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --a
 Create the manifest from [docs/mcp.md](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/mcp.md); the angle-bracket path is
 user supplied. The `mcp` extra is not installed by the core Quick Start command.
 Manifest v1 remains a legacy-wire compatibility contract. Manifest v2 requires
-an explicit `protocol_mode` of `legacy`, `auto`, or `2026-07-28`; discovery and
-negotiated connection diagnostics are available only for the modern modes.
+an explicit `protocol_mode` of `legacy`, `auto`, or `2026-07-28`; successful
+live Tool/call results expose bounded negotiated connection
+diagnostics in all three modes, while the standalone `discover` operation is
+limited to `auto` and `2026-07-28`.
 
 The `process:spawn` and exact `mcp_stdio:<sha256>` grants are required only for
 stdio servers. Copy `stdio_authority_resource` from `mcp inspect`; do not derive

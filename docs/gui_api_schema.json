@@ -29,8 +29,47 @@
       "jsonrpc.call": { "route": "POST /api/jsonrpc/{endpoint_id}/call", "request_def": "jsonRpcCallPayload" },
       "mcp.register": { "route": "POST /api/mcp/register", "request_def": "registryManifestPayload" },
       "mcp.call": { "route": "POST /api/mcp/{server_id}/call", "request_def": "mcpCallPayload" },
+      "mcp.unregister": { "route": "POST /api/mcp/{server_id}/unregister", "request_def": "mcpUnregisterPayload" },
+      "mcp.prompt.confirm": { "route": "POST /api/mcp/{server_id}/prompts/get", "request_def": "mcpPromptGetPayload", "conditional": "confirmed=true plus the Runtime-issued expected_preview_sha256 are required only when accepting the exact preview as untrusted user context." },
+      "mcp.auth.login": { "route": "POST /api/mcp/auth/{profile_id}/login", "request_def": "mcpOAuthLoginPayload" },
+      "mcp.auth.logout": { "route": "POST /api/mcp/auth/{profile_id}/logout", "request_def": "mcpConfirmedEmptyPayload" },
+      "mcp.auth.profile.add": { "route": "POST /api/mcp/auth/profiles", "request_def": "mcpOAuthProfileMutationPayload" },
+      "mcp.auth.profile.replace": { "route": "POST /api/mcp/auth/profiles", "request_def": "mcpOAuthProfileMutationPayload" },
+      "mcp.auth.profile.remove": { "route": "POST /api/mcp/auth/profiles/{profile_id}/remove", "request_def": "mcpConfirmedEmptyPayload" },
+      "mcp.continuation.respond": { "route": "POST /api/mcp/continuations/{continuation_id}/respond", "request_def": "mcpContinuationRespondPayload" },
+      "mcp.continuation.cancel": { "route": "POST /api/mcp/continuations/{continuation_id}/cancel", "request_def": "mcpRevisionMutationPayload" },
+      "mcp.remote_task.update": { "route": "POST /api/mcp/remote-tasks/{task_ref}/update", "request_def": "mcpRemoteTaskUpdatePayload" },
+      "mcp.remote_task.cancel": { "route": "POST /api/mcp/remote-tasks/{task_ref}/cancel", "request_def": "mcpRevisionMutationPayload" },
+      "mcp.subscription.start": { "route": "POST /api/mcp/{server_id}/subscriptions/start", "request_def": "mcpSubscriptionStartPayload" },
+      "mcp.subscription.stop": { "route": "POST /api/mcp/subscriptions/{subscription_id}/stop", "request_def": "mcpConfirmedEmptyPayload" },
       "task_run.cancel": { "route": "POST /api/task-runs/{run_id}/cancel", "request_def": "taskRunCancelPayload" },
       "task_run.recover": { "route": "POST /api/task-runs/{run_id}/recover", "request_def": "taskRunRecoverPayload" }
+    },
+    "mcp_v3_host_operations": {
+      "resources.list": { "route": "POST /api/mcp/{server_id}/resources/list", "request_def": "mcpPagePayload" },
+      "resource_templates.list": { "route": "POST /api/mcp/{server_id}/resource-templates/list", "request_def": "mcpPagePayload" },
+      "resources.read": { "route": "POST /api/mcp/{server_id}/resources/read", "request_def": "mcpResourceReadPayload", "response_def": "mcpOperationResultProjection" },
+      "prompts.list": { "route": "POST /api/mcp/{server_id}/prompts/list", "request_def": "mcpPagePayload" },
+      "prompts.get": { "route": "POST /api/mcp/{server_id}/prompts/get", "request_def": "mcpPromptGetPayload", "response_def": "mcpOperationResultProjection" },
+      "completion": { "route": "POST /api/mcp/{server_id}/completion", "request_def": "mcpCompletionPayload", "response_def": "mcpOperationResultProjection" },
+      "auth.status": { "route": "GET /api/mcp/auth/{profile_id}/status", "request_def": null, "local_only": true },
+      "auth.profiles.list": { "route": "GET /api/mcp/auth/profiles", "request_def": null, "response_def": "mcpOAuthStatusListProjection", "local_only": true },
+      "auth.profile.add": { "route": "POST /api/mcp/auth/profiles", "request_def": "mcpOAuthProfileMutationPayload", "response_def": "mcpOAuthStatusProjection", "host_only": true },
+      "auth.profile.replace": { "route": "POST /api/mcp/auth/profiles", "request_def": "mcpOAuthProfileMutationPayload", "response_def": "mcpOAuthStatusProjection", "host_only": true },
+      "auth.profile.remove": { "route": "POST /api/mcp/auth/profiles/{profile_id}/remove", "request_def": "mcpConfirmedEmptyPayload", "response_def": "mcpOAuthStatusProjection", "host_only": true },
+      "auth.login": { "route": "POST /api/mcp/auth/{profile_id}/login", "request_def": "mcpOAuthLoginPayload" },
+      "auth.callback": { "route": "POST /api/mcp/auth/challenges/{challenge_id}/callback", "request_def": "mcpOAuthCallbackPayload" },
+      "auth.logout": { "route": "POST /api/mcp/auth/{profile_id}/logout", "request_def": "mcpConfirmedEmptyPayload" },
+      "continuation.respond": { "route": "POST /api/mcp/continuations/{continuation_id}/respond", "request_def": "mcpContinuationRespondPayload", "response_def": "mcpOperationResultProjection", "human_request_settlement": "Runtime settles the bound durable HumanRequest before continuing; responses are never forwarded directly." },
+      "continuation.inspect": { "route": "POST /api/mcp/continuations/{continuation_id}/inspect", "request_def": "mcpEmptyPayload", "response_def": "mcpInputRequiredProjection", "provider_io": false },
+      "continuation.cancel": { "route": "POST /api/mcp/continuations/{continuation_id}/cancel", "request_def": "mcpRevisionMutationPayload", "response_def": "mcpOperationResultProjection" },
+      "remote_task.get": { "route": "POST /api/mcp/remote-tasks/{task_ref}/get", "request_def": "mcpRevisionReadPayload", "response_def": "mcpRemoteTaskProjection" },
+      "remote_task.update": { "route": "POST /api/mcp/remote-tasks/{task_ref}/update", "request_def": "mcpRemoteTaskUpdatePayload", "response_def": "mcpRemoteTaskProjection", "human_request_settlement": "Runtime settles the bound durable HumanRequest before updating; responses are never forwarded directly." },
+      "remote_task.cancel": { "route": "POST /api/mcp/remote-tasks/{task_ref}/cancel", "request_def": "mcpRevisionMutationPayload", "response_def": "mcpRemoteTaskProjection" },
+      "subscription.start": { "route": "POST /api/mcp/{server_id}/subscriptions/start", "request_def": "mcpSubscriptionStartPayload" },
+      "subscription.status": { "route": "POST /api/mcp/subscriptions/{subscription_id}/status", "request_def": "mcpEmptyPayload" },
+      "subscription.events": { "route": "POST /api/mcp/subscriptions/{subscription_id}/events", "request_def": "mcpSubscriptionEventsPayload" },
+      "subscription.stop": { "route": "POST /api/mcp/subscriptions/{subscription_id}/stop", "request_def": "mcpConfirmedEmptyPayload" }
     }
   },
   "x-agent-libos-definition-usage": {
@@ -49,9 +88,158 @@
       "minLength": 1,
       "pattern": "\\S"
     },
+    "stringMap": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/nonEmptyString" },
+      "additionalProperties": { "type": "string" }
+    },
+    "uniqueNonEmptyStrings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/nonEmptyString" }
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "mcpInputRequestProjection": {
+      "type": "object",
+      "required": ["request_id", "kind", "schema"],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/nonEmptyString" },
+        "kind": { "enum": ["elicitation", "sampling_unsupported", "roots_unsupported"] },
+        "mode": { "enum": ["form", "url", null] },
+        "prompt": { "type": ["string", "null"] },
+        "schema": { "$ref": "#/$defs/jsonObject" },
+        "inert_url": {
+          "description": "Untrusted display-only Provider text. Clients must never fetch or open it automatically.",
+          "type": ["string", "null"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "mcpInputRequiredProjection": {
+      "type": "object",
+      "required": [
+        "kind",
+        "continuation_id",
+        "revision",
+        "respondable",
+        "input_requests"
+      ],
+      "properties": {
+        "kind": { "const": "input_required" },
+        "continuation_id": { "type": "string", "maxLength": 4096 },
+        "revision": { "type": "integer", "minimum": 0 },
+        "input_requests": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/mcpInputRequestProjection" }
+        },
+        "expires_at": { "type": ["string", "null"] },
+        "respondable": { "type": "boolean" },
+        "human_request_id": {
+          "oneOf": [{ "$ref": "#/$defs/nonEmptyString" }, { "type": "null" }]
+        },
+        "human_revision": { "type": ["integer", "null"], "minimum": 0 },
+        "human_preview_sha256": {
+          "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+        }
+      },
+      "allOf": [{
+        "if": { "properties": { "respondable": { "const": true } }, "required": ["respondable"] },
+        "then": {
+          "required": ["human_request_id", "human_revision", "human_preview_sha256"],
+          "properties": {
+            "continuation_id": { "$ref": "#/$defs/nonEmptyString" },
+            "human_request_id": { "$ref": "#/$defs/nonEmptyString" },
+            "human_revision": { "type": "integer", "minimum": 0 },
+            "human_preview_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "else": {
+          "properties": {
+            "continuation_id": { "const": "" },
+            "input_requests": {
+              "minItems": 1,
+              "items": {
+                "allOf": [
+                  { "$ref": "#/$defs/mcpInputRequestProjection" },
+                  { "properties": { "kind": { "enum": ["sampling_unsupported", "roots_unsupported"] } } }
+                ]
+              }
+            },
+            "human_request_id": { "type": "null" },
+            "human_revision": { "type": "null" },
+            "human_preview_sha256": { "type": "null" }
+          }
+        }
+      }],
+      "additionalProperties": false
+    },
+    "mcpRemoteTaskProjection": {
+      "type": "object",
+      "required": ["kind", "task_ref", "revision", "status", "input_requests"],
+      "properties": {
+        "kind": { "const": "remote_task" },
+        "task_ref": { "$ref": "#/$defs/nonEmptyString" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "status": { "enum": ["working", "input_required", "completed", "failed", "cancelled", "cancel_requested", "needs_attention"] },
+        "status_message": { "type": ["string", "null"] },
+        "result": {},
+        "input_requests": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/mcpInputRequestProjection" }
+        },
+        "created_at": { "type": ["string", "null"] },
+        "updated_at": { "type": ["string", "null"] },
+        "ttl_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "poll_interval_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "human_request_id": {
+          "oneOf": [{ "$ref": "#/$defs/nonEmptyString" }, { "type": "null" }]
+        },
+        "human_revision": { "type": ["integer", "null"], "minimum": 0 },
+        "human_preview_sha256": {
+          "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+        }
+      },
+      "allOf": [{
+        "if": { "properties": { "status": { "const": "input_required" } }, "required": ["status"] },
+        "then": {
+          "required": ["human_request_id", "human_revision", "human_preview_sha256"],
+          "properties": {
+            "input_requests": { "minItems": 1 },
+            "human_request_id": { "$ref": "#/$defs/nonEmptyString" },
+            "human_revision": { "type": "integer", "minimum": 0 },
+            "human_preview_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "else": {
+          "properties": {
+            "human_request_id": { "type": "null" },
+            "human_revision": { "type": "null" },
+            "human_preview_sha256": { "type": "null" }
+          }
+        }
+      }],
+      "additionalProperties": false
+    },
+    "mcpCompleteProjection": {
+      "type": "object",
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": { "const": "complete" },
+        "value": {},
+        "preview_sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    },
+    "mcpOperationResultProjection": {
+      "oneOf": [
+        { "$ref": "#/$defs/mcpCompleteProjection" },
+        { "$ref": "#/$defs/mcpInputRequiredProjection" },
+        { "$ref": "#/$defs/mcpRemoteTaskProjection" }
+      ]
     },
     "capabilityRights": {
       "oneOf": [
@@ -785,6 +973,271 @@
           }
         }
       ]
+    },
+    "mcpUnregisterPayload": {
+      "type": "object",
+      "required": ["confirmed"],
+      "properties": {
+        "confirmed": { "const": true },
+        "actor": { "$ref": "#/$defs/nonEmptyString" }
+      },
+      "additionalProperties": false
+    },
+    "mcpPagePayload": {
+      "type": "object",
+      "properties": {
+        "cursor": { "type": ["string", "null"], "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "mcpResourceReadPayload": {
+      "type": "object",
+      "required": ["resource_id"],
+      "properties": {
+        "resource_id": { "$ref": "#/$defs/nonEmptyString" },
+        "variables": {
+          "oneOf": [
+            { "$ref": "#/$defs/stringMap" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "mcpPromptGetPayload": {
+      "type": "object",
+      "required": ["prompt_id"],
+      "properties": {
+        "prompt_id": { "$ref": "#/$defs/nonEmptyString" },
+        "arguments": {
+          "oneOf": [
+            { "$ref": "#/$defs/stringMap" },
+            { "type": "null" }
+          ]
+        },
+        "confirmed": { "type": "boolean" },
+        "expected_preview_sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["confirmed"],
+            "properties": { "confirmed": { "const": true } }
+          },
+          "then": { "required": ["expected_preview_sha256"] },
+          "else": { "not": { "required": ["expected_preview_sha256"] } }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "mcpCompletionPayload": {
+      "type": "object",
+      "required": ["reference_type", "reference_id", "argument"],
+      "properties": {
+        "reference_type": { "$ref": "#/$defs/nonEmptyString" },
+        "reference_id": { "$ref": "#/$defs/nonEmptyString" },
+        "argument": { "$ref": "#/$defs/stringMap" },
+        "context": {
+          "oneOf": [
+            { "$ref": "#/$defs/stringMap" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "mcpOAuthProfileInput": {
+      "type": "object",
+      "required": [
+        "profile_id",
+        "server_id",
+        "resource_uri",
+        "expected_issuer",
+        "redirect_uri",
+        "client_id",
+        "registration_mode"
+      ],
+      "properties": {
+        "profile_id": { "$ref": "#/$defs/nonEmptyString" },
+        "server_id": { "$ref": "#/$defs/nonEmptyString" },
+        "resource_uri": { "$ref": "#/$defs/nonEmptyString" },
+        "expected_issuer": { "$ref": "#/$defs/nonEmptyString" },
+        "redirect_uri": { "$ref": "#/$defs/nonEmptyString" },
+        "client_id": { "$ref": "#/$defs/nonEmptyString" },
+        "registration_mode": { "enum": ["preregistered", "cimd"] },
+        "token_endpoint_auth_method": { "enum": ["none", "client_secret_basic", "client_secret_post"] },
+        "allowed_scopes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "default_scopes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "audience": { "oneOf": [{ "$ref": "#/$defs/nonEmptyString" }, { "type": "null" }] },
+        "protected_resource_metadata_url": { "oneOf": [{ "$ref": "#/$defs/nonEmptyString" }, { "type": "null" }] },
+        "authorization_server_metadata_url": { "oneOf": [{ "$ref": "#/$defs/nonEmptyString" }, { "type": "null" }] },
+        "protected_resource_metadata_sha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "authorization_server_metadata_sha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "allowed_endpoint_origins": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "allow_loopback_http": { "type": "boolean" },
+        "protocol_revision": { "const": "2026-07-28" },
+        "transport": { "const": "streamable_http" }
+      },
+      "additionalProperties": false
+    },
+    "mcpOAuthProfileMutationPayload": {
+      "type": "object",
+      "required": ["profile", "replace", "confirmed"],
+      "properties": {
+        "profile": { "$ref": "#/$defs/mcpOAuthProfileInput" },
+        "client_secret": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "pattern": "^[^\\u0000\\r\\n]+$"
+        },
+        "replace": { "type": "boolean" },
+        "confirmed": { "const": true }
+      },
+      "additionalProperties": false
+    },
+    "mcpOAuthStatusProjection": {
+      "type": "object",
+      "required": ["profile_id", "status", "scopes"],
+      "properties": {
+        "profile_id": { "$ref": "#/$defs/nonEmptyString" },
+        "status": { "enum": ["unconfigured", "authorization_required", "authorized", "expired", "revoked", "needs_attention"] },
+        "issuer": { "type": ["string", "null"] },
+        "resource": { "type": ["string", "null"] },
+        "scopes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "principal_sha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "expires_at": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "mcpOAuthStatusListProjection": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": { "$ref": "#/$defs/mcpOAuthStatusProjection" }
+    },
+    "mcpOAuthLoginPayload": {
+      "type": "object",
+      "required": ["confirmed"],
+      "properties": {
+        "confirmed": { "const": true },
+        "scopes": {
+          "oneOf": [
+            { "$ref": "#/$defs/uniqueNonEmptyStrings" },
+            { "type": "array", "maxItems": 0 }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "mcpOAuthCallbackPayload": {
+      "type": "object",
+      "required": ["callback_url"],
+      "properties": {
+        "callback_url": { "$ref": "#/$defs/nonEmptyString" }
+      },
+      "additionalProperties": false
+    },
+    "mcpConfirmedEmptyPayload": {
+      "type": "object",
+      "required": ["confirmed"],
+      "properties": {
+        "confirmed": { "const": true }
+      },
+      "additionalProperties": false
+    },
+    "mcpEmptyPayload": {
+      "type": "object",
+      "maxProperties": 0,
+      "additionalProperties": false
+    },
+    "mcpContinuationRespondPayload": {
+      "type": "object",
+      "required": [
+        "expected_revision",
+        "responses",
+        "human_request_id",
+        "human_expected_revision",
+        "human_preview_sha256",
+        "confirmed"
+      ],
+      "properties": {
+        "expected_revision": { "type": "integer", "minimum": 0 },
+        "responses": { "$ref": "#/$defs/jsonObject" },
+        "human_request_id": { "$ref": "#/$defs/nonEmptyString" },
+        "human_expected_revision": { "type": "integer", "minimum": 0 },
+        "human_preview_sha256": { "$ref": "#/$defs/sha256" },
+        "confirmed": { "const": true }
+      },
+      "additionalProperties": false
+    },
+    "mcpRevisionReadPayload": {
+      "type": "object",
+      "properties": {
+        "expected_revision": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "mcpRevisionMutationPayload": {
+      "type": "object",
+      "required": ["expected_revision", "confirmed"],
+      "properties": {
+        "expected_revision": { "type": "integer", "minimum": 0 },
+        "confirmed": { "const": true }
+      },
+      "additionalProperties": false
+    },
+    "mcpRemoteTaskUpdatePayload": {
+      "type": "object",
+      "required": [
+        "expected_revision",
+        "responses",
+        "human_request_id",
+        "human_expected_revision",
+        "human_preview_sha256",
+        "confirmed"
+      ],
+      "properties": {
+        "expected_revision": { "type": "integer", "minimum": 0 },
+        "responses": { "$ref": "#/$defs/jsonObject" },
+        "human_request_id": { "$ref": "#/$defs/nonEmptyString" },
+        "human_expected_revision": { "type": "integer", "minimum": 0 },
+        "human_preview_sha256": { "$ref": "#/$defs/sha256" },
+        "confirmed": { "const": true }
+      },
+      "additionalProperties": false
+    },
+    "mcpSubscriptionStartPayload": {
+      "type": "object",
+      "required": ["filters", "confirmed"],
+      "properties": {
+        "filters": { "$ref": "#/$defs/uniqueNonEmptyStrings" },
+        "confirmed": { "const": true }
+      },
+      "additionalProperties": false
+    },
+    "mcpSubscriptionEventsPayload": {
+      "type": "object",
+      "properties": {
+        "after": { "type": "integer", "minimum": 0 },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+      },
+      "additionalProperties": false
     },
     "taskRunCommandMutation": {
       "type": "object",

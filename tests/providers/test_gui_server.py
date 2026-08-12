@@ -13,6 +13,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 from agent_libos.api.gui.server import (
     GuiEventBroadcaster,
+    GuiRequestHandler,
     GuiRuntimeService,
     GuiServerError,
     _BoundedSeenKeys,
@@ -70,6 +71,7 @@ from agent_libos.evidence.payload_retention import (
     llm_call_payload_sha256,
     retain_llm_call_payload,
 )
+from agent_libos.mcp import McpSubscriptionEvent
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, HumanResponseRequired, ProcessWaitRequired, ValidationError
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import dumps, to_jsonable
@@ -103,6 +105,256 @@ def _noncanonical_base64url_alias(segment: str) -> str:
         ) == decoded:
             return candidate
     raise AssertionError("base64url segment has no non-canonical alias")
+
+
+def test_gui_mcp_continuation_inspect_survives_runtime_reopen(
+    tmp_path: Path,
+) -> None:
+    from agent_libos.mcp import InMemoryMcpCredentialBroker, McpInputRequired
+    from agent_libos.models import CapabilityRight
+    from agent_libos.substrate import LocalResourceProviderSubstrate
+    from tests.unit.test_mcp_v3_continuations import _binding, _input_required
+
+    database = tmp_path / "gui-mcp-continuation-reopen.sqlite"
+    broker = InMemoryMcpCredentialBroker()
+
+    def substrate() -> LocalResourceProviderSubstrate:
+        selected = LocalResourceProviderSubstrate(tmp_path)
+        selected.mcp_credential_broker = broker
+        return selected
+
+    initial = Runtime.open(database, substrate=substrate())
+    try:
+        owner_id = initial.process.spawn(
+            image="base-agent:v0",
+            goal="recover MCP continuation in GUI",
+            authority_manifest={
+                "authorized_capabilities": [{
+                    "resource": "human:owner",
+                    "rights": [CapabilityRight.WRITE.value],
+                }]
+            },
+        )
+        pending = initial._mcp_continuation_manager.capture_input_required(
+            _binding(owner_id=owner_id),
+            _input_required(state="PRIVATE-REOPEN-REQUEST-STATE"),
+            expires_at=None,
+        )
+        assert isinstance(pending, McpInputRequired)
+    finally:
+        initial.close()
+
+    assert all(
+        b"PRIVATE-REOPEN-REQUEST-STATE" not in candidate.read_bytes()
+        for candidate in database.parent.glob(f"{database.name}*")
+        if candidate.is_file()
+    )
+    reopened = Runtime.open(database, substrate=substrate())
+    server = create_gui_http_server(
+        runtime=reopened,
+        port=0,
+        token="reopen-token",
+        auto_run=False,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        conn = http.client.HTTPConnection(
+            host,
+            port,
+            timeout=_GUI_TEST_HTTP_TIMEOUT_S,
+        )
+        conn.request(
+            "POST",
+            f"/api/mcp/continuations/{pending.continuation_id}/inspect",
+            body="{}",
+            headers={
+                "Authorization": "Bearer reopen-token",
+                "Content-Type": "application/json",
+            },
+        )
+        response = conn.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+        assert response.status == 200, body
+        assert body["kind"] == "input_required"
+        assert body["continuation_id"] == pending.continuation_id
+        assert body["revision"] == pending.revision
+        assert body["human_request_id"] == pending.human_request_id
+        assert body["human_preview_sha256"] == pending.human_preview_sha256
+        assert "PRIVATE-REOPEN-REQUEST-STATE" not in dumps(body)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.service.shutdown()
+        server.server_close()
+        reopened.close()
+        broker.close()
+
+
+def test_gui_mcp_task_get_recovers_nonzero_revision_after_runtime_reopen(
+    tmp_path: Path,
+) -> None:
+    import time
+
+    from agent_libos.mcp import InMemoryMcpCredentialBroker
+    from agent_libos.substrate import LocalResourceProviderSubstrate
+    from tests.unit.test_mcp_v3_tasks import (
+        _Boundary,
+        _TASKS_DIGEST,
+        _binding,
+        _task_result,
+    )
+
+    class TasksProvider:
+        mcp_manifest_schema_version = 3
+        mcp_protocol_revision = "2026-07-28"
+
+        async def get_remote_task(
+            self, server: Any, remote_task_id: str, *, deadline: float
+        ) -> dict[str, Any]:
+            raise AssertionError((server, remote_task_id, deadline))
+
+        async def update_remote_task(
+            self,
+            server: Any,
+            remote_task_id: str,
+            response: dict[str, Any],
+            *,
+            deadline: float,
+        ) -> dict[str, Any]:
+            raise AssertionError((server, remote_task_id, response, deadline))
+
+        async def cancel_remote_task(
+            self, server: Any, remote_task_id: str, *, deadline: float
+        ) -> dict[str, Any]:
+            raise AssertionError((server, remote_task_id, deadline))
+
+    database = tmp_path / "gui-mcp-task-reopen.sqlite"
+    broker = InMemoryMcpCredentialBroker()
+    provider = TasksProvider()
+    config = AgentLibOSConfig(
+        mcp=replace(
+            DEFAULT_CONFIG.mcp,
+            tasks_extension_enabled=True,
+            tasks_extension_spec_sha256=_TASKS_DIGEST,
+            remote_task_poll_min_interval_s=0.000001,
+        )
+    )
+
+    def substrate() -> LocalResourceProviderSubstrate:
+        selected = LocalResourceProviderSubstrate(tmp_path)
+        selected.mcp_credential_broker = broker
+        selected.mcp_tasks_provider = provider
+        return selected
+
+    raw_input_required = _task_result(
+        status="input_required",
+        pollIntervalMs=1,
+        inputRequests={
+            "remote-input": {
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "form",
+                    "message": "Approve the reopened Task?",
+                    "requestedSchema": {
+                        "type": "object",
+                        "properties": {"approved": {"type": "boolean"}},
+                        "required": ["approved"],
+                    },
+                },
+            }
+        },
+    )
+    initial = Runtime.open(database, substrate=substrate(), config=config)
+    try:
+        owner_id = initial.process.spawn(
+            image="base-agent:v0",
+            goal="recover MCP Task in GUI",
+            authority_manifest={
+                "authorized_capabilities": [{
+                    "resource": "human:owner",
+                    "rights": [CapabilityRight.WRITE.value],
+                }]
+            },
+        )
+        manager = initial._mcp_remote_task_manager
+        binding = _binding(owner_id=owner_id)
+        task = manager.capture_task(
+            binding,
+            _task_result(pollIntervalMs=1),
+        )
+        first_boundary = _Boundary()
+        first_boundary.get_results.append(raw_input_required)
+        manager.boundary = first_boundary
+        time.sleep(0.02)
+        first_observation = asyncio.run(
+            manager.get(
+                task.task_ref,
+                expected_revision=task.revision,
+                binding=binding,
+                deadline=time.monotonic() + 5,
+            )
+        )
+        assert first_observation.revision > 0
+    finally:
+        initial.close()
+
+    assert all(
+        b"remote-bearer-id" not in candidate.read_bytes()
+        for candidate in database.parent.glob(f"{database.name}*")
+        if candidate.is_file()
+    )
+    reopened = Runtime.open(database, substrate=substrate(), config=config)
+    second_boundary = _Boundary()
+    second_boundary.get_results.append(raw_input_required)
+    reopened._mcp_remote_task_manager.boundary = second_boundary
+    server = create_gui_http_server(
+        runtime=reopened,
+        port=0,
+        token="task-reopen-token",
+        auto_run=False,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        time.sleep(0.02)
+        host, port = server.server_address
+        conn = http.client.HTTPConnection(
+            host,
+            port,
+            timeout=_GUI_TEST_HTTP_TIMEOUT_S,
+        )
+        conn.request(
+            "POST",
+            f"/api/mcp/remote-tasks/{task.task_ref}/get",
+            body="{}",
+            headers={
+                "Authorization": "Bearer task-reopen-token",
+                "Content-Type": "application/json",
+            },
+        )
+        response = conn.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+        assert response.status == 200, body
+        assert body["kind"] == "remote_task"
+        assert body["task_ref"] == task.task_ref
+        assert body["revision"] > first_observation.revision
+        assert body["status"] == "input_required"
+        assert body["human_request_id"]
+        assert "remote-bearer-id" not in dumps(body)
+        assert len(second_boundary.get_calls) == 1
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.service.shutdown()
+        server.server_close()
+        reopened.close()
+        broker.close()
 
 
 def test_gui_validates_user_profiles_before_opening_owned_runtime(
@@ -3013,6 +3265,11 @@ class TestGuiServer:
         runtime.config = replace(
             runtime.config,
             gui=replace(runtime.config.gui, snapshot_collection_max_items=16),
+            mcp=replace(
+                runtime.config.mcp,
+                list_limit=1,
+                server_page_limit=17,
+            ),
         )
         service._static_snapshot_dirty = True
         seen: dict[str, list[int | None]] = {}
@@ -5466,6 +5723,1403 @@ class TestGuiServer:
         assert status == 400
         assert 'manifest_text' in body['error']['message']
 
+    def test_mcp_register_rejects_non_string_source_before_mutation(self) -> None:
+        status, body = self.request(
+            'POST',
+            '/api/mcp/register',
+            {
+                'manifest_text': _gui_mcp_manifest('gui-invalid-source'),
+                'source': 7,
+                'confirmed': True,
+            },
+        )
+
+        assert status == 400
+        assert body['error']['message'] == 'source must be a JSON string or null'
+        assert self.server.service.runtime.store.get_mcp_server('gui-invalid-source') is None
+
+    def test_mcp_register_replace_and_unregister_are_explicit_confirmed_operations(self) -> None:
+        manifest = _gui_mcp_manifest('gui-replace-mcp')
+        replacement = manifest.replace('timeout_s: 5', 'timeout_s: 6')
+
+        first_status, first = self.request(
+            'POST',
+            '/api/mcp/register',
+            {'manifest_text': manifest, 'confirmed': True},
+        )
+        duplicate_status, _duplicate = self.request(
+            'POST',
+            '/api/mcp/register',
+            {'manifest_text': replacement, 'confirmed': True},
+        )
+        replace_status, replaced = self.request(
+            'POST',
+            '/api/mcp/register',
+            {'manifest_text': replacement, 'replace': True, 'confirmed': True},
+        )
+        confirmation_status, confirmation = self.request(
+            'POST',
+            '/api/mcp/gui-replace-mcp/unregister',
+            {},
+        )
+        unregister_status, unregistered = self.request(
+            'POST',
+            '/api/mcp/gui-replace-mcp/unregister',
+            {'confirmed': True},
+        )
+
+        assert first_status == 200
+        assert first['timeout_s'] == 5
+        assert duplicate_status == 400
+        assert replace_status == 200
+        assert replaced['timeout_s'] == 6
+        assert confirmation_status == 409
+        assert confirmation['error']['action'] == 'mcp.unregister'
+        assert unregister_status == 200
+        assert unregistered == {'server_id': 'gui-replace-mcp', 'deleted': True}
+        assert self.server.service.runtime.store.get_mcp_server('gui-replace-mcp') is None
+
+    def test_mcp_unregister_actor_mode_requires_exact_server_admin_capability(self) -> None:
+        runtime = self.server.service.runtime
+        _status, spawned = self.request(
+            'POST',
+            '/api/processes',
+            {'goal': 'mcp unregister actor', 'auto_run': False},
+        )
+        pid = spawned['pid']
+        runtime.mcp.register_server_from_yaml_text(
+            _gui_mcp_manifest('gui-unregister-actor'),
+            actor='test',
+            require_capability=False,
+        )
+
+        typo_status, typo = self.request(
+            'POST',
+            '/api/mcp/gui-unregister-actor/unregister',
+            {'actor_pid': pid, 'confirmed': True},
+        )
+
+        denied_status, denied = self.request(
+            'POST',
+            '/api/mcp/gui-unregister-actor/unregister',
+            {'actor': pid, 'confirmed': True},
+        )
+
+        assert typo_status == 400
+        assert typo['error']['code'] == 'unknown_request_field'
+        assert denied_status == 403
+        assert 'mcp_server:gui-unregister-actor' in denied['error']['message']
+        assert runtime.store.get_mcp_server('gui-unregister-actor') is not None
+
+        runtime.capability.grant(
+            pid,
+            'mcp_server:gui-unregister-actor',
+            [CapabilityRight.ADMIN],
+            issued_by='test',
+        )
+        allowed_status, allowed = self.request(
+            'POST',
+            '/api/mcp/gui-unregister-actor/unregister',
+            {'actor': pid, 'confirmed': True},
+        )
+
+        assert allowed_status == 200
+        assert allowed == {'server_id': 'gui-unregister-actor', 'deleted': True}
+        assert runtime.store.get_mcp_server('gui-unregister-actor') is None
+
+    def test_mcp_tools_get_is_cache_only_and_live_refresh_requires_post(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        observed: list[dict[str, object]] = []
+
+        def record_list_tools(
+            server_id: str,
+            *,
+            actor: str,
+            require_capability: bool,
+            refresh: bool,
+        ) -> dict[str, object]:
+            observed.append(
+                {
+                    'server_id': server_id,
+                    'actor': actor,
+                    'require_capability': require_capability,
+                    'refresh': refresh,
+                }
+            )
+            return {
+                'server_id': server_id,
+                'schema_version': 2,
+                'transport': 'stdio',
+                'protocol_mode': 'auto',
+                'tools': [],
+                'refreshed': refresh,
+                'response_bytes': 0,
+            }
+
+        monkeypatch.setattr(
+            self.server.service.runtime.mcp,
+            'list_tools',
+            record_list_tools,
+        )
+        cursor = self.server.service.broadcaster.replay_after(0)[-1].seq
+
+        cached_status, cached = self.request(
+            'GET',
+            '/api/mcp/gui-modern-mcp/tools?refresh=false',
+        )
+        for query in (
+            'refresh=true',
+            'refresh=treu',
+            'refresh=',
+            'refresh=false&refresh=false',
+            'unknown=false',
+        ):
+            status, _body = self.request(
+                'GET',
+                f'/api/mcp/gui-modern-mcp/tools?{query}',
+            )
+            assert status == 400
+        typo_status, typo = self.request(
+            'POST',
+            '/api/mcp/gui-modern-mcp/tools/refresh',
+            {'actor_pid': 'pid-modern-reader'},
+        )
+        refresh_status, refreshed = self.request(
+            'POST',
+            '/api/mcp/gui-modern-mcp/tools/refresh',
+            {'actor': 'pid-modern-reader'},
+        )
+        published_reasons = [
+            event.data['reason']
+            for event in self.server.service.broadcaster.replay_after(cursor)
+            if event.event == 'snapshot'
+        ]
+
+        assert cached_status == 200
+        assert cached['refreshed'] is False
+        assert typo_status == 400
+        assert typo['error']['code'] == 'unknown_request_field'
+        assert refresh_status == 200
+        assert refreshed['refreshed'] is True
+        assert published_reasons == ['mcp.tools.refresh']
+        assert observed == [
+            {
+                'server_id': 'gui-modern-mcp',
+                'actor': 'gui',
+                'require_capability': False,
+                'refresh': False,
+            },
+            {
+                'server_id': 'gui-modern-mcp',
+                'actor': 'pid-modern-reader',
+                'require_capability': True,
+                'refresh': True,
+            },
+        ]
+
+    def test_mcp_v3_resources_are_post_only_strict_and_use_host_actor(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        observed: list[dict[str, Any]] = []
+
+        def list_resources(
+            server_id: str,
+            *,
+            cursor: str | None,
+            actor: str,
+        ) -> dict[str, Any]:
+            observed.append({"server_id": server_id, "cursor": cursor, "actor": actor})
+            return {
+                "items": [{"resource_id": "logical-doc", "name": "Document"}],
+                "next_cursor": "opaque-next",
+                "cache_hint": None,
+            }
+
+        monkeypatch.setattr(
+            self.server.service.runtime.mcp,
+            "list_resources",
+            list_resources,
+            raising=False,
+        )
+
+        get_status, _get = self.request(
+            "GET", "/api/mcp/modern/resources/list"
+        )
+        unknown_status, unknown = self.request(
+            "POST",
+            "/api/mcp/modern/resources/list",
+            {"cursor": "c1", "url": "https://hidden.invalid"},
+        )
+        query_status, query_error = self.request(
+            "POST",
+            "/api/mcp/modern/resources/list?url=https%3A%2F%2Fhidden.invalid",
+            {},
+        )
+        status, page = self.request(
+            "POST", "/api/mcp/modern/resources/list", {"cursor": "c1"}
+        )
+
+        assert get_status == 404
+        assert unknown_status == 400
+        assert unknown["error"]["code"] == "unknown_request_field"
+        assert query_status == 400
+        assert query_error["error"]["code"] == "unknown_query_parameter"
+        assert status == 200
+        assert page["next_cursor"] == "opaque-next"
+        assert observed == [{"server_id": "modern", "cursor": "c1", "actor": "gui"}]
+
+    def test_mcp_v3_resource_read_rejects_non_string_variables_pre_provider(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls = 0
+
+        def read_resource(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            return {"kind": "complete", "value": None}
+
+        monkeypatch.setattr(
+            self.server.service.runtime.mcp,
+            "read_resource",
+            read_resource,
+            raising=False,
+        )
+
+        status, body = self.request(
+            "POST",
+            "/api/mcp/modern/resources/read",
+            {"resource_id": "doc", "variables": {"page": 1}},
+        )
+
+        assert status == 400
+        assert "string values" in body["error"]["message"]
+        assert calls == 0
+
+    def test_mcp_v3_prompt_preview_confirmation_and_async_facade(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        observed: list[bool] = []
+
+        async def get_prompt(
+            server_id: str,
+            prompt_id: str,
+            *,
+            arguments: dict[str, str] | None,
+            confirmed: bool,
+            expected_preview_sha256: str | None,
+            actor: str,
+        ) -> dict[str, Any]:
+            assert (server_id, prompt_id, arguments, actor) == (
+                "modern",
+                "review",
+                {"topic": "MCP"},
+                "gui",
+            )
+            if confirmed:
+                assert expected_preview_sha256 == "a" * 64
+            else:
+                assert expected_preview_sha256 is None
+            observed.append(confirmed)
+            return {
+                "kind": "complete",
+                "preview_sha256": "a" * 64,
+                "value": {
+                    "prompt_id": "review",
+                    "messages": [],
+                    "user_confirmation_required": True,
+                },
+            }
+
+        monkeypatch.setattr(
+            self.server.service.runtime.mcp,
+            "get_prompt",
+            get_prompt,
+            raising=False,
+        )
+
+        preview_status, _preview = self.request(
+            "POST",
+            "/api/mcp/modern/prompts/get",
+            {"prompt_id": "review", "arguments": {"topic": "MCP"}},
+        )
+        unbound_status, unbound = self.request(
+            "POST",
+            "/api/mcp/modern/prompts/get",
+            {
+                "prompt_id": "review",
+                "arguments": {"topic": "MCP"},
+                "confirmed": True,
+            },
+        )
+        confirmed_status, _confirmed = self.request(
+            "POST",
+            "/api/mcp/modern/prompts/get",
+            {
+                "prompt_id": "review",
+                "arguments": {"topic": "MCP"},
+                "confirmed": True,
+                "expected_preview_sha256": "a" * 64,
+            },
+        )
+
+        assert preview_status == 200
+        assert unbound_status == 400
+        assert unbound["error"]["code"] == "mcp_prompt_preview_binding_required"
+        assert confirmed_status == 200
+        assert observed == [False, True]
+
+    def test_mcp_v3_completion_context_is_a_strict_string_map_pre_facade(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        observed: list[dict[str, Any]] = []
+
+        def complete_prompt(
+            server_id: str,
+            reference_type: str,
+            reference_id: str,
+            argument: dict[str, str],
+            *,
+            context: dict[str, str] | None,
+            actor: str,
+        ) -> dict[str, Any]:
+            observed.append(
+                {
+                    "server_id": server_id,
+                    "reference_type": reference_type,
+                    "reference_id": reference_id,
+                    "argument": argument,
+                    "context": context,
+                    "actor": actor,
+                }
+            )
+            return {
+                "kind": "complete",
+                "value": {"values": ["one"], "has_more": False},
+            }
+
+        monkeypatch.setattr(
+            self.server.service.runtime.mcp,
+            "complete_prompt",
+            complete_prompt,
+            raising=False,
+        )
+        invalid_status, _invalid = self.request(
+            "POST",
+            "/api/mcp/modern/completion",
+            {
+                "reference_type": "ref/prompt",
+                "reference_id": "review",
+                "argument": {"name": "topic", "value": "MCP"},
+                "context": {"count": 1},
+            },
+        )
+        blank_key_status, _blank_key = self.request(
+            "POST",
+            "/api/mcp/modern/completion",
+            {
+                "reference_type": "ref/prompt",
+                "reference_id": "review",
+                "argument": {"name": "topic", "value": "MCP"},
+                "context": {"   ": "hidden"},
+            },
+        )
+        status, _result = self.request(
+            "POST",
+            "/api/mcp/modern/completion",
+            {
+                "reference_type": "ref/prompt",
+                "reference_id": "review",
+                "argument": {"name": "topic", "value": "MCP"},
+                "context": {"tenant": "local"},
+            },
+        )
+
+        assert invalid_status == 400
+        assert blank_key_status == 400
+        assert status == 200
+        assert observed == [{
+            "server_id": "modern",
+            "reference_type": "ref/prompt",
+            "reference_id": "review",
+            "argument": {"name": "topic", "value": "MCP"},
+            "context": {"tenant": "local"},
+            "actor": "gui",
+        }]
+
+    def test_mcp_v3_gui_host_resource_and_prompt_mrtr_round_trip(self) -> None:
+        import contextlib
+        import time
+
+        mcp_types = pytest.importorskip("mcp.types")
+        from agent_libos.mcp import (
+            InMemoryMcpCredentialBroker,
+            McpPromptSpec,
+            McpResourceSpec,
+            McpSdkV2SessionProvider,
+            McpServerManifestV3,
+        )
+        from agent_libos.models import McpHttpTransportSpec
+
+        runtime = self.server.service.runtime
+        manifest = McpServerManifestV3(
+            schema_version=3,
+            server_id="gui-host-mrtr",
+            transport="streamable_http",
+            http=McpHttpTransportSpec(url="http://127.0.0.1:8765/mcp"),
+            timeout_s=2.0,
+            max_request_bytes=16_384,
+            max_response_bytes=16_384,
+            protocol_mode=McpProtocolMode.REVISION_2026_07_28,
+            resources=(
+                McpResourceSpec(
+                    resource_id="document",
+                    remote_uri="opaque://provider/document",
+                ),
+            ),
+            prompts=(
+                McpPromptSpec(
+                    prompt_id="review",
+                    mcp_name="provider.review",
+                    argument_names=("subject",),
+                ),
+            ),
+        )
+        runtime.mcp.register_server(
+            manifest,
+            actor="runtime",
+            require_capability=False,
+        )
+        broker = InMemoryMcpCredentialBroker()
+        runtime._mcp_continuation_manager.broker = broker
+        initial_calls: list[tuple[str, Any]] = []
+
+        class Session:
+            protocol_version = "2026-07-28"
+
+            async def read_resource(self, selector: str, **kwargs: Any) -> Any:
+                initial_calls.append(("resource", (selector, kwargs)))
+                return mcp_types.InputRequiredResult(
+                    inputRequests={
+                        "resource-confirm": mcp_types.ElicitRequest(
+                            params=mcp_types.ElicitRequestFormParams(
+                                message="Approve the untrusted Resource?",
+                                requestedSchema={
+                                    "type": "object",
+                                    "properties": {
+                                        "approved": {"type": "boolean"}
+                                    },
+                                    "required": ["approved"],
+                                },
+                            )
+                        )
+                    },
+                    requestState="resource-state",
+                )
+
+            async def get_prompt(
+                self,
+                name: str,
+                arguments: dict[str, str],
+                **kwargs: Any,
+            ) -> Any:
+                initial_calls.append(("prompt", (name, arguments, kwargs)))
+                return mcp_types.InputRequiredResult(
+                    inputRequests={
+                        "prompt-confirm": mcp_types.ElicitRequest(
+                            params=mcp_types.ElicitRequestFormParams(
+                                message="Approve the untrusted Prompt?",
+                                requestedSchema={
+                                    "type": "object",
+                                    "properties": {
+                                        "approved": {"type": "boolean"}
+                                    },
+                                    "required": ["approved"],
+                                },
+                            )
+                        )
+                    },
+                    requestState="prompt-state",
+                )
+
+        @contextlib.asynccontextmanager
+        async def session_factory(_server: Any, *, deadline: float) -> Any:
+            assert deadline > time.monotonic()
+            yield Session()
+
+        sdk_provider = McpSdkV2SessionProvider(
+            session_factory,
+            result_adapter=runtime._mcp_v3_tool_provider.result_adapter,
+        )
+        runtime.mcp._modern_client.resource_provider = sdk_provider  # noqa: SLF001
+        runtime.mcp._modern_client.prompt_provider = sdk_provider  # noqa: SLF001
+        continuation_calls: list[tuple[str, Any]] = []
+
+        class ContinuationProvider:
+            async def continue_resource(
+                self,
+                server: Any,
+                resource_name: str,
+                logical_id: str,
+                input_responses: dict[str, Any],
+                request_state: str | None,
+                *,
+                deadline: float,
+            ) -> dict[str, Any]:
+                assert deadline > time.monotonic()
+                continuation_calls.append(
+                    (
+                        "resource",
+                        (
+                            server.server_id,
+                            resource_name,
+                            logical_id,
+                            input_responses,
+                            request_state,
+                        ),
+                    )
+                )
+                return {
+                    "resultType": "complete",
+                    "resource_id": logical_id,
+                    "contents": [
+                        {
+                            "kind": "text",
+                            "text": "approved resource",
+                            "annotations": None,
+                            "metadata": {},
+                        }
+                    ],
+                    "provenance": "untrusted_mcp_resource",
+                }
+
+            async def continue_prompt(
+                self,
+                server: Any,
+                prompt_name: str,
+                logical_id: str,
+                arguments: dict[str, str],
+                input_responses: dict[str, Any],
+                request_state: str | None,
+                *,
+                deadline: float,
+            ) -> dict[str, Any]:
+                assert deadline > time.monotonic()
+                continuation_calls.append(
+                    (
+                        "prompt",
+                        (
+                            server.server_id,
+                            prompt_name,
+                            logical_id,
+                            arguments,
+                            input_responses,
+                            request_state,
+                        ),
+                    )
+                )
+                return {
+                    "resultType": "complete",
+                    "prompt_id": logical_id,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": {
+                                "kind": "text",
+                                "text": "approved prompt",
+                                "annotations": None,
+                                "metadata": {},
+                            },
+                            "provenance": "untrusted_mcp_prompt",
+                        }
+                    ],
+                    "description": None,
+                    "user_confirmation_required": True,
+                }
+
+        runtime.mcp._modern_continuation_provider = ContinuationProvider()  # noqa: SLF001
+
+        def respond(pending: dict[str, Any]) -> dict[str, Any]:
+            assert pending["kind"] == "input_required"
+            status, result = self.request(
+                "POST",
+                f"/api/mcp/continuations/{pending['continuation_id']}/respond",
+                {
+                    "expected_revision": pending["revision"],
+                    "responses": {
+                        "input-1": {
+                            "action": "accept",
+                            "content": {"approved": True},
+                        }
+                    },
+                    "human_request_id": pending["human_request_id"],
+                    "human_expected_revision": pending["human_revision"],
+                    "human_preview_sha256": pending["human_preview_sha256"],
+                    "confirmed": True,
+                },
+            )
+            assert status == 200
+            return result
+
+        try:
+            resource_status, resource_pending = self.request(
+                "POST",
+                "/api/mcp/gui-host-mrtr/resources/read",
+                {"resource_id": "document"},
+            )
+            assert resource_status == 200, resource_pending
+            resource_complete = respond(resource_pending)
+
+            prompt_status, prompt_pending = self.request(
+                "POST",
+                "/api/mcp/gui-host-mrtr/prompts/get",
+                {"prompt_id": "review", "arguments": {"subject": "release"}},
+            )
+            assert prompt_status == 200, prompt_pending
+            prompt_complete = respond(prompt_pending)
+        finally:
+            broker.close()
+
+        assert resource_complete["value"]["resource_id"] == "document"
+        assert (
+            resource_complete["value"]["provenance"]
+            == "untrusted_mcp_resource"
+        )
+        assert prompt_complete["value"]["prompt_id"] == "review"
+        assert prompt_complete["value"]["user_confirmation_required"] is True
+        assert (
+            prompt_complete["value"]["messages"][0]["provenance"]
+            == "untrusted_mcp_prompt"
+        )
+        assert len(initial_calls) == 2
+        assert continuation_calls == [
+            (
+                "resource",
+                (
+                    "gui-host-mrtr",
+                    "opaque://provider/document",
+                    "document",
+                    {
+                        "resource-confirm": {
+                            "action": "accept",
+                            "content": {"approved": True},
+                        }
+                    },
+                    "resource-state",
+                ),
+            ),
+            (
+                "prompt",
+                (
+                    "gui-host-mrtr",
+                    "provider.review",
+                    "review",
+                    {"subject": "release"},
+                    {
+                        "prompt-confirm": {
+                            "action": "accept",
+                            "content": {"approved": True},
+                        }
+                    },
+                    "prompt-state",
+                ),
+            ),
+        ]
+
+    def test_mcp_v3_continuation_and_task_answers_require_human_receipts(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        observed: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+        def respond(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            observed.append(("respond", args, kwargs))
+            return {"kind": "complete", "value": None}
+
+        def update(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            observed.append(("update", args, kwargs))
+            return {
+                "kind": "remote_task",
+                "task_ref": "task-local",
+                "revision": 8,
+                "status": "working",
+                "input_requests": [],
+            }
+
+        mcp = self.server.service.runtime.mcp
+        monkeypatch.setattr(mcp, "respond_continuation", respond, raising=False)
+        monkeypatch.setattr(mcp, "update_remote_task", update, raising=False)
+        missing_status, _missing = self.request(
+            "POST",
+            "/api/mcp/continuations/continuation-local/respond",
+            {"expected_revision": 3, "responses": {"field": "yes"}, "confirmed": True},
+        )
+        malformed_status, _malformed = self.request(
+            "POST",
+            "/api/mcp/remote-tasks/task-local/update",
+            {
+                "expected_revision": 7,
+                "responses": {"field": "yes"},
+                "human_request_id": "human-local",
+                "human_expected_revision": 4,
+                "human_preview_sha256": "C" * 64,
+                "confirmed": True,
+            },
+        )
+        receipt = {
+            "human_request_id": "human-local",
+            "human_expected_revision": 4,
+            "human_preview_sha256": "c" * 64,
+        }
+        continuation_status, _continuation = self.request(
+            "POST",
+            "/api/mcp/continuations/continuation-local/respond",
+            {
+                "expected_revision": 3,
+                "responses": {"field": "yes"},
+                **receipt,
+                "confirmed": True,
+            },
+        )
+        task_status, _task = self.request(
+            "POST",
+            "/api/mcp/remote-tasks/task-local/update",
+            {
+                "expected_revision": 7,
+                "responses": {"field": "yes"},
+                **receipt,
+                "confirmed": True,
+            },
+        )
+
+        assert missing_status == 400
+        assert malformed_status == 400
+        assert continuation_status == 200
+        assert task_status == 200
+        assert [item[0] for item in observed] == ["respond", "update"]
+        assert observed[0][1] == ("continuation-local",)
+        assert observed[0][2] == {
+            "expected_revision": 3,
+            "responses": {"field": "yes"},
+            "human_request_id": "human-local",
+            "human_expected_revision": 4,
+            "human_preview_sha256": "c" * 64,
+            "actor": "gui",
+        }
+        assert observed[1][1] == ("task-local",)
+        assert observed[1][2] == {
+            "expected_revision": 7,
+            "responses": {"field": "yes"},
+            "human_request_id": "human-local",
+            "human_expected_revision": 4,
+            "human_preview_sha256": "c" * 64,
+            "actor": "gui",
+        }
+
+    def test_mcp_v3_continuation_inspect_and_task_reobserve_restore_durable_views(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+        continuation = {
+            "kind": "input_required",
+            "continuation_id": "continuation-reopened",
+            "revision": 12,
+            "respondable": True,
+            "input_requests": [],
+            "human_request_id": "human-reopened",
+            "human_revision": 4,
+            "human_preview_sha256": "a" * 64,
+        }
+        task = {
+            "kind": "remote_task",
+            "task_ref": "task-reopened",
+            "revision": 19,
+            "status": "working",
+            "input_requests": [],
+        }
+
+        def inspect(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            calls.append(("inspect", args, kwargs))
+            return continuation
+
+        def reobserve(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            calls.append(("get", args, kwargs))
+            return task
+
+        mcp = self.server.service.runtime.mcp
+        monkeypatch.setattr(mcp, "get_continuation", inspect, raising=False)
+        monkeypatch.setattr(mcp, "get_remote_task", reobserve, raising=False)
+
+        inspect_status, inspect_body = self.request(
+            "POST",
+            "/api/mcp/continuations/continuation-reopened/inspect",
+            {},
+        )
+        unknown_status, _unknown = self.request(
+            "POST",
+            "/api/mcp/continuations/continuation-reopened/inspect",
+            {"raw_request_state": "must-not-be-accepted"},
+        )
+        absent_status, _absent = self.request(
+            "POST", "/api/mcp/remote-tasks/task-reopened/get", {}
+        )
+        null_status, _null = self.request(
+            "POST",
+            "/api/mcp/remote-tasks/task-reopened/get",
+            {"expected_revision": None},
+        )
+        cas_status, _cas = self.request(
+            "POST",
+            "/api/mcp/remote-tasks/task-reopened/get",
+            {"expected_revision": 19},
+        )
+        invalid_status, _invalid = self.request(
+            "POST",
+            "/api/mcp/remote-tasks/task-reopened/get",
+            {"expected_revision": True},
+        )
+        update_without_cas_status, _update_without_cas = self.request(
+            "POST",
+            "/api/mcp/remote-tasks/task-reopened/update",
+            {
+                "responses": {},
+                "human_request_id": "human-reopened",
+                "human_expected_revision": 4,
+                "human_preview_sha256": "a" * 64,
+                "confirmed": True,
+            },
+        )
+        cancel_without_cas_status, _cancel_without_cas = self.request(
+            "POST",
+            "/api/mcp/remote-tasks/task-reopened/cancel",
+            {"confirmed": True},
+        )
+
+        assert inspect_status == 200
+        assert inspect_body == continuation
+        assert unknown_status == 400
+        assert (
+            absent_status,
+            null_status,
+            cas_status,
+            invalid_status,
+            update_without_cas_status,
+            cancel_without_cas_status,
+        ) == (
+            200,
+            200,
+            200,
+            400,
+            400,
+            400,
+        )
+        assert calls == [
+            (
+                "inspect",
+                ("continuation-reopened",),
+                {"actor": "gui"},
+            ),
+            (
+                "get",
+                ("task-reopened",),
+                {"expected_revision": None, "actor": "gui"},
+            ),
+            (
+                "get",
+                ("task-reopened",),
+                {"expected_revision": None, "actor": "gui"},
+            ),
+            (
+                "get",
+                ("task-reopened",),
+                {"expected_revision": 19, "actor": "gui"},
+            ),
+        ]
+
+    def test_mcp_v3_durable_reload_errors_and_secret_extras_fail_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mcp = self.server.service.runtime.mcp
+
+        def expired(*_args: Any, **_kwargs: Any) -> None:
+            raise ValidationError("MCP continuation expired")
+
+        monkeypatch.setattr(mcp, "get_continuation", expired, raising=False)
+        expired_status, expired_body = self.request(
+            "POST", "/api/mcp/continuations/expired-local/inspect", {}
+        )
+
+        def missing(*_args: Any, **_kwargs: Any) -> None:
+            raise ValidationError("MCP continuation was not found")
+
+        monkeypatch.setattr(mcp, "get_continuation", missing, raising=False)
+        missing_status, missing_body = self.request(
+            "POST", "/api/mcp/continuations/missing-local/inspect", {}
+        )
+
+        def leaking(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "kind": "input_required",
+                "continuation_id": "continuation-local",
+                "revision": 1,
+                "respondable": True,
+                "input_requests": [],
+                "human_request_id": "human-local",
+                "human_revision": 1,
+                "human_preview_sha256": "b" * 64,
+                "remote_task_id": "PRIVATE-REMOTE-TASK-ID",
+            }
+
+        monkeypatch.setattr(mcp, "get_continuation", leaking, raising=False)
+        leak_status, leak_body = self.request(
+            "POST", "/api/mcp/continuations/continuation-local/inspect", {}
+        )
+
+        assert expired_status == 400
+        assert missing_status == 400
+        assert "expired" in expired_body["error"]["message"]
+        assert "not found" in missing_body["error"]["message"]
+        assert leak_status == 502
+        assert leak_body["error"]["code"] == "mcp_private_projection_rejected"
+        assert "PRIVATE-REMOTE-TASK-ID" not in dumps(leak_body)
+
+    def test_mcp_v3_missing_runtime_surface_fails_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            self.server.service.runtime.mcp,
+            "list_resource_templates",
+            None,
+            raising=False,
+        )
+
+        status, body = self.request(
+            "POST", "/api/mcp/modern/resource-templates/list", {}
+        )
+
+        assert status == 501
+        assert body["error"] == {
+            "message": "MCP client surface is unavailable in this Runtime",
+            "code": "mcp_surface_unavailable",
+            "operation": "list_resource_templates",
+        }
+
+    def test_mcp_oauth_callback_and_remote_task_projection_do_not_reflect_secrets(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        callback_secret = "http://127.0.0.1/callback?code=PRIVATE-CODE&state=PRIVATE-STATE"
+
+        def reject_callback(*_args: Any, **_kwargs: Any) -> None:
+            raise ValidationError(f"invalid callback {callback_secret}")
+
+        monkeypatch.setattr(
+            self.server.service.runtime.mcp,
+            "auth_complete",
+            reject_callback,
+            raising=False,
+        )
+        callback_status, callback = self.request(
+            "POST",
+            "/api/mcp/auth/challenges/challenge-local/callback",
+            {"callback_url": callback_secret},
+        )
+
+        def leak_oauth_token(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "profile_id": "profile-local",
+                "status": "authorized",
+                "token": "PRIVATE-OAUTH-TOKEN",
+            }
+
+        monkeypatch.setattr(
+            self.server.service.runtime.mcp,
+            "auth_status",
+            leak_oauth_token,
+            raising=False,
+        )
+        oauth_status, oauth = self.request(
+            "GET",
+            "/api/mcp/auth/profile-local/status",
+        )
+
+        def leak_remote_id(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "kind": "remote_task",
+                "task_ref": "local-task",
+                "remote_task_id": "PRIVATE-REMOTE-ID",
+                "status": "working",
+            }
+
+        monkeypatch.setattr(
+            self.server.service.runtime.mcp,
+            "get_remote_task",
+            leak_remote_id,
+            raising=False,
+        )
+        task_status, task = self.request(
+            "POST",
+            "/api/mcp/remote-tasks/local-task/get",
+            {"expected_revision": 0},
+        )
+
+        assert callback_status == 400
+        assert callback["error"] == {
+            "message": "MCP OAuth callback was rejected",
+            "code": "mcp_oauth_callback_rejected",
+        }
+        assert "PRIVATE-CODE" not in dumps(callback)
+        assert "PRIVATE-STATE" not in dumps(callback)
+        assert oauth_status == 502
+        assert oauth["error"]["code"] == "mcp_private_projection_rejected"
+        assert "PRIVATE-OAUTH-TOKEN" not in dumps(oauth)
+        assert task_status == 502
+        assert task["error"]["code"] == "mcp_private_projection_rejected"
+        assert "PRIVATE-REMOTE-ID" not in dumps(task)
+
+    def test_mcp_oauth_profile_admin_scrubs_transient_secret_on_every_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        secret = "GUI-OAUTH-CLIENT-SECRET-SENTINEL"
+        profile = _gui_mcp_oauth_profile()
+        mcp = self.server.service.runtime.mcp
+        calls: list[tuple[str, bytes | None, str]] = []
+        cache_at_response: list[str] = []
+        original_write_json = GuiRequestHandler._write_json
+
+        def observe_cache(
+            handler: GuiRequestHandler,
+            value: Any,
+            *,
+            status: int = 200,
+        ) -> None:
+            cache_at_response.append(
+                repr(getattr(handler, "_cached_json_body", {}))
+            )
+            original_write_json(handler, value, status=status)
+
+        def add_profile(
+            selected: Any,
+            *,
+            client_secret: bytes | None,
+            actor: str,
+        ) -> dict[str, Any]:
+            calls.append((selected.profile_id, client_secret, actor))
+            return {
+                "profile_id": selected.profile_id,
+                "status": "authorization_required",
+                "scopes": [],
+            }
+
+        monkeypatch.setattr(GuiRequestHandler, "_write_json", observe_cache)
+        monkeypatch.setattr(mcp, "add_oauth_profile", add_profile, raising=False)
+
+        invalid_status, invalid = self.request(
+            "POST",
+            "/api/mcp/auth/profiles",
+            {
+                "profile": {**profile, "registration_mode": "dcr"},
+                "client_secret": secret,
+                "replace": False,
+                "confirmed": True,
+            },
+        )
+        unknown_status, unknown = self.request(
+            "POST",
+            "/api/mcp/auth/profiles",
+            {
+                "profile": profile,
+                "client_secret": secret,
+                "replace": False,
+                "confirmed": True,
+                "unexpected": True,
+            },
+        )
+        confirmation_status, confirmation = self.request(
+            "POST",
+            "/api/mcp/auth/profiles",
+            {
+                "profile": profile,
+                "client_secret": secret,
+                "replace": True,
+                "confirmed": False,
+            },
+        )
+
+        def reject_profile(
+            _selected: Any,
+            *,
+            client_secret: bytes | None,
+            actor: str,
+        ) -> None:
+            assert client_secret == secret.encode("utf-8")
+            assert actor == "gui"
+            raise ValidationError(f"broker rejected {secret}")
+
+        monkeypatch.setattr(
+            mcp,
+            "add_oauth_profile",
+            reject_profile,
+            raising=False,
+        )
+        rejected_status, rejected = self.request(
+            "POST",
+            "/api/mcp/auth/profiles",
+            {
+                "profile": profile,
+                "client_secret": secret,
+                "replace": False,
+                "confirmed": True,
+            },
+        )
+        monkeypatch.setattr(mcp, "add_oauth_profile", add_profile, raising=False)
+        added_status, added = self.request(
+            "POST",
+            "/api/mcp/auth/profiles",
+            {
+                "profile": profile,
+                "client_secret": secret,
+                "replace": False,
+                "confirmed": True,
+            },
+        )
+
+        assert (invalid_status, unknown_status, confirmation_status) == (
+            400,
+            400,
+            409,
+        )
+        assert rejected_status == 400
+        assert rejected["error"] == {
+            "message": "MCP OAuth profile change was rejected",
+            "code": "mcp_oauth_profile_change_rejected",
+        }
+        assert added_status == 200
+        assert added == {
+            "profile_id": "profile-local",
+            "status": "authorization_required",
+            "scopes": [],
+        }
+        assert calls == [("profile-local", secret.encode("utf-8"), "gui")]
+        assert invalid["error"]["code"] == "invalid_mcp_oauth_profile"
+        assert unknown["error"]["code"] == "unknown_request_field"
+        assert confirmation["error"]["action"] == "mcp.auth.profile.replace"
+
+        public_state = dumps(
+            {
+                "responses": [invalid, unknown, confirmation, rejected, added],
+                "audit": [
+                    to_jsonable(item)
+                    for item in self.server.service.runtime.audit.trace()
+                ],
+                "events": [
+                    to_jsonable(item)
+                    for item in self.server.service.broadcaster.replay_after(0)
+                ],
+                "handler_cache_at_response": cache_at_response,
+            }
+        )
+        assert secret not in public_state
+        assert cache_at_response
+
+    def test_mcp_oauth_profile_admin_routes_use_exact_gui_host_facades(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        profile = _gui_mcp_oauth_profile()
+        status = {
+            "profile_id": "profile-local",
+            "status": "authorization_required",
+            "scopes": ["resource.read"],
+        }
+        calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+        def operation(name: str, result: Any):
+            def selected(*args: Any, **kwargs: Any) -> Any:
+                calls.append((name, args, kwargs))
+                return result
+
+            return selected
+
+        mcp = self.server.service.runtime.mcp
+        monkeypatch.setattr(
+            mcp,
+            "list_oauth_profiles",
+            operation("list", (status,)),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            mcp,
+            "replace_oauth_profile",
+            operation("replace", status),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            mcp,
+            "remove_oauth_profile",
+            operation("remove", {**status, "status": "revoked"}),
+            raising=False,
+        )
+
+        list_status, listed = self.request("GET", "/api/mcp/auth/profiles")
+        replace_status, replaced = self.request(
+            "POST",
+            "/api/mcp/auth/profiles",
+            {
+                "profile": profile,
+                "client_secret": "one-time-secret",
+                "replace": True,
+                "confirmed": True,
+            },
+        )
+        remove_status, removed = self.request(
+            "POST",
+            "/api/mcp/auth/profiles/profile-local/remove",
+            {"confirmed": True},
+        )
+        null_secret_status, _null_secret = self.request(
+            "POST",
+            "/api/mcp/auth/profiles",
+            {
+                "profile": profile,
+                "client_secret": None,
+                "replace": True,
+                "confirmed": True,
+            },
+        )
+
+        assert (list_status, replace_status, remove_status) == (200, 200, 200)
+        assert listed == [status]
+        assert replaced == status
+        assert removed["status"] == "revoked"
+        assert null_secret_status == 400
+        assert [item[0] for item in calls] == ["list", "replace", "remove"]
+        assert calls[0][1] == ()
+        assert calls[0][2] == {"actor": "gui"}
+        selected_profile = calls[1][1][0]
+        assert selected_profile.profile_id == "profile-local"
+        assert selected_profile.server_id == "modern"
+        assert calls[1][2] == {
+            "client_secret": b"one-time-secret",
+            "actor": "gui",
+        }
+        assert calls[2][1] == ("profile-local",)
+        assert calls[2][2] == {"actor": "gui"}
+
+    def test_mcp_subscription_routes_never_poll_or_reconnect_implicitly(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+        def operation(name: str, result: Any):
+            def selected(*args: Any, **kwargs: Any) -> Any:
+                calls.append((name, args, kwargs))
+                return result
+            return selected
+
+        active = {
+            "subscription_id": "sub-local",
+            "server_id": "modern",
+            "status": "active",
+            "requested_filters": ["resources/updated"],
+            "acknowledged_filters": ["resources/updated"],
+        }
+        mcp = self.server.service.runtime.mcp
+        monkeypatch.setattr(mcp, "start_subscription", operation("start", active), raising=False)
+        monkeypatch.setattr(mcp, "subscription_status", operation("status", active), raising=False)
+        monkeypatch.setattr(mcp, "subscription_events", operation("events", []), raising=False)
+
+        start_status, _start = self.request(
+            "POST",
+            "/api/mcp/modern/subscriptions/start",
+            {"filters": ["resources/updated"], "confirmed": True},
+        )
+        status_status, _status = self.request(
+            "POST", "/api/mcp/subscriptions/sub-local/status", {}
+        )
+        events_status, events = self.request(
+            "POST",
+            "/api/mcp/subscriptions/sub-local/events",
+            {"after": 0, "limit": 10},
+        )
+
+        assert (start_status, status_status, events_status) == (200, 200, 200)
+        assert events == []
+        assert [item[0] for item in calls] == ["start", "status", "events"]
+        assert calls[0][2]["actor"] == "gui"
+        assert calls[0][2]["filters"] == ("resources/updated",)
+
+    def test_mcp_subscription_event_route_preserves_single_reader_cursor(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cursor = 0
+
+        def consume_events(
+            subscription_id: str,
+            *,
+            after: int,
+            limit: int,
+            actor: str,
+        ) -> tuple[McpSubscriptionEvent, ...]:
+            nonlocal cursor
+            assert subscription_id == "subscription-local"
+            assert limit == 1
+            assert actor == "gui"
+            if after != cursor:
+                raise ValidationError(
+                    "MCP subscription event cursor is stale or has multiple readers"
+                )
+            if cursor != 0:
+                return ()
+            cursor = 1
+            return (
+                McpSubscriptionEvent(
+                    sequence=1,
+                    event_type="resourcesListChanged",
+                    payload={"changed": True},
+                    received_at="2026-08-11T00:00:00Z",
+                ),
+            )
+
+        monkeypatch.setattr(
+            self.server.service.runtime.mcp,
+            "subscription_events",
+            consume_events,
+            raising=False,
+        )
+        first_status, first = self.request(
+            "POST",
+            "/api/mcp/subscriptions/subscription-local/events",
+            {"after": 0, "limit": 1},
+        )
+        stale_status, stale = self.request(
+            "POST",
+            "/api/mcp/subscriptions/subscription-local/events",
+            {"after": 0, "limit": 1},
+        )
+        next_status, next_events = self.request(
+            "POST",
+            "/api/mcp/subscriptions/subscription-local/events",
+            {"after": 1, "limit": 1},
+        )
+
+        assert first_status == 200
+        assert first[0]["sequence"] == 1
+        assert stale_status == 400
+        assert "multiple readers" in stale["error"]["message"]
+        assert (next_status, next_events) == (200, [])
+
     def test_mcp_register_actor_mode_requires_server_write_capability(self) -> None:
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'mcp actor', 'auto_run': False})
         pid = spawned['pid']
@@ -5680,7 +7334,7 @@ class TestGuiServer:
         )
 
         assert status == 400
-        assert 'arguments must be a JSON object' in body['error']['message']
+        assert body['error']['message'] == 'MCP tool arguments must be a strict JSON object'
 
     def test_mcp_provider_exception_secret_is_absent_from_gui_response(self) -> None:
         secret = "GUI_MCP_HOST_EXCEPTION_SECRET_SENTINEL"
@@ -5770,8 +7424,135 @@ class TestGuiServer:
 
         assert status == 200
         assert body['ok'] is False
-        assert set(body['error']) == {'code', 'error_type', 'correlation_id'}
+        assert set(body['error']) == {
+            'code',
+            'error_type',
+            'correlation_id',
+            'retryable',
+            'automatic_retry_disabled',
+        }
+        assert body['error']['retryable'] is False
+        assert body['error']['automatic_retry_disabled'] is True
         assert secret not in json.dumps(body, sort_keys=True)
+
+    def test_mcp_v3_tool_exception_redacts_active_header_secret_from_gui_and_evidence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from agent_libos.mcp import McpServerManifestV3
+        from agent_libos.models import (
+            McpHeaderSpec,
+            McpHttpTransportSpec,
+            McpToolSpec,
+            ResourceBudget,
+        )
+
+        secret = "GUI_MODERN_MCP_HEADER_SECRET_SENTINEL"
+        env_name = "AGENT_LIBOS_MCP_GUI_MODERN_SECRET"
+        monkeypatch.setenv(env_name, secret)
+
+        class FailingModernToolProvider:
+            mcp_manifest_schema_version = 3
+            mcp_protocol_revision = "2026-07-28"
+
+            async def call_tool(
+                self,
+                _manifest: Any,
+                _tool_id: str,
+                _arguments: dict[str, Any],
+                *,
+                deadline: float,
+                sensitive_values: tuple[str, ...] = (),
+            ) -> Any:
+                assert deadline > 0
+                assert secret in sensitive_values
+                raise ValidationError(
+                    f"modern Tool Provider reflected {sensitive_values[0]}"
+                )
+
+        runtime = self.server.service.runtime
+        server_id = "gui-modern-provider-failure"
+        runtime.mcp.register_server(
+            McpServerManifestV3(
+                schema_version=3,
+                server_id=server_id,
+                transport="streamable_http",
+                http=McpHttpTransportSpec(
+                    url="http://127.0.0.1:8765/mcp",
+                    headers={
+                        "Authorization": McpHeaderSpec(
+                            env=env_name,
+                            prefix="Bearer ",
+                        )
+                    },
+                ),
+                timeout_s=2.0,
+                max_request_bytes=16_384,
+                max_response_bytes=16_384,
+                protocol_mode=McpProtocolMode.REVISION_2026_07_28,
+                tools=(
+                    McpToolSpec(
+                        tool_id="echo",
+                        mcp_name="provider.echo",
+                        right="read",
+                        rollback_class="no_rollback_required",
+                        rollback_status="not_required",
+                        state_mutation=False,
+                        information_flow=True,
+                        input_schema={
+                            "type": "object",
+                            "additionalProperties": False,
+                        },
+                    ),
+                ),
+            ),
+            actor="runtime",
+            require_capability=False,
+        )
+        runtime.mcp._modern_tool_provider = FailingModernToolProvider()  # noqa: SLF001
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="reject reflected modern MCP credentials in GUI",
+            resource_budget=ResourceBudget(max_mcp_bytes=256_000),
+        )
+        runtime.capability.grant(
+            pid,
+            f"mcp:{server_id}:echo",
+            [CapabilityRight.READ],
+            issued_by="test",
+        )
+        runtime.capability.grant(
+            pid,
+            f"mcp_server:{server_id}",
+            [CapabilityRight.EXECUTE],
+            issued_by="test",
+        )
+
+        status, body = self.request(
+            "POST",
+            f"/api/mcp/{server_id}/call",
+            {
+                "pid": pid,
+                "tool_id": "echo",
+                "arguments": {},
+                "confirmed": True,
+            },
+        )
+
+        assert status == 400
+        public = json.dumps(body, sort_keys=True)
+        assert "MCP provider operation failed" in public
+        assert secret not in public
+        evidence = dumps(
+            {
+                "audit": [to_jsonable(row) for row in runtime.audit.trace()],
+                "effects": [
+                    to_jsonable(row)
+                    for row in runtime.store.list_external_effects(pid=pid)
+                ],
+            }
+        )
+        assert secret not in evidence
 
     def test_skill_register_without_actor_rejects_host_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5938,7 +7719,7 @@ class TestGuiServer:
         runtime = self.server.service.runtime
         pid = runtime.process.spawn(image='base-agent:v0', goal='typed gui permission')
         resource = runtime.filesystem.resource_for('agent_outputs/typed-gui.txt')
-        request_id = runtime.human.query(
+        request_id = runtime.human.query_authority_request(
             pid=pid,
             human=DEFAULT_CONFIG.runtime.default_human,
             request={
@@ -5952,6 +7733,7 @@ class TestGuiServer:
                 },
             },
             blocking=True,
+            authority_origin='permission_policy',
         )
         presented = self.server.service.human_request_view(
             runtime.human.get(request_id)
@@ -6089,7 +7871,7 @@ class TestGuiServer:
     def test_permission_response_without_approved_uses_explicit_deny_policy(self) -> None:
         runtime = self.server.service.runtime
         pid = runtime.process.spawn(image='base-agent:v0', goal='gui human default reject')
-        request_id = runtime.human.query(
+        request_id = runtime.human.query_authority_request(
             pid=pid,
             human=DEFAULT_CONFIG.runtime.default_human,
             request={
@@ -6102,6 +7884,7 @@ class TestGuiServer:
                 },
             },
             blocking=True,
+            authority_origin='permission_policy',
         )
 
         status, rejected = self.request(
@@ -6304,3 +8087,22 @@ timeout_s: 5
 max_request_bytes: 65536
 max_response_bytes: 1048576
 """.lstrip()
+
+
+def _gui_mcp_oauth_profile() -> dict[str, Any]:
+    return {
+        "profile_id": "profile-local",
+        "server_id": "modern",
+        "resource_uri": "https://resource.example/mcp",
+        "expected_issuer": "https://issuer.example",
+        "redirect_uri": "http://127.0.0.1/callback",
+        "client_id": "gui-client",
+        "registration_mode": "preregistered",
+        "token_endpoint_auth_method": "client_secret_basic",
+        "allowed_scopes": ["resource.read"],
+        "default_scopes": ["resource.read"],
+        "allowed_endpoint_origins": ["https://issuer.example"],
+        "allow_loopback_http": True,
+        "protocol_revision": "2026-07-28",
+        "transport": "streamable_http",
+    }

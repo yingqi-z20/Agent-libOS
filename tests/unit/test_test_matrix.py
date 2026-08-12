@@ -58,6 +58,38 @@ class TestTestMatrix:
         assert "--run-mcp" in command
         assert command[-2:] == ["-m", "not postgres and not real_llm"]
 
+    def test_run_mcp_rejects_an_incomplete_optional_dependency_set(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        parser = argparse.ArgumentParser()
+        monkeypatch.setattr(
+            test_matrix,
+            "missing_mcp_optional_dependencies",
+            lambda: ("httpx2", "opentelemetry-api"),
+        )
+
+        with pytest.raises(SystemExit):
+            test_matrix._validate_args(parser, _args(run_mcp=True))
+
+        error = capsys.readouterr().err
+        assert "httpx2, opentelemetry-api" in error
+        assert "uv sync --frozen --extra mcp" in error
+
+    def test_run_mcp_accepts_the_complete_optional_dependency_set(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        parser = argparse.ArgumentParser()
+        monkeypatch.setattr(
+            test_matrix,
+            "missing_mcp_optional_dependencies",
+            lambda: (),
+        )
+
+        test_matrix._validate_args(parser, _args(run_mcp=True))
+
     def test_keep_agent_outputs_sets_pytest_environment(self) -> None:
         assert test_matrix._pytest_env(_args(keep_agent_outputs=True)) == {
             "AGENT_LIBOS_KEEP_AGENT_OUTPUTS": "1"
@@ -94,6 +126,238 @@ class TestTestMatrix:
 
         assert command[:4] == [test_matrix.sys.executable, "-m", "pytest", "tests"]
         assert command[4:8] == ["-n", "4", "--dist", "load"]
+
+    @pytest.mark.parametrize(
+        ("lane", "selected_path", "has_monitor_phase"),
+        [
+            ("runtime", "tests/runtime", False),
+            ("security", "tests/security", True),
+            ("self-evolution", "tests/self_evolution", True),
+            ("providers", "tests/providers", False),
+            ("all", "tests", True),
+        ],
+    )
+    def test_parallel_lane_runs_real_deno_in_a_separate_serial_phase(
+        self,
+        lane: str,
+        selected_path: str,
+        has_monitor_phase: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            test_matrix.shutil,
+            "which",
+            lambda name: "/usr/bin/deno" if name == "deno" else None,
+        )
+
+        commands = test_matrix._commands_for(
+            _args(lane=lane, workers="4", dist="load")
+        )
+
+        assert len(commands) == (3 if has_monitor_phase else 2)
+        parallel = commands[1] if has_monitor_phase else commands[0]
+        real_deno = commands[-1]
+        assert parallel.argv[4:8] == ["-n", "4", "--dist", "load"]
+        assert parallel.argv[-2:] == [
+            "-m",
+            "not postgres and not real_deno and not real_llm and not mcp",
+        ]
+        expected_general_marker = "not postgres and real_deno"
+        if has_monitor_phase:
+            expected_general_marker += " and not deno_resource_monitor"
+        expected_general_marker += " and not real_llm and not mcp"
+        assert real_deno.argv[-2:] == [
+            "-m",
+            expected_general_marker,
+        ]
+        assert parallel.invariant_test_paths == (selected_path,)
+        assert real_deno.invariant_test_paths == (selected_path,)
+        assert parallel.invariant_marker_expression == parallel.argv[-1]
+        assert real_deno.invariant_marker_expression == real_deno.argv[-1]
+        assert not parallel.allow_no_tests
+        assert real_deno.allow_no_tests
+        assert real_deno.argv[4:6] == ["-n", "0"]
+        assert "--dist" not in real_deno.argv
+        if has_monitor_phase:
+            monitor = commands[0]
+            assert monitor.argv[4:6] == ["-n", "0"]
+            assert "--dist" not in monitor.argv
+            assert monitor.argv[-2:] == [
+                "-m",
+                "not postgres and real_deno and deno_resource_monitor "
+                "and not real_llm and not mcp",
+            ]
+            assert monitor.invariant_test_paths == (selected_path,)
+            assert monitor.invariant_marker_expression == monitor.argv[-1]
+            assert monitor.allow_no_tests
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"skip_real_deno": True, "workers": "4"},
+            {"skip_real_deno": False, "workers": "1"},
+        ],
+    )
+    def test_real_deno_phase_is_not_added_when_skipped_or_already_serial(
+        self,
+        overrides: dict[str, object],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(test_matrix.shutil, "which", lambda _name: "/usr/bin/deno")
+
+        commands = test_matrix._commands_for(
+            _args(lane="self-evolution", **overrides)
+        )
+
+        assert len(commands) == 1
+        if overrides["skip_real_deno"]:
+            assert "--skip-real-deno" in commands[0].argv
+            assert "not real_deno" in commands[0].argv[-1]
+
+    def test_real_deno_phase_is_not_added_when_deno_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(test_matrix.shutil, "which", lambda _name: None)
+
+        commands = test_matrix._commands_for(
+            _args(lane="security", workers="4", dist="worksteal")
+        )
+
+        assert len(commands) == 1
+        assert "not real_deno" not in commands[0].argv[-1]
+
+    def test_real_deno_phase_preserves_mcp_and_real_llm_filters(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(test_matrix.shutil, "which", lambda _name: "/usr/bin/deno")
+
+        commands = test_matrix._commands_for(
+            _args(
+                lane="providers",
+                workers="3",
+                dist="worksteal",
+                run_real_llm=True,
+                run_mcp=True,
+            )
+        )
+
+        assert commands[0].argv[-2:] == [
+            "-m",
+            "not postgres and not real_deno",
+        ]
+        assert commands[1].argv[-2:] == [
+            "-m",
+            "not postgres and real_deno",
+        ]
+        for command in commands:
+            assert "--run-real-llm" in command.argv
+            assert "--run-mcp" in command.argv
+
+    def test_real_deno_shard_reuses_paths_and_names_the_shard(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(test_matrix.shutil, "which", lambda _name: "/usr/bin/deno")
+        args = _args(
+            lane="self-evolution",
+            workers="4",
+            dist="worksteal",
+            shard_count=2,
+            shard_index=1,
+        )
+
+        commands = test_matrix._commands_for(args)
+
+        assert len(commands) == 3
+        selected_paths = commands[0].invariant_test_paths
+        assert selected_paths
+        assert all(command.invariant_test_paths == selected_paths for command in commands)
+        assert all("shard 2/2" in command.name for command in commands)
+        assert "workers" not in commands[0].name
+        assert "workers" not in commands[2].name
+        assert "workers" in commands[1].name
+
+    def test_optional_real_deno_phase_accepts_only_pytest_no_tests_status(self) -> None:
+        optional = test_matrix.Command(
+            "optional real Deno",
+            [test_matrix.sys.executable, "-m", "pytest"],
+            invariant_marker_expression="real_deno",
+            allow_no_tests=True,
+        )
+        required = test_matrix.Command(
+            "required pytest",
+            [test_matrix.sys.executable, "-m", "pytest"],
+        )
+        non_pytest = test_matrix.Command(
+            "unrelated helper",
+            ["helper"],
+            allow_no_tests=True,
+        )
+
+        assert test_matrix._normalize_command_status(optional, 5) == 0
+        assert test_matrix._normalize_command_status(optional, 1) == 1
+        assert test_matrix._normalize_command_status(required, 5) == 5
+        assert test_matrix._normalize_command_status(non_pytest, 5) == 5
+
+    def test_main_propagates_parallel_phase_failure_before_serial_phase(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        commands = [
+            test_matrix.Command(
+                "parallel",
+                [test_matrix.sys.executable, "-m", "pytest", "tests/unit"],
+            ),
+            test_matrix.Command(
+                "real Deno",
+                [test_matrix.sys.executable, "-m", "pytest", "tests/unit"],
+                allow_no_tests=True,
+            ),
+        ]
+        invoked: list[str] = []
+        monkeypatch.setattr(test_matrix, "_commands_for", lambda _args: commands)
+
+        def run(command: test_matrix.Command, *, max_seconds: float) -> int:
+            del max_seconds
+            invoked.append(command.name)
+            return 1
+
+        monkeypatch.setattr(test_matrix, "_run", run)
+
+        assert test_matrix.main(["--lane", "unit"]) == 1
+        assert invoked == ["parallel"]
+
+    def test_main_accepts_no_tests_only_for_optional_serial_phase(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        command = test_matrix.Command(
+            "real Deno",
+            [test_matrix.sys.executable, "-m", "pytest", "tests/unit"],
+            invariant_test_paths=("tests/unit",),
+            invariant_marker_expression="real_deno",
+            allow_no_tests=True,
+        )
+        invoked: list[str] = []
+        monkeypatch.setattr(test_matrix, "_commands_for", lambda _args: [command])
+
+        def run(command: test_matrix.Command, *, max_seconds: float) -> int:
+            del max_seconds
+            invoked.append(command.name)
+            assert command.env is not None
+            receipt = command.env["AGENT_LIBOS_INVARIANT_EXECUTION_RECEIPT"]
+            Path(receipt).write_text(
+                '{"passed_node_ids": [], "schema_version": 1}',
+                encoding="utf-8",
+            )
+            return test_matrix.PYTEST_NO_TESTS_EXIT_CODE
+
+        monkeypatch.setattr(test_matrix, "_run", run)
+
+        assert test_matrix.main(["--lane", "unit"]) == 0
+        assert invoked == ["real Deno"]
 
     def test_pytest_args_include_requested_slowest_durations(self) -> None:
         command = test_matrix._pytest_args(("tests/security",), _args(durations=25))

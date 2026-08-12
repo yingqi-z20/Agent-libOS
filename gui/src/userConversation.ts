@@ -138,13 +138,22 @@ export function isHumanDecision(request: HumanRequest): boolean {
 }
 
 export function humanRequestDecisionText(request: HumanRequest): string {
+  if (isExternalOperationApproval(request)) return "";
   const decision = request.decision ?? {};
   const answer = decision.answer;
   if (answer !== undefined && answer !== null) return String(answer);
   return "";
 }
 
-export function humanRequestPrompt(request: HumanRequest): string {
+export function isExternalOperationApproval(request: HumanRequest): boolean {
+  return request.payload?.type === "external_operation_approval";
+}
+
+export function humanRequestPrompt(
+  request: HumanRequest,
+  externalPrompt = "External operation approval"
+): string {
+  if (isExternalOperationApproval(request)) return externalPrompt;
   return String(
     request.payload?.question ??
       request.payload?.reason ??

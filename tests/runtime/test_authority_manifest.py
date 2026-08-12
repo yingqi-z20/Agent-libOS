@@ -20,6 +20,38 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, ProcessError, ValidationError
 
 
+def _host_external_read_request(
+    pid: str,
+    resource: str,
+    *,
+    expires_at: object,
+) -> dict[str, object]:
+    """Compose the exact Host-owned external approval shape used by primitives."""
+
+    return {
+        "type": "external_operation_approval",
+        "question": "Allow this exact read?",
+        "requested_once_capability": {
+            "subject": pid,
+            "resource": resource,
+            "rights": [CapabilityRight.READ.value],
+            "constraints": {},
+            "delegable": False,
+            "expires_at": expires_at,
+        },
+        "context": {
+            "adapter": "filesystem",
+            "authority_operation": "filesystem.read",
+            "primitive": "runtime.filesystem.read_text",
+            "operation": "read_text",
+            "pid": pid,
+            "resource": resource,
+            "right": CapabilityRight.READ.value,
+            "target_state_version": None,
+        },
+    }
+
+
 def test_image_requirements_are_declared_but_not_granted_by_default() -> None:
     runtime = Runtime.open("local")
     try:
@@ -323,7 +355,7 @@ def test_manifest_expiry_caps_human_requested_capability_variants() -> None:
     try:
         manifest_expiry = "2099-01-01T00:00:00Z"
         permanent_resource = "object:human-grant"
-        once_resource = "object:human-grant-once"
+        once_resource = "filesystem:workspace:human-grant-once.txt"
         pid = runtime.process.spawn(
             goal="bound all Human capability variants",
             authority_manifest={
@@ -333,29 +365,41 @@ def test_manifest_expiry_caps_human_requested_capability_variants() -> None:
                         "rights": [CapabilityRight.WRITE.value],
                     }
                 ],
+                "approval_policy": {
+                    "requestable_capabilities": [
+                        {
+                            "resource": permanent_resource,
+                            "rights": [CapabilityRight.READ.value],
+                        }
+                    ]
+                },
                 "expires_at": manifest_expiry,
             },
         )
-        request_id = runtime.human.query(
+        permanent_request_id = runtime.human.request_permission(
             pid,
             DEFAULT_CONFIG.runtime.default_human,
-            {
-                "type": "approval",
-                "question": "grant bounded capabilities",
-                "requested_capability": {
-                    "resource": permanent_resource,
-                    "rights": [CapabilityRight.READ.value],
-                    "expires_at": "2199-01-01T00:00:00Z",
-                },
-                "requested_once_capability": {
-                    "resource": once_resource,
-                    "rights": [CapabilityRight.READ.value],
-                    "expires_at": "2199-01-01T00:00:00Z",
-                },
-            },
+            permanent_resource,
+            [CapabilityRight.READ.value],
+            "grant a manifest-bounded persistent capability",
             blocking=False,
         )
-        runtime.human.approve(request_id)
+        once_request_id = runtime.human.query_authority_request(
+            pid,
+            DEFAULT_CONFIG.runtime.default_human,
+            _host_external_read_request(
+                pid,
+                once_resource,
+                expires_at="2199-01-01T00:00:00Z",
+            ),
+            blocking=False,
+            authority_origin="external_operation",
+        )
+        runtime.human.approve(
+            permanent_request_id,
+            {"approved": True, "policy": CapabilityManager.ALWAYS_ALLOW},
+        )
+        runtime.human.approve(once_request_id)
 
         grants = {
             cap.resource: cap
@@ -436,32 +480,21 @@ def test_standard_permission_request_inherits_requestable_expiry_ceiling(
 def test_human_capability_grant_rejects_malformed_expiry(expires_at: object) -> None:
     runtime = Runtime.open("local")
     try:
-        resource = "object:invalid-human-expiry"
+        resource = "filesystem:workspace:invalid-human-expiry.txt"
         pid = runtime.process.spawn(goal="reject invalid Human lease")
-        runtime.capability.grant(
-            pid,
-            DEFAULT_CONFIG.runtime.default_human_resource,
-            [CapabilityRight.WRITE],
-            issued_by="test.host",
-        )
-        request_id = runtime.human.query(
-            pid,
-            DEFAULT_CONFIG.runtime.default_human,
-            {
-                "type": "approval",
-                "question": "invalid lease must not become permanent",
-                "requested_capability": {
-                    "resource": resource,
-                    "rights": [CapabilityRight.READ.value],
-                    "expires_at": expires_at,
-                },
-            },
-            blocking=False,
-        )
-
         with pytest.raises(ValidationError, match="expires_at"):
-            runtime.human.approve(request_id)
-        assert runtime.human.get(request_id).status.value == "pending"
+            runtime.human.query_authority_request(
+                pid,
+                DEFAULT_CONFIG.runtime.default_human,
+                _host_external_read_request(
+                    pid,
+                    resource,
+                    expires_at=expires_at,
+                ),
+                blocking=False,
+                authority_origin="external_operation",
+            )
+        assert runtime.human.list(pid) == []
         assert not any(
             cap.resource == resource for cap in runtime.capability.capabilities_for(pid)
         )
@@ -487,33 +520,65 @@ def test_human_capability_grant_rejects_malformed_authority_fields() -> None:
             ("constraints-string", {"rights": ["read"], "constraints": "none"}),
         ]
 
+        # Generic Human questions are never an authority-composition boundary,
+        # even when the smuggled specification happens to look well formed.
         for request_field in (
             "requested_capability",
             "requested_once_capability",
         ):
-            for case, malformed in malformed_specs:
-                resource = f"object:invalid-human-authority:{request_field}:{case}"
-                request_id = runtime.human.query(
+            resource = f"object:smuggled-human-authority:{request_field}"
+            smuggled_spec: dict[str, object] = {
+                "resource": resource,
+                "rights": [CapabilityRight.READ.value],
+            }
+            if request_field == "requested_once_capability":
+                smuggled_spec.update({"subject": pid, "constraints": {}})
+            with pytest.raises(
+                ValidationError,
+                match="generic human query.*authority",
+            ):
+                runtime.human.query(
                     pid,
                     DEFAULT_CONFIG.runtime.default_human,
                     {
                         "type": "approval",
-                        "question": "malformed authority must fail closed",
-                        request_field: {
-                            "resource": resource,
-                            **malformed,
-                        },
+                        "question": "generic questions cannot mint authority",
+                        request_field: smuggled_spec,
                     },
                     blocking=False,
                 )
+            assert runtime.human.list(pid) == []
+            assert not any(
+                cap.resource == resource
+                for cap in runtime.capability.capabilities_for(pid)
+            )
 
-                with pytest.raises(ValidationError):
-                    runtime.human.approve(request_id)
-                assert runtime.human.get(request_id).status.value == "pending"
-                assert not any(
-                    cap.resource == resource
-                    for cap in runtime.capability.capabilities_for(pid)
+        # A genuine Host composition call still rejects malformed one-shot
+        # authority before persistence; the trusted entry does not relax shape
+        # validation or silently normalize malformed fields.
+        for case, malformed in malformed_specs:
+            resource = f"filesystem:workspace:invalid-human-authority-{case}.txt"
+            payload = _host_external_read_request(
+                pid,
+                resource,
+                expires_at="2099-01-01T00:00:00Z",
+            )
+            once = payload["requested_once_capability"]
+            assert isinstance(once, dict)
+            once.update(malformed)
+            with pytest.raises(ValidationError):
+                runtime.human.query_authority_request(
+                    pid,
+                    DEFAULT_CONFIG.runtime.default_human,
+                    payload,
+                    blocking=False,
+                    authority_origin="external_operation",
                 )
+            assert runtime.human.list(pid) == []
+            assert not any(
+                cap.resource == resource
+                for cap in runtime.capability.capabilities_for(pid)
+            )
     finally:
         runtime.close()
 

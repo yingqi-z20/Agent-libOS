@@ -21,6 +21,7 @@ BUILTIN_SKILL_MAX_FILE_BYTES = 24 * 1_024
 BUILTIN_SKILL_MAX_INSTRUCTION_BYTES = 16 * 1_024
 BUILTIN_SKILL_MAX_TOOLS = 9
 BUILTIN_SKILL_MAX_TOOL_NAME_CHARS = 128
+BUILTIN_SKILL_TOOL_COUNT = 101
 
 BUILTIN_SKILL_IDS = (
     "agent-libos-skill-navigation",
@@ -92,9 +93,10 @@ class BuiltinSkillCatalog:
                     )
                 owner_by_tool[tool_name] = skill_id
 
-        if len(owner_by_tool) != 99:
+        if len(owner_by_tool) != BUILTIN_SKILL_TOOL_COUNT:
             raise ValidationError(
-                f"built-in Skill catalog must own exactly 99 tools, found {len(owner_by_tool)}"
+                "built-in Skill catalog must own exactly "
+                f"{BUILTIN_SKILL_TOOL_COUNT} tools, found {len(owner_by_tool)}"
             )
         self._packages = packages
         self._owner_by_tool = owner_by_tool

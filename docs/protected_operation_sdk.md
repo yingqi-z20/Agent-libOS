@@ -115,14 +115,24 @@ the other nor changes the already committed result, and failures are reduced to
 a bounded payload-free envelope.
 
 Result identity never invokes arbitrary provider conversion hooks. The general
-safe canonical projection accepts only exact scalars, string-keyed mappings,
-lists/tuples, bytes, enums, and explicitly allowlisted Host result dataclasses,
-subject to 4,096 nodes and 256 KiB. When that small projection is insufficient,
-Filesystem, Shell, Git, JSON-RPC, and MCP contracts plus explicitly Host-bound
-result dataclasses may use a streaming digest capped at 500,000 nodes and 64
-MiB. Streaming reads only exact built-in containers and Host-bound enum/
-dataclass storage; it neither constructs a second aggregate plaintext value nor
+safe canonical projection accepts only exact `None`, `bool`, `int`, finite
+`float`, `str`, `bytes`, and `bytearray` values; `StrEnum` values; exact
+`list`/`tuple` containers; exact `dict` containers with exact string keys; and
+explicitly allowlisted Host result dataclasses, subject to 4,096 nodes and 256
+KiB. It does not accept an arbitrary `Enum`. When that small projection is
+insufficient, Filesystem, Shell, Git, JSON-RPC, MCP, and LLM contracts plus
+explicitly Host-bound result dataclasses may use a streaming digest capped at
+500,000 nodes and 64 MiB. Streaming accepts the same exact built-in scalars and
+containers, but an enum must be a Host-owned, module-bound `Enum` whose stored
+value is an exact string; dataclasses must likewise be Host-bound and
+allowlisted. It neither constructs a second aggregate plaintext value nor
 persists source text.
+
+For the allowlisted `LLMCompletion`, only normalized fields consumed by the
+Runtime participate in result identity and local text traversal. Raw provider
+objects, hidden reasoning, provider request options, compatibility-removal
+metadata, provider trace, and provider-attempt sequence state are explicitly
+excluded; this path does not claim to classify or bind those opaque fields.
 
 The observation descriptor is at most 4 KiB and contains only schema version,
 bounded type identity, digest mode, and canonical byte count. Type identity is
@@ -440,10 +450,19 @@ Startup reconciliation may query by key or provider receipt, but never invokes
 the original provider operation. An unresolved outcome remains `unknown`; do
 not bypass the retained key and blindly retry it.
 
-Human terminal output uses
-`PostProviderFailureMode.PRESERVE_RESULT`. Once the sink accepts content, a
-later local settlement failure returns the accepted result, keeps pending
-unknown evidence, and never invokes the sink again.
+The default is `PostProviderFailureMode.PROPAGATE`: a local completion-settlement
+failure is raised even though the provider may already have returned, so the
+pending/unknown intent must not be treated as safe to retry. Select
+`PRESERVE_RESULT` only when returning the accepted provider result is necessary
+to prevent replay and the caller can continue with conservative pending/unknown
+evidence. This mode does not suppress a failure of the conservative fallback
+settlement itself; that secondary error still propagates.
+
+Both `primitive.human.read` and `primitive.human.write` use
+`PostProviderFailureMode.PRESERVE_RESULT`. Once the Human provider accepts an
+answer or output and fallback settlement succeeds, a later local completion
+failure returns that accepted result, keeps pending/unknown evidence, and never
+invokes the Human provider again.
 
 ## Prepare, settle, and compensation hooks
 
@@ -492,11 +511,25 @@ under `agent_libos/` and the repository-level `modules/` directory. It rejects:
 The intentional exceptions are narrow and visible in the checker: filesystem
 path normalization; Human delivery-buffer `read`/`write`; Git's local,
 non-dispatching `preflight_remote_fingerprint`, `preflight_path_kind`,
-`repository_lock`, and `validate_read_only_operation`; the lifecycle
-implementation files; and recovery-time `handle.close()` in a function whose
-first executable statement is the exact recovery-cleanup lease guard. The last
-exception is evidence-free cleanup of an already-published transient handle;
-none of these entries is a general provider-call allowance.
+`repository_lock`, and `validate_read_only_operation`; the exact Host-only
+`GitPrimitive._semantic_read_flow_snapshot` call graph described below; the
+lifecycle implementation files; and recovery-time `handle.close()` in a
+function whose first executable statement is the exact recovery-cleanup lease
+guard. The last exception is evidence-free cleanup of an already-published
+transient handle; none of these entries is a general provider-call allowance.
+
+`GitPrimitive._semantic_read_flow_snapshot` is the one semantic pre-intent
+provider exception. While revalidating a canary grant, before authority exists
+to enter the ordinary Protected Operation, it may observe only local repository
+layout/state and run checker-reviewed read-only Git commands. It cannot make a
+remote or mutating provider call, returns only bounded digests plus DataFlow
+label/source-reference metadata, and has no durable external-effect intent of
+its own. The checker pins the owning class, private root method, reachable
+provider methods, `read_only=True`, and the absence of dynamic runner keyword
+arguments. If a grant is later used, the ordinary Git read creates its durable
+intent and repeats the flow/state observation inside the protected provider
+phase before returning payload. This exception is a trusted local security
+preflight, not evidence that a protected provider dispatch occurred.
 
 The checker is not a sound whole-program Python call-graph analysis. It does not
 scan tests, scripts, examples, installed third-party packages, or module source

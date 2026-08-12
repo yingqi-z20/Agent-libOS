@@ -116,7 +116,8 @@ from agent_libos.models.exceptions import (
 from agent_libos.models.snapshot import SnapshotRows
 
 
-_THREAD_SYNC_TIMEOUT_S = 30.0
+# Match the Windows runtime lane's documented hosted-runner I/O allowance.
+_THREAD_SYNC_TIMEOUT_S = 120.0 if os.name == "nt" else 30.0
 
 
 STORE_BACKENDS = [
@@ -773,6 +774,44 @@ def test_mcp_manifest_v1_store_bytes_and_digest_remain_1_1_0_canonical(
         loaded = runtime.store.get_mcp_server(server.server_id)
         assert loaded is not None
         assert loaded[0] == server
+
+
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
+def test_mcp_registry_search_matches_only_public_server_id_as_literal_text(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    server_ids = ("alpha_one", "alpha-two", "literal+mark")
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        for server_id in server_ids:
+            runtime.store.upsert_mcp_server(
+                _registry_contract_mcp_server(server_id),
+                registered_by="test",
+                created_at=utc_now(),
+            )
+        runtime.store.upsert_mcp_server(
+            _registry_contract_http_mcp_server("public-http-id"),
+            registered_by="test",
+            created_at=utc_now(),
+        )
+
+        def matched(text: str) -> list[str]:
+            return [
+                server.server_id
+                for server, _metadata in runtime.store.list_mcp_servers(
+                    text=text,
+                )
+            ]
+
+        assert matched("ALPHA_O") == ["alpha_one"]
+        assert matched("_") == ["alpha_one"]
+        assert matched("+") == ["literal+mark"]
+        assert matched("%") == []
+        # These values occur only in the private canonical manifest.
+        assert matched("demo_mcp") == []
+        assert matched("python3") == []
+        assert matched("old.example.test") == []
+        assert matched("/mcp") == []
 
 
 @pytest.mark.parametrize("kind", PERSISTENT_STORE_BACKENDS)

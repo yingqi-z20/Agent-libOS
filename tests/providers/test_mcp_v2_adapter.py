@@ -6,6 +6,7 @@ import json
 import sys
 import threading
 import time
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any
@@ -14,11 +15,14 @@ import pytest
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
+    McpCallStatus,
+    McpDispatchState,
     McpExchangePhase,
     McpExchangeReceipt,
     McpHttpTransportSpec,
     McpProtocolEra,
     McpProtocolMode,
+    McpRetryClass,
     McpServerSpec,
     McpToolSpec,
 )
@@ -39,7 +43,7 @@ from agent_libos.substrate.local import (
     _strict_stdio_client,
 )
 
-pytestmark = pytest.mark.mcp
+pytestmark = [pytest.mark.mcp, pytest.mark.mcp_transport]
 
 
 class _RawWireTransport:
@@ -51,6 +55,7 @@ class _RawWireTransport:
         supported_versions: list[str] | None = None,
         listed_tool: dict[str, Any] | None = None,
         call_result: dict[str, Any] | None = None,
+        advertise_tasks_extension: bool = False,
     ) -> None:
         self.outbound: list[Any] = []
         self.outbound_metadata: list[Any] = []
@@ -64,6 +69,7 @@ class _RawWireTransport:
             "structuredContent": {"ok": True},
             "isError": False,
         }
+        self.advertise_tasks_extension = advertise_tasks_extension
         self._next_request_id = 10_000
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._drive_task: asyncio.Task[None] | None = None
@@ -96,9 +102,14 @@ class _RawWireTransport:
                 if isinstance(message, JSONRPCRequest):
                     if message.method == "server/discover":
                         self._modern = True
+                        capabilities: dict[str, Any] = {"tools": {}}
+                        if self.advertise_tasks_extension:
+                            capabilities["extensions"] = {
+                                "io.modelcontextprotocol/tasks": {}
+                            }
                         result = {
                             "supportedVersions": self.supported_versions,
-                            "capabilities": {"tools": {}},
+                            "capabilities": capabilities,
                             "resultType": "complete",
                             "ttlMs": 0,
                             "cacheScope": "private",
@@ -180,6 +191,98 @@ class _Transport:
 
     async def __aexit__(self, *_exc: object) -> None:
         return None
+
+
+def test_governed_v3_request_ids_do_not_repeat_across_sdk_sessions() -> None:
+    from mcp.client import ClientSession
+    from mcp.types import JSONRPCRequest
+
+    transports = (_RawWireTransport(), _RawWireTransport())
+    sequence = 0
+
+    def allocate_request_id() -> str:
+        nonlocal sequence
+        sequence += 1
+        return f"runtime-scope:{sequence}"
+
+    async def exercise() -> None:
+        for transport in transports:
+            async with _mcp_sdk_v2_client(
+                ClientSession,
+                transport,
+                server=_http_server(),
+                mode=McpProtocolMode.AUTO,
+                sdk_mode="auto",
+                deadline=time.monotonic() + 5,
+                max_response_bytes=1_048_576,
+                enable_modern_mrtr=True,
+                request_id_allocator=allocate_request_id,
+            ) as client:
+                await client.call_tool("demo.echo", {})
+
+    asyncio.run(exercise())
+    requests = [
+        message
+        for transport in transports
+        for message in transport.outbound
+        if isinstance(message, JSONRPCRequest)
+    ]
+    request_ids = [message.id for message in requests]
+    tool_request_ids = [
+        message.id for message in requests if message.method == "tools/call"
+    ]
+    assert tool_request_ids == ["runtime-scope:2", "runtime-scope:4"]
+    assert len(request_ids) == len(set(request_ids))
+    for transport in transports:
+        discover = next(
+            message
+            for message in transport.outbound
+            if isinstance(message, JSONRPCRequest)
+            and message.method == "server/discover"
+        )
+        metadata = discover.params["_meta"]
+        assert metadata["io.modelcontextprotocol/clientInfo"] == {
+            "name": "agent-libos",
+            "version": "1.5.0",
+        }
+        assert metadata["io.modelcontextprotocol/clientCapabilities"][
+            "elicitation"
+        ] == {"form": {}, "url": {}}
+
+
+def test_manifest_v2_keeps_released_client_identity_and_no_elicitation() -> None:
+    from mcp.client import ClientSession
+    from mcp.types import JSONRPCRequest
+
+    transport = _RawWireTransport()
+
+    async def exercise() -> None:
+        async with _mcp_sdk_v2_client(
+            ClientSession,
+            transport,
+            server=_http_server(),
+            mode=McpProtocolMode.AUTO,
+            sdk_mode="auto",
+            deadline=time.monotonic() + 5,
+            max_response_bytes=1_048_576,
+        ):
+            return
+
+    asyncio.run(exercise())
+    discover = next(
+        message
+        for message in transport.outbound
+        if isinstance(message, JSONRPCRequest)
+        and message.method == "server/discover"
+    )
+    metadata = discover.params["_meta"]
+    assert metadata["io.modelcontextprotocol/clientInfo"] == {
+        "name": "agent-libos",
+        "version": "1.4.2",
+    }
+    capabilities = metadata["io.modelcontextprotocol/clientCapabilities"]
+    assert "elicitation" not in capabilities
+    assert "extensions" not in capabilities
 
 
 class _McpError(Exception):
@@ -900,6 +1003,74 @@ def test_manifest_v2_pagination_is_bounded_and_receipted(
     ]
 
 
+@pytest.mark.parametrize("schema_version", (1, 2))
+def test_legacy_list_limit_remains_v1_v2_tools_only(
+    monkeypatch: pytest.MonkeyPatch,
+    schema_version: int,
+) -> None:
+    provider = SdkMcpProvider(
+        mcp_config=replace(
+            DEFAULT_CONFIG.mcp,
+            list_limit=1,
+            server_page_limit=5,
+            tool_catalog_limit=5,
+        )
+    )
+    tool = _tool()
+    server = McpServerSpec(
+        **{
+            **_http_server().__dict__,
+            "schema_version": schema_version,
+            "protocol_mode": (
+                McpProtocolMode.AUTO if schema_version == 2 else None
+            ),
+            "tools": [tool],
+        }
+    )
+
+    class Session:
+        _agent_libos_sdk_v2 = schema_version == 2
+        _agent_libos_mcp_config = provider.mcp_config
+        _agent_libos_receipts: list[Any] = []
+        _agent_libos_connection = None
+
+        def __init__(self) -> None:
+            self.session = self
+            self.call_calls = 0
+
+        async def list_tools(self, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                tools=[
+                    SimpleNamespace(name="demo.echo", inputSchema={}),
+                    SimpleNamespace(name="demo.other", inputSchema={}),
+                ],
+                nextCursor=None,
+            )
+
+        async def call_tool(self, *_args: Any, **_kwargs: Any) -> Any:
+            self.call_calls += 1
+            raise AssertionError("over-limit legacy catalog must not call a Tool")
+
+    session = Session()
+
+    @contextlib.asynccontextmanager
+    async def fake_session(*_args: Any, **_kwargs: Any):
+        yield session
+
+    monkeypatch.setattr(provider, "_session", fake_session)
+    result = provider.validate_and_call(
+        server,
+        tool,
+        {},
+        timeout_s=1,
+        max_response_bytes=server.max_response_bytes,
+    )
+
+    assert result.error_type == "LiveToolValidationError"
+    assert result.call_started is False
+    assert session.call_calls == 0
+
+
 def test_v2_schema_drift_uses_canonical_json_and_has_no_call_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1280,6 +1451,96 @@ def test_notification_flood_is_dropped_without_adapter_queues_or_runtime_actions
     assert state == {"bindings": {}, "listens": {}, "extensions": None}
 
 
+def test_modern_subscription_read_seam_drops_unrelated_notifications() -> None:
+    from mcp.client import ClientSession
+
+    class CountingClientSession(ClientSession):
+        notification_dispatches = 0
+
+        async def _on_notify(self, *args: Any, **kwargs: Any) -> None:
+            type(self).notification_dispatches += 1
+            await super()._on_notify(*args, **kwargs)
+
+    async def exercise() -> int:
+        transport = _RawWireTransport()
+        async with _mcp_sdk_v2_client(
+            CountingClientSession,
+            transport,
+            server=_http_server(McpProtocolMode.REVISION_2026_07_28),
+            mode=McpProtocolMode.REVISION_2026_07_28,
+            sdk_mode="auto",
+            deadline=time.monotonic() + 2,
+            max_response_bytes=1_048_576,
+            allow_server_notifications=True,
+        ):
+            for method, params in (
+                ("notifications/message", {"level": "info", "data": "drop"}),
+                ("notifications/attacker/flood", {"blob": "drop"}),
+                ("notifications/roots/list_changed", None),
+                (
+                    "notifications/tasks/status",
+                    {"taskId": "unpinned-task-must-be-dropped"},
+                ),
+            ):
+                await transport.notify(method, params)
+            await asyncio.sleep(0.05)
+            return CountingClientSession.notification_dispatches
+
+    assert asyncio.run(exercise()) == 0
+
+
+def test_task_status_notification_requires_exact_governed_subscription_pins() -> None:
+    from mcp.client import ClientSession
+
+    notification = {
+        "taskId": "raw-private-task-id",
+        "status": "working",
+        "createdAt": "2030-01-01T00:00:00Z",
+        "lastUpdatedAt": "2030-01-01T00:00:01Z",
+        "_meta": {"io.modelcontextprotocol/subscriptionId": "listen-id"},
+    }
+
+    async def exercise(*, advertise_tasks_extension: bool) -> list[dict[str, Any]]:
+        transport = _RawWireTransport(
+            advertise_tasks_extension=advertise_tasks_extension
+        )
+        ingress: list[dict[str, Any]] = []
+        next_id = 0
+
+        def allocate_request_id() -> str:
+            nonlocal next_id
+            next_id += 1
+            return f"governed-request-{next_id}"
+
+        async with _mcp_sdk_v2_client(
+            ClientSession,
+            transport,
+            server=_http_server(McpProtocolMode.REVISION_2026_07_28),
+            mode=McpProtocolMode.REVISION_2026_07_28,
+            sdk_mode="auto",
+            deadline=time.monotonic() + 2,
+            max_response_bytes=1_048_576,
+            allow_server_notifications=True,
+            enable_modern_mrtr=True,
+            tasks_extension_sha256="d" * 64,
+            request_id_allocator=allocate_request_id,
+            task_notification_ingress=ingress.append,
+        ):
+            await transport.notify("notifications/tasks/status", notification)
+            for _ in range(100):
+                if ingress:
+                    break
+                await asyncio.sleep(0)
+        return ingress
+
+    assert asyncio.run(exercise(advertise_tasks_extension=True)) == [notification]
+    with pytest.raises(
+        ValidationError,
+        match="server Tasks extension does not match the registered Host pin",
+    ):
+        asyncio.run(exercise(advertise_tasks_extension=False))
+
+
 def test_stdio_notification_flood_is_counted_before_sdk_dispatch_and_bounded() -> None:
     from mcp.client.stdio import StdioServerParameters
 
@@ -1487,6 +1748,41 @@ def test_modern_connection_redacts_reflected_exact_and_common_credentials() -> N
     serialized = repr(connection)
     assert opaque_secret not in serialized
     assert github_token not in serialized
+
+
+def test_modern_negotiation_rejects_provider_capability_fanout_above_config() -> None:
+    class FanoutSession(_NegotiationSession):
+        discover_error = None
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.server_capabilities = {
+                "tools": {"enabled": True},
+                "resources": {"enabled": True},
+                "prompts": {"enabled": True},
+            }
+
+    async def exercise() -> None:
+        async with _mcp_sdk_v2_client(
+            FanoutSession,
+            _Transport(),
+            server=_http_server(McpProtocolMode.REVISION_2026_07_28),
+            mode=McpProtocolMode.REVISION_2026_07_28,
+            sdk_mode="auto",
+            deadline=time.monotonic() + 1,
+            max_response_bytes=1_048_576,
+            mcp_config=replace(
+                DEFAULT_CONFIG.mcp,
+                provider_capability_limit=2,
+            ),
+        ):
+            raise AssertionError("over-limit capability negotiation must not yield")
+
+    with pytest.raises(
+        ValidationError,
+        match="provider_capability_limit=2",
+    ):
+        asyncio.run(exercise())
 
 
 def _legacy_tools_http_handler() -> type[BaseHTTPRequestHandler]:
@@ -1919,6 +2215,87 @@ def test_builtin_v2_malformed_pre_call_response_is_wire_certified(
             receipt.phase is not McpExchangePhase.TOOLS_CALL
             for receipt in result.receipts
         )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_builtin_v2_negotiated_failure_before_first_list_is_not_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the built-in wire ledger may certify this zero-list prefix."""
+
+    import mcp.client
+
+    handler = _legacy_tools_http_handler()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    provider = SdkMcpProvider()
+    sdk_client_session = mcp.client.ClientSession
+
+    class FailBeforeFirstListSession(sdk_client_session):
+        async def list_tools(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("injected failure before first tools/list dispatch")
+
+    monkeypatch.setattr(mcp.client, "ClientSession", FailBeforeFirstListSession)
+    try:
+        tool = _tool()
+        spec = McpServerSpec(
+            schema_version=2,
+            server_id="negotiated-before-first-list",
+            transport="streamable_http",
+            tools=[tool],
+            timeout_s=2,
+            max_request_bytes=65_536,
+            max_response_bytes=1_048_576,
+            http=McpHttpTransportSpec(
+                url=f"http://127.0.0.1:{server.server_port}/mcp"
+            ),
+            protocol_mode=McpProtocolMode.REVISION_2026_07_28,
+        )
+
+        provider_result = provider.validate_and_call(
+            spec,
+            tool,
+            {},
+            timeout_s=spec.timeout_s,
+            max_response_bytes=spec.max_response_bytes,
+        )
+
+        assert handler.methods == ["server/discover"]
+        assert provider_result.error_type == "McpPreCallFailure"
+        assert provider_result.connection is not None
+        assert provider_result.connection.protocol_era is McpProtocolEra.MODERN
+        assert provider_result.connection.protocol_revision == "2026-07-28"
+        assert not provider_result.call_started
+        assert provider_result.list_request_bytes == 0
+        assert provider_result.list_response_bytes == 0
+        assert provider_result.call_request_bytes == 0
+        assert provider_result.call_response_bytes == 0
+        assert provider_result.response_bytes == 0
+        assert [receipt.phase for receipt in provider_result.receipts] == [
+            McpExchangePhase.SERVER_DISCOVER,
+        ]
+        assert provider_result.receipts[0].request_bytes > 0
+        assert provider_result.receipts[0].response_bytes > 0
+
+        primitive = object.__new__(McpPrimitive)
+        primitive.provider = provider
+        public_result = primitive._call_result_from_provider(  # noqa: SLF001
+            spec,
+            tool,
+            provider_result,
+        )
+
+        assert public_result.status is McpCallStatus.TRANSPORT_ERROR
+        assert public_result.dispatch_state is McpDispatchState.NOT_STARTED
+        assert public_result.retry_class is McpRetryClass.REOBSERVE_REQUIRED
+        assert public_result.automatic_retry_disabled is True
+        assert public_result.error is not None
+        assert public_result.error["retryable"] is False
+        assert public_result.error["automatic_retry_disabled"] is True
     finally:
         server.shutdown()
         thread.join(timeout=5)

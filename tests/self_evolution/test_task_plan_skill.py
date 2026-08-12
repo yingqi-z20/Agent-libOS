@@ -100,12 +100,17 @@ class TestTaskPlanSkill:
         }
 
         skill_md = PACKAGE_ROOT.joinpath("SKILL.md").read_text(encoding="utf-8")
+        skills_doc = Path("docs/skills.md").read_text(encoding="utf-8")
         openai_yaml = PACKAGE_ROOT.joinpath("agents/openai.yaml").read_text(
             encoding="utf-8"
         )
         for tool_name in TOOL_NAMES:
             assert tool_name in skill_md
         assert "run_jit_tool" in skill_md
+        assert "not an atomic compare-and-swap" in skill_md
+        assert "Do not issue parallel `update_task_plan`" in skill_md
+        assert "## Task Plan Skill" in skills_doc
+        assert "caller-supplied compare-and-swap token" in skills_doc
         assert 'display_name: "Task Plan"' in openai_yaml
         assert "$task-plan" in openai_yaml
 

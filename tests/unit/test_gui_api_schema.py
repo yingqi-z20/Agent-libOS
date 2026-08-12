@@ -64,8 +64,40 @@ _ROUTE_BASES = {
     "_dispatch_images": ("api", "images"),
     "_dispatch_jsonrpc": ("api", "jsonrpc"),
     "_dispatch_mcp": ("api", "mcp"),
+    "_dispatch_mcp_modern_post": ("api", "mcp"),
+    "_dispatch_mcp_modern_prompt_post": ("api", "mcp"),
+    "_dispatch_mcp_modern_oauth_post": ("api", "mcp"),
+    "_dispatch_mcp_modern_continuation_post": ("api", "mcp"),
+    "_dispatch_mcp_modern_remote_task_post": ("api", "mcp"),
+    "_dispatch_mcp_modern_subscription_post": ("api", "mcp"),
+    "_dispatch_mcp_oauth_profile_admin_post": ("api", "mcp"),
     "_dispatch_task_runs": ("api", "task-runs"),
 }
+
+
+def _route_placeholders(function: str, action: str) -> dict[int, str]:
+    placeholders = dict(_ROUTE_PLACEHOLDERS.get(function, {}))
+    if not (
+        function == "_dispatch_mcp_modern_post"
+        or function.startswith("_dispatch_mcp_modern_")
+        or function == "_dispatch_mcp_oauth_profile_admin_post"
+    ):
+        return placeholders
+    if action in {"mcp.auth.profile.add", "mcp.auth.profile.replace"}:
+        return {}
+    if action == "mcp.auth.profile.remove":
+        return {2: "{profile_id}"}
+    if action.startswith("mcp.auth."):
+        return {1: "{profile_id}"}
+    if action.startswith("mcp.continuation."):
+        return {1: "{continuation_id}"}
+    if action.startswith("mcp.remote_task."):
+        return {1: "{task_ref}"}
+    if action == "mcp.subscription.stop":
+        return {1: "{subscription_id}"}
+    if action in {"mcp.prompt.confirm", "mcp.subscription.start"}:
+        return {0: "{server_id}"}
+    raise AssertionError(f"missing MCP modern route placeholder for {action}")
 _ROUTE_PLACEHOLDERS = {
     "_dispatch_checkpoints": {0: "{checkpoint_id}"},
     "_dispatch_skills": {0: "{skill_id}"},
@@ -109,6 +141,10 @@ def _confirmed_actions(action: ast.expr) -> set[str]:
         )
         if literal == "skill.":
             return {"skill.activate", "skill.unload"}
+        if literal == "mcp.continuation.":
+            return {"mcp.continuation.respond", "mcp.continuation.cancel"}
+        if literal == "mcp.remote_task.":
+            return {"mcp.remote_task.update", "mcp.remote_task.cancel"}
     raise AssertionError("unsupported dynamic confirmation action")
 
 
@@ -194,7 +230,7 @@ def _relative_route(test: ast.expr, function: str, action: str) -> tuple[str, ..
                 if isinstance(element, ast.Constant) and isinstance(element.value, str)
             )
 
-    indexed: dict[int, str] = dict(_ROUTE_PLACEHOLDERS.get(function, {}))
+    indexed = _route_placeholders(function, action)
     route_length = 0
     for item in ast.walk(test):
         if not isinstance(item, ast.Compare) or len(item.ops) != 1:
@@ -215,12 +251,33 @@ def _relative_route(test: ast.expr, function: str, action: str) -> tuple[str, ..
             isinstance(item.left, ast.Subscript)
             and isinstance(item.left.value, ast.Name)
             and item.left.value.id == "route"
-            and isinstance(item.left.slice, ast.Constant)
+        ):
+            continue
+        comparator = item.comparators[0]
+        if (
+            isinstance(item.left.slice, ast.Slice)
+            and isinstance(item.ops[0], ast.Eq)
+            and isinstance(comparator, (ast.List, ast.Tuple))
+        ):
+            route_slice = item.left.slice
+            assert route_slice.step is None
+            assert route_slice.lower is None or (
+                isinstance(route_slice.lower, ast.Constant)
+                and isinstance(route_slice.lower.value, int)
+            )
+            lower = 0 if route_slice.lower is None else route_slice.lower.value
+            for offset, element in enumerate(comparator.elts):
+                assert isinstance(element, ast.Constant) and isinstance(
+                    element.value, str
+                )
+                indexed[lower + offset] = element.value
+            continue
+        if not (
+            isinstance(item.left.slice, ast.Constant)
             and isinstance(item.left.slice.value, int)
         ):
             continue
         index = item.left.slice.value
-        comparator = item.comparators[0]
         if isinstance(comparator, ast.Constant) and isinstance(comparator.value, str):
             indexed[index] = comparator.value
         elif isinstance(item.ops[0], ast.In) and isinstance(comparator, (ast.Set, ast.Tuple)):
@@ -244,6 +301,78 @@ def test_gui_api_schema_is_valid_draft_2020_12() -> None:
     assert list(Draft202012Validator(schema).iter_errors({"confirmed": True}))
     usage = schema["x-agent-libos-definition-usage"]
     assert usage["local_ref_example"].endswith("#/$defs/processExecPayload")
+
+
+def test_gui_api_schema_models_durable_mcp_reload_without_weakening_cas() -> None:
+    schema = _schema()
+    operations = schema["x-agent-libos-contract-scope"]["mcp_v3_host_operations"]
+    assert operations["continuation.inspect"] == {
+        "route": "POST /api/mcp/continuations/{continuation_id}/inspect",
+        "request_def": "mcpEmptyPayload",
+        "response_def": "mcpInputRequiredProjection",
+        "provider_io": False,
+    }
+    _validator_for("mcpEmptyPayload").validate({})
+    assert list(_validator_for("mcpEmptyPayload").iter_errors({"state": "private"}))
+
+    revision_read = _validator_for("mcpRevisionReadPayload")
+    for body in ({}, {"expected_revision": None}, {"expected_revision": 9}):
+        revision_read.validate(body)
+    for body in (
+        {"expected_revision": -1},
+        {"expected_revision": True},
+        {"expected_revision": 1, "confirmed": True},
+    ):
+        assert list(revision_read.iter_errors(body))
+    mutation = _validator_for("mcpRevisionMutationPayload")
+    assert list(mutation.iter_errors({"confirmed": True}))
+    mutation.validate({"expected_revision": 9, "confirmed": True})
+
+    input_required = _validator_for("mcpInputRequiredProjection")
+    respondable = {
+        "kind": "input_required",
+        "continuation_id": "continuation-local",
+        "revision": 3,
+        "respondable": True,
+        "input_requests": [],
+        "human_request_id": "human-local",
+        "human_revision": 4,
+        "human_preview_sha256": "a" * 64,
+    }
+    input_required.validate(respondable)
+    unsupported = {
+        "kind": "input_required",
+        "continuation_id": "",
+        "revision": 0,
+        "respondable": False,
+        "input_requests": [{
+            "request_id": "sampling-local",
+            "kind": "sampling_unsupported",
+            "schema": {},
+        }],
+        "human_request_id": None,
+        "human_revision": None,
+        "human_preview_sha256": None,
+    }
+    input_required.validate(unsupported)
+    assert list(input_required.iter_errors({
+        **respondable,
+        "human_request_id": None,
+    }))
+    assert list(input_required.iter_errors({
+        **unsupported,
+        "continuation_id": "forged",
+    }))
+    assert list(input_required.iter_errors({
+        **unsupported,
+        "input_requests": [{
+            "request_id": "elicitation-local",
+            "kind": "elicitation",
+            "mode": "form",
+            "prompt": "not typed unsupported",
+            "schema": {"type": "object", "properties": {}},
+        }],
+    }))
 
 
 def test_gui_api_schema_tracks_every_explicit_confirmation_operation() -> None:
@@ -627,6 +756,15 @@ def test_gui_api_schema_requires_confirmation_and_workspace_relative_skill_path(
             {"confirmed": True, "manifest_text": "schema_version: 1", "path": "server.yaml"}
         )
     )
+    assert list(
+        _validator_for("registryManifestPayload").iter_errors(
+            {
+                "confirmed": True,
+                "manifest_text": "schema_version: 1",
+                "source": 7,
+            }
+        )
+    )
 
     mcp_call = _validator_for("mcpCallPayload")
     mcp_call.validate(
@@ -647,3 +785,228 @@ def test_gui_api_schema_requires_confirmation_and_workspace_relative_skill_path(
             {"confirmed": True, "pid": "pid_1", "tool_id": "echo", "arguments": []}
         )
     )
+    mcp_unregister = _validator_for("mcpUnregisterPayload")
+    mcp_unregister.validate({"confirmed": True})
+    mcp_unregister.validate({"confirmed": True, "actor": "pid_1"})
+    assert list(mcp_unregister.iter_errors({}))
+    assert list(
+        mcp_unregister.iter_errors(
+            {"confirmed": True, "actor_pid": "pid_1"}
+        )
+    )
+
+
+def test_gui_api_schema_covers_strict_mcp_v3_host_surfaces() -> None:
+    page = _validator_for("mcpPagePayload")
+    page.validate({})
+    page.validate({"cursor": "opaque"})
+    assert list(page.iter_errors({"cursor": ""}))
+    assert list(page.iter_errors({"url": "https://hidden.invalid"}))
+
+    resource = _validator_for("mcpResourceReadPayload")
+    resource.validate({"resource_id": "logical-doc", "variables": {"page": "1"}})
+    assert list(resource.iter_errors({"resource_id": "logical-doc", "variables": {"page": 1}}))
+    assert list(resource.iter_errors({"resource_id": "logical-doc", "headers": {"x": "y"}}))
+
+    preview = _validator_for("mcpPromptGetPayload")
+    preview.validate({"prompt_id": "review", "confirmed": False})
+    preview.validate({
+        "prompt_id": "review",
+        "arguments": {"topic": "MCP"},
+        "confirmed": True,
+        "expected_preview_sha256": "a" * 64,
+    })
+    assert list(preview.iter_errors({"prompt_id": "review", "confirmed": True}))
+    assert list(preview.iter_errors({
+        "prompt_id": "review",
+        "confirmed": False,
+        "expected_preview_sha256": "a" * 64,
+    }))
+    assert list(preview.iter_errors({"prompt_id": "review", "arguments": None, "actor": "pid_1"}))
+
+    completion = _validator_for("mcpCompletionPayload")
+    completion.validate({
+        "reference_type": "ref/prompt",
+        "reference_id": "review",
+        "argument": {"name": "topic", "value": "MCP"},
+        "context": {"tenant": "local"},
+    })
+    assert list(completion.iter_errors({
+        "reference_type": "ref/prompt",
+        "reference_id": "review",
+        "argument": {"name": "topic", "value": "MCP"},
+        "context": {"count": 1},
+    }))
+
+    oauth = _validator_for("mcpOAuthLoginPayload")
+    oauth.validate({"confirmed": True, "scopes": ["resource.read"]})
+    assert list(oauth.iter_errors({"confirmed": False}))
+    assert list(oauth.iter_errors({"confirmed": True, "client_secret": "private"}))
+
+    continuation = _validator_for("mcpContinuationRespondPayload")
+    human_receipt = {
+        "human_request_id": "human-local",
+        "human_expected_revision": 2,
+        "human_preview_sha256": "c" * 64,
+    }
+    continuation.validate({
+        "expected_revision": 1,
+        "responses": {"request-local": "yes"},
+        **human_receipt,
+        "confirmed": True,
+    })
+    assert list(continuation.iter_errors({"expected_revision": 1, "responses": {}, "confirmed": False}))
+    assert list(continuation.iter_errors({
+        "expected_revision": 1,
+        "responses": {"request-local": "yes"},
+        **human_receipt,
+        "human_preview_sha256": "C" * 64,
+        "confirmed": True,
+    }))
+
+    task_update = _validator_for("mcpRemoteTaskUpdatePayload")
+    task_update.validate({
+        "expected_revision": 3,
+        "responses": {"request-local": "yes"},
+        **human_receipt,
+        "confirmed": True,
+    })
+    assert list(task_update.iter_errors({
+        "expected_revision": 3,
+        "responses": {"request-local": "yes"},
+        "confirmed": True,
+    }))
+
+    input_required_projection = _validator_for("mcpInputRequiredProjection")
+    projected_input = {
+        "kind": "input_required",
+        "continuation_id": "continuation-local",
+        "revision": 4,
+        "respondable": True,
+        "input_requests": [{
+            "request_id": "request-local",
+            "kind": "elicitation",
+            "mode": "url",
+            "schema": {"type": "object"},
+            "inert_url": "https://provider.invalid/review",
+        }],
+        "human_request_id": "human-local",
+        "human_revision": 2,
+        "human_preview_sha256": "c" * 64,
+    }
+    input_required_projection.validate(projected_input)
+    assert list(input_required_projection.iter_errors({
+        **projected_input,
+        "human_request_id": None,
+    }))
+
+    task_projection = _validator_for("mcpRemoteTaskProjection")
+    task_projection.validate({
+        "kind": "remote_task",
+        "task_ref": "task-local",
+        "revision": 1,
+        "status": "working",
+        "input_requests": [],
+    })
+    task_projection.validate({
+        "kind": "remote_task",
+        "task_ref": "task-local",
+        "revision": 2,
+        "status": "input_required",
+        "input_requests": projected_input["input_requests"],
+        "human_request_id": "human-task-local",
+        "human_revision": 3,
+        "human_preview_sha256": "d" * 64,
+    })
+    assert list(task_projection.iter_errors({
+        "kind": "remote_task",
+        "task_ref": "task-local",
+        "revision": 2,
+        "status": "input_required",
+        "input_requests": projected_input["input_requests"],
+    }))
+
+    task_get = _validator_for("mcpRevisionReadPayload")
+    task_get.validate({"expected_revision": 0})
+    assert list(task_get.iter_errors({"expected_revision": -1}))
+
+    subscription = _validator_for("mcpSubscriptionStartPayload")
+    subscription.validate({"filters": ["resources/updated"], "confirmed": True})
+    assert list(subscription.iter_errors({"filters": ["resources/updated", "resources/updated"], "confirmed": True}))
+
+    schema = _schema()
+    operations = schema["x-agent-libos-contract-scope"]["mcp_v3_host_operations"]
+    assert operations["auth.status"]["route"].startswith("GET ")
+    assert operations["auth.status"]["local_only"] is True
+    assert all(
+        item["route"].startswith("POST ")
+        for name, item in operations.items()
+        if name not in {"auth.status", "auth.profiles.list"}
+    )
+    for item in operations.values():
+        request_def = item["request_def"]
+        if request_def is not None:
+            assert request_def in schema["$defs"]
+        response_def = item.get("response_def")
+        if response_def is not None:
+            assert response_def in schema["$defs"]
+
+
+def test_gui_api_schema_models_exact_non_secret_oauth_host_profile_admin() -> None:
+    profile = {
+        "profile_id": "profile-local",
+        "server_id": "server-local",
+        "resource_uri": "https://resource.example/mcp",
+        "expected_issuer": "https://issuer.example",
+        "redirect_uri": "http://127.0.0.1/callback",
+        "client_id": "gui-client",
+        "registration_mode": "preregistered",
+        "token_endpoint_auth_method": "client_secret_basic",
+        "allowed_scopes": ["resource.read"],
+        "default_scopes": ["resource.read"],
+        "allowed_endpoint_origins": ["https://issuer.example"],
+        "allow_loopback_http": True,
+        "protocol_revision": "2026-07-28",
+        "transport": "streamable_http",
+    }
+    profile_validator = _validator_for("mcpOAuthProfileInput")
+    profile_validator.validate(profile)
+    for invalid in (
+        {**profile, "registration_mode": "dcr"},
+        {**profile, "client_secret": "must-not-enter-profile"},
+        {key: value for key, value in profile.items() if key != "expected_issuer"},
+        {**profile, "allow_loopback_http": "true"},
+    ):
+        assert list(profile_validator.iter_errors(invalid))
+
+    mutation_validator = _validator_for("mcpOAuthProfileMutationPayload")
+    mutation_validator.validate({
+        "profile": profile,
+        "client_secret": "one-time-secret",
+        "replace": False,
+        "confirmed": True,
+    })
+    for invalid in (
+        {"profile": profile, "client_secret": None, "replace": False, "confirmed": True},
+        {"profile": profile, "replace": False, "confirmed": False},
+        {"profile": profile, "replace": False, "confirmed": True, "actor": "pid"},
+        {"profile": profile, "replace": False, "confirmed": True, "client_secret": "bad\nsecret"},
+    ):
+        assert list(mutation_validator.iter_errors(invalid))
+
+    status_list_validator = _validator_for("mcpOAuthStatusListProjection")
+    status_list_validator.validate([{
+        "profile_id": "profile-local",
+        "status": "authorization_required",
+        "scopes": [],
+    }])
+    assert list(status_list_validator.iter_errors([{
+        "profile_id": "profile-local",
+        "status": "authorized",
+        "scopes": [],
+        "access_token": "private",
+    }]))
+
+    operations = _schema()["x-agent-libos-contract-scope"]["mcp_v3_host_operations"]
+    for name in ("auth.profile.add", "auth.profile.replace", "auth.profile.remove"):
+        assert operations[name]["host_only"] is True

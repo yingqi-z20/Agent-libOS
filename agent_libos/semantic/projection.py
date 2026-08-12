@@ -32,6 +32,16 @@ _CREDENTIAL_PATTERNS = (
             re.IGNORECASE,
         ),
     ),
+    (
+        "credential_marker",
+        re.compile(
+            r"\b(?:[A-Za-z0-9]{2,32}[_-]){0,4}"
+            r"(?:secret|credential|password|passwd|token)[_-]"
+            r"(?:sentinel(?:[_-][A-Za-z0-9][A-Za-z0-9_-]{3,127})?"
+            r"|[A-Za-z0-9][A-Za-z0-9_-]{11,127})\b",
+            re.IGNORECASE,
+        ),
+    ),
     ("credential_token", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     (
         "credential_token",
@@ -224,12 +234,7 @@ def build_external_projection(
         request.redacted_intent or "",
         input_sha256=request.input_sha256,
     )
-    metadata_only = (
-        selected_labels.sensitivity not in {DataSensitivity.PUBLIC, DataSensitivity.NORMAL}
-        or selected_labels.is_mixed_identity
-        or redacted.dlp_matched
-        or not redacted.text
-    )
+    metadata_only = _requires_metadata_only(selected_labels, redacted)
     digests = {
         name: value
         for name, value in (
@@ -287,6 +292,21 @@ def build_external_projection(
             selected_labels,
             dlp_findings,
         ),
+    )
+
+
+def _requires_metadata_only(
+    labels: DataLabels,
+    redacted: RedactedIntent,
+) -> bool:
+    return bool(
+        labels.sensitivity
+        not in {DataSensitivity.PUBLIC, DataSensitivity.NORMAL}
+        or labels.is_mixed_identity
+        or labels.tenant is not None
+        or labels.principal is not None
+        or redacted.dlp_matched
+        or not redacted.text
     )
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -9,9 +10,11 @@ from typing import Any
 import pytest
 
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.skills import get_builtin_skill_catalog
 from agent_libos.substrate import LocalResourceProviderSubstrate
+from agent_libos.tools.builtin.process import _build_cumulative_exit_review
 from benchmarks.long_horizon_agent import (
     HostOracleRunner,
     evaluate_run,
@@ -27,6 +30,9 @@ from benchmarks.long_horizon_agent.runner import (
     UNITTEST_ARGV,
     _action_sequence,
     _adjacent_prompt_prefix_metrics,
+    _forbidden_model_text_leak_count,
+    _forbidden_model_text_leak_counts,
+    _forbidden_model_text_leak_details,
     _grant_authority,
     _host_oracle_report_projection,
     _successful_action_sequence,
@@ -44,6 +50,89 @@ def _activate_action(skill_id: str) -> dict[str, str]:
         "skill_id": skill_id,
         "expected_package_sha256": package.package_sha256,
     }
+
+
+def test_model_text_leak_metrics_are_categorized_without_prompt_retention() -> None:
+    calls = [
+        SimpleNamespace(
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        '{"run_id":"run_0123456789abcdef",'
+                        '"goal_oid":"obj_0123456789abcdef",'
+                        '"current_pid":"pid_0123456789abcdef"}'
+                    ),
+                }
+            ],
+            response_content="",
+            tool_calls=[
+                {
+                    "name": "human_output",
+                    "arguments": (
+                        '{"message":"checkpoint ckpt_deadbeefdeadbeef '
+                        'message pmsg_deadbeefdeadbeef"}'
+                    ),
+                },
+                {
+                    "name": "inspect_checkpoint",
+                    "arguments": '{"checkpoint_id":"ckpt_allowed"}',
+                },
+            ],
+        )
+    ]
+
+    counts = _forbidden_model_text_leak_counts(calls)
+
+    assert counts == {
+        "host_contract_fields": 1,
+        "materialization_fields": 0,
+        "completion_binding_fields": 1,
+        "current_process_ids": 1,
+        "terminal_host_identifiers": 2,
+    }
+    assert _forbidden_model_text_leak_count(calls) == 5
+    assert _forbidden_model_text_leak_details(calls) == [
+        {
+            "call_ordinal": 1,
+            "categories": {
+                "host_contract_fields": 1,
+                "completion_binding_fields": 1,
+                "current_process_ids": 1,
+                "terminal_host_identifiers": 2,
+            },
+            "surfaces": {"messages": 3, "tool_calls": 2},
+            "response_tools": ["human_output", "inspect_checkpoint"],
+        }
+    ]
+
+
+def test_model_text_leak_metrics_preserve_business_fields_and_catch_evt_ids() -> None:
+    business_call = SimpleNamespace(
+        messages=[
+            {
+                "role": "user",
+                "content": '{"run_id":"customer-run-42","schema_version":1}',
+            }
+        ],
+        response_content="",
+        tool_calls=[],
+    )
+    terminal_call = SimpleNamespace(
+        messages=[],
+        response_content="",
+        tool_calls=[
+            {
+                "name": "human_output",
+                "arguments": '{"message":"evt_0123456789abcdef"}',
+            }
+        ],
+    )
+
+    assert _forbidden_model_text_leak_count([business_call]) == 0
+    assert _forbidden_model_text_leak_counts([terminal_call])[
+        "terminal_host_identifiers"
+    ] == 1
 
 
 def test_fixture_starts_with_a_real_failure_and_clean_git_state(tmp_path: Path) -> None:
@@ -109,8 +198,12 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
     prepare_workspace(workspace)
     substrate = LocalResourceProviderSubstrate(workspace)
     results: list[dict[str, Any]] = []
+    config = replace(
+        DEFAULT_CONFIG,
+        llm=replace(DEFAULT_CONFIG.llm, prompt_layout="cache_optimized_v2"),
+    )
 
-    runtime = Runtime.open(database, substrate=substrate)
+    runtime = Runtime.open(database, substrate=substrate, config=config)
     try:
         pid = runtime.process.spawn(image="coding-agent:v0", goal=GOAL)
         initial_process = runtime.process.get(pid)
@@ -156,7 +249,7 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
     finally:
         runtime.close()
 
-    reopened = Runtime.open(database, substrate=substrate)
+    reopened = Runtime.open(database, substrate=substrate, config=config)
     try:
         rehydrated_process = reopened.process.get(pid)
         assert rehydrated_process.goal_oid == initial_goal.oid
@@ -172,7 +265,7 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
 
         dispatch(_activate_action("agent-libos-child-processes"))
         message_result = dispatch({"action": "read_process_messages"})
-        message_id = message_result["payload"]["messages"][0]["message_id"]
+        assert message_result["payload"]["messages"]
         dispatch(_activate_action("agent-libos-workspace-editing"))
         dispatch(
             {
@@ -222,11 +315,19 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
         )
         review_result = dispatch({"action": "process_exit"})
         review = review_result["payload"]["completion_review"]
-        assert review["goal"]["source"] == "object_memory"
-        assert review["goal"]["oid"] == initial_goal.oid
-        assert review["goal"]["version"] == initial_goal.version
-        assert "payload" not in review["goal"]
-        assert "fallback" not in review["goal"]
+        stored_review_result = reopened.store.get_object(review_result["result_oid"])
+        assert stored_review_result is not None
+        durable_review = stored_review_result.payload["result"]["completion_review"]
+        assert durable_review == review
+        encoded_durable_review = json.dumps(durable_review, sort_keys=True)
+        assert initial_goal.oid not in encoded_durable_review
+        host_review = _build_cumulative_exit_review(reopened, pid)
+        assert host_review["goal"]["source"] == "object_memory"
+        assert host_review["goal"]["oid"] == initial_goal.oid
+        assert host_review["goal"]["version"] == initial_goal.version
+        assert "payload" not in host_review["goal"]
+        assert "fallback" not in host_review["goal"]
+        assert len(review["requirements"]) == 2
         dispatch(
             {
                 "action": "human_output",
@@ -238,49 +339,30 @@ def test_deterministic_long_horizon_task_survives_restart_and_completion_gate(
             }
         )
         evidence = {
-            "goal_oid": review["goal"]["oid"],
-            "reviewed_message_ids": [message_id],
             "acceptance_checks": [
                 {
-                    "requirement": "reproduce and fix the percentage defect",
-                    "source_refs": [review["goal"]["oid"]],
                     "status": "completed",
                     "evidence_tool_calls": [
                         "run_shell_command",
                         "write_text_file",
-                    ],
-                    "evidence_summary": "The failing suite was reproduced, code was edited, and the suite passed.",
-                },
-                {
-                    "requirement": "cover the exact 100.00 threshold",
-                    "source_refs": [review["goal"]["oid"]],
-                    "status": "completed",
-                    "evidence_tool_calls": [
-                        "write_text_file",
-                        "run_shell_command",
-                    ],
-                    "evidence_summary": "A named exact-threshold regression passes.",
-                },
-                {
-                    "requirement": "preserve zero-quantity behavior",
-                    "source_refs": [message_id],
-                    "status": "completed",
-                    "evidence_tool_calls": [
-                        "write_text_file",
-                        "run_shell_command",
-                    ],
-                    "evidence_summary": "The acknowledged follow-up has a passing regression.",
-                },
-                {
-                    "requirement": "inspect Git state and diff and create a checkpoint",
-                    "source_refs": [review["goal"]["oid"]],
-                    "status": "completed",
-                    "evidence_tool_calls": [
                         "git_status",
                         "git_diff",
                         "create_checkpoint",
                     ],
-                    "evidence_summary": "Both Git reads and checkpoint creation succeeded.",
+                    "evidence_summary": (
+                        "The defect and threshold regression were fixed, the suite "
+                        "passed, Git state was inspected, and a checkpoint was created."
+                    ),
+                },
+                {
+                    "status": "completed",
+                    "evidence_tool_calls": [
+                        "write_text_file",
+                        "run_shell_command",
+                    ],
+                    "evidence_summary": (
+                        "The acknowledged zero-quantity follow-up has a passing regression."
+                    ),
                 },
             ],
             "final_verification": [

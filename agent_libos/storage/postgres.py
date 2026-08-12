@@ -18,6 +18,8 @@ from agent_libos.storage.sql import (
     _V4_KEYSET_TEXT_COLUMNS,
     _V4_REQUIRED_COLUMNS,
     _V5_REQUIRED_COLUMNS,
+    _V6_REQUIRED_COLUMNS,
+    _V7_REQUIRED_COLUMNS,
 )
 from agent_libos.storage.v5_schema_contract import (
     HUMAN_REQUEST_INDEX_CONTRACTS,
@@ -27,6 +29,16 @@ from agent_libos.storage.v5_schema_contract import (
     V5_STORAGE_COLUMN_CONTRACTS,
     V5_STORAGE_KEY_CONSTRAINTS,
     V5_STORAGE_POSTGRES_CHECKS,
+)
+from agent_libos.storage.v6_schema_contract import (
+    V6_STORAGE_COLUMN_CONTRACTS,
+    V6_STORAGE_KEY_CONSTRAINTS,
+    V6_STORAGE_POSTGRES_CHECKS,
+)
+from agent_libos.storage.v7_schema_contract import (
+    V7_STORAGE_COLUMN_CONTRACTS,
+    V7_STORAGE_KEY_CONSTRAINTS,
+    V7_STORAGE_POSTGRES_CHECKS,
 )
 
 
@@ -433,6 +445,83 @@ class PostgresStore(SQLRuntimeStore):
         cls._require_canonical_catalog_contract(conn, store_version=5)
 
     @classmethod
+    def _require_v6_schema_shape(cls, conn: Any) -> None:
+        """Require every schema-v6 manifest relation to be an ordinary table."""
+
+        required_tables = sorted(_V6_REQUIRED_COLUMNS)
+        placeholders = ", ".join("?" for _ in required_tables)
+        rows = conn.execute(
+            f"""
+            SELECT relation.relname AS name,
+                   relation.relkind AS relation_kind
+              FROM pg_catalog.pg_class AS relation
+              JOIN pg_catalog.pg_namespace AS namespace
+                ON namespace.oid = relation.relnamespace
+             WHERE namespace.nspname = current_schema()
+               AND relation.relname IN ({placeholders})
+            """,
+            required_tables,
+        )
+        relation_kinds = {
+            str(row["name"]): str(row["relation_kind"])
+            for row in rows
+        }
+        invalid_relations = {
+            table: relation_kinds.get(table, "missing")
+            for table in required_tables
+            if relation_kinds.get(table) != "r"
+        }
+        if invalid_relations:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v6 "
+                "manifest relation types: "
+                f"{invalid_relations}; expected PostgreSQL relkind 'r'"
+            )
+        super()._require_v6_schema_shape(conn)
+        cls._require_v5_storage_contract(conn)
+        cls._require_v6_storage_contract(conn)
+        cls._require_canonical_catalog_contract(conn, store_version=6)
+
+    @classmethod
+    def _require_v7_schema_shape(cls, conn: Any) -> None:
+        """Require every schema-v7 manifest relation to be an ordinary table."""
+
+        required_tables = sorted(_V7_REQUIRED_COLUMNS)
+        placeholders = ", ".join("?" for _ in required_tables)
+        rows = conn.execute(
+            f"""
+            SELECT relation.relname AS name,
+                   relation.relkind AS relation_kind
+              FROM pg_catalog.pg_class AS relation
+              JOIN pg_catalog.pg_namespace AS namespace
+                ON namespace.oid = relation.relnamespace
+             WHERE namespace.nspname = current_schema()
+               AND relation.relname IN ({placeholders})
+            """,
+            required_tables,
+        )
+        relation_kinds = {
+            str(row["name"]): str(row["relation_kind"])
+            for row in rows
+        }
+        invalid_relations = {
+            table: relation_kinds.get(table, "missing")
+            for table in required_tables
+            if relation_kinds.get(table) != "r"
+        }
+        if invalid_relations:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v7 "
+                "manifest relation types: "
+                f"{invalid_relations}; expected PostgreSQL relkind 'r'"
+            )
+        super()._require_v7_schema_shape(conn)
+        cls._require_v5_storage_contract(conn)
+        cls._require_v6_storage_contract(conn)
+        cls._require_v7_storage_contract(conn)
+        cls._require_canonical_catalog_contract(conn, store_version=7)
+
+    @classmethod
     def _require_canonical_catalog_contract(
         cls,
         conn: Any,
@@ -481,6 +570,38 @@ class PostgresStore(SQLRuntimeStore):
             raise UnsupportedStoreVersion(
                 "unsupported Agent libOS schema v5 semantic relation boundary: "
                 f"{boundary_problems}"
+            )
+
+    @classmethod
+    def _require_v6_storage_contract(cls, conn: Any) -> None:
+        problems = {
+            **cls._storage_column_problems(conn, V6_STORAGE_COLUMN_CONTRACTS),
+            **cls._storage_check_problems(conn, V6_STORAGE_POSTGRES_CHECKS),
+            **cls._storage_key_constraint_problems(
+                conn,
+                V6_STORAGE_KEY_CONSTRAINTS,
+            ),
+        }
+        if problems:
+            raise UnsupportedStoreVersion(
+                "unsupported Agent libOS schema v6 storage contract: "
+                f"{problems}"
+            )
+
+    @classmethod
+    def _require_v7_storage_contract(cls, conn: Any) -> None:
+        problems = {
+            **cls._storage_column_problems(conn, V7_STORAGE_COLUMN_CONTRACTS),
+            **cls._storage_check_problems(conn, V7_STORAGE_POSTGRES_CHECKS),
+            **cls._storage_key_constraint_problems(
+                conn,
+                V7_STORAGE_KEY_CONSTRAINTS,
+            ),
+        }
+        if problems:
+            raise UnsupportedStoreVersion(
+                "unsupported Agent libOS schema v7 storage contract: "
+                f"{problems}"
             )
 
     @classmethod

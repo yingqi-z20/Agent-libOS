@@ -625,7 +625,7 @@ class TestRuntimeShutdown:
             CAPABILITY_MANAGER_MIXED_PUBLIC_METHODS,
             CAPABILITY_MANAGER_READ_ONLY_PUBLIC_METHODS,
         )
-        assert sum(len(methods) for methods in manager_classes) == 54
+        assert sum(len(methods) for methods in manager_classes) == 59
         assert {
             "inspect_for_presentation",
             "parent_chain_active",
@@ -3547,6 +3547,22 @@ class TestRuntimeShutdown:
                 human,
                 {"type": "question", "question": "rejected query"},
                 blocking=False,
+            ),
+            "query_authority_request": lambda: runtime.human.query_authority_request(
+                pid,
+                human,
+                {
+                    "type": "permission_request",
+                    "question": "rejected Host permission request",
+                    "requested_permission": {
+                        "subject": pid,
+                        "resource": "object:rejected-authority-request",
+                        "rights": ["read"],
+                        "constraints": {},
+                    },
+                },
+                blocking=False,
+                authority_origin="permission_policy",
             ),
             "reconcile_terminal_retry_fence": lambda: (
                 runtime.human.reconcile_terminal_retry_fence(request_id)

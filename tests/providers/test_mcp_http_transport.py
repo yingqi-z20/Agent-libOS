@@ -18,7 +18,7 @@ from agent_libos.substrate.local import (
 )
 
 
-pytestmark = pytest.mark.mcp
+pytestmark = [pytest.mark.mcp, pytest.mark.mcp_transport]
 
 
 def _handler(

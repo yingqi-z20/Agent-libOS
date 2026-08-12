@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ import pytest
 from agent_libos.config import AgentLibOSConfig, LLMDefaults, LLMProfile
 from agent_libos.llm.client import LLMClient, LLMCompletion
 from agent_libos.llm.profiles import LLMProfileRegistry
-from agent_libos.models import DataLabels
+from agent_libos.models import DataFlowContext, DataLabels, DataSourceRef
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.models.semantic import (
     SemanticAssessment,
@@ -21,6 +22,7 @@ from agent_libos.models.semantic import (
 )
 from agent_libos.semantic.external import (
     ExternalLLMSemanticAssessor,
+    HostSemanticAssessmentInvocation,
     ProtectedSemanticAssessmentCall,
     SemanticAssessmentDeadlineExceeded,
     SemanticExternalAssessorConfigurationError,
@@ -136,6 +138,11 @@ def _request(
     labels: DataLabels | None = None,
     redacted_intent: str | None = "review the workspace report",
 ) -> SemanticAssessmentRequest:
+    selected_labels = labels or DataLabels(
+        sensitivity="normal",
+        integrity="checked",
+        trust_level="verified",
+    )
     return SemanticAssessmentRequest(
         kind=kind,
         domain=SemanticDomain.FILESYSTEM,
@@ -143,12 +150,7 @@ def _request(
         input_sha256="1" * 64,
         deadline_at=deadline_at
         or (_NOW + timedelta(seconds=30)).isoformat().replace("+00:00", "Z"),
-        data_labels=labels
-        or DataLabels(
-            sensitivity="normal",
-            integrity="checked",
-            trust_level="verified",
-        ),
+        data_labels=selected_labels,
         redacted_intent=redacted_intent,
         pid="pid-semantic",
         request_id="request-semantic",
@@ -159,7 +161,9 @@ def _request(
         resource_sha256="4" * 64,
         args_sha256="5" * 64,
         state_sha256="6" * 64,
-        source_refs_sha256="7" * 64,
+        source_refs_sha256=DataFlowContext(
+            labels=selected_labels
+        ).source_refs_hash(),
         data_labels_sha256="8" * 64,
         sink_identity_sha256="9" * 64,
         tool_schema_sha256="a" * 64,
@@ -300,6 +304,98 @@ def test_external_assessor_uses_safe_projection_and_protected_single_dispatch() 
     assert "/Users/example/private/account.txt" not in outbound
     assert _SECRET not in repr(call)
     assert _SECRET not in repr(assessment)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (
+        SemanticAssessmentKind.ROOT_GOAL,
+        SemanticAssessmentKind.PROVIDER_INGRESS,
+        SemanticAssessmentKind.APPROVAL,
+    ),
+)
+def test_external_assessor_never_sends_generic_secret_markers_for_any_capture_kind(
+    kind: SemanticAssessmentKind,
+) -> None:
+    sentinel = "SEMANTIC_SECRET_SENTINEL_7f33"
+    client = _SemanticClient(json.dumps(_empty_success_payload()))
+    assessor, protected, _registry = _assessor(client)
+
+    assessment = assessor.assess(
+        _request(
+            kind=kind,
+            redacted_intent=f"Classify {sentinel} without exposing it",
+        )
+    )
+
+    assert assessment.status.value == "success"
+    assert len(protected.calls) == 1
+    call = protected.calls[0]
+    assert call.egress_payload["projection_mode"] == "metadata_only"
+    assert "redacted_intent" not in call.egress_payload
+    assert any(
+        item["category"] == "credential"
+        and item["code"] == "credential_material"
+        for item in call.egress_payload["dlp_findings"]
+    )
+    outbound = json.dumps(client.calls, sort_keys=True)
+    assert sentinel not in outbound
+    assert sentinel not in json.dumps(call.egress_payload, sort_keys=True)
+
+
+def test_secret_dlp_marker_pattern_does_not_match_ordinary_prose() -> None:
+    client = _SemanticClient(json.dumps(_empty_success_payload()))
+    assessor, protected, _registry = _assessor(client)
+    prose = "Review the secret sentinel policy and credential handling guide"
+
+    assessor.assess(_request(redacted_intent=prose))
+
+    assert protected.calls[0].egress_payload["projection_mode"] == "redacted"
+    assert protected.calls[0].egress_payload["redacted_intent"] == prose
+
+
+def test_external_source_refs_require_nonserializable_host_invocation() -> None:
+    source_ref_sentinel = "SEMANTIC_SOURCE_REF_SECRET_SENTINEL_64bd"
+    labels = DataLabels(
+        sensitivity="normal",
+        integrity="checked",
+        trust_level="verified",
+    )
+    flow = DataFlowContext(
+        labels=labels,
+        source_refs=(
+            DataSourceRef(
+                oid=source_ref_sentinel,
+                version=1,
+                content_sha256="d" * 64,
+            ),
+        ),
+    )
+    request = replace(
+        _request(labels=labels),
+        source_refs_sha256=flow.source_refs_hash(),
+    )
+    client = _SemanticClient(json.dumps(_empty_success_payload()))
+    assessor, protected, _registry = _assessor(client)
+
+    with pytest.raises(CapabilityDenied, match="requires live source references"):
+        assessor.assess(request)
+    assert client.calls == []
+    invocation = HostSemanticAssessmentInvocation(
+        request=request,
+        data_flow_context=flow,
+    )
+    assert not hasattr(invocation, "to_dict")
+    assert source_ref_sentinel not in repr(invocation)
+    with pytest.raises(TypeError, match="not serializable"):
+        pickle.dumps(invocation)
+
+    assessment = assessor.assess_host(invocation)
+
+    assert assessment.status.value == "success"
+    assert protected.calls[0].data_flow_context.source_refs == flow.source_refs
+    assert source_ref_sentinel not in repr(protected.calls[0])
+    assert source_ref_sentinel not in json.dumps(client.calls, sort_keys=True)
 
 
 @pytest.mark.parametrize(
@@ -803,6 +899,34 @@ def test_sensitive_or_mixed_identity_projection_is_metadata_only(
     assert protected.calls[0].egress_payload["projection_mode"] == "metadata_only"
     assert "redacted_intent" not in protected.calls[0].egress_payload
     assert intent not in client.calls[0]["messages"][1]["content"]
+
+
+def test_external_projection_never_serializes_tenant_or_principal_identity() -> None:
+    tenant = "SEMANTIC_TENANT_SECRET_SENTINEL_58c1"
+    principal = "SEMANTIC_PRINCIPAL_SECRET_SENTINEL_58c1"
+    labels = DataLabels(tenant=tenant, principal=principal)
+    client = _SemanticClient(json.dumps(_empty_success_payload()))
+    assessor, protected, _registry = _assessor(client)
+
+    assessor.assess(
+        _request(
+            labels=labels,
+            redacted_intent="ordinary content that would otherwise be included",
+        )
+    )
+
+    call = protected.calls[0]
+    assert call.data_flow_context.labels.tenant == tenant
+    assert call.data_flow_context.labels.principal == principal
+    assert call.egress_payload["projection_mode"] == "metadata_only"
+    assert set(call.egress_payload["labels"]) == {
+        "sensitivity",
+        "integrity",
+        "trust_level",
+    }
+    outbound = json.dumps(client.calls, sort_keys=True)
+    assert tenant not in outbound
+    assert principal not in outbound
 
 
 class _EgressBlockedProtectedCalls(_ProtectedCalls):

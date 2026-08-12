@@ -66,7 +66,7 @@ injection and Host-API contract.
 | Git | `LocalGitProvider` pinned to the Runtime workspace repository | configured repository resource (default `git:workspace`), affected filesystem resources, per-remote `git_remote:workspace:<name>`, per-PR `git_pr:workspace:<id>`, state-token CAS, and mandatory approval for destructive operations | Reads are ingress; local mutations, fetch, push, and simulated-PR transitions use distinct protected-operation descriptors and local query-only reconciliation | System Git 2.26+, byte-safe parsing, repository/config identity validation, cross-process lock, no arbitrary argv/URL, executable extensions disabled, bounded output |
 | Human | `LocalHumanProvider` plus GUI/terminal host surfaces | Typed question/permission request and explicit policy decision | Terminal read/write and GUI request presentation are protected information-flow operations; conditional GUI views expose only bound metadata and reject parent responses until their exact one-shot release is consumed through presentation | Typed responses, queue state, bounded payload/output, lock-free blocking I/O with claimed request state |
 | JSON-RPC | `HttpJsonRpcProvider` | Registered endpoint and exact method capability; model-supplied URLs are forbidden | Registry metadata is gated before lookup; calls prepare the reservation/intent before resolving header values, then remote DNS starts inside that intent; transport/classification settles the same effect id | Closed manifest shape, header-env allowlist, request/response hard limits, timeout, resolved-address policy, client-only JSON-RPC 2.0 |
-| MCP | `SdkMcpProvider` on Python MCP SDK v2 for Streamable HTTP and stdio | Registered server/tool capability; protected discovery/refresh additionally needs exact server read+execute, and stdio operations require `process:spawn` plus exact `mcp_stdio:<digest>` execute authority | Tool calls retain negative clearance precheck, exact Sink/registry fencing, pending-first effects, and bounded detached results. Manifest v2 adds bounded discovery, negotiation, pagination, and per-phase receipts inside the same absolute deadline and cumulative byte reservation | Tools-only Manifest v1/v2 surface; explicit `legacy`/`auto`/`2026-07-28` mode; header/stdio-env allowlists; contained stdio lifecycle |
+| MCP | `SdkMcpProvider` for the stable Manifest v1/v2 Tools contract, plus typed exact-v3 Tool and Host client/providers for Streamable HTTP and stdio | Registered server/tool/read-surface authority; protected discovery/refresh additionally needs exact server read+execute, and stdio operations require `process:spawn` plus exact `mcp_stdio:<digest>` execute authority | Tool calls retain negative clearance precheck, exact Sink/registry fencing, pending-first effects, and bounded detached results. V2/v3 negotiation and operation phases share an absolute deadline and cumulative bounds; v3 Tool/Resource/Prompt/MRTR/Task results remain untrusted until Host validation | Exact-version manifests, header/stdio-env allowlists, purpose-specific catalog/content limits, fenced connection lifecycle, no automatic replay, and contained stdio lifecycle |
 | PTY | Trusted `modules/pty` Runtime Module provider hooks | Startup hash trust plus normal process/shell authority; published sessions are Object Memory `EXTERNAL_REF` handles with Object rights | Spawn is bidirectional; read/continuous ingest are ingress; write/resize/public close are egress. Effectful operations use protected pending-to-finalized evidence; write raises the session label high-water even after an ambiguous provider outcome | Output bounds on both backends; independent reader/monitor workers and process-tree wall/CPU/RSS supervision on POSIX. Windows uses `pywinpty`/ConPTY, has no Job Object or resource supervisor, and rejects `SubprocessLimits` before spawn |
 
 Filesystem compare-and-swap is an optional provider extension, not a breaking
@@ -105,9 +105,10 @@ cancellation, and crash-ambiguous outcomes charge one call and the aggregate
 maximum without inventing a prompt/completion split. Settlement completes
 before the LLM call row or any model-selected tool dispatch.
 
-`max_llm_calls` counts executor-level logical calls. OpenAI SDK retries,
-compatibility retries, and API/tool-protocol fallbacks inside one such call may
-still perform multiple physical requests. The reservation is therefore a hard
+`max_llm_calls` counts executor-level logical calls. The built-in client
+disables OpenAI SDK retries; Agent libOS's explicit traced transport retries,
+compatibility retries, and API/tool-protocol fallbacks inside one logical call
+may still perform multiple physical requests. The reservation is therefore a hard
 Runtime admission/accounting boundary, not an exact physical-request,
 provider-billing, currency, or monetary-spend cap. Missing or invalid billable
 usage fails closed and charges the aggregate maximum when a cumulative token
@@ -171,10 +172,92 @@ iterator, count, or size violation fails the completion closed through the same
 text-free `LLMError` boundary; oversized provider content is not truncated into
 an apparently valid model action.
 
-Explicit `safety_identifier`, `prompt_cache_key`, and
-`prompt_cache_retention` fields are dispatched to the Host-selected
-OpenAI-compatible endpoint, including a custom base URL; bounded compatibility
-retry may remove a rejected field. `previous_response_id` is different: the
+### Prompt caching v2 release evidence
+
+Prompt caching has a model-visible layout and a provider transport policy.
+`llm.prompt_layout=cache_optimized_v2` keeps stable instructions and append-only
+TaskRun requirements ahead of volatile state, minimizes libOS-owned metadata,
+and removes generated JSON-Schema `title` annotations. `legacy_v1` remains the
+default and rollback layout during the profile opt-in canary; switch the default
+only after the paired release gate passes. `prompt_cache_mode=provider_default`
+sends no v2 cache options;
+`implicit` sends request-wide implicit mode, while `explicit` also places one
+stable text breakpoint. Both opt-in modes require `prompt_cache_key`; the
+wire key is derived from provider, model, Image/stable-prefix, tool fingerprint,
+and the configured privacy domain without a Run or process id. The only v2 TTL
+is `30m`, and it is mutually exclusive with legacy `prompt_cache_retention`.
+See the [OpenAI prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
+
+The maintenance, browser, and knowledge live evaluators accept
+`--prompt-layout`, and their redacted reports aggregate total input/output,
+cache reads, cache writes, uncached input, completion evidence, and forbidden
+Host-identifier counts. Build one arm from two or more provider reports with a
+JSON manifest and then compare paired arms:
+
+```bash
+uv run python scripts/build_prompt_cache_arm_report.py \
+  --manifest .benchmark_runs/cache-v2-providers.json \
+  --output .benchmark_runs/cache-v2-arm.json
+uv run python scripts/check_prompt_cache_gate.py \
+  --legacy .benchmark_runs/cache-v1-arm.json \
+  --candidate .benchmark_runs/cache-v2-arm.json
+```
+
+The manifest is a complete JSON object. `security_invariants_passed` is a
+required operator attestation that the relevant deterministic security suite
+passed; omitting it is an input error, and setting it to `false` deliberately
+produces a non-releasable arm. The arm builder does not derive or verify a
+source revision from that boolean, so the release operator must separately
+archive the clean source identity and ensure both arms and the security run use
+that source. `providers` is a non-empty array; strict paired release evidence
+needs at least two unique provider/model pairs in each arm. The builder accepts
+at most 1 MiB for this manifest and 16 MiB for each provider report, and rejects
+duplicate JSON keys, non-finite numbers, and present fields of the wrong type.
+For example:
+
+```json
+{
+  "security_invariants_passed": true,
+  "providers": [
+    {
+      "provider_id": "provider-a",
+      "model_id": "model-a",
+      "repetitions": 3,
+      "report": "provider-a-cache-v2.json",
+      "pricing": {
+        "input_per_million": 2.5,
+        "cached_input_per_million": 1.25,
+        "output_per_million": 10.0
+      }
+    },
+    {
+      "provider_id": "provider-b",
+      "model_id": "model-b",
+      "repetitions": 3,
+      "report": "provider-b-cache-v2.json"
+    }
+  ]
+}
+```
+
+Each provider report path is resolved relative to the manifest and must point
+to a redacted live-evaluator report for the same explicit `prompt_layout`; its
+metrics supply the workflow count, oracle results, completion evidence, cache
+counters, and closed-category identifier-leak evidence. An optional `pricing`
+object uses per-million rates for `input_per_million`,
+`cached_input_per_million`, `output_per_million`, and (when applicable)
+`cache_write_input_per_million`. A distinct write rate requires reported write
+tokens; unknown is rejected rather than billed as zero. The strict gate
+requires the same two-or-more provider/model pairs in both arms, at least three
+repetitions and six workflows per provider, all oracles and completion evidence,
+the deterministic security flag, zero forbidden identifiers, the token
+reduction thresholds, non-regressing hit rate, and non-increasing known-price
+cost per successful task.
+
+Explicit cache policy fields are dispatched to the Host-selected OpenAI-compatible
+endpoint, including a custom base URL. If the endpoint rejects a v2 cache field,
+bounded compatibility retry removes the whole v2 cache option group and records
+a content-free downgrade reason. `previous_response_id` is different: the
 low-level client admits it only for the official Responses endpoint with
 provider storage enabled, and the AgentProcess executor never supplies one.
 
@@ -193,10 +276,23 @@ Manifest v1 keeps the existing `McpProvider` signatures and legacy wire
 behavior. Manifest v2 requires the optional `McpModernProtocolProvider`
 extension and explicitly selects `legacy`, `auto`, or `2026-07-28`; server
 capabilities reported by discovery are diagnostics, never Runtime authority.
-The modern Adapter advertises no Sampling, Roots, Elicitation, subscriptions,
-Tasks, or extensions. It clears ambient OpenTelemetry context and installs no
-exporter. See [MCP](mcp.md) for safe fallback and strict-core exclusions.
+The v1/v2 modern Adapter advertises no Sampling, Roots, Elicitation,
+subscriptions, Tasks, or extensions. Exact-v3 handles Elicitation as a
+Host-owned continuation, subscriptions as inert bounded event queues, Tools
+through the modern closed result union, and Tasks only behind the Host's exact
+extension digest pin. Neither path supports
+Sampling, Roots, Apps, Logging, or an OpenTelemetry product integration; the
+transport clears ambient trace context and installs no exporter. See
+[MCP](mcp.md) for lifecycle fences and exclusions.
 See [Data Flow](data_flow.md).
+
+Exact-v3 custom MCP SPIs are trusted, cooperative Host code. Their async methods
+must honor the supplied absolute deadline, yield instead of blocking the event
+loop, bound CPU work, and propagate cancellation. Runtime pre/post checks make
+an entered overrun unknown and non-replayable, but do not claim to preempt
+arbitrary in-process Python; hard isolation requires a killable worker process.
+Built-in governed SDK transports continue to enforce bounded network/stdio I/O
+and cleanup independently of this custom-SPI contract.
 
 Supplying an already-constructed `LocalResourceProviderSubstrate` does not make
 its Git settings independent of the Runtime configuration. During open, the

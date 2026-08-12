@@ -1812,6 +1812,72 @@ textarea {
   color: #9a3412;
 }
 
+.mcpModernPanel {
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.mcpModernPanel > header h4,
+.mcpModernPanel > header p,
+.mcpModernPanel .adminDisclosure p {
+  margin: 0;
+}
+
+.mcpModernPanel > header p,
+.mcpModernPanel .adminDisclosure p {
+  color: #627d98;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.mcpModernPanel .adminDisclosure {
+  min-width: 0;
+}
+
+.mcpUntrustedNotice {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid #f5c2a3;
+  border-radius: 6px;
+  background: #fff7ed;
+}
+
+.mcpHumanReceipt {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 3px 8px;
+  margin: 0;
+  font-size: 11px;
+}
+
+.mcpHumanReceipt dt {
+  color: #627d98;
+  font-weight: 700;
+}
+
+.mcpHumanReceipt dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.mcpSchemaArguments {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
+  gap: 7px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid #d9e2ec;
+  border-radius: 6px;
+  background: #fff;
+}
+
 .adminFormGrid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -4040,6 +4106,144 @@ button.promptChip:hover:not(:disabled) {
   gap: 6px;
 }
 
+.semanticEvidenceDashboard {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr));
+  gap: 12px;
+}
+
+.semanticEvidenceWindowNotice {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.semanticEvidenceCard {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.semanticEvidenceCard > header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.semanticEvidenceCard > header h3,
+.semanticEvidenceDetails summary {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.semanticLineageControls {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(120px, 1fr);
+  gap: 8px;
+}
+
+.semanticLineageControls label {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.semanticLineageControls select {
+  min-width: 0;
+  width: 100%;
+}
+
+.semanticLineageResult {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+.semanticLineageResult ol,
+.semanticEvidenceRows {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.semanticLineageResult li,
+.semanticEvidenceRows article {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  padding: 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-subtle);
+}
+
+.semanticLineageResult li {
+  margin-inline-start: min(calc(var(--semantic-depth, 0) * 8px), 64px);
+}
+
+.semanticLineageResult li > span,
+.semanticEvidenceRows article > span {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.semanticLineageResult small,
+.semanticEvidenceRows small {
+  color: var(--color-text-tertiary);
+  overflow-wrap: anywhere;
+  font-size: 10px;
+}
+
+.semanticLineageResult code,
+.semanticEvidenceRows code {
+  min-width: 0;
+  padding: 3px 6px;
+  overflow-wrap: anywhere;
+  border-radius: 5px;
+  color: var(--color-code-fg);
+  background: var(--color-code-bg);
+  font-size: 10px;
+  unicode-bidi: plaintext;
+}
+
+.semanticMetricLine,
+.semanticTripNotice {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.semanticTripNotice {
+  padding: 8px;
+  border: 1px solid #edb6ba;
+  border-radius: var(--radius-sm);
+  color: #9e2d37;
+  background: #fff0f1;
+}
+
+.semanticEvidenceDetails {
+  display: grid;
+  gap: 8px;
+}
+
+.semanticEvidenceDetails summary {
+  cursor: pointer;
+  color: var(--color-text-secondary);
+}
+
 @media (max-width: 720px) {
   .semanticLayout {
     grid-template-columns: minmax(0, 1fr);
@@ -4060,6 +4264,10 @@ button.promptChip:hover:not(:disabled) {
   }
 
   .semanticDigestList dl > div {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .semanticLineageControls {
     grid-template-columns: minmax(0, 1fr);
   }
 }

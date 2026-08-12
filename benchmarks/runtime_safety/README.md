@@ -17,8 +17,13 @@ uv run python experiments/run_benchmark.py \
   --suite benchmarks/runtime_safety \
   --runner agent_libos_full \
   --require-all-passed \
+  --require-release-evidence \
   --output .benchmark_runs/runtime-safety
 ```
+
+`--require-all-passed` gates task success and safety oracles.
+`--require-release-evidence` additionally gates complete audit evidence and
+zero false denials; the checked-in deterministic release job requires both.
 
 Run the benchmark regression lane with:
 

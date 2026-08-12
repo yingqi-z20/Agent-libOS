@@ -238,29 +238,36 @@ checkpoint-committed image restores the process's captured
 `loaded_skills.package_snapshot`, but does not replace the current global Skill
 or Image registry with historical nested metadata.
 
-`prompt_mode` controls prompt composition. `image_only` is a transparent
-upstream-agent boundary: the system message is byte-for-byte the Image prompt,
-and the first user message is the process goal (a string is unchanged; a
-structured goal is canonical JSON). Later quanta send the cumulative native
-`assistant(tool_calls) -> tool` transcript. Tool messages contain the bounded
-model projection, not the Runtime result envelope. Object Memory, Capability,
-Skill, fallback-action, pressure-notice, and Agent libOS explanatory text are
-never injected. This is the default for custom images and image packages.
-`minimal_runtime` omits the full `BASE_SYSTEM_PROMPT`/action-planner envelope,
-but it is not otherwise transparent: it still adds the complete cumulative
-completion contract, factual runtime/state sections, activated Skill bodies and
-recovered-goal context, and optional Host-enabled fallback JSON guidance.
-Unactivated Skill metadata is not injected; the model obtains it through
-`discover_skills`.
-`libos_default` additionally preserves the native Agent libOS planner envelope
-used by built-in images. Only `image_only` is byte-transparent.
+`prompt_mode` and the Host-selected `llm.prompt_layout` are separate prompt
+composition axes. `prompt_mode` selects which Runtime envelope the Image uses;
+the layout controls how Runtime-owned and TaskRun material is arranged and where
+a cache-stable prefix can end. Neither setting changes primitive authorization.
+Their current model-visible combinations are:
 
-The transparent transcript is reconstructed from the latest complete,
-successful `action_selection` call for the exact `(image_id, goal_oid, system
-prompt hash, durable LLM-context generation)` anchor plus its call-id-paired
-tool outputs, including after an ordinary Runtime reopen. The Responses API
-receives explicit historical `function_call` and `function_call_output` input
-items and does not rely on `previous_response_id`. Image-only provider errors
+| `prompt_mode` | Ordinary process, `legacy_v1` | Ordinary process, `cache_optimized_v2` | TaskRun, `legacy_v1` | TaskRun, `cache_optimized_v2` |
+| --- | --- | --- | --- | --- |
+| `image_only` | Byte-for-byte Image system prompt; the first user message is the raw process goal; later quanta use the cumulative native transcript. | Same model-visible messages as ordinary `legacy_v1`; the layout does not rewrite this non-TaskRun transparent path. | The Image system prompt remains byte-for-byte, but the first user message is a Host-authored durable TaskRun JSON contract followed by the Run transcript, not the raw process goal. | The Image system prompt remains byte-for-byte; an id-free semantic, append-only TaskRun contract is the stable user message, followed by the Run transcript and any nonempty current TaskRun state. |
+| `minimal_runtime` | Omits `BASE_SYSTEM_PROMPT` and the action-planner envelope, but includes the cumulative completion contract, factual Runtime state, activated Skills, recovered-goal context, and optional fallback JSON guidance. | Preserves those semantics while compacting libOS-owned metadata and placing stable material before the volatile Runtime tail. | The legacy TaskRun contract and Run transcript precede the ordinary assembled minimal-runtime user message. | The semantic append-only TaskRun contract, Run transcript, and any current TaskRun state precede the compact assembled minimal-runtime user message. |
+| `libos_default` | The minimal-runtime material plus the native Agent libOS planner envelope used by built-in Images. | The same planner contract with the v2 stable/volatile layout and compact Host metadata. | The legacy TaskRun contract and transcript precede the assembled planner/runtime message. | The semantic append-only TaskRun contract, transcript, and any current TaskRun state precede the compact planner/runtime message. |
+
+For an ordinary non-TaskRun `image_only` process, a structured initial goal is
+canonical JSON and a string goal is unchanged. Tool messages contain the
+bounded model projection, not the Runtime result envelope. Object Memory,
+Capability, Skill, fallback-action, pressure-notice, and Agent libOS explanatory
+text are not injected. This is the default for custom Images and Image packages.
+TaskRun supervision is the explicit transparency exception shown above: it owns
+the durable user contract and transcript while preserving the exact Image system
+prompt. Unactivated Skill metadata is not injected in Runtime-owned modes; the
+model obtains it through `discover_skills`.
+
+The detailed transparent-transcript rules below apply to an ordinary
+non-TaskRun `image_only` process. Its transcript is reconstructed from the
+latest complete, successful `action_selection` call for the exact `(image_id,
+goal_oid, system prompt hash, durable LLM-context generation)` anchor plus its
+call-id-paired tool outputs, including after an ordinary Runtime reopen. The
+Responses API receives explicit historical `function_call` and
+`function_call_output` input items and does not rely on `previous_response_id`.
+Image-only provider errors
 use a separate purpose and therefore do not shadow the last complete transcript
 head; legacy same-purpose error rows are likewise ignored by the
 latest-successful-head lookup. Repair prompts are request-local. A stopped
@@ -494,10 +501,14 @@ collision fails Runtime construction instead of silently replacing an image.
 The four long-horizon specialist images deliberately omit
 `metadata.tool_projection`. Their complete, small `default_tools` tables are
 therefore model-visible at boot without Skill discovery turns. This is a
-visibility optimization, not an authority grant: every primitive still checks
-Capability, Task Authority, provider policy, data flow, budgets, and durable
-effect settlement. The broader general-purpose images retain source-neutral
-on-demand Skill projection for tasks whose tool domain is not known at launch.
+visibility optimization, not an authority grant: every call remains subject to
+the applicable Capability, Task Authority, data-flow, budget, and policy checks.
+Provider policy and durable external-effect settlement apply when the primitive
+crosses those respective boundaries; internal Object Memory and lifecycle
+operations do not acquire Provider or external-effect semantics merely because
+their tools are model-visible. The broader general-purpose images retain
+source-neutral on-demand Skill projection for tasks whose tool domain is not
+known at launch.
 
 LLM selection is host-controlled and process-local. A process stores only an
 `llm_profile_id`; the host Runtime resolves that id to a configured
@@ -514,8 +525,12 @@ The default provider posture is stateless: `llm.store=false` and
 `responses_previous_response_id=false`. This limits provider-side retention; it
 is not an end-to-end privacy guarantee. By default `llm.persist_full_io=true`
 also retains prepared prompts and visible tools and, for successful responses,
-tool/reasoning records, response content, and raw provider response fields in
-the RuntimeStore subject to Host retention policy and database access controls.
+tool/reasoning records, response content, and a bounded, redacted
+Provider-response projection in the RuntimeStore subject to Host retention
+policy and database access controls. The projection preserves bounded readable
+fields and ordinary metadata, but hashes opaque, encrypted, signature, and
+credential-like values and replaces over-limit text or structure with bounded
+omission descriptors. It is not the complete Provider SDK response object.
 A failed call's ordinary request fields follow the same policy, but provider or
 extension exception text is never persisted or exposed to the model regardless
 of this setting; durable failure evidence contains only a stable public
@@ -536,6 +551,59 @@ create extra resource reservations or change the one-logical-call budget.
 Trace persistence is terminal-call evidence, not a crash-safe per-attempt
 journal; cancellation or process loss may therefore leave only the protected
 effect and budget evidence.
+
+Prompt caching has a model-visible layout policy and an independent Provider
+transport policy. The repository default remains
+`llm.prompt_layout=legacy_v1`, `prompt_cache_mode=provider_default`, and no cache
+key or TTL. `cache_optimized_v2` is an explicit Host opt-in: it places stable
+instructions and append-only TaskRun requirements ahead of volatile state,
+minimizes libOS-owned identifiers and metadata, and removes generated
+JSON-Schema `title` annotations. Selecting that layout alone does not ask a
+Provider to cache, and selecting a cache transport mode does not by itself
+select the v2 layout.
+
+`prompt_cache_mode=provider_default` sends no v2 `prompt_cache_options` or
+explicit breakpoint; separately configured legacy key/retention fields retain
+their legacy Provider behavior. `implicit` sends request-wide implicit cache
+options, while `explicit` also marks one stable text breakpoint. Both opt-in
+modes require a nonempty Host-configured `prompt_cache_key`. The wire key is not
+that plaintext value: the Runtime derives an `alibos:v2:` key from the configured
+privacy/routing domain, Provider endpoint, model, stable prompt projection, and
+normalized tool table, without a Run or process id. The only v2 TTL is `30m`;
+it is mutually exclusive with legacy `prompt_cache_retention`, and opt-in modes
+cannot use that retention field.
+
+Cache options are sent to the exact Host-selected OpenAI-compatible endpoint,
+including an explicitly allowed custom base URL. If an endpoint rejects any v2
+cache field, bounded compatibility retry removes the cache key, options, and all
+cache breakpoints as one group before retrying within the same logical protected
+LLM call. A successful downgraded request is not reported as having sent the
+requested v2 policy merely because the original profile requested it. The
+LLM-call request options separately record configured policy, the secret-free
+facts of the request that actually succeeded, removed option names, breakpoint
+count, and the content-free reason `provider_rejected_cache_options`.
+
+Each LLM call also records a content-free `prompt_projection`: layout, per-segment
+byte and estimated-token counts and hashes, normalized-tool size/token/hash, and
+the stable-prefix count and hash. It does not add prompt plaintext to telemetry.
+Live cache evidence aggregates Provider-reported total input/output, cache reads,
+cache writes when known, uncached input, completion evidence, and forbidden
+Host-identifier counts. Reported-call counters are tracked separately; the
+strict gate rejects missing cache counters rather than accepting a numerical
+aggregate zero as complete evidence.
+
+The Runtime does not execute the prompt-cache release gate during dispatch; an
+explicit Host configuration can enable v2 for a canary. The offline strict gate
+is the policy for changing the repository default. It compares paired
+`legacy_v1` and candidate arms for the same two-or-more Provider/model pairs,
+requires at least three repetitions and six workflows per Provider, complete
+cache telemetry, all task/oracle/completion/security evidence, 100% success, and
+zero forbidden internal identifiers. The candidate must reduce uncached input
+by at least 20% and total input by at least 10%, must not lower cache hit rate,
+and, where prices are known, must not increase cost per successful task. Until
+that evidence passes, `legacy_v1` remains the default and rollback layout. See
+[prompt-caching Provider policy](providers.md#prompt-caching-v2-release-evidence)
+for the evaluator and report entrypoints.
 
 The low-level OpenAI client sends an explicitly supplied
 `previous_response_id` only for an official, stored Responses request whose
@@ -1268,7 +1336,7 @@ status, timestamps, and audit linkage.
 
 If a primitive or human tool blocks on human approval, the process enters
 `waiting_human`. Human requests are terminally decided once: only pending
-requests can be approved or rejected. Store schema v5 gives every request a
+requests can be approved or rejected. Store schema v7 gives every request a
 durable non-negative `revision`. Response, cancellation, claim/delivery, and
 retryable delivery-state updates compare the expected revision and status; a
 winner increments the revision, so a stale response cannot exploit a

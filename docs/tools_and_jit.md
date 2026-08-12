@@ -95,7 +95,7 @@ filesystem, shell, Git, remote, checkpoint, human, and other effects still pass
 through normal authority and approval boundaries. Cross-process operations
 still require `process:<pid>` `admin`.
 
-The catalog gives each of the 99 built-in static tools one intent-focused owner
+The catalog gives each of the 101 built-in static tools one intent-focused owner
 across 26 Skills, with at most nine tools per Skill. The owner is available
 through `SkillManager.builtin_skill_for_tool()`. This keeps automatic routing
 deterministic and prevents overlapping Skills from making unload provenance

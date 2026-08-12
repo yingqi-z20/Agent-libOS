@@ -86,9 +86,63 @@ def normalize_openai_strict_schema(
 
     _validate_schema_bounds(schema)
     candidate = deepcopy(schema)
+    _strip_model_annotation_titles(candidate)
     if _normalize_schema(candidate):
         return candidate, True
-    return deepcopy(schema), False
+    return candidate, False
+
+
+def compact_model_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Remove non-semantic generated annotations from a model-facing schema."""
+
+    _validate_schema_bounds(schema)
+    selected = deepcopy(schema)
+    _strip_model_annotation_titles(selected)
+    return selected
+
+
+def _strip_model_annotation_titles(schema: dict[str, Any]) -> None:
+    pending = [schema]
+    while pending:
+        current = pending.pop()
+        current.pop("title", None)
+
+        for keyword in (
+            "additionalItems",
+            "additionalProperties",
+            "contains",
+            "contentSchema",
+            "else",
+            "if",
+            "items",
+            "not",
+            "propertyNames",
+            "then",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+        ):
+            child = current.get(keyword)
+            if isinstance(child, dict):
+                pending.append(child)
+
+        for keyword in (
+            "$defs",
+            "definitions",
+            "dependencies",
+            "dependentSchemas",
+            "patternProperties",
+            "properties",
+        ):
+            children = current.get(keyword)
+            if isinstance(children, dict):
+                pending.extend(
+                    child for child in children.values() if isinstance(child, dict)
+                )
+
+        for keyword in ("allOf", "anyOf", "items", "oneOf", "prefixItems"):
+            children = current.get(keyword)
+            if isinstance(children, list):
+                pending.extend(child for child in children if isinstance(child, dict))
 
 
 def normalize_openai_structured_output_schema(
@@ -243,6 +297,7 @@ def _normalize_schema(schema: Any) -> bool:
 
 
 __all__ = [
+    "compact_model_json_schema",
     "normalize_openai_chat_tool_schema",
     "normalize_openai_strict_schema",
     "normalize_openai_structured_output_schema",

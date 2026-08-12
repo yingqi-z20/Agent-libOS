@@ -16,6 +16,22 @@ class McpCallStatus(StrEnum):
     INPUT_REQUIRED_UNSUPPORTED = "input_required_unsupported"
 
 
+class McpDispatchState(StrEnum):
+    """Bounded public evidence about consequential ``tools/call`` dispatch."""
+
+    NOT_STARTED = "not_started"
+    STARTED = "started"
+    UNKNOWN = "unknown"
+
+
+class McpRetryClass(StrEnum):
+    """Safe retry guidance which never authorizes an automatic replay."""
+
+    NOT_APPLICABLE = "not_applicable"
+    REOBSERVE_REQUIRED = "reobserve_required"
+    UNSAFE_OR_UNKNOWN = "unsafe_or_unknown"
+
+
 class McpProtocolMode(StrEnum):
     """Host-selected MCP wire-protocol behavior for a registered server."""
 
@@ -257,3 +273,6 @@ class McpCallResult:
     duration_s: float = 0.0
     connection: McpConnectionInfo | None = None
     receipts: tuple[McpExchangeReceipt, ...] = ()
+    dispatch_state: McpDispatchState = McpDispatchState.UNKNOWN
+    retry_class: McpRetryClass = McpRetryClass.UNSAFE_OR_UNKNOWN
+    automatic_retry_disabled: bool = True

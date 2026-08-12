@@ -5,7 +5,14 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { redactGuiServerOutput, requireLoopbackDevServerUrl, runtimeServerEnv } from "./env.js";
+import {
+  ensurePrivateRuntimeDirectory,
+  packagedRuntimeArguments,
+  packagedRuntimeLayout,
+  resolveRuntimeServerCommand,
+  runtimeChildEnvironment
+} from "./desktopRuntime.js";
+import { redactGuiServerOutput, requireLoopbackDevServerUrl } from "./env.js";
 import { readImagePackageFiles } from "./imagePackage.js";
 import { appendStartupOutput, cleanupBeforeExit, consumeStartupOutput, isChildAlive, withStartupFailureCleanup, type ServerConnection } from "./processLifecycle.js";
 import {
@@ -22,16 +29,12 @@ import {
 } from "./security.js";
 import { mainWindowBounds, shouldCreateBrowserWindow } from "./windowBounds.js";
 
-type RuntimeServerCommand = {
-  command: string;
-  args: string[];
-};
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "..", "..");
 const smokeMode = process.env.AGENT_LIBOS_GUI_SMOKE === "1";
 const smokeWindowMode = smokeMode && process.env.AGENT_LIBOS_GUI_SMOKE_WINDOW === "1";
+const smokePersistentRuntime = smokeMode && process.env.AGENT_LIBOS_GUI_SMOKE_PERSIST === "1";
 const smokeLogPath = process.env.AGENT_LIBOS_GUI_SMOKE_LOG;
 const imageManifestMaxBytes = 1_048_576;
 const startupOutputMaxBytes = 65_536;
@@ -61,7 +64,12 @@ protocol.registerSchemesAsPrivileged([
 ]);
 
 if (smokeMode) {
-  const smokeUserDataPath = path.join(repoRoot, "gui", ".smoke-user-data");
+  const configuredSmokeUserData = process.env.AGENT_LIBOS_GUI_SMOKE_USER_DATA;
+  const smokeUserDataPath = configuredSmokeUserData
+    ? path.resolve(configuredSmokeUserData)
+    : app.isPackaged
+      ? path.join(app.getPath("temp"), `agent-libos-desktop-smoke-${process.pid}`)
+      : path.join(repoRoot, "gui", ".smoke-user-data");
   fs.mkdirSync(smokeUserDataPath, { recursive: true });
   app.setPath("userData", smokeUserDataPath);
   app.setPath("sessionData", smokeUserDataPath);
@@ -272,16 +280,33 @@ async function doStartRuntimeServer(db?: string): Promise<ServerConnection> {
   smokeLog("server.start", { db: db ?? null });
   const previousProcess = serverProcess;
   const previousConnection = connection;
-  const serverCommand = resolveRuntimeServerCommand();
+  const userDataPath = app.getPath("userData");
+  const serverCommand = resolveRuntimeServerCommand({
+    packaged: app.isPackaged,
+    repoRoot,
+    resourcesPath: process.resourcesPath,
+    userDataPath
+  });
   smokeLog("server.command", { command: serverCommand.command, args: serverCommand.args });
-  const llmProfilesFile = path.join(app.getPath("userData"), "llm-profiles.json");
+  const packagedLayout = app.isPackaged
+    ? packagedRuntimeLayout(process.resourcesPath, userDataPath)
+    : null;
+  const llmProfilesFile = packagedLayout?.llmProfilesFile ?? path.join(userDataPath, "llm-profiles.json");
   fs.mkdirSync(path.dirname(llmProfilesFile), { recursive: true });
-  const serverArgs = db === undefined
-    ? [...serverCommand.args, "--port", "0", "--llm-profiles-file", llmProfilesFile]
-    : [...serverCommand.args, "--db", db, "--port", "0", "--llm-profiles-file", llmProfilesFile];
+  if (packagedLayout) ensurePrivateRuntimeDirectory(packagedLayout.runtimeDirectory);
+  const serverArgs = packagedLayout
+    ? [...serverCommand.args, ...packagedRuntimeArguments(packagedLayout, db)]
+    : db === undefined
+      ? [...serverCommand.args, "--port", "0", "--llm-profiles-file", llmProfilesFile]
+      : [...serverCommand.args, "--db", db, "--port", "0", "--llm-profiles-file", llmProfilesFile];
   const child = spawn(serverCommand.command, serverArgs, {
-    cwd: repoRoot,
-    env: runtimeServerEnv(repoRoot),
+    cwd: packagedLayout?.runtimeDirectory ?? repoRoot,
+    env: runtimeChildEnvironment({
+      packaged: app.isPackaged,
+      repoRoot,
+      resourcesPath: process.resourcesPath,
+      userDataPath
+    }),
     detached: process.platform !== "win32",
     windowsHide: true
   });
@@ -380,26 +405,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function resolveRuntimeServerCommand(): RuntimeServerCommand {
-  const explicit = process.env.AGENT_LIBOS_GUI_SERVER_BIN;
-  if (explicit && explicit.trim()) {
-    return { command: explicit.trim(), args: [] };
-  }
-  const venvScript =
-    process.platform === "win32"
-      ? path.join(repoRoot, ".venv", "Scripts", "agent-libos-gui-server.exe")
-      : path.join(repoRoot, ".venv", "bin", "agent-libos-gui-server");
-  if (fs.existsSync(venvScript)) {
-    return { command: venvScript, args: [] };
-  }
-  return { command: "uv", args: ["run", "agent-libos-gui-server"] };
-}
-
 async function createWindow() {
   smokeLog("startup.begin");
   // Smoke validation must never open or mutate an operator's default
   // persistent database merely because the command runs from the repo root.
-  connection = await startRuntimeServer(smokeMode ? "local" : undefined);
+  connection = await startRuntimeServer(smokeMode && !smokePersistentRuntime ? "local" : undefined);
   smokeLog("window.server.ready", { db: connection.db, url: connection.url });
   if (!shouldCreateBrowserWindow(smokeMode, smokeWindowMode)) {
     const health = await withTimeout(requestServer(connection, "/api/health", "GET", 5000), 5000, "server health");
@@ -565,7 +575,9 @@ function installProductionCsp(window: BrowserWindow) {
 
 function installProductionRendererProtocol() {
   if (productionRendererProtocolInstalled) return;
-  const distRoot = path.join(repoRoot, "gui", "dist");
+  const distRoot = app.isPackaged
+    ? packagedRuntimeLayout(process.resourcesPath, app.getPath("userData")).rendererRoot
+    : path.join(repoRoot, "gui", "dist");
   protocol.handle(productionRendererScheme, async (request) => {
     const asset = await readProductionRendererAsset(distRoot, request.url);
     if (asset === null) {

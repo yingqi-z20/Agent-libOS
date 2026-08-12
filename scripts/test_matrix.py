@@ -14,6 +14,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from scripts.mcp_test_support import (
+    mcp_dependency_error,
+    missing_mcp_optional_dependencies,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 LANE_PATHS = {
     "unit": ("tests/unit",),
@@ -40,11 +45,20 @@ PARALLEL_BY_DEFAULT_LANES = {
     "providers",
     "all",
 }
+REAL_DENO_SERIAL_LANES = {
+    "runtime",
+    "security",
+    "self-evolution",
+    "providers",
+    "all",
+}
+DENO_RESOURCE_MONITOR_LANES = {"security", "self-evolution", "all"}
 DEFAULT_SERIAL_DIST = "loadfile"
 DEFAULT_PARALLEL_DIST = "worksteal"
 WORKERS_ENV = "AGENT_LIBOS_TEST_WORKERS"
 DIST_ENV = "AGENT_LIBOS_TEST_DIST"
 XDIST_DISTS = ("loadfile", "loadscope", "load", "worksteal")
+PYTEST_NO_TESTS_EXIT_CODE = 5
 
 
 @dataclass(frozen=True)
@@ -55,6 +69,7 @@ class Command:
     enforce_timeout: bool = True
     invariant_test_paths: tuple[str, ...] | None = None
     invariant_marker_expression: str | None = None
+    allow_no_tests: bool = False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -125,7 +140,12 @@ def main(argv: list[str] | None = None) -> int:
             if _is_pytest_command(command):
                 receipt_path = Path(receipt_dir) / f"command-{index}.json"
                 command = _with_invariant_receipt(command, receipt_path)
-            status = _run(command, max_seconds=args.max_lane_seconds)
+            raw_status = _run(command, max_seconds=args.max_lane_seconds)
+            no_tests_collected = _is_allowed_pytest_no_tests_status(
+                command,
+                raw_status,
+            )
+            status = _normalize_command_status(command, raw_status)
             if status != 0:
                 return status
             if receipt_path is not None:
@@ -134,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
                     lane=None if args.lane == "all" else args.lane,
                     selected_test_paths=command.invariant_test_paths,
                     marker_expression=command.invariant_marker_expression,
+                    no_tests_collected=no_tests_collected,
                 )
                 if status != 0:
                     return status
@@ -149,14 +170,13 @@ def _commands_for(args: argparse.Namespace) -> list[Command]:
             Command("gui build", [npm, "--prefix", "gui", "run", "build"]),
         ]
     if args.lane == "all":
-        return [
-            Command(
-                f"pytest all deterministic lanes{_worker_suffix(args)}",
-                _pytest_args(("tests",), args),
-                env=_pytest_env(args),
-                invariant_marker_expression=_pytest_marker_expression(args),
-            )
-        ]
+        return _python_lane_commands(
+            args,
+            name=f"pytest all deterministic lanes{_worker_suffix(args)}",
+            serial_name="pytest all deterministic lanes real Deno (serial)",
+            monitor_name="pytest all deterministic lanes Deno resource monitor (serial)",
+            selected_paths=("tests",),
+        )
     selected_paths = _sharded_lane_paths(
         LANE_PATHS[args.lane],
         shard_count=args.shard_count,
@@ -167,17 +187,106 @@ def _commands_for(args: argparse.Namespace) -> list[Command]:
         if args.shard_count == 1
         else f" shard {args.shard_index + 1}/{args.shard_count}"
     )
-    return [
-        Command(
-            f"pytest {args.lane}{shard_suffix}{_worker_suffix(args)}",
-            _pytest_args(selected_paths, args),
-            env=_pytest_env(args),
-            invariant_test_paths=(
-                selected_paths if args.shard_count > 1 else None
-            ),
-            invariant_marker_expression=_pytest_marker_expression(args),
+    return _python_lane_commands(
+        args,
+        name=f"pytest {args.lane}{shard_suffix}{_worker_suffix(args)}",
+        serial_name=f"pytest {args.lane}{shard_suffix} real Deno (serial)",
+        monitor_name=(
+            f"pytest {args.lane}{shard_suffix} Deno resource monitor (serial)"
+        ),
+        selected_paths=selected_paths,
+    )
+
+
+def _python_lane_commands(
+    args: argparse.Namespace,
+    *,
+    name: str,
+    serial_name: str,
+    monitor_name: str,
+    selected_paths: tuple[str, ...],
+) -> list[Command]:
+    if not _requires_serial_real_deno_phase(args):
+        return [
+            Command(
+                name,
+                _pytest_args(selected_paths, args),
+                env=_pytest_env(args),
+                invariant_test_paths=selected_paths,
+                invariant_marker_expression=_pytest_marker_expression(args),
+            )
+        ]
+
+    parallel_marker = _pytest_marker_expression(args, real_deno=False)
+    monitor_marker = _pytest_marker_expression(
+        args,
+        real_deno=True,
+        deno_resource_monitor=True,
+    )
+    general_marker = _pytest_marker_expression(
+        args,
+        real_deno=True,
+        deno_resource_monitor=(
+            False if args.lane in DENO_RESOURCE_MONITOR_LANES else None
+        ),
+    )
+    commands: list[Command] = []
+    # Resource-budget monitor tests must run before xdist starts.  On Hosts
+    # with restricted process inspection, recently reaped worker process trees
+    # can transiently make the fail-closed monitor unavailable even to a fresh
+    # pytest process.  A dedicated first process preserves the monitor contract
+    # without retrying or weakening it.
+    if args.lane in DENO_RESOURCE_MONITOR_LANES:
+        commands.append(
+            Command(
+                monitor_name,
+                _pytest_args(
+                    selected_paths,
+                    args,
+                    marker_expression=monitor_marker,
+                    include_workers=False,
+                ),
+                env=_pytest_env(args),
+                invariant_test_paths=selected_paths,
+                invariant_marker_expression=monitor_marker,
+                allow_no_tests=True,
+            )
         )
-    ]
+    commands.append(
+        Command(
+            name,
+            _pytest_args(
+                selected_paths,
+                args,
+                marker_expression=parallel_marker,
+            ),
+            env=_pytest_env(args),
+            # Marker-split receipts must collect the exact selected nodes even
+            # for an otherwise unsharded lane.  This prevents either phase
+            # from claiming invariant evidence owned by the other phase.
+            invariant_test_paths=selected_paths,
+            invariant_marker_expression=parallel_marker,
+        )
+    )
+    commands.append(
+        Command(
+            serial_name,
+            _pytest_args(
+                selected_paths,
+                args,
+                marker_expression=general_marker,
+                include_workers=False,
+            ),
+            env=_pytest_env(args),
+            invariant_test_paths=selected_paths,
+            invariant_marker_expression=general_marker,
+            # A file-weighted shard can legitimately contain no real-Deno
+            # nodes.  Pytest reports that as exit 5; all other nonzero statuses
+            # remain failures and stop the matrix before receipt validation.
+            allow_no_tests=True,
+        )
+    )
+    return commands
 
 
 def _sharded_lane_paths(
@@ -216,10 +325,21 @@ def _sharded_lane_paths(
     return tuple(sorted(buckets[shard_index]))
 
 
-def _pytest_args(paths: tuple[str, ...], args: argparse.Namespace) -> list[str]:
+def _pytest_args(
+    paths: tuple[str, ...],
+    args: argparse.Namespace,
+    *,
+    marker_expression: str | None = None,
+    include_workers: bool = True,
+) -> list[str]:
     command = [sys.executable, "-m", "pytest", *paths]
-    if _workers_enabled(args):
+    if include_workers and _workers_enabled(args):
         command.extend(["-n", args.workers, "--dist", args.dist])
+    elif not include_workers:
+        # Command-line options override PYTEST_ADDOPTS, so an ambient
+        # ``-n auto`` cannot silently turn the resource-monitor phase back
+        # into a concurrent run.
+        command.extend(["-n", "0"])
     if args.durations is not None:
         command.extend(["--durations", str(args.durations)])
     if args.skip_real_deno:
@@ -228,19 +348,65 @@ def _pytest_args(paths: tuple[str, ...], args: argparse.Namespace) -> list[str]:
         command.append("--run-real-llm")
     if getattr(args, "run_mcp", False):
         command.append("--run-mcp")
-    command.extend(["-m", _pytest_marker_expression(args)])
+    command.extend(
+        [
+            "-m",
+            marker_expression
+            if marker_expression is not None
+            else _pytest_marker_expression(args),
+        ]
+    )
     return command
 
 
-def _pytest_marker_expression(args: argparse.Namespace) -> str:
+def _pytest_marker_expression(
+    args: argparse.Namespace,
+    *,
+    real_deno: bool | None = None,
+    deno_resource_monitor: bool | None = None,
+) -> str:
     marker_filters: list[str] = ["not postgres"]
-    if args.skip_real_deno:
+    if real_deno is True:
+        marker_filters.append("real_deno")
+    elif real_deno is False or args.skip_real_deno:
         marker_filters.append("not real_deno")
+    if deno_resource_monitor is True:
+        marker_filters.append("deno_resource_monitor")
+    elif deno_resource_monitor is False:
+        marker_filters.append("not deno_resource_monitor")
     if not args.run_real_llm:
         marker_filters.append("not real_llm")
     if not getattr(args, "run_mcp", False):
         marker_filters.append("not mcp")
     return " and ".join(marker_filters)
+
+
+def _requires_serial_real_deno_phase(args: argparse.Namespace) -> bool:
+    return (
+        args.lane in REAL_DENO_SERIAL_LANES
+        and _workers_enabled(args)
+        and not args.skip_real_deno
+        and shutil.which("deno") is not None
+    )
+
+
+def _normalize_command_status(command: Command, status: int) -> int:
+    if _is_allowed_pytest_no_tests_status(command, status):
+        return 0
+    return status
+
+
+def _is_allowed_pytest_no_tests_status(command: Command, status: int) -> bool:
+    marker_terms = {
+        term.strip()
+        for term in (command.invariant_marker_expression or "").split("and")
+    }
+    return (
+        status == PYTEST_NO_TESTS_EXIT_CODE
+        and command.allow_no_tests
+        and _is_pytest_command(command)
+        and "real_deno" in marker_terms
+    )
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -250,6 +416,10 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("pytest-xdist is required for --workers; run `uv sync --frozen` first")
     if args.lane == "gui" and args.keep_agent_outputs:
         parser.error("--keep-agent-outputs only applies to pytest lanes")
+    if getattr(args, "run_mcp", False):
+        missing_mcp = missing_mcp_optional_dependencies()
+        if missing_mcp:
+            parser.error(mcp_dependency_error(missing_mcp))
     if args.shard_index >= args.shard_count:
         parser.error("--shard-index must be less than --shard-count")
     if args.lane in {"gui", "all"} and (
@@ -352,6 +522,7 @@ def _validate_invariant_receipt(
     lane: str | None,
     selected_test_paths: tuple[str, ...] | None = None,
     marker_expression: str | None = None,
+    no_tests_collected: bool = False,
 ) -> int:
     from scripts import check_test_invariants as checker
 
@@ -364,11 +535,11 @@ def _validate_invariant_receipt(
         # marker-selected nodes so those files do not create false evidence
         # failures while selected skips still fail closed.
         selected_nodeids = (
-            None
-            if selected_test_paths is None
+            set()
+            if no_tests_collected
             else checker._collect_pytest_nodeids(
                 marker_expression,
-                test_paths=selected_test_paths,
+                test_paths=selected_test_paths or ("tests",),
             )
         )
     except (OSError, ValueError) as exc:

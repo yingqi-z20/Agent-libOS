@@ -17,6 +17,14 @@ from agent_libos.tools.builtin.filesystem import (
     WriteTextFileTool,
 )
 from agent_libos.tools.builtin.git import GitCommitTool
+from agent_libos.tools.builtin.mcp import (
+    CallMcpToolTool,
+    InspectMcpServerTool,
+    ListMcpResourcesTool,
+    ListMcpServersTool,
+    ListMcpToolsTool,
+    ReadMcpResourceTool,
+)
 from agent_libos.tools.builtin.process import ExecProcessTool, ForkChildProcessTool
 
 
@@ -132,6 +140,112 @@ def test_workspace_filesystem_tools_reject_unknown_arguments_before_execution(
     result = tool.invoke(
         raw_invalid,
         ToolContext(trace_id='trace', call_id='call', pid='pid_test'),
+    )
+
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.code is ToolErrorCode.VALIDATION_ERROR
+    execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("tool", "valid_args", "unknown_field"),
+    [
+        (ListMcpServersTool(), {}, "url"),
+        (
+            InspectMcpServerTool(),
+            {"server_id": "registered"},
+            "transport",
+        ),
+        (
+            ListMcpToolsTool(),
+            {"server_id": "registered", "refresh": False},
+            "headers",
+        ),
+        (
+            CallMcpToolTool(),
+            {
+                "server_id": "registered",
+                "tool_id": "allowed",
+                "arguments": {"provider_specific": {"nested": True}},
+            },
+            "command",
+        ),
+        (
+            ListMcpResourcesTool(),
+            {"server_id": "registered", "kind": "resource"},
+            "url",
+        ),
+        (
+            ReadMcpResourceTool(),
+            {
+                "server_id": "registered",
+                "resource_id": "status",
+                "variables": {},
+            },
+            "actor",
+        ),
+    ],
+    ids=(
+        "list-servers",
+        "inspect-server",
+        "list-tools",
+        "call-tool",
+        "list-resources",
+        "read-resource",
+    ),
+)
+@pytest.mark.parametrize("encoding", ["mapping", "json"])
+def test_mcp_tools_reject_unknown_top_level_arguments_before_execution(
+    tool: BaseAgentTool,
+    valid_args: Mapping[str, object],
+    unknown_field: str,
+    encoding: str,
+) -> None:
+    execute = AsyncMock(side_effect=AssertionError("invalid MCP arguments reached execution"))
+    tool.execute = execute  # type: ignore[method-assign]
+    invalid_args = {**valid_args, unknown_field: "attacker-controlled"}
+    raw_invalid: Mapping[str, object] | str = (
+        invalid_args if encoding == "mapping" else json.dumps(invalid_args)
+    )
+
+    result = tool.invoke(
+        raw_invalid,
+        ToolContext(trace_id="trace", call_id="call", pid="pid_test"),
+    )
+
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.code is ToolErrorCode.VALIDATION_ERROR
+    execute.assert_not_awaited()
+    assert tool.args_schema.model_json_schema()["additionalProperties"] is False
+
+    parsed = tool.parse_args(
+        valid_args if encoding == "mapping" else json.dumps(valid_args)
+    )
+    if isinstance(tool, CallMcpToolTool):
+        assert parsed.arguments == {"provider_specific": {"nested": True}}
+
+
+@pytest.mark.parametrize("encoding", ["mapping", "json"])
+def test_call_mcp_tool_rejects_explicit_null_arguments_before_execution(
+    encoding: str,
+) -> None:
+    tool = CallMcpToolTool()
+    execute = AsyncMock(side_effect=AssertionError("explicit null reached MCP execution"))
+    tool.execute = execute  # type: ignore[method-assign]
+    invalid_args = {
+        "server_id": "registered",
+        "tool_id": "allowed",
+        "arguments": None,
+    }
+    raw_invalid: Mapping[str, object] | str = (
+        invalid_args if encoding == "mapping" else json.dumps(invalid_args)
+    )
+
+    result = tool.invoke(
+        raw_invalid,
+        ToolContext(trace_id="trace", call_id="call", pid="pid_test"),
     )
 
     assert result.ok is False

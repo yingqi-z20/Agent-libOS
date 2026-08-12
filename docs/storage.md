@@ -1,10 +1,12 @@
 # Runtime Storage
 
-Agent libOS 1.4.0 stores durable runtime state through a `UnitOfWork` composed of
+Agent libOS 1.5.0 stores durable runtime state through a `UnitOfWork` composed of
 explicit domain boundaries, including `ProcessRepository`,
 `ResourceRepository`, `RuntimePublicationRepository`,
 `SnapshotCheckpointRepository`, `RuntimeModuleRepository`,
 `PayloadRetentionRepository`, `SemanticAssessmentRepository`,
+`McpContinuationRepository`, `McpRemoteTaskRepository`,
+`McpSubscriptionRepository`, `McpAuthMetadataRepository`,
 `ObjectRepository`, `AuthorityRepository`, `EvidenceRepository`, and
 `ExtensionRepository`. All repositories in one runtime share the same
 transaction coordinator. Migrated runtime domains use those repositories. The
@@ -43,7 +45,7 @@ removed.
 
 SQLite is the default local engine. SQLite and PostgreSQL are independent
 connection/dialect/lease adapters over the same typed repository
-implementation and canonical store schema v5. The shared implementation emits a
+implementation and canonical store schema v7. The shared implementation emits a
 small SQLite-shaped SQL subset. The PostgreSQL dialect translates parameter
 placeholders, `COLLATE BINARY`, `INSERT OR IGNORE`, the one reviewed
 `INSERT OR REPLACE` upsert, `INDEXED BY`, the Skill-package description
@@ -51,6 +53,14 @@ placeholders, `COLLATE BINARY`, `INSERT OR IGNORE`, the one reviewed
 syntax-surface test ratchets that set. PostgreSQL therefore does not inherit the
 SQLite store or its connection/locking behavior, but it is also not a second,
 copied repository implementation.
+
+PostgreSQL support requires the optional `postgres` dependency extra and a
+server whose major version is `17`. The committed canonical catalog records
+PostgreSQL major 17, so startup fails closed on another major even if the
+application relations otherwise appear compatible. PostgreSQL 17.10 is the
+tested, manifest-generation baseline. Another 17.x release is not rejected by
+the major-version field alone, but remains outside the validated release matrix
+and must still match the complete canonical storage catalog.
 
 Library defaults are deliberately ephemeral. `Runtime.open()` and
 `Runtime.aopen()` do not load the repository's `config.yaml`; with neither an
@@ -79,28 +89,26 @@ transactions on the owning thread use savepoints; another thread cannot join an
 active outer transaction. PostgreSQL database concurrency does not imply that
 this repository has a connection pool or concurrent per-Runtime transactions.
 
-## Strict store schema v5
+## Strict store schema v7
 
-Fresh databases created by Agent libOS 1.4.0 use store schema v5 and create a
+Fresh databases created by Agent libOS 1.5.0 use store schema v7 and create a
 `runtime_schema` table with one marker row; the canonical DDL constrains its
 `singleton` value to `1`. Opening an existing store requires the row selected
-by `singleton = 1` to contain schema version `5`. Product version and store
-schema version are independent identifiers: `1.4.0` is the current product
-release, while `5` is the persisted schema contract. Both backends apply
+by `singleton = 1` to contain schema version `7`. Product version and store
+schema version are independent identifiers: `1.5.0` is the current product
+release, while `7` is the persisted schema contract. Both backends apply
 the same acceptance rules, with one backend-specific initial probe order:
 
 1. SQLite validates `PRAGMA encoding` before reading the version marker;
    PostgreSQL reads the marker first and validates server encoding with the
    remaining shape probes.
-2. For a version-5 marker, require the exact manifest table set and exact
-   column-name set for every table, and validate the required keyset
-   text-column collations. The v5 Task Run/recovery/semantic index manifest fixes
-   each required index's table, ordered columns, uniqueness, full/partial
-   shape, partial predicate, ascending direction, and keyset collation. A
-   PostgreSQL required index must additionally be valid, ready, and live. The
-   required Task Run and semantic unique constraints are checked, and extra
-   declared indexes on those constrained tables are rejected regardless of
-   index name. A required SQLite relation must have
+2. For a version-7 marker, run the focused relation, table/column, counter-seed,
+   encoding, keyset-collation, and recovery-index probes, then require the
+   complete backend canonical storage catalog. The v7 Task
+   Run/recovery/semantic/FlowGraph index contract fixes each required index's
+   table, ordered columns, uniqueness, full/partial shape, predicate, direction,
+   and keyset collation. A PostgreSQL required index must additionally be valid,
+   ready, and live. A required SQLite relation must have
    `sqlite_master.type = 'table'`, and a required PostgreSQL relation must have
    `pg_class.relkind = 'r'`; a same-column view cannot impersonate a manifest
    table and is rejected before the initializer can mutate the schema.
@@ -111,10 +119,10 @@ the same acceptance rules, with one backend-specific initial probe order:
    relation kinds `r`, `p`, `v`, `m`, `S`, and `f`, not function/type/domain-only
    schemas.
 4. In one transaction, run the idempotent initializer. For an accepted existing
-   version-5 store this can insert allowed non-manifest seed rows such as the
+   version-7 store this can insert allowed non-manifest seed rows such as the
    system namespace; required counter seeds are validated during preflight and
    cannot be repaired here. Its `CREATE INDEX IF NOT EXISTS` statements cannot
-   repair a missing or malformed v5-manifest index because preflight has already
+   repair a missing or malformed v7-manifest index because preflight has already
    rejected that store without writing. For an empty target it creates the
    complete schema and then writes the marker.
 
@@ -122,23 +130,105 @@ An interrupted bootstrap rolls back both schema and marker, so reopening the
 same empty target retries initialization instead of misclassifying it as an
 unsupported older database.
 
-The DDL emitted for a fresh schema-v5 store is the current release shape,
+The DDL emitted for a fresh schema-v7 store is the current release shape,
 including typed process wait/outcome fields and the Durable Task Run ledger,
 payload, resume-point, command, requirement, and link tables, plus Human
-request revisions and the semantic job/evidence tables. A version marker
+request revisions, semantic job/evidence tables, FlowGraph, policy/control,
+machine-settlement, review, and health evidence tables. Schema v7 additionally
+adds five payload-free MCP tables: `mcp_continuations`, `mcp_remote_tasks`,
+`mcp_subscriptions`, `mcp_auth_metadata`, and
+`mcp_side_effect_preparations`. They contain local identities,
+server/owner/auth-generation fences, SHA-256 commitments, lifecycle revisions,
+expiry/counter state, closed diagnostic metadata, and opaque credential-broker
+references only. OAuth tokens and client secrets, authorization codes,
+PKCE/state, bearer-like remote task ids, raw MRTR request state, notification
+bodies, and raw provider results have no Store column.
+The preparation table is a crash-recovery ownership sidecar. The Runtime first
+persists a preallocated Human request id and exact reserved credential-broker
+slot references, then creates the Human request and writes those exact broker
+slots. The same preparation precommits the bounded opaque refs and Human
+preview digest that an update will supersede. One SQL transaction inserts,
+revision-CASes, or retention-deletes the continuation/Task row and changes the
+preparation from `prepared/abort` to `cleaning/retire`. Normal completion and
+restart recovery then cancel the superseded Human request, delete only the old
+broker slots, and revision-delete the sidecar. A precommit crash instead claims
+the `prepared` row, cancels only the newly allocated Human request, deletes only
+the newly reserved slots, and removes the sidecar; it never replays Provider
+I/O. Retirement-only preparations may own no new slot: their strict typed
+metadata is the durable ownership record before a terminal projection is
+physically removed.
+When a protected result publishes more than one durable MCP projection, each
+prepared-row commit joins the same outer RuntimeStore transaction as the
+originating effect settlement. Broker and Human cleanup is deliberately
+deferred until that outer transaction commits. Rolling it back therefore
+publishes none of the projections and restores every sidecar to `prepared`, so
+startup can abort their preallocated external state without replaying the
+Provider.
+For an initial protected result, that same commit writes only a closed
+`{kind, continuation_id|task_ref}` projection into the finalized external
+effect's provider receipt. It contains no remote id, request state, Human
+payload, or broker value. This receipt is the durable Host handoff if the
+process exits after commit but before the local ref reaches its caller; the
+Host accepts it only when the referenced main row carries the same effect
+fence.
+Every later continuation result uses the same transaction. A next-round
+receipt points to the unchanged local continuation id while its new request
+state remains broker-only; a completed result terminalizes the continuation
+without persisting the Provider content; and a Task handoff binds the Task to
+the response effect while the Continuation's broker receipt carries only the
+safe Task ref and response-effect id needed to verify that recovery chain.
+The sidecar contains only opaque local references, SHA-256 commitments, fixed
+authority fences, and closed diagnostic codes, never the Human preview body or
+credential-broker value.
+Terminal continuation rows (`complete`, `cancelled`, `expired`) and terminal
+remote-task rows (`completed`, `failed`, `cancelled`) have bounded oldest-first
+retention queries and revision-fenced deletion. `needs_attention` rows use the
+same retention path once the manager has preserved their unknown-dispatch
+evidence; they do not consume the active-record cap forever. The manager first
+writes a retirement-only sidecar, then atomically deletes only an unchanged
+retained row while advancing that sidecar to `cleaning`; it never deletes a
+broker slot or cancels a Human request ahead of the SQL fence. Cleanup is
+idempotent and leaves the Human identity, effect, event, and audit evidence.
+The narrow legacy terminal-delete repository method is safe only for a row with
+no Human, broker, or result ownership and rejects every other row; callers must
+use atomic terminal retirement for those rows.
+An `input_required` remote-task row must bind a real durable
+`human_requests.request_id`. A Human request cannot be shared by any MCP
+continuation or remote-task row. A physical `NO ACTION` foreign key proves the
+referenced Human row exists and prevents lifecycle cleanup from cascading away
+MCP evidence. Both backends serialize cross-table binding writes through a
+common durable fence so concurrent continuation/task inserts or CAS transitions
+cannot pass independent absence checks. A task binding can be introduced only
+with an `input_required` state, and another round atomically replaces it under
+revision CAS. Opaque broker slots are also single-owner across continuation
+state and both remote-task broker fields; a task's remote-id and state slots
+must be distinct. Other task states may clear or retain the local audit reference,
+but no Human preview or response is copied into the task row. Metadata keys and
+values both use a closed Host-owned code vocabulary; an arbitrary provider
+string is rejected even when it looks like a short lowercase diagnostic code.
+A version marker
 alone is insufficient: stores missing a required table, required column,
-canonical keyset collation, required v5 index/unique shape, or required
+canonical keyset collation, required v7 index/unique shape, or required
 recovery predicate are rejected, and the runtime does not present that
 rejection as a migration.
 
-The open-time compatibility probe is intentionally not a byte-for-byte DDL
-validator. It rejects extra tables and columns, but apart from the checks above
-it does not compare column types, `NOT NULL`/`CHECK`/foreign-key/primary-key
-constraints, arbitrary collations outside the keyset manifest, extra non-table
-schema objects, or index/uniqueness definitions outside the explicit v5 Task
-Run/recovery/semantic manifest. Operators must create stores through this release's
-backend rather than treating a hand-built schema that passes the compatibility
-probe as canonical.
+The open-time validator does not compare raw DDL bytes: it normalizes the
+backend catalog before comparison. It nevertheless requires the complete
+canonical storage catalog captured for that backend, not merely the focused
+manifest probes above. SQLite compares every user table, index, trigger, and
+view; normalized `sqlite_master` definitions; table options; column type,
+nullability, default, primary-key position, generated/hidden shape; foreign
+keys; and complete index keys, direction, collation, uniqueness, origin, and
+partial shape. PostgreSQL compares the pinned server major; relations and their
+persistence/access method/options/replica identity/partition/RLS shape;
+columns, types, order, nullability, defaults, collations, identity and generated
+shape; constraints; indexes; triggers; policies; rewrite rules; and
+inheritance. Missing, extra, or changed captured entries fail closed. The
+PostgreSQL catalog does not claim to inventory a schema containing only
+standalone functions, enum/base types, or domains that create none of the
+captured relation kinds; those objects are outside the RuntimeStore DDL.
+Operators must create stores through this release's backend rather than
+treating a hand-built approximation as canonical.
 
 Text columns that form durable startup, recovery, or retention keysets have a
 canonical bytewise collation: `BINARY` on SQLite and `"C"` on PostgreSQL. Both
@@ -147,22 +237,25 @@ shape, and their covering indexes use the same collation. Queries inherit the
 validated column collation so SQLite retains composite row-value range seeks.
 SQLite database files and PostgreSQL servers must both use UTF-8 encoding;
 under UTF-8, `BINARY` and `"C"` ordering match Python's Unicode string ordering
-for persisted cursor values. Opening an existing version-5 store fails closed
+for persisted cursor values. Opening an existing version-7 store fails closed
 when its database encoding, any required keyset text column, or any required
 keyset text-column collation is not canonical; those required column
 collations are checked with one set-based catalog probe. A UTF-16 SQLite file
 or locale-inheriting draft PostgreSQL schema is therefore rejected rather than
-silently paginating with a different order or degrading to a sort. This check
-does not validate the collation of text columns outside the keyset manifest.
+silently paginating with a different order or degrading to a sort. That focused
+set-based keyset probe does not itself inspect other text-column collations;
+the complete canonical catalog comparison above still rejects drift in them.
 
-The only supported migration is the explicit, offline, operator-invoked
-canonical v4-to-v5 procedure below. There are no automatic migrations,
-backfills, read-only compatibility modes, or dual runtime schema paths. A v3
+The only supported migrations are the explicit, offline, operator-invoked
+canonical v4-to-v5, v5-to-v6, and v6-to-v7 procedures below. They must be run
+in order.
+There are no automatic migrations, backfills, read-only compatibility modes,
+or dual runtime schema paths. A v3
 database remains archive-only and must be opened with Agent libOS 1.0.1.
-Agent libOS 1.4.0 raises `UnsupportedStoreVersion` during ordinary Runtime
+Agent libOS 1.5.0 raises `UnsupportedStoreVersion` during ordinary Runtime
 preflight, before initialization, index creation, seed insertion, recovery,
-audit, or any other write. The same zero-write rule applies to v4 before the
-offline migrator runs, older/unversioned stores, and malformed v5 stores.
+audit, or any other write. The same zero-write rule applies to v4/v5 before the
+matching offline migrator runs, older/unversioned stores, and malformed v7 stores.
 SQLite performs this probe against a private snapshot so rejection leaves the
 original database, WAL/SHM sidecars, and any existing lease bytes and modes
 unchanged.
@@ -237,6 +330,103 @@ persistence and keyset comparison.
 Checkpoint/image snapshot codecs do not own these Host evidence tables.
 Restore and fork therefore neither copy nor delete semantic assessments.
 
+### Phase 2–4 semantic records
+
+Schema v6 adds four append-only FlowGraph relations:
+`semantic_flow_entities`, `semantic_flow_activities`,
+`semantic_flow_edges`, and `semantic_flow_label_assertions`. They retain
+bounded identifiers, versions, labels, coverage, and provenance digests only;
+raw bodies, paths, argv, prompts, responses, credentials, and reasoning are
+forbidden. Cross-tenant edges fail atomically, Host edges are never removed,
+and model assertions can only tighten sensitivity/integrity/trust.
+
+`semantic_policy_epochs` is immutable and uniquely indexes both generation and
+policy digest. Each row also stores a bounded canonical rollout scope made only
+from tenant, auto-rule, hard-deny, classifier-artifact, and resource SHA-256
+commitments plus action/right and bounded allow-parameter metadata; no raw rule
+identifier, profile identifier, or resource is retained. This scope lets
+startup prove subset narrowing and detect same-cardinality swaps, weakened
+denies, relaxed confidence/TTL/rate limits, classifier drift, and budget-shard
+rule replacement without treating aggregate metrics as authority evidence.
+`semantic_control_state` is the one
+revision/generation-CAS pointer for `off`, `shadow`, `enforce_deny`, or
+`canary_auto`, including trip
+state; every successful pointer change also appends
+`semantic_control_transitions`. `semantic_rate_budgets` is the mutable
+revisioned per-tenant/logical-rule counter. Its `epoch_id` is an immutable
+origin/provenance anchor, not a partition key: rotating an epoch, reopening the
+Store, or tightening a limit never resets minute, day, or inflight usage.
+Static Host configuration is the only policy source; these tables do not create
+a remote control API.
+
+`semantic_machine_settlements`, `semantic_machine_outcomes`,
+`semantic_review_labels`, and `semantic_health_events` are append-only. They
+bind request/effect/epoch/tenant/action/binding/decision digests and closed
+outcomes without source payloads. Reviews contain only `safe`, `unsafe`, or
+`inconclusive` plus reviewer/evidence digests. A Host review append cannot
+settle a request or mutate policy/control. Checkpoint restore and fork neither
+copy, rewind, nor delete these Host-global records.
+
+## Offline v6 to v7 migration
+
+The v6-to-v7 command is an offline administrative surface. Ordinary Runtime
+startup never imports or invokes it:
+
+```bash
+uv run agent-libos --db <target> store migrate --to 7 --dry-run \
+  --sqlite-backup <verified-v6-backup>
+uv run agent-libos --db <target> store migrate --to 7 --apply \
+  --expected-plan-sha256 <digest> \
+  --sqlite-backup <verified-v6-backup>
+```
+
+For PostgreSQL, replace the SQLite backup option with
+`--postgres-snapshot-confirmed` on apply. Planning validates an exact canonical
+v6 source and emits a deterministic contract and plan digest without writing.
+SQLite planning additionally validates that an independent, current-user-owned,
+single-link backup is a logical match for the source. Apply obtains the same
+exclusive SQLite lease or PostgreSQL advisory lock as Runtime startup,
+revalidates the source and recovery evidence, creates the five MCP v7 tables,
+compare-and-swaps the singleton marker `6 -> 7`, and validates the complete
+canonical v7 catalog before commit. Any DDL, marker, catalog, lease, backup, or
+digest failure rolls back the whole transaction.
+
+The migration does not copy provider content or create auth credentials. New
+tables begin empty. OAuth tokens, client secrets, authorization codes,
+PKCE/state, remote task ids, continuation request state, resource/prompt
+content, and subscription events remain outside RuntimeStore. Only later MCP
+operations may write their typed, payload-free projections through the v7
+repositories.
+
+## Offline v5 to v6 migration
+
+The v5-to-v6 command is an offline administrative surface and is never imported
+or invoked by ordinary Runtime startup:
+
+```bash
+uv run agent-libos --db <target> store migrate --to 6 --dry-run
+uv run agent-libos --db <target> store migrate --to 6 --apply \
+  --expected-plan-sha256 <digest> <backup-confirmation-option>
+```
+
+It uses the same safety protocol as the legacy migration below: stop all
+writers, establish an independent recovery point, validate the complete
+canonical v5 source storage catalog, obtain the SQLite exclusive lease or
+PostgreSQL advisory lock, repeat source/backup validation, and run DDL plus
+singleton marker CAS `5 -> 6` in one transaction. It then validates the
+complete canonical v6 storage catalog, including every captured relation,
+column, constraint, index, and backend hook, before commit. Failure at any
+point rolls back both DDL and marker.
+
+SQLite dry-run is zero-write and requires `--sqlite-backup` to validate an
+independent, current-user-owned, single-link `0600` regular file without live
+journal/WAL/SHM sidecars. Apply revalidates that the backup still matches the
+locked source. PostgreSQL apply requires `--postgres-snapshot-confirmed`; the
+operator, not Agent libOS, owns and verifies that snapshot. The plan digest is
+deterministic for the locked logical source and must be supplied exactly to
+apply. A v4 store is not accepted by `--to 6`; it must independently complete
+the v4-to-v5 workflow first.
+
 ## Offline v4 to v5 migration
 
 The migration command is an offline administrative surface and is deliberately
@@ -258,9 +448,9 @@ The supported procedure is:
    PostgreSQL, create and verify an operator-managed snapshot of the exact
    `current_database()` and `current_schema()`.
 3. Run `--dry-run` (with `--sqlite-backup` when validating SQLite). It inspects
-   a private snapshot, validates the complete canonical v4 shape and logical
-   digest, performs zero source/lease/sidecar writes, and prints a versioned
-   plan plus deterministic `ddl_sha256` and `plan_sha256`.
+   a private snapshot, validates the complete canonical v4 storage catalog and
+   logical digest, performs zero source/lease/sidecar writes, and prints a
+   versioned plan plus deterministic `ddl_sha256` and `plan_sha256`.
 4. Review the plan. Run `--apply` with that exact
    `--expected-plan-sha256`. SQLite additionally requires the same verified
    `--sqlite-backup`; PostgreSQL requires
@@ -269,7 +459,7 @@ The supported procedure is:
    advisory lock, repeats canonical v4 and backup/source validation, and opens
    one transaction. It adds `human_requests.revision`, creates the two semantic
    tables/indexes, compare-and-swaps the singleton marker from 4 to 5, runs the
-   complete canonical v5 validator, and only then commits.
+   complete canonical v5 storage catalog validator, and only then commits.
 6. Open the migrated target with this release and archive the plan/result with
    the operator recovery record. Keep the backup until application validation
    is complete.
@@ -278,8 +468,9 @@ A missing/mismatched plan digest, stale or non-self-contained SQLite backup,
 absent PostgreSQL confirmation, lock conflict, noncanonical v4 input, failed
 DDL, marker CAS miss, or failed v5 readback aborts. The transaction rolls back
 both schema changes and marker; it never silently repairs a malformed source.
-Planning a v5 or older store is also not an idempotent “success”: this command
-has exactly one source and target version. See [CLI Reference](cli.md#offline-store-migration)
+Planning an already-v5/newer or pre-v4 store is also not an idempotent
+“success”: this command accepts only an exact canonical v4 source and has
+exactly one target version. See [CLI Reference](cli.md#offline-store-migration)
 for concrete commands.
 
 On POSIX, SQLite apply additionally requires both source and independent backup
@@ -639,8 +830,8 @@ tools table. Candidate receipts bind the exact Object Memory descriptor OID,
 so cleanup and convergence checks use candidate/descriptor primary keys. The
 capability effect and its exact receipt share the publication UnitOfWork, so
 recovery has no metadata-scan fallback for unreceipted capabilities.
-`process_tool_bindings` is part of the complete fresh version-5 release shape,
-not a lazy projection or startup backfill. A draft version-5 database that
+`process_tool_bindings` is part of the complete fresh version-7 release shape,
+not a lazy projection or startup backfill. A draft version-7 database that
 lacks it is rejected by the strict shape probe; supported stores therefore
 retain the projection across reopen without scanning or rewriting processes.
 The projection also stores transactionally derived JIT eligibility. A
@@ -657,7 +848,7 @@ Data-flow evidence stores labels, source references, hashes, Sink/trust
 generation, and decisions—not payload copies. LLM pending actions and context
 generations retain canonical metadata-only `DataFlowContext` values. The
 label/source JSON and pending-action context columns required by those records
-are non-null in the fresh schema-v5 DDL, and row decoders require their canonical
+are non-null in the fresh schema-v7 DDL, and row decoders require their canonical
 object shapes and complete security labels. Malformed persisted values fail
 closed instead of being repaired heuristically; other schema fields may still
 be nullable where their domain permits it.
@@ -687,7 +878,7 @@ generation fences, safe-point integrity, and current bindings remain
 authoritative in their existing rows and are not copied into the generic
 process wait. Normal transition and execution-completion APIs reject callers
 that attempt to create this reserved receipt.
-For every current-v5 typed wait and outcome, including stale execution,
+For every current-v7 typed wait and outcome, including stale execution,
 `status_message` is only a compatibility projection for older clients and is
 never parsed as the control protocol. The
 narrow internal exception is checkpoint-fork publication: newly inserted
@@ -728,7 +919,7 @@ specified in [Runtime Events](events.md).
 
 ## Backup and restore runbook
 
-This runbook covers the supported recovery unit: one quiesced schema-v5 SQL
+This runbook covers the supported recovery unit: one quiesced schema-v7 SQL
 store restored into a new target and then opened by the same Agent libOS
 release. It is an operational database backup, not a checkpoint restore and not
 a snapshot of the whole environment.
@@ -751,7 +942,7 @@ Before either backend is backed up:
    not proceed from a recovery-required or incomplete shutdown result.
 4. Record the Agent libOS product version, backend configuration, and the value
    of `runtime_schema.schema_version`. For this release the expected pair is
-   product `1.4.0`, store schema `5`.
+   product `1.5.0`, store schema `7`.
 5. Prepare an owner-only backup directory and run the dump-producing command
    under `umask 077`. Before accepting either backend's archive, verify it is a
    regular, current-user-owned, single-link file with mode `0600`.
@@ -787,32 +978,36 @@ Use this procedure only for a file-backed SQLite target; `local` and
      "PRAGMA quick_check; SELECT schema_version FROM runtime_schema WHERE singleton = 1;"
    ```
 
-   The expected output includes `ok` and `5`.
+   The expected output includes `ok` and `7`.
 3. To restore, keep the source database untouched and materialize the verified
    backup at a new, owner-only path. Do not restore over a path held by a live
    Runtime and do not restore old lease/sidecar files. Point a stopped Host at
-   the new path and let `Runtime.open()` perform the complete schema-v5 shape,
-   encoding, collation, and startup-recovery checks. Keep the old target until
-   that open and a clean shutdown succeed.
+   the new path and let `Runtime.open()` perform the complete schema-v7
+   canonical storage catalog, encoding, and startup-recovery checks. Keep the
+   old target until that open and a clean shutdown succeed.
 
 ### PostgreSQL
 
 Use normal libpq credential mechanisms such as a service definition and
 password file; avoid placing credentials in shell history. The PostgreSQL
-Runtime identity and lease are scoped to `current_database()` plus the exact
-`current_schema()`, so the backup unit is that one schema rather than the whole
-database. Configure the service's `search_path` to select the Runtime schema;
+server must be major version 17; 17.10 is the tested baseline used to generate
+the committed catalog manifest. Check this before the dump with
+`SHOW server_version_num`; a restored target on another major is rejected by
+`Runtime.open()`. The PostgreSQL Runtime identity and lease are scoped to
+`current_database()` plus the exact `current_schema()`, so the backup unit is
+that one schema rather than the whole database. Configure the service's
+`search_path` to select the Runtime schema;
 the commands below use `agent_libos_runtime` as an example. With the Runtime
 stopped and its advisory-lock session closed:
 
-1. Confirm the selected schema and version, then create and inspect a
-   custom-format logical dump of that exact schema. Replace
-   `agent_libos_runtime` with the `current_schema()` result; do not use a schema
-   wildcard.
+1. Confirm the PostgreSQL server version, selected schema, and store version,
+   then create and inspect a custom-format logical dump of that exact schema.
+   Replace `agent_libos_runtime` with the `current_schema()` result; do not use
+   a schema wildcard.
 
    ```bash
    psql 'service=agent_libos' -At \
-     -c 'SELECT current_schema(); SELECT schema_version FROM runtime_schema WHERE singleton = 1;'
+     -c 'SHOW server_version_num; SELECT current_schema(); SELECT schema_version FROM runtime_schema WHERE singleton = 1;'
    mkdir -p /srv/backups
    chmod 700 /srv/backups
    (
@@ -843,16 +1038,17 @@ stopped and its advisory-lock session closed:
      --dbname='service=agent_libos_restore' \
      /srv/backups/agent-libos-2026-07-30.dump
    psql 'service=agent_libos_restore' -At \
-     -c 'SELECT current_schema(); SELECT schema_version FROM runtime_schema WHERE singleton = 1;'
+     -c 'SHOW server_version_num; SELECT current_schema(); SELECT schema_version FROM runtime_schema WHERE singleton = 1;'
    ```
 
-   Require the restored `current_schema()` to equal the dumped schema and the
-   schema version to equal `5` before opening the Runtime.
+   Require the restored `server_version_num` to have major version 17,
+   `current_schema()` to equal the dumped schema, and the store schema version
+   to equal `7` before opening the Runtime.
 
 3. Point a stopped Host at the restored target. `Runtime.open()` must acquire
-   the new target's advisory lease and pass the schema-v5 table, column,
-   encoding, and keyset-collation probes before the target is promoted. Keep
-   the original database until the restored Runtime also shuts down cleanly.
+   the new target's advisory lease and pass the complete schema-v7 canonical
+   storage catalog and encoding probes before the target is promoted. Keep the
+   original database until the restored Runtime also shuts down cleanly.
 
 ### Coverage and online-backup boundary
 

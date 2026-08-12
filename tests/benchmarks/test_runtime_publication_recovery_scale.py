@@ -21,7 +21,11 @@ from agent_libos.runtime.checkpoint_reconciliation import (
 )
 from agent_libos.runtime.operation_manager import OperationManager
 from agent_libos.models.exceptions import UnsupportedStoreVersion
-from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS, _V5_REQUIRED_COLUMNS
+from agent_libos.storage.sql import (
+    _V4_REQUIRED_COLUMNS,
+    _V5_REQUIRED_COLUMNS,
+    _V6_REQUIRED_COLUMNS,
+)
 
 
 def test_publication_scale_profile_and_workflows_are_stable() -> None:
@@ -206,11 +210,10 @@ def test_publication_scale_reviews_only_the_exact_domain_validation_query() -> N
 
 
 @pytest.mark.parametrize(
-    ("version", "required_columns"),
-    [(4, _V4_REQUIRED_COLUMNS), (5, _V5_REQUIRED_COLUMNS)],
+    "required_columns",
+    [_V4_REQUIRED_COLUMNS, _V5_REQUIRED_COLUMNS, _V6_REQUIRED_COLUMNS],
 )
-def test_publication_startup_manifest_schema_probe_allowlist_is_exact(
-    version: int,
+def test_publication_startup_manifest_schema_probe_is_version_independent(
     required_columns: dict[str, frozenset[str]],
 ) -> None:
     manifest_tables = sorted(required_columns)
@@ -225,17 +228,21 @@ def test_publication_startup_manifest_schema_probe_allowlist_is_exact(
     exact_probe = manifest_probe(manifest_tables)
     assert (
         publication_runner._publication_statement_shape(exact_probe)
-        == f"v{version}_manifest_schema_probe"
+        == "manifest_schema_probe"
+    )
+    additive_probe = manifest_probe(
+        sorted([*manifest_tables, "zz_future_canonical_table"])
+    )
+    assert (
+        publication_runner._publication_statement_shape(additive_probe)
+        == "manifest_schema_probe"
     )
 
     near_or_arbitrary_probes = (
-        manifest_probe(
-            [name for name in manifest_tables if name != "runtime_publications"]
-        ),
         manifest_probe(["runtime_publications"]),
-        manifest_probe([*manifest_tables, "not_a_manifest_table"]),
         manifest_probe(list(reversed(manifest_tables))),
         manifest_probe([name.upper() for name in manifest_tables]),
+        manifest_probe([*manifest_tables, manifest_tables[-1]]),
         exact_probe.replace("SELECT name, type", "SELECT name, type, sql"),
         "SELECT name, type FROM sqlite_master "
         "WHERE name = 'runtime_publications'",
@@ -245,6 +252,21 @@ def test_publication_startup_manifest_schema_probe_allowlist_is_exact(
     assert all(
         publication_runner._publication_statement_shape(probe) == "unreviewed"
         for probe in near_or_arbitrary_probes
+    )
+
+
+def test_publication_catalog_probe_shape_does_not_review_domain_injection() -> None:
+    probes = (
+        "SELECT name, type FROM sqlite_master WHERE name IN "
+        "('runtime_publications', 'runtime_schema') "
+        "UNION SELECT publication_id, state FROM runtime_publications",
+        "SELECT name, type FROM sqlite_master WHERE name IN "
+        "('runtime_schema', (SELECT publication_id "
+        "FROM runtime_publications LIMIT 1))",
+    )
+    assert all(
+        publication_runner._publication_statement_shape(probe) == "unreviewed"
+        for probe in probes
     )
 
 
@@ -771,12 +793,12 @@ def test_publication_scale_rejects_same_name_weak_reconciliation_index(
         "_seed_terminal_publication_history",
         seed_with_weak_index,
     )
-    # Schema v5 now rejects the weakened same-name index during the store's
+    # Schema v7 rejects the weakened same-name index during the store's
     # full-catalog preflight, before the benchmark's redundant local shape
     # assertion can run.
     with pytest.raises(
         UnsupportedStoreVersion,
-        match="schema v5 full catalog",
+        match="schema v7 full catalog",
     ):
         run_publication_scale_benchmark(
             total_records=40,

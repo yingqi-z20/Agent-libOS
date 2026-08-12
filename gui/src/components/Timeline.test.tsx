@@ -122,6 +122,27 @@ describe("Timeline", () => {
     expect(html).toContain("timelineFilterCount");
   });
 
+  it("renders only canonical external-operation evidence, never its free-form payload", () => {
+    const request = humanRequest("req_external", "pid_1", "2026-06-19T01:00:02.000Z");
+    request.payload = {
+      type: "external_operation_approval",
+      question: "TIMELINE_QUESTION_SECRET_SENTINEL",
+      reason: "TIMELINE_REASON_SECRET_SENTINEL",
+      context: { argv: ["TIMELINE_CONTEXT_SECRET_SENTINEL"] }
+    };
+    const html = renderToStaticMarkup(
+      <I18nProvider initialLanguage="en">
+        <Timeline pid="pid_1" messages={[]} humanRequests={[request]} llmCalls={[]} events={[]} audit={[]} />
+      </I18nProvider>
+    );
+
+    expect(html).toContain("External operation approval");
+    expect(html).toContain("approval_preview_valid");
+    expect(html).not.toContain("TIMELINE_QUESTION_SECRET_SENTINEL");
+    expect(html).not.toContain("TIMELINE_REASON_SECRET_SENTINEL");
+    expect(html).not.toContain("TIMELINE_CONTEXT_SECRET_SENTINEL");
+  });
+
   it("keeps timeline controls outside live announcements while preserving a focusable scroll region", () => {
     const container = document.createElement("div");
     container.innerHTML = renderToStaticMarkup(
@@ -303,6 +324,7 @@ function humanRequest(requestId: string, pid: string, createdAt: string): HumanR
     status: "pending",
     decision: null,
     blocking: true,
+    revision: 0,
     created_at: createdAt,
     updated_at: createdAt
   };

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -12,6 +13,19 @@ from agent_libos.models.exceptions import ValidationError
 from agent_libos.utils.yaml_loader import YAML_MAX_UTF8_BYTES, load_yaml_mapping
 
 _CONFIG_ADAPTER = TypeAdapter(AgentLibOSConfig)
+
+
+class AgentLibOSConfigDeprecationWarning(FutureWarning):
+    """Stable, filterable warning for accepted legacy configuration fields."""
+
+    code = "deprecated_mcp_list_limit"
+
+
+_MCP_LIST_LIMIT_DEPRECATION_MESSAGE = (
+    "mcp.list_limit is deprecated and now applies only to Manifest v1/v2 "
+    "Tools compatibility; use mcp.server_page_limit for registered-server "
+    "pages and mcp.tool_catalog_limit for Manifest v3 Tools"
+)
 
 
 def get_project_root(start: str | Path | None = None) -> Path:
@@ -40,6 +54,7 @@ def load_config_file(path: str | Path, *, base: AgentLibOSConfig = DEFAULT_CONFI
             ) from exc
         raise ValueError(f"invalid YAML config {selected}: {exc}") from exc
 
+    _warn_for_explicit_legacy_fields(data)
     merged = _deep_merge(asdict(base), data)
     return _CONFIG_ADAPTER.validate_python(merged)
 
@@ -81,6 +96,16 @@ def _deep_merge(base: Any, overlay: Any) -> Any:
                 merged[key] = value
         return merged
     return overlay
+
+
+def _warn_for_explicit_legacy_fields(data: Mapping[str, Any]) -> None:
+    mcp = data.get("mcp")
+    if isinstance(mcp, Mapping) and "list_limit" in mcp:
+        warnings.warn(
+            _MCP_LIST_LIMIT_DEPRECATION_MESSAGE,
+            AgentLibOSConfigDeprecationWarning,
+            stacklevel=3,
+        )
 
 
 def _read_config_text(path: Path) -> str:

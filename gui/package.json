@@ -1,6 +1,8 @@
 {
   "name": "agent-libos-gui",
-  "version": "1.4.0",
+  "version": "1.5.0",
+  "description": "Agent libOS self-contained internal desktop distribution",
+  "author": "Agent libOS contributors",
   "private": true,
   "type": "module",
   "main": "dist-electron/main.js",
@@ -15,7 +17,10 @@
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.electron.json --noEmit && tsc -p tsconfig.electron-tests.json",
     "test": "vitest run",
     "test:e2e": "node scripts/run-e2e.mjs",
-    "electron:dev": "npm run build && electron dist-electron/main.js"
+    "electron:dev": "npm run build && electron dist-electron/main.js",
+    "desktop:stage": "npm run build && uv run --project .. --frozen --group desktop --extra mcp python ../scripts/stage_desktop_runtime.py",
+    "desktop:dir": "npm run desktop:stage && electron-builder --config electron-builder.yml --dir --publish never",
+    "desktop:dist": "npm run desktop:stage && electron-builder --config electron-builder.yml --publish never && uv run --project .. --frozen --group desktop --extra mcp python ../scripts/finalize_desktop_artifacts.py ../desktop-dist && uv run --project .. --frozen --group desktop --extra mcp python ../scripts/check_desktop_artifacts.py ../desktop-dist"
   },
   "dependencies": {
     "lucide-react": "^1.28.0",
@@ -33,7 +38,8 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.0.5",
-    "electron": "^43.2.0",
+    "electron": "43.2.0",
+    "electron-builder": "26.15.3",
     "jsdom": "^30.0.1",
     "typescript": "^7.0.2",
     "vite": "^8.2.0",

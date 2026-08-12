@@ -15,14 +15,16 @@ from types import SimpleNamespace
 from agent_libos import Runtime
 from agent_libos.api.cli import cli as cli_entrypoint
 from agent_libos.api.cli import _handle_interactive_human_response
+from agent_libos.api.cli import _handle_interactive_line
 from agent_libos.api.cli import main as cli_main
 from agent_libos.api.cli import _print_interactive_help
 from agent_libos.api.cli import _parse_cli_args
 from agent_libos.api.cli import _run_capabilities_command
 from agent_libos.api.cli import _run_interactive_command
 from agent_libos.api.cli import _run_mcp_command
+from agent_libos.api.cli import _show_pending_interactive_human_request
 from agent_libos.capability.manager import CapabilityManager
-from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.config import AgentLibOSConfigDeprecationWarning, DEFAULT_CONFIG
 from agent_libos.models import (
     CapabilityRight,
     ObjectMetadata,
@@ -185,6 +187,145 @@ class TestCLIBuiltinCommand:
             "/exit",
         ):
             assert command in output.err
+
+    def test_interactive_external_approval_retains_display_fence_and_refreshes_after_cas_conflict(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        request = SimpleNamespace(
+            request_id="req-external",
+            human="operator",
+            status=HumanRequestStatus.PENDING,
+            revision=7,
+            payload={"type": "external_operation_approval"},
+        )
+
+        class FakeHuman:
+            def __init__(self) -> None:
+                self.approval_fences: list[dict[str, object]] = []
+
+            def pending(self, *, human: str) -> list[object]:
+                assert human == "operator"
+                return [request]
+
+            def get(self, request_id: str) -> object:
+                assert request_id == request.request_id
+                return request
+
+            def present_terminal_request(
+                self,
+                selected: object,
+                *,
+                suffix: str,
+            ) -> dict[str, object]:
+                assert selected is request
+                assert "approve" in suffix
+                digest = "a" * 64 if request.revision == 7 else "b" * 64
+                return {
+                    "expected_revision": request.revision,
+                    "preview_sha256": digest,
+                }
+
+            def approve(
+                self,
+                request_id: str,
+                _decision: dict[str, object],
+                *,
+                responder: str,
+                **fence: object,
+            ) -> None:
+                assert request_id == request.request_id
+                assert responder == "human:operator"
+                self.approval_fences.append(fence)
+                raise ValidationError(
+                    "human request revision conflict: expected 7, found 8"
+                )
+
+        fake_human = FakeHuman()
+        runtime = SimpleNamespace(human=fake_human)
+        state: dict[str, object] = {
+            "pid": "pid-external",
+            "shown_request_id": "",
+            "shown_request_revision": None,
+            "shown_preview_sha256": "",
+        }
+
+        _show_pending_interactive_human_request(runtime, "operator", state)
+        assert state["shown_request_revision"] == 7
+        assert state["shown_preview_sha256"] == "a" * 64
+
+        request.revision = 8
+        assert (
+            _handle_interactive_line(
+                runtime,
+                "/approve",
+                state,
+                "operator",
+                "human",
+                [],
+            )
+            is None
+        )
+        assert fake_human.approval_fences == [
+            {
+                "expected_revision": 7,
+                "preview_sha256": "a" * 64,
+            }
+        ]
+        assert state["shown_request_id"] == ""
+
+        _show_pending_interactive_human_request(runtime, "operator", state)
+        assert state["shown_request_revision"] == 8
+        assert state["shown_preview_sha256"] == "b" * 64
+        assert "review the refreshed request" in capsys.readouterr().err
+
+    def test_interactive_approve_reports_atomic_host_policy_rejection(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        request = SimpleNamespace(
+            request_id="req-hard-deny",
+            human="operator",
+            status=HumanRequestStatus.PENDING,
+            payload={"type": "external_operation_approval"},
+        )
+
+        class FakeHuman:
+            def get(self, request_id: str) -> object:
+                assert request_id == request.request_id
+                return request
+
+            def approve(
+                self,
+                request_id: str,
+                _decision: dict[str, object],
+                *,
+                responder: str,
+                expected_revision: int | None,
+                preview_sha256: str | None,
+            ) -> object:
+                assert request_id == request.request_id
+                assert responder == "human:operator"
+                assert expected_revision == 3
+                assert preview_sha256 == "c" * 64
+                return SimpleNamespace(
+                    status=HumanRequestStatus.REJECTED,
+                    decision={"approved": False, "source": "machine_policy"},
+                )
+
+        handled = _handle_interactive_human_response(
+            SimpleNamespace(human=FakeHuman()),
+            "/approve",
+            "operator",
+            shown_request_id=request.request_id,
+            shown_request_revision=3,
+            shown_preview_sha256="c" * 64,
+        )
+
+        assert handled is True
+        output = capsys.readouterr().err
+        assert "Host policy rejected human request req-hard-deny" in output
+        assert "Approved human request" not in output
 
     @pytest.mark.parametrize(
         ("request_type", "response", "message"),
@@ -628,7 +769,7 @@ class TestCLIBuiltinCommand:
     ) -> None:
         message = (
             "Agent libOS store schema v3 is not writable or readable by this runtime; "
-            "expected 5. Use Agent libOS 1.0.1 to view or archive this store. "
+            "expected 7. Use Agent libOS 1.0.1 to view or archive this store. "
             "No migration was attempted."
         )
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -655,7 +796,7 @@ class TestCLIBuiltinCommand:
     def test_python_module_entrypoint_uses_structured_error_boundary(self) -> None:
         message = (
             "Agent libOS store schema v3 is not writable or readable by this runtime; "
-            "expected 5. Use Agent libOS 1.0.1 to view or archive this store. "
+            "expected 7. Use Agent libOS 1.0.1 to view or archive this store. "
             "No migration was attempted."
         )
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1258,12 +1399,37 @@ class TestCLIBuiltinCommand:
             listed = _run_cli_json(['--db', str(db), 'mcp', 'list'])
             inspected = _run_cli_json(['--db', str(db), 'mcp', 'inspect', 'cli-mcp'])
             tools = _run_cli_json(['--db', str(db), 'mcp', 'tools', 'cli-mcp'])
+            second_manifest = root / 'mcp-second.yaml'
+            second_manifest.write_text(_cli_mcp_manifest('cli-mcp-second'), encoding='utf-8')
+            _run_cli_json(['--db', str(db), 'mcp', 'register', str(second_manifest)])
+            limited = _run_cli_json(['--db', str(db), 'mcp', 'list', '--limit', '1'])
+            config = root / 'config.yaml'
+            config.write_text(
+                'mcp:\n'
+                '  list_limit: 1\n'
+                '  server_page_limit: 2\n'
+                '  tool_catalog_limit: 3\n',
+                encoding='utf-8',
+            )
+            with pytest.warns(
+                AgentLibOSConfigDeprecationWarning,
+                match=r'mcp\.list_limit is deprecated',
+            ):
+                purpose_limited = _run_cli_json([
+                    '--config', str(config), '--db', str(db), 'mcp', 'list',
+                ])
 
             assert registered['server_id'] == 'cli-mcp'
-            assert listed[0]['server_id'] == 'cli-mcp'
+            assert set(listed) == {'servers', 'has_more'}
+            assert listed['has_more'] is False
+            assert listed['servers'][0]['server_id'] == 'cli-mcp'
             assert inspected['transport']['type'] == 'stdio'
             assert tools['tools'][0]['tool_id'] == 'echo'
             assert tools['tools'][0]['resource'] == 'mcp:cli-mcp:echo'
+            assert len(limited['servers']) == 1
+            assert limited['has_more'] is True
+            assert len(purpose_limited['servers']) == 2
+            assert purpose_limited['has_more'] is False
 
     def test_cli_mcp_discover_forwards_process_actor_and_projects_connection(self) -> None:
         _parser, args = _parse_cli_args(

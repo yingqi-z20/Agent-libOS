@@ -151,6 +151,15 @@ class Runtime:
     data_flow: DataFlowManager
     protected_operations: ProtectedOperationSDK
     semantic: SemanticManager
+    semantic_control: Any
+    semantic_control_fence: Any
+    semantic_flow: Any
+    semantic_runtime_flow: Any
+    semantic_authority_validator: Any
+    semantic_rate_budget: Any
+    semantic_auto_approval: Any
+    semantic_authority_recovery: Any
+    recovered_semantic_authority: Any
     _semantic_assessor_override: Any | None
     _semantic_tenant_bucketer_override: Callable[[str], str] | None
     external_primitive_boundary_names: frozenset[str]
@@ -164,6 +173,23 @@ class Runtime:
     shell: ShellAdapter
     jsonrpc: JsonRpcPrimitive
     mcp: McpPrimitive
+    _mcp_modern_client: Any
+    _mcp_credential_broker: Any
+    _mcp_oauth_manager: Any
+    _mcp_oauth_transport: Any
+    _mcp_connection_supervisor: Any
+    _mcp_governed_sdk_session_factory: Any
+    _mcp_sdk_session_factory: Any
+    _mcp_artifact_writer: Any
+    _mcp_resource_provider: Any
+    _mcp_prompt_provider: Any
+    _mcp_v3_tool_provider: Any
+    _mcp_continuation_provider: Any
+    _mcp_continuation_manager: Any
+    _mcp_remote_task_manager: Any
+    _mcp_subscription_provider: Any
+    _mcp_subscription_manager: Any
+    _mcp_tasks_provider: Any
     tools: ToolBroker
     object_tasks: ObjectTaskManager
     task_runs: TaskRunManager
@@ -193,6 +219,9 @@ class Runtime:
     recovered_terminal_cleanups: dict[str, Any]
     recovered_task_runs: tuple[TaskRunSummary, ...]
     recovered_task_run_count: int
+    recovered_mcp_continuations: int
+    recovered_mcp_remote_tasks: int
+    recovered_mcp_subscriptions: int
     reconciled_external_effects: ExternalEffectRecoverySummary
     payload_retention: PayloadRetentionMaintenance
     explainable_boundary_names: frozenset[str]
@@ -328,11 +357,34 @@ class Runtime:
             capability=self._recovery_diagnostics_release_capability,
         )
 
-    def bind_shutdown_finalizer(self, finalizer: Any) -> None:
-        self.lifecycle.bind_finalizer(finalizer)
+    def bind_shutdown_finalizer(
+        self,
+        finalizer: Any,
+        *,
+        recovery_safe: bool = False,
+    ) -> None:
+        """Register a composition-owned finalizer before Runtime OPEN."""
+
+        self.lifecycle.bind_finalizer(finalizer, recovery_safe=recovery_safe)
 
     def _notify_process_terminal(self, pid: str) -> None:
         errors: list[tuple[str, BaseException]] = []
+        # Process lifecycle state is already terminal.  Revoke every MCP
+        # connection/subscription fenced to this owner synchronously; Provider
+        # cleanup is scheduled and cannot make terminalization appear rolled
+        # back.
+        try:
+            subscriptions = getattr(self, "_mcp_subscription_manager", None)
+            close_owner = getattr(subscriptions, "close_owner_nowait", None)
+            if callable(close_owner):
+                close_owner(pid)
+            else:
+                supervisor = getattr(self, "_mcp_connection_supervisor", None)
+                close_owner = getattr(supervisor, "close_owner_nowait", None)
+                if callable(close_owner):
+                    close_owner(pid)
+        except BaseException:
+            pass
         try:
             self.human.cancel_pending_for_process(
                 pid,

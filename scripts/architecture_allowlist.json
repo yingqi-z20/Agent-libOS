@@ -3,11 +3,8 @@
     "agent_libos/api/gui/server.py::GuiRequestHandler._dispatch": 51,
     "agent_libos/api/gui/server.py::GuiRequestHandler._dispatch_object_tasks": 37,
     "agent_libos/api/gui/server.py::GuiRequestHandler._dispatch_process": 52,
-    "agent_libos/human/manager.py::HumanObjectManager._terminal_question": 24,
     "agent_libos/human/manager.py::HumanObjectManager.list_for_presentation_window": 25,
-    "agent_libos/human/manager.py::HumanObjectManager.query": 28,
     "agent_libos/human/manager.py::HumanObjectManager.request_data_release": 24,
-    "agent_libos/llm/client.py::LLMClient._compatibility_retry_payload": 25,
     "agent_libos/llm/executor.py::LLMProcessExecutor._previous_response_state_for_state": 29,
     "agent_libos/llm/executor.py::LLMProcessExecutor._resume_pending_llm_release_action": 23,
     "agent_libos/utils/openai_schema.py::_normalize_schema": 27,
@@ -33,7 +30,7 @@
   "function_line_budgets": {
     "agent_libos/config/defaults.py::_validate_config": 317,
     "agent_libos/primitives/filesystem.py::FilesystemAdapter._delete_directory_serialized": 243,
-    "agent_libos/primitives/mcp.py::McpPrimitive._call_tool": 347,
+    "agent_libos/primitives/mcp.py::McpPrimitive._call_tool": 325,
     "agent_libos/primitives/shell.py::ShellAdapter.run": 257,
     "agent_libos/storage/sql.py::SQLRuntimeStore.initialize": 402
   },
@@ -74,7 +71,6 @@
       "agent_libos/api/gui/server.py::GuiRuntimeService::skills": 1,
       "agent_libos/api/gui/server.py::GuiRuntimeService::store": 3,
       "agent_libos/api/gui/server.py::GuiRuntimeService::tools": 1,
-      "agent_libos/runtime/syscalls.py::LibOSSyscallSession::audit": 4,
       "agent_libos/runtime/syscalls.py::LibOSSyscallSession::capability": 9,
       "agent_libos/runtime/syscalls.py::LibOSSyscallSession::checkpoint": 7,
       "agent_libos/runtime/syscalls.py::LibOSSyscallSession::clock": 2,
@@ -83,7 +79,6 @@
       "agent_libos/runtime/syscalls.py::LibOSSyscallSession::human": 7,
       "agent_libos/runtime/syscalls.py::LibOSSyscallSession::image_registry": 6,
       "agent_libos/runtime/syscalls.py::LibOSSyscallSession::jsonrpc": 3,
-      "agent_libos/runtime/syscalls.py::LibOSSyscallSession::mcp": 4,
       "agent_libos/runtime/syscalls.py::LibOSSyscallSession::memory": 9,
       "agent_libos/runtime/syscalls.py::LibOSSyscallSession::messages": 5,
       "agent_libos/runtime/syscalls.py::LibOSSyscallSession::operations": 3,
@@ -91,8 +86,7 @@
       "agent_libos/runtime/syscalls.py::LibOSSyscallSession::resources": 1,
       "agent_libos/runtime/syscalls.py::LibOSSyscallSession::scheduler": 3,
       "agent_libos/runtime/syscalls.py::LibOSSyscallSession::shell": 1,
-      "agent_libos/runtime/syscalls.py::LibOSSyscallSession::skills": 6,
-      "agent_libos/runtime/syscalls.py::LibOSSyscallSession::syscalls": 1
+      "agent_libos/runtime/syscalls.py::LibOSSyscallSession::skills": 6
     },
     "runtime-storage-sql-bypass": {},
     "typed-storage-reflection-bypass": {},

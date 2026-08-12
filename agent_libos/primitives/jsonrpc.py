@@ -711,7 +711,7 @@ class JsonRpcPrimitive:
                 method_id=str(context["method_id"]),
             )
             approval_context = {**context, "sandbox_profile": self._profile_json(profile)}
-            request_id = self.human.query(
+            request_id = self.human.query_authority_request(
                 pid=pid,
                 human=self.config.runtime.default_human,
                 request={
@@ -726,6 +726,7 @@ class JsonRpcPrimitive:
                     "context": approval_context,
                 },
                 blocking=True,
+                authority_origin="external_operation",
                 source_oids=source_oids,
             )
             raise HumanApprovalRequired(
@@ -798,7 +799,7 @@ class JsonRpcPrimitive:
             method_id=str(context["method_id"]),
         )
         approval_context = {**context, "right": right, "sandbox_profile": self._profile_json(profile)}
-        request_id = self.human.query(
+        request_id = self.human.query_authority_request(
             pid=pid,
             human=self.config.runtime.default_human,
             request={
@@ -813,6 +814,7 @@ class JsonRpcPrimitive:
                 "context": approval_context,
             },
             blocking=True,
+            authority_origin="external_operation",
             source_oids=source_oids,
         )
         raise HumanApprovalRequired(
@@ -1536,12 +1538,15 @@ class JsonRpcPrimitive:
         return MappingProxyType(resolved_headers)
 
     def _validate_url(self, url: str) -> None:
-        parsed = urlsplit(url)
+        try:
+            parsed = urlsplit(url)
+        except ValueError as exc:
+            raise ValidationError("JSON-RPC endpoint URL is invalid") from exc
         try:
             _ = parsed.port
         except ValueError as exc:
             raise ValidationError("JSON-RPC endpoint URL has invalid port") from exc
-        if parsed.username or parsed.password:
+        if parsed.username is not None or parsed.password is not None:
             raise ValidationError("JSON-RPC endpoint URL must not include userinfo")
         if parsed.fragment:
             raise ValidationError("JSON-RPC endpoint URL must not include a fragment")

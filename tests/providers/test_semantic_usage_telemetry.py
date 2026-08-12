@@ -212,15 +212,29 @@ def test_external_assessor_rejects_reentrancy_and_clears_its_thread_guard() -> N
             self._usage_local = threading.local()
             self.calls = 0
 
-        def _assess_once(self, request: Any) -> SemanticAssessment:
+        def _assess_once(
+            self,
+            request: Any,
+            *,
+            data_flow_context: Any,
+        ) -> SemanticAssessment:
             self.calls += 1
             if self.calls == 1:
                 with pytest.raises(RuntimeError, match="must not be reentrant"):
-                    self.assess(request)
+                    self._assess_guarded(
+                        request,
+                        data_flow_context=data_flow_context,
+                    )
             return SemanticAssessment(status=SemanticAssessmentStatus.SUCCESS)
 
     assessor = ReentrancyProbe()
 
-    assert assessor.assess(object()).status is SemanticAssessmentStatus.SUCCESS
-    assert assessor.assess(object()).status is SemanticAssessmentStatus.SUCCESS
+    assert assessor._assess_guarded(
+        object(),
+        data_flow_context=None,
+    ).status is SemanticAssessmentStatus.SUCCESS
+    assert assessor._assess_guarded(
+        object(),
+        data_flow_context=None,
+    ).status is SemanticAssessmentStatus.SUCCESS
     assert assessor.calls == 2

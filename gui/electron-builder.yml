@@ -1,0 +1,64 @@
+appId: io.agentlibos.desktop
+productName: Agent libOS
+copyright: Copyright © 2026 Agent libOS contributors
+electronVersion: 43.2.0
+asar: true
+npmRebuild: false
+buildDependenciesFromSource: false
+compression: maximum
+directories:
+  buildResources: desktop-resources
+  output: ../desktop-dist
+files:
+  - dist-electron/**/*
+  - package.json
+  - '!node_modules/**/*'
+  - '!**/*.map'
+extraResources:
+  - from: .desktop-stage/backend
+    to: backend
+  - from: .desktop-stage/bin
+    to: bin
+  - from: .desktop-stage/renderer
+    to: renderer
+  - from: .desktop-stage/legal
+    to: legal
+  - from: .desktop-stage/metadata
+    to: metadata
+mac:
+  category: public.app-category.developer-tools
+  icon: desktop-resources/icon.svg
+  identity: '-'
+  hardenedRuntime: false
+  gatekeeperAssess: false
+  artifactName: Agent-libOS-${version}-macos-${arch}.${ext}
+  target:
+    - dmg
+    - zip
+dmg:
+  title: Agent libOS ${version} Internal
+  sign: false
+win:
+  icon: desktop-resources/icon.svg
+  forceCodeSigning: false
+  artifactName: Agent-libOS-${version}-windows-${arch}.${ext}
+  target:
+    - nsis
+    - zip
+nsis:
+  artifactName: Agent-libOS-Setup-${version}-windows-${arch}.${ext}
+  oneClick: false
+  perMachine: false
+  allowElevation: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  runAfterFinish: false
+linux:
+  category: Development
+  executableName: agent-libos
+  icon: desktop-resources/icon.svg
+  artifactName: Agent-libOS-${version}-linux-${arch}.${ext}
+  target:
+    - AppImage
+    - tar.gz
+publish: null

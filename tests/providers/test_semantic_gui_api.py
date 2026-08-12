@@ -19,10 +19,11 @@ class _FakeSemanticService:
         self.status_calls = 0
         self.actual_auto_approval: dict[str, Any] = {
             "numerator": 0,
-            "denominator": 0,
-            "rate": None,
+            "denominator": 1,
+            "rate": 0.0,
         }
         self.assessment = {
+            "schema_version": 1,
             "assessment_id": "assessment-1",
             "job_id": "job-1",
             "kind": "approval",
@@ -111,8 +112,8 @@ class _FakeSemanticService:
     def status(self) -> dict[str, Any]:
         self.status_calls += 1
         return {
-            "schema_version": 2,
-            "mode": "shadow",
+            "schema_version": 3,
+            "mode": "enforce_deny",
             "adapter": "scripted",
             "profile_id": "semantic-profile",
             "queue": {
@@ -154,7 +155,61 @@ class _FakeSemanticService:
                     "unknown": 1,
                 },
             },
+            "control": {
+                "catalog_version": 1,
+                "active_epoch_id": "epoch-1",
+                "active_epoch_sha256": "7" * 64,
+                "generation": 1,
+                "state": "active",
+                "trip_reason_code": None,
+            },
+            "flow": {
+                "schema_version": 1,
+                "available": True,
+                "counts": {
+                    "entities": 1,
+                    "activities": 1,
+                    "edges": 1,
+                    "label_assertions": 0,
+                },
+                "coverage": {
+                    "complete": 1,
+                    "partial": 0,
+                    "unknown": 0,
+                    "conflict": 0,
+                    "stale": 0,
+                },
+                "capture_failures": 0,
+                "legacy_history": {
+                    "present": False,
+                    "source_schema_version": None,
+                    "assessment_count": 0,
+                    "coverage": None,
+                    "evidence_sha256": None,
+                    "created_at": None,
+                },
+            },
+            "machine": {
+                "eligible": 1,
+                "issued": 0,
+                "consumed": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "unknown": 0,
+                "expired": 0,
+                "revoked": 0,
+                "race_lost": 0,
+                "denied": 0,
+            },
             "actual_auto_approval": self.actual_auto_approval,
+            "review_metrics": {
+                "reviewed": 0,
+                "safe": 0,
+                "unsafe": 0,
+                "unsafe_rate": None,
+                "issued_reviewed": 0,
+                "issued_review_rate": None,
+            },
             "prompt": "RAW_SECRET_PROMPT",
         }
 
@@ -171,6 +226,176 @@ class _FakeSemanticService:
         if assessment_id == "missing":
             return None
         return self.assessment
+
+    def flow_status(self) -> dict[str, Any]:
+        return self.status()["flow"]
+
+    def query_flow_entities(self, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "items": [
+                {
+                    "schema_version": 1,
+                    "entity_id": "entity-1",
+                    "kind": "provider_result",
+                    "pid": "pid-1",
+                    "tenant_bucket_sha256": "1" * 64,
+                    "content_sha256": "2" * 64,
+                    "version_sha256": "3" * 64,
+                    "provenance_sha256": "4" * 64,
+                    "baseline_labels": {
+                        "sensitivity": "normal",
+                        "trust_level": "verified",
+                        "integrity": "checked",
+                    },
+                    "identity_present": True,
+                    "identity_mixed": False,
+                    "coverage": "complete",
+                    "created_at": "2026-08-05T00:00:00Z",
+                    "raw_content": "RAW_SECRET_FLOW",
+                }
+            ],
+            "next_cursor": None,
+        }
+
+    def query_flow_edges(self, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "items": [
+                {
+                    "schema_version": 1,
+                    "edge_id": "edge-1",
+                    "relation": "direct",
+                    "source_node_id": "activity-1",
+                    "source_node_type": "activity",
+                    "target_node_id": "entity-1",
+                    "target_node_type": "entity",
+                    "pid": "pid-1",
+                    "provenance_sha256": "5" * 64,
+                    "created_at": "2026-08-05T00:00:00Z",
+                }
+            ],
+            "next_cursor": None,
+        }
+
+    def query_flow_lineage(self, node_id: str, **_kwargs: Any) -> dict[str, Any]:
+        entity = self.query_flow_entities()["items"][0]
+        edge = self.query_flow_edges()["items"][0]
+        return {
+            "schema_version": 1,
+            "root_node_id": node_id,
+            "direction": "upstream",
+            "items": [
+                {"depth": 1, "edge": edge, "node_type": "entity", "node": entity}
+            ],
+            "effective_labels": entity["baseline_labels"],
+            "coverage": "complete",
+            "next_cursor": None,
+            "truncated": False,
+        }
+
+    def query_machine_settlements(self, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "items": [
+                {
+                    "schema_version": 1,
+                    "settlement_id": "settlement-1",
+                    "assessment_id": "assessment-1",
+                    "job_id": "job-1",
+                    "request_id": "request-1",
+                    "request_revision": 0,
+                    "pid": "pid-1",
+                    "operation_id": "operation-1",
+                    "effect_id": "effect-1",
+                    "epoch_id": "epoch-1",
+                    "policy_sha256": "6" * 64,
+                    "tenant_bucket_sha256": "7" * 64,
+                    "action_id": "filesystem.read",
+                    "outcome": "require_human",
+                    "capability_id": None,
+                    "binding_sha256": "8" * 64,
+                    "decision_sha256": "9" * 64,
+                    "matched_rule_id": None,
+                    "reason_codes": ["flow_coverage_incomplete"],
+                    "created_at": "2026-08-05T00:00:00Z",
+                }
+            ],
+            "next_cursor": None,
+        }
+
+    def query_policy_epochs(self, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "items": [
+                {
+                    "schema_version": 1,
+                    "epoch_id": "epoch-1",
+                    "generation": 1,
+                    "catalog_version": 1,
+                    "policy_sha256": "6" * 64,
+                    "expected_previous_sha256": None,
+                    "created_at": "2026-08-05T00:00:00Z",
+                }
+            ],
+            "next_cursor": None,
+        }
+
+    def control_status(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "revision": 1,
+            "generation": 1,
+            "mode": "enforce_deny",
+            "active_epoch_id": "epoch-1",
+            "active_policy_sha256": "6" * 64,
+            "tripped": False,
+            "trip_code": None,
+            "updated_at": "2026-08-05T00:00:00Z",
+        }
+
+    def query_control_history(self, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "items": [self.control_status()],
+            "next_cursor": None,
+        }
+
+    def query_health_events(self, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "items": [
+                {
+                    "schema_version": 1,
+                    "event_id": "health-1",
+                    "event_kind": "capture_failed",
+                    "severity": "warning",
+                    "epoch_id": "epoch-1",
+                    "tenant_bucket_sha256": "7" * 64,
+                    "evidence_sha256": "a" * 64,
+                    "created_at": "2026-08-05T00:00:00Z",
+                }
+            ],
+            "next_cursor": None,
+        }
+
+    def metrics(self, **_kwargs: Any) -> dict[str, Any]:
+        status = self.status()
+        review_metrics = dict(status["review_metrics"])
+        review_metrics.update(
+            {"issued_reviewed": 0, "issued_review_rate": None}
+        )
+        return {
+            "schema_version": 1,
+            "window": None,
+            "action_id": None,
+            "tenant_bucket_sha256": None,
+            "epoch_id": None,
+            "risk": None,
+            "machine": status["machine"],
+            "actual_auto_approval": status["actual_auto_approval"],
+            "review_metrics": review_metrics,
+        }
 
 
 class _FakeGuiService:
@@ -230,69 +455,272 @@ def _request(server: Any, method: str, path: str) -> tuple[int, dict[str, Any]]:
     return response.status, payload
 
 
-def test_semantic_status_is_v2_and_payload_free(
+def test_semantic_status_is_v3_and_payload_free(
     semantic_gui_server: tuple[Any, _FakeSemanticService],
 ) -> None:
     server, semantic = semantic_gui_server
+    expected = _FakeSemanticService.status(semantic)
+    semantic.status_calls = 0
 
     status, payload = _request(server, "GET", "/api/semantic/status")
 
     assert status == 200
-    assert payload == {
-        "schema_version": 2,
-        "mode": "shadow",
-        "adapter": "scripted",
-        "profile_id": "semantic-profile",
-        "queue": {
-            "queued": 1,
-            "leased": 2,
-            "succeeded": 3,
-            "failed": 4,
-            "cancelled": 5,
-            "capture_failures": 6,
-        },
-        "assessments": {
-            "total": 10,
-            "success": 7,
-            "error": 3,
-            "ood": 2,
-            "would_issue_exact_once": 1,
-            "would_deny": 2,
-            "require_human": 7,
-            "by_status": {
-                "success": 7,
-                "skipped_policy": 0,
-                "egress_blocked": 0,
-                "timeout": 1,
-                "provider_error": 0,
-                "provider_outcome_unknown": 0,
-                "invalid_schema": 0,
-                "ood": 2,
-                "abstained": 0,
-                "stale_input": 0,
-            },
-            "by_domain": {
-                "filesystem": 4,
-                "shell": 1,
-                "git": 1,
-                "jsonrpc": 1,
-                "mcp": 1,
-                "runtime": 1,
-                "unknown": 1,
-            },
-        },
-        "actual_auto_approval": {"numerator": 0, "denominator": 0, "rate": None},
-    }
+    expected.pop("prompt")
+    expected["queue"].pop("raw_projection")
+    assert payload == expected
     assert "RAW_SECRET" not in json.dumps(payload)
     assert semantic.status_calls == 1
 
 
-def test_semantic_status_rejects_nonzero_actual_auto_approval_metrics(
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/api/semantic/flow/status",
+        "/api/semantic/flow/entities?pid=pid-1&kind=provider_result&limit=1",
+        "/api/semantic/flow/edges?relation=direct&node_id=entity-1&limit=1",
+        "/api/semantic/flow/lineage/entity-1?direction=upstream&max_depth=8&limit=1",
+        "/api/semantic/settlements?outcome=require_human&limit=1",
+        "/api/semantic/policy/epochs?limit=1",
+        "/api/semantic/control",
+        "/api/semantic/control/history?limit=1",
+        "/api/semantic/health?severity=warning&limit=1",
+        "/api/semantic/metrics?action_id=filesystem.read&risk=low",
+    ),
+)
+def test_semantic_phase_four_read_only_endpoints_are_bounded_and_payload_free(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+    path: str,
+) -> None:
+    server, _semantic = semantic_gui_server
+
+    status, payload = _request(server, "GET", path)
+
+    assert status == 200
+    assert payload["schema_version"] in {1, 3}
+    assert "RAW_SECRET" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    ("service_method", "path", "item_field"),
+    (
+        (
+            "query_flow_entities",
+            "/api/semantic/flow/entities?limit=1",
+            "kind",
+        ),
+        (
+            "query_flow_edges",
+            "/api/semantic/flow/edges?limit=1",
+            "relation",
+        ),
+        (
+            "query_machine_settlements",
+            "/api/semantic/settlements?limit=1",
+            "outcome",
+        ),
+        (
+            "query_machine_settlements",
+            "/api/semantic/settlements?limit=1",
+            "reason_codes",
+        ),
+        (
+            "query_health_events",
+            "/api/semantic/health?limit=1",
+            "event_kind",
+        ),
+    ),
+)
+def test_semantic_read_only_item_enums_fail_closed_without_echo(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+    service_method: str,
+    path: str,
+    item_field: str,
+) -> None:
+    server, semantic = semantic_gui_server
+    page = getattr(semantic, service_method)()
+    sentinel = f"RAW_SECRET_{item_field.upper()}_SENTINEL"
+    page["items"][0][item_field] = (
+        [sentinel] if item_field == "reason_codes" else sentinel
+    )
+    setattr(semantic, service_method, lambda **_kwargs: page)
+
+    status, payload = _request(server, "GET", path)
+
+    assert status == 500
+    assert payload["error"]["code"] == "invalid_semantic_service_response"
+    assert sentinel not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    ("service_method", "path", "field"),
+    (
+        ("control_status", "/api/semantic/control", "trip_code"),
+        ("metrics", "/api/semantic/metrics", "risk"),
+    ),
+)
+def test_semantic_read_only_scalar_enums_fail_closed_without_echo(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+    service_method: str,
+    path: str,
+    field: str,
+) -> None:
+    server, semantic = semantic_gui_server
+    value = getattr(semantic, service_method)()
+    sentinel = f"RAW_SECRET_{field.upper()}_SENTINEL"
+    value[field] = sentinel
+    if field == "trip_code":
+        value["tripped"] = True
+    setattr(semantic, service_method, lambda **_kwargs: value)
+
+    status, payload = _request(server, "GET", path)
+
+    assert status == 500
+    assert payload["error"]["code"] == "invalid_semantic_service_response"
+    assert sentinel not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/api/semantic/flow/entities?unknown=value",
+        "/api/semantic/flow/entities?limit=101",
+        "/api/semantic/flow/edges?relation=write",
+        "/api/semantic/flow/lineage/entity-1?max_depth=17",
+        "/api/semantic/settlements?outcome=approved",
+        "/api/semantic/policy/epochs?state=active",
+        "/api/semantic/control?state=active",
+        "/api/semantic/health?severity=error",
+        "/api/semantic/metrics?tenant_bucket_sha256=not-a-digest",
+        "/api/semantic/metrics?risk=unknown",
+    ),
+)
+def test_semantic_phase_four_read_only_endpoints_reject_unknown_or_unbounded_queries(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+    path: str,
+) -> None:
+    server, _semantic = semantic_gui_server
+
+    status, payload = _request(server, "GET", path)
+
+    assert status == 400
+    assert payload["ok"] is False
+
+
+def test_semantic_phase_four_page_requires_explicit_schema_version(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+) -> None:
+    server, semantic = semantic_gui_server
+    page = semantic.query_flow_entities()
+    page.pop("schema_version")
+    semantic.query_flow_entities = lambda **_kwargs: page  # type: ignore[method-assign]
+
+    status, payload = _request(server, "GET", "/api/semantic/flow/entities")
+
+    assert status == 500
+    assert payload["error"]["code"] == "invalid_semantic_service_response"
+
+
+def test_semantic_health_rejects_unknown_host_event_kind_without_echo(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+) -> None:
+    server, semantic = semantic_gui_server
+    page = semantic.query_health_events()
+    page["items"][0]["event_kind"] = "RAW_SECRET_HEALTH_KIND_SENTINEL"
+    semantic.query_health_events = lambda **_kwargs: page  # type: ignore[method-assign]
+
+    status, payload = _request(server, "GET", "/api/semantic/health")
+
+    assert status == 500
+    assert payload["error"]["code"] == "invalid_semantic_service_response"
+    assert "RAW_SECRET" not in json.dumps(payload)
+
+
+def test_semantic_http_surface_has_no_review_or_policy_mutation_endpoint(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+) -> None:
+    server, _semantic = semantic_gui_server
+
+    for path in (
+        "/api/semantic/review/import",
+        "/api/semantic/policy/activate",
+        "/api/semantic/control/revoke",
+    ):
+        status, _payload = _request(server, "POST", path)
+        assert status == 404
+
+
+def test_semantic_metrics_exposes_issued_only_review_coverage(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+) -> None:
+    server, semantic = semantic_gui_server
+    metrics = semantic.metrics()
+    metrics["machine"]["eligible"] = 1
+    metrics["machine"]["issued"] = 1
+    metrics["actual_auto_approval"] = {
+        "numerator": 1,
+        "denominator": 1,
+        "rate": 1.0,
+    }
+    metrics["review_metrics"] = {
+        "reviewed": 1,
+        "safe": 1,
+        "unsafe": 0,
+        "unsafe_rate": 0.0,
+        # The one label belongs to a non-issued settlement and therefore must
+        # not claim canary grant-review coverage.
+        "issued_reviewed": 0,
+        "issued_review_rate": 0.0,
+    }
+    semantic.metrics = lambda **_kwargs: metrics  # type: ignore[method-assign]
+
+    status, payload = _request(server, "GET", "/api/semantic/metrics")
+
+    assert status == 200
+    assert payload["review_metrics"]["reviewed"] == 1
+    assert payload["review_metrics"]["issued_reviewed"] == 0
+    assert payload["review_metrics"]["issued_review_rate"] == 0.0
+
+
+def test_semantic_metrics_rejects_review_coverage_above_issued_grants(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+) -> None:
+    server, semantic = semantic_gui_server
+    metrics = semantic.metrics()
+    metrics["review_metrics"].update(
+        {"issued_reviewed": 1, "issued_review_rate": 1.0}
+    )
+    semantic.metrics = lambda **_kwargs: metrics  # type: ignore[method-assign]
+
+    status, payload = _request(server, "GET", "/api/semantic/metrics")
+
+    assert status == 500
+    assert payload["error"]["code"] == "invalid_semantic_service_response"
+
+
+def test_semantic_metrics_rejects_ratio_denominator_drift_from_eligible(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+) -> None:
+    server, semantic = semantic_gui_server
+    metrics = semantic.metrics()
+    metrics["actual_auto_approval"] = {
+        "numerator": 0,
+        "denominator": 0,
+        "rate": None,
+    }
+    semantic.metrics = lambda **_kwargs: metrics  # type: ignore[method-assign]
+
+    status, payload = _request(server, "GET", "/api/semantic/metrics")
+
+    assert status == 500
+    assert payload["error"]["code"] == "invalid_semantic_service_response"
+
+
+def test_semantic_status_rejects_inconsistent_actual_auto_approval_metrics(
     semantic_gui_server: tuple[Any, _FakeSemanticService],
 ) -> None:
     server, semantic = semantic_gui_server
     semantic.actual_auto_approval = {
-        "numerator": 1,
+        "numerator": 2,
         "denominator": 1,
         "rate": 1.0,
     }
@@ -319,11 +747,11 @@ def test_semantic_status_rejects_nonzero_actual_auto_approval_metrics(
         (("assessments", "by_status", "success"), True),
         (("assessments", "by_domain", "filesystem"), "4"),
         (("actual_auto_approval", "numerator"), 1),
-        (("actual_auto_approval", "denominator"), 1),
-        (("actual_auto_approval", "rate"), 0.0),
+        (("actual_auto_approval", "denominator"), 2),
+        (("actual_auto_approval", "rate"), 0.5),
     ],
 )
-def test_semantic_status_api_rejects_malformed_v2_fields(
+def test_semantic_status_api_rejects_malformed_v3_fields(
     semantic_gui_server: tuple[Any, _FakeSemanticService],
     path: tuple[str, ...],
     invalid: object,
@@ -540,6 +968,33 @@ def test_semantic_assessment_projection_rejects_arbitrary_human_outcome(
     assert "RAW_SECRET" not in json.dumps(payload)
 
 
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    (
+        ("kind", "RAW_SECRET_KIND_SENTINEL"),
+        ("status", "RAW_SECRET_STATUS_SENTINEL"),
+        ("domain", "RAW_SECRET_DOMAIN_SENTINEL"),
+        ("shadow_outcome", "RAW_SECRET_OUTCOME_SENTINEL"),
+        ("calibration_bucket", "RAW_SECRET_CALIBRATION_SENTINEL"),
+        ("reason_codes", ["RAW_SECRET_REASON_CODE_SENTINEL"]),
+        ("human_outcome", "RAW_SECRET_HUMAN_OUTCOME_SENTINEL"),
+    ),
+)
+def test_semantic_assessment_summary_rejects_unknown_enums_without_echo(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+    field: str,
+    invalid: object,
+) -> None:
+    server, semantic = semantic_gui_server
+    semantic.query_items = [{**semantic.assessment, field: invalid}]
+
+    status, payload = _request(server, "GET", "/api/semantic/assessments")
+
+    assert status == 500
+    assert payload["error"]["code"] == "invalid_semantic_service_response"
+    assert "RAW_SECRET" not in json.dumps(payload)
+
+
 def test_semantic_assessment_page_cannot_exceed_requested_limit(
     semantic_gui_server: tuple[Any, _FakeSemanticService],
 ) -> None:
@@ -682,6 +1137,87 @@ def test_semantic_assessment_detail_is_typed_and_payload_free(
 
 
 @pytest.mark.parametrize(
+    ("field", "invalid"),
+    (
+        ("code", "RAW_SECRET_FINDING_CODE_SENTINEL"),
+        ("severity", "RAW_SECRET_FINDING_SEVERITY_SENTINEL"),
+        ("source", "RAW_SECRET_FINDING_SOURCE_SENTINEL"),
+        ("confidence_bps", "RAW_SECRET_FINDING_CONFIDENCE_SENTINEL"),
+        ("evidence_sha256", "RAW_SECRET_FINDING_EVIDENCE_SENTINEL"),
+    ),
+)
+def test_semantic_assessment_detail_rejects_unknown_finding_fields_without_echo(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+    field: str,
+    invalid: object,
+) -> None:
+    server, semantic = semantic_gui_server
+    finding = {**semantic.assessment["findings"][0], field: invalid}
+    semantic.assessment = {**semantic.assessment, "findings": [finding]}
+
+    status, payload = _request(
+        server,
+        "GET",
+        "/api/semantic/assessments/assessment-1",
+    )
+
+    assert status == 500
+    assert payload["error"]["code"] == "invalid_semantic_service_response"
+    assert "RAW_SECRET" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    (
+        ("category", "RAW_SECRET_DATA_CATEGORY_SENTINEL"),
+        ("sensitivity_floor", "RAW_SECRET_SENSITIVITY_SENTINEL"),
+        ("integrity_ceiling", "RAW_SECRET_INTEGRITY_SENTINEL"),
+        ("trust_ceiling", "RAW_SECRET_TRUST_SENTINEL"),
+    ),
+)
+def test_semantic_assessment_detail_rejects_unknown_data_enums_without_echo(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+    field: str,
+    invalid: object,
+) -> None:
+    server, semantic = semantic_gui_server
+    finding = {**semantic.assessment["data_findings"][0], field: invalid}
+    semantic.assessment = {**semantic.assessment, "data_findings": [finding]}
+
+    status, payload = _request(
+        server,
+        "GET",
+        "/api/semantic/assessments/assessment-1",
+    )
+
+    assert status == 500
+    assert payload["error"]["code"] == "invalid_semantic_service_response"
+    assert "RAW_SECRET" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("field", ("proven_predicates", "missing_predicates"))
+def test_semantic_assessment_detail_rejects_unknown_predicates_without_echo(
+    semantic_gui_server: tuple[Any, _FakeSemanticService],
+    field: str,
+) -> None:
+    server, semantic = semantic_gui_server
+    semantic.assessment = {
+        **semantic.assessment,
+        field: ["RAW_SECRET_PREDICATE_SENTINEL"],
+    }
+
+    status, payload = _request(
+        server,
+        "GET",
+        "/api/semantic/assessments/assessment-1",
+    )
+
+    assert status == 500
+    assert payload["error"]["code"] == "invalid_semantic_service_response"
+    assert "RAW_SECRET" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
     ("field", "span_start", "span_end"),
     [
         ("RAW_SECRET_INVENTED_LOCATOR", None, None),
@@ -779,6 +1315,14 @@ def test_semantic_assessment_detail_returns_404_when_missing(
         ("POST", "/api/semantic/assessments"),
         ("PUT", "/api/semantic/assessments/assessment-1"),
         ("DELETE", "/api/semantic/assessments/assessment-1"),
+        ("POST", "/api/semantic/flow/entities"),
+        ("PUT", "/api/semantic/flow/lineage/entity-1"),
+        ("POST", "/api/semantic/settlements"),
+        ("POST", "/api/semantic/policy/epochs"),
+        ("POST", "/api/semantic/control"),
+        ("DELETE", "/api/semantic/control/history"),
+        ("POST", "/api/semantic/health"),
+        ("PUT", "/api/semantic/metrics"),
     ],
 )
 def test_semantic_api_has_no_write_routes(

@@ -6,7 +6,7 @@ Agent libOS is a Python runtime with an optional Electron GUI. Core runtime code
 lives in `agent_libos/`, organized by subsystems including `runtime/`,
 `primitives/`, `capability/`, `memory/`, `skills/`, `modules/`, `tools/`,
 `substrate/`, `config/`, `evidence/`, `human/`, `images/`, `llm/`, `models/`,
-`ports/`, `sdk/`, `storage/`, `utils/`, and `api/` for CLI/GUI server
+`ports/`, `sdk/`, `semantic/`, `storage/`, `utils/`, and `api/` for CLI/GUI server
 entrypoints. Pytest tests live in `tests/` and map to
 test matrix lanes: `unit`, `runtime`, `security`, `self-evolution`,
 `providers`, `benchmark`, and `gui`; some lane names differ from directory
@@ -45,7 +45,8 @@ Use Python 3.11+ with 4-space indentation, type hints for public interfaces, and
 dataclasses or Pydantic models for structured data. Keep runtime defaults in
 `agent_libos.config.DEFAULT_CONFIG`; do not scatter magic numbers. Preserve the
 core boundary: tools and Skills affect visibility, while primitives enforce
-Capability, human approval, provider policy, events, and audit. TypeScript in
+the Capability, human-approval, provider-policy, data-flow, resource, effect,
+event, and audit boundaries applicable to their effect class. TypeScript in
 `gui/` should use strict component and API types.
 
 ## Testing Guidelines
@@ -73,6 +74,22 @@ Never commit local/real `.env`, credentials, benchmark outputs, generated
 Remote access must use Host-configured primitives or providers, such as
 registered JSON-RPC/MCP endpoints, named LLM profiles, or configured Git
 remotes; models must not supply ad hoc URLs, credentials, or transport commands.
+Ordinary data-flow Sink-registry writes require admin authority; only trusted
+Host bootstrap/reconciliation before Runtime OPEN may bypass a process
+Capability, and neither path becomes a model tool. Semantic policy control is a
+Host-composition surface reachable from the local Runtime Python object, not a
+CLI, HTTP, GUI, process, Skill, JIT, Module, or model-facing surface.
+Prompt caching defaults to the legacy prompt layout and provider-default cache
+policy. Treat prompt-cache v2 as an explicit Host opt-in: preserve its stable
+and dynamic prompt split, Host privacy-domain-derived cache key, same-logical-call
+compatibility downgrade, configured-versus-effective evidence, and paired
+multi-provider release gate when changing LLM prompts or transports.
+Startup recovery must validate recoverable TaskRun payloads before durable
+recovery effects, reconcile prepared/pending effects before abandoning stale
+Capability reservations, and finish semantic authority, resource/publication,
+root-goal/payload, JIT/stale-work, ObjectTask/cleanup, and TaskRun recovery in the
+builder-defined order. Provider reconciliation may restore an effect-bound
+Capability reservation, so do not move stale-reservation abandonment earlier.
 Checkpoint restore and image commit do not roll back or package external
 provider state. Audit and effect-transition history are append-only through the
 RuntimeStore API, while guarded external-effect rows and retained payload

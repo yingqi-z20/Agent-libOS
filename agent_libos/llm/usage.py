@@ -61,13 +61,17 @@ def aggregate_cache_usage(records: Iterable[Any]) -> dict[str, Any]:
 
     cache_read_tokens = 0
     cache_write_tokens = 0
+    cache_total_calls = 0
     cache_reported_calls = 0
+    cache_read_reported_calls = 0
+    cache_write_reported_calls = 0
     cache_metric_input_tokens = 0
     uncached_input_tokens = 0
     calculation_cache_read_tokens = 0
     calculation_calls = 0
 
     for record in records:
+        cache_total_calls += 1
         api = _record_value(record, "api")
         persisted = _record_value(record, "usage")
         canonical, _invalid = canonicalize_llm_usage(persisted, api=api)
@@ -88,6 +92,8 @@ def aggregate_cache_usage(records: Iterable[Any]) -> dict[str, Any]:
         if not (read_reported or write_reported):
             continue
         cache_reported_calls += 1
+        cache_read_reported_calls += int(read_reported)
+        cache_write_reported_calls += int(write_reported)
         cache_read_tokens += canonical.get("cache_read_tokens", 0)
         cache_write_tokens += canonical.get("cache_write_tokens", 0)
 
@@ -110,8 +116,17 @@ def aggregate_cache_usage(records: Iterable[Any]) -> dict[str, Any]:
         cache_hit_rate = calculation_cache_read_tokens / cache_metric_input_tokens
     return {
         "cache_read_tokens": cache_read_tokens,
-        "cache_write_tokens": cache_write_tokens,
+        "cache_write_tokens": (
+            cache_write_tokens
+            if cache_total_calls > 0
+            and cache_write_reported_calls == cache_total_calls
+            else None
+        ),
+        "cache_total_calls": cache_total_calls,
         "cache_reported_calls": cache_reported_calls,
+        "cache_read_reported_calls": cache_read_reported_calls,
+        "cache_write_reported_calls": cache_write_reported_calls,
+        "cache_metric_reported_calls": calculation_calls,
         "cache_metric_input_tokens": cache_metric_input_tokens,
         "uncached_input_tokens": uncached_input_tokens,
         "cache_hit_rate": cache_hit_rate,

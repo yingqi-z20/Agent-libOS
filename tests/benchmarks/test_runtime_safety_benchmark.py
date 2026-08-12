@@ -45,6 +45,59 @@ SUITE_ROOT = Path('benchmarks/runtime_safety')
 
 class TestRuntimeSafetyBenchmark:
 
+    def test_documented_task_example_loads_against_checked_in_suite(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        schema_document = (SUITE_ROOT / 'schema.md').read_text(encoding='utf-8')
+        task_example = schema_document.split('```yaml', 1)[1].split('```', 1)[0]
+        example_path = tmp_path / 'documented_task.yaml'
+        example_path.write_text(task_example.strip() + '\n', encoding='utf-8')
+
+        task = load_task_file(example_path, suite_root=SUITE_ROOT.resolve())
+
+        assert task.workspace == 'fixtures/basic_repo'
+
+    def test_paper_thesis_describes_only_implemented_deterministic_baselines_and_metrics(
+        self,
+    ) -> None:
+        thesis = Path('docs/paper_thesis.md').read_text(encoding='utf-8')
+        evaluation = thesis.split('4. Evaluation.', 1)[1].split('## Non-Goals', 1)[0]
+        normalized_evaluation = ' '.join(evaluation.split())
+
+        for runner in (
+            'direct_tool_wrapper',
+            'confirmation_wrapper',
+            'sandbox_only',
+        ):
+            assert f'`{runner}`' in normalized_evaluation
+        assert 'static-category' in normalized_evaluation
+        assert 'is not Host, container, VM' in normalized_evaluation
+        assert (
+            'none of these deterministic baselines invokes a real LLM'
+            in normalized_evaluation
+        )
+
+        documented_metrics = {
+            'tasks',
+            'task_success_rate',
+            'safety_pass_rate',
+            'unauthorized_side_effect_rate',
+            'false_denial_rate',
+            'approval_count',
+            'tool_calls',
+            'primitive_calls',
+            'llm_tokens',
+            'wall_time_s',
+            'audit_completeness',
+        }
+        assert documented_metrics <= set(METRIC_COLUMNS)
+        assert all(
+            f'`{metric}`' in normalized_evaluation for metric in documented_metrics
+        )
+        assert 'token/cost accounting' not in normalized_evaluation
+        assert 'does not emit cost or overhead metrics' in normalized_evaluation
+
     def test_loads_runtime_safety_task_suite(self) -> None:
         tasks = load_tasks(SUITE_ROOT)
         assert len(tasks) >= 28
@@ -2742,6 +2795,89 @@ class TestRuntimeSafetyBenchmark:
                     str(tmp_path / 'release-output'),
                 ]
             )
+
+    def test_release_evidence_gate_is_stricter_without_changing_oracle_flag(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        selected_task = load_tasks(SUITE_ROOT)[0]
+        evidence_failure = TaskRun(
+            result=BenchmarkResult(
+                task_id=selected_task.id,
+                runner='direct_tool_wrapper',
+                attack_class=selected_task.attack_class,
+                ok=True,
+                task_success=True,
+                safety_passed=True,
+                unknown_effects=0,
+                forbidden_performed=0,
+                approval_count=0,
+                tool_calls=1,
+                primitive_calls=1,
+                llm_tokens=0,
+                wall_time_s=0.1,
+                audit_records=1,
+                audit_completeness=0.5,
+            ),
+            effects=[
+                EffectRecord(
+                    effect_id='allowed-but-denied',
+                    task_id=selected_task.id,
+                    runner='direct_tool_wrapper',
+                    type='filesystem.read',
+                    performed=False,
+                    denied=True,
+                    simulated=False,
+                    outcome='denied',
+                    evidence='runtime_result_denial',
+                    classification='allowed',
+                )
+            ],
+        )
+        monkeypatch.setattr(
+            run_benchmark_module,
+            'run_suite',
+            lambda *args, **kwargs: [evidence_failure],
+        )
+        common = [
+            '--suite',
+            str(SUITE_ROOT),
+            '--task',
+            selected_task.id,
+            '--runner',
+            'direct_tool_wrapper',
+        ]
+
+        run_benchmark_module.main(
+            [
+                *common,
+                '--require-all-passed',
+                '--output',
+                str(tmp_path / 'oracle-compatible-output'),
+            ]
+        )
+        with pytest.raises(SystemExit, match='2 benchmark release-evidence failure'):
+            run_benchmark_module.main(
+                [
+                    *common,
+                    '--require-all-passed',
+                    '--require-release-evidence',
+                    '--output',
+                    str(tmp_path / 'release-evidence-output'),
+                ]
+            )
+
+    def test_release_workflow_enforces_runtime_safety_evidence_and_whitespace(
+        self,
+    ) -> None:
+        workflow = Path('.github/workflows/test.yml').read_text(encoding='utf-8')
+
+        assert '--require-all-passed' in workflow
+        assert '--require-release-evidence' in workflow
+        assert 'scripts/check_changed_whitespace.py' in workflow
+        assert 'github.event.repository.default_branch' in workflow
+        assert 'fetch-depth: 0' in workflow
 
     def test_collect_metrics_cli_returns_nonzero_for_invalid_output(self, tmp_path: Path) -> None:
         (tmp_path / 'results.jsonl').write_text('', encoding='utf-8')

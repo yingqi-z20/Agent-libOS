@@ -592,8 +592,10 @@ class TestPermissionPolicy:
         assert first_prompt[0].payload['type'] == 'external_operation_approval'
         assert first_prompt[0].status == HumanRequestStatus.APPROVED
         assert 'content sha256' in self.human_output[0]
-        assert 'content preview' in self.human_output[0]
-        assert 'one-time capability' in self.human_output[0]
+        assert 'content bytes' in self.human_output[0]
+        assert 'Host-bound canonical argument projection' in self.human_output[0]
+        assert repr('first') not in self.human_output[0]
+        assert 'one-time capability' not in self.human_output[0]
         assert retry.ok
         assert (self.runtime.workspace_root / path).read_text(encoding='utf-8') == 'first'
         assert self.runtime.process.get(pid).status == ProcessStatus.WAITING_HUMAN

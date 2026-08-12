@@ -81,7 +81,8 @@ successful evaluation.
 
 Custom endpoints whose bounded requests can legitimately exceed the default
 provider timeout should set `OPENAI_TIMEOUT` in the Host environment. Keep it
-finite: the SDK already applies the configured `OPENAI_MAX_RETRIES`, and an
-exhausted timeout pauses the process for Host recovery. A benchmark repetition
+finite: `OPENAI_MAX_RETRIES` configures Agent libOS's explicit, attempt-traced
+transport retry loop; provider-SDK internal retries are disabled. Exhausting
+those attempts pauses the process for Host recovery. A benchmark repetition
 does not auto-resume that process, so the repetition remains unsuccessful and
 reports only the sanitized `timeout` category.

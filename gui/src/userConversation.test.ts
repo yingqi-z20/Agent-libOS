@@ -91,6 +91,32 @@ describe("deriveUserConversation", () => {
     );
   });
 
+  it("never projects free-form external-operation text into the conversation", () => {
+    const value = snapshot();
+    value.human_requests.push({
+      request_id: "hreq_external",
+      pid: "pid_1",
+      human: "owner",
+      payload: {
+        type: "external_operation_approval",
+        question: "EXTERNAL_QUESTION_SECRET_SENTINEL",
+        reason: "EXTERNAL_REASON_SECRET_SENTINEL",
+        context: { command: "EXTERNAL_CONTEXT_SECRET_SENTINEL" }
+      },
+      status: "pending",
+      decision: null,
+      blocking: true,
+      revision: 2,
+      created_at: "2026-06-19T01:00:09.000Z",
+      updated_at: "2026-06-19T01:00:09.000Z"
+    });
+
+    const external = deriveUserConversation(value, "pid_1").find((item) => item.id === "request:hreq_external");
+
+    expect(external).toEqual(expect.objectContaining({ text: "External operation approval" }));
+    expect(external?.text).not.toContain("SECRET_SENTINEL");
+  });
+
   it("keeps completed human request decisions in the conversation", () => {
     const items = deriveUserConversation(snapshot(), "pid_1");
 
@@ -221,6 +247,7 @@ function snapshot(): RuntimeSnapshot {
         status: "delivered",
         decision: { delivered: true },
         blocking: false,
+        revision: 1,
         created_at: "2026-06-19T01:00:02.000Z",
         updated_at: "2026-06-19T01:00:03.000Z"
       },
@@ -232,6 +259,7 @@ function snapshot(): RuntimeSnapshot {
         status: "pending",
         decision: null,
         blocking: true,
+        revision: 0,
         created_at: "2026-06-19T01:00:04.000Z",
         updated_at: "2026-06-19T01:00:04.000Z"
       },
@@ -243,6 +271,7 @@ function snapshot(): RuntimeSnapshot {
         status: "approved",
         decision: { approved: true, source: "gui", answer: "Use vivado/dev" },
         blocking: true,
+        revision: 1,
         created_at: "2026-06-19T01:00:05.000Z",
         updated_at: "2026-06-19T01:00:06.000Z"
       },
@@ -254,6 +283,7 @@ function snapshot(): RuntimeSnapshot {
         status: "rejected",
         decision: { approved: false, source: "gui" },
         blocking: true,
+        revision: 1,
         created_at: "2026-06-19T01:00:07.000Z",
         updated_at: "2026-06-19T01:00:08.000Z"
       }

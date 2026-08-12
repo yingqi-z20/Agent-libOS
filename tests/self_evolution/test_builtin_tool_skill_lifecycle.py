@@ -391,7 +391,22 @@ def test_reopen_reproduces_old_builtin_snapshot_after_catalog_upgrade(
             },
         )
         assert activated.ok
-        assert activated.payload["result"]["package_sha256"] == upgraded.package_sha256
+        assert activated.payload["result"] == {
+            "skill_id": upgraded.skill_id,
+            "name": upgraded.name,
+            "version": upgraded.version,
+            "tool_names": sorted(
+                [*upgraded.allowed_tools, *[tool.name for tool in upgraded.jit_tools]]
+            ),
+        }
+        assert activated.result_handle is not None
+        stored_activation = reopened.store.get_object(activated.result_handle.oid)
+        assert stored_activation is not None
+        assert (
+            stored_activation.payload["result"]["result"]["package_sha256"]
+            == upgraded.package_sha256
+        )
+        assert stored_activation.payload["model_projection"] == activated.payload
         assert _loaded_context(reopened, pid)["instructions"] == upgraded.instructions
         rediscovered = reopened.tools.call(
             pid,

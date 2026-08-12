@@ -3,7 +3,19 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
-import type { SemanticAssessmentDetail, SemanticAssessmentSummary, SemanticStatus } from "../api/types";
+import type {
+  SemanticAssessmentDetail,
+  SemanticAssessmentSummary,
+  SemanticControlState,
+  SemanticFlowEntity,
+  SemanticFlowLineage,
+  SemanticFlowStatus,
+  SemanticHealthEvent,
+  SemanticMachineSettlement,
+  SemanticMetrics,
+  SemanticPolicyEpochSummary,
+  SemanticStatus
+} from "../api/types";
 import { I18nProvider } from "../i18n";
 import { mergeAssessments, SemanticPanel, type SemanticPanelClient } from "./SemanticPanel";
 
@@ -25,12 +37,27 @@ describe("SemanticPanel", () => {
     await act(flushPromises);
 
     expect(container.querySelector("[data-testid='semantic-panel']")).not.toBeNull();
-    expect(container.textContent).toContain("Read-only Shadow evidence for process pid_1");
+    expect(container.textContent).toContain("Read-only semantic evidence for process pid_1");
     expect(container.textContent).toContain("Semantic results never approve, reject, relabel, or release data");
     expect(container.textContent).toContain("Queued");
     expect(container.textContent).toContain("Would approve once");
     expect(container.textContent).toContain("Require human");
-    expect(container.textContent).toContain("N/A (Shadow)");
+    expect(container.textContent).toContain("33.33%");
+    expect(container.textContent).toContain("Data-flow lineage");
+    expect(container.textContent).toContain("Legacy v5 flow history");
+    expect(container.textContent).toContain("4 migrated assessment(s) have unknown lineage coverage");
+    expect(container.textContent).toContain("provider_result");
+    expect(container.textContent).toContain("Machine settlements");
+    expect(container.textContent).toContain("Issued grants reviewed");
+    expect(container.textContent).toContain("Issued-grant review coverage");
+    expect(container.textContent).toContain("100.00%");
+    expect(container.textContent).toContain("settlement_1");
+    expect(container.textContent).toContain("approved · human · request revision 1");
+    expect(container.textContent).toContain("c".repeat(64));
+    expect(container.textContent).toContain("Policy epochs");
+    expect(container.textContent).toContain("epoch_1");
+    expect(container.textContent).toContain("Safety health events");
+    expect(container.textContent).toContain("semantic_policy_activated");
     expect(container.textContent).toContain("OOD");
     const aggregateText = container.querySelector(".semanticAggregateGroups")?.textContent ?? "";
     expect(aggregateText).toContain("Success3");
@@ -59,6 +86,9 @@ describe("SemanticPanel", () => {
       "assessment_1",
       expect.objectContaining({ signal: expect.any(AbortSignal), timeoutMs: 15_000 })
     );
+    const buttonText = [...container.querySelectorAll("button")].map((button) => button.textContent ?? "").join(" ");
+    expect(buttonText).not.toMatch(/activate|rotate|revoke|trip|enable canary|disable canary/i);
+    expect(container.querySelector("input[type='checkbox']")).toBeNull();
 
     await act(() => root.unmount());
     container.remove();
@@ -124,19 +154,109 @@ describe("SemanticPanel", () => {
       ["assessment_2", "timeout"]
     ]);
   });
+
+  it("fails closed when independently read control snapshots disagree", async () => {
+    const client = semanticClient();
+    vi.mocked(client.getSemanticControl).mockResolvedValue({ ...control(), generation: 2 });
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(<I18nProvider initialLanguage="en"><SemanticPanel client={client} /></I18nProvider>);
+      await flushPromises();
+    });
+    await act(flushPromises);
+
+    expect(container.textContent).toContain("evidence snapshots changed during the read");
+    expect(container.querySelector(".semanticEvidenceDashboard")).toBeNull();
+
+    await act(() => root.unmount());
+    container.remove();
+  });
+
+  it("fails closed when independently read unfiltered canary metrics disagree", async () => {
+    const client = semanticClient();
+    vi.mocked(client.getSemanticMetrics).mockResolvedValue({
+      ...metrics(),
+      machine: { ...metrics().machine, denied: metrics().machine.denied + 1 }
+    });
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(<I18nProvider initialLanguage="en"><SemanticPanel client={client} /></I18nProvider>);
+      await flushPromises();
+    });
+    await act(flushPromises);
+
+    expect(container.textContent).toContain("evidence snapshots changed during the read");
+    expect(container.querySelector(".semanticEvidenceDashboard")).toBeNull();
+
+    await act(() => root.unmount());
+    container.remove();
+  });
+
+  it("fails closed when independently read Flow status snapshots disagree", async () => {
+    const client = semanticClient();
+    vi.mocked(client.getSemanticFlowStatus).mockResolvedValue({
+      ...flowStatus(),
+      counts: { ...flowStatus().counts, edges: flowStatus().counts.edges + 1 }
+    });
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(<I18nProvider initialLanguage="en"><SemanticPanel client={client} /></I18nProvider>);
+      await flushPromises();
+    });
+    await act(flushPromises);
+
+    expect(container.textContent).toContain("evidence snapshots changed during the read");
+    expect(container.querySelector(".semanticEvidenceDashboard")).toBeNull();
+
+    await act(() => root.unmount());
+    container.remove();
+  });
+
+  it("marks bounded evidence windows when a ledger has more records", async () => {
+    const client = semanticClient();
+    vi.mocked(client.listSemanticFlowEntities).mockResolvedValue({
+      schema_version: 1,
+      items: [flowEntity()],
+      next_cursor: "entity_cursor"
+    });
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(<I18nProvider initialLanguage="en"><SemanticPanel client={client} /></I18nProvider>);
+      await flushPromises();
+    });
+    await act(flushPromises);
+
+    expect(container.textContent).toContain("Showing the first 50 records");
+
+    await act(() => root.unmount());
+    container.remove();
+  });
 });
 
 function semanticClient(): SemanticPanelClient {
   return {
     getSemanticStatus: vi.fn(async () => status()),
     listSemanticAssessments: vi.fn(async () => ({ schema_version: 1 as const, items: [summary()], next_cursor: null })),
-    getSemanticAssessment: vi.fn(async () => detail())
+    getSemanticAssessment: vi.fn(async () => detail()),
+    getSemanticFlowStatus: vi.fn(async () => flowStatus()),
+    listSemanticFlowEntities: vi.fn(async () => ({ schema_version: 1 as const, items: [flowEntity()], next_cursor: null })),
+    getSemanticFlowLineage: vi.fn(async () => lineage()),
+    listSemanticSettlements: vi.fn(async () => ({ schema_version: 1 as const, items: [settlement()], next_cursor: null })),
+    listSemanticPolicyEpochs: vi.fn(async () => ({ schema_version: 1 as const, items: [epoch()], next_cursor: null })),
+    getSemanticControl: vi.fn(async () => control()),
+    listSemanticControlHistory: vi.fn(async () => ({ schema_version: 1 as const, items: [control()], next_cursor: null })),
+    listSemanticHealthEvents: vi.fn(async () => ({ schema_version: 1 as const, items: [healthEvent()], next_cursor: null })),
+    getSemanticMetrics: vi.fn(async () => metrics())
   };
 }
 
 function status(): SemanticStatus {
   return {
-    schema_version: 2,
+    schema_version: 3,
     mode: "shadow",
     adapter: "external",
     profile_id: "semantic-classifier",
@@ -171,7 +291,36 @@ function status(): SemanticStatus {
         unknown: 1
       }
     },
-    actual_auto_approval: { numerator: 0, denominator: 0, rate: null }
+    control: {
+      catalog_version: null,
+      active_epoch_id: null,
+      active_epoch_sha256: null,
+      generation: 1,
+      state: "inactive",
+      trip_reason_code: null
+    },
+    flow: flowStatus(),
+    machine: {
+      eligible: 3,
+      issued: 1,
+      consumed: 1,
+      succeeded: 1,
+      failed: 0,
+      unknown: 0,
+      expired: 0,
+      revoked: 0,
+      race_lost: 1,
+      denied: 1
+    },
+    actual_auto_approval: { numerator: 1, denominator: 3, rate: 1 / 3 },
+    review_metrics: {
+      reviewed: 1,
+      safe: 1,
+      unsafe: 0,
+      unsafe_rate: 0,
+      issued_reviewed: 1,
+      issued_review_rate: 1
+    }
   };
 }
 
@@ -245,6 +394,174 @@ function detail(): SemanticAssessmentDetail {
     args_sha256: "0".repeat(64),
     state_sha256: "a".repeat(64),
     projection_sha256: "b".repeat(64)
+  };
+}
+
+function flowStatus(): SemanticFlowStatus {
+  return {
+    schema_version: 1,
+    available: true,
+    counts: { entities: 1, activities: 1, edges: 1, label_assertions: 1 },
+    coverage: { complete: 1, partial: 0, unknown: 0, conflict: 0, stale: 0 },
+    capture_failures: 0,
+    legacy_history: {
+      present: true,
+      source_schema_version: 5,
+      assessment_count: 4,
+      coverage: "unknown",
+      evidence_sha256: "d".repeat(64),
+      created_at: "2030-01-01T00:00:00Z"
+    }
+  };
+}
+
+function flowEntity(): SemanticFlowEntity {
+  return {
+    schema_version: 1,
+    entity_id: "entity_1",
+    kind: "provider_result",
+    pid: "pid_1",
+    tenant_bucket_sha256: "1".repeat(64),
+    content_sha256: "2".repeat(64),
+    version_sha256: "3".repeat(64),
+    provenance_sha256: "4".repeat(64),
+    baseline_labels: { sensitivity: "normal", trust_level: "trusted", integrity: "verified" },
+    coverage: "complete",
+    identity_present: true,
+    identity_mixed: false,
+    created_at: "2030-01-01T00:00:00Z"
+  };
+}
+
+function lineage(): SemanticFlowLineage {
+  return {
+    schema_version: 1,
+    root_node_id: "entity_1",
+    direction: "upstream",
+    items: [{
+      depth: 1,
+      edge: {
+        schema_version: 1,
+        edge_id: "edge_1",
+        relation: "direct",
+        source_node_id: "activity_1",
+        source_node_type: "activity",
+        target_node_id: "entity_1",
+        target_node_type: "entity",
+        pid: "pid_1",
+        provenance_sha256: "5".repeat(64),
+        created_at: "2030-01-01T00:00:00Z"
+      },
+      node_type: "activity",
+      node: {
+        schema_version: 1,
+        activity_id: "activity_1",
+        kind: "provider_call",
+        pid: "pid_1",
+        action_id: "filesystem.read",
+        effect_id: "effect_1",
+        state_sha256: "6".repeat(64),
+        provider_spec_sha256: "7".repeat(64),
+        tool_schema_sha256: "8".repeat(64),
+        model_artifact_sha256: null,
+        tenant_bucket_sha256: "1".repeat(64),
+        created_at: "2030-01-01T00:00:00Z"
+      }
+    }],
+    effective_labels: { sensitivity: "normal", trust_level: "trusted", integrity: "verified" },
+    coverage: "complete",
+    next_cursor: null,
+    truncated: false
+  };
+}
+
+function settlement(): SemanticMachineSettlement {
+  return {
+    schema_version: 1,
+    settlement_id: "settlement_1",
+    assessment_id: "assessment_1",
+    job_id: "job_1",
+    request_id: "request_1",
+    request_revision: 0,
+    pid: "pid_1",
+    operation_id: "operation_1",
+    effect_id: "effect_1",
+    epoch_id: "epoch_1",
+    policy_sha256: "9".repeat(64),
+    tenant_bucket_sha256: "1".repeat(64),
+    action_id: "filesystem.read",
+    outcome: "issued",
+    capability_id: "cap_1",
+    binding_sha256: "a".repeat(64),
+    decision_sha256: "b".repeat(64),
+    matched_rule_id: "rule_1",
+    reason_codes: ["policy_match"],
+    created_at: "2030-01-01T00:00:01Z",
+    human_outcome: "approved",
+    human_outcome_source: "human",
+    human_outcome_request_revision: 1,
+    human_outcome_decision_sha256: "c".repeat(64),
+    human_outcome_created_at: "2030-01-01T00:00:02Z"
+  };
+}
+
+function epoch(): SemanticPolicyEpochSummary {
+  return {
+    schema_version: 1,
+    epoch_id: "epoch_1",
+    generation: 1,
+    catalog_version: 1,
+    policy_sha256: "9".repeat(64),
+    expected_previous_sha256: null,
+    created_at: "2030-01-01T00:00:00Z"
+  };
+}
+
+function control(): SemanticControlState {
+  return {
+    schema_version: 1,
+    revision: 1,
+    generation: 1,
+    mode: "shadow",
+    active_epoch_id: null,
+    active_policy_sha256: null,
+    tripped: false,
+    trip_code: null,
+    updated_at: "2030-01-01T00:00:00Z"
+  };
+}
+
+function healthEvent(): SemanticHealthEvent {
+  return {
+    schema_version: 1,
+    event_id: "health_1",
+    event_kind: "semantic_policy_activated",
+    severity: "info",
+    epoch_id: "epoch_1",
+    tenant_bucket_sha256: "1".repeat(64),
+    evidence_sha256: "c".repeat(64),
+    created_at: "2030-01-01T00:00:00Z"
+  };
+}
+
+function metrics(): SemanticMetrics {
+  return {
+    schema_version: 1,
+    window: null,
+    action_id: null,
+    tenant_bucket_sha256: null,
+    epoch_id: null,
+    risk: null,
+    machine: status().machine,
+    actual_auto_approval: status().actual_auto_approval,
+    review_metrics: {
+      reviewed: 1,
+      safe: 1,
+      unsafe: 0,
+      unsafe_rate: 0,
+      issued_reviewed: 1,
+      issued_review_rate: 1
+    }
   };
 }
 

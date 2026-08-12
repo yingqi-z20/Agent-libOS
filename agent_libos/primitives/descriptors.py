@@ -221,6 +221,20 @@ PROTECTED_OPERATION_DESCRIPTORS = (
         classifier_failure_label="post_list_tools_failure",
     ),
     operation(
+        "primitive.mcp.probe_candidate.internal",
+        "mcp",
+        "probe_candidate",
+        resource_policy=ResourcePolicy.OPTIONAL,
+        authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+        information_flow=True,
+        data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+        internal_reason=(
+            "explicit reviewed Host onboarding probe of an unregistered MCP "
+            "transport; it creates evidence but never registry authority"
+        ),
+        require_classifier=False,
+    ),
+    operation(
         "primitive.mcp.call",
         "mcp",
         "call_tool",
@@ -232,6 +246,269 @@ PROTECTED_OPERATION_DESCRIPTORS = (
         classifier_failure_rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
         classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
         classifier_failure_label="post_call_failure",
+    ),
+    *tuple(
+        operation(
+            f"primitive.mcp.{name}",
+            "mcp",
+            name,
+            resource_policy=ResourcePolicy.REQUIRED,
+            state_mutation=name
+            in {
+                "continuation.respond",
+                "continuation.cancel",
+                "tasks.update",
+                "tasks.cancel",
+            },
+            information_flow=True,
+            data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+            classifier_failure_rollback_class=(
+                ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+                if name == "tasks.get"
+                else ExternalEffectRollbackClass.IRREVERSIBLE
+            ),
+            classifier_failure_rollback_status=(
+                ExternalEffectRollbackStatus.NOT_REQUIRED
+                if name == "tasks.get"
+                else ExternalEffectRollbackStatus.NOT_SUPPORTED
+            ),
+            classifier_failure_label=f"post_{name.replace('.', '_')}_failure",
+            require_classifier=False,
+        )
+        for name in (
+            "continuation.respond",
+            "continuation.cancel",
+            "tasks.get",
+            "tasks.update",
+            "tasks.cancel",
+        )
+    ),
+    *tuple(
+        operation(
+            f"primitive.mcp.{name}.internal",
+            "mcp",
+            name,
+            resource_policy=ResourcePolicy.OPTIONAL,
+            authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+            state_mutation=name
+            in {
+                "continuation.respond",
+                "continuation.cancel",
+                "tasks.update",
+                "tasks.cancel",
+            },
+            information_flow=True,
+            data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+            internal_reason=(
+                "Host continuation and Task actions revalidate the durable "
+                "owner, registry, authorization, Human, and provider fences"
+            ),
+            classifier_failure_rollback_class=(
+                ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+                if name == "tasks.get"
+                else ExternalEffectRollbackClass.IRREVERSIBLE
+            ),
+            classifier_failure_rollback_status=(
+                ExternalEffectRollbackStatus.NOT_REQUIRED
+                if name == "tasks.get"
+                else ExternalEffectRollbackStatus.NOT_SUPPORTED
+            ),
+            classifier_failure_label=f"post_{name.replace('.', '_')}_failure",
+            require_classifier=False,
+        )
+        for name in (
+            "continuation.respond",
+            "continuation.cancel",
+            "tasks.get",
+            "tasks.update",
+            "tasks.cancel",
+        )
+    ),
+    *tuple(
+        operation(
+            f"primitive.mcp.{name}",
+            "mcp",
+            name,
+            resource_policy=ResourcePolicy.OPTIONAL,
+            information_flow=True,
+            data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+            require_classifier=False,
+        )
+        for name in (
+            "resources.list",
+            "resource_templates.list",
+            "resources.read",
+            "prompts.list",
+            "prompts.get",
+            "completion.complete",
+        )
+    ),
+    *tuple(
+        operation(
+            f"primitive.mcp.{name}.internal",
+            "mcp",
+            name,
+            resource_policy=ResourcePolicy.OPTIONAL,
+            authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+            information_flow=True,
+            data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+            internal_reason=(
+                "explicit local Host MCP v3 client operation through the same "
+                "transport, data-flow, registry, effect, and evidence boundary"
+            ),
+            require_classifier=False,
+        )
+        for name in (
+            "resources.list",
+            "resource_templates.list",
+            "resources.read",
+            "prompts.list",
+            "prompts.get",
+            "completion.complete",
+        )
+    ),
+    *tuple(
+        operation(
+            f"primitive.mcp.{name}",
+            "mcp",
+            name,
+            resource_policy=ResourcePolicy.OPTIONAL,
+            information_flow=True,
+            data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+            require_classifier=False,
+        )
+        for name in (
+            "subscriptions.status",
+            "subscriptions.events",
+        )
+    ),
+    operation(
+        "primitive.mcp.subscriptions.start",
+        "mcp",
+        "subscriptions.start",
+        resource_policy=ResourcePolicy.OPTIONAL,
+        state_mutation=True,
+        information_flow=True,
+        data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+        classifier_failure_rollback_class=ExternalEffectRollbackClass.ROLLBACKABLE,
+        classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_APPLIED,
+        classifier_failure_label="post_subscription_start_failure",
+        require_classifier=False,
+    ),
+    operation(
+        "primitive.mcp.subscriptions.stop",
+        "mcp",
+        "subscriptions.stop",
+        resource_policy=ResourcePolicy.OPTIONAL,
+        state_mutation=True,
+        information_flow=True,
+        data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+        classifier_failure_rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+        classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+        classifier_failure_label="post_subscription_stop_failure",
+        require_classifier=False,
+    ),
+    *tuple(
+        operation(
+            f"primitive.mcp.{name}.internal",
+            "mcp",
+            name,
+            resource_policy=ResourcePolicy.OPTIONAL,
+            authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+            state_mutation=name in {"subscriptions.start", "subscriptions.stop"},
+            information_flow=True,
+            data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+            classifier_failure_rollback_class=(
+                ExternalEffectRollbackClass.ROLLBACKABLE
+                if name == "subscriptions.start"
+                else (
+                    ExternalEffectRollbackClass.IRREVERSIBLE
+                    if name == "subscriptions.stop"
+                    else ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+                )
+            ),
+            classifier_failure_rollback_status=(
+                ExternalEffectRollbackStatus.NOT_APPLIED
+                if name == "subscriptions.start"
+                else (
+                    ExternalEffectRollbackStatus.NOT_SUPPORTED
+                    if name == "subscriptions.stop"
+                    else ExternalEffectRollbackStatus.NOT_REQUIRED
+                )
+            ),
+            classifier_failure_label=f"post_{name.replace('.', '_')}_failure",
+            internal_reason=(
+                "explicit local Host MCP subscription lifecycle operation through "
+                "the same registry, transport, data-flow, effect, and evidence boundary"
+            ),
+            require_classifier=False,
+        )
+        for name in (
+            "subscriptions.start",
+            "subscriptions.status",
+            "subscriptions.events",
+            "subscriptions.stop",
+        )
+    ),
+    operation(
+        "primitive.mcp.auth.begin.internal",
+        "mcp",
+        "auth.begin",
+        resource_policy=ResourcePolicy.OPTIONAL,
+        authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+        information_flow=True,
+        data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+        internal_reason=(
+            "OAuth browser authorization is an explicit Host-only MCP operation"
+        ),
+        require_classifier=False,
+    ),
+    operation(
+        "primitive.mcp.auth.challenge.internal",
+        "mcp",
+        "auth.challenge",
+        resource_policy=ResourcePolicy.OPTIONAL,
+        authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+        information_flow=True,
+        data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+        internal_reason=(
+            "OAuth scope step-up is an explicit Host-only MCP operation"
+        ),
+        require_classifier=False,
+    ),
+    operation(
+        "primitive.mcp.auth.complete.internal",
+        "mcp",
+        "auth.complete",
+        resource_policy=ResourcePolicy.OPTIONAL,
+        authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+        state_mutation=True,
+        information_flow=True,
+        data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+        classifier_failure_rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+        classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+        classifier_failure_label="post_oauth_token_exchange_failure",
+        internal_reason=(
+            "OAuth code exchange is explicit Host-only and never automatically replayed"
+        ),
+        require_classifier=False,
+    ),
+    operation(
+        "primitive.mcp.auth.revoke.internal",
+        "mcp",
+        "auth.revoke",
+        resource_policy=ResourcePolicy.OPTIONAL,
+        authority_mode=AuthorityMode.RUNTIME_INTERNAL,
+        state_mutation=True,
+        information_flow=True,
+        data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
+        classifier_failure_rollback_class=ExternalEffectRollbackClass.IRREVERSIBLE,
+        classifier_failure_rollback_status=ExternalEffectRollbackStatus.NOT_SUPPORTED,
+        classifier_failure_label="post_oauth_revocation_failure",
+        internal_reason=(
+            "OAuth revocation is explicit Host-only and never automatically replayed"
+        ),
+        require_classifier=False,
     ),
 )
 

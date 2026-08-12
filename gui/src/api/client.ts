@@ -1,5 +1,78 @@
-import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LlmCallDetail, LlmCallPage, LlmTraceContentChunk, LlmTraceContentField, LLMProfileInput, LLMProfileSummary, McpCallResult, McpDiscoveryResult, McpServerSummary, McpToolListResult, ModuleSummary, ObjectTask, OperationListResponse, RuntimeSnapshot, SemanticAssessmentDetail, SemanticAssessmentDomain, SemanticAssessmentKind, SemanticAssessmentPage, SemanticAssessmentStatus, SemanticStatus, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunSpecV1, TaskRunSummary } from "./types";
-import { assertLlmCallDetail, assertLlmCallPage, assertLlmTraceContentChunk, assertMcpCallResult, assertMcpDiscoveryResult, assertMcpServerSummary, assertMcpToolListResult, assertRuntimeSnapshot, assertSchedulerStatus, assertSemanticAssessmentDetailResponse, assertSemanticAssessmentPage, assertSemanticStatus, assertTaskRunDetail, assertTaskRunSummary } from "./types";
+import type { AgentRating, AuditRecord, CapabilityDelegationInput, CapabilityMutationInput, CapabilitySummary, CheckpointDiffResult, CheckpointInspectResult, CheckpointSummary, ExplainOperationResponse, GuiConnection, HumanRequest, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, JsonRpcEndpointSummary, LlmCallDetail, LlmCallPage, LlmTraceContentChunk, LlmTraceContentField, LLMProfileInput, LLMProfileSummary, McpCallResult, McpDiscoveryResult, McpServerSummary, McpToolListResult, McpUnregisterResult, ModuleSummary, ObjectTask, OperationListResponse, RuntimeSnapshot, SemanticAssessmentDetail, SemanticAssessmentDomain, SemanticAssessmentKind, SemanticAssessmentPage, SemanticAssessmentStatus, SemanticStatus, SseMessage, StreamConnectionStatus, TaskRunDetail, TaskRunHumanRequestPage, TaskRunLedgerPage, TaskRunSpecV1, TaskRunSummary } from "./types";
+import type {
+  McpAuthorizationChallenge,
+  McpCompletionResult,
+  McpHumanReceipt,
+  McpInputRequired,
+  McpOAuthProfileInput,
+  McpOAuthStatus,
+  McpOperationResult,
+  McpPage,
+  McpPrompt,
+  McpPromptResult,
+  McpRemoteTask,
+  McpResource,
+  McpResourceContents,
+  McpResourceTemplate,
+  McpSubscription,
+  McpSubscriptionEvent,
+  SemanticControlHistoryPage,
+  SemanticControlState,
+  SemanticFlowDirection,
+  SemanticFlowEdgePage,
+  SemanticFlowEntityPage,
+  SemanticFlowLineage,
+  SemanticFlowStatus,
+  SemanticHealthEventPage,
+  SemanticMachineSettlementPage,
+  SemanticMetrics,
+  SemanticPolicyEpochPage,
+  SemanticRisk,
+  SemanticSettlementOutcome
+} from "./types";
+import {
+  assertHumanRequest,
+  assertLlmCallDetail,
+  assertLlmCallPage,
+  assertLlmTraceContentChunk,
+  assertMcpCallResult,
+  assertMcpAuthorizationChallenge,
+  assertMcpCompletionOperationResult,
+  assertMcpContinuationResult,
+  assertMcpDiscoveryResult,
+  assertMcpInputRequired,
+  assertMcpOAuthProfileInput,
+  assertMcpOAuthStatus,
+  assertMcpOAuthStatuses,
+  assertMcpPromptOperationResult,
+  assertMcpPromptPage,
+  assertMcpRemoteTask,
+  assertMcpResourceOperationResult,
+  assertMcpResourcePage,
+  assertMcpResourceTemplatePage,
+  assertMcpServerSummary,
+  assertMcpSubscription,
+  assertMcpSubscriptionEvents,
+  assertMcpToolListResult,
+  assertMcpUnregisterResult,
+  assertRuntimeSnapshot,
+  assertSchedulerStatus,
+  assertSemanticAssessmentDetailResponse,
+  assertSemanticAssessmentPage,
+  assertSemanticControlHistoryPage,
+  assertSemanticControlState,
+  assertSemanticFlowEdgePage,
+  assertSemanticFlowEntityPage,
+  assertSemanticFlowLineage,
+  assertSemanticFlowStatus,
+  assertSemanticHealthEventPage,
+  assertSemanticMachineSettlementPage,
+  assertSemanticMetrics,
+  assertSemanticPolicyEpochPage,
+  assertSemanticStatus,
+  assertTaskRunDetail,
+  assertTaskRunSummary
+} from "./types";
 import type { OptionalQuanta } from "../quanta";
 
 type JsonBody = Record<string, unknown>;
@@ -16,6 +89,10 @@ const semanticStatuses = new Set([
   "provider_outcome_unknown", "invalid_schema", "ood", "abstained", "stale_input"
 ]);
 const semanticDomains = new Set(["filesystem", "shell", "git", "jsonrpc", "mcp", "runtime", "unknown"]);
+const semanticFlowDirections = new Set(["upstream", "downstream"]);
+const semanticSettlementOutcomes = new Set([
+  "issued", "denied", "require_human", "race_lost", "stale", "budget_exhausted", "revoked", "expired", "failed"
+]);
 
 export type CapabilityPageResponse = {
   items: CapabilitySummary[];
@@ -32,6 +109,22 @@ export type SemanticAssessmentFilters = {
   domain?: SemanticAssessmentDomain;
   actionId?: string;
   tenantBucketSha256?: string;
+};
+
+export type SemanticEvidenceFilters = {
+  pid?: string;
+  actionId?: string;
+  tenantBucketSha256?: string;
+  epochId?: string;
+};
+
+export type SemanticSettlementFilters = SemanticEvidenceFilters & {
+  outcome?: SemanticSettlementOutcome;
+};
+
+export type SemanticMetricsFilters = Pick<SemanticEvidenceFilters, "actionId" | "tenantBucketSha256" | "epochId"> & {
+  window?: string;
+  risk?: SemanticRisk;
 };
 
 export class LibOSClient {
@@ -305,6 +398,144 @@ export class LibOSClient {
     return value.assessment;
   }
 
+  async getSemanticFlowStatus(options: RequestOptions = {}): Promise<SemanticFlowStatus> {
+    const value = await this.request<unknown>("GET", "/api/semantic/flow/status", undefined, options);
+    assertSemanticFlowStatus(value);
+    return value;
+  }
+
+  async listSemanticFlowEntities(
+    filters: Pick<SemanticEvidenceFilters, "pid" | "tenantBucketSha256"> = {},
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticFlowEntityPage> {
+    const query = semanticEvidenceQuery(filters, limit, after);
+    const value = await this.request<unknown>("GET", `/api/semantic/flow/entities?${query.toString()}`, undefined, options);
+    assertSemanticFlowEntityPage(value);
+    if (filters.pid && value.items.some((item) => item.pid !== filters.pid)) {
+      throw new Error("GUI Semantic flow entity page contains an entity from another process.");
+    }
+    return value;
+  }
+
+  async listSemanticFlowEdges(
+    filters: Pick<SemanticEvidenceFilters, "pid"> = {},
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticFlowEdgePage> {
+    const query = semanticEvidenceQuery(filters, limit, after);
+    const value = await this.request<unknown>("GET", `/api/semantic/flow/edges?${query.toString()}`, undefined, options);
+    assertSemanticFlowEdgePage(value);
+    if (filters.pid && value.items.some((item) => item.pid !== filters.pid)) {
+      throw new Error("GUI Semantic flow edge page contains an edge from another process.");
+    }
+    return value;
+  }
+
+  async getSemanticFlowLineage(
+    nodeId: string,
+    direction: SemanticFlowDirection,
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticFlowLineage> {
+    const selectedNodeId = semanticQueryIdentifier(nodeId, "node_id");
+    const selectedDirection = semanticQueryEnum(direction, "direction", semanticFlowDirections) as SemanticFlowDirection;
+    const query = semanticPageQuery(limit, after);
+    query.set("direction", selectedDirection);
+    const value = await this.request<unknown>(
+      "GET",
+      `/api/semantic/flow/lineage/${encodeURIComponent(selectedNodeId)}?${query.toString()}`,
+      undefined,
+      options
+    );
+    assertSemanticFlowLineage(value);
+    if (value.root_node_id !== selectedNodeId || value.direction !== selectedDirection) {
+      throw new Error("GUI Semantic flow lineage identity does not match the request.");
+    }
+    return value;
+  }
+
+  async listSemanticSettlements(
+    filters: SemanticSettlementFilters = {},
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticMachineSettlementPage> {
+    const query = semanticEvidenceQuery(filters, limit, after);
+    const outcome = semanticQueryEnum(filters.outcome, "outcome", semanticSettlementOutcomes);
+    if (outcome !== undefined) query.set("outcome", outcome);
+    const value = await this.request<unknown>("GET", `/api/semantic/settlements?${query.toString()}`, undefined, options);
+    assertSemanticMachineSettlementPage(value);
+    if (filters.pid && value.items.some((item) => item.pid !== filters.pid)) {
+      throw new Error("GUI Semantic settlement page contains a settlement from another process.");
+    }
+    return value;
+  }
+
+  async listSemanticPolicyEpochs(
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticPolicyEpochPage> {
+    const query = semanticPageQuery(limit, after);
+    const value = await this.request<unknown>("GET", `/api/semantic/policy/epochs?${query.toString()}`, undefined, options);
+    assertSemanticPolicyEpochPage(value);
+    return value;
+  }
+
+  async getSemanticControl(options: RequestOptions = {}): Promise<SemanticControlState> {
+    const value = await this.request<unknown>("GET", "/api/semantic/control", undefined, options);
+    assertSemanticControlState(value);
+    return value;
+  }
+
+  async listSemanticControlHistory(
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticControlHistoryPage> {
+    const query = semanticPageQuery(limit, after);
+    const value = await this.request<unknown>("GET", `/api/semantic/control/history?${query.toString()}`, undefined, options);
+    assertSemanticControlHistoryPage(value);
+    return value;
+  }
+
+  async listSemanticHealthEvents(
+    limit = 50,
+    after?: string,
+    options: RequestOptions = {}
+  ): Promise<SemanticHealthEventPage> {
+    const query = semanticPageQuery(limit, after);
+    const value = await this.request<unknown>("GET", `/api/semantic/health?${query.toString()}`, undefined, options);
+    assertSemanticHealthEventPage(value);
+    return value;
+  }
+
+  async getSemanticMetrics(
+    filters: SemanticMetricsFilters = {},
+    options: RequestOptions = {}
+  ): Promise<SemanticMetrics> {
+    const query = semanticEvidenceQuery(filters, 50, undefined, false);
+    const risk = semanticQueryEnum(filters.risk, "risk", new Set(["low", "medium", "high", "critical"]));
+    if (risk !== undefined) query.set("risk", risk);
+    const window = semanticQueryText(filters.window, "window", 128);
+    if (window !== undefined) query.set("window", window);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const value = await this.request<unknown>("GET", `/api/semantic/metrics${suffix}`, undefined, options);
+    assertSemanticMetrics(value);
+    if ((filters.actionId && value.action_id !== filters.actionId)
+        || (filters.tenantBucketSha256 && value.tenant_bucket_sha256 !== filters.tenantBucketSha256)
+        || (filters.epochId && value.epoch_id !== filters.epochId)
+        || (filters.risk && value.risk !== filters.risk)
+        || (filters.window && value.window !== filters.window)) {
+      throw new Error("GUI Semantic metrics identity does not match the request.");
+    }
+    return value;
+  }
+
   async listProcessLlmCalls(pid: string, limit = 50, cursor?: string, options: RequestOptions = {}): Promise<LlmCallPage> {
     const query = new URLSearchParams({ limit: String(limit) });
     if (cursor) query.set("cursor", cursor);
@@ -564,13 +795,25 @@ export class LibOSClient {
     return value;
   }
 
-  async listMcpTools(serverId: string, refresh = false): Promise<McpToolListResult> {
+  async listMcpTools(serverId: string, refresh = false, actor?: string): Promise<McpToolListResult> {
     const value = await this.request<unknown>(
-      "GET",
-      `/api/mcp/${encodeURIComponent(serverId)}/tools${refresh ? "?refresh=true" : ""}`
+      refresh ? "POST" : "GET",
+      `/api/mcp/${encodeURIComponent(serverId)}/tools${refresh ? "/refresh" : ""}`,
+      refresh ? { ...(actor ? { actor } : {}) } : undefined,
+      refresh ? { timeoutMs: defaultReadRequestTimeoutMs } : {}
     );
     assertMcpToolListResult(value);
     if (value.server_id !== serverId) throw new Error("GUI MCP tool list identity does not match the requested server id.");
+    return value;
+  }
+
+  async unregisterMcpServer(serverId: string, confirmed: boolean, actor?: string): Promise<McpUnregisterResult> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/unregister`, {
+      confirmed,
+      ...(actor ? { actor } : {})
+    });
+    assertMcpUnregisterResult(value);
+    if (value.server_id !== serverId) throw new Error("GUI MCP unregister identity does not match the requested server id.");
     return value;
   }
 
@@ -605,6 +848,276 @@ export class LibOSClient {
     if (value.server_id !== serverId || value.tool_id !== toolId) {
       throw new Error("GUI MCP call identity does not match the requested tool.");
     }
+    return value;
+  }
+
+  async listMcpResources(serverId: string, cursor?: string | null): Promise<McpPage<McpResource>> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/resources/list`, {
+      ...(cursor ? { cursor } : {})
+    });
+    assertMcpResourcePage(value);
+    return value;
+  }
+
+  async listMcpResourceTemplates(serverId: string, cursor?: string | null): Promise<McpPage<McpResourceTemplate>> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/resource-templates/list`, {
+      ...(cursor ? { cursor } : {})
+    });
+    assertMcpResourceTemplatePage(value);
+    return value;
+  }
+
+  async readMcpResource(
+    serverId: string,
+    resourceId: string,
+    variables?: Record<string, string> | null
+  ): Promise<McpOperationResult<McpResourceContents>> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/resources/read`, {
+      resource_id: resourceId,
+      ...(variables ? { variables } : {})
+    });
+    assertMcpResourceOperationResult(value);
+    return value;
+  }
+
+  async listMcpPrompts(serverId: string, cursor?: string | null): Promise<McpPage<McpPrompt>> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/prompts/list`, {
+      ...(cursor ? { cursor } : {})
+    });
+    assertMcpPromptPage(value);
+    return value;
+  }
+
+  async getMcpPrompt(
+    serverId: string,
+    promptId: string,
+    args: Record<string, string> | null,
+    confirmed = false,
+    expectedPreviewSha256?: string
+  ): Promise<McpOperationResult<McpPromptResult>> {
+    if (confirmed && !expectedPreviewSha256) {
+      throw new Error("GUI MCP prompt confirmation requires its exact preview digest.");
+    }
+    if (!confirmed && expectedPreviewSha256) {
+      throw new Error("GUI MCP prompt preview must not include a confirmation digest.");
+    }
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/prompts/get`, {
+      prompt_id: promptId,
+      ...(args ? { arguments: args } : {}),
+      confirmed,
+      ...(expectedPreviewSha256 ? { expected_preview_sha256: expectedPreviewSha256 } : {})
+    });
+    assertMcpPromptOperationResult(value);
+    return value;
+  }
+
+  async completeMcpPrompt(
+    serverId: string,
+    referenceType: "prompt" | "resource_template",
+    referenceId: string,
+    argument: Record<string, string>,
+    context?: Record<string, string> | null
+  ): Promise<McpOperationResult<McpCompletionResult>> {
+    if (referenceType !== "prompt" && referenceType !== "resource_template") {
+      throw new Error("GUI MCP completion reference type is unsupported.");
+    }
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/completion`, {
+      reference_type: referenceType,
+      reference_id: referenceId,
+      argument,
+      ...(context ? { context } : {})
+    });
+    assertMcpCompletionOperationResult(value);
+    return value;
+  }
+
+  async getMcpOAuthStatus(profileId: string): Promise<McpOAuthStatus> {
+    const value = await this.request<unknown>("GET", `/api/mcp/auth/${encodeURIComponent(profileId)}/status`);
+    assertMcpOAuthStatus(value);
+    if (value.profile_id !== profileId) throw new Error("GUI MCP OAuth profile identity is malformed.");
+    return value;
+  }
+
+  async listMcpOAuthProfiles(): Promise<McpOAuthStatus[]> {
+    const value = await this.request<unknown>("GET", "/api/mcp/auth/profiles");
+    assertMcpOAuthStatuses(value);
+    return value;
+  }
+
+  async configureMcpOAuthProfile(
+    profile: McpOAuthProfileInput,
+    clientSecret: string | null,
+    replace: boolean,
+    confirmed: boolean
+  ): Promise<McpOAuthStatus> {
+    assertMcpOAuthProfileInput(profile);
+    const value = await this.request<unknown>("POST", "/api/mcp/auth/profiles", {
+      profile,
+      ...(clientSecret === null ? {} : { client_secret: clientSecret }),
+      replace,
+      confirmed
+    });
+    assertMcpOAuthStatus(value);
+    if (value.profile_id !== profile.profile_id) {
+      throw new Error("GUI MCP OAuth profile identity is malformed.");
+    }
+    return value;
+  }
+
+  async removeMcpOAuthProfile(
+    profileId: string,
+    confirmed: boolean
+  ): Promise<McpOAuthStatus> {
+    const value = await this.request<unknown>(
+      "POST",
+      `/api/mcp/auth/profiles/${encodeURIComponent(profileId)}/remove`,
+      { confirmed }
+    );
+    assertMcpOAuthStatus(value);
+    if (value.profile_id !== profileId) {
+      throw new Error("GUI MCP OAuth profile identity is malformed.");
+    }
+    return value;
+  }
+
+  async beginMcpOAuth(profileId: string, scopes: string[], confirmed: boolean): Promise<McpAuthorizationChallenge> {
+    const value = await this.request<unknown>("POST", `/api/mcp/auth/${encodeURIComponent(profileId)}/login`, {
+      scopes,
+      confirmed
+    });
+    assertMcpAuthorizationChallenge(value);
+    return value;
+  }
+
+  async completeMcpOAuth(challengeId: string, callbackUrl: string): Promise<McpOAuthStatus> {
+    const value = await this.request<unknown>("POST", `/api/mcp/auth/challenges/${encodeURIComponent(challengeId)}/callback`, {
+      callback_url: callbackUrl
+    });
+    assertMcpOAuthStatus(value);
+    return value;
+  }
+
+  async logoutMcpOAuth(profileId: string, confirmed: boolean): Promise<McpOAuthStatus> {
+    const value = await this.request<unknown>("POST", `/api/mcp/auth/${encodeURIComponent(profileId)}/logout`, { confirmed });
+    assertMcpOAuthStatus(value);
+    if (value.profile_id !== profileId) throw new Error("GUI MCP OAuth profile identity is malformed.");
+    return value;
+  }
+
+  async respondMcpContinuation(
+    continuationId: string,
+    expectedRevision: number,
+    responses: Record<string, unknown>,
+    humanReceipt: McpHumanReceipt,
+    confirmed: boolean
+  ): Promise<McpOperationResult<unknown>> {
+    const value = await this.request<unknown>("POST", `/api/mcp/continuations/${encodeURIComponent(continuationId)}/respond`, {
+      expected_revision: expectedRevision,
+      responses,
+      human_request_id: humanReceipt.human_request_id,
+      human_expected_revision: humanReceipt.human_revision,
+      human_preview_sha256: humanReceipt.human_preview_sha256,
+      confirmed
+    });
+    assertMcpContinuationResult(value);
+    return value;
+  }
+
+  async getMcpContinuation(continuationId: string): Promise<McpInputRequired> {
+    const value = await this.request<unknown>(
+      "POST",
+      `/api/mcp/continuations/${encodeURIComponent(continuationId)}/inspect`,
+      {}
+    );
+    assertMcpInputRequired(value);
+    if (value.continuation_id !== continuationId) {
+      throw new Error("GUI MCP continuation identity is malformed.");
+    }
+    return value;
+  }
+
+  async cancelMcpContinuation(
+    continuationId: string,
+    expectedRevision: number,
+    confirmed: boolean
+  ): Promise<McpOperationResult<unknown>> {
+    const value = await this.request<unknown>("POST", `/api/mcp/continuations/${encodeURIComponent(continuationId)}/cancel`, {
+      expected_revision: expectedRevision,
+      confirmed
+    });
+    assertMcpContinuationResult(value);
+    return value;
+  }
+
+  async getMcpRemoteTask(
+    taskRef: string,
+    expectedRevision?: number | null
+  ): Promise<McpRemoteTask> {
+    const value = await this.request<unknown>("POST", `/api/mcp/remote-tasks/${encodeURIComponent(taskRef)}/get`, {
+      ...(expectedRevision === undefined ? {} : { expected_revision: expectedRevision })
+    });
+    assertMcpRemoteTask(value);
+    if (value.task_ref !== taskRef) throw new Error("GUI MCP remote task identity is malformed.");
+    return value;
+  }
+
+  async updateMcpRemoteTask(
+    taskRef: string,
+    expectedRevision: number,
+    responses: Record<string, unknown>,
+    humanReceipt: McpHumanReceipt,
+    confirmed: boolean
+  ): Promise<McpRemoteTask> {
+    const value = await this.request<unknown>("POST", `/api/mcp/remote-tasks/${encodeURIComponent(taskRef)}/update`, {
+      expected_revision: expectedRevision,
+      responses,
+      human_request_id: humanReceipt.human_request_id,
+      human_expected_revision: humanReceipt.human_revision,
+      human_preview_sha256: humanReceipt.human_preview_sha256,
+      confirmed
+    });
+    assertMcpRemoteTask(value);
+    if (value.task_ref !== taskRef) throw new Error("GUI MCP remote task identity is malformed.");
+    return value;
+  }
+
+  async cancelMcpRemoteTask(taskRef: string, expectedRevision: number, confirmed: boolean): Promise<McpRemoteTask> {
+    const value = await this.request<unknown>("POST", `/api/mcp/remote-tasks/${encodeURIComponent(taskRef)}/cancel`, {
+      expected_revision: expectedRevision,
+      confirmed
+    });
+    assertMcpRemoteTask(value);
+    if (value.task_ref !== taskRef) throw new Error("GUI MCP remote task identity is malformed.");
+    return value;
+  }
+
+  async startMcpSubscription(serverId: string, filters: string[], confirmed: boolean): Promise<McpSubscription> {
+    const value = await this.request<unknown>("POST", `/api/mcp/${encodeURIComponent(serverId)}/subscriptions/start`, {
+      filters,
+      confirmed
+    });
+    assertMcpSubscription(value);
+    if (value.server_id !== serverId) throw new Error("GUI MCP subscription server identity is malformed.");
+    return value;
+  }
+
+  async getMcpSubscriptionStatus(subscriptionId: string): Promise<McpSubscription> {
+    const value = await this.request<unknown>("POST", `/api/mcp/subscriptions/${encodeURIComponent(subscriptionId)}/status`, {});
+    assertMcpSubscription(value);
+    if (value.subscription_id !== subscriptionId) throw new Error("GUI MCP subscription identity is malformed.");
+    return value;
+  }
+
+  async listMcpSubscriptionEvents(subscriptionId: string, after = 0, limit = 100): Promise<McpSubscriptionEvent[]> {
+    const value = await this.request<unknown>("POST", `/api/mcp/subscriptions/${encodeURIComponent(subscriptionId)}/events`, { after, limit });
+    assertMcpSubscriptionEvents(value);
+    return value;
+  }
+
+  async stopMcpSubscription(subscriptionId: string, confirmed: boolean): Promise<McpSubscription> {
+    const value = await this.request<unknown>("POST", `/api/mcp/subscriptions/${encodeURIComponent(subscriptionId)}/stop`, { confirmed });
+    assertMcpSubscription(value);
+    if (value.subscription_id !== subscriptionId) throw new Error("GUI MCP subscription identity is malformed.");
     return value;
   }
 
@@ -1009,6 +1522,45 @@ function semanticQuerySha256(value: string | undefined, field: string): string |
   return value;
 }
 
+function semanticQueryIdentifier(value: string, field: string): string {
+  const selected = semanticQueryText(value, field, semanticFilterMaxChars);
+  if (selected === undefined || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/.test(selected)) {
+    throw new Error(`Semantic evidence ${field} is invalid.`);
+  }
+  return selected;
+}
+
+function semanticPageQuery(limit: number, after?: string): URLSearchParams {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    throw new Error("Semantic evidence page limit must be an integer from 1 to 100.");
+  }
+  const query = new URLSearchParams({ limit: String(limit) });
+  const cursor = semanticQueryText(after, "after", semanticCursorMaxChars);
+  if (cursor !== undefined) query.set("after", cursor);
+  return query;
+}
+
+function semanticEvidenceQuery(
+  filters: SemanticEvidenceFilters,
+  limit: number,
+  after?: string,
+  includePage = true
+): URLSearchParams {
+  const query = includePage ? semanticPageQuery(limit, after) : new URLSearchParams();
+  const pid = semanticQueryText(filters.pid, "pid", semanticFilterMaxChars);
+  const actionId = semanticQueryText(filters.actionId, "action_id", 128);
+  if (actionId !== undefined && !/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/.test(actionId)) {
+    throw new Error("Semantic evidence action_id is invalid.");
+  }
+  const tenant = semanticQuerySha256(filters.tenantBucketSha256, "tenant_bucket_sha256");
+  const epoch = semanticQueryText(filters.epochId, "epoch_id", semanticFilterMaxChars);
+  if (pid !== undefined) query.set("pid", pid);
+  if (actionId !== undefined) query.set("action_id", actionId);
+  if (tenant !== undefined) query.set("tenant_bucket_sha256", tenant);
+  if (epoch !== undefined) query.set("epoch_id", epoch);
+  return query;
+}
+
 function withOptionalQuanta(body: JsonBody, maxQuanta: OptionalQuanta): JsonBody {
   return maxQuanta === null ? body : { ...body, max_quanta: maxQuanta };
 }
@@ -1119,21 +1671,8 @@ function taskRunHumanRequestPage(value: unknown): TaskRunHumanRequestPage {
 }
 
 function humanRequest(value: unknown): HumanRequest {
-  if (!isJsonObject(value)
-      || typeof value.request_id !== "string" || !value.request_id
-      || typeof value.pid !== "string" || !value.pid
-      || typeof value.human !== "string" || !value.human
-      || !isJsonObject(value.payload)
-      || typeof value.status !== "string" || !value.status
-      || !(value.decision === null || isJsonObject(value.decision))
-      || typeof value.blocking !== "boolean"
-      || typeof value.created_at !== "string" || !value.created_at
-      || typeof value.updated_at !== "string" || !value.updated_at
-      || (value.release_request_id !== undefined && typeof value.release_request_id !== "string")
-      || (value.release_for_request_id !== undefined && typeof value.release_for_request_id !== "string")) {
-    throw new Error("GUI human request response is malformed.");
-  }
-  return value as HumanRequest;
+  assertHumanRequest(value);
+  return value;
 }
 
 function pagedItems(value: unknown, label: string): { items: unknown[]; next_cursor: string | null; has_more: boolean } {

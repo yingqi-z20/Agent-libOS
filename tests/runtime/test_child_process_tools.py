@@ -26,7 +26,7 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ProcessError, ProcessWaitRequired
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.skills import get_builtin_skill_catalog
-from scripts.llm_context_probe import last_tool_result, static_prefix
+from scripts.llm_context_probe import last_tool_result
 from tests.support.public_errors import assert_public_error_message
 
 
@@ -132,7 +132,10 @@ class TestChildProcessTool:
             parent = runtime.process.spawn(image='base-agent:v0', goal='fork child and wait')
             _grant_process_spawn(runtime, parent)
             results = asyncio.run(runtime.arun_until_idle(max_quanta=8))
-            assert runtime.process.get(parent).status == ProcessStatus.EXITED
+            parent_process = runtime.process.get(parent)
+            assert parent_process.status == ProcessStatus.EXITED, repr(
+                parent_process.outcome
+            )
             assert client.child_pid is not None
             assert client.child_pid is not None
             assert runtime.process.get(client.child_pid).status == ProcessStatus.EXITED
@@ -1305,6 +1308,8 @@ class ParentChildClient:
         self.parent_pid: str | None = None
         self.child_pid: str | None = None
         self.parent_step = 0
+        self.child_step = 0
+        self.parent_completion_payload: dict[str, Any] | None = None
         self.calls = 0
 
     async def acomplete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
@@ -1312,11 +1317,29 @@ class ParentChildClient:
 
     def complete_action(self, messages: list[dict[str, str]], tools: list[dict[str, object]]) -> LLMCompletion:
         self.calls += 1
-        pid = _pid_from_messages(messages)
-        parent_pid = _parent_pid_from_messages(messages)
-        if parent_pid is not None:
-            return self._completion('process_exit', {'payload': {'child_pid': pid, 'value': 42}})
-        self.parent_pid = pid
+        del tools
+        rendered = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+        is_child = 'return value 42' in rendered
+        review = _find_completion_review(messages)
+        if review is not None:
+            payload = (
+                {'value': 42}
+                if is_child
+                else self.parent_completion_payload
+            )
+            assert payload is not None
+            return self._completion(
+                'process_exit',
+                _completion_claim(review, payload),
+            )
+        if is_child and self.child_step == 0:
+            self.child_step = 1
+            return self._completion('read_process_messages', {})
+        if is_child and self.child_step == 1:
+            self.child_step = 2
+            return self._completion('process_exit', {'payload': {'value': 42}})
+        if is_child:
+            raise AssertionError('child action plan is complete')
         if self.parent_step == 0:
             self.parent_step = 1
             return self._completion(
@@ -1338,38 +1361,91 @@ class ParentChildClient:
         if self.parent_step == 3:
             wait_result = _last_tool_result(messages, 'wait_child_process')
             self.parent_step = 4
-            return self._completion('process_exit', {'payload': {'waited': wait_result['ready'], 'child_pid': wait_result['child_pid']}})
+            self.parent_completion_payload = {
+                'waited': wait_result['ready'],
+                'child_pid': wait_result['child_pid'],
+            }
+            return self._completion(
+                'process_exit',
+                {'payload': self.parent_completion_payload},
+            )
         raise AssertionError('parent action plan is complete')
 
     def _completion(self, name: str, args: dict[str, Any]) -> LLMCompletion:
         return LLMCompletion(content='', tool_calls=[{'id': f'child_process_{self.calls}', 'name': name, 'arguments': json.dumps(args)}])
 
-def _pid_from_messages(messages: list[dict[str, str]]) -> str:
-    pid = static_prefix(messages).get('pid')
-    if not isinstance(pid, str) or not pid:
-        pid, _ = _source_only_process_identity(messages)
-    if not isinstance(pid, str) or not pid:
-        raise AssertionError('prompt did not include process pid')
-    return pid
 
-def _parent_pid_from_messages(messages: list[dict[str, str]]) -> str | None:
-    value = static_prefix(messages).get('parent_pid')
-    if value is None and not static_prefix(messages):
-        _, value = _source_only_process_identity(messages)
-    if value is None or isinstance(value, str):
-        return value
-    raise AssertionError('prompt parent pid had an unexpected shape')
+def _find_completion_review(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, str):
+        try:
+            return _find_completion_review(json.loads(value))
+        except json.JSONDecodeError:
+            for line in value.splitlines():
+                candidate = line.strip()
+                if not candidate.startswith('{'):
+                    continue
+                try:
+                    found = _find_completion_review(json.loads(candidate))
+                except json.JSONDecodeError:
+                    continue
+                if found is not None:
+                    return found
+            return None
+    if isinstance(value, list):
+        for item in value:
+            found = _find_completion_review(item)
+            if found is not None:
+                return found
+        return None
+    if not isinstance(value, dict):
+        return None
+    review = value.get('completion_review')
+    if isinstance(review, dict) and isinstance(review.get('review_token'), str):
+        return review
+    for item in value.values():
+        found = _find_completion_review(item)
+        if found is not None:
+            return found
+    return None
 
-def _source_only_process_identity(messages: list[dict[str, str]]) -> tuple[str | None, str | None]:
-    text = '\n'.join(str(message.get('content', '')) for message in messages)
-    match = re.search(
-        r'(?m)^(?:Process|Process facts):\n- pid: (?P<pid>\S+)\n- parent_pid: (?P<parent_pid>\S+)$',
-        text,
-    )
-    if match is None:
-        return None, None
-    parent_pid = match.group('parent_pid')
-    return match.group('pid'), None if parent_pid == 'None' else parent_pid
+
+def _completion_claim(
+    review: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    available = [
+        str(tool)
+        for tool in review.get('available_evidence_tools', [])
+        if isinstance(tool, str) and tool != 'process_exit'
+    ]
+    assert available
+    requirements = review.get('requirements')
+    assert isinstance(requirements, list) and requirements
+    checks = []
+    for requirement in requirements:
+        eligible = (
+            requirement.get('eligible_evidence_tools')
+            if isinstance(requirement, dict)
+            else None
+        )
+        candidates = [tool for tool in available if not eligible or tool in eligible]
+        assert candidates
+        checks.append(
+            {
+                'status': 'completed',
+                'evidence_tool_calls': candidates[:1],
+                'evidence_summary': 'Verified by the cited successful runtime tool call.',
+            }
+        )
+    return {
+        'payload': dict(payload),
+        'review_token': review['review_token'],
+        'completion_evidence': {
+            'acceptance_checks': checks,
+            'final_verification': available[:1],
+        },
+    }
+
 
 def _last_tool_result(messages: list[dict[str, str]], tool_name: str) -> dict[str, Any]:
     result = last_tool_result(messages, tool_name)

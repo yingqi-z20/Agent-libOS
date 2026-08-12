@@ -397,30 +397,31 @@ class TestCapabilityManager:
         try:
             requester = runtime.process.spawn(image='base-agent:v0', goal='request grant')
             victim = runtime.process.spawn(image='base-agent:v0', goal='unrelated victim')
-            request_id = runtime.human.query(
-                requester,
-                'owner',
-                {
-                    'type': 'approval',
-                    'question': 'grant requested authority',
-                    'requested_capability': {
-                        'subject': victim,
-                        'resource': 'object:cross-subject',
-                        'rights': ['read'],
+            with pytest.raises(
+                ValidationError,
+                match='generic human query cannot contain authority-shaping fields',
+            ):
+                runtime.human.query(
+                    requester,
+                    'owner',
+                    {
+                        'type': 'approval',
+                        'question': 'grant requested authority',
+                        'requested_capability': {
+                            'subject': victim,
+                            'resource': 'object:cross-subject',
+                            'rights': ['read'],
+                        },
                     },
-                },
-                blocking=False,
-            )
-
-            with pytest.raises(ValidationError, match='subject must match request process'):
-                runtime.human.approve(request_id)
+                    blocking=False,
+                )
 
             assert not runtime.capability.check(
                 victim,
                 'object:cross-subject',
                 CapabilityRight.READ,
             )
-            assert runtime.human.get(request_id).status.value == 'pending'
+            assert runtime.human.list(requester) == []
         finally:
             runtime.close()
 

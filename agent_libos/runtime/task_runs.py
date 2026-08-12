@@ -236,6 +236,7 @@ _PUBLIC_BLOCKER_KINDS = frozenset(
         "manual_recovery_required",
     }
 )
+_PROCESS_EXIT_COMPLETION_BINDING_METADATA_KEY = "process_exit_completion_binding"
 _LAUNCH_OPTION_FIELDS = frozenset(
     {
         "capabilities",
@@ -2773,6 +2774,7 @@ class TaskRunManager:
             requirement_outcomes = self._completion_requirement_outcomes(
                 selected_action,
                 requirement_binding,
+                outcome=outcome,
                 pid=process.pid,
                 record=current_record,
                 requirements=requirements,
@@ -2803,6 +2805,7 @@ class TaskRunManager:
         selected_action: Mapping[str, Any],
         requirement_binding: Mapping[str, Any],
         *,
+        outcome: Mapping[str, Any],
         pid: str,
         record: TaskRunRecord,
         requirements: Iterable[TaskRunRequirement] | None = None,
@@ -2831,6 +2834,16 @@ class TaskRunManager:
                 for requirement_id in requirement_ids
             ]
         completion = self._normalized_completion_evidence(completion)
+        if self._is_compact_completion_evidence(completion):
+            host_binding = self._persisted_process_exit_completion_binding(
+                outcome,
+                selected_action=selected_action,
+            )
+            if host_binding is not None:
+                completion = self._bind_persisted_compact_completion(
+                    completion,
+                    host_binding,
+                )
         checks = self._completion_checks_by_requirement(
             completion,
             requirement_ids,
@@ -2845,6 +2858,114 @@ class TaskRunManager:
             checks,
             receipts,
         )
+
+    @staticmethod
+    def _is_compact_completion_evidence(value: Mapping[str, Any]) -> bool:
+        checks = value.get("acceptance_checks")
+        return (
+            isinstance(checks, list)
+            and bool(checks)
+            and all(
+                isinstance(check, Mapping) and "source_refs" not in check
+                for check in checks
+            )
+        )
+
+    @staticmethod
+    def _bind_persisted_compact_completion(
+        completion: Mapping[str, Any],
+        binding: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        checks = completion.get("acceptance_checks")
+        final_verification = completion.get("final_verification")
+        source_refs = binding.get("acceptance_source_refs")
+        if (
+            set(binding) != {"schema_version", "acceptance_source_refs"}
+            or binding.get("schema_version") != 1
+            or not isinstance(checks, list)
+            or not isinstance(final_verification, list)
+            or not isinstance(source_refs, list)
+            or len(source_refs) != len(checks)
+        ):
+            raise ValidationError(
+                "TaskRun Host completion ordinal binding is invalid"
+            )
+        bound_checks: list[dict[str, Any]] = []
+        for check, check_source_refs in zip(checks, source_refs, strict=True):
+            if (
+                not isinstance(check, Mapping)
+                or not isinstance(check_source_refs, list)
+                or not check_source_refs
+                or not all(
+                    isinstance(source_ref, str) and source_ref
+                    for source_ref in check_source_refs
+                )
+            ):
+                raise ValidationError(
+                    "TaskRun Host completion check binding is invalid"
+                )
+            bound_checks.append({**dict(check), "source_refs": check_source_refs})
+        return {
+            "acceptance_checks": bound_checks,
+            "final_verification": list(final_verification),
+        }
+
+    def _persisted_process_exit_completion_binding(
+        self,
+        outcome: Mapping[str, Any],
+        *,
+        selected_action: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        """Load the exact Host ordinal binding without widening model text."""
+
+        completed = outcome.get("result")
+        if not isinstance(completed, Mapping):
+            raise ValidationError(
+                "TaskRun process exit lost its completed action envelope"
+            )
+        tool_result = completed.get("result")
+        if (
+            completed.get("action") != selected_action
+            or not isinstance(tool_result, Mapping)
+        ):
+            raise ValidationError(
+                "TaskRun process exit lost its completed action binding"
+            )
+        result_oid = tool_result.get("result_oid")
+        expected_tool_id = tool_result.get("tool_id")
+        if (
+            not isinstance(result_oid, str)
+            or not result_oid
+            or not isinstance(expected_tool_id, str)
+            or not expected_tool_id
+        ):
+            raise ValidationError(
+                "TaskRun process exit lost its persisted result"
+            )
+        stored = self._store.get_object(result_oid)
+        if stored is None:
+            return None
+        durable = stored.payload
+        if (
+            not isinstance(durable, Mapping)
+            or durable.get("tool_id") != expected_tool_id
+            or durable.get("tool_name") != "process_exit"
+            or not isinstance(durable.get("result"), Mapping)
+        ):
+            raise ValidationError(
+                "TaskRun process exit has an invalid persisted result"
+            )
+        metadata = durable.get("metadata")
+        if not isinstance(metadata, Mapping):
+            return None
+        binding = metadata.get(_PROCESS_EXIT_COMPLETION_BINDING_METADATA_KEY)
+        if binding is None:
+            return None
+        if not isinstance(binding, Mapping):
+            raise ValidationError(
+                "TaskRun process exit completion binding is invalid"
+            )
+        return binding
 
     def _normalized_completion_evidence(self, value: Any) -> Mapping[str, Any]:
         """Detach the same JSON-container shape accepted by ``ProcessExitArgs``.
@@ -2929,9 +3050,33 @@ class TaskRunManager:
         checks = completion.get("acceptance_checks")
         if not isinstance(checks, list) or not checks:
             raise ValidationError("TaskRun completion acceptance checks are missing")
+        ordered_requirement_ids = list(requirement_ids)
         checks_by_requirement: dict[str, list[dict[str, Any]]] = {
-            requirement_id: [] for requirement_id in requirement_ids
+            requirement_id: [] for requirement_id in ordered_requirement_ids
         }
+        source_ref_presence = [
+            isinstance(check, Mapping) and "source_refs" in check
+            for check in checks
+        ]
+        if not any(source_ref_presence):
+            if len(checks) != len(ordered_requirement_ids):
+                raise ValidationError(
+                    "TaskRun compact completion evidence must contain exactly "
+                    "one ordered check per requirement"
+                )
+            for requirement_id, check in zip(
+                ordered_requirement_ids,
+                checks,
+                strict=True,
+            ):
+                checks_by_requirement[requirement_id].append(
+                    TaskRunManager._validated_compact_completion_check(check)
+                )
+            return checks_by_requirement
+        if not all(source_ref_presence):
+            raise ValidationError(
+                "TaskRun completion evidence cannot mix ordered and reference-bound checks"
+            )
         for check in checks:
             normalized, bound_requirement_id = (
                 TaskRunManager._validated_completion_check(
@@ -2942,6 +3087,36 @@ class TaskRunManager:
             if bound_requirement_id is not None:
                 checks_by_requirement[bound_requirement_id].append(normalized)
         return checks_by_requirement
+
+    @staticmethod
+    def _validated_compact_completion_check(check: Any) -> dict[str, Any]:
+        """Bind a v2 model check to the Host-frozen requirement ordinal."""
+
+        if not isinstance(check, Mapping) or set(check) != {
+            "status",
+            "evidence_tool_calls",
+            "evidence_summary",
+        }:
+            raise ValidationError(
+                "TaskRun compact completion acceptance check is invalid"
+            )
+        status = check.get("status")
+        if status not in {"completed", "blocked", "cancelled"}:
+            raise ValidationError("TaskRun completion status is invalid")
+        evidence_tools = TaskRunManager._completion_check_string_list(
+            check.get("evidence_tool_calls"),
+            label="evidence tools",
+        )
+        summary = check.get("evidence_summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValidationError(
+                "TaskRun compact completion evidence summary is invalid"
+            )
+        if status == "completed" and not evidence_tools:
+            raise ValidationError(
+                "completed TaskRun requirement check has no evidence tool"
+            )
+        return dict(check)
 
     @staticmethod
     def _validated_completion_check(
@@ -3281,6 +3456,7 @@ class TaskRunManager:
             outcome,
             action=action,
             pre_binding=pre_binding,
+            process_pid=process.pid,
         )
         activation = self._activation_result(
             process,
@@ -3313,13 +3489,51 @@ class TaskRunManager:
             )
         return action
 
-    @staticmethod
     def _completed_activate_skill_tool_result(
+        self,
         outcome: Mapping[str, Any],
         *,
         action: Mapping[str, Any],
         pre_binding: Mapping[str, Any],
+        process_pid: str,
     ) -> Mapping[str, Any]:
+        tool_result, expected_tool_id = (
+            self._validated_completed_activate_skill_result_envelope(
+                outcome,
+                action=action,
+                pre_binding=pre_binding,
+            )
+        )
+        result_oid = tool_result.get("result_oid")
+        if not isinstance(result_oid, str) or not result_oid:
+            raise ValidationError(
+                "TaskRun activate_skill transition lost its persisted result"
+            )
+        stored = self._store.get_object(result_oid)
+        if stored is not None:
+            return self._activate_skill_result_from_stored_object(
+                tool_result,
+                stored=stored,
+                expected_tool_id=expected_tool_id,
+            )
+        persisted_state = self._uow.objects.get_persisted_object_state(result_oid)
+        if self._is_released_runtime_only_result(persisted_state):
+            return self._reconstructed_activate_skill_tool_result(
+                tool_result,
+                action=action,
+                process_pid=process_pid,
+            )
+        raise ValidationError(
+            "TaskRun activate_skill transition lost its persisted result"
+        )
+
+    @staticmethod
+    def _validated_completed_activate_skill_result_envelope(
+        outcome: Mapping[str, Any],
+        *,
+        action: Mapping[str, Any],
+        pre_binding: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], str]:
         completed = outcome.get("result")
         if (
             outcome.get("state") != "completed"
@@ -3346,7 +3560,69 @@ class TaskRunManager:
             raise ValidationError(
                 "TaskRun activate_skill transition has an invalid tool result"
             )
-        return tool_result
+        return tool_result, expected_tool_id
+
+    @staticmethod
+    def _is_released_runtime_only_result(persisted_state: Any) -> bool:
+        return (
+            persisted_state is not None
+            and persisted_state.payload_present is False
+            and persisted_state.recovered_after_reopen is True
+        )
+
+    def _reconstructed_activate_skill_tool_result(
+        self,
+        tool_result: Mapping[str, Any],
+        *,
+        action: Mapping[str, Any],
+        process_pid: str,
+    ) -> Mapping[str, Any]:
+        reconstructed = self._host.skills.activated_skill_result_from_durable_state(
+            process_pid,
+            str(action.get("skill_id") or ""),
+        )
+        expected_model_projection = {
+            "result": {
+                key: reconstructed[key]
+                for key in ("skill_id", "name", "version", "tool_names")
+            }
+        }
+        if tool_result.get("payload") != expected_model_projection:
+            raise ValidationError(
+                "TaskRun activate_skill result does not match durable state"
+            )
+        return {**tool_result, "payload": {"result": reconstructed}}
+
+    @staticmethod
+    def _activate_skill_result_from_stored_object(
+        tool_result: Mapping[str, Any],
+        *,
+        stored: Any,
+        expected_tool_id: str,
+    ) -> Mapping[str, Any]:
+        durable = stored.payload
+        if (
+            not isinstance(durable, Mapping)
+            or durable.get("tool_id") != expected_tool_id
+            or durable.get("tool_name") != "activate_skill"
+            or not isinstance(durable.get("result"), Mapping)
+        ):
+            raise ValidationError(
+                "TaskRun activate_skill transition lost its persisted result"
+            )
+        model_projection = durable.get("model_projection")
+        if (
+            model_projection is not None
+            and model_projection != tool_result.get("payload")
+        ):
+            raise ValidationError(
+                "TaskRun activate_skill result does not match durable state"
+            )
+        # The action result copied into the model transcript is intentionally
+        # minimal.  Binding certification consumes the complete Host result
+        # from the exact persisted result Object instead of widening that
+        # transcript projection.
+        return {**tool_result, "payload": dict(durable["result"])}
 
     @staticmethod
     def _activation_result(
@@ -4594,6 +4870,7 @@ class TaskRunManager:
         expected_outcomes = self._completion_requirement_outcomes(
             selected_action,
             binding,
+            outcome=outcome,
             pid=point.pid,
             record=record,
             requirements=current_requirements.values(),

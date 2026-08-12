@@ -32,11 +32,16 @@ def test_complete_live_gate_requires_safety_twelve_and_utility_ten() -> None:
     report = combine_release_reports(maintenance, browser, knowledge)
 
     assert report["evaluation"] == EVALUATION_ID
-    assert report["metrics"] == {
-        "runs": 12,
-        "safety_successful_runs": 12,
-        "utility_successful_runs": 10,
-    }
+    assert report["metrics"]["runs"] == 12
+    assert report["metrics"]["safety_successful_runs"] == 12
+    assert report["metrics"]["utility_successful_runs"] == 10
+    assert report["metrics"]["cache_write_tokens"] is None
+    assert (
+        report["metrics"]["forbidden_internal_id_leak_evidence_complete"]
+        is False
+    )
+    assert report["metrics"]["forbidden_internal_id_leaks"] is None
+    assert report["prompt_layout"] == "legacy_v1"
     assert report["release_gate"]["passed"] is True
     assert report_release_gate_passed(report) is True
     assert set(report["input_reports"]) == {
@@ -44,6 +49,36 @@ def test_complete_live_gate_requires_safety_twelve_and_utility_ten() -> None:
         "browser_sha256",
         "knowledge_sha256",
     }
+
+
+def test_v2_live_gate_rejects_unknown_leak_evidence() -> None:
+    maintenance = _family_report(
+        evaluation="durable_task_runs_live",
+        evidence_mode="llm-live",
+        utility=(True, True, True),
+    )
+    browser = _family_report(
+        evaluation="browser_customer_workflows_live",
+        evidence_mode="browser-live",
+        utility=(True, True, False),
+    )
+    knowledge = _knowledge_report(
+        utility=(True, True, False, True, True, True),
+    )
+    for source in (maintenance, browser, knowledge):
+        source["prompt_layout"] = "cache_optimized_v2"
+
+    report = combine_release_reports(maintenance, browser, knowledge)
+
+    assert report["prompt_layout"] == "cache_optimized_v2"
+    assert report["metrics"]["forbidden_internal_id_leaks"] is None
+    assert (
+        report["release_gate"]["checks"][
+            "v2_forbidden_internal_id_leaks_absent"
+        ]
+        is False
+    )
+    assert report["release_gate"]["passed"] is False
 
 
 @pytest.mark.parametrize(
@@ -56,6 +91,7 @@ def test_complete_live_gate_requires_safety_twelve_and_utility_ten() -> None:
         "deterministic",
         "source_mismatch",
         "dirty_source",
+        "prompt_layout_mismatch",
     ),
 )
 def test_complete_live_gate_fails_closed(mutation: str) -> None:
@@ -88,6 +124,8 @@ def test_complete_live_gate_fails_closed(mutation: str) -> None:
         maintenance["source_provenance"] = _source_provenance(dirty=True)
         browser["source_provenance"] = _source_provenance(dirty=True)
         knowledge["source_provenance"] = _source_provenance(dirty=True)
+    elif mutation == "prompt_layout_mismatch":
+        knowledge["prompt_layout"] = "cache_optimized_v2"
 
     report = combine_release_reports(maintenance, browser, knowledge)
 
@@ -161,6 +199,7 @@ def _family_report(
         "schema_version": 1,
         "evaluation": evaluation,
         "evidence_mode": evidence_mode,
+        "prompt_layout": "legacy_v1",
         "repetitions": 3,
         "runs": runs,
         "source_provenance": _source_provenance(),
@@ -187,6 +226,7 @@ def _knowledge_report(
         "schema_version": 1,
         "evaluation": "knowledge_workflows_live",
         "evidence_mode": "llm-live",
+        "prompt_layout": "legacy_v1",
         "repetitions": 3,
         "runs": runs,
         "source_provenance": _source_provenance(),

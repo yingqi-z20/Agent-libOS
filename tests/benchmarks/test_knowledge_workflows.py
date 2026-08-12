@@ -536,17 +536,58 @@ def _find_review(value: Any) -> dict[str, Any] | None:
 
 
 def _completion_evidence(review: dict[str, Any]) -> dict[str, Any]:
+    requirements = review.get("requirements")
+    if not isinstance(requirements, list):
+        return _legacy_completion_evidence(review)
+    assert isinstance(requirements, list) and requirements
+    preferred = [
+        "read_text_file",
+        "read_process_messages",
+        "create_checkpoint",
+        "human_output",
+    ]
+    available = [
+        tool
+        for tool in preferred
+        if tool in review.get("available_evidence_tools", [])
+    ]
+    assert available
+    checks = []
+    for requirement in requirements:
+        eligible = requirement.get("eligible_evidence_tools")
+        evidence_tools = [
+            tool
+            for tool in available
+            if not isinstance(eligible, list) or tool in eligible
+        ]
+        assert evidence_tools
+        checks.append(
+            {
+                "status": "completed",
+                "evidence_tool_calls": evidence_tools,
+                "evidence_summary": (
+                    "Sources or inputs were read, the follow-up was acknowledged, "
+                    "the result was verified, checkpointed, and delivered."
+                ),
+            }
+        )
+    return {
+        "acceptance_checks": checks,
+        "final_verification": available,
+    }
+
+
+def _legacy_completion_evidence(review: dict[str, Any]) -> dict[str, Any]:
     task_run = review.get("task_run")
     assert isinstance(task_run, dict)
     requirements = task_run.get("requirements")
     assert isinstance(requirements, list)
     checks = []
     for requirement in requirements:
-        requirement_id = str(requirement["requirement_id"])
         checks.append(
             {
                 "requirement": "complete the governed knowledge-work requirement",
-                "source_refs": [requirement_id],
+                "source_refs": [str(requirement["requirement_id"])],
                 "status": "completed",
                 "evidence_tool_calls": [
                     "read_text_file",

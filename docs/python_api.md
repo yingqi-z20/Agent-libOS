@@ -43,6 +43,15 @@ The wider `agent_libos.models` package contains subsystem and persistence
 models used by the implementation. Their presence there does not add them to
 the top-level compatibility surface.
 
+Modern MCP Host-client contracts are exported from `agent_libos.mcp`, not
+promoted wholesale into the package root. That surface includes the strict v3
+Manifest/parser/Host-policy types; `McpModernClient` and its binding/limit
+types; Resource, Prompt, Completion, content, page, MRTR, Task, subscription,
+OAuth, and connection-lifecycle models/managers; provider Protocols; and the
+explicit DX validation/doctor/probe/scaffold/export/import helpers. See
+[MCP Client](mcp.md) for the version gates and exclusions; importing one of
+these Host types does not bind it to a Runtime or make it model-visible.
+
 ## Opening and closing a Runtime
 
 Use `Runtime.open(...)` in synchronous hosts:
@@ -240,7 +249,7 @@ enforce their own authority.
 | `checkpoint`, `image_registry`, `image_artifacts`, `skills`, `modules` | Checkpoint, image, Skill, and trusted-module registries |
 | `operations`, `explain`, `audit`, `events`, `payload_retention` | Causal operations, evidence, audit/events, and payload-retention maintenance |
 | `llms`, `llm` | LLM profile registry and process executor |
-| `semantic` | Host-only read access to semantic Shadow health and bounded assessment evidence; capture/worker mutation remains runtime-internal |
+| `semantic` | Host evidence/query service for status v3, assessments, FlowGraph, settlements, policy/control history, health, metrics, and review import; machine settlement and policy control remain private Runtime composition ports |
 | `substrate`, `store`, `uow` | Provider substrate and persistence composition boundary |
 
 Manager methods have per-operation authority contracts; the presence of an
@@ -303,12 +312,27 @@ every process action still goes through the normal Tool/Skill and primitive
 authority boundaries. See [Durable Task Runs](durable_task_runs.md) for payload
 opt-in, retention, recovery, and external-effect semantics.
 
-`Runtime.semantic` is an evidence service, not an authorization manager. Its
-public Host reads are `status()`,
-`query_assessments(pid=None, request_id=None, operation_id=None, kind=None,
-status=None, domain=None, action_id=None, tenant_bucket_sha256=None, after=None,
-limit=None)`, and
-`get_assessment(assessment_id)`. Queries are hard-bounded and keyset-paged. The
+`Runtime.semantic` is an evidence and review service, not a general
+authorization manager. Its complete public Host evidence/review surface is:
+
+| Method | Return |
+| --- | --- |
+| `runtime.semantic.status()` | schema-v3 status `dict[str, Any]` |
+| `runtime.semantic.flow_status()` | FlowGraph status `dict[str, Any]` |
+| `runtime.semantic.metrics(*, window=None, action_id=None, tenant_bucket_sha256=None, epoch_id=None, risk=None)` | metrics `dict[str, Any]` |
+| `runtime.semantic.control_status()` | control-state `dict[str, Any]` |
+| `runtime.semantic.query_assessments(*, pid=None, request_id=None, operation_id=None, kind=None, status=None, domain=None, action_id=None, tenant_bucket_sha256=None, after=None, limit=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.get_assessment(assessment_id)` | assessment `dict[str, Any]` or `None` |
+| `runtime.semantic.query_flow_entities(*, after=None, limit=None, pid=None, kind=None, tenant_bucket_sha256=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.query_flow_edges(*, after=None, limit=None, pid=None, relation=None, node_id=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.query_flow_lineage(node_id, *, direction="upstream", after=None, limit=None, max_depth=8)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.query_machine_settlements(*, after=None, limit=None, pid=None, request_id=None, effect_id=None, action_id=None, tenant_bucket_sha256=None, outcome=None, epoch_id=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.query_policy_epochs(*, after=None, limit=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.query_control_history(*, after=None, limit=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.query_health_events(*, after=None, limit=None, severity=None, code=None, epoch_id=None)` | keyset page `dict[str, Any]` |
+| `runtime.semantic.append_review_label(*, settlement_id, outcome, reviewer_id, evidence_sha256, reviewed_at=None)` | appended review-evidence `dict[str, Any]` |
+
+Paged queries are hard-bounded and keyset-paged. The
 omitted direct-Host limit uses `semantic.assessment_list_limit`; an explicit
 limit cannot exceed the smaller of `semantic.assessment_list_hard_limit` and
 500. The CLI and local HTTP API apply their stricter 50-row default and 100-row
@@ -323,21 +347,33 @@ through `2^53 - 1`, matching JSON/TypeScript safe-integer decoding.
 conflict invalidates only that counter. Unknown/raw
 usage fields are never returned. Deterministic/scripted, missing, non-exact, or
 invalid telemetry remains `None`, and populated values are not authoritative
-billing evidence. Runtime-internal capture and worker methods are not exported
-as model Tools, Skills, JIT syscalls, Modules, HTTP writes, or machine
-settlement APIs. See [Semantic Approval and Data
+billing evidence. `append_review_label(...)` is the only public write and is a
+strict Host review-evidence append; it cannot settle a request, issue/revoke a
+Capability, activate/revoke an epoch, change control state, mutate labels, or
+call a provider. Runtime-internal
+capture, enforcement, and worker methods are not exported as model Tools,
+Skills, JIT syscalls, Modules, HTTP writes, or Runtime facade settlement APIs.
+See [Semantic Approval and Data
 Identification](semantic_shadow.md).
 
-`status()` returns schema v2. Its `assessments.by_status` and
+`status()` returns schema v3 with queue, assessments, control, FlowGraph,
+machine, actual-auto-approval, and review-metric sections. The dedicated
+FlowGraph endpoint exposes the same typed status with its bounded graph reads.
+Its
+`assessments.by_status` and
 `assessments.by_domain` mappings contain the complete closed enum key sets and
 must each sum to `assessments.total`; inconsistent mappings are rejected by the
-CLI and GUI adapters. Because this release has no real semantic auto-approval,
-`actual_auto_approval` is exactly
-`{"numerator": 0, "denominator": 0, "rate": null}`.
+CLI and GUI adapters. The exact machine counter set is `eligible`, `issued`,
+`consumed`, `succeeded`, `failed`, `unknown`, `expired`, `revoked`,
+`race_lost`, and `denied`. `actual_auto_approval.rate` is `None` exactly when
+`eligible` is zero; `review_metrics.unsafe_rate` is `None` exactly when
+`reviewed` is zero; and `review_metrics.issued_review_rate` is `None` exactly
+when `issued` is zero. A non-null review rate does not by itself prove complete
+Host review coverage.
 
 Embedded Hosts may pass `semantic_assessor=` to `Runtime(...)`,
 `Runtime.open(...)`, or `Runtime.aopen(...)` only when the configured adapter is
-`scripted`; enabled scripted Shadow requires that injected object to implement
+`scripted`; an enabled scripted semantic mode requires that injected object to implement
 the synchronous `assess()` port. The external adapter rejects an override, and
 other adapters reject this injection. This constructor dependency is Host code,
 not a CLI/HTTP/GUI/model/Skill/JIT/Module extension surface.
@@ -372,14 +408,52 @@ synchronous counterparts, but must be awaited.
 | --- | --- |
 | `runtime.mcp.register_server(server, *, actor="runtime", replace=False, require_capability=True, source=None)` | inspected server `dict` |
 | `runtime.mcp.register_server_from_yaml_text(text, *, actor, replace=False, require_capability=True, source=None)` | inspected server `dict` |
+| `runtime.mcp.validate_server_manifest(server)` | strict typed v1/v2/v3 manifest; validation only, with no registry/provider effect |
+| `runtime.mcp.get_server_manifest(server_id)` | validated typed registered manifest for trusted Host tooling |
+| `runtime.mcp.import_server_manifest(server, *, expected_current_sha256, actor="runtime", replace=False, require_capability=True, source=None)` | reviewed import for any schema; v3 uses Store-atomic CAS, while v1/v2 use the Runtime-local registry fence |
+| `runtime.mcp.import_v3_manifest(server, *, expected_current_sha256, actor="runtime", replace=False, require_capability=True, source=None)` | exact-CAS inspected v3 server `dict`; `None` expects no current row |
 | `runtime.mcp.list_servers(*, actor=None, require_capability=True, text=None, limit=None)` | bounded `list[dict]` |
 | `runtime.mcp.list_servers_window(*, actor=None, require_capability=True, text=None, limit=None)` | `(list[dict], has_more)` |
 | `runtime.mcp.inspect_server(server_id, *, actor=None, require_capability=True, include_sensitive_fields=False)` | server `dict` |
 | `runtime.mcp.discover(server_id, *, actor=None, require_capability=True)` / `await runtime.mcp.adiscover(...)` | `McpDiscoveryResult` for Manifest v2 modern-capable modes |
 | `runtime.mcp.list_tools(server_id, *, actor=None, require_capability=True, refresh=False)` / `await runtime.mcp.alist_tools(...)` | tool-list `dict` |
+| `runtime.mcp.list_resources(server_id, *, cursor=None, actor="runtime", model_visible_only=False)` / `await runtime.mcp.alist_resources(...)` | bounded v3 `McpPage[McpResource]` |
+| `runtime.mcp.list_resource_templates(server_id, *, cursor=None, actor="runtime", model_visible_only=False)` / `await runtime.mcp.alist_resource_templates(...)` | bounded v3 `McpPage[McpResourceTemplate]` |
+| `runtime.mcp.read_resource(server_id, resource_id, *, variables=None, actor="runtime", for_model=False)` / `await runtime.mcp.aread_resource(...)` | governed v3 `McpComplete`, `McpInputRequired`, or `McpRemoteTask` |
+| `runtime.mcp.list_prompts(server_id, *, cursor=None, actor="runtime")` / `await runtime.mcp.alist_prompts(...)` | bounded v3 `McpPage[McpPrompt]` Host facade |
+| `runtime.mcp.get_prompt(server_id, prompt_id, *, arguments=None, confirmed=False, expected_preview_sha256=None, actor="runtime")` / `await runtime.mcp.aget_prompt(...)` | governed Prompt result; confirmation is bound to the exact preview digest |
+| `runtime.mcp.complete_prompt(server_id, reference_type, reference_id, argument, *, context=None, actor="runtime")` / `await runtime.mcp.acomplete_prompt(...)` | governed bounded Completion result |
 | `runtime.mcp.unregister_server(server_id, *, actor="runtime", require_capability=True)` | deletion `dict` |
-| `runtime.mcp.call_tool(pid, server_id, tool_id, arguments=None, *, source_oids=None)` / `await runtime.mcp.acall_tool(...)` | `McpCallResult` |
+| `runtime.mcp.call_tool(pid, server_id, tool_id, arguments=None, *, source_oids=None)` / `await runtime.mcp.acall_tool(...)` | v1/v2: `McpCallResult`; v3: `McpComplete`, `McpInputRequired`, or `McpRemoteTask` |
 | `runtime.mcp.grant_tool(pid, server_id, tool_id, *, right, issued_by="mcp", delegable=True)` | capability value |
+
+`McpModernClient` is the lower-level Host composition surface for v3
+Resources, Resource Templates, Prompts, and Completion. It provides sync and
+`a`-prefixed async `list_resources`, `list_resource_templates`,
+`read_resource`, `list_prompts`, `get_prompt`, and `complete_prompt` methods.
+The Runtime methods above are the protected process/model Resource facade;
+Prompts, Completion, OAuth, subscriptions, continuations, and remote Tasks are
+not model tools. A Host that exposes those operations must supply the governed
+binding/provider managers and preserve their Capability, data-flow, effect,
+resource, event, audit, and lifecycle fences.
+
+Exact-v3 custom Provider protocols are exported from `agent_libos.mcp`. Each
+implementation declares `mcp_manifest_schema_version = 3` and
+`mcp_protocol_revision = "2026-07-28"`; Runtime composition rejects legacy
+lookalikes, synchronous or variadic methods, and a continuation provider that
+does not implement Tool, Resource-read, and Prompt-get continuation. The modern
+Tool SPI receives the operation-local `sensitive_values` snapshot. Custom
+non-Complete results become public only when their local reference and full
+authority/effect binding match the durable continuation or Task manager;
+Completion is Complete-only.
+
+These custom SPIs are trusted, cooperative Host composition. An implementation
+must honor its absolute `deadline`, yield rather than block the event-loop
+thread, keep CPU work bounded or move it behind a killable process, and propagate
+cancellation. Runtime checks before and after dispatch and records an
+entered-provider timeout as unknown/no-replay, but it cannot safely hard-kill
+arbitrary in-process Python. The built-in governed SDK/transport providers retain
+hard bounded I/O and process cleanup.
 
 `actor`, `require_capability`, `include_sensitive_fields`, `source`, and the
 `grant_*` conveniences are trusted Host control-plane inputs. Do not derive
@@ -389,6 +463,9 @@ them from model output or expose these manager methods as model tools.
 a process to self-authorize. Calls to remote methods/tools always use the
 target `pid` and still enforce that process's complete Capability, Task
 Authority, Human, data-flow, resource, effect, event, and audit path.
+`get_server_manifest` and sensitive inspection can reveal Host-declared URI and
+environment-variable references, but never resolved secret values; keep them
+off model, GUI, and untrusted extension surfaces.
 
 The `*_from_yaml_text` methods parse supplied text; they do not open `source`
 as a path. `source` is evidence metadata only. Trusted Host code must read and
@@ -497,7 +574,7 @@ cannot silently abandon an owned store or partially assembled component graph.
 
 ## Compatibility boundary
 
-- Agent libOS 1.4.0 is experimental. The top-level `agent_libos.__all__` names
+- Agent libOS 1.5.0 is experimental. The top-level `agent_libos.__all__` names
   and the Runtime entrypoints documented here are the intended application
   import surface for this release. Pin the package version when depending on
   exact signatures or dataclass fields.

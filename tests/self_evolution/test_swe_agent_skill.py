@@ -30,7 +30,16 @@ class TestSWEAgentSkill:
     def test_shipped_skill_pins_current_jit_extension_compatibility(self) -> None:
         skill_md = PACKAGE_ROOT.joinpath('SKILL.md').read_text(encoding='utf-8')
 
-        assert 'compatibility: agent-libos==1.4.0\n' in skill_md
+        assert 'compatibility: agent-libos==1.5.0\n' in skill_md
+
+    def test_shipped_docs_explain_ripgrep_no_match_status(self) -> None:
+        skill_md = PACKAGE_ROOT.joinpath('SKILL.md').read_text(encoding='utf-8')
+        skills_doc = Path('docs/skills.md').read_text(encoding='utf-8')
+
+        for text in (skill_md, skills_doc):
+            normalized = ' '.join(text.split())
+            assert '`1` is the normal no-match result' in normalized
+            assert '`output_incomplete=false`' in text
 
     def test_command_wrappers_reserve_outer_sandbox_cleanup_windows(self) -> None:
         specs = {
@@ -376,6 +385,64 @@ class TestSWEAgentSkill:
                         }
                     ],
                     'expected': expected,
+                }
+            ],
+        )
+
+        assert validation.ok, validation.errors
+
+    @pytest.mark.real_deno
+    def test_swe_grep_preserves_ripgrep_no_match_status(self) -> None:
+        source = PACKAGE_ROOT.joinpath('scripts/swe_grep.ts').read_text(
+            encoding='utf-8'
+        )
+        sandbox = DenoTypescriptSandbox(deno_executable='deno')
+        argv = [
+            'rg',
+            '-n',
+            '--null',
+            '--with-filename',
+            '--hidden',
+            '--glob',
+            '!.git/*',
+            '-F',
+            '--',
+            'missing',
+            'src',
+        ]
+
+        validation = sandbox.run_tests(
+            source,
+            [
+                {
+                    'args': {'pattern': 'missing', 'path': 'src'},
+                    'syscalls': [
+                        {
+                            'name': 'shell.run',
+                            'args': {'argv': argv, 'timeout_s': 10},
+                            'result': {
+                                'returncode': 1,
+                                'stdout': '',
+                                'stderr': '',
+                                'stdout_truncated': False,
+                                'stderr_truncated': False,
+                            },
+                        }
+                    ],
+                    'expected': {
+                        'argv': argv,
+                        'returncode': 1,
+                        'files': [],
+                        'matches': [],
+                        'omitted_matches': 0,
+                        'observed_omitted_matches': 0,
+                        'matches_incomplete': False,
+                        'stdout_truncated': False,
+                        'stderr_truncated': False,
+                        'output_incomplete': False,
+                        'stderr': '',
+                        'message': '',
+                    },
                 }
             ],
         )

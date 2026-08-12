@@ -43,6 +43,14 @@ Product entrypoints use this order:
    - `llm.max_tokens`, `llm.max_input_tokens_per_call`,
      `llm.max_total_tokens_per_call`, `llm.temperature`, and each profile's
      corresponding token limits and temperature;
+   - every numeric field in `semantic`: `semantic.max_concurrency`,
+     `semantic.assessment_timeout_s`, `semantic.job_lease_s`,
+     `semantic.shutdown_join_timeout_s`, `semantic.projection_ttl_s`,
+     `semantic.recovery_batch_limit`, `semantic.intent_max_chars`,
+     `semantic.projection_max_bytes`, `semantic.assessment_list_limit`,
+     `semantic.assessment_list_hard_limit`, `semantic.flow_query_limit`,
+     `semantic.flow_query_hard_limit`, `semantic.settlement_list_limit`, and
+     `semantic.settlement_list_hard_limit`;
    - `git.ref_list_limit`, `git.pull_request_list_limit`, all six
      `memory.query_scan_*`/`memory.metadata_*` bounds, and
      `skills.max_package_directories`, `skills.max_package_depth`, and
@@ -172,7 +180,8 @@ whose id equals `llm.default_profile_id` then inherits the matching legacy
 endpoint, model, or provider-policy settings. When neither is present,
 `llm.timeout_s`, `llm.max_retries`, `llm.api_mode`, `llm.store`,
 `llm.safety_identifier`, `llm.prompt_cache_key`,
-`llm.prompt_cache_retention`, `llm.responses_previous_response_id`,
+`llm.prompt_cache_retention`, `llm.prompt_cache_mode`,
+`llm.prompt_cache_ttl`, `llm.responses_previous_response_id`,
 `llm.parallel_tool_calls`, `llm.auto_wait_on_empty_tool_calls`,
 `llm.fallback_json_actions`,
 `llm.temperature`, `llm.max_tokens`, `llm.max_input_tokens_per_call`,
@@ -183,6 +192,7 @@ legacy mappings are
 `OPENAI_TIMEOUT`; `OPENAI_MAX_RETRIES`; `OPENAI_API_MODE`; `OPENAI_STORE`;
 `OPENAI_REASONING_EFFORT`; `OPENAI_VERBOSITY`; `OPENAI_SAFETY_IDENTIFIER`;
 `OPENAI_PROMPT_CACHE_KEY`; `OPENAI_PROMPT_CACHE_RETENTION`;
+`OPENAI_PROMPT_CACHE_MODE`; `OPENAI_PROMPT_CACHE_TTL`;
 `OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID`; and
 `OPENAI_PARALLEL_TOOL_CALLS`; and `OPENAI_FALLBACK_JSON_ACTIONS`. The default profile also snapshots
 `OPENAI_ENABLE_THINKING` and the OpenAI organization/project routing variables
@@ -200,8 +210,10 @@ ambiguous, potentially billable transport retries. Hosts can lower or raise it
 with a selected profile's `timeout_s` or, for the default profile only,
 `OPENAI_TIMEOUT`.
 
-After the SDK exhausts its configured retries, timeout, connection, rate-limit,
-and retryable HTTP status failures are recorded and pause the AgentProcess for
+Agent libOS performs the configured `max_retries` as explicit, separately
+traced transport retries; provider-SDK internal retries are disabled. After
+Agent libOS exhausts those retries, timeout, connection, rate-limit, and
+retryable HTTP status failures are recorded and pause the AgentProcess for
 explicit Host resume. Resuming issues a new, separately accounted provider call
 from the durable process context. Deterministic configuration, protocol, and
 non-retryable provider errors still fail the process closed; the Runtime never
@@ -237,12 +249,12 @@ same change.
 | `data_flow` | `default_trust_level`, `default_max_sensitivity`, `sink_rules`, `operation_minimum_integrity`, `registry_resource`, `registry_list_limit`, `decision_list_limit`, `file_binding_list_limit` |
 | `scheduler` | `max_quanta`, `poll_interval_s`, `max_workers`, `drain_window_s`, `shutdown_join_timeout_s` |
 | `process` | `max_tool_calls`, `max_child_processes`, `max_runtime_seconds`, `max_context_materialization_tokens`, `max_context_materialization_total_tokens`, `max_llm_calls`, `max_llm_total_tokens`, `max_subprocess_wall_seconds`, `max_subprocess_cpu_seconds`, `max_subprocess_memory_bytes`, `max_external_read_bytes`, `max_external_write_bytes`, `max_jsonrpc_bytes`, `max_mcp_bytes`, `max_deno_syscalls`, `default_goal_text`, `default_working_directory`, `fork_budget_divisor`, `fork_min_tool_calls`, `fork_min_child_processes` |
-| `llm` | `default_profile_id`, `profiles`, `temperature`, `max_tokens`, `max_input_tokens_per_call`, `max_total_tokens_per_call`, `context_window_tokens`, `timeout_s`, `max_retries`, `api_mode`, `store`, `safety_identifier`, `prompt_cache_key`, `prompt_cache_retention`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `fallback_json_actions`, `compatibility_retry_attempts`, `action_repair_attempts`, `tool_output_prompt_max_chars`, `content_preview_chars`, `tool_arguments_preview_chars`, `call_record_preview_chars`, `call_record_list_limit`, `call_record_hard_limit`, `persist_full_io`, `json_instruction`, `fallback_status_codes` |
+| `llm` | `default_profile_id`, `profiles`, `temperature`, `max_tokens`, `max_input_tokens_per_call`, `max_total_tokens_per_call`, `context_window_tokens`, `timeout_s`, `max_retries`, `api_mode`, `store`, `safety_identifier`, `prompt_layout`, `prompt_cache_key`, `prompt_cache_retention`, `prompt_cache_mode`, `prompt_cache_ttl`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `fallback_json_actions`, `compatibility_retry_attempts`, `action_repair_attempts`, `tool_output_prompt_max_chars`, `content_preview_chars`, `tool_arguments_preview_chars`, `call_record_preview_chars`, `call_record_list_limit`, `call_record_hard_limit`, `persist_full_io`, `json_instruction`, `fallback_status_codes` |
 | `tools` | `version`, `default_timeout_s`, `standard_timeout_s`, `interactive_timeout_s`, `default_text_encoding`, `tool_observability_preview_chars`, `tool_call_args_hard_limit_bytes`, `tool_result_payload_hard_limit_bytes`, `filesystem_read_max_bytes`, `filesystem_read_hard_limit_bytes`, `directory_entry_limit`, `directory_entry_hard_limit`, `executable_snapshot_sibling_limit`, `memory_payload_chars`, `memory_payload_hard_limit_chars`, `memory_payload_hard_limit_bytes`, `memory_append_entry_max_bytes`, `message_subject_max_chars`, `message_body_max_chars`, `message_payload_max_bytes`, `message_id_max_chars`, `message_read_limit`, `message_read_hard_limit`, `message_filter_ids_hard_limit`, `message_filter_json_max_bytes`, `message_wait_status_max_chars`, `human_request_payload_max_bytes`, `human_output_max_chars`, `human_request_list_limit`, `object_file_max_bytes`, `object_file_hard_limit_bytes`, `shell_timeout_s`, `sandbox_timeout_s`, `jit_source_max_chars`, `jit_tests_max_count`, `jit_test_case_max_bytes`, `jit_validation_timeout_s`, `jit_validation_log_max_chars`, `deno_executable`, `deno_timeout_s`, `deno_timeout_hard_limit_s`, `deno_max_rpc_calls`, `deno_max_stdout_bytes`, `deno_max_stderr_bytes`, `deno_jsr_allowlist`, `static_tool_id_digest_chars`, `approval_preview_chars`, `clock_timezone`, `max_sleep_seconds`, `sleep_timeout_grace_s`, `human_response_payload_max_bytes`, `human_response_max_depth`, `human_response_max_nodes` |
 | `shell` | `policy_capability_key`, `policy_resource`, `default_policy_level`, `timeout_hard_limit_s`, `max_stdout_chars`, `max_stderr_chars`, `stdout_hard_limit_chars`, `stderr_hard_limit_chars`, `rules`, `whitelist`, `blacklist` |
 | `git` | `enabled`, `executable`, `minimum_version`, `repository_resource`, `worktree_root`, `trusted_metadata_roots`, `local_timeout_s`, `remote_timeout_s`, `timeout_hard_limit_s`, `lock_timeout_s`, `status_entry_limit`, `status_entry_hard_limit`, `log_entry_limit`, `log_entry_hard_limit`, `output_max_bytes`, `output_hard_limit_bytes`, `patch_max_bytes`, `patch_hard_limit_bytes`, `state_content_hard_limit_bytes`, `allowed_remote_schemes`, `allow_scp_style_ssh`, `allow_file_remotes`, `inherit_credential_helpers`, `inherit_ssh_agent`, `protect_git_metadata`, `ref_list_limit`, `pull_request_list_limit` |
 | `jsonrpc` | `registry_resource`, `endpoint_id_max_chars`, `method_id_max_chars`, `rpc_method_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `audit_preview_chars`, `header_env_allowlist` |
-| `mcp` | `registry_resource`, `server_id_max_chars`, `tool_id_max_chars`, `mcp_name_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `protocol_probe_timeout_s`, `list_max_pages`, `schema_max_depth`, `schema_max_nodes`, `schema_max_ref_hops`, `schema_max_composition_expansions`, `audit_preview_chars`, `header_env_allowlist`, `stdio_env_allowlist` |
+| `mcp` | `registry_resource`, `server_id_max_chars`, `tool_id_max_chars`, `mcp_name_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `server_page_limit`, `tool_catalog_limit`, `resource_catalog_limit`, `resource_template_limit`, `prompt_catalog_limit`, `provider_capability_limit`, `max_content_blocks`, `max_prompt_messages`, `max_completion_values`, `protocol_probe_timeout_s`, `list_max_pages`, `schema_max_depth`, `schema_max_nodes`, `schema_max_ref_hops`, `schema_max_composition_expansions`, `schema_regex_pattern_max_bytes`, `schema_regex_max_evaluations`, `schema_regex_match_timeout_s`, `connection_idle_ttl_s`, `connection_absolute_ttl_s`, `connection_max_open`, `mrtr_max_rounds`, `mrtr_max_input_requests`, `mrtr_request_state_max_bytes`, `continuation_ttl_s`, `continuation_max_records`, `continuation_terminal_records`, `subscription_max_open`, `subscription_queue_events`, `subscription_event_max_bytes`, `subscription_max_lifetime_s`, `remote_task_poll_min_interval_s`, `remote_task_max_wait_s`, `remote_task_max_records`, `remote_task_terminal_records`, `cursor_handle_limit`, `subscription_terminal_records`, `cache_hint_ttl_cap_ms`, `oauth_enabled`, `oauth_state_ttl_s`, `tasks_extension_enabled`, `tasks_extension_spec_sha256`, `audit_preview_chars`, `header_env_allowlist`, `stdio_env_allowlist` |
 | `image` | `registry_resource`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `manifest_hard_limit_bytes`, `structured_field_hard_limit_bytes`, `max_default_tools`, `max_required_capabilities`, `max_required_modules`, `package_manifest_name`, `package_workspace_dir`, `package_tools_dir`, `package_resources_dir`, `materialized_workspace_root`, `package_manifest_max_bytes`, `package_manifest_hard_limit_bytes`, `package_file_max_bytes`, `package_max_bytes`, `package_max_files`, `prompt_max_chars`, `max_package_jit_tools`, `max_workspace_grants` |
 | `image_commit` | `artifact_version`, `artifact_hard_limit_bytes`, `payload_capture_limit_bytes`, `max_required_capabilities`, `max_committed_tools`, `max_committed_jit_sources`, `metadata_preview_chars` |
 | `memory` | `object_schema_version`, `materialize_budget_tokens`, `query_limit`, `context_policy`, `metadata_sensitivity`, `metadata_retention_policy`, `process_namespace_prefix`, `query_scan_page_size`, `query_scan_ceiling`, `metadata_text_max_chars`, `metadata_collection_max_items`, `metadata_collection_item_max_chars`, `metadata_max_bytes` |
@@ -254,7 +266,7 @@ same change.
 | `modules` | `schema_version`, `manifest_paths`, `trusted_modules`, `trusted_sha256`, `manifest_max_bytes`, `manifest_hard_limit_bytes`, `source_max_bytes`, `package_max_bytes`, `max_package_files`, `load_policy`, `discover_limit`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `entrypoint_max_chars`, `max_declared_tools`, `max_declared_images`, `max_declared_syscalls`, `max_declared_provider_hooks`, `max_declared_startup_hooks` |
 | `launcher` | `permission_presets`, `default_permission_preset`, `read_only_preset`, `edit_preset`, `full_preset` |
 | `scripts` | `ask_file_max_bytes`, `ask_file_max_quanta`, `document_summary_max_bytes`, `document_summary_max_read_bytes`, `document_summary_max_quanta`, `document_context_min_tokens`, `document_context_slack_tokens`, `document_context_max_tokens`, `object_copy_max_quanta`, `llm_write_smoke_max_quanta`, `clock_demo_iterations`, `clock_demo_interval_s`, `clock_demo_timezone`, `chat_max_turns`, `chat_context_tokens`, `chat_quanta_per_turn`, `chat_quanta_overhead` |
-| `semantic` | `mode`, `adapter`, `external_profile_id`, `max_concurrency`, `assessment_timeout_s`, `job_lease_s`, `shutdown_join_timeout_s`, `projection_ttl_s`, `recovery_batch_limit`, `intent_max_chars`, `projection_max_bytes`, `assessment_list_limit`, `assessment_list_hard_limit` |
+| `semantic` | `mode`, `adapter`, `external_profile_id`, `policy_epoch`, `max_concurrency`, `assessment_timeout_s`, `job_lease_s`, `shutdown_join_timeout_s`, `projection_ttl_s`, `recovery_batch_limit`, `intent_max_chars`, `projection_max_bytes`, `assessment_list_limit`, `assessment_list_hard_limit`, `flow_query_limit`, `flow_query_hard_limit`, `settlement_list_limit`, `settlement_list_hard_limit` |
 
 Three fields remain accepted only so existing 1.x configuration files keep
 loading: `runtime.runtime_db_filename`, `tools.sandbox_timeout_s`, and
@@ -293,22 +305,23 @@ Each entry under `llm.profiles.<profile_id>` accepts exactly these fields:
 
 | Profile | Fields |
 | --- | --- |
-| `llm.profiles.<profile_id>` | `kind`, `base_url`, `model`, `api_key_env`, `api_mode`, `timeout_s`, `max_retries`, `store`, `reasoning_effort`, `verbosity`, `safety_identifier`, `safety_identifier_env`, `prompt_cache_key`, `prompt_cache_retention`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `fallback_json_actions`, `temperature`, `max_tokens`, `max_input_tokens_per_call`, `max_total_tokens_per_call`, `context_window_tokens`, `allow_custom_base_url` |
+| `llm.profiles.<profile_id>` | `kind`, `base_url`, `model`, `api_key_env`, `api_mode`, `timeout_s`, `max_retries`, `store`, `reasoning_effort`, `verbosity`, `safety_identifier`, `safety_identifier_env`, `prompt_cache_key`, `prompt_cache_retention`, `prompt_cache_mode`, `prompt_cache_ttl`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `fallback_json_actions`, `temperature`, `max_tokens`, `max_input_tokens_per_call`, `max_total_tokens_per_call`, `context_window_tokens`, `allow_custom_base_url` |
 
 The same test checks this nested inventory. Exact values remain authoritative
 in the live dump and typed source. Optional Runtime
 Modules may also own module-local settings that are not fields of
 `AgentLibOSConfig`.
 
-### Semantic Shadow configuration
+### Semantic Phase 2–4 configuration
 
 Semantic assessment is disabled by default:
 
 ```yaml
 semantic:
-  mode: off
+  mode: "off"
   adapter: deterministic
   external_profile_id: null
+  policy_epoch: null
   max_concurrency: 2
   assessment_timeout_s: 30.0
   job_lease_s: 60.0
@@ -319,16 +332,26 @@ semantic:
   projection_max_bytes: 16384
   assessment_list_limit: 100
   assessment_list_hard_limit: 1000
+  flow_query_limit: 100
+  flow_query_hard_limit: 1000
+  settlement_list_limit: 100
+  settlement_list_hard_limit: 1000
 ```
 
-`mode` is exactly `off` or `shadow`; off performs no capture writes and claims
-no jobs. `adapter` is `deterministic`, `scripted`, or `external`. Scripted is
+`mode` is exactly `off`, `shadow`, `enforce_deny`, or `canary_auto`; off
+performs no capture writes, claims no jobs, and is the global kill switch.
+`enforce_deny` and `canary_auto` require an immutable static `policy_epoch`;
+the latter also requires at least one auto-approval rule and the `external`
+adapter. `adapter` is
+`deterministic`, `scripted`, or `external`. Scripted is
 for deterministic development/test fixtures. An `external_profile_id` is
 forbidden for the other adapters. `max_concurrency` is positive and at most 32;
 assessment, lease, and shutdown-join timeouts are positive, and the lease must
 be at least as long as both timeout values.
-Projection TTL and list limits are positive; the selected list limit cannot
-exceed its hard limit. Recovery/cleanup pages use the positive
+Projection TTL and list limits are positive, and `projection_ttl_s` must be at
+least `job_lease_s`; each assessment, flow, and settlement selected limit
+cannot exceed its hard limit, and the new flow and settlement hard limits
+cannot exceed 1,000. Recovery/cleanup pages use the positive
 `recovery_batch_limit`, capped at 500. The intent bound cannot exceed 2,000
 characters and the encoded projection bound must be from 512 through 16,384
 bytes.
@@ -347,23 +370,53 @@ that root-goal bound but cannot exceed 2,000 characters; it is not a switch
 that enables approval or provider payload export.
 
 An external adapter can be staged while mode is off without resolving a
-profile. Enabling external Shadow requires a configured named profile other
-than `llm.default_profile_id`, with an explicit model, `store: false`,
-`max_retries: 0`, no prompt-cache key/retention, no previous-response chaining,
-and a finite timeout compatible with `semantic.assessment_timeout_s`. The
-runtime freezes the profile snapshot identity and explicit model at assembly;
-assessment rechecks snapshot/resolution/client identity and model/timeout, and
-the Protected Operation revalidates the profile-bound Sink. Drift fails closed
-instead of inheriting permissive default-profile state. This is a
-classifier-only profile; ordinary processes continue to use their own selected
-LLM profiles. See [Semantic Approval and Data
+profile. Enabling any external semantic mode requires a configured named
+profile other than `llm.default_profile_id`, with an explicit model; explicit
+`api_mode: chat` or `api_mode: responses`; `store: false`; `max_retries: 0`;
+`responses_previous_response_id: false`; `fallback_json_actions: false`; and a
+finite timeout compatible with `semantic.assessment_timeout_s`. Prompt caching
+must be disabled both on that profile and in the global `llm` defaults: neither
+level may set a cache key, retention, or TTL; the profile cache mode may only be
+unset or `provider_default`, and the global cache mode must be
+`provider_default`. The runtime freezes the profile snapshot identity and
+explicit model at assembly; assessment rechecks snapshot/resolution/client
+identity and model/timeout, and the Protected Operation revalidates the
+profile-bound Sink. Drift fails closed instead of inheriting permissive
+default-profile state. This is a classifier-only profile; ordinary processes
+continue to use their own selected LLM profiles. See [Semantic Approval and Data
 Identification](semantic_shadow.md#external-classifier-configuration).
 
 Tenant bucketing is intentionally not a YAML setting. The default is no
 bucketer and persisted `tenant_bucket_sha256` remains `null`. An embedded Host
 may inject `semantic_tenant_bucketer=` at Runtime construction and should back
 it with a deployment-keyed HMAC; no CLI, HTTP, GUI, model, Skill, JIT, or Module
-surface can install or replace it.
+surface can install or replace it. `canary_auto` additionally requires the
+policy epoch to pin that exact profile id, the classifier profile identity
+digest, and the classifier model digest. These three classifier identity fields
+must always be supplied together; canary mode requires all three.
+
+`SemanticPolicyEpochV1` is a closed static Host object. It contains
+`schema_version`, `catalog_version`, `epoch_id`, positive `generation`,
+`expected_previous_sha256`, exact `tenant_bucket_sha256s`, closed
+`auto_approval_rules` and `hard_deny_rules`, the optional grouped classifier
+profile id/profile digest/model digest identity, `minimum_confidence_bps`,
+`required_calibration_bucket`, Capability TTL, rate/day/inflight ceilings, and
+`created_at`. It requires at least one rule; auto rules require at least one
+exact tenant digest. Rule ids are unique across both arrays. Catalog v1 permits
+automatic candidates only for `filesystem.read`, `git.read`, and `git.diff`
+with their exact single read-like right.
+
+When generation 1 contains auto-approval rules, its tenant digest set must
+contain exactly one bucket. Later generations may contain more than one exact
+tenant digest, subject to the other static policy and rollout checks.
+
+The confidence floor cannot be below 9,900 basis points, calibration is fixed
+to `very_high`, Capability TTL cannot exceed 300 seconds, and the respective
+rate ceilings cannot exceed 10/minute, 100/day, or 2 inflight. Static
+configuration can only narrow those values. Activation compares the expected
+previous policy digest and durable generation; conflicts fail assembly. There
+is no CLI, HTTP, GUI, model, Skill, JIT, or Module policy activation/revocation
+surface.
 
 Checkpoint snapshot format versions are owned by the runtime codec and are not
 configurable. A runtime release emits only the snapshot version it can decode.
@@ -391,16 +444,25 @@ configurable. A runtime release emits only the snapshot version it can decode.
   fields are excluded from Provider/Sink and client-cache identity; they do not
   claim tokenizer-exact Provider billing or monetary cost control.
 - JSON-RPC/MCP header and stdio allowlists contain exact environment-variable
-  names or trailing-`*` prefix patterns. For example,
-  `AGENT_LIBOS_MCP_*` admits names beginning with `AGENT_LIBOS_MCP_`; `*` has no
-  wildcard meaning anywhere except the final character. Manifests reference
+  names or trailing-`*` prefix patterns. MCP configuration requires each entry
+  to be either a valid environment-variable name or a valid, non-empty prefix
+  followed by exactly one `*`. For example, `AGENT_LIBOS_MCP_*` admits names
+  beginning with `AGENT_LIBOS_MCP_`. A bare `*`, internal or repeated `*`,
+  whitespace, and invalid names are rejected for both MCP allowlists; an empty
+  MCP allowlist is valid and denies every manifest-selected variable.
+  Manifests reference
   those names; resolved secret values must not be persisted in registry rows,
   audit metadata, benchmark provenance, or GUI responses.
-  MCP Manifest v2 additionally requires `protocol_mode` in the manifest itself;
-  it is not a mutable global configuration fallback. Manifest v1 omits that
-  field and is permanently legacy-wire. Header names are checked
-  case-insensitively and cannot override protocol/session/content-negotiation,
-  `Mcp-Param-*`, trace, baggage, or other Host-generated MCP fields.
+  MCP Manifest v2 requires an explicit `protocol_mode`; Manifest v3 requires
+  exact `"2026-07-28"`. Neither is a mutable global configuration fallback.
+  Manifest v1 omits that field and is permanently legacy-wire. Header names
+  are checked case-insensitively. Every version rejects
+  protocol/session/resume, trace, and baggage controls. Manifest v2/v3
+  additionally reject all reserved content-negotiation and `Mcp-Param-*`
+  headers and protocol `_meta` keys;
+  Manifest v1 retains its compatibility support for `Accept`, `Mcp-Param-*`,
+  and application `_meta`, but none of those exceptions permits the common
+  high-risk controls.
 - `mcp.timeout_s` defaults to `10.0` seconds (with a `60.0` second hard limit)
   and is one absolute exchange deadline, not a fresh timeout for each I/O
   stage. DNS queueing and resolution, every resolved-address connect attempt,
@@ -411,8 +473,9 @@ configurable. A runtime release emits only the snapshot version it can decode.
   the remaining deadline. `mcp.max_request_bytes`
   defaults to `65536` and `mcp.max_response_bytes` to `1048576`; provider byte
   counters are cumulative across those phases, must cover the canonical JSON
-  payload, and may not under-report it. The complete live Tool catalog cannot
-  exceed `mcp.list_limit` (100 by default).
+  payload, and may not under-report it. The complete Manifest v1/v2 live Tool
+  catalog cannot exceed the deprecated compatibility setting `mcp.list_limit`
+  (100 by default).
   Stdio additionally caps each response frame at `max_response_bytes`, total
   stdout at four times that value, stderr at that value, each request frame at
   `max_request_bytes`, and total stdin at four times that value. Stdio children
@@ -428,6 +491,56 @@ configurable. A runtime release emits only the snapshot version it can decode.
   `mcp.schema_max_ref_hops: 128`, and
   `mcp.schema_max_composition_expansions: 1024`. These are Host policy caps;
   a server or model cannot raise them at dispatch time.
+  For Manifest v1, v2, and v3, JSON Schema `pattern` and
+  `patternProperties` validation additionally uses a shared maximum of 4,096
+  regex evaluations, a shared 50 ms monotonic matching deadline, and a
+  1,024-byte UTF-8 cap per pattern. These defaults are configured by
+  `mcp.schema_regex_max_evaluations`,
+  `mcp.schema_regex_match_timeout_s`, and
+  `mcp.schema_regex_pattern_max_bytes`. An exhausted budget, timeout, invalid
+  regex, or oversized pattern fails closed before provider dispatch.
+  `mcp.manifest_max_bytes` may be lowered from its 262,144-byte default but may
+  not exceed the shared YAML loader's fixed 1,048,576-byte UTF-8 ceiling.
+- `mcp.list_limit` is accepted only as a deprecated Manifest v1/v2
+  `tools/list` compatibility limit. It is not a fallback for registered-server
+  pages or Manifest v3 Tools. A YAML overlay that explicitly contains the
+  field emits one filterable `AgentLibOSConfigDeprecationWarning` with code
+  `deprecated_mcp_list_limit`; constructing or loading defaults does not emit a
+  warning. Equal or different values do not couple the independent limits:
+  migrate registered-server consumers to `server_page_limit` and Manifest v3
+  Tool catalogs to `tool_catalog_limit`.
+- MCP's modern-client bounds are purpose-specific. `server_page_limit`,
+  `tool_catalog_limit`, `resource_catalog_limit`, `resource_template_limit`,
+  and `prompt_catalog_limit` prevent one catalog from borrowing another's
+  budget. `provider_capability_limit`, `max_content_blocks`,
+  `max_prompt_messages`, and `max_completion_values` bound decoded provider
+  results before they reach a Host consumer. Connections have both idle and
+  absolute TTLs and a global open-count ceiling. MRTR continuations,
+  subscriptions, and remote Tasks have independent count, byte, time, and
+  queue limits; exhausted limits fail closed without reconnecting or replaying
+  an operation. `cursor_handle_limit` bounds the opaque cursor vault,
+  `subscription_terminal_records` bounds retained terminal diagnostics, and
+  `cache_hint_ttl_cap_ms` caps untrusted provider cache-hint TTLs. The modern
+  client does not implement a response-body cache.
+- Pre-release names `cache_max_entries`, `cache_max_bytes`,
+  `cache_ttl_cap_ms`, and `cache_public_cross_principal` are no longer accepted;
+  the strict configuration loader rejects them as unknown keys. Move opaque
+  cursor and terminal-diagnostic bounds to `cursor_handle_limit` and
+  `subscription_terminal_records`, and move the provider hint TTL cap to
+  `cache_hint_ttl_cap_ms`. There is no replacement response-cache setting
+  because no response-body cache exists.
+- OAuth and the digest-pinned Tasks extension are disabled by default.
+  Enabling Tasks requires `tasks_extension_spec_sha256` to be an exact
+  lowercase SHA-256 pin; a server-advertised digest cannot select or update it.
+  OAuth credentials and tokens are supplied by a Host credential broker and
+  are not configuration-file fields. The default system broker recognizes only
+  the reviewed `keyring==25.7.0` OS implementations listed in the support
+  matrix; Chainer/plugin/third-party backends and unreviewed versions fail
+  closed even when they advertise a positive priority. A Host-approved custom
+  secure store must be supplied explicitly as the caller-owned
+  `substrate.mcp_credential_broker` SPI. Provider cache hints are diagnostics
+  and never authorize reuse, cross-principal sharing, or retention of response
+  bodies.
 - `tools.shell_timeout_s` defaults to `30.0` seconds and
   `shell.timeout_hard_limit_s` to `300.0`. Provider timeout and subprocess-limit
   failures are recognized through their causal wrapper chain, charged once to
@@ -456,8 +569,11 @@ configurable. A runtime release emits only the snapshot version it can decode.
   startup. See [Git Provider and Primitive](git.md).
 - `llm.persist_full_io` defaults to true. Set it to false when the deployment's
   user agreement does not authorize retention of full prompts, tool schemas,
-  reasoning, outputs, successful response content, and raw provider response
-  fields. Provider and extension exception text is never persisted or exposed
+  reasoning, outputs, successful response content, and the bounded
+  provider-response projection stored in the `raw_response` field. That field
+  is not a byte-for-byte SDK response: sensitive and opaque values are hashed
+  and oversized structures are replaced by omission metadata and a digest.
+  Provider and extension exception text is never persisted or exposed
   to the model, regardless of this setting. The opt-out persists canonical
   content-free summary envelopes containing byte counts,
   JSON shape/count metadata when available, and hashes rather than readable
@@ -502,7 +618,7 @@ configurable. A runtime release emits only the snapshot version it can decode.
   increase provider retention.
 - `runtime.launch_authority_mode: manifest_required` treats image capability
   requirements as declarations, not grants. It is the only accepted value in
-  the current 1.1.x contract.
+  the current 1.x contract.
 - `runtime.publication_recovery_max_attempts` bounds durable compensation
   retries. Exceeding it persists a `manual` publication disposition and fails
   every startup closed instead of silently repeating an uncertain cleanup

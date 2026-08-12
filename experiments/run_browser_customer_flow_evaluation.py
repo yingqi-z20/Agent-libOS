@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
+from agent_libos.config import DEFAULT_CONFIG
 from benchmarks.browser_customer_workflows import (
     RELEASE_REPETITIONS,
     report_release_gate_passed,
@@ -47,7 +49,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--artifacts-root",
         help=(
-            "Optional new directory retaining synthetic browser state and v4 "
+            "Optional new directory retaining synthetic browser state and v7 "
             "Runtime databases. Omit it for automatic temporary cleanup."
         ),
     )
@@ -69,6 +71,12 @@ def main(argv: list[str] | None = None) -> None:
             "3/3 and customer-flow utility at least 2/3."
         ),
     )
+    parser.add_argument(
+        "--prompt-layout",
+        choices=("legacy_v1", "cache_optimized_v2"),
+        default=DEFAULT_CONFIG.llm.prompt_layout,
+        help="Model prompt layout used for this paired evaluation arm.",
+    )
     args = parser.parse_args(argv)
     if not args.confirm_real_llm:
         parser.error("--confirm-real-llm is required to spend real LLM tokens")
@@ -86,6 +94,10 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--max-quanta must be greater than --phase-one-quanta")
 
     output = Path(args.output).resolve()
+    config = replace(
+        DEFAULT_CONFIG,
+        llm=replace(DEFAULT_CONFIG.llm, prompt_layout=args.prompt_layout),
+    )
     artifacts_root = (
         Path(args.artifacts_root).resolve() if args.artifacts_root else None
     )
@@ -106,6 +118,7 @@ def main(argv: list[str] | None = None) -> None:
                 max_quanta=args.max_quanta,
                 confirm_real_llm=True,
                 confirm_browser=True,
+                config=config,
             )
             report["artifacts_root"] = str(artifacts_root)
         else:
@@ -119,6 +132,7 @@ def main(argv: list[str] | None = None) -> None:
                     max_quanta=args.max_quanta,
                     confirm_real_llm=True,
                     confirm_browser=True,
+                    config=config,
                 )
         rendered = artifact.commit(report)
     print(rendered, end="")

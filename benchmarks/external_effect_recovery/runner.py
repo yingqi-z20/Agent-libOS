@@ -19,7 +19,6 @@ from agent_libos.models import ExternalEffectRecoveryQuery
 from agent_libos.runtime import RuntimeBuilder
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import sqlite as sqlite_storage
-from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS, _V5_REQUIRED_COLUMNS
 from agent_libos.storage.sqlite import SQLiteStore
 from agent_libos.utils.serde import dumps
 
@@ -131,18 +130,11 @@ _EXTERNAL_EFFECT_SCHEMA_CATALOG_INDEXES = (
     _EXTERNAL_EFFECT_SCHEMA_INDEXES
     | {"sqlite_autoindex_external_effects_1"}
 )
-_SQLITE_V4_MANIFEST_TABLES = tuple(sorted(_V4_REQUIRED_COLUMNS))
-_SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE = (
-    "SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN ("
-    + ", ".join("?" for _ in _SQLITE_V4_MANIFEST_TABLES)
-    + ")"
+_SQLITE_SCHEMA_CATALOG_PROBE_RE = re.compile(
+    r"SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN "
+    r"\(\?(?:, \?)+\)"
 )
-_SQLITE_V5_MANIFEST_TABLES = tuple(sorted(_V5_REQUIRED_COLUMNS))
-_SQLITE_V5_MANIFEST_SCHEMA_PROBE_SHAPE = (
-    "SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN ("
-    + ", ".join("?" for _ in _SQLITE_V5_MANIFEST_TABLES)
-    + ")"
-)
+_SQLITE_SCHEMA_IDENTIFIER_RE = re.compile(r"[a-z][a-z0-9_]*")
 _GLOBAL_PATCH_SCOPE_LOCK = threading.RLock()
 
 
@@ -858,6 +850,8 @@ def _handler_select_kind(sql: str) -> str | None:
 
 
 def _handler_statement_kind(sql: str) -> str | None:
+    if _is_canonical_schema_catalog_probe(sql):
+        return "manifest_schema_probe"
     select_kind = _handler_select_kind(sql)
     if select_kind is not None:
         return select_kind
@@ -869,27 +863,8 @@ def _handler_statement_kind(sql: str) -> str | None:
 def _startup_statement_kind(sql: str) -> str | None:
     normalized = " ".join(str(sql).upper().split()).rstrip(";")
     normalized_literals = _SQL_TEXT_LITERAL_RE.sub("?", normalized)
-    manifest_tables = tuple(
-        literal[1:-1].replace("''", "'")
-        for literal in _SQL_TEXT_LITERAL_RE.findall(str(sql))
-    )
-    for version, expected_shape, expected_tables in (
-        (
-            4,
-            _SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE,
-            _SQLITE_V4_MANIFEST_TABLES,
-        ),
-        (
-            5,
-            _SQLITE_V5_MANIFEST_SCHEMA_PROBE_SHAPE,
-            _SQLITE_V5_MANIFEST_TABLES,
-        ),
-    ):
-        if (
-            normalized_literals == expected_shape
-            and manifest_tables == expected_tables
-        ):
-            return f"v{version}_manifest_schema_probe"
+    if _is_canonical_schema_catalog_probe(sql):
+        return "manifest_schema_probe"
     if re.fullmatch(
         r"SELECT NAME, SQL FROM SQLITE_MASTER WHERE TYPE = \?"
         r" AND NAME IN \(\?(?:, \?)*\)",
@@ -927,6 +902,37 @@ def _startup_statement_kind(sql: str) -> str | None:
         if index_name in _EXTERNAL_EFFECT_SCHEMA_INDEXES:
             return f"schema_index:{index_name}"
     return None
+
+
+def _is_canonical_schema_catalog_probe(sql: str) -> bool:
+    """Recognize only the store's sorted, full-catalog introspection shape.
+
+    The benchmark is interested in domain-table work, not the canonical
+    schema validator reading ``sqlite_master``.  Matching a versioned table
+    tuple made every additive schema release look like an unreviewed domain
+    query.  The validator's SQL shape is stable: it selects only ``name`` and
+    ``type``, uses a literal ``IN`` list, and emits sorted unique canonical
+    identifiers including the schema marker.  No statement that reads rows
+    from ``external_effects`` can satisfy this full match.
+    """
+
+    raw_sql = str(sql)
+    normalized = " ".join(raw_sql.upper().split()).rstrip(";")
+    normalized_literals = _SQL_TEXT_LITERAL_RE.sub("?", normalized)
+    if _SQLITE_SCHEMA_CATALOG_PROBE_RE.fullmatch(normalized_literals) is None:
+        return False
+    table_names = tuple(
+        literal[1:-1].replace("''", "'")
+        for literal in _SQL_TEXT_LITERAL_RE.findall(raw_sql)
+    )
+    return (
+        "runtime_schema" in table_names
+        and table_names == tuple(sorted(set(table_names)))
+        and all(
+            _SQLITE_SCHEMA_IDENTIFIER_RE.fullmatch(name) is not None
+            for name in table_names
+        )
+    )
 
 
 def _normalize_handler_select(sql: str) -> str:
@@ -990,12 +996,12 @@ def _strip_sql_comments(sql: str) -> str:
 def _assert_startup_statement_contract(actual: Counter[str]) -> None:
     # Existing-store validation first runs against an isolated safety snapshot,
     # then repeats on the measured main connection to close the snapshot/open
-    # race.  The latter includes the canonical v5 full-catalog probes below.
+    # race.  The latter includes one canonical full-catalog probe below.
     expected = Counter(
         {
             "schema_probe": 1,
             "keyset_collation_schema_probe": 1,
-            "v5_manifest_schema_probe": 1,
+            "manifest_schema_probe": 1,
             "catalog_table_xinfo": 1,
             "catalog_foreign_key_list": 1,
             "catalog_index_list": 1,

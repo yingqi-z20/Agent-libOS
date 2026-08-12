@@ -930,14 +930,24 @@ class BaseAgentTool(ABC, Generic[InputT]):
     expose_internal_errors: ClassVar[bool] = False
     enforce_timeout: ClassVar[bool] = True
 
-    def spec(self, *, config: AgentLibOSConfig | None = None) -> ToolSpec:
+    def spec(
+        self,
+        *,
+        config: AgentLibOSConfig | None = None,
+        model_visible: bool = False,
+    ) -> ToolSpec:
         self._validate_contract()
         selected_config = config or DEFAULT_CONFIG
         policy = self.policy.model_dump()
         _apply_runtime_policy_overrides(policy, selected_config)
         input_schema = self.args_schema.model_json_schema()
         _strip_internal_schema_fields(input_schema)
-        _apply_runtime_schema_overrides(self.name, input_schema, selected_config)
+        _apply_runtime_schema_overrides(
+            self.name,
+            input_schema,
+            selected_config,
+            model_visible=model_visible,
+        )
         return ToolSpec(
             name=self.name,
             description=self.description,
@@ -952,11 +962,11 @@ class BaseAgentTool(ABC, Generic[InputT]):
         )
 
     def to_openai_chat_tool(self, *, config: AgentLibOSConfig | None = None) -> dict[str, Any]:
-        spec = self.spec(config=config)
+        spec = self.spec(config=config, model_visible=True)
         return openai_chat_tool_schema(spec.name, spec.description, spec.input_schema)
 
     def to_mcp_tool(self, *, config: AgentLibOSConfig | None = None) -> dict[str, Any]:
-        spec = self.spec(config=config)
+        spec = self.spec(config=config, model_visible=True)
         return {
             "name": spec.name,
             "description": spec.description,
@@ -1426,13 +1436,23 @@ def _runtime_tool_config(ctx: ToolContext) -> AgentLibOSConfig:
     return selected if isinstance(selected, AgentLibOSConfig) else DEFAULT_CONFIG
 
 
-def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: AgentLibOSConfig) -> None:
+def _apply_runtime_schema_overrides(
+    name: str,
+    schema: dict[str, Any],
+    config: AgentLibOSConfig,
+    *,
+    model_visible: bool = False,
+) -> None:
     properties = schema.get("properties")
     if not isinstance(properties, dict):
         return
-    tools = config.tools
-    shell = config.shell
-    runtime = config.runtime
+    _apply_model_visible_schema_overrides(
+        name,
+        schema,
+        properties,
+        config,
+        model_visible=model_visible,
+    )
 
     if _apply_checkpoint_schema_overrides(name, properties, config):
         return
@@ -1440,7 +1460,43 @@ def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: A
         return
     if _apply_registry_schema_overrides(name, properties, config):
         return
+    if _apply_data_tool_schema_overrides(name, properties, config):
+        return
+    _apply_interaction_tool_schema_overrides(name, properties, config)
 
+
+def _apply_model_visible_schema_overrides(
+    name: str,
+    schema: dict[str, Any],
+    properties: dict[str, Any],
+    config: AgentLibOSConfig,
+    *,
+    model_visible: bool,
+) -> None:
+    if name == "process_exit" and model_visible:
+        _apply_process_exit_schema_projection(schema, properties, config)
+    if (
+        name != "send_process_message"
+        or not model_visible
+        or config.llm.prompt_layout != "cache_optimized_v2"
+        or "recipient_pid" not in properties
+    ):
+        return
+    properties["recipient"] = properties.pop("recipient_pid")
+    required = schema.get("required")
+    if isinstance(required, list):
+        schema["required"] = [
+            "recipient" if field == "recipient_pid" else field
+            for field in required
+        ]
+
+
+def _apply_data_tool_schema_overrides(
+    name: str,
+    properties: dict[str, Any],
+    config: AgentLibOSConfig,
+) -> bool:
+    tools = config.tools
     if name in {"read_text_file", "read_file_bytes"}:
         _set_property_default(properties, "encoding", tools.default_text_encoding)
         _set_number_bounds(
@@ -1449,8 +1505,10 @@ def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: A
             default=tools.filesystem_read_max_bytes,
             maximum=tools.filesystem_read_hard_limit_bytes,
         )
+        return True
     elif name == "read_directory":
         _set_number_bounds(properties, "limit", default=tools.directory_entry_limit, maximum=tools.directory_entry_hard_limit)
+        return True
     elif name == "create_object_from_file":
         _set_property_default(properties, "encoding", tools.default_text_encoding)
         effective_max_bytes = min(
@@ -1463,8 +1521,10 @@ def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: A
             default=min(tools.object_file_max_bytes, effective_max_bytes),
             maximum=effective_max_bytes,
         )
+        return True
     elif name == "write_object_to_file":
         _set_property_default(properties, "encoding", tools.default_text_encoding)
+        return True
     elif name == "read_memory_object":
         _set_number_bounds(
             properties,
@@ -1472,9 +1532,22 @@ def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: A
             default=tools.memory_payload_chars,
             maximum=tools.memory_payload_hard_limit_chars,
         )
+        return True
     elif name in {"read_process_messages", "receive_process_messages"}:
         _set_number_bounds(properties, "limit", default=tools.message_read_limit, maximum=tools.message_read_hard_limit)
-    elif name == "run_shell_command":
+        return True
+    return False
+
+
+def _apply_interaction_tool_schema_overrides(
+    name: str,
+    properties: dict[str, Any],
+    config: AgentLibOSConfig,
+) -> None:
+    tools = config.tools
+    shell = config.shell
+    runtime = config.runtime
+    if name == "run_shell_command":
         _set_number_bounds(
             properties,
             "timeout_s",
@@ -1496,6 +1569,36 @@ def _apply_runtime_schema_overrides(name: str, schema: dict[str, Any], config: A
         _set_property_default(properties, "channel", runtime.terminal_channel)
     elif name == "request_permission":
         _set_property_default(properties, "human", runtime.default_human)
+
+
+def _apply_process_exit_schema_projection(
+    schema: dict[str, Any],
+    properties: dict[str, Any],
+    config: AgentLibOSConfig,
+) -> None:
+    evidence = properties.get("completion_evidence")
+    definitions = schema.get("$defs")
+    if not isinstance(evidence, dict) or not isinstance(definitions, dict):
+        return
+    if config.llm.prompt_layout == "cache_optimized_v2":
+        evidence["anyOf"] = [
+            {"$ref": "#/$defs/CompactProcessCompletionEvidence"},
+            {"type": "null"},
+        ]
+        evidence["description"] = (
+            "Completion evidence for the fresh review: one status, evidence tool "
+            "list, and summary per ordered semantic requirement, followed by final "
+            "verification tools. Host identities are bound by review_token and order."
+        )
+        definitions.pop("ProcessCompletionEvidence", None)
+        definitions.pop("CompletionAcceptanceCheck", None)
+        return
+    evidence["anyOf"] = [
+        {"$ref": "#/$defs/ProcessCompletionEvidence"},
+        {"type": "null"},
+    ]
+    definitions.pop("CompactProcessCompletionEvidence", None)
+    definitions.pop("CompactCompletionAcceptanceCheck", None)
 
 
 def _apply_checkpoint_schema_overrides(
@@ -1524,7 +1627,7 @@ def _apply_registry_schema_overrides(
     limits = {
         "list_memory_namespace": (None, config.memory.query_limit),
         "list_jsonrpc_endpoints": (None, config.jsonrpc.list_limit),
-        "list_mcp_servers": (None, config.mcp.list_limit),
+        "list_mcp_servers": (None, config.mcp.server_page_limit),
         "list_capabilities": (
             config.capability.list_limit,
             config.capability.list_limit,
@@ -1600,6 +1703,13 @@ def _apply_runtime_arg_defaults(name: str, args: dict[str, Any], config: AgentLi
     tools = config.tools
     shell = config.shell
     runtime = config.runtime
+
+    if (
+        name == "send_process_message"
+        and "recipient" in args
+        and "recipient_pid" not in args
+    ):
+        args["recipient_pid"] = args.pop("recipient")
 
     if _apply_git_arg_defaults(name, args, config):
         return args

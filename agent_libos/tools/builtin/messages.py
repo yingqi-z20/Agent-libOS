@@ -52,7 +52,10 @@ class ProcessMessageInfo(BaseModel):
 
 
 class ModelProcessMessageInfo(BaseModel):
-    message_id: str
+    message_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     sender: str
     kind: str
     channel: str
@@ -65,7 +68,12 @@ class ModelProcessMessageInfo(BaseModel):
 
 
 class SendProcessMessageArgs(BaseModel):
-    recipient_pid: str = Field(description="Target process id. Must be self, parent, or a direct child.")
+    recipient_pid: str = Field(
+        description=(
+            "Semantic target 'self' or 'parent', or an exact direct-child process "
+            "id obtained from a child list/inspect result."
+        )
+    )
     kind: str = Field(default=ProcessMessageKind.NORMAL.value, description="Message kind: normal or interrupt.")
     channel: str = Field(default="default", description="Mailbox channel for selective receive.")
     correlation_id: str | None = Field(default=None, description="Optional conversation/request correlation id.")
@@ -151,15 +159,27 @@ class SendProcessMessageTool(SyncAgentTool[SendProcessMessageArgs]):
     )
     tags = ["process", "message"]
 
-    def run(self, args: SendProcessMessageArgs, ctx: ToolContext) -> SendProcessMessageOutput:
+    def run(self, args: SendProcessMessageArgs, ctx: ToolContext) -> ToolResult:
         runtime = ctx.runtime
         if runtime is None:
             raise ToolExecutionError("Runtime is unavailable.", code=ToolErrorCode.EXECUTION_ERROR)
         source_oids, source_labels, source_context = _flow_sources(ctx)
+        semantic_target = args.recipient_pid.strip()
+        recipient_pid = semantic_target
+        if semantic_target == "self":
+            recipient_pid = ctx.pid
+        elif semantic_target == "parent":
+            parent_pid = runtime.process.get(ctx.pid).parent_pid
+            if not parent_pid:
+                raise ToolExecutionError(
+                    "The current process has no parent target.",
+                    code=ToolErrorCode.VALIDATION_ERROR,
+                )
+            recipient_pid = parent_pid
         try:
             message = runtime.messages.send_from_process(
                 ctx.pid,
-                args.recipient_pid,
+                recipient_pid,
                 kind=ProcessMessageKind(args.kind),
                 channel=args.channel,
                 correlation_id=args.correlation_id,
@@ -177,7 +197,7 @@ class SendProcessMessageTool(SyncAgentTool[SendProcessMessageArgs]):
                 code=ToolErrorCode.VALIDATION_ERROR,
                 details={"kind": args.kind, "allowed": [kind.value for kind in ProcessMessageKind]},
             ) from exc
-        return SendProcessMessageOutput(
+        output = SendProcessMessageOutput(
             message_id=message.message_id,
             recipient_pid=message.recipient_pid,
             kind=message.kind.value,
@@ -185,6 +205,25 @@ class SendProcessMessageTool(SyncAgentTool[SendProcessMessageArgs]):
             correlation_id=message.correlation_id,
             reply_to=message.reply_to,
             subject=message.subject,
+        )
+        model_data = {
+            "recipient": (
+                semantic_target
+                if semantic_target in {"self", "parent"}
+                else message.recipient_pid
+            ),
+            "kind": message.kind.value,
+            "channel": message.channel,
+            "correlation_id": message.correlation_id,
+            "reply_to": message.reply_to,
+            "subject": message.subject,
+        }
+        # This identifier is actionable: the visible message tools consume it
+        # through ``reply_to`` and ``message_ids`` for exact correlation.
+        model_data["message_id"] = message.message_id
+        return ToolResult.success(
+            data=output.model_dump(),
+            model_data=model_data,
         )
 
 
@@ -335,9 +374,10 @@ def _model_message_info(
     message: ProcessMessage,
     *,
     acknowledged: bool = False,
+    expose_message_id: bool = True,
 ) -> ModelProcessMessageInfo:
     return ModelProcessMessageInfo(
-        message_id=message.message_id,
+        message_id=message.message_id if expose_message_id else None,
         sender=message.sender,
         kind=message.kind.value,
         channel=message.channel,
@@ -408,6 +448,8 @@ def _bounded_message_result(
         omitted_count=omitted_count,
         acked_message_ids=predicted_acked_ids,
         acknowledge_selected=ack,
+        expose_message_ids=True,
+        expose_acked_message_ids=not _cache_optimized_v2(runtime),
     )
 
     # Label observation is evidence/provenance materialization, so perform it
@@ -461,12 +503,6 @@ def _select_messages_for_result(
             acked_message_ids=acked_ids,
             acknowledge_selected=ack,
         )
-        estimate = _result_envelope_size(
-            runtime,
-            ctx,
-            tool_name=tool_name,
-            output=output,
-        )
         model_output = _model_message_output(
             tool_name=tool_name,
             ready=ready,
@@ -474,8 +510,16 @@ def _select_messages_for_result(
             omitted_count=omitted_count,
             acked_message_ids=acked_ids,
             acknowledge_selected=ack,
+            expose_message_ids=True,
+            expose_acked_message_ids=not _cache_optimized_v2(runtime),
         )
-        estimate = max(estimate, json_size_bytes(model_output.model_dump()))
+        estimate = _result_envelope_size(
+            runtime,
+            ctx,
+            tool_name=tool_name,
+            output=output,
+            model_projection=model_output.model_dump(),
+        )
         # A received labelled message creates one metadata-only Object carrier.
         # Its source ref is small and fixed-width; reserve more than the encoded
         # ref plus the maximum possible aggregate label identity expansion.
@@ -526,14 +570,22 @@ def _model_message_output(
     omitted_count: int,
     acked_message_ids: list[str],
     acknowledge_selected: bool,
+    expose_message_ids: bool,
+    expose_acked_message_ids: bool,
 ) -> ModelReadProcessMessagesOutput:
     return ModelReadProcessMessagesOutput(
         ready=ready,
         messages=[
-            _model_message_info(message, acknowledged=acknowledge_selected)
+            _model_message_info(
+                message,
+                acknowledged=acknowledge_selected,
+                expose_message_id=expose_message_ids,
+            )
             for message in selected
         ],
-        acked_message_ids=acked_message_ids,
+        acked_message_ids=(
+            acked_message_ids if expose_acked_message_ids else []
+        ),
         has_more=omitted_count > 0,
         omitted_count=omitted_count,
         continuation=(
@@ -551,6 +603,19 @@ def _message_result_limit(runtime: Any) -> int:
     )
 
 
+def _cache_optimized_v2(runtime: Any) -> bool:
+    return (
+        str(
+            getattr(
+                getattr(getattr(runtime, "config", None), "llm", None),
+                "prompt_layout",
+                "legacy_v1",
+            )
+        )
+        == "cache_optimized_v2"
+    )
+
+
 def _result_envelope_size(
     runtime: Any,
     ctx: ToolContext,
@@ -558,6 +623,7 @@ def _result_envelope_size(
     tool_name: str,
     output: ReadProcessMessagesOutput,
     metadata: dict[str, Any] | None = None,
+    model_projection: Any | None = None,
 ) -> int:
     result_metadata = dict(metadata or {})
     result_metadata.update(
@@ -573,16 +639,17 @@ def _result_envelope_size(
     )
     current_context = runtime.data_flow.current_context()
     result_metadata.setdefault("data_flow_context", current_context.to_dict())
-    return json_size_bytes(
-        {
-            "tool_id": str(ctx.metadata.get("tool_id") or ("tool_" + "x" * 128)),
-            "tool_name": tool_name,
-            "result": output.model_dump(),
-            "content": "",
-            "artifacts": [],
-            "metadata": result_metadata,
-        }
-    )
+    envelope = {
+        "tool_id": str(ctx.metadata.get("tool_id") or ("tool_" + "x" * 128)),
+        "tool_name": tool_name,
+        "result": output.model_dump(),
+        "content": "",
+        "artifacts": [],
+        "metadata": result_metadata,
+    }
+    if model_projection is not None:
+        envelope["model_projection"] = model_projection
+    return json_size_bytes(envelope)
 
 
 def _ensure_message_result_fits(
@@ -593,15 +660,17 @@ def _ensure_message_result_fits(
     result: ToolResult,
 ) -> None:
     output = ReadProcessMessagesOutput.model_validate(result.data)
+    limit = _message_result_limit(runtime)
+    model_projection = result.model_projection(limit_bytes=limit)
     size = _result_envelope_size(
         runtime,
         ctx,
         tool_name=tool_name,
         output=output,
         metadata=result.metadata,
+        model_projection=model_projection,
     )
-    limit = _message_result_limit(runtime)
-    model_size = json_size_bytes(result.model_projection(limit_bytes=limit))
+    model_size = json_size_bytes(model_projection)
     if max(size, model_size) > limit:
         raise ToolExecutionError(
             "Process message response exceeds the durable result budget; no messages were acknowledged.",

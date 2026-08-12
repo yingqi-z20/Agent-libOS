@@ -8,7 +8,7 @@ import math
 import re
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Protocol, TypeVar
 
@@ -22,7 +22,7 @@ from agent_libos.models import (
     integrity_rank,
     sensitivity_rank,
 )
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.models.semantic import (
     SEMANTIC_PROVIDER_RESPONSE_SCHEMA,
     SemanticAssessment,
@@ -99,6 +99,44 @@ class SemanticAssessmentDeadlineExceeded(RuntimeError):
     retryable = False
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class HostSemanticAssessmentInvocation:
+    """Ephemeral Host envelope for classifier DataFlow provenance.
+
+    The envelope intentionally has no serialization surface and is never
+    persisted in a semantic job or assessment.  It exists solely to carry the
+    live source references from a capture point to the protected-operation
+    DataFlow preflight in the same Runtime process.
+    """
+
+    request: SemanticAssessmentRequest
+    data_flow_context: DataFlowContext
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, SemanticAssessmentRequest):
+            raise TypeError("semantic Host invocation request is invalid")
+        if not isinstance(self.data_flow_context, DataFlowContext):
+            raise TypeError("semantic Host invocation DataFlow context is invalid")
+        if (
+            self.data_flow_context.labels.to_dict()
+            != self.request.data_labels.to_dict()
+        ):
+            raise CapabilityDenied(
+                "semantic Host invocation labels do not match the request"
+            )
+        if (
+            self.request.source_refs_sha256 is None
+            or self.data_flow_context.source_refs_hash()
+            != self.request.source_refs_sha256
+        ):
+            raise CapabilityDenied(
+                "semantic Host invocation sources do not match the request"
+            )
+
+    def __reduce__(self) -> Any:
+        raise TypeError("semantic Host invocation is not serializable")
+
+
 @dataclass(frozen=True)
 class SemanticUsageTelemetry:
     """Payload-free, strictly validated classifier usage for one dispatch."""
@@ -142,8 +180,8 @@ class ProtectedSemanticAssessmentCall:
     response_schema_sha256: str
     deadline_at: str
     sink: DataSink
-    data_flow_context: DataFlowContext
-    egress_payload: Mapping[str, Any]
+    data_flow_context: DataFlowContext = field(repr=False)
+    egress_payload: Mapping[str, Any] = field(repr=False)
     operation: str = "semantic.llm.assess"
     effect: str = "llm.complete"
     data_flow_request_release: bool = False
@@ -289,11 +327,69 @@ class ExternalLLMSemanticAssessor:
             raise TypeError("now must be callable")
 
     def assess(self, request: SemanticAssessmentRequest) -> SemanticAssessment:
+        """Compatibility surface limited to a provably empty source set.
+
+        Production workers call :meth:`assess_host`; this method remains for
+        isolated adapters/tests and cannot silently discard non-empty source
+        references.
+        """
+
+        if not isinstance(request, SemanticAssessmentRequest):
+            raise TypeError("semantic assessment request has an invalid type")
+        empty = DataFlowContext(labels=request.data_labels)
+        if request.source_refs_sha256 != empty.source_refs_hash():
+            raise CapabilityDenied(
+                "semantic external assessment requires live source references"
+            )
+        return self.assess_host(
+            HostSemanticAssessmentInvocation(
+                request=request,
+                data_flow_context=empty,
+            )
+        )
+
+    def assess_host(
+        self,
+        invocation: HostSemanticAssessmentInvocation,
+    ) -> SemanticAssessment:
+        """Production Host path carrying transient source refs to preflight."""
+
+        if not isinstance(invocation, HostSemanticAssessmentInvocation):
+            raise TypeError("semantic Host assessment invocation is invalid")
+        return self._assess_guarded(
+            invocation.request,
+            data_flow_context=invocation.data_flow_context,
+        )
+
+    def assess_with_flow(
+        self,
+        request: SemanticAssessmentRequest,
+        *,
+        data_flow_context: DataFlowContext,
+    ) -> SemanticAssessment:
+        """Deprecated Host alias retained for internal source compatibility."""
+
+        return self.assess_host(
+            HostSemanticAssessmentInvocation(
+                request=request,
+                data_flow_context=data_flow_context,
+            )
+        )
+
+    def _assess_guarded(
+        self,
+        request: SemanticAssessmentRequest,
+        *,
+        data_flow_context: DataFlowContext | None,
+    ) -> SemanticAssessment:
         if getattr(self._usage_local, "assessment_active", False) is True:
             raise RuntimeError("semantic assessment calls must not be reentrant")
         self._usage_local.assessment_active = True
         try:
-            return self._assess_once(request)
+            return self._assess_once(
+                request,
+                data_flow_context=data_flow_context,
+            )
         finally:
             if hasattr(self._usage_local, "assessment_active"):
                 del self._usage_local.assessment_active
@@ -301,6 +397,8 @@ class ExternalLLMSemanticAssessor:
     def _assess_once(
         self,
         request: SemanticAssessmentRequest,
+        *,
+        data_flow_context: DataFlowContext | None,
     ) -> SemanticAssessment:
         self.take_last_usage_telemetry()
         if not isinstance(request, SemanticAssessmentRequest):
@@ -358,6 +456,11 @@ class ExternalLLMSemanticAssessor:
             identity=f"llm:{resolved.profile_id}",
             identity_sha256=resolved.identity_sha256,
         )
+        protected_flow = self._protected_flow_context(
+            request,
+            projection_labels=projection.data_flow_labels,
+            live=data_flow_context,
+        )
         call = ProtectedSemanticAssessmentCall(
             pid=request.pid,
             actor=request.pid,
@@ -370,7 +473,7 @@ class ExternalLLMSemanticAssessor:
             response_schema_sha256=response_schema_sha256,
             deadline_at=request.deadline_at,
             sink=sink,
-            data_flow_context=DataFlowContext(labels=projection.data_flow_labels),
+            data_flow_context=protected_flow,
             egress_payload=projection_payload,
         )
         messages = self._messages(projection_json)
@@ -441,6 +544,37 @@ class ExternalLLMSemanticAssessor:
                 "protected semantic call did not return its single dispatched result"
             )
         return protected_result
+
+    @staticmethod
+    def _protected_flow_context(
+        request: SemanticAssessmentRequest,
+        *,
+        projection_labels: DataLabels,
+        live: DataFlowContext | None,
+    ) -> DataFlowContext:
+        if live is None:
+            empty = DataFlowContext(labels=request.data_labels)
+            if request.source_refs_sha256 != empty.source_refs_hash():
+                raise CapabilityDenied(
+                    "semantic classifier egress has no live source references"
+                )
+            live = empty
+        if live.labels.to_dict() != request.data_labels.to_dict():
+            raise CapabilityDenied(
+                "semantic live DataFlow labels changed before classifier egress"
+            )
+        if (
+            request.source_refs_sha256 is not None
+            and live.source_refs_hash() != request.source_refs_sha256
+        ):
+            raise CapabilityDenied(
+                "semantic live DataFlow sources changed before classifier egress"
+            )
+        return DataFlowContext(
+            labels=projection_labels,
+            source_refs=live.source_refs,
+            materialization_id=live.materialization_id,
+        )
 
     def take_last_usage_telemetry(self) -> SemanticUsageTelemetry | None:
         """Consume usage from this thread's most recent completed dispatch."""

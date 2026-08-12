@@ -2,7 +2,7 @@
 name: swe-agent
 description: SWE-Agent inspired coding workflow for fixing, reviewing, and improving software repositories through a compact agent-computer interface.
 license: Apache-2.0
-compatibility: agent-libos==1.4.0
+compatibility: agent-libos==1.5.0
 allowed-tools: read_directory read_text_file write_text_file write_directory run_shell_command get_working_directory set_working_directory parse_pytest_log create_checkpoint diff_checkpoint create_memory_object append_memory_object read_memory_object create_object_from_file write_object_to_file request_permission human_output process_exit
 metadata:
   agent-libos.version: v0
@@ -32,6 +32,10 @@ Use this skill when the goal is to fix, review, or improve a software repository
      searched file and for valid paths containing colons. The Host Shell
      provider must still resolve `rg` from its safe PATH and allow the command;
      activating this Skill does not prove that external dependency is usable.
+     Interpret its ripgrep `returncode`: `0` means at least one match, `1` is
+     the normal no-match result, and any other nonzero value is an execution
+     error. Claim no match only when `output_incomplete=false`, and inspect
+     `stderr` before reporting the negative result.
    - `swe_edit` for exactly one of three modes: non-empty `old_text`, paired
      `start_line`/`end_line`, or `create_if_missing: true`. Every mode requires
      non-empty `path` and an explicit `new_text`; do not mix mode fields.

@@ -1239,7 +1239,7 @@ class ShellAdapter:
                 "high_risk": decision.high_risk,
             }
         )
-        request_id = self.human.query(
+        request_id = self.human.query_authority_request(
             pid=pid,
             human=self.config.runtime.default_human,
             request={
@@ -1254,6 +1254,7 @@ class ShellAdapter:
                 "context": approval_context,
             },
             blocking=True,
+            authority_origin="external_operation",
             source_oids=source_oids,
         )
         raise HumanApprovalRequired(

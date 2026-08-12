@@ -30,7 +30,9 @@ _LEGACY_PROFILE_ENV_KEYS = {
     "OPENAI_ORG_ID",
     "OPENAI_PARALLEL_TOOL_CALLS",
     "OPENAI_PROMPT_CACHE_KEY",
+    "OPENAI_PROMPT_CACHE_MODE",
     "OPENAI_PROMPT_CACHE_RETENTION",
+    "OPENAI_PROMPT_CACHE_TTL",
     "OPENAI_PROJECT",
     "OPENAI_PROJECT_ID",
     "OPENAI_REASONING_EFFORT",
@@ -63,6 +65,8 @@ class _ResolvedLLMPolicy:
     api_mode: str
     store: bool
     prompt_cache_retention: str | None
+    prompt_cache_mode: str
+    prompt_cache_ttl: str | None
     responses_previous_response_id: bool
     fallback_json_actions: bool
 
@@ -302,6 +306,8 @@ class LLMProfileRegistry:
                 "api_mode": policy.api_mode,
                 "store": policy.store,
                 "prompt_cache_retention": policy.prompt_cache_retention,
+                "prompt_cache_mode": policy.prompt_cache_mode,
+                "prompt_cache_ttl": policy.prompt_cache_ttl,
                 "responses_previous_response_id": policy.responses_previous_response_id,
                 "fallback_json_actions": policy.fallback_json_actions,
                 "api_key_env": profile.api_key_env,
@@ -470,6 +476,8 @@ class LLMProfileRegistry:
                 or self.config.llm.prompt_cache_key
             ),
             "prompt_cache_retention": policy.prompt_cache_retention,
+            "prompt_cache_mode": policy.prompt_cache_mode,
+            "prompt_cache_ttl": policy.prompt_cache_ttl,
             "responses_previous_response_id": policy.responses_previous_response_id,
             "fallback_json_actions": policy.fallback_json_actions,
             "parallel_tool_calls": (
@@ -539,6 +547,24 @@ class LLMProfileRegistry:
                     else _prompt_cache_retention_env(legacy_env)
                     or self.config.llm.prompt_cache_retention,
                     label="prompt_cache_retention",
+                )
+            ),
+            prompt_cache_mode=(
+                _normalize_prompt_cache_mode(
+                    profile.prompt_cache_mode
+                    if profile.prompt_cache_mode is not None
+                    else _prompt_cache_mode_env(legacy_env)
+                    or self.config.llm.prompt_cache_mode,
+                    label="prompt_cache_mode",
+                )
+            ),
+            prompt_cache_ttl=(
+                _normalize_prompt_cache_ttl(
+                    profile.prompt_cache_ttl
+                    if profile.prompt_cache_ttl is not None
+                    else _prompt_cache_ttl_env(legacy_env)
+                    or self.config.llm.prompt_cache_ttl,
+                    label="prompt_cache_ttl",
                 )
             ),
             responses_previous_response_id=(
@@ -852,6 +878,26 @@ def _prompt_cache_retention_env(env: Mapping[str, str]) -> str | None:
     )
 
 
+def _prompt_cache_mode_env(env: Mapping[str, str]) -> str | None:
+    value = _optional_env(env, "OPENAI_PROMPT_CACHE_MODE")
+    if value is None:
+        return None
+    return _normalize_prompt_cache_mode(
+        value,
+        label="OPENAI_PROMPT_CACHE_MODE",
+    )
+
+
+def _prompt_cache_ttl_env(env: Mapping[str, str]) -> str | None:
+    value = _optional_env(env, "OPENAI_PROMPT_CACHE_TTL")
+    if value is None:
+        return None
+    return _normalize_prompt_cache_ttl(
+        value,
+        label="OPENAI_PROMPT_CACHE_TTL",
+    )
+
+
 def _normalize_prompt_cache_retention(value: str | None, *, label: str) -> str | None:
     if value is None:
         return None
@@ -860,6 +906,24 @@ def _normalize_prompt_cache_retention(value: str | None, *, label: str) -> str |
         return "in_memory"
     if selected not in {"in_memory", "24h"}:
         raise LLMError(f"{label} must be one of in_memory, 24h")
+    return selected
+
+
+def _normalize_prompt_cache_mode(value: str, *, label: str) -> str:
+    selected = str(value).strip().lower()
+    if selected not in {"provider_default", "implicit", "explicit"}:
+        raise LLMError(
+            f"{label} must be one of provider_default, implicit, explicit"
+        )
+    return selected
+
+
+def _normalize_prompt_cache_ttl(value: str | None, *, label: str) -> str | None:
+    if value is None:
+        return None
+    selected = str(value).strip().lower()
+    if selected != "30m":
+        raise LLMError(f"{label} must be 30m or unset")
     return selected
 
 

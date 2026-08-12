@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
@@ -13,6 +13,32 @@ from agent_libos.storage.semantic import (
     SemanticAssessmentPage,
     SemanticAssessmentRecord,
     SemanticStatusAggregate,
+)
+from agent_libos.storage.semantic_v6 import (
+    SemanticControlStateRecord,
+    SemanticControlTransitionRecord,
+    SemanticFlowActivityRecord,
+    SemanticFlowBundle,
+    SemanticFlowEdgeRecord,
+    SemanticFlowEntityRecord,
+    SemanticFlowLabelAssertionRecord,
+    SemanticFlowPage,
+    SemanticHealthEventRecord,
+    SemanticHumanOutcomeLinkRecord,
+    SemanticLegacyCoverageRecord,
+    SemanticMachineOutcomeRecord,
+    SemanticMachineSettlementRecord,
+    SemanticPolicyEpochRecord,
+    SemanticRateBudgetRecord,
+    SemanticReviewLabelRecord,
+    SemanticV6Cursor,
+)
+from agent_libos.storage.mcp_v7 import (
+    McpAuthMetadataRecord,
+    McpContinuationRecord,
+    McpRemoteTaskRecord,
+    McpSideEffectPreparationRecord,
+    McpSubscriptionRecord,
 )
 from agent_libos.models import (
     AgentObject,
@@ -120,6 +146,12 @@ class SemanticAssessmentBackendProtocol(Protocol):
         job_id: str,
     ) -> SemanticAssessmentJobRecord | None: ...
 
+    def get_semantic_assessment_job_for_request(
+        self,
+        request_id: str,
+        request_revision: int,
+    ) -> SemanticAssessmentJobRecord | None: ...
+
     def claim_next_semantic_assessment_job(
         self,
         *,
@@ -177,6 +209,177 @@ class SemanticAssessmentBackendProtocol(Protocol):
         action_id: str | None = None,
         tenant_bucket_sha256: str | None = None,
     ) -> SemanticAssessmentPage: ...
+
+    def append_semantic_flow_bundle(
+        self,
+        *,
+        entities: tuple[SemanticFlowEntityRecord, ...] = (),
+        activities: tuple[SemanticFlowActivityRecord, ...] = (),
+        edges: tuple[SemanticFlowEdgeRecord, ...] = (),
+        assertions: tuple[SemanticFlowLabelAssertionRecord, ...] = (),
+    ) -> SemanticFlowBundle: ...
+
+    def get_semantic_flow_entity(self, entity_id: str) -> SemanticFlowEntityRecord | None: ...
+
+    def get_semantic_flow_activity(self, activity_id: str) -> SemanticFlowActivityRecord | None: ...
+
+    def query_semantic_flow_entities(
+        self, *, limit: int, after: SemanticV6Cursor | None = None,
+        pid: str | None = None, kind: str | None = None,
+        tenant_bucket_sha256: str | None = None,
+    ) -> SemanticFlowPage: ...
+
+    def query_semantic_flow_activities(
+        self, *, limit: int, after: SemanticV6Cursor | None = None,
+        pid: str | None = None, kind: str | None = None,
+        tenant_bucket_sha256: str | None = None,
+    ) -> SemanticFlowPage: ...
+
+    def query_semantic_flow_edges(
+        self, *, limit: int, after: SemanticV6Cursor | None = None,
+        pid: str | None = None, relation: str | None = None,
+        node_id: str | None = None,
+    ) -> SemanticFlowPage: ...
+
+    def query_semantic_flow_label_assertions(
+        self, *, limit: int, after: SemanticV6Cursor | None = None,
+        entity_id: str | None = None, source: str | None = None,
+        coverage: str | None = None,
+    ) -> SemanticFlowPage: ...
+
+    def semantic_flow_status_aggregate(self) -> Mapping[str, Any]: ...
+
+    def get_semantic_legacy_coverage(
+        self,
+    ) -> SemanticLegacyCoverageRecord | None: ...
+
+    def append_semantic_policy_epoch(self, record: SemanticPolicyEpochRecord) -> SemanticPolicyEpochRecord: ...
+
+    def get_semantic_policy_epoch(self, epoch_id: str) -> SemanticPolicyEpochRecord | None: ...
+
+    def query_semantic_policy_epochs(self, *, limit: int, after: SemanticV6Cursor | None = None) -> SemanticFlowPage: ...
+
+    def get_semantic_control_state(self) -> SemanticControlStateRecord | None: ...
+
+    def fence_semantic_control_state(
+        self,
+        expected: SemanticControlStateRecord,
+    ) -> bool: ...
+
+    def compare_and_set_semantic_control_state(
+        self, expected: SemanticControlStateRecord | None,
+        target: SemanticControlStateRecord,
+    ) -> bool: ...
+
+    def query_semantic_control_history(
+        self, *, limit: int, after: SemanticV6Cursor | None = None,
+    ) -> SemanticFlowPage: ...
+
+    def append_semantic_machine_settlement(
+        self, record: SemanticMachineSettlementRecord,
+    ) -> SemanticMachineSettlementRecord: ...
+
+    def query_semantic_machine_settlements(
+        self, *, limit: int, after: SemanticV6Cursor | None = None,
+        request_id: str | None = None, pid: str | None = None,
+        epoch_id: str | None = None,
+        tenant_bucket_sha256: str | None = None,
+        action_id: str | None = None, outcome: str | None = None,
+        effect_id: str | None = None,
+    ) -> SemanticFlowPage: ...
+
+    def query_unresolved_semantic_machine_settlements(
+        self, *, limit: int, after: SemanticV6Cursor | None = None,
+        request_id: str | None = None, pid: str | None = None,
+        epoch_id: str | None = None,
+        tenant_bucket_sha256: str | None = None,
+        action_id: str | None = None,
+        effect_id: str | None = None,
+    ) -> SemanticFlowPage: ...
+
+    def get_semantic_machine_settlement(
+        self, settlement_id: str,
+    ) -> SemanticMachineSettlementRecord | None: ...
+
+    def append_semantic_review_label(self, record: SemanticReviewLabelRecord) -> SemanticReviewLabelRecord: ...
+
+    def query_semantic_review_labels(
+        self, *, limit: int, after: SemanticV6Cursor | None = None,
+        settlement_id: str | None = None, outcome: str | None = None,
+    ) -> SemanticFlowPage: ...
+
+    def append_semantic_health_event(self, record: SemanticHealthEventRecord) -> SemanticHealthEventRecord: ...
+
+    def query_semantic_health_events(
+        self, *, limit: int, after: SemanticV6Cursor | None = None,
+        epoch_id: str | None = None, severity: str | None = None,
+        event_kind: str | None = None,
+    ) -> SemanticFlowPage: ...
+
+    def append_semantic_human_outcome_link(
+        self, record: SemanticHumanOutcomeLinkRecord,
+    ) -> SemanticHumanOutcomeLinkRecord: ...
+
+    def get_semantic_human_outcome_link_for_request(
+        self, request_id: str,
+    ) -> SemanticHumanOutcomeLinkRecord | None: ...
+
+    def query_semantic_human_outcome_links(
+        self, *, limit: int, after: SemanticV6Cursor | None = None,
+        request_id: str | None = None, pid: str | None = None,
+        assessment_id: str | None = None, settlement_id: str | None = None,
+        outcome: str | None = None, source: str | None = None,
+    ) -> SemanticFlowPage: ...
+
+    def semantic_human_outcome_links_for_assessments(
+        self, assessment_ids: Sequence[str],
+    ) -> Mapping[str, SemanticHumanOutcomeLinkRecord]: ...
+
+    def semantic_human_outcome_links_for_settlements(
+        self, settlement_ids: Sequence[str],
+    ) -> Mapping[str, SemanticHumanOutcomeLinkRecord]: ...
+
+    def semantic_human_outcome_link_counts(self) -> Mapping[str, Any]: ...
+
+    def append_semantic_machine_outcome(self, record: SemanticMachineOutcomeRecord) -> SemanticMachineOutcomeRecord: ...
+
+    def append_semantic_machine_outcome_if_absent(
+        self, record: SemanticMachineOutcomeRecord,
+    ) -> bool: ...
+
+    def query_semantic_machine_outcomes(
+        self, *, limit: int, after: SemanticV6Cursor | None = None,
+        settlement_id: str | None = None, outcome: str | None = None,
+    ) -> SemanticFlowPage: ...
+
+    def semantic_machine_outcome_counts(self) -> Mapping[str, int]: ...
+
+    def semantic_metrics(
+        self, *, window: str | None = None, action_id: str | None = None,
+        tenant_bucket_sha256: str | None = None, epoch_id: str | None = None,
+        risk: str | None = None,
+    ) -> Mapping[str, Any]: ...
+
+    def semantic_rollout_review_evidence(
+        self,
+        epoch_id: str,
+        action_id: str,
+        *,
+        limit: int = 1_000,
+    ) -> Mapping[str, Any]: ...
+
+    def semantic_unsafe_review_count(
+        self,
+        *,
+        epoch_id: str | None = None,
+    ) -> int: ...
+
+    def get_semantic_rate_budget(self, bucket_id: str) -> SemanticRateBudgetRecord | None: ...
+
+    def compare_and_set_semantic_rate_budget(
+        self, expected: SemanticRateBudgetRecord | None,
+        target: SemanticRateBudgetRecord,
+    ) -> bool: ...
 
 
 class ProcessStateRepository(ProcessRestoreEpochRepositoryPort, Protocol):
@@ -2249,6 +2452,102 @@ class OperationEvidenceBackendProtocol(TransactionBackendProtocol, Protocol):
     ) -> list[ExternalEffectRecord]: ...
 
 
+class McpV7BackendProtocol(Protocol):
+    """Payload-free durable MCP continuation/control state."""
+
+    def insert_mcp_continuation(self, record: McpContinuationRecord) -> McpContinuationRecord: ...
+    def get_mcp_continuation(self, continuation_id: str) -> McpContinuationRecord | None: ...
+    def list_mcp_continuations(
+        self, *, owner_id: str | None = None, server_id: str | None = None,
+        server_generation: int | None = None, status: str | None = None,
+        expired_before: str | None = None, limit: int = 100,
+    ) -> tuple[McpContinuationRecord, ...]: ...
+    def compare_and_swap_mcp_continuation(
+        self, continuation_id: str, *, expected_revision: int,
+        replacement: McpContinuationRecord,
+    ) -> bool: ...
+    def count_active_mcp_continuations(self, *, owner_id: str | None = None) -> int: ...
+    def list_terminal_mcp_continuations(
+        self, *, owner_id: str | None = None, limit: int = 100,
+    ) -> tuple[McpContinuationRecord, ...]: ...
+    def delete_terminal_mcp_continuation(
+        self, continuation_id: str, *, expected_revision: int,
+    ) -> bool: ...
+
+    def insert_mcp_remote_task(self, record: McpRemoteTaskRecord) -> McpRemoteTaskRecord: ...
+    def get_mcp_remote_task(self, task_ref: str) -> McpRemoteTaskRecord | None: ...
+    def get_mcp_remote_task_by_remote_id_sha256(
+        self, server_id: str, remote_id_sha256: str,
+    ) -> McpRemoteTaskRecord | None: ...
+    def list_mcp_remote_tasks(
+        self, *, owner_id: str | None = None, server_id: str | None = None,
+        server_generation: int | None = None, status: str | None = None,
+        expired_before: str | None = None, limit: int = 100,
+    ) -> tuple[McpRemoteTaskRecord, ...]: ...
+    def count_mcp_remote_tasks(self, *, owner_id: str | None = None) -> int: ...
+    def compare_and_swap_mcp_remote_task(
+        self, task_ref: str, *, expected_revision: int,
+        replacement: McpRemoteTaskRecord,
+    ) -> bool: ...
+    def count_active_mcp_remote_tasks(self, *, owner_id: str | None = None) -> int: ...
+    def list_terminal_mcp_remote_tasks(
+        self, *, owner_id: str | None = None, limit: int = 100,
+    ) -> tuple[McpRemoteTaskRecord, ...]: ...
+    def delete_terminal_mcp_remote_task(
+        self, task_ref: str, *, expected_revision: int,
+    ) -> bool: ...
+
+    def insert_mcp_subscription(self, record: McpSubscriptionRecord) -> McpSubscriptionRecord: ...
+    def get_mcp_subscription(self, subscription_id: str) -> McpSubscriptionRecord | None: ...
+    def list_mcp_subscriptions(
+        self, *, owner_id: str | None = None, server_id: str | None = None,
+        server_generation: int | None = None, status: str | None = None,
+        limit: int = 100,
+    ) -> tuple[McpSubscriptionRecord, ...]: ...
+    def compare_and_swap_mcp_subscription(
+        self, subscription_id: str, *, expected_revision: int,
+        replacement: McpSubscriptionRecord,
+    ) -> bool: ...
+
+    def insert_mcp_auth_metadata(self, record: McpAuthMetadataRecord) -> McpAuthMetadataRecord: ...
+    def get_mcp_auth_metadata(self, profile_id: str) -> McpAuthMetadataRecord | None: ...
+    def list_mcp_auth_metadata(
+        self, *, server_id: str | None = None,
+        server_generation: int | None = None, status: str | None = None,
+        expired_before: str | None = None, limit: int = 100,
+    ) -> tuple[McpAuthMetadataRecord, ...]: ...
+    def compare_and_swap_mcp_auth_metadata(
+        self, profile_id: str, *, expected_revision: int,
+        replacement: McpAuthMetadataRecord,
+    ) -> bool: ...
+
+    def insert_mcp_side_effect_preparation(
+        self, record: McpSideEffectPreparationRecord,
+    ) -> McpSideEffectPreparationRecord: ...
+    def get_mcp_side_effect_preparation(
+        self, preparation_id: str,
+    ) -> McpSideEffectPreparationRecord | None: ...
+    def list_mcp_side_effect_preparations(
+        self, *, owner_id: str | None = None,
+        operation_kind: str | None = None, status: str | None = None,
+        expired_before: str | None = None, limit: int = 100,
+    ) -> tuple[McpSideEffectPreparationRecord, ...]: ...
+    def compare_and_swap_mcp_side_effect_preparation(
+        self, preparation_id: str, *, expected_revision: int,
+        replacement: McpSideEffectPreparationRecord,
+    ) -> bool: ...
+    def delete_mcp_side_effect_preparation(
+        self, preparation_id: str, *, expected_revision: int,
+    ) -> bool: ...
+    def commit_mcp_side_effect_preparation(
+        self, preparation_id: str, *, expected_revision: int,
+        replacement: McpContinuationRecord | McpRemoteTaskRecord,
+    ) -> bool: ...
+    def commit_terminal_mcp_side_effect_preparation(
+        self, preparation_id: str, *, expected_revision: int,
+    ) -> bool: ...
+
+
 class UnitOfWorkBackendProtocol(
     SemanticAssessmentBackendProtocol,
     ProcessBackendProtocol,
@@ -2263,6 +2562,7 @@ class UnitOfWorkBackendProtocol(
     OperationEvidenceBackendProtocol,
     ToolArtifactRepositoryProtocol,
     PayloadRetentionStore,
+    McpV7BackendProtocol,
     Protocol,
 ):
     """Complete concrete backend contract required to assemble a UnitOfWork."""

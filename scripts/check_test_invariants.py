@@ -18,7 +18,13 @@ MANIFEST = ROOT / "tests" / "invariants.yaml"
 DOCUMENTATION = ROOT / "docs" / "invariants.md"
 VALID_LANES = {"unit", "runtime", "security", "self-evolution", "providers", "benchmark"}
 MANIFEST_SCHEMA_VERSION = 2
-DEFAULT_DETERMINISTIC_MARKER_EXPRESSION = "not postgres and not real_llm and not mcp"
+# The ordinary lane selector excludes the whole MCP product marker to avoid
+# running those nodes twice.  Invariant evidence is a different question:
+# deterministic MCP regressions that do not require a frozen SDK transport are
+# valid non-optional witnesses and must remain eligible here.
+DEFAULT_DETERMINISTIC_MARKER_EXPRESSION = (
+    "not postgres and not real_llm and not mcp_transport"
+)
 PLATFORM_MARKERS = {
     "darwin": "platform_darwin",
     "linux": "platform_linux",
@@ -140,6 +146,17 @@ def _check_invariant_execution(
         if selected_nodeids is None
         else {node_id.replace("\\", "/") for node_id in selected_nodeids}
     )
+
+    def node_path_is_selected(node_id: str) -> bool:
+        if normalized_selected_paths is None:
+            return True
+        node_path = node_id.split("::", 1)[0]
+        return any(
+            node_path == selected_path
+            or node_path.startswith(selected_path.rstrip("/") + "/")
+            for selected_path in normalized_selected_paths
+        )
+
     selected_platform = platform or _current_platform_key()
     for invariant in invariants:
         if not isinstance(invariant, dict):
@@ -186,7 +203,7 @@ def _check_invariant_execution(
             applicable_nodes = {
                 node_id
                 for node_id in applicable_nodes
-                if node_id.split("::", 1)[0] in normalized_selected_paths
+                if node_path_is_selected(node_id)
             }
             if not applicable_nodes:
                 continue
@@ -211,7 +228,7 @@ def _check_invariant_execution(
             normalized = node_id.replace("\\", "/")
             if (
                 normalized_selected_paths is not None
-                and normalized.split("::", 1)[0] not in normalized_selected_paths
+                and not node_path_is_selected(normalized)
             ):
                 continue
             if (

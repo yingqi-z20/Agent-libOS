@@ -28,8 +28,9 @@ arguments, or restore a provider.
 ### `list_capabilities`
 
 `list_capabilities(include_inactive=false, limit=<current-schema-default>,
-after_cap_id=null)` returns `{capabilities:[...], has_more, next_cursor}` for
-this process only and never grants or consumes authority.
+after_cap_id=null)` returns `{capabilities:[...], has_more}` for this process
+only and never grants or consumes authority. A non-null `next_cursor` is added
+only when another page is available.
 
 - `limit` must be positive and is capped by the Host
   `capability.list_limit` (default 100). When `has_more=true`, pass the non-null
@@ -42,33 +43,36 @@ this process only and never grants or consumes authority.
 - `include_inactive=true` is diagnostic and subject to the same paging bound. It may
   show `revoked`, `disabled`, `exec_revoked`, expired, exhausted, or
   parent-invalid rows. Stored `status="active"` can still be ineffective.
-- Important fields are `cap_id`, `subject`, canonical `resource`, `rights`, base
-  `effect`, `constraints`/`rules`, lease, status, delegation, revocability, and
-  lineage.
-- Every row is a bounded presentation, not the durable authority record.
-  If `metadata_projection` or `constraints_projection` has `omitted=true`, its
-  sibling `metadata` or `constraints` is deliberately `{}` and the latter also
-  makes `rules=[]`. The receipt gives the canonical byte count and SHA-256 of
-  the omitted value. Never interpret those empty containers as real empty
-  policy or metadata; use the hash only for identity/change detection, not to
-  reconstruct or authorize the hidden value.
+- Model-visible fields can include `cap_id`, semantic `resource`, `rights`, base
+  `effect`, `status`, `uses_remaining`, `expires_at`, `constraints`, `rules`,
+  `delegable`, a compact `delegation`, or `presentation_omitted`. Empty or
+  unavailable optional fields can be absent.
+- Every model row is a bounded action-oriented projection, not the durable
+  authority record. Durable ToolResult data may additionally contain `subject`,
+  issuer/parent lineage, lease/delegation depth, revocability, metadata, and
+  `metadata_projection`/`constraints_projection` omission receipts. Those Host
+  provenance and receipt fields are intentionally not model-visible. Missing
+  `constraints`/`rules` in the model projection is therefore not proof that the
+  durable policy is empty; require owning-primitive or Host explain evidence
+  rather than inventing or reconstructing it.
 
 Do not infer a final decision from one row. An `allow` may be a scoped miss,
 become `ask`/`deny` under an Authority Rule, lose to an applicable deny, expire,
 or fail a primitive-specific constraint when exact operation context is known.
-When a policy-bearing projection is omitted or exact operation context is not
-available, list/inspect cannot determine the final policy. Stop and require the
-owning primitive's or Host's explain evidence; do not guess or run a risky probe.
+When policy-bearing fields are absent from the model projection or exact
+operation context is not available, list/inspect cannot determine the final
+policy. Stop and require the owning primitive's or Host's explain evidence; do
+not guess or run a risky probe.
 
 ### `inspect_capability`
 
 `inspect_capability(cap_id)` returns `{capability:{...}}` for an exact known ID
 only when this process is its subject. Unknown IDs are validation failures;
-cross-subject inspection is denied. Use it to check lease, constraints,
-lineage, `delegable`, and `revocable`. `metadata` is descriptive, not authority.
-Inspection uses the same bounded projection and omission receipts as listing,
-so it may not expose full constraints, rules, or metadata. It does not evaluate
-a proposed operation and cannot prove success.
+cross-subject inspection is denied. Use it to check the visible resource,
+rights, effect, status, lease values, constraints/rules, and delegation summary.
+It does not expose subject, issuer/parent lineage, revocability, metadata, or
+durable omission receipts. Missing policy fields remain inconclusive. Inspection
+does not evaluate a proposed operation and cannot prove success.
 
 ### `request_permission`
 
@@ -121,8 +125,8 @@ installed policy: `approved` may mean `always_allow` or `ask_each_time`, while
    typed; bare `*` is invalid, and wildcards are terminal only: `kind:*` is a
    prefix and `kind:body/*` a subtree. Prefer an exact resource.
 3. Page through current rows to exhaustion and inspect a known candidate ID.
-   A partial page, `has_more=true`, or an omission receipt is not proof of
-   absence or of an empty policy. If projection or operation context is
+   A partial page, `has_more=true`, or absent model policy fields are not proof
+   of absence or of an empty policy. If projection or operation context is
    insufficient to establish the final policy, stop and require owning-
    primitive or Host explain evidence instead of guessing or probing.
 4. Follow a final policy only when complete operation-specific evidence or the
@@ -171,7 +175,8 @@ create speculative standing authority.
 ## Completion evidence
 
 Diagnosis should name the exact operation, canonical resource/right, visible
-Capability IDs and relevant fields, plus uncertainty from a bounded list.
+Capability IDs and model-projected fields, plus uncertainty from a bounded list
+or intentionally hidden Host provenance.
 
 A permission workflow needs: (1) the single request receipt and request ID;
 (2) any resulting list/inspect evidence without inventing the omitted policy;

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import field
+import hashlib
 import math
 import re
+from dataclasses import field
 from typing import Annotated, Final, Literal
 from urllib.parse import SplitResult, unquote_plus, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BeforeValidator, ConfigDict, StrictFloat, StrictInt
+from pydantic import BeforeValidator, ConfigDict, StrictBool, StrictFloat, StrictInt
 from pydantic.dataclasses import dataclass
 
 from agent_libos.models.capability import AuthorityRule
@@ -18,16 +19,24 @@ from agent_libos.models.data_flow import (
     SinkTrustRule,
     sensitivity_rank,
 )
+from agent_libos.models.semantic import SemanticPolicyEpochV1
+from agent_libos.utils.yaml_loader import YAML_MAX_UTF8_BYTES
 
 _PYDANTIC_CONFIG = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 _TIMEZONE_KEY_PATTERN = re.compile(
     r"[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*\Z"
 )
+_ENVIRONMENT_VARIABLE_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _FIXED_TIMEZONE_FALLBACK_KEYS = frozenset({"Asia/Shanghai"})
 
 # The current MCP release contract allows automatic modern discovery to consume no more
 # than five seconds, even when the enclosing operation has a longer deadline.
 MCP_PROTOCOL_PROBE_TIMEOUT_MAX_S: Final[float] = 5.0
+MCP_LIST_MAX_PAGES_HARD: Final[int] = 16
+MCP_TOOL_CATALOG_HARD_LIMIT: Final[int] = 100
+MCP_COMPLETION_VALUES_HARD_LIMIT: Final[int] = 100
+MCP_V3_CATALOG_HARD_LIMIT: Final[int] = 1_000
+MCP_LEGACY_LIST_LIMIT_DEFAULT: Final[int] = 100
 
 ShellPolicyLevel = Literal[
     "always_deny",
@@ -47,6 +56,9 @@ PromptCacheRetention = Annotated[
     Literal["in_memory", "24h"] | None,
     BeforeValidator(_normalize_prompt_cache_retention),
 ]
+PromptLayout = Literal["legacy_v1", "cache_optimized_v2"]
+PromptCacheMode = Literal["provider_default", "implicit", "explicit"]
+PromptCacheTTL = Literal["30m"] | None
 
 _SENSITIVE_LLM_URL_QUERY_KEY_NAMES = frozenset(
     {
@@ -507,6 +519,8 @@ class LLMProfile:
     safety_identifier_env: str | None = None
     prompt_cache_key: str | None = None
     prompt_cache_retention: PromptCacheRetention = None
+    prompt_cache_mode: PromptCacheMode | None = None
+    prompt_cache_ttl: PromptCacheTTL = None
     responses_previous_response_id: bool | None = None
     parallel_tool_calls: bool | None = None
     auto_wait_on_empty_tool_calls: bool | None = None
@@ -536,8 +550,11 @@ class LLMDefaults:
     api_mode: Literal["auto", "responses", "chat"] = "auto"
     store: bool = False
     safety_identifier: str | None = None
+    prompt_layout: PromptLayout = "legacy_v1"
     prompt_cache_key: str | None = None
     prompt_cache_retention: PromptCacheRetention = None
+    prompt_cache_mode: PromptCacheMode = "provider_default"
+    prompt_cache_ttl: PromptCacheTTL = None
     responses_previous_response_id: bool = False
     parallel_tool_calls: bool = False
     auto_wait_on_empty_tool_calls: bool = False
@@ -560,11 +577,12 @@ class LLMDefaults:
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class SemanticDefaults:
-    """Host-owned Shadow assessment settings; ``off`` has no capture effects."""
+    """Host-owned semantic assessment and enforcement settings."""
 
-    mode: Literal["off", "shadow"] = "off"
+    mode: Literal["off", "shadow", "enforce_deny", "canary_auto"] = "off"
     adapter: Literal["deterministic", "scripted", "external"] = "deterministic"
     external_profile_id: str | None = None
+    policy_epoch: SemanticPolicyEpochV1 | None = None
     max_concurrency: StrictInt = 2
     assessment_timeout_s: StrictFloat = 30.0
     job_lease_s: StrictFloat = 60.0
@@ -575,6 +593,10 @@ class SemanticDefaults:
     projection_max_bytes: StrictInt = 16_384
     assessment_list_limit: StrictInt = 100
     assessment_list_hard_limit: StrictInt = 1_000
+    flow_query_limit: StrictInt = 100
+    flow_query_hard_limit: StrictInt = 1_000
+    settlement_list_limit: StrictInt = 100
+    settlement_list_hard_limit: StrictInt = 1_000
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -802,13 +824,55 @@ class McpDefaults:
     max_response_bytes: int = 1_048_576
     max_request_hard_limit_bytes: int = 1_048_576
     max_response_hard_limit_bytes: int = 8_388_608
-    list_limit: int = 100
+    list_limit: int = MCP_LEGACY_LIST_LIMIT_DEFAULT
+    # Deprecated legacy v1/v2 Tools-only compatibility limit. New surfaces use
+    # purpose-specific limits so changing one catalog cannot silently expand
+    # another authority or resource boundary.
+    server_page_limit: StrictInt = 100
+    tool_catalog_limit: StrictInt = MCP_TOOL_CATALOG_HARD_LIMIT
+    resource_catalog_limit: StrictInt = 200
+    resource_template_limit: StrictInt = 200
+    prompt_catalog_limit: StrictInt = 200
+    provider_capability_limit: StrictInt = 64
+    max_content_blocks: StrictInt = 256
+    max_prompt_messages: StrictInt = 128
+    max_completion_values: StrictInt = MCP_COMPLETION_VALUES_HARD_LIMIT
     protocol_probe_timeout_s: float = MCP_PROTOCOL_PROBE_TIMEOUT_MAX_S
     list_max_pages: int = 16
     schema_max_depth: int = 64
     schema_max_nodes: int = 10_000
     schema_max_ref_hops: int = 128
     schema_max_composition_expansions: int = 1_024
+    schema_regex_pattern_max_bytes: StrictInt = 1_024
+    schema_regex_max_evaluations: StrictInt = 4_096
+    schema_regex_match_timeout_s: StrictFloat = 0.05
+    connection_idle_ttl_s: StrictFloat = 30.0
+    connection_absolute_ttl_s: StrictFloat = 300.0
+    connection_max_open: StrictInt = 64
+    mrtr_max_rounds: StrictInt = 8
+    mrtr_max_input_requests: StrictInt = 16
+    mrtr_request_state_max_bytes: StrictInt = 65_536
+    continuation_ttl_s: StrictFloat = 3_600.0
+    continuation_max_records: StrictInt = 1_000
+    continuation_terminal_records: StrictInt = 256
+    subscription_max_open: StrictInt = 8
+    subscription_queue_events: StrictInt = 256
+    subscription_event_max_bytes: StrictInt = 65_536
+    subscription_max_lifetime_s: StrictFloat = 3_600.0
+    remote_task_poll_min_interval_s: StrictFloat = 0.25
+    remote_task_max_wait_s: StrictFloat = 3_600.0
+    remote_task_max_records: StrictInt = 1_000
+    remote_task_terminal_records: StrictInt = 256
+    # Modern Resources/Prompts do not retain response bodies.  These bounds
+    # cover only the explicitly implemented opaque cursor vault, durable
+    # subscription terminal diagnostics, and untrusted provider cache hints.
+    cursor_handle_limit: StrictInt = 256
+    subscription_terminal_records: StrictInt = 256
+    cache_hint_ttl_cap_ms: StrictInt = 3_600_000
+    oauth_enabled: StrictBool = False
+    oauth_state_ttl_s: StrictFloat = 600.0
+    tasks_extension_enabled: StrictBool = False
+    tasks_extension_spec_sha256: str | None = None
     audit_preview_chars: int = 512
     header_env_allowlist: tuple[str, ...] = ("AGENT_LIBOS_MCP_*",)
     stdio_env_allowlist: tuple[str, ...] = ("AGENT_LIBOS_MCP_*",)
@@ -1339,15 +1403,54 @@ def _validate_mcp_config(mcp: McpDefaults) -> None:
         "max_request_hard_limit_bytes",
         "max_response_hard_limit_bytes",
         "list_limit",
+        "server_page_limit",
+        "tool_catalog_limit",
+        "resource_catalog_limit",
+        "resource_template_limit",
+        "prompt_catalog_limit",
+        "provider_capability_limit",
+        "max_content_blocks",
+        "max_prompt_messages",
+        "max_completion_values",
         "protocol_probe_timeout_s",
         "list_max_pages",
         "schema_max_depth",
         "schema_max_nodes",
         "schema_max_ref_hops",
         "schema_max_composition_expansions",
+        "schema_regex_pattern_max_bytes",
+        "schema_regex_max_evaluations",
+        "schema_regex_match_timeout_s",
+        "connection_idle_ttl_s",
+        "connection_absolute_ttl_s",
+        "connection_max_open",
+        "mrtr_max_rounds",
+        "mrtr_max_input_requests",
+        "mrtr_request_state_max_bytes",
+        "continuation_ttl_s",
+        "continuation_max_records",
+        "continuation_terminal_records",
+        "subscription_max_open",
+        "subscription_queue_events",
+        "subscription_event_max_bytes",
+        "subscription_max_lifetime_s",
+        "remote_task_poll_min_interval_s",
+        "remote_task_max_wait_s",
+        "remote_task_max_records",
+        "remote_task_terminal_records",
+        "cursor_handle_limit",
+        "subscription_terminal_records",
+        "cache_hint_ttl_cap_ms",
+        "oauth_state_ttl_s",
         "audit_preview_chars",
     ):
         _positive_or_non_empty(f"mcp.{name}", getattr(mcp, name))
+    for name in (
+        "continuation_terminal_records",
+        "remote_task_terminal_records",
+    ):
+        if getattr(mcp, name) > 499:
+            raise ValueError(f"mcp.{name} must be <= 499")
     _require_at_least("mcp.timeout_hard_limit_s", mcp.timeout_hard_limit_s, "mcp.timeout_s", mcp.timeout_s)
     _require_at_least("mcp.max_request_hard_limit_bytes", mcp.max_request_hard_limit_bytes, "mcp.max_request_bytes", mcp.max_request_bytes)
     _require_at_least("mcp.max_response_hard_limit_bytes", mcp.max_response_hard_limit_bytes, "mcp.max_response_bytes", mcp.max_response_bytes)
@@ -1356,8 +1459,56 @@ def _validate_mcp_config(mcp: McpDefaults) -> None:
             "mcp.protocol_probe_timeout_s must be <= release maximum "
             f"{MCP_PROTOCOL_PROBE_TIMEOUT_MAX_S}"
         )
-    _require_non_empty_items("mcp.header_env_allowlist", mcp.header_env_allowlist)
-    _require_non_empty_items("mcp.stdio_env_allowlist", mcp.stdio_env_allowlist)
+    if mcp.list_max_pages > MCP_LIST_MAX_PAGES_HARD:
+        raise ValueError(
+            f"mcp.list_max_pages must be <= {MCP_LIST_MAX_PAGES_HARD}"
+        )
+    if mcp.tool_catalog_limit > MCP_TOOL_CATALOG_HARD_LIMIT:
+        raise ValueError(
+            "mcp.tool_catalog_limit must be <= "
+            f"{MCP_TOOL_CATALOG_HARD_LIMIT}"
+        )
+    for name in (
+        "resource_catalog_limit",
+        "resource_template_limit",
+        "prompt_catalog_limit",
+    ):
+        if getattr(mcp, name) > MCP_V3_CATALOG_HARD_LIMIT:
+            raise ValueError(f"mcp.{name} must be <= {MCP_V3_CATALOG_HARD_LIMIT}")
+    if mcp.max_completion_values > MCP_COMPLETION_VALUES_HARD_LIMIT:
+        raise ValueError(
+            "mcp.max_completion_values must be <= "
+            f"{MCP_COMPLETION_VALUES_HARD_LIMIT}"
+        )
+    if mcp.connection_absolute_ttl_s < mcp.connection_idle_ttl_s:
+        raise ValueError(
+            "mcp.connection_absolute_ttl_s must be >= connection_idle_ttl_s"
+        )
+    tasks_digest = mcp.tasks_extension_spec_sha256
+    if tasks_digest is not None and (
+        type(tasks_digest) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", tasks_digest) is None
+    ):
+        raise ValueError(
+            "mcp.tasks_extension_spec_sha256 must be a lowercase SHA-256"
+        )
+    if mcp.tasks_extension_enabled and tasks_digest is None:
+        raise ValueError(
+            "mcp.tasks_extension_enabled requires tasks_extension_spec_sha256"
+        )
+    if mcp.manifest_max_bytes > YAML_MAX_UTF8_BYTES:
+        raise ValueError(
+            "mcp.manifest_max_bytes must be <= YAML_MAX_UTF8_BYTES="
+            f"{YAML_MAX_UTF8_BYTES}"
+        )
+    _require_mcp_env_allowlist(
+        "mcp.header_env_allowlist",
+        mcp.header_env_allowlist,
+    )
+    _require_mcp_env_allowlist(
+        "mcp.stdio_env_allowlist",
+        mcp.stdio_env_allowlist,
+    )
 
 
 def _validate_config(config: AgentLibOSConfig) -> None:
@@ -1691,83 +1842,17 @@ def _validate_llm_config(
         )
     for profile_id, profile in llm.profiles.items():
         prefix = f"llm.profiles[{profile_id!r}]"
-        _require_non_empty("llm.profiles key", profile_id)
-        if profile.kind != "openai_compatible":
-            raise ValueError(f"{prefix}.kind is not supported: {profile.kind}")
-        if profile.base_url is not None:
-            _require_non_empty(f"{prefix}.base_url", profile.base_url)
-            validate_llm_base_url(
-                profile.base_url,
-                label=f"{prefix}.base_url",
-            )
-        if profile.model is not None:
-            _require_non_empty(f"{prefix}.model", profile.model)
-        _require_non_empty(f"{prefix}.api_key_env", profile.api_key_env)
-        if profile.api_mode is not None and profile.api_mode not in {
-            "auto",
-            "responses",
-            "chat",
-        }:
-            raise ValueError(f"{prefix}.api_mode is not supported: {profile.api_mode}")
-        _optional_non_empty(f"{prefix}.safety_identifier", profile.safety_identifier)
-        _optional_max_chars(f"{prefix}.safety_identifier", profile.safety_identifier, 64)
-        _optional_non_empty(
-            f"{prefix}.safety_identifier_env",
-            profile.safety_identifier_env,
-        )
-        _optional_non_empty(f"{prefix}.prompt_cache_key", profile.prompt_cache_key)
-        _positive_optional(f"{prefix}.timeout_s", profile.timeout_s)
-        _nonnegative_optional(f"{prefix}.max_retries", profile.max_retries)
-        _nonnegative_optional(f"{prefix}.temperature", profile.temperature)
-        _positive_optional(f"{prefix}.max_tokens", profile.max_tokens)
-        _positive_optional(
-            f"{prefix}.max_input_tokens_per_call",
-            profile.max_input_tokens_per_call,
-        )
-        _positive_optional(
-            f"{prefix}.max_total_tokens_per_call",
-            profile.max_total_tokens_per_call,
-        )
-        _positive_optional(
-            f"{prefix}.context_window_tokens",
-            profile.context_window_tokens,
-        )
-        effective_max_tokens = (
-            llm.max_tokens if profile.max_tokens is None else profile.max_tokens
-        )
-        effective_context_window = (
-            llm.context_window_tokens
-            if profile.context_window_tokens is None
-            else profile.context_window_tokens
-        )
-        effective_max_input_tokens = (
-            llm.max_input_tokens_per_call
-            if profile.max_input_tokens_per_call is None
-            else profile.max_input_tokens_per_call
-        )
-        effective_max_total_tokens = (
-            llm.max_total_tokens_per_call
-            if profile.max_total_tokens_per_call is None
-            else profile.max_total_tokens_per_call
-        )
-        if effective_max_tokens >= effective_context_window:
-            raise ValueError(
-                f"{prefix} effective max_tokens must be less than "
-                "effective context_window_tokens"
-            )
-        if effective_max_input_tokens > effective_max_total_tokens:
-            raise ValueError(
-                f"{prefix} effective max_input_tokens_per_call must not exceed "
-                "effective max_total_tokens_per_call"
-            )
-        if effective_max_tokens > effective_max_total_tokens:
-            raise ValueError(
-                f"{prefix} effective max_tokens must not exceed "
-                "effective max_total_tokens_per_call"
-            )
+        _validate_llm_profile(profile_id, profile, llm, prefix=prefix)
     _optional_non_empty("llm.safety_identifier", llm.safety_identifier)
     _optional_max_chars("llm.safety_identifier", llm.safety_identifier, 64)
     _optional_non_empty("llm.prompt_cache_key", llm.prompt_cache_key)
+    _validate_prompt_cache_policy(
+        "llm",
+        mode=llm.prompt_cache_mode,
+        key=llm.prompt_cache_key,
+        retention=llm.prompt_cache_retention,
+        ttl=llm.prompt_cache_ttl,
+    )
     _nonnegative("llm.temperature", llm.temperature)
     _positive("llm.max_tokens", llm.max_tokens)
     _positive("llm.max_input_tokens_per_call", llm.max_input_tokens_per_call)
@@ -1808,7 +1893,145 @@ def _validate_llm_config(
         _validate_semantic_config(semantic, llm)
 
 
+def _validate_llm_profile(
+    profile_id: str,
+    profile: LLMProfile,
+    llm: LLMDefaults,
+    *,
+    prefix: str,
+) -> None:
+    _require_non_empty("llm.profiles key", profile_id)
+    if profile.kind != "openai_compatible":
+        raise ValueError(f"{prefix}.kind is not supported: {profile.kind}")
+    if profile.base_url is not None:
+        _require_non_empty(f"{prefix}.base_url", profile.base_url)
+        validate_llm_base_url(profile.base_url, label=f"{prefix}.base_url")
+    if profile.model is not None:
+        _require_non_empty(f"{prefix}.model", profile.model)
+    _require_non_empty(f"{prefix}.api_key_env", profile.api_key_env)
+    if profile.api_mode is not None and profile.api_mode not in {
+        "auto",
+        "responses",
+        "chat",
+    }:
+        raise ValueError(f"{prefix}.api_mode is not supported: {profile.api_mode}")
+    _optional_non_empty(f"{prefix}.safety_identifier", profile.safety_identifier)
+    _optional_max_chars(f"{prefix}.safety_identifier", profile.safety_identifier, 64)
+    _optional_non_empty(
+        f"{prefix}.safety_identifier_env",
+        profile.safety_identifier_env,
+    )
+    _optional_non_empty(f"{prefix}.prompt_cache_key", profile.prompt_cache_key)
+    _validate_llm_profile_cache(profile, llm, prefix=prefix)
+    _positive_optional(f"{prefix}.timeout_s", profile.timeout_s)
+    _nonnegative_optional(f"{prefix}.max_retries", profile.max_retries)
+    _nonnegative_optional(f"{prefix}.temperature", profile.temperature)
+    for field in (
+        "max_tokens",
+        "max_input_tokens_per_call",
+        "max_total_tokens_per_call",
+        "context_window_tokens",
+    ):
+        _positive_optional(f"{prefix}.{field}", getattr(profile, field))
+    _validate_llm_profile_token_bounds(profile, llm, prefix=prefix)
+
+
+def _validate_llm_profile_cache(
+    profile: LLMProfile,
+    llm: LLMDefaults,
+    *,
+    prefix: str,
+) -> None:
+    def inherited(field: str) -> Any:
+        profile_value = getattr(profile, field)
+        return getattr(llm, field) if profile_value is None else profile_value
+
+    _validate_prompt_cache_policy(
+        prefix,
+        mode=inherited("prompt_cache_mode"),
+        key=inherited("prompt_cache_key"),
+        retention=inherited("prompt_cache_retention"),
+        ttl=inherited("prompt_cache_ttl"),
+    )
+
+
+def _validate_llm_profile_token_bounds(
+    profile: LLMProfile,
+    llm: LLMDefaults,
+    *,
+    prefix: str,
+) -> None:
+    effective_max_tokens = profile.max_tokens or llm.max_tokens
+    effective_context_window = (
+        profile.context_window_tokens or llm.context_window_tokens
+    )
+    effective_max_input_tokens = (
+        profile.max_input_tokens_per_call or llm.max_input_tokens_per_call
+    )
+    effective_max_total_tokens = (
+        profile.max_total_tokens_per_call or llm.max_total_tokens_per_call
+    )
+    if effective_max_tokens >= effective_context_window:
+        raise ValueError(
+            f"{prefix} effective max_tokens must be less than "
+            "effective context_window_tokens"
+        )
+    if effective_max_input_tokens > effective_max_total_tokens:
+        raise ValueError(
+            f"{prefix} effective max_input_tokens_per_call must not exceed "
+            "effective max_total_tokens_per_call"
+        )
+    if effective_max_tokens > effective_max_total_tokens:
+        raise ValueError(
+            f"{prefix} effective max_tokens must not exceed "
+            "effective max_total_tokens_per_call"
+        )
+
+
 def _validate_semantic_config(semantic: SemanticDefaults, llm: LLMDefaults) -> None:
+    _validate_semantic_active_policy(semantic)
+    _validate_semantic_worker_bounds(semantic)
+    _validate_semantic_query_bounds(semantic)
+    if semantic.adapter != "external":
+        if semantic.external_profile_id is not None:
+            raise ValueError(
+                "semantic.external_profile_id is allowed only with adapter=external"
+            )
+        return
+    if semantic.mode == "off":
+        # An external adapter can be staged while disabled without resolving
+        # credentials or requiring an installed profile.
+        return
+    _validate_semantic_external_profile(semantic.external_profile_id, llm)
+    if semantic.mode == "canary_auto":
+        _validate_semantic_canary_classifier_pin(semantic, llm)
+
+
+def _validate_semantic_active_policy(semantic: SemanticDefaults) -> None:
+    if semantic.mode in {"enforce_deny", "canary_auto"}:
+        if semantic.policy_epoch is None:
+            raise ValueError(
+                f"semantic mode {semantic.mode} requires a static policy_epoch"
+            )
+    if semantic.policy_epoch is not None and not isinstance(
+        semantic.policy_epoch, SemanticPolicyEpochV1
+    ):
+        raise TypeError("semantic.policy_epoch must be SemanticPolicyEpochV1")
+    if (
+        semantic.mode == "canary_auto"
+        and semantic.policy_epoch is not None
+        and not semantic.policy_epoch.auto_approval_rules
+    ):
+        raise ValueError(
+            "semantic canary_auto requires at least one auto_approval_rule"
+        )
+    if semantic.mode == "canary_auto" and semantic.adapter != "external":
+        raise ValueError(
+            "semantic canary_auto requires the external classifier adapter"
+        )
+
+
+def _validate_semantic_worker_bounds(semantic: SemanticDefaults) -> None:
     _positive("semantic.max_concurrency", semantic.max_concurrency)
     if semantic.max_concurrency > 32:
         raise ValueError("semantic.max_concurrency must not exceed 32")
@@ -1845,6 +2068,9 @@ def _validate_semantic_config(semantic: SemanticDefaults, llm: LLMDefaults) -> N
         raise ValueError("semantic.intent_max_chars must not exceed 2000")
     if semantic.projection_max_bytes < 512 or semantic.projection_max_bytes > 16_384:
         raise ValueError("semantic.projection_max_bytes must be from 512 through 16384")
+
+
+def _validate_semantic_query_bounds(semantic: SemanticDefaults) -> None:
     _positive("semantic.assessment_list_limit", semantic.assessment_list_limit)
     _positive("semantic.assessment_list_hard_limit", semantic.assessment_list_hard_limit)
     _require_at_least(
@@ -1853,17 +2079,49 @@ def _validate_semantic_config(semantic: SemanticDefaults, llm: LLMDefaults) -> N
         "semantic.assessment_list_limit",
         semantic.assessment_list_limit,
     )
-    if semantic.adapter != "external":
-        if semantic.external_profile_id is not None:
-            raise ValueError(
-                "semantic.external_profile_id is allowed only with adapter=external"
-            )
-        return
-    if semantic.mode != "shadow":
-        # An external adapter can be staged while disabled without resolving
-        # credentials or requiring an installed profile.
-        return
-    _validate_semantic_external_profile(semantic.external_profile_id, llm)
+    for list_name, hard_name in (
+        ("flow_query_limit", "flow_query_hard_limit"),
+        ("settlement_list_limit", "settlement_list_hard_limit"),
+    ):
+        selected = getattr(semantic, list_name)
+        hard = getattr(semantic, hard_name)
+        _positive(f"semantic.{list_name}", selected)
+        _positive(f"semantic.{hard_name}", hard)
+        _require_at_least(
+            f"semantic.{hard_name}",
+            hard,
+            f"semantic.{list_name}",
+            selected,
+        )
+        if hard > 1_000:
+            raise ValueError(f"semantic.{hard_name} must not exceed 1000")
+
+
+def _validate_semantic_canary_classifier_pin(
+    semantic: SemanticDefaults,
+    llm: LLMDefaults,
+) -> None:
+    epoch = semantic.policy_epoch
+    assert epoch is not None
+    if epoch.classifier_profile_id != semantic.external_profile_id:
+        raise ValueError(
+            "semantic policy epoch must pin the external classifier profile"
+        )
+    if epoch.classifier_model_sha256 is None:
+        raise ValueError(
+            "semantic canary_auto policy epoch must pin the classifier model digest"
+        )
+    if epoch.classifier_profile_sha256 is None:
+        raise ValueError(
+            "semantic canary_auto policy epoch must pin the classifier profile identity digest"
+        )
+    profile = llm.profiles[semantic.external_profile_id]
+    assert profile.model is not None
+    model_sha256 = hashlib.sha256(profile.model.encode("utf-8")).hexdigest()
+    if epoch.classifier_model_sha256 != model_sha256:
+        raise ValueError(
+            "semantic policy epoch classifier model digest does not match the configured model"
+        )
 
 
 def _validate_semantic_external_profile(
@@ -1890,8 +2148,12 @@ def _validate_semantic_external_profile(
     if (
         profile.prompt_cache_key is not None
         or profile.prompt_cache_retention is not None
+        or profile.prompt_cache_mode not in {None, "provider_default"}
+        or profile.prompt_cache_ttl is not None
         or llm.prompt_cache_key is not None
         or llm.prompt_cache_retention is not None
+        or llm.prompt_cache_mode != "provider_default"
+        or llm.prompt_cache_ttl is not None
     ):
         raise ValueError("semantic external LLM profile must disable prompt caching")
     if profile.responses_previous_response_id is not False:
@@ -1905,6 +2167,36 @@ def _positive_or_non_empty(name: str, value: object) -> None:
         _require_non_empty(name, value)
     else:
         _positive(name, value)
+
+
+def _validate_prompt_cache_policy(
+    prefix: str,
+    *,
+    mode: str,
+    key: str | None,
+    retention: str | None,
+    ttl: str | None,
+) -> None:
+    if mode not in {"provider_default", "implicit", "explicit"}:
+        raise ValueError(f"{prefix}.prompt_cache_mode is not supported: {mode}")
+    if ttl is not None and ttl != "30m":
+        raise ValueError(f"{prefix}.prompt_cache_ttl must be 30m or null")
+    if retention is not None and ttl is not None:
+        raise ValueError(
+            f"{prefix}.prompt_cache_retention and prompt_cache_ttl are mutually exclusive"
+        )
+    if mode != "provider_default" and not str(key or "").strip():
+        raise ValueError(
+            f"{prefix}.prompt_cache_key is required when prompt_cache_mode is {mode}"
+        )
+    if mode == "provider_default" and ttl is not None:
+        raise ValueError(
+            f"{prefix}.prompt_cache_ttl requires implicit or explicit prompt_cache_mode"
+        )
+    if mode != "provider_default" and retention is not None:
+        raise ValueError(
+            f"{prefix}.prompt_cache_retention cannot be combined with prompt_cache_mode {mode}"
+        )
 
 
 def _nonnegative_fields(prefix: str, obj: object, names: tuple[str, ...]) -> None:
@@ -1982,6 +2274,27 @@ def _optional_max_chars(name: str, value: object | None, max_chars: int) -> None
 def _require_non_empty_items(name: str, values: tuple[str, ...]) -> None:
     for index, value in enumerate(values):
         _require_non_empty(f"{name}[{index}]", value)
+
+
+def _require_mcp_env_allowlist(name: str, values: tuple[str, ...]) -> None:
+    """Validate exact names or one non-empty name prefix plus trailing ``*``."""
+
+    for index, value in enumerate(values):
+        candidate = (
+            value[:-1]
+            if isinstance(value, str) and value.endswith("*")
+            else value
+        )
+        if (
+            not isinstance(value, str)
+            or _ENVIRONMENT_VARIABLE_NAME_PATTERN.fullmatch(candidate) is None
+            or ("*" in value and not value.endswith("*"))
+            or value.count("*") > 1
+        ):
+            raise ValueError(
+                f"{name}[{index}] must be a valid environment variable name "
+                "or a non-empty valid prefix followed by one trailing '*'"
+            )
 
 
 def _require_at_least(max_name: str, max_value: int | float, min_name: str, min_value: int | float) -> None:

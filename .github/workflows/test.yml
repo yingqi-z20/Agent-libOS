@@ -12,8 +12,8 @@ permissions:
   contents: read
 
 env:
-  RELEASE_WHEEL: dist/agent_libos-1.4.0-py3-none-any.whl
-  RELEASE_SDIST: dist/agent_libos-1.4.0.tar.gz
+  RELEASE_WHEEL: dist/agent_libos-1.5.0-py3-none-any.whl
+  RELEASE_SDIST: dist/agent_libos-1.5.0.tar.gz
   RELEASE_CHECKSUMS: dist/SHA256SUMS
 
 jobs:
@@ -26,6 +26,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check changed lines for whitespace errors
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: >-
+          python3 scripts/check_changed_whitespace.py
+          --base-sha "$BASE_SHA"
+          --default-branch "$DEFAULT_BRANCH"
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -103,6 +113,7 @@ jobs:
       - security
       - host-filesystem-identity
       - mcp-sdk
+      - mcp-native
       - deterministic-release
       - postgres
       - gui
@@ -133,10 +144,10 @@ jobs:
       - name: Build and validate distributions
         run: |
           uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
-          python scripts/check_release_artifacts.py dist --write-checksums
+          uv run --frozen --no-dev --group release python scripts/check_release_artifacts.py dist --write-checksums
           uv run --frozen --no-dev --group release twine check "$RELEASE_WHEEL" "$RELEASE_SDIST"
           uv run --frozen --no-dev --group release check-wheel-contents "$RELEASE_WHEEL"
-          python scripts/check_release_artifacts.py dist --verify-checksums
+          uv run --frozen --no-dev --group release python scripts/check_release_artifacts.py dist --verify-checksums
 
       - name: Preserve canonical candidate distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -184,23 +195,25 @@ jobs:
 
       - name: Verify canonical candidate distributions
         run: |
-          python scripts/check_release_artifacts.py dist --verify-checksums
+          uv run --frozen --no-dev --group release python scripts/check_release_artifacts.py dist --verify-checksums
           (cd dist && sha256sum --check --strict SHA256SUMS)
 
       - name: Export frozen artifact dependency sets
         run: |
-          uv export --frozen --no-dev --no-emit-project --output-file runtime-requirements.txt
+          uv export --frozen --no-dev --extra mcp --no-emit-project --output-file mcp-runtime-requirements.txt
           uv export --frozen --only-group release --no-emit-project --output-file release-build-requirements.txt
 
       - name: Clean-install wheel and run entrypoint smoke
         run: |
           uv venv --python "${{ matrix.python-version }}" .release-venv
-          uv pip install --python .release-venv/bin/python --require-hashes -r runtime-requirements.txt
-          uv pip install --python .release-venv/bin/python --no-deps "$RELEASE_WHEEL"
+          uv pip install --python .release-venv/bin/python --require-hashes -r mcp-runtime-requirements.txt
+          uv pip install --python .release-venv/bin/python --no-deps "${RELEASE_WHEEL}[mcp]"
           uv pip check --python .release-venv/bin/python
           smoke_root="$(mktemp -d)"
           cd "$smoke_root"
-          "$GITHUB_WORKSPACE/.release-venv/bin/python" -c "import agent_libos, importlib.metadata; from agent_libos.skills import get_builtin_skill_catalog; catalog = get_builtin_skill_catalog(); runtime = agent_libos.Runtime.open(':memory:'); owned = {tool for skill in catalog.list() for tool in skill.allowed_tools}; registered = {str(row['name']) for row in runtime.tools.list()}; pid = runtime.process.spawn(image='coding-agent:v0', goal='installed Skill activation smoke'); selected = runtime.skills.discover_skills_result('agent-libos-workspace-editing', actor=pid, limit=1)['skills'][0]; activation = runtime.tools.call(pid, 'activate_skill', {'skill_id': selected['skill_id'], 'expected_package_sha256': selected['package_sha256']}); assert agent_libos.__version__ == importlib.metadata.version('agent-libos'); assert len(catalog.list()) == 26; assert len(owned) == 99; assert owned == registered; assert activation.ok; assert activation.payload['result']['package_sha256'] == selected['package_sha256']; runtime.close()"
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" "$GITHUB_WORKSPACE/scripts/smoke_mcp_extra.py"
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" "$GITHUB_WORKSPACE/scripts/smoke_mcp_installed_mrtr_tasks.py"
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" -c "import agent_libos, importlib.metadata; from agent_libos.skills import get_builtin_skill_catalog; catalog = get_builtin_skill_catalog(); runtime = agent_libos.Runtime.open(':memory:'); owned = {tool for skill in catalog.list() for tool in skill.allowed_tools}; registered = {str(row['name']) for row in runtime.tools.list()}; pid = runtime.process.spawn(image='coding-agent:v0', goal='installed Skill activation smoke'); selected = runtime.skills.discover_skills_result('agent-libos-workspace-editing', actor=pid, limit=1)['skills'][0]; activation = runtime.tools.call(pid, 'activate_skill', {'skill_id': selected['skill_id'], 'expected_package_sha256': selected['package_sha256']}); refreshed = runtime.skills.discover_skills_result('agent-libos-workspace-editing', actor=pid, limit=1)['skills'][0]; assert agent_libos.__version__ == importlib.metadata.version('agent-libos'); assert len(catalog.list()) == 26; assert len(owned) == 101; assert owned == registered; assert activation.ok; assert activation.payload['result'] == {'skill_id': selected['skill_id'], 'name': selected['name'], 'version': selected['version'], 'tool_names': sorted(selected['allowed_tools'])}; assert refreshed['skill_id'] == selected['skill_id']; assert refreshed['package_sha256'] == selected['package_sha256']; assert refreshed['active'] is True; runtime.close()"
           "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos" --help
           "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos-gui-server" --help
           "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos-migrate-tool-groups" --help
@@ -209,13 +222,15 @@ jobs:
       - name: Clean-install source distribution
         run: |
           uv venv --python "${{ matrix.python-version }}" .release-sdist-venv
-          uv pip install --python .release-sdist-venv/bin/python --require-hashes -r runtime-requirements.txt
+          uv pip install --python .release-sdist-venv/bin/python --require-hashes -r mcp-runtime-requirements.txt
           uv pip install --python .release-sdist-venv/bin/python --require-hashes -r release-build-requirements.txt
-          uv pip install --python .release-sdist-venv/bin/python --no-deps --no-build-isolation "$RELEASE_SDIST"
+          uv pip install --python .release-sdist-venv/bin/python --no-deps --no-build-isolation "${RELEASE_SDIST}[mcp]"
           uv pip check --python .release-sdist-venv/bin/python
           sdist_smoke_root="$(mktemp -d)"
           cd "$sdist_smoke_root"
-          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/python" -c "import agent_libos, importlib.metadata; from agent_libos.skills import get_builtin_skill_catalog; catalog = get_builtin_skill_catalog(); runtime = agent_libos.Runtime.open(':memory:'); owned = {tool for skill in catalog.list() for tool in skill.allowed_tools}; registered = {str(row['name']) for row in runtime.tools.list()}; pid = runtime.process.spawn(image='coding-agent:v0', goal='installed Skill activation smoke'); selected = runtime.skills.discover_skills_result('agent-libos-workspace-editing', actor=pid, limit=1)['skills'][0]; activation = runtime.tools.call(pid, 'activate_skill', {'skill_id': selected['skill_id'], 'expected_package_sha256': selected['package_sha256']}); assert agent_libos.__version__ == importlib.metadata.version('agent-libos'); assert len(catalog.list()) == 26; assert len(owned) == 99; assert owned == registered; assert activation.ok; assert activation.payload['result']['package_sha256'] == selected['package_sha256']; runtime.close()"
+          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/python" "$GITHUB_WORKSPACE/scripts/smoke_mcp_extra.py"
+          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/python" "$GITHUB_WORKSPACE/scripts/smoke_mcp_installed_mrtr_tasks.py"
+          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/python" -c "import agent_libos, importlib.metadata; from agent_libos.skills import get_builtin_skill_catalog; catalog = get_builtin_skill_catalog(); runtime = agent_libos.Runtime.open(':memory:'); owned = {tool for skill in catalog.list() for tool in skill.allowed_tools}; registered = {str(row['name']) for row in runtime.tools.list()}; pid = runtime.process.spawn(image='coding-agent:v0', goal='installed Skill activation smoke'); selected = runtime.skills.discover_skills_result('agent-libos-workspace-editing', actor=pid, limit=1)['skills'][0]; activation = runtime.tools.call(pid, 'activate_skill', {'skill_id': selected['skill_id'], 'expected_package_sha256': selected['package_sha256']}); refreshed = runtime.skills.discover_skills_result('agent-libos-workspace-editing', actor=pid, limit=1)['skills'][0]; assert agent_libos.__version__ == importlib.metadata.version('agent-libos'); assert len(catalog.list()) == 26; assert len(owned) == 101; assert owned == registered; assert activation.ok; assert activation.payload['result'] == {'skill_id': selected['skill_id'], 'name': selected['name'], 'version': selected['version'], 'tool_names': sorted(selected['allowed_tools'])}; assert refreshed['skill_id'] == selected['skill_id']; assert refreshed['package_sha256'] == selected['package_sha256']; assert refreshed['active'] is True; runtime.close()"
           "$GITHUB_WORKSPACE/.release-sdist-venv/bin/agent-libos" --help
           "$GITHUB_WORKSPACE/.release-sdist-venv/bin/agent-libos-gui-server" --help
           "$GITHUB_WORKSPACE/.release-sdist-venv/bin/agent-libos-migrate-tool-groups" --help
@@ -276,7 +291,7 @@ jobs:
           --lane ${{ matrix.lane }}
           ${{ matrix.shard_args }}
           --durations 25
-          --max-lane-seconds ${{ matrix.lane == 'runtime' && 480 || 360 }}
+          --max-lane-seconds ${{ (matrix.lane == 'runtime' || matrix.lane == 'benchmark') && 480 || 360 }}
 
   security:
     needs: static
@@ -388,6 +403,11 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Set up Deno
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: "2.9.4"
+
       - name: Set up uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
@@ -397,17 +417,67 @@ jobs:
       - name: Install frozen MCP SDK dependencies
         run: uv sync --frozen --extra mcp
 
+      - name: Install frozen TypeScript MCP SDK v2 fixture
+        run: >-
+          npm --prefix tests/fixtures/mcp_sdk_v2/typescript_server
+          ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify complete MCP pytest marker closure
+        run: uv run python scripts/check_mcp_test_closure.py
+
       - name: Run complete MCP SDK integration suite
         run: >-
           uv run python -m pytest
-          tests/providers/test_mcp_http_transport.py
-          tests/providers/test_mcp_primitive.py::TestMcpPrimitive::test_sdk_http_client_uses_snapshotted_headers_and_disables_ambient_env
-          tests/providers/test_mcp_v2_adapter.py
-          tests/providers/test_mcp_sdk_integration.py
+          tests -m "mcp and not postgres"
           --run-mcp --fail-on-skip
 
-      - name: Run applicable MCP client conformance scenarios
+      - name: Run reviewed fixed-upstream MCP client conformance scenarios
         run: uv run python scripts/run_mcp_conformance.py
+
+  mcp-native:
+    needs: static
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14]
+
+    name: mcp native transport (${{ matrix.os }})
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.32"
+          enable-cache: true
+
+      - name: Install frozen MCP SDK dependencies
+        run: uv sync --frozen --extra mcp
+
+      - name: Run native stdio and loopback HTTP MCP smoke
+        run: >-
+          uv run python -m pytest
+          tests/providers/test_mcp_sdk_integration.py::TestMcpSdkIntegration::test_stdio_fastmcp_tool_call
+          tests/providers/test_mcp_sdk_integration.py::TestMcpSdkIntegration::test_stdio_modern_discovery_call_and_phase_receipts
+          tests/providers/test_mcp_sdk_integration.py::TestMcpSdkIntegration::test_streamable_http_fastmcp_tool_call
+          tests/providers/test_mcp_modern_cli_e2e.py::test_modern_cli_runs_real_stdio_and_loopback_http_without_stderr
+          tests/providers/test_mcp_modern_cli_e2e.py::test_oauth_foreground_login_rehydrates_in_fresh_cli_runtime_and_resources
+          tests/providers/test_mcp_modern_cli_e2e.py::test_subscription_listen_streams_and_stops_on_one_real_runtime
+          tests/runtime/test_mcp_v3_durable_facade.py::test_runtime_facade_captures_real_human_and_reopens_without_initial_replay
+          tests/runtime/test_mcp_v3_durable_facade.py::test_cli_resource_and_prompt_initial_elicitation_use_protected_host_questions
+          tests/runtime/test_mcp_v3_durable_facade.py::test_runtime_remote_task_facade_get_update_cancel_uses_only_local_refs
+          --run-mcp --fail-on-skip
 
   windows:
     needs: static
@@ -524,6 +594,7 @@ jobs:
           --suite benchmarks/runtime_safety
           --runner agent_libos_full
           --require-all-passed
+          --require-release-evidence
           --output .benchmark_runs/ci-release-smoke
 
       - name: Run 100k external-effect recovery scale smoke

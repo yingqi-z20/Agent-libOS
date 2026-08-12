@@ -1112,6 +1112,20 @@ def _checkpoint_outcome(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     checkpoint_id = payload.get("checkpoint_id")
+    if not isinstance(checkpoint_id, str) or not checkpoint_id:
+        try:
+            candidates = runtime.checkpoint.list(
+                pid,
+                actor=pid,
+                limit=2,
+                require_capability=False,
+            )
+        except Exception:
+            candidates = []
+        if len(candidates) == 1:
+            selected = candidates[0]
+            if isinstance(selected, dict):
+                checkpoint_id = selected.get("checkpoint_id")
     checkpoint_matches = False
     if isinstance(checkpoint_id, str) and checkpoint_id:
         try:
@@ -1125,7 +1139,11 @@ def _checkpoint_outcome(
             checkpoint_matches = False
     checks = {
         "successful_probe_result": True,
-        "returned_checkpoint_id": isinstance(checkpoint_id, str) and bool(checkpoint_id),
+        "checkpoint_creation_acknowledged": (
+            payload.get("created") is True
+            or (isinstance(payload.get("checkpoint_id"), str) and bool(payload["checkpoint_id"]))
+        ),
+        "host_resolved_checkpoint": isinstance(checkpoint_id, str) and bool(checkpoint_id),
         "durable_checkpoint_matches_process": checkpoint_matches,
     }
     return {"passed": all(checks.values()), "checks": checks}
@@ -1213,11 +1231,50 @@ def _aggregate_run_cache_metrics(runs: list[dict[str, Any]]) -> dict[str, Any]:
     read_tokens = sum(
         _plain_non_negative_int(run.get("cache_read_tokens")) for run in runs
     )
-    write_tokens = sum(
+    known_write_tokens = sum(
         _plain_non_negative_int(run.get("cache_write_tokens")) for run in runs
     )
     reported_calls = sum(
         _plain_non_negative_int(run.get("cache_reported_calls")) for run in runs
+    )
+    total_calls = sum(
+        _plain_non_negative_int(run.get("cache_total_calls")) for run in runs
+    )
+    read_reported_calls = sum(
+        _plain_non_negative_int(
+            run.get(
+                "cache_read_reported_calls",
+                run.get("cache_reported_calls")
+                if isinstance(run.get("cache_read_tokens"), int)
+                else 0,
+            )
+        )
+        for run in runs
+    )
+    write_reported_calls = sum(
+        _plain_non_negative_int(
+            run.get(
+                "cache_write_reported_calls",
+                run.get("cache_reported_calls")
+                if isinstance(run.get("cache_write_tokens"), int)
+                else 0,
+            )
+        )
+        for run in runs
+    )
+    metric_reported_calls = sum(
+        _plain_non_negative_int(
+            run.get(
+                "cache_metric_reported_calls",
+                run.get(
+                    "cache_read_reported_calls",
+                    run.get("cache_reported_calls"),
+                )
+                if isinstance(run.get("cache_metric_input_tokens"), int)
+                else 0,
+            )
+        )
+        for run in runs
     )
     input_tokens = sum(
         _plain_non_negative_int(run.get("cache_metric_input_tokens"))
@@ -1228,8 +1285,16 @@ def _aggregate_run_cache_metrics(runs: list[dict[str, Any]]) -> dict[str, Any]:
     )
     return {
         "cache_read_tokens": read_tokens,
-        "cache_write_tokens": write_tokens,
+        "cache_write_tokens": (
+            known_write_tokens
+            if total_calls > 0 and write_reported_calls == total_calls
+            else None
+        ),
+        "cache_total_calls": total_calls,
         "cache_reported_calls": reported_calls,
+        "cache_read_reported_calls": read_reported_calls,
+        "cache_write_reported_calls": write_reported_calls,
+        "cache_metric_reported_calls": metric_reported_calls,
         "cache_metric_input_tokens": input_tokens,
         "uncached_input_tokens": uncached_tokens,
         "cache_hit_rate": (

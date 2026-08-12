@@ -6,7 +6,13 @@ from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.exceptions import SkillPackageChanged, ValidationError
-from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolExecutionError, ToolPolicy
+from agent_libos.tools.base import (
+    SyncAgentTool,
+    ToolContext,
+    ToolExecutionError,
+    ToolPolicy,
+    ToolResult,
+)
 from agent_libos.utils.skill_search import SKILL_SEARCH_TEXT_MAX_CHARS
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -212,7 +218,7 @@ class ActivateSkillTool(SyncAgentTool[ActivateSkillArgs]):
     )
     tags = ["skill", "activate"]
 
-    def run(self, args: ActivateSkillArgs, ctx: ToolContext) -> ActivateSkillOutput:
+    def run(self, args: ActivateSkillArgs, ctx: ToolContext) -> ToolResult:
         try:
             result = _runtime(ctx).skills.activate_skill(
                 ctx.pid,
@@ -226,7 +232,19 @@ class ActivateSkillTool(SyncAgentTool[ActivateSkillArgs]):
             ) from exc
         except ValidationError as exc:
             raise ValidationError(_source_neutral_error_message(str(exc))) from exc
-        return ActivateSkillOutput(result=result)
+        output = ActivateSkillOutput(result=result)
+        activated = output.result
+        return ToolResult.success(
+            data=output.model_dump(),
+            model_data={
+                "result": {
+                    "skill_id": activated.skill_id,
+                    "name": activated.name,
+                    "version": activated.version,
+                    "tool_names": activated.tool_names,
+                }
+            },
+        )
 
 
 class ReadSkillResourceTool(SyncAgentTool[ReadSkillResourceArgs]):
@@ -275,7 +293,7 @@ class UnloadSkillTool(SyncAgentTool[UnloadSkillArgs]):
     )
     tags = ["skill", "unload"]
 
-    def run(self, args: UnloadSkillArgs, ctx: ToolContext) -> UnloadSkillOutput:
+    def run(self, args: UnloadSkillArgs, ctx: ToolContext) -> ToolResult:
         try:
             result = _runtime(ctx).skills.unload_skill(
                 ctx.pid,
@@ -284,7 +302,17 @@ class UnloadSkillTool(SyncAgentTool[UnloadSkillArgs]):
             )
         except ValidationError as exc:
             raise ValidationError(_source_neutral_error_message(str(exc))) from exc
-        return UnloadSkillOutput(result=result)
+        output = UnloadSkillOutput(result=result)
+        unloaded = output.result
+        return ToolResult.success(
+            data=output.model_dump(),
+            model_data={
+                "result": {
+                    "skill_id": unloaded.skill_id,
+                    "removed_tools": unloaded.removed_tools,
+                }
+            },
+        )
 
 
 def _runtime(ctx: ToolContext) -> Any:

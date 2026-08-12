@@ -216,20 +216,25 @@ def _canonical_source_context_tool_result_objects(
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if (
-            not isinstance(record, dict)
-            or record.get("record_type") != "object_memory_object"
-            or record.get("type") != "tool_result"
+        if not isinstance(record, dict) or record.get("type") != "tool_result":
+            continue
+        canonical_envelope = record.get("record_type") == "object_memory_object"
+        compact_envelope = (
+            record.get("record_type") is None
+            and "content_trust" in record
+            and "immutable" in record
+            and "namespace" in record
+        )
+        if not canonical_envelope and not compact_envelope:
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("tool_name"), str
         ):
             continue
         oid = record.get("object_oid")
-        payload = record.get("payload")
-        if (
-            isinstance(oid, str)
-            and isinstance(payload, dict)
-            and isinstance(payload.get("tool_name"), str)
-        ):
-            result.append((oid, payload))
+        semantic_oid = oid if isinstance(oid, str) else f"semantic:{len(result)}"
+        result.append((semantic_oid, payload))
     return result
 
 

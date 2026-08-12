@@ -94,11 +94,15 @@ pnpm-debug.log*
 # Vite, Electron, and GUI test/build artifacts
 /gui/dist/
 /gui/dist-electron/
+/gui/build/
 /gui/.vite/
 /gui/coverage/
 /gui/.smoke-log.jsonl
 /gui/.smoke-user-data/
 /gui/release/
+/gui/.desktop-build/
+/gui/.desktop-stage/
+/desktop-dist/
 /gui/playwright-report/
 /gui/.playwright-results/
 

@@ -68,6 +68,8 @@ MCP_SYSCALLS = (
     SyscallDescriptor("mcp.inspect", "_mcp_inspect"),
     SyscallDescriptor("mcp.tools", "_mcp_tools"),
     SyscallDescriptor("mcp.call", "_mcp_call"),
+    SyscallDescriptor("mcp.resources", "_mcp_resources"),
+    SyscallDescriptor("mcp.resource_read", "_mcp_resource_read"),
 )
 
 PROCESS_SYSCALLS = (

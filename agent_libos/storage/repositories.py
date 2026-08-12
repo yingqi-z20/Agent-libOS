@@ -101,6 +101,14 @@ from agent_libos.storage.contracts import (
     TaskRunBackendProtocol,
     TransactionBackendProtocol,
     UnitOfWorkBackendProtocol,
+    McpV7BackendProtocol,
+)
+from agent_libos.storage.mcp_v7 import (
+    McpAuthMetadataRecord,
+    McpContinuationRecord,
+    McpRemoteTaskRecord,
+    McpSideEffectPreparationRecord,
+    McpSubscriptionRecord,
 )
 from agent_libos.storage.base import StoreAssemblyReadiness
 from agent_libos.storage.semantic import (
@@ -4234,9 +4242,15 @@ class ExtensionRepository(_RepositoryFacade):
             "list_jsonrpc_endpoints",
             "delete_jsonrpc_endpoint",
             "upsert_mcp_server",
+            "upsert_mcp_v3_server",
+            "compare_and_swap_mcp_v3_server",
             "get_mcp_registry_binding",
             "get_mcp_server",
+            "get_mcp_v3_server",
+            "get_mcp_server_manifest",
             "list_mcp_servers",
+            "list_mcp_v3_servers",
+            "list_mcp_server_manifests",
             "delete_mcp_server",
             "get_image",
             "list_images",
@@ -4506,6 +4520,7 @@ class SemanticAssessmentRepository(_RepositoryFacade):
         {
             "enqueue_semantic_assessment_job",
             "get_semantic_assessment_job",
+            "get_semantic_assessment_job_for_request",
             "claim_next_semantic_assessment_job",
             "query_expired_semantic_assessment_jobs",
             "query_semantic_assessment_jobs",
@@ -4513,6 +4528,42 @@ class SemanticAssessmentRepository(_RepositoryFacade):
             "append_semantic_assessment",
             "get_semantic_assessment",
             "query_semantic_assessments",
+            "append_semantic_flow_bundle",
+            "get_semantic_flow_entity",
+            "get_semantic_flow_activity",
+            "query_semantic_flow_entities",
+            "query_semantic_flow_activities",
+            "query_semantic_flow_edges",
+            "query_semantic_flow_label_assertions",
+            "semantic_flow_status_aggregate",
+            "get_semantic_legacy_coverage",
+            "append_semantic_policy_epoch",
+            "get_semantic_policy_epoch",
+            "query_semantic_policy_epochs",
+            "get_semantic_control_state",
+            "fence_semantic_control_state",
+            "query_semantic_control_history",
+            "append_semantic_machine_settlement",
+            "query_semantic_machine_settlements",
+            "query_unresolved_semantic_machine_settlements",
+            "get_semantic_machine_settlement",
+            "append_semantic_review_label",
+            "query_semantic_review_labels",
+            "append_semantic_health_event",
+            "query_semantic_health_events",
+            "append_semantic_human_outcome_link",
+            "get_semantic_human_outcome_link_for_request",
+            "query_semantic_human_outcome_links",
+            "semantic_human_outcome_links_for_assessments",
+            "semantic_human_outcome_links_for_settlements",
+            "semantic_human_outcome_link_counts",
+            "append_semantic_machine_outcome",
+            "query_semantic_machine_outcomes",
+            "semantic_machine_outcome_counts",
+            "semantic_metrics",
+            "semantic_rollout_review_evidence",
+            "semantic_unsafe_review_count",
+            "get_semantic_rate_budget",
         }
     )
 
@@ -4535,6 +4586,326 @@ class SemanticAssessmentRepository(_RepositoryFacade):
                 assessment,
             ),
             operation="terminalize semantic assessment job",
+        )
+
+    def compare_and_set_semantic_control_state(self, expected: Any, target: Any) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._semantic_backend,
+            self.transaction,
+            lambda: self._semantic_backend.compare_and_set_semantic_control_state(
+                expected, target
+            ),
+            operation="compare and set semantic control state",
+        )
+
+    def compare_and_set_semantic_rate_budget(self, expected: Any, target: Any) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._semantic_backend,
+            self.transaction,
+            lambda: self._semantic_backend.compare_and_set_semantic_rate_budget(
+                expected, target
+            ),
+            operation="compare and set semantic rate budget",
+        )
+
+    def append_semantic_machine_outcome_if_absent(self, record: Any) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._semantic_backend,
+            self.transaction,
+            lambda: self._semantic_backend.append_semantic_machine_outcome_if_absent(
+                record
+            ),
+            operation="append semantic machine outcome if absent",
+        )
+
+
+class McpContinuationRepository(_RepositoryFacade):
+    """Durable MRTR continuation bindings; provider payloads never enter Store."""
+
+    def __init__(self, backend: McpV7BackendProtocol) -> None:
+        super().__init__(backend)
+        self._backend = backend
+
+    def insert(self, record: McpContinuationRecord) -> McpContinuationRecord:
+        return self._backend.insert_mcp_continuation(record)
+
+    def get(self, continuation_id: str) -> McpContinuationRecord | None:
+        return self._backend.get_mcp_continuation(continuation_id)
+
+    def list(self, **filters: Any) -> tuple[McpContinuationRecord, ...]:
+        return self._backend.list_mcp_continuations(**filters)
+
+    def count_active(self, *, owner_id: str | None = None) -> int:
+        return self._backend.count_active_mcp_continuations(owner_id=owner_id)
+
+    def list_terminal(
+        self,
+        *,
+        owner_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[McpContinuationRecord, ...]:
+        return self._backend.list_terminal_mcp_continuations(
+            owner_id=owner_id,
+            limit=limit,
+        )
+
+    def delete_terminal(
+        self,
+        continuation_id: str,
+        *,
+        expected_revision: int,
+    ) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._backend,
+            self.transaction,
+            lambda: self._backend.delete_terminal_mcp_continuation(
+                continuation_id,
+                expected_revision=expected_revision,
+            ),
+            operation="delete terminal MCP continuation",
+        )
+
+    def compare_and_swap(
+        self, continuation_id: str, *, expected_revision: int,
+        replacement: McpContinuationRecord,
+    ) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._backend,
+            self.transaction,
+            lambda: self._backend.compare_and_swap_mcp_continuation(
+                continuation_id,
+                expected_revision=expected_revision,
+                replacement=replacement,
+            ),
+            operation="compare and swap MCP continuation",
+        )
+
+
+class McpRemoteTaskRepository(_RepositoryFacade):
+    """Durable local references to bearer-like remote Tasks extension ids."""
+
+    def __init__(self, backend: McpV7BackendProtocol) -> None:
+        super().__init__(backend)
+        self._backend = backend
+
+    def insert(self, record: McpRemoteTaskRecord) -> McpRemoteTaskRecord:
+        return self._backend.insert_mcp_remote_task(record)
+
+    def get(self, task_ref: str) -> McpRemoteTaskRecord | None:
+        return self._backend.get_mcp_remote_task(task_ref)
+
+    def get_by_remote_id_sha256(
+        self,
+        server_id: str,
+        remote_id_sha256: str,
+    ) -> McpRemoteTaskRecord | None:
+        return self._backend.get_mcp_remote_task_by_remote_id_sha256(
+            server_id,
+            remote_id_sha256,
+        )
+
+    def list(self, **filters: Any) -> tuple[McpRemoteTaskRecord, ...]:
+        return self._backend.list_mcp_remote_tasks(**filters)
+
+    def count(self, *, owner_id: str | None = None) -> int:
+        return self._backend.count_mcp_remote_tasks(owner_id=owner_id)
+
+    def count_active(self, *, owner_id: str | None = None) -> int:
+        return self._backend.count_active_mcp_remote_tasks(owner_id=owner_id)
+
+    def list_terminal(
+        self,
+        *,
+        owner_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[McpRemoteTaskRecord, ...]:
+        return self._backend.list_terminal_mcp_remote_tasks(
+            owner_id=owner_id,
+            limit=limit,
+        )
+
+    def delete_terminal(
+        self,
+        task_ref: str,
+        *,
+        expected_revision: int,
+    ) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._backend,
+            self.transaction,
+            lambda: self._backend.delete_terminal_mcp_remote_task(
+                task_ref,
+                expected_revision=expected_revision,
+            ),
+            operation="delete terminal MCP remote task",
+        )
+
+    def compare_and_swap(
+        self, task_ref: str, *, expected_revision: int,
+        replacement: McpRemoteTaskRecord,
+    ) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._backend,
+            self.transaction,
+            lambda: self._backend.compare_and_swap_mcp_remote_task(
+                task_ref,
+                expected_revision=expected_revision,
+                replacement=replacement,
+            ),
+            operation="compare and swap MCP remote task",
+        )
+
+
+class McpSideEffectPreparationRepository(_RepositoryFacade):
+    """Crash-safe ownership of preallocated Human and broker side effects."""
+
+    def __init__(self, backend: McpV7BackendProtocol) -> None:
+        super().__init__(backend)
+        self._backend = backend
+
+    def insert(
+        self,
+        record: McpSideEffectPreparationRecord,
+    ) -> McpSideEffectPreparationRecord:
+        return self._backend.insert_mcp_side_effect_preparation(record)
+
+    def get(
+        self,
+        preparation_id: str,
+    ) -> McpSideEffectPreparationRecord | None:
+        return self._backend.get_mcp_side_effect_preparation(preparation_id)
+
+    def list(
+        self,
+        **filters: Any,
+    ) -> tuple[McpSideEffectPreparationRecord, ...]:
+        return self._backend.list_mcp_side_effect_preparations(**filters)
+
+    def compare_and_swap(
+        self,
+        preparation_id: str,
+        *,
+        expected_revision: int,
+        replacement: McpSideEffectPreparationRecord,
+    ) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._backend,
+            self.transaction,
+            lambda: self._backend.compare_and_swap_mcp_side_effect_preparation(
+                preparation_id,
+                expected_revision=expected_revision,
+                replacement=replacement,
+            ),
+            operation="compare and swap MCP side-effect preparation",
+        )
+
+    def delete(self, preparation_id: str, *, expected_revision: int) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._backend,
+            self.transaction,
+            lambda: self._backend.delete_mcp_side_effect_preparation(
+                preparation_id,
+                expected_revision=expected_revision,
+            ),
+            operation="delete MCP side-effect preparation",
+        )
+
+    def commit(
+        self,
+        preparation_id: str,
+        *,
+        expected_revision: int,
+        replacement: McpContinuationRecord | McpRemoteTaskRecord,
+    ) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._backend,
+            self.transaction,
+            lambda: self._backend.commit_mcp_side_effect_preparation(
+                preparation_id,
+                expected_revision=expected_revision,
+                replacement=replacement,
+            ),
+            operation="commit MCP side-effect preparation",
+        )
+
+    def commit_terminal(
+        self,
+        preparation_id: str,
+        *,
+        expected_revision: int,
+    ) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._backend,
+            self.transaction,
+            lambda: self._backend.commit_terminal_mcp_side_effect_preparation(
+                preparation_id,
+                expected_revision=expected_revision,
+            ),
+            operation="commit terminal MCP side-effect preparation",
+        )
+
+
+class McpSubscriptionRepository(_RepositoryFacade):
+    """Durable subscription lifecycle metadata; event queues stay in memory."""
+
+    def __init__(self, backend: McpV7BackendProtocol) -> None:
+        super().__init__(backend)
+        self._backend = backend
+
+    def insert(self, record: McpSubscriptionRecord) -> McpSubscriptionRecord:
+        return self._backend.insert_mcp_subscription(record)
+
+    def get(self, subscription_id: str) -> McpSubscriptionRecord | None:
+        return self._backend.get_mcp_subscription(subscription_id)
+
+    def list(self, **filters: Any) -> tuple[McpSubscriptionRecord, ...]:
+        return self._backend.list_mcp_subscriptions(**filters)
+
+    def compare_and_swap(
+        self, subscription_id: str, *, expected_revision: int,
+        replacement: McpSubscriptionRecord,
+    ) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._backend,
+            self.transaction,
+            lambda: self._backend.compare_and_swap_mcp_subscription(
+                subscription_id,
+                expected_revision=expected_revision,
+                replacement=replacement,
+            ),
+            operation="compare and swap MCP subscription",
+        )
+
+
+class McpAuthMetadataRepository(_RepositoryFacade):
+    """Non-secret OAuth diagnostic state; credentials remain in the broker."""
+
+    def __init__(self, backend: McpV7BackendProtocol) -> None:
+        super().__init__(backend)
+        self._backend = backend
+
+    def insert(self, record: McpAuthMetadataRecord) -> McpAuthMetadataRecord:
+        return self._backend.insert_mcp_auth_metadata(record)
+
+    def get(self, profile_id: str) -> McpAuthMetadataRecord | None:
+        return self._backend.get_mcp_auth_metadata(profile_id)
+
+    def list(self, **filters: Any) -> tuple[McpAuthMetadataRecord, ...]:
+        return self._backend.list_mcp_auth_metadata(**filters)
+
+    def compare_and_swap(
+        self, profile_id: str, *, expected_revision: int,
+        replacement: McpAuthMetadataRecord,
+    ) -> bool:
+        return _transactional_backend_cas_result_rollback_on_error(
+            self._backend,
+            self.transaction,
+            lambda: self._backend.compare_and_swap_mcp_auth_metadata(
+                profile_id,
+                expected_revision=expected_revision,
+                replacement=replacement,
+            ),
+            operation="compare and swap MCP auth metadata",
         )
 
 
@@ -4624,6 +4995,7 @@ _MIGRATED_BACKEND_PROTOCOLS: tuple[tuple[str, type[Any]], ...] = (
     ("operation-evidence", OperationEvidenceBackendProtocol),
     ("tool-artifact", ToolArtifactRepositoryProtocol),
     ("payload-retention", PayloadRetentionStore),
+    ("mcp-v7", McpV7BackendProtocol),
 )
 _MISSING_BACKEND_MEMBER = object()
 _SIGNATURE_PROBE = object()
@@ -4753,6 +5125,11 @@ class UnitOfWork:
         self.module_publications = RuntimeModuleRepository(store)
         self.retention = PayloadRetentionRepository(store)
         self.semantic = SemanticAssessmentRepository(store)
+        self.mcp_continuations = McpContinuationRepository(store)
+        self.mcp_remote_tasks = McpRemoteTaskRepository(store)
+        self.mcp_side_effects = McpSideEffectPreparationRepository(store)
+        self.mcp_subscriptions = McpSubscriptionRepository(store)
+        self.mcp_auth = McpAuthMetadataRepository(store)
         self.protected_effects = ProtectedEffectRepository(self)
 
     def locked(self) -> AbstractContextManager[None]:

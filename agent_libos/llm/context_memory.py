@@ -1457,6 +1457,7 @@ def _capability_signature(capabilities: list[Capability]) -> list[dict[str, Any]
                 "effect": cap.effect.value,
                 "status": cap.status.value,
                 "policy": _capability_policy(cap),
+                "constraints": dict(cap.constraints),
                 "uses_remaining": cap.uses_remaining,
                 "delegable": cap.delegable,
                 "delegation_depth": cap.delegation_depth,

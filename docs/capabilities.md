@@ -554,7 +554,10 @@ Deno/TypeScript JIT tools can use the syscall names:
 - `capability.delegate`
 - `capability.revoke`
 - `mcp.list`, `mcp.inspect`, `mcp.tools`, and `mcp.call` for registered MCP
-  servers and tools.
+  servers and Tools;
+- `mcp.resources` and `mcp.resource_read` for manifest-declared,
+  model-visible v3 Resources/Resource Templates through logical ids and opaque
+  cursors only.
 
 Syscalls do not consult the process tool table. They are authorized by pid,
 capability records, primitive rules, and Human approval where required. Their
@@ -616,8 +619,13 @@ discovery, not tool invocation. Granting `mcp:demo-tools:echo read` allows only
 that manifest-declared tool, subject to argument schema validation, live tool
 schema checks, runtime DNS/secret policy for HTTP transports, provider
 classification, audit, and external-effect recording. MCP Resources and
-Prompts are not exposed. Manifest v2 protocol discovery is a separate protected
-external read: a process needs both `read` and `execute` on the exact
+Prompts do not inherit Tool authority. The built-in v3 Resource list/read
+facade accepts only manifest logical ids and `model_visible: true` entries.
+Catalog access requires `read` plus `execute` on the exact
+`mcp_server:<server-id>`; content read additionally requires `read` on
+`mcp:<server-id>:resource:<logical-id>`. Prompts and Completion remain Host
+surfaces rather than model tools. Manifest v2 protocol discovery is a separate
+protected external read: a process needs both `read` and `execute` on the exact
 `mcp_server:<server-id>` resource. Discovery metadata cannot grant Tool rights
 or turn an unsupported server capability into a Runtime capability.
 

@@ -129,18 +129,24 @@ longer defines.
   sensitivity release, and the Host-declared floor remains in final effect
   evidence. This is an opt-in containment primitive; the permissive default
   preserves existing contracts.
-- `provider-usage-reservations-fail-closed`: MCP uses one absolute deadline
-  across DNS, executable snapshot, live listing, validation, and call dispatch.
-  An exhausted deadline cannot start a provider; known response bytes settle
-  exactly, an unknown host failure charges the current phase maximum, and a
-  later phase that never started charges zero rather than the full composite
-  reservation. Provider exceptions cross public, Tool, syscall, LLM, and
-  evidence surfaces only as a code/type/correlation envelope without host
-  exception text.
+- `provider-usage-reservations-fail-closed`: MCP uses one absolute deadline from
+  bounded schema/regex and environment/executable-identity preflight through
+  protected preparation, DNS, executable snapshot, live listing, validation,
+  and call dispatch. A pre-dispatch timeout during schema, identity, or
+  protected revalidation creates no effect and cannot start a provider; known
+  response bytes settle exactly, an unknown host failure charges the current
+  phase maximum, and a later phase
+  that never started charges zero rather than the full composite reservation.
+  Provider exceptions cross public, Tool, syscall, LLM, and evidence surfaces
+  only as a code/type/correlation envelope without host exception text.
 - `provider-results-are-decoded-at-the-host-boundary`: MCP and JSON-RPC provider
   results are detached and validated before runtime field access; malformed or
   unknown post-return failures expose only public envelopes, and unknown
   response bytes settle at the active-stage ceiling.
+- `mcp-registry-search-exposes-only-public-identifiers`: MCP registry text
+  search performs a case-insensitive literal substring match over public server
+  ids only; SQL wildcard characters remain literal and private canonical
+  manifest fields cannot be probed through search results.
 - `provider-approval-is-bound-to-versioned-spec`: JSON-RPC and MCP approvals
   bind an immutable registry-specification digest and monotonic generation,
   including absent first-registration state, and are revalidated before every
@@ -318,13 +324,38 @@ longer defines.
   pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
   typed boundaries compute the next state generation, preventing a direct-write
   rewind from reviving a stale token.
-- `v5-persisted-state-is-strict-and-versioned`: ordinary 1.4.0 Runtime startup
-  accepts only the frozen version-5 physical schema (including Durable Task
-  Run, typed process state, Human revision, and semantic job/evidence state)
-  plus canonical security carriers. A canonical v4 source is accepted only by
-  the explicit offline digest-bound migration command; v3, older, incomplete,
-  or malformed state is rejected before Runtime mutation. Recovery operates
-  only on valid schema-v5 state.
+- `v7-persisted-state-is-strict-and-versioned`: ordinary 1.5.0 Runtime startup
+  accepts only the frozen version-7 physical schema (including Durable Task
+  Run, typed process state, Human revision, semantic job/evidence state,
+  FlowGraph, policy epochs, machine-settlement evidence, and sanitized MCP v3
+  continuation/Task/subscription/auth projections) plus canonical security
+  carriers. Canonical v4-to-v5, v5-to-v6, and v6-to-v7 upgrades are explicit,
+  offline, digest-bound migration steps; Runtime startup never migrates a
+  store. Older, incomplete, or malformed state is rejected before Runtime
+  mutation. Recovery operates only on valid schema-v7 state, and remote MCP
+  request state, input payloads, task ids, and OAuth secrets never become Store
+  columns. Every persisted input-required Task remains bound to a durable Human
+  request that is unique across continuations and Tasks, and each multi-round
+  continuation response atomically replaces that binding under its SQL
+  revision fence. Opaque credential-broker slots are likewise unique across
+  continuation broker state and both remote-Task broker fields. Before creating
+  any MCP Human question or credential-broker
+  value, the Runtime durably owns its preallocated id and exact reserved broker
+  slots in a payload-free preparation row. Atomic main-row commit advances that
+  row to a durable retirement stage; normal or startup cleanup deletes only the
+  superseded slots/Human binding, while a precommit abort deletes only newly
+  allocated state, without replaying Provider I/O. Ordinary sidecar CAS can
+  claim only an unchanged `abort` plan; only the atomic main-row commit methods
+  may produce `retire`. When one MCP handoff must publish multiple main rows,
+  or must settle another protected projection at the same commit point, their
+  prepared-row commits join one RuntimeStore transaction; external Human and
+  broker cleanup is deferred until that outer transaction commits, while a
+  rollback leaves every preparation in `prepared` for deterministic recovery.
+  Bounded retention first owns
+  old refs in a retirement-only preparation, then atomically deletes only
+  revision-matched terminal or `needs_attention` continuation/Task projections.
+  Unknown outcomes cannot permanently consume the active cap, and physical
+  cleanup never deletes Human identity, effect, event, or audit evidence.
 - `durable-task-run-ledger-is-versioned-and-generation-fenced`: mutable Run
   projections advance through revision CAS under the current monotonic Runtime
   epoch. Stable command identities make retries idempotent, while requirements,
@@ -399,6 +430,22 @@ longer defines.
   authority reservations, operation links, events, and audit commit or roll
   back as one unit, so an evidence-sink failure cannot publish a partial Human
   authority transition.
+- `human-approval-preview-is-host-bound-and-safe`: external-operation approval
+  surfaces render only a strict Host-derived, digest-bound argument projection.
+  Requester prose and claimed risk never become Host evidence; safe bounded
+  identities and workspace-relative resources remain readable, while secrets,
+  long or high-sensitivity identities and paths, payloads, and terminal
+  control/format characters are redacted, omitted, or visibly encoded. Git
+  references retain a closed Host role plus safe display-or-redaction and an
+  exact digest. Material filesystem, shell, Git, JSON-RPC, MCP, and PTY facts
+  remain typed and variant-closed across terminal, API, and GUI decoders.
+- `human-authority-request-shape-is-host-bound`: the model-visible generic
+  Human query accepts no authority-shaping field or Host-origin marker. Only a
+  Host control entry can publish an exactly typed permission, data-release, or
+  effect-bound external-operation request; every Human terminalization path
+  revalidates that durable shape before applying side effects. Canonical Human
+  previews may represent bounded scoped resources, while deterministic machine
+  settlement remains restricted to the separate exact-resource decoder.
 - `ambiguous-human-provider-outcomes-require-host-resume`: once a Human
   provider phase may have started but its outcome is unknown, the exact request
   becomes terminal and non-retryable, the effect ledger retains the
@@ -1066,7 +1113,9 @@ longer defines.
   Refreshed tool listing/tool calls atomically reserve their
   deduplicated main, server, process-spawn, and exact stdio authority and persist
   pending evidence before DNS/live-provider boundaries. Local/stdio first-call
-  PENS may restore; non-local DNS observation cannot be erased.
+  PENS may restore; non-local DNS observation cannot be erased. The GUI cached
+  Tool-list GET cannot request live I/O; live refresh uses its explicit POST
+  route, and process-mode unregistration still requires exact server `admin`.
 - `mcp-protocol-mode-is-explicit-and-registry-fenced`: Manifest v1 omits
   protocol mode and retains its exact canonical registry/approval/Sink identity;
   Manifest v2 requires one of the three release-locked modes. Replacement
@@ -1077,15 +1126,83 @@ longer defines.
   legacy signal and only before Tool dispatch. Authentication/server errors,
   malformed or oversized replies, modern protocol errors, DNS/TLS failures, and
   ambiguous timeouts never become legacy evidence or a replay path.
-- `mcp-unsupported-modern-features-never-gain-runtime-authority`: discovered
-  server capabilities, annotations, cache hints, notifications, and unsupported
+- `mcp-v1-v2-unsupported-modern-features-never-gain-runtime-authority`: on the
+  Manifest v1/v2 governed-Tools compatibility path, discovered server
+  capabilities, annotations, cache hints, notifications, and unsupported
   reverse requests are untrusted diagnostics. They cannot register Tools,
   grant Capability, alter effect policy, invoke Runtime behavior, or persist a
-  negotiated session.
-- `mcp-input-required-is-never-automatically-replayed`: modern
-  `input_required` is a stable, non-retryable terminal result. Continuation
-  state is not persisted or returned; consequential/ambiguous mutation remains
-  unknown and a linked Durable Task Run requires Host attention.
+  negotiated session. Implemented Manifest v3 Host surfaces do not widen this
+  compatibility contract.
+- `mcp-v3-host-surfaces-are-closed-allowlisted-and-fenced`: Manifest v3 Host
+  Resources, Resource Templates, Prompts, Completion, and OAuth use closed
+  manifest allowlists and Host-pinned authority. Live discovery cannot add
+  authority; remote prompt/resource content stays untrusted; Apps content fails
+  closed; and a registry or OAuth fence change discards the provider result.
+  The real OAuth gate uses PKCE, pinned issuer/resource/endpoints, verified TLS,
+  and operation-local Bearer injection without persisting tokens or codes.
+  Fixed-upstream conformance retains only bounded check identity, status, and
+  specification references plus a deterministic digest; raw details and logs
+  are discarded on success and on every fail-closed path.
+  Frozen independent Python and TypeScript SDK v2 servers traverse this same
+  Runtime registry, ProtectedOperation, audit, and transport-cleanup path in the
+  release gate. CLI projections accept only the frozen, operation-specific
+  page, catalog-item, result-union, and Human-input DTO envelopes; unknown
+  fields fail closed, while only the explicitly typed metadata, schema, result,
+  and payload JSON slots remain opaque. Candidate-manifest probing is a
+  separate Host-only, reviewed, exact-digest ProtectedOperation: rejection
+  occurs before transport; success uses one pending-first bounded session,
+  records effect/audit/event evidence, returns untrusted candidate catalogs,
+  and cannot mutate registry generation, rows, or Capability authority.
+- `mcp-v3-subscription-events-are-consumed-bounded-and-inert`: Manifest v3
+  subscription notifications remain bounded, untrusted, inert records behind
+  an owner-fenced single-consumer cursor. Successful reads acknowledge and
+  evict only their returned prefix, preserving unread events and reclaiming
+  queue capacity; stale, future, or competing readers fail closed. Only
+  validated catalog-change events, and only after durable receipt accounting,
+  revoke that server's local opaque catalog cursors. Notification handling
+  cannot dispatch remote work or launch a model, Tool, TaskRun, or another
+  subscription. Task-status frames additionally require exact v3 Tasks pins and
+  an installed bounded ingress, then expose only the owner-bound local Task ref
+  after Apps removal and exact-secret redaction.
+- `mcp-v3-side-effect-preparations-are-crash-atomic`: Manifest v3 continuation
+  and remote-Task Human questions and credential-broker slots are preallocated
+  behind durable ownership before materialization. An uncommitted preparation
+  aborts only its newly owned Human/secret slots and cannot retire references
+  still named by the main record; an atomically committed transition or
+  retention deletion leaves a cleaning record until old Human/secret ownership
+  is retired. The same transaction publishes only a closed local-ref receipt
+  in the finalized protected effect, allowing Host recovery after a
+  commit-before-return crash without adding a remote Tasks list. SQLite restart
+  recovers later Elicitation rounds from broker-only state, while an ordinary
+  error or process-level interruption during protected evidence persistence
+  rolls back the Continuation, Task, receipt, event, and audit publication as
+  one unit. Recovery keeps completed response payloads out of the Store,
+  completes cleanup, marks interrupted mutations `needs_attention` without
+  Provider replay, leaves no answerable orphan, and runs only after TaskRun
+  payload preflight under the same Runtime recovery lease.
+- `mcp-input-required-is-never-automatically-replayed`: Manifest v1/v2
+  `input_required` remains a stable, non-retryable terminal result, with
+  consequential or ambiguous mutation retained as unknown. Manifest v3 uses a
+  separate opaque continuation: remote `requestState` and request keys remain
+  in the credential broker, and only an explicit revision-fenced Host response
+  may advance it. A stale response or restart never replays the initial
+  operation.
+- `mcp-model-resources-are-logical-allowlisted-and-protected`: model-facing
+  Manifest v3 Resource list/read accepts only registered logical server and
+  Resource ids, Host-issued opaque cursors, and exact string template variables,
+  then routes exclusively through the protected asynchronous Runtime facade.
+  Only `model_visible` manifest entries are eligible; raw URLs, URIs, headers,
+  transports, credentials, actors, provider cursors, Prompt/OAuth/Human-response,
+  subscription, and remote-task controls are absent. Binary content remains an
+  artifact receipt, ResourceLinks remain inert, and missing facade support fails
+  before provider dispatch. Model-facing v3 Tool outcomes form a closed union:
+  only sanitized Complete JSON, a local continuation or Task handle, bounded
+  status/final result, and a local Human receipt are projected. Provider input
+  requests, raw request state/Task ids, lifecycle revisions and timing metadata
+  remain Host-only. Provider-controlled Tool results are recursively redacted
+  against the exact operation credential snapshot before Runtime evidence,
+  persistence, or model projection; v1/v2 retain their established projected
+  payload.
 - `mcp-v1-identity-and-provider-contract-remain-stable`: adding Manifest v2 and
   the optional modern provider SPI does not add a v1 discovery probe, change v1
   canonical bytes/digests, or add required parameters to the existing
@@ -1158,11 +1275,48 @@ longer defines.
   require real tool, provider-state, external-effect, and operation evidence;
   modeled rows stay in a separate denominator.
 
-- `semantic-shadow-has-no-machine-mutation-entry`: every semantic public
-  surface is observation-only. The broker has no permit type, the Task
-  Authority candidate lookup is side-effect-free, and CLI/HTTP/GUI/model/Skill/
-  JIT/Module paths expose no semantic Human-settlement, Capability issuance,
-  permission-policy, DataLabel, release, or provider mutation.
+- `semantic-machine-mutation-is-host-private-and-closed`: semantic enforcement
+  is reachable only through the Runtime-composed private Host settlement port.
+  CLI/HTTP/GUI/model/Skill/JIT/Module paths cannot settle a request, issue a
+  Capability, mutate labels/release, or activate/revoke policy. Host review
+  import can append evidence only.
+- `semantic-model-never-supplies-allow-predicate`: classifier output contains
+  only closed findings, calibration, OOD, and abstention. It can veto or
+  escalate but cannot generate permit/deny, select a rule, fill a missing Host
+  predicate, or act as the safety oracle.
+- `semantic-hard-deny-set-is-closed`: real machine rejection is limited to
+  malformed/incomplete exact requests, binding mismatch, stale state/manifest/
+  epoch, explicit DataFlow denial, and exact Host hard-deny rules. Unsupported,
+  high-risk, uncertain, OOD, and model findings remain Human decisions.
+- `semantic-machine-terminalization-is-cas-atomic`: Human, cancel, terminal,
+  deterministic deny, and canary approval share one request revision/status
+  CAS and transaction. Request, Process, one-use Capability, job/assessment,
+  settlement, budget, event, and audit have one winner or roll back together.
+- `semantic-exact-once-authority-is-binding-and-epoch-fenced`: a machine grant
+  is short-lived, revocable, nondelegable, and has exactly one use. Its binding
+  covers the request/effect/action/resource/right/args/state, manifest, policy,
+  assessment/classifier, tenant/labels, Sink/tool/provider, nonce, and deadline;
+  the active control generation is rechecked through provider dispatch.
+- `semantic-canary-expansion-is-review-gated`: adding a tenant, widening a
+  resource/rule, or otherwise expanding an affected action requires at least
+  seven days of durable activation plus 1,000 complete safe reviews from the
+  preceding immutable epoch. Unsafe review evidence remains attached to its
+  original settlement while authority is off and blocks later expansion; if
+  any epoch is active when the unsafe review arrives, the current epoch trips.
+- `semantic-canary-budget-is-stable-and-cas`: minute, day, and inflight canary
+  budgets are keyed by tenant and logical rule across epoch rotation and Store
+  reopen. The stored epoch is origin provenance only; old-epoch outcome release
+  and new-epoch reservation share revision CAS, and transaction rollback cannot
+  mint additional budget.
+- `semantic-unknown-flow-blocks-auto-authority`: only complete, current,
+  single-tenant FlowGraph coverage can satisfy auto approval. Missing historical
+  v5 edges, partial/unknown/conflict/stale capture, or mixed identity fail closed
+  to Human review.
+- `semantic-high-risk-and-cross-tenant-authority-is-unreachable`: only catalog
+  v1 exact reads for an explicitly allowlisted tenant can receive machine
+  authority. Shell, JSON-RPC, MCP, network, writes/deletes, release,
+  permission/control administration, wildcards, and cross-tenant flows have no
+  machine issuance path.
 - `semantic-candidates-are-exact-and-attenuated`: absent, null, or empty
   `semantic_auto_approval` is deny-all. Parent and child must declare the
   closed versioned ceiling independently; the child can only preserve an exact
@@ -1180,7 +1334,7 @@ longer defines.
   only a higher sensitivity floor or lower integrity/trust ceiling. Projection
   and service code do not mutate the input labels, ambient `DataFlowContext`,
   Object/file labels, endorsement/declassification, Sink clearance, or release
-  state in Phase 0+1. Local Host DLP freezes only allowlisted category/reason/
+  state in Phase 2–4. Local Host DLP freezes only allowlisted category/reason/
   digest evidence and merges monotonic Host findings into every terminal path;
   it never persists matched text or turns a finding into authority.
 - `semantic-evidence-is-plaintext-free`: approval/provider projections are
@@ -1231,22 +1385,25 @@ longer defines.
 - PostgreSQL CI uses PostgreSQL 17 on Ubuntu. Other supported server versions
   and deployment TLS/authentication topologies are not release-gated here.
 - JSON-RPC, MCP, and Git remote tests use deterministic loopback or local
-  remotes. The complete MCP transport, adapter, and SDK integration files plus
-  fixed-upstream applicable Tools-client conformance scenarios without an
-  expected-failure baseline run on Ubuntu Python 3.11 and 3.14 from the frozen
-  optional extra; real proxy/TLS/DNS policy,
+  remotes. The complete MCP transport, adapter, SDK integration, and modern
+  Host-client fixture files plus fixed-upstream Tools/HTTP-schema (including
+  Resource/Prompt request-header branches), MRTR, and Host-pinned
+  pre-registration/CIMD OAuth client scenarios run without an expected-failure
+  baseline on Ubuntu Python 3.11 and 3.14 from the frozen optional extra; real
+  proxy/TLS/DNS policy,
   HTTPS/OpenSSH authentication, and remote MCP deployment identity remain
-  environment-gated. GitHub/GitLab API integrations and MCP MRTR/OAuth/listen,
-  Resources, Prompts, Tasks, Apps, Roots, Sampling, Logging, OTel product
-  support, and server surfaces are not implemented.
+  environment-gated. GitHub/GitLab API integrations and MCP Apps, Roots,
+  Sampling, Logging, OTel product support, OAuth DCR, deprecated standalone
+  SSE, and server surfaces are not implemented.
 - Real LLM credentials and token-spending paths are opt-in. The default matrix
   covers mock/action-selection behavior, not a live request for every supported
   profile or provider deployment.
-- Semantic Shadow safety tests use deterministic/scripted classifiers and
-  adversarial fake-provider responses. A real classifier smoke is opt-in and
-  cannot establish production calibration, OOD coverage, provider retention,
-  tenant rollout safety, or a future machine-settlement policy. Phase 0+1 has
-  no such settlement path.
+- Semantic safety tests use deterministic/scripted classifiers and adversarial
+  fake-provider responses. A real classifier smoke is opt-in and cannot
+  establish production calibration, OOD coverage, provider retention, or
+  tenant rollout safety; models are not a safety oracle. Production
+  `canary_auto` still requires static Host epochs, explicit tenants, review
+  coverage, operational trip monitoring, and environment-specific evidence.
 - GUI CI covers React tests, TypeScript typechecking, production build, and the
   Python HTTP/SSE server on Ubuntu. Accessibility/usability studies, native
   Electron lifecycle, and the production-build custom-protocol BrowserWindow

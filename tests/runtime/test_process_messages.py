@@ -145,6 +145,84 @@ class TestProcessMessage:
         finally:
             runtime.close()
 
+    def test_v2_message_tool_uses_semantic_self_and_parent_targets(self) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(
+                DEFAULT_CONFIG.llm,
+                prompt_layout='cache_optimized_v2',
+            ),
+        )
+        runtime = Runtime.open('local', config=config)
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, 'child')
+
+            handle = runtime.tools.resolve('send_process_message', pid=parent)
+            implementation = runtime.tools.registry.implementation(handle.tool_id)
+            assert implementation is not None
+            schema = implementation.spec(
+                config=runtime.config,
+                model_visible=True,
+            ).input_schema
+            assert 'recipient' in schema['properties']
+            assert 'recipient_pid' not in schema['properties']
+
+            to_self = runtime.tools.call(
+                parent,
+                'send_process_message',
+                {'recipient': 'self', 'body': 'local note'},
+            )
+            assert to_self.ok, to_self.error
+            assert to_self.payload['recipient'] == 'self'
+            assert to_self.payload['message_id']
+            assert parent not in json.dumps(to_self.payload, sort_keys=True)
+            stored = runtime.store.get_object(to_self.result_handle.oid)
+            assert stored is not None
+            assert stored.payload['result']['recipient_pid'] == parent
+            assert stored.payload['result']['message_id']
+
+            to_parent = runtime.tools.call(
+                child,
+                'send_process_message',
+                {
+                    'recipient': 'parent',
+                    'channel': 'child-only',
+                    'body': 'child update',
+                },
+            )
+            assert to_parent.ok, to_parent.error
+            assert to_parent.payload['recipient'] == 'parent'
+            assert to_parent.payload['message_id']
+            assert parent not in json.dumps(to_parent.payload, sort_keys=True)
+            assert runtime.messages.unread(parent)[-1].body == 'child update'
+
+            read = runtime.tools.call(
+                parent,
+                'read_process_messages',
+                {'channel': 'child-only'},
+            )
+            assert read.ok, read.error
+            assert read.payload['acked_message_ids'] == []
+            assert read.payload['messages'][0]['message_id'] == to_parent.payload['message_id']
+            reply = runtime.tools.call(
+                parent,
+                'send_process_message',
+                {
+                    'recipient_pid': child,
+                    'reply_to': read.payload['messages'][0]['message_id'],
+                    'body': 'acknowledged',
+                },
+            )
+            assert reply.ok, reply.error
+            durable_read = runtime.store.get_object(read.result_handle.oid)
+            assert durable_read is not None
+            assert durable_read.payload['result']['acked_message_ids']
+            assert durable_read.payload['result']['messages'][0]['message_id']
+        finally:
+            runtime.close()
+
     def test_human_can_send_normal_and_interrupt_process_messages(self) -> None:
         runtime = Runtime.open('local')
         try:

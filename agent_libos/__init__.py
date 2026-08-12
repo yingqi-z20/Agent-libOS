@@ -13,9 +13,11 @@ from agent_libos.models import (
     MemoryView,
     McpCallResult,
     McpConnectionInfo,
+    McpDispatchState,
     McpDiscoveryResult,
     McpProtocolEra,
     McpProtocolMode,
+    McpRetryClass,
     McpProviderCallResult,
     McpToolListResult,
     ObjectHandle,
@@ -85,9 +87,11 @@ __all__ = [
     "MemoryView",
     "McpCallResult",
     "McpConnectionInfo",
+    "McpDispatchState",
     "McpDiscoveryResult",
     "McpProtocolEra",
     "McpProtocolMode",
+    "McpRetryClass",
     "McpProviderCallResult",
     "McpToolListResult",
     "ObjectHandle",
@@ -141,4 +145,4 @@ __all__ = [
     "WorkflowRunResult",
 ]
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"

@@ -198,6 +198,7 @@ class TestSkillIntegration:
                 runtime.close()
 
     @pytest.mark.real_deno
+    @pytest.mark.deno_resource_monitor
     def test_jit_skill_validation_uses_broker_resource_limits_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_dir = write_skill_package(

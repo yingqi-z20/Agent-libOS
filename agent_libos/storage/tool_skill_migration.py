@@ -109,6 +109,8 @@ _LEGACY_TOOL_GROUP_TOOLS: dict[str, tuple[str, ...]] = {
         "inspect_mcp_server",
         "list_mcp_tools",
         "call_mcp_tool",
+        "list_mcp_resources",
+        "read_mcp_resource",
     ),
     "checkpoint": (
         "create_checkpoint",

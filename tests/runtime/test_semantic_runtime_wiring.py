@@ -41,6 +41,9 @@ from agent_libos.models import (
     JsonRpcCallStatus,
     McpCallResult,
     McpCallStatus,
+    ObjectMetadata,
+    ObjectPatch,
+    ObjectType,
     ProcessStatus,
     SinkTrustLevel,
     SinkTrustRule,
@@ -887,6 +890,7 @@ def _semantic_call(
     *,
     payload: object,
     labels: DataLabels | None = None,
+    flow_context: DataFlowContext | None = None,
 ) -> ProtectedSemanticAssessmentCall:
     return ProtectedSemanticAssessmentCall(
         pid=pid,
@@ -900,15 +904,30 @@ def _semantic_call(
         response_schema_sha256=_B,
         deadline_at="2027-01-01T00:00:00+00:00",
         sink=sink,
-        data_flow_context=DataFlowContext(labels=labels or DataLabels()),
+        data_flow_context=(
+            flow_context
+            if flow_context is not None
+            else DataFlowContext(labels=labels or DataLabels())
+        ),
         egress_payload=payload,
     )
 
 
 def test_semantic_protected_port_records_only_digests_and_suppresses_recursion() -> None:
     sentinel = "SEMANTIC_PROTECTED_PAYLOAD_SENTINEL"
+    source_identity_sentinel = "SEMANTIC_SOURCE_IDENTITY_SECRET_SENTINEL_8f91"
     with temporary_runtime() as runtime:
         pid = runtime.process.spawn(goal="protected semantic classifier")
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {"value": "source evidence"},
+            metadata=ObjectMetadata(origin=source_identity_sentinel),
+        )
+        flow_context = runtime.data_flow.context_from_source_oids(
+            pid,
+            [source.oid],
+        )
         sink = DataSink("llm:classifier", identity_sha256=_A)
         runtime.data_flow.register_sink_trust(
             SinkTrustRule(
@@ -940,7 +959,12 @@ def test_semantic_protected_port_records_only_digests_and_suppresses_recursion()
             return {"provider_value": sentinel}
 
         result = port.invoke(
-            _semantic_call(pid, sink, payload={"redacted_intent": sentinel}),
+            _semantic_call(
+                pid,
+                sink,
+                payload={"redacted_intent": sentinel},
+                flow_context=flow_context,
+            ),
             provider=_Provider(),
             dispatch=dispatch,
         )
@@ -957,16 +981,73 @@ def test_semantic_protected_port_records_only_digests_and_suppresses_recursion()
         effects = runtime.store.list_external_effects(pid=pid)
         assert effects[-1].provider == "llm"
         assert effects[-1].operation == "complete"
+        data_flow_evidence = effects[-1].provider_metadata["data_flow"]
+        assert data_flow_evidence["source_refs_sha256"] == (
+            flow_context.source_refs_hash()
+        )
+        assert data_flow_evidence["source_ref_count"] == 1
+        assert "source_refs" not in data_flow_evidence
+        assert data_flow_evidence["labels"] == {
+            "sensitivity": "normal",
+            "integrity": "unknown",
+            "trust_level": "unknown",
+            "identity_present": False,
+            "identity_mixed": False,
+        }
+        decisions = [
+            item
+            for item in runtime.store.list_data_flow_decisions(pid=pid)
+            if item.sink == sink.identity
+        ]
+        assert decisions
+        assert all(item.source_refs == () for item in decisions)
+        assert all(
+            item.labels.origin is None
+            and item.labels.tenant is None
+            and item.labels.principal is None
+            and item.labels.declassification_authority is None
+            for item in decisions
+        )
+        decision_ids = {item.decision_id for item in decisions}
+        decision_events = [
+            item
+            for item in runtime.store.list_events()
+            if item.type == EventType.DATA_FLOW_DECISION
+            and item.payload.get("decision_id") in decision_ids
+        ]
+        decision_audits = [
+            item
+            for item in runtime.store.list_audit()
+            if item.action == "data_flow.egress"
+            and (item.decision or {}).get("decision_id") in decision_ids
+        ]
+        assert decision_events and decision_audits
+        assert all("source_refs" not in item.payload for item in decision_events)
+        assert all(item.input_refs == [] for item in decision_audits)
+        persisted_decisions = runtime.store._query(  # noqa: SLF001 - privacy oracle
+            "SELECT labels_json, source_refs_json FROM data_flow_decisions "
+            "WHERE pid = ? AND sink = ?",
+            (pid, sink.identity),
+        )
+        assert persisted_decisions
+        assert all(
+            json.loads(item["source_refs_json"]) == []
+            and json.loads(item["labels_json"])["origin"] is None
+            for item in persisted_decisions
+        )
         retained = json.dumps(
             {
                 "effect": effects[-1].provider_metadata,
-                "audit": [item.__dict__ for item in runtime.store.list_audit()],
-                "events": [item.__dict__ for item in runtime.store.list_events()],
+                "audit": [item.__dict__ for item in decision_audits],
+                "events": [item.__dict__ for item in decision_events],
+                "decision_rows": [dict(item) for item in persisted_decisions],
             },
             default=str,
             sort_keys=True,
         )
         assert sentinel not in retained
+        assert source.oid not in retained
+        assert source_identity_sentinel not in retained
 
 
 def test_semantic_protected_port_never_creates_data_release_request() -> None:
@@ -1006,6 +1087,120 @@ def test_semantic_protected_port_never_creates_data_release_request() -> None:
         assert runtime.store.list_external_effects(pid=pid) == []
 
 
+def test_semantic_contract_rejects_caller_override_of_source_ref_redaction() -> None:
+    with temporary_runtime() as runtime:
+        pid = runtime.process.spawn(goal="semantic evidence redaction is Host-owned")
+        SdkProtectedSemanticCallPort(
+            runtime.protected_operations,
+            profile_identity_resolver=lambda _profile_id: _A,
+        )
+        invocation = ProtectedOperationInvocation(
+            pid=pid,
+            actor=pid,
+            target="llm:classifier",
+            data_flow_redact_source_refs_evidence=False,
+        )
+
+        with pytest.raises(ValidationError, match="redaction is Host-mandated"):
+            runtime.protected_operations.start(
+                "semantic.llm.assess",
+                invocation,
+                provider=_Provider(),
+            )
+
+
+def test_semantic_classifier_stale_source_ref_blocks_before_provider_and_stays_redacted() -> None:
+    source_identity_sentinel = "SEMANTIC_STALE_SOURCE_SECRET_SENTINEL_45ab"
+    with temporary_runtime() as runtime:
+        pid = runtime.process.spawn(goal="block stale semantic classifier sources")
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {"value": "first version"},
+            metadata=ObjectMetadata(origin=source_identity_sentinel),
+            immutable=False,
+        )
+        stale_flow = runtime.data_flow.context_from_source_oids(pid, [source.oid])
+        runtime.memory.update_object(
+            pid,
+            source,
+            ObjectPatch(payload={"value": "second version"}),
+            expected_version=1,
+        )
+        sink = DataSink("llm:classifier", identity_sha256=_A)
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern=sink.identity,
+                identity_sha256=_A,
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="test.host",
+            require_capability=False,
+        )
+        port = SdkProtectedSemanticCallPort(
+            runtime.protected_operations,
+            profile_identity_resolver=lambda _profile_id: _A,
+        )
+        provider_calls: list[bool] = []
+
+        with pytest.raises(CapabilityDenied):
+            port.invoke(
+                _semantic_call(
+                    pid,
+                    sink,
+                    payload={"projection_mode": "metadata_only"},
+                    flow_context=stale_flow,
+                ),
+                provider=_Provider(),
+                dispatch=lambda: provider_calls.append(True),
+            )
+
+        assert provider_calls == []
+        decisions = [
+            item
+            for item in runtime.store.list_data_flow_decisions(
+                pid=pid,
+                outcome="deny",
+            )
+            if item.sink == sink.identity
+        ]
+        assert len(decisions) == 1
+        decision = decisions[0]
+        assert decision.source_refs == ()
+        assert source.oid not in decision.reason
+        events = [
+            item
+            for item in runtime.store.list_events()
+            if item.type == EventType.DATA_FLOW_DECISION
+            and item.payload.get("decision_id") == decision.decision_id
+        ]
+        audits = [
+            item
+            for item in runtime.store.list_audit()
+            if item.action == "data_flow.egress"
+            and (item.decision or {}).get("decision_id") == decision.decision_id
+        ]
+        retained = json.dumps(
+            {
+                "decision": decision.__dict__,
+                "events": [item.__dict__ for item in events],
+                "audits": [item.__dict__ for item in audits],
+            },
+            default=str,
+            sort_keys=True,
+        )
+        assert events and audits
+        assert events[0].payload["source_refs_sha256"] == (
+            stale_flow.source_refs_hash()
+        )
+        assert events[0].payload["source_ref_count"] == 1
+        assert "source_refs" not in events[0].payload
+        assert audits[0].input_refs == []
+        assert source.oid not in retained
+        assert source_identity_sentinel not in retained
+
+
 def _approval_request(
     pid: str,
     request_id: str,
@@ -1034,6 +1229,7 @@ def _approval_request(
         human="host",
         payload={
             "type": "external_operation_approval",
+            "_agent_libos_authority_request_origin": "external_operation",
             "context": context,
             "effect_binding": binding,
             "requested_once_capability": {
@@ -1447,8 +1643,13 @@ def test_approval_binding_tamper_is_fail_closed_without_authority_delta() -> Non
             pid = _semantic_pid(runtime)
             runtime.semantic._human_outcome_reader = lambda _request_id: "pending"
             before = tuple(runtime.capability.list_subject(pid))
+
+            def capture(request: HumanRequest) -> None:
+                runtime.human.requests.insert(request)
+                assert runtime.semantic.capture_approval(request) is not None
+
             valid = _approval_request(pid, "binding-valid")
-            assert runtime.semantic.capture_approval(valid) is not None
+            capture(valid)
 
             wrong_hash = deepcopy(valid)
             wrong_hash.request_id = "binding-hash-tamper"
@@ -1457,19 +1658,19 @@ def test_approval_binding_tamper_is_fail_closed_without_authority_delta() -> Non
             wrong_hash.payload["requested_once_capability"]["constraints"][
                 "approval_binding"
             ]["canonical_args_hash"] = wrong
-            assert runtime.semantic.capture_approval(wrong_hash) is not None
+            capture(wrong_hash)
 
             nested = deepcopy(valid)
             nested.request_id = "binding-nested-tamper"
             nested.payload["requested_once_capability"]["constraints"][
                 "approval_binding"
             ]["effect_id"] = "eff_other"
-            assert runtime.semantic.capture_approval(nested) is not None
+            capture(nested)
 
             subject = deepcopy(valid)
             subject.request_id = "binding-subject-tamper"
             subject.payload["requested_once_capability"]["subject"] = "pid_other"
-            assert runtime.semantic.capture_approval(subject) is not None
+            capture(subject)
 
             context_pid = deepcopy(valid)
             context_pid.request_id = "binding-context-pid-tamper"
@@ -1485,19 +1686,19 @@ def test_approval_binding_tamper_is_fail_closed_without_authority_delta() -> Non
             context_pid.payload["requested_once_capability"]["constraints"][
                 "approval_binding"
             ] = dict(changed_binding)
-            assert runtime.semantic.capture_approval(context_pid) is not None
+            capture(context_pid)
 
             resource = deepcopy(valid)
             resource.request_id = "binding-resource-tamper"
             resource.payload["requested_once_capability"]["resource"] = (
                 "filesystem:workspace:reports/other.txt"
             )
-            assert runtime.semantic.capture_approval(resource) is not None
+            capture(resource)
 
             right = deepcopy(valid)
             right.request_id = "binding-right-tamper"
             right.payload["requested_once_capability"]["rights"] = ["write"]
-            assert runtime.semantic.capture_approval(right) is not None
+            capture(right)
 
             action = deepcopy(valid)
             action.request_id = "binding-action-tamper"
@@ -1513,7 +1714,7 @@ def test_approval_binding_tamper_is_fail_closed_without_authority_delta() -> Non
             action.payload["requested_once_capability"]["constraints"][
                 "approval_binding"
             ] = dict(action_binding)
-            assert runtime.semantic.capture_approval(action) is not None
+            capture(action)
 
             assert _assessment_for(runtime, valid.request_id).shadow_outcome == (
                 "would_issue_exact_once"
@@ -1537,10 +1738,47 @@ def test_approval_binding_tamper_is_fail_closed_without_authority_delta() -> Non
                 "require_human"
             )
             assert _assessment_for(runtime, action.request_id).shadow_outcome == (
-                "would_deny"
+                "require_human"
             )
             assert valid.status is HumanRequestStatus.PENDING
             assert tuple(runtime.capability.list_subject(pid)) == before
+        finally:
+            runtime.close()
+
+
+def test_shadow_terminal_decision_rereads_human_revision_and_payload() -> None:
+    config = AgentLibOSConfig(
+        semantic=SemanticDefaults(mode="shadow", adapter="deterministic")
+    )
+    with TemporaryDirectory() as temp_dir:
+        runtime = Runtime.open(
+            "local",
+            config=config,
+            substrate=LocalResourceProviderSubstrate(Path(temp_dir)),
+        )
+        try:
+            assert runtime.semantic.shutdown()
+            pid = _semantic_pid(runtime)
+            runtime.semantic._human_outcome_reader = lambda _request_id: "pending"
+            request = _approval_request(pid, "shadow-live-revision-drift")
+            runtime.human.requests.insert(request)
+            queued = runtime.semantic.capture_approval(request)
+            assert queued is not None
+            payload = deepcopy(request.payload)
+            payload["question"] = "changed after semantic capture"
+            changed = runtime.human.requests.replace_current(
+                request,
+                payload=payload,
+            )
+            assert changed.status is HumanRequestStatus.PENDING
+            assert changed.revision == request.revision + 1
+
+            _drain_semantic_synchronously(runtime)
+            assessment = _assessment_for(runtime, request.request_id)
+            assert assessment.shadow_outcome == "require_human"
+            assert "binding_current" in assessment.missing_predicates
+            assert "binding_current" not in assessment.proven_predicates
+            assert runtime.human.get(request.request_id) == changed
         finally:
             runtime.close()
 
@@ -1599,6 +1837,7 @@ def test_jsonrpc_and_mcp_exact_bindings_are_not_misclassified_as_malformed() -> 
                     human="host",
                     payload={
                         "type": "external_operation_approval",
+                        "_agent_libos_authority_request_origin": "external_operation",
                         "context": context,
                         "effect_binding": binding,
                         "requested_once_capability": {
@@ -1614,6 +1853,7 @@ def test_jsonrpc_and_mcp_exact_bindings_are_not_misclassified_as_malformed() -> 
                     created_at=now,
                     updated_at=now,
                 )
+                runtime.human.requests.insert(request)
                 assert runtime.semantic.capture_approval(request) is not None
                 record = _assessment_for(runtime, request_id)
                 assert "malformed_request" not in record.reason_codes
@@ -1777,20 +2017,30 @@ def test_human_compatibility_observer_cannot_replace_host_semantic_capture() -> 
             runtime.human.set_request_capture(
                 lambda request: compatibility_seen.append(request.request_id)
             )
-            first_id = runtime.human.query(
+            first_payload = deepcopy(_approval_request(pid, "compat-first").payload)
+            first_payload.pop("_agent_libos_authority_request_origin")
+            first_payload.pop("effect_binding")
+            first_payload["requested_once_capability"]["constraints"] = {}
+            first_id = runtime.human.query_authority_request(
                 pid,
                 "host",
-                deepcopy(_approval_request(pid, "compat-first").payload),
+                first_payload,
+                authority_origin="external_operation",
             )
             assert _assessment_for(runtime, first_id) is not None
             assert compatibility_seen == [first_id]
             runtime.human.reject(first_id, {"approved": False})
 
             runtime.human.set_request_capture(None)
-            second_id = runtime.human.query(
+            second_payload = deepcopy(_approval_request(pid, "compat-second").payload)
+            second_payload.pop("_agent_libos_authority_request_origin")
+            second_payload.pop("effect_binding")
+            second_payload["requested_once_capability"]["constraints"] = {}
+            second_id = runtime.human.query_authority_request(
                 pid,
                 "host",
-                deepcopy(_approval_request(pid, "compat-second").payload),
+                second_payload,
+                authority_origin="external_operation",
             )
             assert _assessment_for(runtime, second_id) is not None
             assert compatibility_seen == [first_id]

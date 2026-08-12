@@ -21,6 +21,7 @@ from agent_libos.skills.builtin_catalog import (
     BUILTIN_SKILL_MAX_FILE_BYTES,
     BUILTIN_SKILL_MAX_INSTRUCTION_BYTES,
     BUILTIN_SKILL_MAX_TOOLS,
+    BUILTIN_SKILL_TOOL_COUNT,
     get_builtin_skill_catalog,
 )
 from agent_libos.skills.schema import SkillPackage
@@ -198,6 +199,23 @@ _HIGH_RISK_SCHEMA_CONTRACTS: dict[str, dict[str, object]] = {
         "fields": {"arguments"},
         "forbidden": {"refresh", "url"},
     },
+    "list_mcp_resources": {
+        "required": {"server_id"},
+        "defaults": {"cursor": None, "kind": "resource"},
+        "enums": {"kind": {"resource", "template"}},
+        "bounds": {"server_id": {"minLength": 1, "maxLength": 96}},
+        "forbidden": {"actor", "header", "transport", "uri", "url"},
+    },
+    "read_mcp_resource": {
+        "required": {"resource_id", "server_id"},
+        "fields": {"variables"},
+        "bounds": {
+            "server_id": {"minLength": 1, "maxLength": 96},
+            "resource_id": {"minLength": 1, "maxLength": 96},
+            "variables": {"maxProperties": 256},
+        },
+        "forbidden": {"actor", "header", "transport", "uri", "url"},
+    },
     "git_integrate": {
         "required": {"operation", "expected_state_token"},
         "enums": {
@@ -279,7 +297,7 @@ write_text_file|path,content|path,bytes_written,created|101
 ask_human|question|request_id,answer,status|100
 human_output|message|delivered,channel,chars|100
 call_jsonrpc_method|endpoint_id,method_id|endpoint_id,method_id,rpc_method,request_id,status,http_status,ok,response_bytes,duration_s|100
-call_mcp_tool|server_id,tool_id|server_id,tool_id,mcp_name,status,ok,response_bytes,duration_s|100
+call_mcp_tool|server_id,tool_id|server_id,tool_id,mcp_name,status,ok,response_bytes,duration_s,dispatch_state,retry_class,automatic_retry_disabled|100
 compact_process_context||compacted,reason|100
 commit_checkpoint_to_image|checkpoint_id,image_id,name|image_id,name,version,replaced,boot_kind,artifact_id,artifact_sha256,required_capabilities_count,required_modules_count|100
 inspect_capability|cap_id|capability|010
@@ -294,7 +312,9 @@ list_capabilities||capabilities,has_more|010
 list_checkpoints||checkpoints,count,has_more|010
 list_jsonrpc_endpoints||endpoints,has_more|010
 list_mcp_servers||servers,has_more|010
+list_mcp_resources|server_id|server_id,kind,items,has_more|100
 list_mcp_tools|server_id|server_id,transport,tools,refreshed,response_bytes|100
+read_mcp_resource|server_id,resource_id|server_id,resource_id,result|100
 run_shell_command|argv|argv,returncode,stdout,stderr,stdout_truncated,stderr_truncated|100
 revoke_capability|cap_id|capability|100
 restore_checkpoint|checkpoint_id|checkpoint_id,publication_id,pid,status,main_state_committed,reconciliation_pending,post_commit_failures,restored_pids,previous_pids,cancelled_human_requests,superseded_messages,superseded_object_tasks,external_effects_since_checkpoint|100
@@ -380,7 +400,7 @@ write_text_file|bytes_written,created,path
 ask_human|answer,request_id,status
 human_output|channel,chars,delivered
 call_jsonrpc_method|duration_s,endpoint_id,error,http_status,method_id,ok,request_id,response_bytes,result,rpc_method,status
-call_mcp_tool|duration_s,error,mcp_name,ok,response_bytes,result,server_id,status,tool_id
+call_mcp_tool|automatic_retry_disabled,dispatch_state,duration_s,error,mcp_name,ok,response_bytes,result,retry_class,server_id,status,tool_id
 compact_process_context|compacted,compacted_tokens,compressor_pids,context_oid,new_version,old_version,preserved_recent_entries,reason,source_tokens
 commit_checkpoint_to_image|artifact_id,artifact_sha256,boot_kind,image_id,name,replaced,required_capabilities_count,required_modules_count,version
 inspect_capability|capability
@@ -395,7 +415,9 @@ list_capabilities|capabilities,has_more,next_cursor
 list_checkpoints|checkpoints,count,has_more
 list_jsonrpc_endpoints|endpoints,has_more
 list_mcp_servers|has_more,servers
+list_mcp_resources|cache_hint,has_more,items,kind,next_cursor,server_id
 list_mcp_tools|refreshed,response_bytes,server_id,tools,transport
+read_mcp_resource|resource_id,result,server_id
 run_shell_command|argv,returncode,stderr,stderr_truncated,stdout,stdout_truncated
 revoke_capability|capability
 restore_checkpoint|cancelled_human_requests,cancelled_human_requests_page,checkpoint_id,external_effect_summary,external_effects_page,external_effects_since_checkpoint,main_state_committed,pid,post_commit_failures,post_commit_failures_page,previous_pids,previous_pids_page,publication_id,reconciliation_pending,restore_external_policy,restored_pids,restored_pids_page,status,superseded_messages,superseded_messages_page,superseded_object_tasks,superseded_object_tasks_page
@@ -461,6 +483,7 @@ _EXPECTED_PAGING_OUTPUT_FIELDS: dict[str, set[str]] = {
     "list_checkpoints": {"has_more"},
     "list_jsonrpc_endpoints": {"has_more"},
     "list_mcp_servers": {"has_more"},
+    "list_mcp_resources": {"has_more", "next_cursor"},
     "read_directory": {"truncated"},
     "read_memory_object": {"next_cursor", "truncated"},
     "read_process_messages": {"continuation", "has_more"},
@@ -501,6 +524,21 @@ def _builtin_tool_schema_contracts() -> dict[str, dict[str, object]]:
     for contract in contracts.values():
         contract.setdefault("output_properties", set())
     return contracts
+
+
+def _static_contract_output_schema(
+    tool_name: str,
+    output_schema: dict[str, object],
+) -> dict[str, object]:
+    """Select the stable object branch from a versioned output union."""
+
+    if tool_name != "call_mcp_tool":
+        return output_schema
+    definitions = output_schema.get("$defs")
+    assert isinstance(definitions, dict)
+    legacy = definitions.get("CallMcpToolOutput")
+    assert isinstance(legacy, dict)
+    return legacy
 
 
 def test_builtin_skill_packages_use_standard_allowed_tools_scalar() -> None:
@@ -566,7 +604,35 @@ def test_builtin_skill_catalog_has_unique_bounded_ownership() -> None:
             owners[tool_name] = package.skill_id
             assert catalog.skill_for_tool(tool_name) == package.skill_id
 
-    assert len(owners) == 99
+    assert len(owners) == BUILTIN_SKILL_TOOL_COUNT
+
+
+def test_mcp_builtin_skill_fits_exact_budget_and_runtime_opens(
+    tmp_path: Path,
+) -> None:
+    skill_path = resources.files("agent_libos.skills.builtin").joinpath(
+        "agent-libos-mcp",
+        "SKILL.md",
+    )
+    raw = skill_path.read_text(encoding="utf-8")
+    instructions = raw.split("---", 2)[2].lstrip("\n")
+    package = get_builtin_skill_catalog().get("agent-libos-mcp")
+
+    assert len(instructions.encode("utf-8")) == len(
+        package.instructions.encode("utf-8")
+    )
+    assert len(instructions.encode("utf-8")) <= (
+        BUILTIN_SKILL_MAX_INSTRUCTION_BYTES
+    )
+
+    runtime = Runtime.open(tmp_path / "mcp-builtin-skill-budget.sqlite")
+    try:
+        assert "call_mcp_tool" in {
+            str(row["name"])
+            for row in runtime.tools.list()
+        }
+    finally:
+        runtime.close()
 
 
 def test_builtin_skill_instructions_route_every_owned_tool() -> None:
@@ -701,7 +767,7 @@ def test_all_builtin_tool_schemas_match_complete_static_contract(
     tmp_path: Path,
 ) -> None:
     contracts = _builtin_tool_schema_contracts()
-    assert len(contracts) == 99
+    assert len(contracts) == BUILTIN_SKILL_TOOL_COUNT
 
     runtime = Runtime.open(tmp_path / "complete-builtin-schema-contract.sqlite")
     try:
@@ -731,18 +797,22 @@ def test_all_builtin_tool_schemas_match_complete_static_contract(
             )
 
             output_schema = spec["output_schema"]
+            contract_output_schema = _static_contract_output_schema(
+                tool_name,
+                output_schema,
+            )
             expected_output_required = contract["output_required"]
             expected_output_properties = contract["output_properties"]
             if expected_output_properties:
-                assert output_schema["type"] == "object", tool_name
-                assert set(output_schema.get("properties", {})) == (
+                assert contract_output_schema["type"] == "object", tool_name
+                assert set(contract_output_schema.get("properties", {})) == (
                     expected_output_properties
-                ), (tool_name, output_schema.get("properties", {}))
-                assert set(output_schema.get("required", [])) == (
+                ), (tool_name, contract_output_schema.get("properties", {}))
+                assert set(contract_output_schema.get("required", [])) == (
                     expected_output_required
-                ), (tool_name, output_schema.get("required", []))
-                assert set(output_schema.get("required", [])) <= set(
-                    output_schema.get("properties", {})
+                ), (tool_name, contract_output_schema.get("required", []))
+                assert set(contract_output_schema.get("required", [])) <= set(
+                    contract_output_schema.get("properties", {})
                 )
             else:
                 # Generic provider-owned Git payloads and echo deliberately use
@@ -765,7 +835,9 @@ def test_all_builtin_tool_schemas_match_complete_static_contract(
                 ],
             }, tool_name
 
-            output_properties = set(output_schema.get("properties", {}))
+            output_properties = set(
+                contract_output_schema.get("properties", {})
+            )
             status_fields = output_properties & _STATUS_OUTPUT_FIELDS
             if status_fields:
                 actual_status_fields[tool_name] = status_fields
@@ -1362,8 +1434,11 @@ def test_every_builtin_skill_has_positive_and_adjacent_negative_routing(
                 },
             )
             assert activation.ok, (case.scenario_id, activation.error)
-            assert activation.payload["result"]["package_sha256"] == (
-                selected["package_sha256"]
+            assert (
+                runtime.process.get(pid).loaded_skills[
+                    case.expected_skill_id
+                ]["package_sha256"]
+                == selected["package_sha256"]
             )
             unload = runtime.tools.call(
                 pid,

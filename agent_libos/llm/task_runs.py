@@ -357,10 +357,30 @@ def _detached_object(value: Mapping[str, Any], label: str) -> dict[str, Any]:
     return selected
 
 
-def task_run_contract_message(context: Mapping[str, Any]) -> str:
+def task_run_contract_message(
+    context: Mapping[str, Any],
+    *,
+    prompt_layout: str = "legacy_v1",
+) -> str:
     """Render the cumulative durable contract without Provider state."""
 
     selected = normalize_task_run_prompt_context(context)
+    if prompt_layout == "cache_optimized_v2":
+        lines = [
+            "Durable TaskRun contract (authoritative across Runtime restarts):",
+            "The goal and ordered requirements below are cumulative. A later requirement "
+            "changes only what it explicitly replaces or cancels.",
+            f"Goal: {selected['goal_text']}",
+            "Ordered requirements (append-only):",
+        ]
+        for ordinal, requirement in enumerate(selected["requirements"], start=1):
+            semantic_requirement = {
+                "order": ordinal,
+                "kind": requirement["kind"],
+                "requirement": requirement["content_text"],
+            }
+            lines.append(dumps(semantic_requirement))
+        return "\n".join(lines)
     contract = {
         "schema_version": 1,
         "run_id": selected["run_id"],
@@ -378,11 +398,37 @@ def task_run_contract_message(context: Mapping[str, Any]) -> str:
     )
 
 
+def task_run_dynamic_state_message(
+    context: Mapping[str, Any],
+) -> str:
+    """Render changeable TaskRun state after the stable contract/transcript."""
+
+    selected = normalize_task_run_prompt_context(context)
+    state: dict[str, Any] = {}
+    summary = selected.get("compressed_summary")
+    if summary not in (None, "", [], {}):
+        state["current_summary"] = summary
+    nondefault = [
+        {
+            "order": ordinal,
+            "status": requirement["status"],
+        }
+        for ordinal, requirement in enumerate(selected["requirements"], start=1)
+        if requirement["status"] not in {"pending", "in_progress"}
+    ]
+    if nondefault:
+        state["requirement_state"] = nondefault
+    if not state:
+        return ""
+    return "Current TaskRun state (dynamic):\n" + dumps(state)
+
+
 __all__ = [
     "TaskRunLLMHook",
     "completed_outcome_manifest",
     "normalize_validated_action_manifest",
     "normalize_task_run_prompt_context",
     "task_run_contract_message",
+    "task_run_dynamic_state_message",
     "validated_action_manifest",
 ]

@@ -1055,7 +1055,7 @@ function ConversationBubble({ item }: { item: UserConversationItem }) {
     return (
       <article className="conversationBubble request">
         <span className="bubbleRole">{t("user.needsInput")}</span>
-        <p>{humanRequestPrompt(item.request)}</p>
+        <p>{humanRequestPrompt(item.request, t("human.externalApprovalTitle"))}</p>
         <time>{formatTime(item.time)}</time>
       </article>
     );

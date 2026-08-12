@@ -1215,6 +1215,195 @@ class TestLLMClient:
         assert payload['prompt_cache_retention'] == '24h'
         assert completion == 'ok'
 
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    def test_v2_explicit_cache_marks_only_the_host_stable_text_prefix(
+        self,
+        api: str,
+    ) -> None:
+        client = LLMClient(
+            model="gpt-5.6",
+            api_key="key",
+            api_mode=api,
+            prompt_cache_key="tenant-domain",
+            prompt_cache_mode="explicit",
+            prompt_cache_ttl="30m",
+        )
+        messages = [
+            {"role": "system", "content": "stable system"},
+            {
+                "role": "user",
+                "content": "stable task contract",
+                "_agent_libos_cache_stable": True,
+            },
+            {"role": "user", "content": "dynamic tail"},
+        ]
+
+        payload = (
+            client._chat_payload(messages, 0.0, 100)
+            if api == "chat"
+            else client._responses_payload(messages, 0.0, 100)
+        )
+        payload["tools"] = []
+        client._finalize_prompt_cache_request(payload)
+        encoded = json.dumps(payload, sort_keys=True)
+
+        assert payload["prompt_cache_options"] == {
+            "mode": "explicit",
+            "ttl": "30m",
+        }
+        assert payload["prompt_cache_key"].startswith("alibos:v2:")
+        assert "tenant-domain" not in payload["prompt_cache_key"]
+        assert encoded.count("prompt_cache_breakpoint") == 1
+        assert "_agent_libos_cache_stable" not in encoded
+        assert "stable task contract" in encoded
+        assert "dynamic tail" in encoded
+
+    def test_v2_implicit_cache_uses_stable_fingerprint_without_wire_breakpoint(self) -> None:
+        client = LLMClient(
+            model="gpt-5.6",
+            api_key="key",
+            api_mode="chat",
+            prompt_cache_key="tenant-domain",
+            prompt_cache_mode="implicit",
+        )
+        messages = [
+            {"role": "system", "content": "stable system"},
+            {
+                "role": "user",
+                "content": "stable contract",
+                "_agent_libos_cache_stable": True,
+            },
+            {"role": "user", "content": "dynamic"},
+        ]
+
+        payload = client._chat_payload(messages, 0.0, 100)
+        client._finalize_prompt_cache_request(payload)
+        encoded = json.dumps(payload, sort_keys=True)
+
+        assert payload["prompt_cache_options"] == {"mode": "implicit"}
+        assert payload["prompt_cache_key"].startswith("alibos:v2:")
+        assert "prompt_cache_breakpoint" not in encoded
+        assert "_agent_libos_cache_stable" not in encoded
+
+        appended_messages = [
+            {"role": "system", "content": "stable system"},
+            {
+                "role": "user",
+                "content": "stable contract\nnew appended requirement",
+                "_agent_libos_cache_stable": True,
+            },
+            {"role": "user", "content": "different dynamic tail"},
+        ]
+        appended_payload = client._chat_payload(appended_messages, 0.0, 100)
+        client._finalize_prompt_cache_request(appended_payload)
+        assert appended_payload["prompt_cache_key"] == payload["prompt_cache_key"]
+
+        changed_system = [
+            {"role": "system", "content": "changed image instructions"},
+            *appended_messages[1:],
+        ]
+        changed_payload = client._chat_payload(changed_system, 0.0, 100)
+        client._finalize_prompt_cache_request(changed_payload)
+        assert changed_payload["prompt_cache_key"] != payload["prompt_cache_key"]
+
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    def test_v2_explicit_cache_breakpoint_can_split_stable_and_dynamic_text(
+        self,
+        api: str,
+    ) -> None:
+        stable = "append-only materialized task context"
+        dynamic = "\n\nCurrent runtime state: changed"
+        client = LLMClient(
+            model="gpt-5.6",
+            api_key="key",
+            api_mode=api,
+            prompt_cache_key="tenant-domain",
+            prompt_cache_mode="explicit",
+        )
+        messages = [
+            {"role": "system", "content": "stable system"},
+            {
+                "role": "user",
+                "content": stable + dynamic,
+                "_agent_libos_cache_stable_prefix_chars": len(stable),
+            },
+        ]
+
+        payload = (
+            client._chat_payload(messages, 0.0, 100)
+            if api == "chat"
+            else client._responses_payload(messages, 0.0, 100)
+        )
+        client._finalize_prompt_cache_request(payload)
+        encoded = json.dumps(payload, sort_keys=True)
+
+        assert encoded.count("prompt_cache_breakpoint") == 1
+        assert "_agent_libos_cache_stable_prefix_chars" not in encoded
+        container = payload["messages"] if api == "chat" else payload["input"]
+        user = next(item for item in container if item.get("role") == "user")
+        assert user["content"][0]["text"] == stable
+        assert user["content"][0]["prompt_cache_breakpoint"] == {
+            "mode": "explicit"
+        }
+        assert user["content"][1]["text"] == dynamic
+
+    def test_v2_cache_policy_requires_key_and_rejects_legacy_retention(self) -> None:
+        with pytest.raises(LLMError, match="prompt_cache_key is required"):
+            LLMClient(
+                model="gpt-5.6",
+                api_key="key",
+                prompt_cache_mode="explicit",
+            )
+        with pytest.raises(LLMError, match="cannot be combined"):
+            LLMClient(
+                model="gpt-5.6",
+                api_key="key",
+                prompt_cache_key="domain",
+                prompt_cache_mode="implicit",
+                prompt_cache_retention="24h",
+            )
+
+    def test_v2_cache_rejection_removes_the_whole_option_group(self) -> None:
+        client = LLMClient(
+            model="gpt-5.6",
+            api_key="key",
+            prompt_cache_key="domain",
+            prompt_cache_mode="explicit",
+        )
+        request = {
+            "model": "gpt-5.6",
+            "prompt_cache_key": "alibos:v2:digest",
+            "prompt_cache_options": {"mode": "explicit"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "stable",
+                            "prompt_cache_breakpoint": {"mode": "explicit"},
+                        }
+                    ],
+                }
+            ],
+        }
+
+        retry = client._compatibility_retry_payload(
+            request,
+            Exception("unknown parameter prompt_cache_options"),
+            api="chat",
+        )
+
+        assert retry == {
+            "model": "gpt-5.6",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "stable"}],
+                }
+            ],
+        }
+
     def test_compatibility_retry_reports_only_cache_options_actually_sent(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1675,6 +1864,19 @@ class TestLLMClient:
         assert client._extra_body() == {'enable_thinking': True}
         assert client._client_kwargs()['organization'] == 'org-one'
         assert client._client_kwargs()['project'] == 'project-one'
+
+    def test_from_env_reads_v2_prompt_cache_mode_and_ttl(self, monkeypatch) -> None:
+        monkeypatch.setenv('OPENAI_API_KEY', 'host-key')
+        monkeypatch.setenv('OPENAI_MODEL', 'gpt-5.6')
+        monkeypatch.setenv('OPENAI_PROMPT_CACHE_KEY', 'tenant-domain')
+        monkeypatch.setenv('OPENAI_PROMPT_CACHE_MODE', 'explicit')
+        monkeypatch.setenv('OPENAI_PROMPT_CACHE_TTL', '30m')
+        monkeypatch.delenv('OPENAI_PROMPT_CACHE_RETENTION', raising=False)
+
+        client = LLMClient.from_env()
+
+        assert client.prompt_cache_mode == 'explicit'
+        assert client.prompt_cache_ttl == '30m'
 
     def test_from_env_does_not_implicitly_load_workspace_dotenv(self, tmp_path, monkeypatch) -> None:
         (tmp_path / '.env').write_text(

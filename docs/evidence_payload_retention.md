@@ -62,8 +62,12 @@ provider finalization accept only `full`; the retention CAS is the only store
 operation that can advance the tier or populate the digest column.
 
 For LLM calls the content-bearing payload fields are messages, visible tools,
-response content, tool calls, reasoning, raw provider response, and the durable
-public/domain error field. Each present value is replaced by its
+response content, tool calls, reasoning, the bounded provider-response
+projection stored under `raw_response`, and the durable public/domain error
+field. The `raw_response` name does not mean a byte-for-byte SDK object:
+sensitive/opaque values are hashed and oversized structures are represented by
+omission metadata and a digest before this retention state machine sees them.
+Each present value is replaced by its
 tier-appropriate content-free envelope; absent optional reasoning,
 raw-response, or error fields remain `null`. Provider-invocation exception text
 has a stricter boundary: it is normalized to a text-free public error before

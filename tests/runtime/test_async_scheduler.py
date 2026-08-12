@@ -61,7 +61,7 @@ class TestAsyncScheduler:
 
                 assert observed == [False]
             finally:
-                runtime.close()
+                await runtime.ashutdown()
 
         asyncio.run(scenario())
 

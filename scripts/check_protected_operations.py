@@ -53,6 +53,28 @@ SAFE_PROVIDER_CALLS = frozenset(
         (Path("agent_libos/human/delivery.py"), "write"),
     }
 )
+# Exact Host-only local security preflights may need to read Provider state
+# before authority exists to enter the ordinary ProtectedOperation phase.  Keep
+# this boundary narrower than SAFE_PROVIDER_CALLS: both the owning class and
+# private method name are pinned, and only the local read methods below may be
+# reached from that root.  Calls into the same helpers from any other
+# unprotected owner are still rejected by the call-graph check.
+SAFE_LOCAL_PROVIDER_PREFLIGHTS = frozenset(
+    {
+        (
+            Path("agent_libos/primitives/git.py"),
+            "GitPrimitive",
+            "_semantic_read_flow_snapshot",
+        ),
+    }
+)
+SAFE_LOCAL_PROVIDER_PREFLIGHT_METHODS = frozenset(
+    {
+        "repository_layout",
+        "repository_state",
+        "run",
+    }
+)
 PROVIDER_HANDLE_METHODS = frozenset(
     {"close", "exit_code", "is_alive", "read", "resize", "write"}
 )
@@ -628,6 +650,35 @@ class _CallGraph:
                     changed = True
         return reaching
 
+    def functions_reachable_from(
+        self,
+        roots: set[FunctionNode],
+    ) -> set[FunctionNode]:
+        """Return exact local callees reachable from a reviewed root set."""
+
+        reachable = set(roots)
+        pending = list(roots)
+        while pending:
+            function = pending.pop()
+            for callee in self.calls.get(function, ()):
+                if callee not in reachable:
+                    reachable.add(callee)
+                    pending.append(callee)
+        return reachable
+
+    def exact_method_roots(
+        self,
+        relative: Path,
+        contracts: frozenset[tuple[Path, str, str]],
+    ) -> set[FunctionNode]:
+        """Resolve only direct class methods named by an exact file contract."""
+
+        return {
+            function
+            for (owner, method_name), function in self.methods.items()
+            if (relative, owner.name, method_name) in contracts
+        }
+
 
 def _provider_call_kind(
     node: ast.Call,
@@ -665,6 +716,59 @@ def _provider_call_kind(
         and path[1] in PROVIDER_HANDLE_METHODS
     ):
         return "provider handle method", path[1]
+    return None
+
+
+def _keyword_argument(
+    node: ast.Call,
+    name: str,
+) -> tuple[bool, ast.AST | None]:
+    for keyword in node.keywords:
+        if keyword.arg == name:
+            return True, keyword.value
+    return False, None
+
+
+def _keyword_only_default(
+    function: FunctionNode,
+    name: str,
+) -> ast.AST | None:
+    arguments = function.args
+    for argument, default in zip(
+        arguments.kwonlyargs,
+        arguments.kw_defaults,
+        strict=True,
+    ):
+        if argument.arg == name:
+            return default
+    return None
+
+
+def _literal_is(node: ast.AST | None, value: object) -> bool:
+    return isinstance(node, ast.Constant) and node.value is value
+
+
+def _local_preflight_run_error(
+    call: ast.Call,
+    callee: FunctionNode,
+) -> str | None:
+    """Require the generic Git runner to stay local and read-only."""
+
+    if any(keyword.arg is None for keyword in call.keywords):
+        return "local security preflight Git runner forbids **kwargs"
+    for name, expected in (
+        ("read_only", True),
+        ("remote", None),
+        ("expected_remote_fingerprint", None),
+        ("stdin", None),
+    ):
+        supplied, selected = _keyword_argument(call, name)
+        value = selected if supplied else _keyword_only_default(callee, name)
+        if not _literal_is(value, expected):
+            return (
+                "local security preflight Git runner must freeze "
+                f"{name}={expected!r}"
+            )
     return None
 
 
@@ -899,6 +1003,13 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
     )
     assigned_contract_names = _assigned_contract_names(tree, parents)
     protected_functions = call_graph.protected_functions(tree)
+    local_preflight_functions = call_graph.functions_reachable_from(
+        call_graph.exact_method_roots(
+            relative,
+            SAFE_LOCAL_PROVIDER_PREFLIGHTS,
+        )
+    )
+    provider_phase_functions = protected_functions | local_preflight_functions
     recovery_cleanup_functions = {
         function
         for function in call_graph.functions
@@ -1042,9 +1153,17 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
             owner = _nearest_owner(node, parents)
             callee = call_graph.resolve(node.func, owner)
             if (
+                owner in local_preflight_functions
+                and callee in local_preflight_functions
+                and _function_name(callee) == "_run"
+            ):
+                run_error = _local_preflight_run_error(node, callee)
+                if run_error is not None:
+                    errors.append(f"{relative}:{node.lineno}: {run_error}")
+            if (
                 callee is not None
                 and callee in provider_reaching
-                and owner not in protected_functions
+                and owner not in provider_phase_functions
             ):
                 errors.append(
                     f"{relative}:{node.lineno}: provider helper {_function_name(callee)} is called "
@@ -1056,6 +1175,20 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
                 errors.append(
                     f"{relative}:{node.lineno}: recovery cleanup lease permits "
                     "only provider handle close"
+                )
+            continue
+        if owner in local_preflight_functions:
+            if (
+                kind != "provider method"
+                or method not in SAFE_LOCAL_PROVIDER_PREFLIGHT_METHODS
+                or (
+                    method == "run"
+                    and _function_name(owner) != "_run"
+                )
+            ):
+                errors.append(
+                    f"{relative}:{node.lineno}: local security preflight permits "
+                    f"only reviewed read-only provider methods, not {kind} {method}"
                 )
             continue
         if owner not in protected_functions:

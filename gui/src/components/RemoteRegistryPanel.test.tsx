@@ -11,7 +11,7 @@ import type { McpDiscoveryResult, McpServerSummary } from "../api/types";
 import type { ConfirmationRequest } from "../adminTypes";
 import { I18nProvider, type Language } from "../i18n";
 import "../styles.css";
-import { RemoteRegistryPanel } from "./RemoteRegistryPanel";
+import { RemoteRegistryPanel, schemaArgumentFields } from "./RemoteRegistryPanel";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -135,6 +135,40 @@ describe("RemoteRegistryPanel MCP v2", () => {
     expect(styles).toContain("grid-template-columns: repeat(auto-fit, minmax(min(100%, 8rem), 1fr));");
     expect(styles).toContain("@container inspector (max-width: 420px)");
     expect(styles).toMatch(/\.remotePanel \.adminActions > button\s*\{[^}]*flex:\s*1 1 100%;/s);
+  });
+
+  it("projects bounded scalar JSON Schema fields without hiding the raw editor", async () => {
+    const selected = server("modern", "2026-07-28");
+    selected.tools = [{
+      tool_id: "search",
+      mcp_name: "search",
+      right: "execute",
+      resource: "mcp:modern",
+      rollback_class: "none",
+      rollback_status: "not_applicable",
+      state_mutation: false,
+      information_flow: true,
+      input_schema: {
+        type: "object",
+        required: ["query"],
+        properties: {
+          query: { type: "string", title: "Search query" },
+          limit: { type: "integer" },
+          mode: { type: "string", enum: ["fast", "thorough"] },
+          nested: { type: "object" }
+        }
+      },
+      metadata: {}
+    }];
+
+    expect(schemaArgumentFields(selected, "search")).toEqual([
+      { name: "query", label: "Search query", required: true, kind: "string", choices: [] },
+      { name: "limit", label: "limit", required: false, kind: "integer", choices: [] },
+      { name: "mode", label: "mode", required: false, kind: "string", choices: ["fast", "thorough"] }
+    ]);
+    const { container } = await renderPanel({ entries: [selected] });
+    expect(container.querySelector('[aria-label="Schema-driven MCP arguments"]')).not.toBeNull();
+    expect(container.querySelector('textarea[aria-label="MCP JSON arguments"]')).not.toBeNull();
   });
 });
 

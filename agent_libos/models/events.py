@@ -31,6 +31,7 @@ class EventType(StrEnum):
     OBJECT_TASK_OWNER_CHANGE_UNDELIVERED = "object_task_owner_change_undelivered"
     HUMAN_QUERY = "human_query"
     HUMAN_RESPONSE = "human_response"
+    SEMANTIC_POLICY_RESPONSE = "semantic_policy_response"
     IMAGE_REGISTERED = "image_registered"
     IMAGE_COMMITTED = "image_committed"
     SKILL_REGISTERED = "skill_registered"

@@ -187,6 +187,35 @@ describe("LibOSClient", () => {
     );
   });
 
+  it("binds external-operation responses to the canonical preview revision and digest", async () => {
+    const fetchMock = mockFetch({});
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.respondHumanRequest(
+      "request_external",
+      {
+        kind: "external_approval",
+        approved: true,
+        expected_revision: 7,
+        preview_sha256: "a".repeat(64)
+      },
+      false,
+      null
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/human-requests/request_external/respond",
+      expect.objectContaining({
+        body: JSON.stringify({
+          approved: true,
+          expected_revision: 7,
+          preview_sha256: "a".repeat(64),
+          auto_run: false
+        })
+      })
+    );
+  });
+
   it("submits agent ratings for the selected process", async () => {
     const fetchMock = mockFetch({});
     const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
@@ -289,6 +318,437 @@ describe("LibOSClient", () => {
       })
     );
     expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)).not.toHaveProperty("confirmed");
+  });
+
+  it("uses POST for an explicit live MCP tool refresh", async () => {
+    const payload = {
+      server_id: "server/1",
+      schema_version: 2,
+      transport: "stdio",
+      protocol_mode: "auto",
+      tools: [],
+      refreshed: true,
+      response_bytes: 0
+    };
+    const fetchMock = mockFetch(payload);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await expect(client.listMcpTools("server/1", true, "pid_1")).resolves.toEqual(payload);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/mcp/server%2F1/tools/refresh",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ actor: "pid_1" })
+      })
+    );
+  });
+
+  it("keeps the ordinary MCP tool list on the cache-only GET route", async () => {
+    const payload = {
+      server_id: "server/1",
+      schema_version: 2,
+      transport: "stdio",
+      protocol_mode: "auto",
+      tools: [],
+      refreshed: false,
+      response_bytes: 0
+    };
+    const fetchMock = mockFetch(payload);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await expect(client.listMcpTools("server/1")).resolves.toEqual(payload);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/mcp/server%2F1/tools",
+      expect.objectContaining({ method: "GET", body: undefined })
+    );
+  });
+
+  it("unregisters MCP servers through a confirmed encoded route", async () => {
+    const payload = { server_id: "server/1", deleted: true };
+    const fetchMock = mockFetch(payload);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await expect(client.unregisterMcpServer("server/1", true, "pid_1")).resolves.toEqual(payload);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/mcp/server%2F1/unregister",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ confirmed: true, actor: "pid_1" })
+      })
+    );
+  });
+
+  it("uses POST and preserves opaque cursors for MCP resources", async () => {
+    const payload = {
+      items: [{ resource_id: "logical-doc", name: "Document" }],
+      next_cursor: "opaque-next",
+      cache_hint: { ttl_ms: 1000, scope: "private" }
+    };
+    const fetchMock = mockFetch(payload);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await expect(client.listMcpResources("server/1", "opaque/current")).resolves.toEqual(payload);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/mcp/server%2F1/resources/list",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ cursor: "opaque/current" })
+      })
+    );
+  });
+
+  it("rejects MCP Apps resources before the renderer can consume them", async () => {
+    mockFetch({
+      items: [{ resource_id: "ui://private-app", name: "App" }],
+      next_cursor: null,
+      cache_hint: null
+    });
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await expect(client.listMcpResources("server")).rejects.toThrow(/unsupported MCP App/);
+  });
+
+  it("keeps MCP prompt preview unconfirmed until the user accepts it", async () => {
+    const payload = {
+      kind: "complete",
+      preview_sha256: "a".repeat(64),
+      value: {
+        prompt_id: "review",
+        messages: [{
+          role: "user",
+          content: { kind: "text", text: "untrusted" },
+          provenance: "untrusted_mcp_prompt"
+        }],
+        user_confirmation_required: true
+      }
+    };
+    const fetchMock = mockFetch(payload);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.getMcpPrompt("server/1", "review", { topic: "MCP" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/mcp/server%2F1/prompts/get",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ prompt_id: "review", arguments: { topic: "MCP" }, confirmed: false })
+      })
+    );
+  });
+
+  it("binds MCP prompt acceptance to the Runtime-issued preview digest", async () => {
+    const payload = {
+      kind: "complete",
+      preview_sha256: "b".repeat(64),
+      value: {
+        prompt_id: "review",
+        messages: [],
+        user_confirmation_required: true
+      }
+    };
+    const fetchMock = mockFetch(payload);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await expect(client.getMcpPrompt("server/1", "review", {}, true)).rejects.toThrow(/exact preview digest/);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await client.getMcpPrompt("server/1", "review", {}, true, "a".repeat(64));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/mcp/server%2F1/prompts/get",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          prompt_id: "review",
+          arguments: {},
+          confirmed: true,
+          expected_preview_sha256: "a".repeat(64)
+        })
+      })
+    );
+  });
+
+  it("passes the full OAuth callback only to the encoded POST callback route", async () => {
+    const payload = {
+      profile_id: "profile/1",
+      status: "authorized",
+      scopes: ["resource.read"]
+    };
+    const callback = "http://127.0.0.1/callback?code=one-time&state=bound";
+    const fetchMock = mockFetch(payload);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.completeMcpOAuth("challenge/1", callback);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/mcp/auth/challenges/challenge%2F1/callback",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ callback_url: callback }) })
+    );
+  });
+
+  it("rejects unknown OAuth fields before a response can reach React", async () => {
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+    for (const extra of [
+      { token: "provider-private" },
+      { state: "provider-private" },
+      { unknown: "provider-controlled" }
+    ]) {
+      mockFetch({
+        profile_id: "profile/1",
+        status: "authorized",
+        scopes: [],
+        ...extra
+      });
+      await expect(client.getMcpOAuthStatus("profile/1")).rejects.toThrow(/OAuth status/);
+    }
+
+    mockFetch({
+      challenge_id: "challenge/1",
+      authorization_url: "https://authorization.invalid/authorize",
+      expires_at: "2030-01-01T00:00:00Z",
+      client_assertion: "provider-private"
+    });
+    await expect(client.beginMcpOAuth("profile/1", [], true)).rejects.toThrow(/OAuth challenge/);
+  });
+
+  it("uses strict Host-only OAuth profile admin routes without projecting secrets", async () => {
+    const status = {
+      profile_id: "profile/1",
+      status: "authorization_required",
+      scopes: []
+    };
+    const profile = {
+      profile_id: "profile/1",
+      server_id: "server/1",
+      resource_uri: "https://resource.example/mcp",
+      expected_issuer: "https://issuer.example",
+      redirect_uri: "http://127.0.0.1/callback",
+      client_id: "gui-client",
+      registration_mode: "preregistered" as const,
+      allowed_scopes: []
+    };
+    const fetchMock = mockFetch(status);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.configureMcpOAuthProfile(profile, "one-time-client-secret", false, true);
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:1/api/mcp/auth/profiles",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          profile,
+          client_secret: "one-time-client-secret",
+          replace: false,
+          confirmed: true
+        })
+      })
+    );
+
+    fetchMock.mockResolvedValueOnce(jsonResponse([status]));
+    await client.listMcpOAuthProfiles();
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:1/api/mcp/auth/profiles",
+      expect.objectContaining({ method: "GET" })
+    );
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ...status, status: "revoked" }));
+    await client.removeMcpOAuthProfile("profile/1", true);
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:1/api/mcp/auth/profiles/profile%2F1/remove",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ confirmed: true })
+      })
+    );
+
+    await expect(client.configureMcpOAuthProfile(
+      { ...profile, client_secret: "must-not-be-profile-data" } as never,
+      null,
+      false,
+      true
+    )).rejects.toThrow(/profile input/);
+  });
+
+  it("binds continuation and Task answers to Runtime-issued Human receipts", async () => {
+    const receipt = {
+      human_request_id: "human-local",
+      human_revision: 5,
+      human_preview_sha256: "c".repeat(64)
+    };
+    const fetchMock = mockFetch({ kind: "complete", value: null });
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.respondMcpContinuation(
+      "continuation/1",
+      7,
+      { "field-local": "yes" },
+      receipt,
+      true
+    );
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:1/api/mcp/continuations/continuation%2F1/respond",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          expected_revision: 7,
+          responses: { "field-local": "yes" },
+          human_request_id: "human-local",
+          human_expected_revision: 5,
+          human_preview_sha256: "c".repeat(64),
+          confirmed: true
+        })
+      })
+    );
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      kind: "remote_task",
+      task_ref: "task/1",
+      revision: 9,
+      status: "working",
+      input_requests: []
+    }));
+    await client.updateMcpRemoteTask(
+      "task/1",
+      8,
+      { "field-local": "yes" },
+      receipt,
+      true
+    );
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:1/api/mcp/remote-tasks/task%2F1/update",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          expected_revision: 8,
+          responses: { "field-local": "yes" },
+          human_request_id: "human-local",
+          human_expected_revision: 5,
+          human_preview_sha256: "c".repeat(64),
+          confirmed: true
+        })
+      })
+    );
+  });
+
+  it("reloads a continuation with an empty POST and reobserves Tasks without a guessed revision", async () => {
+    const continuation = {
+      kind: "input_required",
+      continuation_id: "continuation/1",
+      revision: 11,
+      respondable: true,
+      input_requests: [{
+        request_id: "field-local",
+        kind: "elicitation",
+        mode: "form",
+        schema: { type: "object", properties: {} }
+      }],
+      human_request_id: "human-local",
+      human_revision: 4,
+      human_preview_sha256: "c".repeat(64)
+    };
+    const fetchMock = mockFetch(continuation);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.getMcpContinuation("continuation/1");
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:1/api/mcp/continuations/continuation%2F1/inspect",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({}) })
+    );
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      kind: "remote_task",
+      task_ref: "task/1",
+      revision: 12,
+      status: "working",
+      input_requests: []
+    }));
+    await client.getMcpRemoteTask("task/1");
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:1/api/mcp/remote-tasks/task%2F1/get",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({}) })
+    );
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      kind: "remote_task",
+      task_ref: "task/1",
+      revision: 13,
+      status: "working",
+      input_requests: []
+    }));
+    await client.getMcpRemoteTask("task/1", null);
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:1/api/mcp/remote-tasks/task%2F1/get",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ expected_revision: null })
+      })
+    );
+  });
+
+  it("rejects unknown or secret-bearing continuation reload projections", async () => {
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+    const base = {
+      kind: "input_required",
+      continuation_id: "continuation-local",
+      revision: 1,
+      respondable: true,
+      input_requests: [{
+        request_id: "field-local",
+        kind: "elicitation",
+        schema: { type: "object", properties: {} }
+      }],
+      human_request_id: "human-local",
+      human_revision: 2,
+      human_preview_sha256: "d".repeat(64)
+    };
+    for (const extra of [
+      { provider_debug: "not contracted" },
+      { access_token: "PRIVATE-TOKEN" },
+      { remote_task_id: "PRIVATE-REMOTE-ID" }
+    ]) {
+      mockFetch({ ...base, ...extra });
+      await expect(client.getMcpContinuation("continuation-local")).rejects.toThrow(
+        /input-required|private credential or remote task/
+      );
+    }
+  });
+
+  it("rejects bearer-like remote task ids in a public GUI response", async () => {
+    mockFetch({
+      kind: "remote_task",
+      task_ref: "local-task",
+      remote_task_id: "private-remote-id",
+      status: "working"
+    });
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await expect(client.getMcpRemoteTask("local-task", 0)).rejects.toThrow(/private credential or remote task/);
+  });
+
+  it("uses explicit POST lifecycle calls for subscriptions without automatic polling", async () => {
+    const payload = {
+      subscription_id: "subscription/1",
+      server_id: "server/1",
+      status: "active",
+      requested_filters: ["resources/updated"],
+      acknowledged_filters: ["resources/updated"]
+    };
+    const fetchMock = mockFetch(payload);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.startMcpSubscription("server/1", ["resources/updated"], true);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:1/api/mcp/server%2F1/subscriptions/start",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ filters: ["resources/updated"], confirmed: true })
+      })
+    );
   });
 
   it("passes the discovered package hash through skill activation", async () => {
@@ -682,6 +1142,7 @@ describe("LibOSClient", () => {
           status: "pending",
           decision: null,
           blocking: true,
+          revision: 0,
           created_at: "2030-01-01T00:00:00Z",
           updated_at: "2030-01-01T00:00:00Z"
         }],
@@ -697,6 +1158,7 @@ describe("LibOSClient", () => {
         status: "pending",
         decision: null,
         blocking: true,
+        revision: 0,
         created_at: "2030-01-01T00:00:00Z",
         updated_at: "2030-01-01T00:00:00Z"
       }));
@@ -723,6 +1185,7 @@ describe("LibOSClient", () => {
       status: "pending",
       decision: null,
       blocking: true,
+      revision: 0,
       created_at: "2030-01-01T00:00:00Z",
       updated_at: "2030-01-01T00:00:00Z"
     })));
@@ -775,6 +1238,92 @@ describe("LibOSClient", () => {
     await expect(client.getSemanticAssessment("assessment/1")).rejects.toThrow(/identity does not match/);
   });
 
+  it("uses only bounded GET surfaces for Flow, settlement, epoch, control, health, and canary evidence", async () => {
+    const flow = semanticStatusFixture().flow;
+    const control = {
+      schema_version: 1,
+      revision: 0,
+      generation: 0,
+      mode: "off",
+      active_epoch_id: null,
+      active_policy_sha256: null,
+      tripped: false,
+      trip_code: null,
+      updated_at: "2030-01-01T00:00:00Z"
+    };
+    const metrics = {
+      schema_version: 1,
+      window: "7d",
+      action_id: "filesystem.read",
+      tenant_bucket_sha256: "6".repeat(64),
+      epoch_id: "epoch_1",
+      risk: "low",
+      machine: { ...semanticStatusFixture().machine, eligible: 2, issued: 1 },
+      actual_auto_approval: { numerator: 1, denominator: 2, rate: 0.5 },
+      review_metrics: {
+        reviewed: 2,
+        safe: 2,
+        unsafe: 0,
+        unsafe_rate: 0,
+        issued_reviewed: 0,
+        issued_review_rate: 0
+      }
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(flow))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [], next_cursor: null }))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [], next_cursor: null }))
+      .mockResolvedValueOnce(jsonResponse({
+        schema_version: 1,
+        root_node_id: "entity_1",
+        direction: "upstream",
+        items: [],
+        effective_labels: null,
+        coverage: "unknown",
+        next_cursor: null,
+        truncated: false
+      }))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [], next_cursor: null }))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [], next_cursor: null }))
+      .mockResolvedValueOnce(jsonResponse(control))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [control], next_cursor: null }))
+      .mockResolvedValueOnce(jsonResponse({ schema_version: 1, items: [], next_cursor: null }))
+      .mockResolvedValueOnce(jsonResponse(metrics));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new LibOSClient({ url: "http://127.0.0.1:1", token: "token", db: "local" });
+
+    await client.getSemanticFlowStatus();
+    await client.listSemanticFlowEntities({ pid: "pid_1" }, 25, "entity_cursor");
+    await client.listSemanticFlowEdges({ pid: "pid_1" }, 25, "edge_cursor");
+    await client.getSemanticFlowLineage("entity_1", "upstream", 25, "lineage_cursor");
+    await client.listSemanticSettlements({ pid: "pid_1", outcome: "issued" }, 25, "settlement_cursor");
+    await client.listSemanticPolicyEpochs(25, "epoch_cursor");
+    await client.getSemanticControl();
+    await client.listSemanticControlHistory(25, "control_cursor");
+    await client.listSemanticHealthEvents(25, "health_cursor");
+    await client.getSemanticMetrics({
+      window: "7d",
+      actionId: "filesystem.read",
+      tenantBucketSha256: "6".repeat(64),
+      epochId: "epoch_1",
+      risk: "low"
+    });
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "http://127.0.0.1:1/api/semantic/flow/status",
+      "http://127.0.0.1:1/api/semantic/flow/entities?limit=25&after=entity_cursor&pid=pid_1",
+      "http://127.0.0.1:1/api/semantic/flow/edges?limit=25&after=edge_cursor&pid=pid_1",
+      "http://127.0.0.1:1/api/semantic/flow/lineage/entity_1?limit=25&after=lineage_cursor&direction=upstream",
+      "http://127.0.0.1:1/api/semantic/settlements?limit=25&after=settlement_cursor&pid=pid_1&outcome=issued",
+      "http://127.0.0.1:1/api/semantic/policy/epochs?limit=25&after=epoch_cursor",
+      "http://127.0.0.1:1/api/semantic/control",
+      "http://127.0.0.1:1/api/semantic/control/history?limit=25&after=control_cursor",
+      "http://127.0.0.1:1/api/semantic/health?limit=25&after=health_cursor",
+      `http://127.0.0.1:1/api/semantic/metrics?action_id=filesystem.read&tenant_bucket_sha256=${"6".repeat(64)}&epoch_id=epoch_1&risk=low&window=7d`
+    ]);
+    expect(fetchMock.mock.calls.every(([, init]) => init.method === "GET")).toBe(true);
+  });
+
   it("rejects unbounded Semantic pagination before issuing a request", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
@@ -788,6 +1337,8 @@ describe("LibOSClient", () => {
     await expect(client.listSemanticAssessments({ tenantBucketSha256: "A".repeat(64) })).rejects.toThrow(/tenant_bucket_sha256/);
     await expect(client.listSemanticAssessments({}, 50, "x".repeat(2_049))).rejects.toThrow(/after/);
     await expect(client.getSemanticAssessment(" ")).rejects.toThrow(/assessment_id/);
+    await expect(client.getSemanticMetrics({ risk: "unknown" as never })).rejects.toThrow(/risk/);
+    await expect(client.getSemanticFlowLineage("node with spaces", "upstream")).rejects.toThrow(/node_id/);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
@@ -841,7 +1392,7 @@ function taskRunSummary() {
 
 function semanticStatusFixture() {
   return {
-    schema_version: 2,
+    schema_version: 3,
     mode: "shadow",
     adapter: "deterministic",
     profile_id: null,
@@ -876,7 +1427,50 @@ function semanticStatusFixture() {
         unknown: 0
       }
     },
-    actual_auto_approval: { numerator: 0, denominator: 0, rate: null }
+    control: {
+      catalog_version: null,
+      active_epoch_id: null,
+      active_epoch_sha256: null,
+      generation: 0,
+      state: "inactive",
+      trip_reason_code: null
+    },
+    flow: {
+      schema_version: 1,
+      available: false,
+      counts: { entities: 0, activities: 0, edges: 0, label_assertions: 0 },
+      coverage: { complete: 0, partial: 0, unknown: 0, conflict: 0, stale: 0 },
+      capture_failures: 0,
+      legacy_history: {
+        present: false,
+        source_schema_version: null,
+        assessment_count: 0,
+        coverage: null,
+        evidence_sha256: null,
+        created_at: null
+      }
+    },
+    machine: {
+      eligible: 0,
+      issued: 0,
+      consumed: 0,
+      succeeded: 0,
+      failed: 0,
+      unknown: 0,
+      expired: 0,
+      revoked: 0,
+      race_lost: 0,
+      denied: 0
+    },
+    actual_auto_approval: { numerator: 0, denominator: 0, rate: null },
+    review_metrics: {
+      reviewed: 0,
+      safe: 0,
+      unsafe: 0,
+      unsafe_rate: null,
+      issued_reviewed: 0,
+      issued_review_rate: null
+    }
   };
 }
 

@@ -1,26 +1,71 @@
-# MCP Client Tools
+# MCP Client
 
-Agent libOS supports client-only MCP Tools for registered external MCP servers.
-Agents cannot pass transports, commands, URLs, headers, or raw server
-configuration at call time. They pass only:
+Agent libOS is an MCP **client**, never an MCP server. Two deliberately separate
+contracts coexist:
+
+- Manifest v1/v2 is the released compatibility contract for governed MCP
+  Tools. It retains its existing registry/Sink identities, provider result,
+  and model-facing Tool projection.
+- Manifest v3 is the exact `2026-07-28` modern Host-client contract. It adds
+  governed Tools with the modern closed result union, plus closed allowlists
+  for Resources, Resource Templates, Prompts, Completion, subscriptions,
+  Host-owned OAuth profiles, MRTR continuations, and a digest-pinned Tasks
+  extension without silently reinterpreting v1/v2.
+
+Neither contract lets an agent supply transports, commands, URLs, headers,
+credentials, raw remote identifiers, or server configuration at call time.
+On every model-facing Tool path, an agent passes only:
 
 - `server_id`
 - `tool_id`
 - `arguments`, as a JSON object; `null` is normalized to `{}` by the primitive
 
-Agent libOS 1.4.0 uses the Python MCP SDK v2. “SDK v2” is not a wire-protocol
-version: MCP protocol revisions are date strings. This release pins its modern
-wire contract to `2026-07-28` and also supports legacy initialize-based
-revisions. Manifest schema, SDK major, protocol revision, Agent libOS product
-version, and RuntimeStore schema are independent identifiers; the Store uses
-schema v5.
+The optional provider uses Python MCP SDK v2, pinned as `mcp==2.0.0`. “SDK v2”
+is not a wire-protocol version: MCP protocol revisions are date strings. Manifest v3
+requires the exact `2026-07-28` wire contract, while the v1/v2 compatibility
+path also supports the documented legacy initialize-based revisions. Manifest
+schema, SDK major, protocol revision, Agent libOS product version, and
+RuntimeStore schema are independent identifiers; the Store uses schema v7.
 
-The supported product surface is deliberately narrower than the upstream SDK:
-Tools list/call and modern `server/discover` only. Resources, Prompts, Tasks,
-Roots, Sampling, Logging, Elicitation/MRTR continuation,
-`subscriptions/listen`, MCP Apps, OAuth client login, and an MCP server product
-surface are not implemented. Static Host environment-backed Authorization
-headers remain supported transport inputs, but that is not OAuth conformance.
+The outbound `clientInfo` identity is part of the compatibility contract and
+is selected by manifest generation, not copied mechanically from the installed
+distribution metadata:
+
+| Manifest contract | `clientInfo.name` | `clientInfo.version` |
+| --- | --- | --- |
+| v1 legacy wire | `mcp` | `0.1.0` |
+| v2 governed Tools compatibility | `agent-libos` | `1.4.2` |
+| v3 exact `2026-07-28` | `agent-libos` | `1.5.0` |
+
+The v1 and v2 values are frozen compatibility identities. Only exact-v3 uses
+the current modern product identity; changing the package version must never
+silently rewrite a v1/v2 handshake.
+
+Manifest v3 is a Host-composition surface, not a new set of automatically
+model-visible tools. Remote Resources and Prompts remain untrusted input;
+Resource links are inert selectors, binary content becomes a Host artifact
+receipt, and prompt messages cannot become system/developer instructions.
+Visibility never grants Capability, data-flow, effect, or provider authority.
+
+The following are explicitly outside this product contract:
+
+- an MCP server surface;
+- executing or rendering MCP Apps (`ui://`, Apps HTML MIME types, and Apps
+  metadata fail closed);
+- OAuth Dynamic Client Registration (DCR); only Host-preconfigured
+  `preregistered` or HTTPS CIMD client profiles are eligible;
+- OAuth client-credentials, enterprise-managed authorization, DPoP,
+  workload-identity federation, and `2025-03-26` OAuth backcompat modes; the
+  current product contract is Host-preconfigured authorization-code/PKCE;
+- Roots, Sampling, and Logging callbacks;
+- the deprecated standalone HTTP+SSE transport; and
+- automatic replay, transparent reconnect/resume, or `Last-Event-ID` recovery.
+
+Streamable HTTP remains supported and may return a bounded
+`text/event-stream` response. That response encoding is part of Streamable
+HTTP and must not be confused with the excluded standalone SSE transport.
+Static Host environment-backed Authorization headers remain supported on the
+v1/v2 compatibility path, but they are not an OAuth login or conformance claim.
 
 Normative upstream references for this release are the MCP
 [protocol versioning rules](https://modelcontextprotocol.io/docs/learn/versioning),
@@ -139,8 +184,9 @@ deployments may customize these values through `AgentLibOSConfig.mcp`.
 
 Manifest v1 is a compatibility contract. It must omit `protocol_mode`, always
 uses the legacy initialize handshake, does not send a modern discovery probe,
-does not follow `nextCursor`, and preserves its existing canonical identity,
-approval binding, and Sink digest.
+does not follow `nextCursor`, and rejects any present, non-null `nextCursor`
+(including the empty string). Safe v1 manifests preserve their existing
+canonical identity, approval binding, and Sink digest.
 
 ## Server Manifest V2
 
@@ -206,7 +252,449 @@ Validation caps schema depth at 64, nodes at 10,000, reference hops at 128, and
 composition expansion at 1,024. Server `outputSchema`, annotations, and cache
 hints are diagnostic metadata only and never expand authority.
 
+For Manifest v1, v2, and v3, `pattern` and `patternProperties` share a maximum
+of 4,096 regex evaluations and one 50 ms monotonic matching deadline, and each
+UTF-8 pattern is capped at 1,024 bytes. The corresponding Host settings are
+`schema_regex_max_evaluations`, `schema_regex_match_timeout_s`, and
+`schema_regex_pattern_max_bytes`. Invalid/oversized regex, timeout, or budget
+exhaustion fails closed before provider dispatch; these limits are not weakened
+to make a remote schema appear compatible.
+
+## Server Manifest V3
+
+Manifest v3 is a new, non-downgradable authority contract. It requires
+`schema_version: 3` and exact `protocol_mode: "2026-07-28"`; `legacy` and
+`auto` are invalid. It supports `stdio` and `streamable_http` only and requires
+at least one declared Tool, Resource, Resource Template, or Prompt. Every
+closed object layer rejects unknown fields and strict scalar/list types; open
+`metadata` and Tool `input_schema` values must still be finite strict JSON.
+
+The repository ships complete, validated examples for
+[stdio](../examples/mcp/stdio-v3.yaml) and
+[loopback Streamable HTTP](../examples/mcp/http-v3.yaml), plus a runnable
+[end-to-end tutorial](../examples/mcp/README.md). Their common shape is:
+
+```yaml
+schema_version: 3
+server_id: modern-demo
+transport: streamable_http
+protocol_mode: "2026-07-28"
+http:
+  url: http://127.0.0.1:8765/mcp
+tools:
+  - tool_id: echo
+    mcp_name: demo.echo
+    right: read
+    rollback_class: no_rollback_required
+    rollback_status: not_required
+    state_mutation: false
+    information_flow: true
+    input_schema: {}
+resources:
+  - resource_id: status
+    remote_uri: demo://status
+    right: read
+    information_flow: true
+    model_visible: false
+    mime_types: [application/json]
+resource_templates:
+  - template_id: greeting
+    remote_uri_template: "demo://greeting/{name}"
+    variables: [name]
+    right: read
+    information_flow: true
+    model_visible: false
+    mime_types: [text/plain]
+prompts:
+  - prompt_id: review
+    mcp_name: demo.review
+    argument_names: [subject]
+subscriptions: []
+timeout_s: 10
+max_request_bytes: 65536
+max_response_bytes: 1048576
+```
+
+V3 Resources and Resource Templates are read/information-flow surfaces. Their
+manifest ids are local logical ids; `remote_uri` and
+`remote_uri_template` are registered transport selectors, not permission to
+open a local or arbitrary network URI. `model_visible` defaults to false and
+cannot turn a declaration into authority. Prompt ids similarly map to pinned
+remote names and argument-name allowlists. Returned prompts always carry
+untrusted provenance and require explicit user confirmation before use.
+
+For Streamable HTTP, optional `auth_profile_id` is an opaque reference to a
+Host-constructed OAuth profile; neither client secrets nor tokens belong in the
+manifest. Profiles use `registration_mode: preregistered` or `cimd`. DCR is
+rejected rather than silently attempted. OAuth is exact-v3 only: the Host owns
+status/begin/complete/revoke/logout, PKCE/state and token custody, while the
+transport receives only the selected access token through a private broker.
+An `auth_profile_id` cannot coexist with a manifest static `Authorization`
+header; that ambiguous dual-credential configuration is rejected during
+offline validation and registration, before provider work.
+
+The optional `subscriptions` array is a closed subset of
+`toolsListChanged`, `promptsListChanged`, `resourcesListChanged`,
+`resourceSubscriptions`, and `taskIds`. A `taskIds` subscription requires:
+
+```yaml
+tasks_extension:
+  extension_id: io.modelcontextprotocol/tasks
+  spec_sha256: <64-lowercase-hex-Host-pin>
+```
+
+The digest is a Host pin for the extension specification, not a value learned
+from the server. Task ids, request-state values, continuation ids, OAuth state,
+and subscription transport handles remain opaque Host state. Manifest v3
+rejects Apps metadata, case-insensitive `ui://` selectors, and every
+media-type-equivalent spelling of `text/html; profile=mcp-app` rather than
+trying to sandbox-render them. This rule also applies to each Completion
+suggestion from either the SDK adapter or a custom Prompt Provider; exact-secret
+redaction cannot turn Apps navigation or render instructions into public text.
+
+Canonical v3 JSON and its SHA-256 are independent of v1/v2 canonicalization.
+The ordinary Host `register_server`/YAML path accepts a typed v3 manifest under
+the same create/explicit-replace authority rules as v1/v2. A reviewed
+export/import or any replacement based on an earlier registry observation must
+instead use the exact Host CAS bridge
+`import_v3_manifest(..., expected_current_sha256=...)`; tooling that cannot
+reach that bridge may validate and plan, but must fail before mutation rather
+than downgrade v3 or perform a non-CAS replacement.
+
+## Modern Host Client API
+
+`McpModernClient` is the Host-facing v3 Resources/Prompts/Completion manager.
+It owns no ambient registry, credential, or transport state. A Host supplies a
+`McpClientBindingResolver` returning the exact manifest digest, registry
+generation, auth generation/principal digest, owner, and an operation-local
+sensitive-value snapshot, plus async Resource/Prompt providers. The binding is
+resolved before and after every operation; any registry, owner, or auth fence
+change fails the result closed.
+
+The synchronous methods, with `a`-prefixed async equivalents, are:
+
+- `list_resources` and `list_resource_templates`;
+- `read_resource` using a local `resource_id` plus exactly the declared
+  template variables;
+- `list_prompts` and `get_prompt` using a local `prompt_id` plus only declared
+  string arguments; and
+- `complete_prompt` (also spelled `complete` for provider-style callers) for a
+  declared Prompt or Resource Template reference. Its `argument` is exactly
+  `{"name": <declared-name>, "value": <string>}`; arbitrary argument maps are
+  rejected.
+
+List methods return bounded `McpPage` values. A provider cursor is never
+returned raw: the client stores it only in a bounded, in-memory vault and
+returns a single-use opaque `mcpcur_*` handle bound to server, surface,
+manifest/auth/owner fence, expiry, and seen-cursor digests. Restart, expiry,
+wrong-surface use, replay, or a repeated provider cursor fails closed and
+requires a fresh list. The vault is capped by `mcp.cursor_handle_limit`.
+Cache hints are advisory, their TTL is capped by
+`mcp.cache_hint_ttl_cap_ms`, and they never expand the manifest allowlist.
+There is no modern MCP response-body cache or cross-principal cache reuse.
+
+Resource read and Prompt get return exactly one of `McpComplete`,
+`McpInputRequired`, or `McpRemoteTask`. Completion is Complete-only because the
+released SDK has no continuation parameters; any non-Complete Completion result
+fails typed before a Human request, durable row, evidence payload, GUI, or model
+projection. SDK and custom Completion results share the same closed public
+shape: a bounded tuple of strings, an optional non-negative integer `total`,
+and a strict boolean `has_more`. Resource contents retain
+`provenance: untrusted_mcp_resource`; large/binary contents require a Host
+artifact writer and expose only a byte length, MIME type, and digest receipt.
+Resource links remain inert. Prompt messages retain
+`provenance: untrusted_mcp_prompt` and
+`user_confirmation_required: true`. Provider metadata, icons, descriptions,
+schemas, cache hints, completion values, and task status never grant authority.
+
+`McpSdkV2SessionProvider` is the adapter for real Python SDK v2 sessions. Its
+factory must yield an already governed, exact-`2026-07-28` session and owns DNS,
+credentials, immutable stdio snapshots, transport limits, absolute deadlines,
+and lifecycle fences. The adapter intentionally does not open a second direct
+SDK transport. Custom providers must meet the same async provider contracts and
+bounded public-result checks, but they are trusted, cooperative Host code rather
+than an in-process isolation boundary. Their `async def` methods must not block
+the event-loop thread, run unbounded CPU work, or suppress cancellation, and
+must honor the supplied absolute deadline. Runtime checks the deadline before
+and after dispatch and classifies an entered-provider overrun as unknown with no
+automatic replay. Python cannot safely preempt arbitrary in-process code; a Host
+that needs a hard boundary must place custom code behind a killable process or
+use the built-in governed SDK/transport path, whose I/O deadline remains hard.
+The synchronous Resource, Prompt, and Completion facade owns a fresh event loop
+for each operation. After the ordinary task-affine cancellation drain, it
+closes that loop on a fixed bound and hard-settles a suspended custom coroutine
+that yielded but kept swallowing cancellation; it never leaves an
+`asyncio.run` shutdown gather or live task on that private loop, and the runner
+itself creates no worker thread. This cleanup does not make Python preemptible:
+Provider code that blocks the calling thread before its first yield, or starts
+an executor/thread that does not finish cooperatively within the deadline,
+remains outside the Host SPI contract and must be isolated by the Host.
+
+`RuntimeBuilder` discovers optional, caller-owned modern Host SPIs only from
+the substrate attributes `mcp_credential_broker`, `mcp_artifact_writer`,
+`mcp_resource_provider`, `mcp_prompt_provider`,
+`mcp_subscription_provider`, and `mcp_tasks_provider`. Supplying one preserves
+that object's identity and requires its complete callable protocol; there is
+no partial or duck-typed success. If no broker is supplied, Runtime constructs
+the system-keyring broker lazily, so a non-OAuth Runtime can open on a headless
+Host while OAuth profile registration/use fails closed when no secure backend
+is available. That default broker accepts only the exact audited classes from
+the locked `keyring==25.7.0` build: macOS Keychain, Windows Credential Manager,
+Linux Secret Service/libsecret, and KWallet 4/5. It verifies the exact class
+object, distribution version, distribution-owned source path, and reviewed
+source digest. `ChainerBackend`, a plugin/backend lookalike or subclass, an
+unknown third-party backend, and an unreviewed keyring version all fail closed;
+a positive keyring priority or a `keyring.*` module name is not evidence. A
+Host that deliberately uses another secure credential facility must inject a
+complete `McpCredentialBroker` through `substrate.mcp_credential_broker`.
+If no artifact writer is supplied, binary Resource content fails closed before
+bytes can enter a public result or RuntimeStore.
+
+The optional Host-private `substrate.mcp_oauth_transport` is a trusted,
+cooperative synchronous SPI. Its `request` implementation must honor the one
+absolute deadline supplied by Runtime; unlike the built-in pinned transport,
+Runtime cannot forcibly stop arbitrary Host code that blocks forever. Runtime
+nevertheless rechecks the deadline immediately after every returned transport
+response and again after the complete OAuth Provider phase (including the
+non-secret Store projection), so a late return is recorded as an ambiguous or
+failed operation and can never publish success. An `auth.begin` or scope-step-up
+challenge that is not returned because deadline/evidence settlement fails is
+discarded; ambiguous broker deletion remains manager-owned for close, expiry,
+or next-begin cleanup.
+
+Modern custom Provider SPIs declare the exact markers
+`mcp_manifest_schema_version = 3` and
+`mcp_protocol_revision = "2026-07-28"`. RuntimeBuilder requires every declared
+method to be an `async def` with the closed public signature; a legacy provider,
+synchronous lookalike, variadic signature, or partial continuation provider is
+rejected during composition. The optional substrate attributes also include
+`mcp_v3_tool_provider` and `mcp_continuation_provider`; a custom continuation
+provider must implement Tool, Resource-read, and Prompt-get continuation. This
+structural check does not turn Python code into a preemptible sandbox: the
+cooperative deadline/cancellation obligations above remain part of the Host SPI
+contract.
+
+A custom Provider-returned `McpInputRequired` or `McpRemoteTask` is not proof of
+Host capture. Before the protected Provider phase ends, Runtime reopens the
+referenced durable record and requires its public projection and complete
+server/manifest generation, owner/auth, original request/effect,
+Capability/data-flow, and current Tasks-pin fences to equal this operation.
+Missing, stale, cross-operation, or altered refs fail closed before result
+accounting or public evidence. Custom continuation results are recursively
+Apps-filtered and exact-secret-redacted under the active binding before the
+continuation manager or credential broker receives them.
+For each continuation or Tasks round, the broker-only `requestState` or remote
+task id is added to that operation's exact-sensitive set. Provider-controlled
+siblings and Provider exception text are sanitized before protected
+settlement, audit/event evidence, Runtime/CLI/GUI output, or another broker
+write; only the private durable-manager boundary may recover the validated
+remote id needed for its own broker lookup.
+
+Ordinary Resources/Prompts/Completion calls are stateless at the protocol
+session layer: each call enters and exits the existing governed transport in
+the same async task and never retains or resumes an MCP session id. The
+connection supervisor holds only a no-I/O fence permit for such a call.
+Long-lived subscription handles are the sole modern read surface retained by
+the supervisor. A Prompt preview carries a deterministic `preview_sha256`
+computed inside the same registry/auth binding used for its provider call;
+confirmation must present that exact digest or the Prompt is fetched only as a
+new unconfirmed preview.
+
+### Subscriptions, MRTR, Tasks, and OAuth lifecycle
+
+`McpSubscriptionManager.start/status/events/stop` is async and accepts only a
+non-empty subset of manifest-declared v3 filters. Connections and queues have
+Host caps, absolute/idle lifetime fences, per-event byte limits, monotonically
+assigned local sequence numbers, and explicit close. Loss becomes `lost`; the
+manager does not reconnect or supply `Last-Event-ID`. A sanitized status/event
+projection may be stored as evidence, but the live handle/queue is not restored
+after restart. `status` may explain the durable `lost` record; `events` for
+that record fails with `NotFound` because an empty list would falsely imply
+that a live queue had been recovered.
+
+`events(after=N, limit=L)` is one owner-fenced, single-consumer receive cursor,
+not a replay snapshot. The first cursor is `0`; every later `after` must equal
+the last sequence returned by the preceding successful non-empty read. A
+successful batch atomically acknowledges and evicts only that returned prefix,
+so unread events remain queued and a timely reader frees capacity before the
+next notification. An empty batch does not advance the cursor. A stale or
+future cursor, a competing reader using an already-consumed cursor, or a
+different owner fails closed. Queue overflow still changes the subscription to
+`lost`; Runtime never drops an unread event while reporting a false `active`
+state. Terminal in-memory queues use the same drain-on-read cursor until they
+are empty.
+
+`notifications/tasks/status` is not part of the general subscription transport
+allowlist. Runtime admits that one wire method only for an exact 2026-07-28
+`taskIds` listen whose synchronous ingress is installed, whose Manifest Tasks
+digest matches the Host review pin, and whose negotiated server advertises the
+same extension identifier. It remains dropped during negotiation and on every
+v1/v2, unpinned, ordinary-call, or non-Tasks subscription path. Before a Task
+event becomes public, Apps keys are removed, exact operation secrets are
+redacted, and the bearer-like remote Task id is resolved through its exact
+registry/auth/owner fence to a local `task_ref`. The notification is only an
+inert refetch hint: it cannot advance durable Task state or create Human work;
+that still requires an explicit protected Task operation.
+
+After a validated and sanitized `toolsListChanged`, `promptsListChanged`,
+`resourcesListChanged`, or `resourceUpdated` event is admitted and its durable
+receipt accounting succeeds, Runtime synchronously revokes that server's local
+opaque catalog cursors. The next catalog read must be a full refresh with no
+cursor. This callback is local-only: it performs no remote request and cannot
+launch a model, Tool, TaskRun, or subscription. Unknown, unsupported Apps, and
+task-status event types never reach this catalog invalidation seam.
+
+`McpContinuationManager` captures an `input_required` result from an already
+governed operation. The canonical original request, Provider request keys, and
+raw `requestState` live only behind a credential broker; the Store retains the
+original-request digest and authority fences. On reopen, a local continuation
+reference recovers that broker-held request only after its canonical digest
+matches the durable fence. The Host first strictly parses and secret-sanitizes
+the complete Elicitation request set, preallocates the Human id and an exact
+reserved broker slot, and commits their payload-free ownership sidecar. Only then does it
+create the ordinary durable Human *question* and write the exact reserved broker
+slot. The continuation-row commit atomically advances the sidecar to retirement;
+normal or restart cleanup then removes only superseded state, so a crash cannot
+leave an undiscoverable Human question or broker value. The Human
+preview binds every local input id and schema digest. Public callers receive the local continuation id,
+bounded questions, expiry/revision, and the real
+`human_request_id`/Human revision/preview digest. There is no placeholder Human
+id. Sampling and Roots remain typed unsupported and create neither a
+respondable continuation nor a Human question.
+
+Initial continuation and remote-Task results are published in the same
+RuntimeStore transaction that settles their originating protected effect.
+Every continuation response is prepared before its protected effect completes:
+a next `input_required` round or terminal `complete` transition commits with
+that effect, while a remote-Task result additionally commits the Task row in
+the same transaction. All involved sidecars remain
+`prepared` when that transaction rolls back; only after it commits may the Host
+finalize their `cleaning/retire` receipts. A crash in either interval is handled
+by startup cleanup and never by replaying the Provider call.
+
+`Runtime.mcp.recover_durable_result(effect_id)` is the Host-only recovery
+surface for the commit-before-return interval. It reads only a finalized,
+committed MCP effect's closed local-ref receipt and then validates the complete
+durable fence chain. Initial continuations retain their immutable origin-effect
+fence; later rounds additionally bind the current response effect in the sealed
+broker envelope. A continuation-to-Task handoff binds its local Task to that
+response effect and checks the response receipt before following the original
+continuation receipt. It is not a
+remote `tasks/list`, does not enumerate handles, and never exposes the remote
+Task id, broker reference, request state, or Provider body.
+This lookup recovers durable local handles, not arbitrary completed response
+bodies. A continuation `complete` result and its terminal state still commit
+atomically, but its `McpComplete.value` is not a durable replay payload; after a
+commit-before-return crash the Host can verify terminal completion and the
+committed effect, but cannot ask Runtime to replay that value.
+
+Respondable MRTR is deliberately surface-specific. Exact-v3 `tools/call`,
+`resources/read`, and `prompts/get` have operation-specific continuation wire
+methods; Resource and Prompt continuation sends the sealed `requestState` and
+the Human-approved `inputResponses` through a new governed request without
+reissuing the original call as an automatic retry. Catalog/list operations are
+not respondable. The released SDK Completion request has no continuation
+parameters, so an `input_required` result from `completion/complete` is rejected
+as typed `mcp_continuation_surface_unsupported` before a continuation or Human
+question is created.
+
+For Host callers, only the exact `runtime`, `gui`, and local `cli` principals
+may create the Human question without a process Capability, and only while the
+matching MCP ProtectedOperation provider dispatch is active. The injected Host authorizer
+rechecks the server, operation, logical reference, effect, Host-authority mode,
+and canonical preview digest before the question is persisted. This is not a
+synthetic `human:owner` grant: process callers still require their ordinary
+`human:owner` `write` Capability.
+
+`respond` does not accept raw Provider-bound responses. Before settling the
+Human question, the Host asks the manager to validate the proposed local ids,
+actions, and form values against the current broker-held request mapping and
+durable revision/preview fences. An invalid answer therefore leaves the Human
+question pending and the continuation unchanged. The Host then settles that
+exact Human question using its revision and preview digest; the manager
+consumes only the approved canonical JSON answer, repeats the same validation
+against the current durable round, and claims the continuation with CAS. A new
+Elicitation round creates a new Human question; an earlier round's receipt
+cannot be reused across continuations or rounds. This data-entry question is
+separate from the protected operation's ASK authority decision. `respond` and
+`cancel` use a Host continuation boundary that re-runs Capability, ASK,
+data-flow, budget, and pending-first effect checks. A locally certified
+not-started dispatch returns to `input_required`; an ambiguous error or crash
+becomes `needs_attention`. Pending Human questions and continuation bindings
+survive Store reopen, but Runtime startup recovery only reconciles an interrupted
+`dispatching` row to `needs_attention`; it never dispatches, resumes, or invokes
+the original API automatically. After TaskRun preflight, recovery distinguishes
+a precommit `prepared/abort` row from a postcommit `cleaning/retire` row. The
+former cancels only the newly preallocated Human/slots; the latter cancels only
+the superseded Human and deletes only old broker slots. Both revision-delete the
+sidecar and neither constructs or replays the continuation/Task operation.
+
+`McpRemoteTaskManager` similarly exposes a local `task_ref`, never the remote
+bearer-like task id. `get` is an explicit re-observation; `update` and `cancel`
+use durable revision CAS and a governed boundary. When creation or an explicit
+`tasks/get` observes `input_required`, the manager strictly parses the full
+request set and creates a new real Human question for that task round; a repeat
+observation of the same outstanding round reuses that exact pending question.
+`tasks/update` applies the same validate-before-settle and validate-again-after-
+settlement fence, consumes only its approved answer, and never accepts raw
+UI/model responses directly. A later input round receives a different Human id. There
+is deliberately no `tasks/list`. The manifest/Host extension digests,
+server/auth/owner binding, origin request/effect, and state transitions must
+all match. A `tasks/cancel` acknowledgement means only local
+`cancel_requested`, never `cancelled`; the caller must explicitly re-observe a
+terminal state. Interrupted or ambiguous update/cancel dispatch is reconciled
+during Runtime startup recovery to `needs_attention`, never replayed. The manager
+never polls automatically. Remote task ids, status state, outstanding Provider
+input keys, and terminal results stay in the credential broker while the Store
+retains only local refs, binding/digests, sanitized diagnostics, CAS revision,
+and the current real Human request id.
+
+`McpOAuthManager.status/begin/complete/revoke/logout` operates only on
+Host-added v3 Streamable HTTP profiles. `begin` returns a bounded authorization
+URL/challenge; `complete` consumes the Host callback URL and challenge. The
+authorization code necessarily exists transiently in the Host UI/HTTP/Runtime
+request path until the single token-exchange attempt. It is never written to
+RuntimeStore or credential-broker storage and never enters audit, event,
+effect, output, error, or log projections. The GUI/server request cache and CLI
+application-owned callback reference are cleared after that attempt; Python or
+JavaScript immutable values are released rather than claiming guaranteed
+physical zeroization. Client credentials, Runtime-held PKCE/state material,
+refresh/access tokens, and revocation material live at rest only inside the
+credential broker. The system
+keyring uses deterministic profile-scoped client slots and alternating token
+generation slots. A later Runtime can use them only after the Host explicitly
+adds the same exact profile again; the encrypted token bundle binds the full
+non-secret profile authority, its credential generation, and already validated
+authorization endpoints. A changed client id, authentication method, redirect,
+audience, metadata pin/URL, endpoint origin, or newer Store generation clears
+the stale token/refresh credential without attempting a refresh. Browser
+challenge/PKCE/state slots are never resumed and are deleted on completion,
+expiry, close, logout, revoke, or the next exact profile registration after a
+crash. Token and revocation requests are not retried, redirects and ambient
+proxies are rejected, and ambiguous rotation/revocation becomes
+`needs_attention`. DCR is unsupported by construction.
+
+The runnable [modern lifecycle tutorial](../examples/mcp/README.md#exercise-mrtr-remote-tasks-subscriptions-and-safe-recovery)
+uses one persistent Host Runtime to exercise Human-bound MRTR, remote Task
+get/update/cancel, subscription start/events/stop, and reopen-to-`lost`
+recovery. It also verifies pending-first evidence and scans its SQLite/output
+for opaque Provider state. Separate one-shot CLI processes cannot share an
+OAuth challenge or a live subscription handle. The CLI therefore completes a
+login callback in one foreground Runtime; later commands must explicitly bind
+the same strict profile file so the secure broker token can be revalidated and
+rehydrated.
+
 ## Authority
+
+The Tool Capability resources below apply to both the stable v1/v2 primitive
+and exact-v3 Tool calls. `McpModernClient` itself is a Host composition object: its allowlists, bounds,
+projections, and fence checks do not manufacture a Runtime Capability or effect
+receipt. The built-in model Resource list/read wrappers therefore enter a
+separate protected primitive facade before calling that client. Any other Host
+exposure of a v3 operation must likewise add the operation-specific Capability,
+Human approval, data-flow, budget, pending-first effect, event, and audit
+checks. Prompts, Completion, subscriptions, OAuth, continuations, and remote
+Tasks are not projected as model tools.
 
 Registry metadata authority:
 
@@ -223,9 +711,40 @@ mcp:<server_id>:*
 mcp:*
 ```
 
+Model-visible v3 Resource authority:
+
+```text
+# list Resources or Resource Templates
+mcp_server:<server_id> read + execute
+
+# read one local logical Resource/Template id
+mcp:<server_id>:resource:<logical_id> read
+mcp_server:<server_id> execute
+```
+
+Stdio Resource operations additionally require `process:spawn` `write` and
+the exact `mcp_stdio:<sha256>` `execute` launch right. Catalog and read calls
+are protected bidirectional operations: registered selectors/variables cross
+the executable-bound Sink, provider content returns as
+`external:mcp` untrusted ingress, a pending effect precedes DNS/session/provider
+work, and registry/auth fence drift discards the result. Process calls reserve
+the manifest byte envelope; Host-internal calls omit process authority
+reservations but retain data-flow, effect, resource, event, and audit evidence.
+
 `list_mcp_servers` requires `read` on `config.mcp.registry_resource` (default
-`mcp_server:*`). `inspect_mcp_server` and cached `list_mcp_tools` require
+`mcp_server:*`) and its model schema and result page are bounded by
+`config.mcp.server_page_limit`, never the deprecated v1/v2 Tools
+`list_limit`. `inspect_mcp_server` and cached `list_mcp_tools` require
 `read` on the exact `mcp_server:<server_id>` resource when called by a process.
+The process/model-safe list, inspect, syscall, and actor-mode CLI projections
+omit v3 Resource and Resource Template selectors, Prompt declarations,
+`auth_profile_id`, subscriptions, and the Tasks extension pin. In particular,
+they never reveal a `model_visible: false` entry or its raw URI through the
+legacy registry-inspection surface; a model must use the protected logical-id
+Resource list/read facade. Trusted Host inspection
+(`include_sensitive_fields=True`, including the non-actor CLI) may show the
+registered declarations for administration, but still never resolves or
+returns credential values.
 `list_mcp_tools(refresh=true)` crosses the provider boundary to run
 `tools/list`, so it also requires `execute` on `mcp_server:<server_id>` and is
 recorded as an MCP external read effect. Host/admin refreshes that bypass
@@ -284,9 +803,10 @@ register/replace/unregister with the interval from that live compare through
 provider-call return; the runtime's single-writer store lease excludes a second
 supported Runtime writer from bypassing the in-process guard.
 
-Tool binding and model visibility are not authority. The built-in base, coding,
-and review Images bind all four MCP tools in their complete process tool tables.
-Their Skill projection keeps those tools out of the model table until the exact
+Tool binding and model visibility are not authority. Built-in Images that
+support MCP bind the four server/Tool entries plus the two v3 Resource
+list/read entries in their complete process tool tables. Their Skill projection
+keeps those tools out of the model table until the exact
 `agent-libos-mcp` Skill is activated. Toolmaker and context-compressor do not
 bind these tools and cannot activate that immutable built-in Skill. Neither
 static binding nor later projection lets a process inspect or call a registered
@@ -381,16 +901,28 @@ tool metadata and fails closed if the
 server no longer exposes the tool or if a pinned `input_schema` changed; those
 post-boundary failures do not restore the use.
 
-For `call_tool`, target-only stdio executable identity selection precedes
-protected preparation. One absolute deadline then begins after preparation and
-covers complete environment snapshotting, primitive DNS, final executable
-snapshotting, protocol discovery/initialization, all live `tools/list` pages,
-validation, and `call_tool`; each subsequent stage receives only the remaining
-time. For live refresh, environment
-snapshotting and initial executable identity selection precede its deadline;
-that deadline then covers primitive DNS, final executable snapshotting,
-protocol negotiation, and all `tools/list` pages. An exhausted deadline cannot
-start the next provider phase.
+For Manifest v1/v2 `call_tool`, one absolute deadline begins after canonical
+argument handling and the visibility-gated manifest lookup. It covers bounded
+schema and regex preflight, target-only stdio environment selection and
+executable identity hashing, protected preparation/revalidation, complete
+environment snapshotting, primitive DNS, final executable snapshotting,
+protocol discovery/initialization, all live `tools/list` pages, validation, and
+`call_tool`; each subsequent stage receives only the remaining time. Discovery
+and live refresh likewise create their deadline before environment snapshotting
+or initial executable identity selection and carry that exact value through
+protected preparation, transport setup, negotiation, and every provider page.
+A pre-dispatch deadline exhaustion during schema, identity, or protected
+revalidation starts no provider and creates no effect record; an exhausted
+deadline cannot start the next provider phase.
+Executable hashing and immutable snapshot copying check this same monotonic
+deadline before and after each bounded read/write chunk and sibling-mirroring
+step. The default SDK provider advertises `supports_mcp_absolute_deadline` and
+receives the unchanged absolute value through snapshot verification and wire
+dispatch; it does not reconstruct a later deadline from remaining seconds.
+Existing custom providers without that opt-in marker retain the legacy relative
+`timeout_s` SPI, receive only the primitive's current remaining time, and are
+checked again immediately before dispatch. They cannot claim end-to-end
+absolute-deadline evidence until they adopt the marker.
 Manifest v2 also applies `max_request_bytes` and `max_response_bytes`
 cumulatively across discovery/initialization, every list page, and the call.
 Bounded `McpExchangeReceipt` entries identify each phase, while
@@ -415,12 +947,16 @@ httpcore retries to zero. Its network backend may try another validated address
 only while establishing a TCP connection; the custom HTTP transport adds no
 retry for an already-issued request after a write/read failure.
 
-The forbidden-header check is case-insensitive and includes protocol version,
-method/name/parameter, session/resume, content-negotiation, trace, and baggage
-headers. In particular, a manifest cannot override `MCP-Protocol-Version`,
-`Mcp-Method`, `Mcp-Name`, `Mcp-Param-*`, session ids, `Last-Event-ID`,
-`traceparent`, `tracestate`, or `baggage`. Required protocol headers and reserved
-request `_meta` values are generated by the Host adapter.
+The forbidden-header check is case-insensitive. All manifest versions reject
+connection framing/routing headers and high-risk protocol, session, resume,
+trace, and baggage controls. In particular, neither version may override
+`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, session ids,
+`Last-Event-ID`, `traceparent`, `tracestate`, or `baggage`. Manifest v2/v3 also
+reserves content-negotiation headers and `Mcp-Param-*`; its protocol request
+`_meta` values are generated by the Host adapter. The v1 compatibility contract
+continues to permit manifest `Accept` and `Mcp-Param-*` headers and application
+metadata under `_meta`, but those exceptions do not permit the high-risk
+controls listed above.
 
 For non-local HTTP, the primitive first resolves every address and rejects the
 operation if any result is non-public. The SDK connection backend resolves and
@@ -463,12 +999,23 @@ blank-line frame boundary. Requests force `Accept-Encoding: identity`, and a
 response carrying any other `Content-Encoding` is rejected before decoding to
 avoid an encoded response expanding past the raw limit.
 
-The client advertises none of the unsupported callback capabilities. A server
-request for Sampling, Roots, Elicitation, subscriptions, or an extension is
-rejected without invoking Runtime behavior. A modern `InputRequiredResult` is
-returned as stable `mcp_input_required_unsupported` with
-`automatic_retry_disabled: true`; Agent libOS never registers an elicitation
-callback, persists its continuation state, or automatically retries it.
+The v1/v2 Tool compatibility client advertises none of the callback or
+extension capabilities. A server request for Sampling, Roots, Elicitation,
+subscriptions, or an extension on that path is rejected without invoking
+Runtime behavior. Its `InputRequiredResult` remains the stable
+`mcp_input_required_unsupported` result with
+`automatic_retry_disabled: true`.
+
+Manifest v3 Tools use the exact `2026-07-28` provider and the same protected
+Capability, Sink, resource, effect, event, and audit path as the other MCP
+operations. Their locally projected list is the manifest allowlist; a call can
+return only `McpComplete`, `McpInputRequired`, or `McpRemoteTask`. Raw provider
+request state, remote task ids, and transport metadata never enter that public
+union. Manifest v3 still never advertises Roots, Sampling, or Logging. It may
+enable only the manifest-pinned subscription filters, MRTR Host continuation,
+and the digest-pinned Tasks extension described above. Those requests are
+captured as opaque Host-owned state; they do not call a model, become a new
+model tool, or authorize automatic retry/replay.
 
 ### Provider Result Bounds
 
@@ -481,9 +1028,12 @@ tree and applies all of these bounds:
 - maximum node count is `min(100,000, max_response_bytes)`;
 - aggregate UTF-8 bytes across all string values and mapping keys cannot exceed
   `max_response_bytes`;
-- a live `tools/list` response contains at most `config.mcp.list_limit` tools
-  (100 with `DEFAULT_CONFIG`), with unique non-empty names;
-- For Manifest v1, a non-empty MCP `nextCursor` is rejected as an incomplete catalog;
+- a Manifest v1/v2 live `tools/list` response contains at most the deprecated
+  compatibility setting `config.mcp.list_limit` tools (100 with
+  `DEFAULT_CONFIG`), with unique non-empty names; Manifest v3 Tool catalogs use
+  `config.mcp.tool_catalog_limit` instead;
+- For Manifest v1, any present, non-null MCP `nextCursor`, including the empty
+  string, is rejected as an incomplete catalog;
   Manifest v2 follows at most 16 pages and rejects malformed or repeated
   cursors;
 - the canonical JSON encoding of the complete returned tool list, or of a call's
@@ -507,7 +1057,7 @@ as sanitized `transport_error` with an error type such as `McpStdioFrameTooLarge
 `McpStdioStdoutTooLarge`, `McpHttpResponseTooLarge`, or
 `McpHttpSseFrameTooLarge`. A live `list_tools(refresh=true)` failure is instead
 raised as a sanitized provider exception and never returns a partial list.
-The atomic validate-and-call path reports a non-empty `nextCursor` as
+The atomic validate-and-call path reports any present, non-null `nextCursor` as
 `LiveToolValidationError` with `call_started: false` and does not invoke the
 selected tool. Because an incomplete catalog has no exact complete-response
 receipt, resource settlement charges the list stage's bounded
@@ -596,10 +1146,34 @@ arguments as data-flow evidence.
 
 ## Call And Tool-List Results
 
-`call_mcp_tool`, `mcp.call`, the Python primitive, and `mcp call` expose the
-same `McpCallResult` fields: `server_id`, `tool_id`, `mcp_name`, `status`,
-`ok`, `result`, `error`, `response_bytes`, `duration_s`, optional negotiated
-`connection`, and bounded phase receipts.
+For Manifest v3, the Python primitive and async facade return the closed modern
+union `McpComplete | McpInputRequired | McpRemoteTask`. `McpComplete.value`
+contains the detached, bounded JSON Tool result. An input request or remote
+Task is captured first and exposes only a local continuation or Task handle;
+the remote request state/task id stays Host-owned. The model-facing
+`call_mcp_tool` projection follows the same closed union. It never exposes a
+transport, raw remote identifier, callback control, or replay flag.
+
+For Manifest v1/v2, the Python primitive, the `mcp.call` Runtime syscall, and
+`mcp call` expose the complete `McpCallResult`: `server_id`, `tool_id`,
+`mcp_name`, `status`, `ok`,
+`result`, `error`, `response_bytes`, `duration_s`, optional negotiated
+`connection`, bounded phase receipts, bounded `dispatch_state`, `retry_class`,
+and `automatic_retry_disabled`. The model-facing `call_mcp_tool` output is
+intentionally narrower only for operation-local negotiation evidence: it omits
+`connection` and `receipts`, but includes the three bounded dispatch/retry
+fields.
+
+`dispatch_state` is exactly `not_started`, `started`, or `unknown`. Only the
+released Manifest-v1 provider certificate or exact built-in wire evidence can
+produce `not_started`; a custom Manifest-v2 provider cannot self-certify it.
+Failure with `not_started` maps to `retry_class: "reobserve_required"`, which
+requires a fresh observation and authorization path. `started` or `unknown`
+failure maps to `unsafe_or_unknown`, while success uses `not_applicable`.
+`automatic_retry_disabled` is always true: none of these fields authorizes the
+SDK, Runtime, model, or Skill to replay `tools/call`. Exact negotiation,
+fallback, or phase receipts still require Host-side Runtime/CLI or recorded
+effect evidence.
 
 | `status` | Meaning |
 | --- | --- |
@@ -608,29 +1182,38 @@ same `McpCallResult` fields: `server_id`, `tool_id`, `mcp_name`, `status`,
 | `transport_error` | The provider or transport failed. This includes raw stdio frame/stdout and HTTP body/SSE-frame limit failures, because no safe materialized call-result receipt exists. An atomic provider also uses this status with `error_type: "LiveToolValidationError"` when combined live validation blocks dispatch. `error` is sanitized rather than exposing raw exception or credential text. |
 | `invalid_response` | The legacy two-call path records this status when mandatory live tool metadata is missing, malformed, or does not match a pinned manifest schema, then raises the validation/provider exception to the caller. |
 | `response_too_large` | A provider materialized a valid call result and returned a bounded, primitive-validated `too_large` receipt for canonical result content over the registered limit. Raw transport-limit failures are instead `transport_error`. |
-| `input_required_unsupported` | The server requested MRTR input, which this release cannot continue. The result is non-retryable; consequential or ambiguously mutating effects remain unknown and a linked Durable Task Run enters `needs_attention`. |
+| `input_required_unsupported` | On the v1/v2 Tool compatibility path, the server requested MRTR input, which that path cannot continue. The result is non-retryable; consequential or ambiguously mutating effects remain unknown and a linked Durable Task Run enters `needs_attention`. V3 Host continuation is a separate opaque-state API and does not reinterpret this result. |
 
-Local argument/schema validation, capability, Human approval, data-flow,
+On the Manifest v1/v2 path, local argument/schema validation, capability, Human approval, data-flow,
 environment, and pre-provider resource failures are raised instead of encoded
 as an `McpCallResult` status. Live absence/schema drift has two observable
 forms: the legacy two-call path durably records `invalid_response` and raises,
 while the atomic SDK path returns `transport_error` with
-`error_type: "LiveToolValidationError"` and `call_started: false` in provider
-evidence. Status alone is not proof that dispatch did or did not start; use the
-recorded phase/effect evidence.
+`error_type: "LiveToolValidationError"`. Status alone is not proof that dispatch
+did or did not start; use bounded `dispatch_state`, and use recorded phase/effect
+evidence when exact wire proof matters.
 
-`list_mcp_tools`/`mcp.tools` and `mcp tools` return `server_id`, `transport`,
-the manifest-declared `tools`, `refreshed`, and `response_bytes`. Cached
-listing has `refreshed: false` and `response_bytes: 0`. A successful live
-refresh has `refreshed: true` and augments declared tool entries with matched
-live metadata; refresh failures are raised with a sanitized provider error
-instead of returning a partial tool list.
+The model-facing `list_mcp_tools` output returns `server_id`, `transport`, the
+manifest-declared `tools`, `refreshed`, and `response_bytes`. It deliberately
+omits `schema_version`, `protocol_mode`, `connection`, and `receipts`. The
+Python primitive, `mcp.tools` Runtime syscall, and `mcp tools` CLI additionally
+return `schema_version` and `protocol_mode`; a successful live refresh also
+includes its optional `connection` and bounded `receipts`. Cached listing has
+`refreshed: false` and `response_bytes: 0`, with no operation-local connection
+or receipts. A successful live refresh has `refreshed: true` and augments
+declared tool entries with matched live metadata; refresh failures are raised
+with a sanitized provider error instead of returning a partial tool list.
 
 `discover` returns configured mode, protocol era and exact revision,
 sessionless/fallback flags, bounded server name/version, and standard versus
 unsupported capability names. The same optional connection projection appears
-on successful live Tool listing and call results. It is current-operation
-diagnostic state: it is not written into the Store or reused across operations.
+on successful live Tool listing and call results at the Python primitive,
+Runtime syscall, and CLI surfaces, but not in the two model-tool projections
+described above. It is current-operation diagnostic state: it is not written
+as resumable/reusable MCP session state and is not reused across operations.
+Its bounded, secret-sanitized connection and phase-receipt projections are,
+however, retained with the applicable effect/event/audit evidence so operators
+can diagnose the completed operation without persisting live session material.
 
 ## CLI
 
@@ -655,7 +1238,13 @@ shipped at the repository root. The placeholder server/module and reserved
 HTTP hostname in the manifest examples will not make these commands a live
 remote demo.
 
-`mcp list` accepts `--text` and `--limit`; `mcp discover` and
+`mcp list` accepts `--text` and `--limit` and returns an envelope
+`{"servers": [...], "has_more": <bool>}`. `has_more: true` means the bounded
+window is incomplete; this command has no cursor, so narrow `--text` or raise
+`--limit` up to the configured maximum. Text search is a case-insensitive
+literal substring match over the public `server_id` only; SQL wildcard
+characters do not act as patterns, and private manifest fields are not
+searchable. `mcp discover` and
 `mcp tools --refresh` perform the protected live provider operations described
 above. Registering with `--replace` requires `admin` rather than `write` on the
 exact server resource.
@@ -708,23 +1297,100 @@ The optional SDK-backed provider requires:
 uv sync --frozen --extra mcp
 ```
 
-The extra installs Python MCP SDK `>=2.0,<3` plus the directly used bounded
-`anyio`, `httpx2`, `httpcore2`, and OpenTelemetry API dependencies. Agent libOS clears
+The extra installs the reviewed Python MCP SDK exactly at `mcp==2.0.0`, the
+audited credential package exactly at `keyring==25.7.0`, and the directly used
+bounded `anyio`, `httpx2`, `httpcore2`, and OpenTelemetry API dependencies.
+Agent libOS clears
 ambient trace and baggage context at the MCP adapter boundary, installs no
-exporter, and does not advertise an OpenTelemetry product capability. Reserved
-MCP negotiation/session/content headers, `Mcp-Param-*`, trace headers, and
-reserved protocol `_meta` keys are Host-generated and cannot be supplied by a
-manifest.
+exporter, and does not advertise an OpenTelemetry product capability. All
+manifest versions forbid high-risk MCP protocol/session/resume and trace/baggage
+headers. Manifest v2/v3 additionally reserve negotiation/content headers,
+`Mcp-Param-*`, and protocol `_meta` keys for the Host. Manifest v1 retains only
+the compatibility exceptions for `Accept`, `Mcp-Param-*`, and application
+metadata under `_meta` described above.
+
+### Host DX workflow
+
+The stable MCP registry CLI remains the authority/effect surface. The
+standalone Host helper `scripts/mcp_dx.py` adds offline validation and explicit
+review workflows without making configuration model-facing:
+
+```bash
+# No registry mutation, DNS, stdio spawn, or provider session:
+uv run python scripts/mcp_dx.py validate examples/mcp/stdio-v3.yaml
+uv run python scripts/mcp_dx.py doctor examples/mcp/http-v3.yaml
+
+# Secret-reference-only registry backup and a no-mutation import plan:
+uv run python scripts/mcp_dx.py export --db .agent_libos.sqlite --server demo-mcp > mcp-export.json
+uv run python scripts/mcp_dx.py import-plan --db target.sqlite mcp-export.json
+
+# Apply exactly one reviewed CAS-bound entry:
+uv run python scripts/mcp_dx.py import-one --db target.sqlite mcp-export.json demo-mcp \
+  --confirm-import --reviewer operator@example --reason "reviewed registry migration"
+```
+
+`validate` accepts Manifest v1, v2, and v3 and reports the canonical digest,
+surface counts, transport, mode, and stdio launch-authority resource. `doctor`
+adds local optional-dependency and manifest-referenced environment-name
+presence checks; it never prints values or performs live provider work. For v3
+it verifies that the selected Runtime exposes the exact
+`import_v3_manifest(..., expected_current_sha256=...)` bridge. A custom Host
+composition without that bridge is reported as not ready and apply fails
+before mutation.
+
+`export` contains canonical manifests and environment-variable **references**,
+never resolved secret values. Its bundle digest covers the closed bundle.
+`import-plan` reports create/replace/unchanged actions without mutation.
+`import-one` rechecks the expected current digest under the registry guard and
+applies one selected server; there is deliberately no partial multi-server
+apply when the Store cannot provide one atomic batch transaction.
+
+A live probe is an external observation and requires an explicit confirmation:
+
+```bash
+uv run python scripts/mcp_dx.py probe --db .agent_libos.sqlite examples/mcp/stdio-v3.yaml \
+  --confirm-probe --reviewer operator@example --reason "review unregistered catalogs"
+```
+
+The shipped candidate probe accepts an unregistered, exact-v3 manifest. The
+Runtime validates its Host policy and digest, creates a pending external-read
+effect before DNS/session dispatch, then collects complete bounded Tool,
+Resource, Resource Template, and Prompt catalogs inside one transport snapshot
+and absolute deadline. Stdio executable pinning, Streamable HTTP SSRF policy,
+secret redaction, provider-capability admission, pagination/cursor-cycle
+rejection, and independent catalog limits remain active. The result has
+`catalog_scope: full_catalog`; it does not register the server, grant authority,
+or turn live metadata into an allowlist. Its effect, event, and audit record the
+fixed `mcp-dx-probe` Host actor plus the explicit reviewer/reason.
+
+Only that exact-digest report plus `--confirm-scaffold` can create a
+deterministic candidate. Generated Tools start at `right: execute`,
+`rollback_class/status: unknown`, `state_mutation: true`, and
+`information_flow: true` with their live input schema pinned. Resources and
+Templates start at `read`, `information_flow: true`, and
+`model_visible: false`; Prompts remain Host-only. The result is a
+non-registerable candidate wrapper; an operator must edit/review it and run the
+separate `approve --confirm-review` transition before extracting a registerable
+manifest. Confirmation never bypasses Runtime Capability, data-flow, effect,
+or resource checks.
 
 ## Tools And Syscalls
 
-LLM tool interfaces, when bound in the complete process table and projected into
-the model tool table:
+The Tool-call entries support the stable v1/v2 result contract and exact-v3
+closed modern result union. V3 Prompts, Completion, OAuth, subscriptions,
+continuations, and remote Tasks remain
+Host-only. The built-in MCP Skill may additionally project the two read-only,
+model-visible v3 Resource entries below; they still enter the protected MCP
+facade and never accept a remote URI or provider cursor. LLM tool interfaces,
+when bound in the complete process table and projected into the model tool
+table:
 
 - `list_mcp_servers`
 - `inspect_mcp_server`
 - `list_mcp_tools`
 - `call_mcp_tool`
+- `list_mcp_resources`
+- `read_mcp_resource`
 
 Deno/TypeScript syscalls:
 
@@ -732,6 +1398,8 @@ Deno/TypeScript syscalls:
 - `mcp.inspect`
 - `mcp.tools`
 - `mcp.call`
+- `mcp.resources`
+- `mcp.resource_read`
 
 Syscalls enter the MCP primitive directly. They do not consult the LLM-facing
 tool table, and they cannot pass arbitrary transports, URLs, headers, secrets,
@@ -742,7 +1410,56 @@ or raw MCP tool names.
 MCP server specs are runtime store registry rows. Resolved secret values and
 their per-operation immutable snapshots are not persisted. Negotiated revision,
 server identity/capabilities, session handles, cursors, and protocol phase state
-are also operation-local and are not persisted as resumable MCP state.
+are operation-local and are not persisted as resumable/reusable MCP session
+state. Bounded, secret-sanitized negotiation and phase-receipt projections may
+be persisted as effect/event/audit evidence for the operation; that evidence
+cannot resume a session, replay a cursor, or authorize a later call.
+
+Store schema v7 adds durable, CAS-revisioned projections for v3 MRTR
+continuations and remote Tasks, plus optional sanitized subscription
+status/event evidence and payload-free preparation ownership rows. It stores
+local continuation/task/subscription refs,
+server/manifest/generation/auth/owner/origin bindings, digests, bounded status,
+revision, expiry, and dispatch classification. Raw remote task ids,
+`requestState`, input payloads, OAuth codes/tokens/state/PKCE material, live
+subscription handles/queues, and provider cursors are not Store payloads.
+Bearer-like values live only behind a Host credential broker; an unavailable or
+missing broker value fails closed rather than reconstructing authority from a
+digest. Preparation rows persist only preallocated local Human ids, exact opaque
+broker references, hashes, authority fences, and lifecycle state. They also
+precommit at most two superseded opaque refs and one old Human id/preview digest.
+Atomic main-row commit advances the preparation to retirement; terminal pruning
+uses a retirement-only row and atomically deletes the unchanged projection.
+Restart cleanup never treats either stage as permission to replay Provider I/O.
+Active continuations and remote Tasks have separate Host count ceilings. Expiry
+is swept in bounded pages during capture and startup recovery; terminal and
+`needs_attention` projections are retained only up to their independent
+oldest-first caps. Pruning first persists an exact retirement-only sidecar,
+atomically deletes the unchanged terminal projection, and only then retires its
+broker slots and pending Human question. Audit, effect, and transition history
+remain append-only when the bounded projection is removed.
+
+Startup reconciliation changes a continuation or Task left in a dispatching
+state to `needs_attention` with unknown/unsafe dispatch evidence. It does not
+send the response/cancel/update again. Subscription records may explain that a
+stream was active or lost, but restart does not recreate it. OAuth browser
+login state and reusable connection sessions are likewise not reconstructed
+from evidence. A token may be rehydrated only from its deterministic secure
+broker slot after explicit exact Host-profile registration and a Store
+generation check; RuntimeStore evidence contains no token or broker reference.
+
+The long-lived GUI can recover safe local continuation and Task projections
+after a browser or Runtime restart without reconstructing a session. An
+explicit empty-body
+`POST /api/mcp/continuations/{continuation_id}/inspect` calls
+`Runtime.mcp.get_continuation` and performs no Provider dispatch. An explicit
+remote Task `get` may omit `expected_revision` (or send `null`) only so a fresh
+Host renderer can load the current durable revision; `update` and `cancel`
+remain revision-CAS mutations. Once loaded, refreshes use the observed revision.
+Expired or unknown refs fail closed and invalidate the renderer form. A
+requestState-only continuation deliberately exposes an empty input array and
+requires the Human-bound empty response `{}`; typed Sampling/Roots unsupported
+results expose neither a durable continuation id nor a Human receipt.
 
 Checkpoint snapshots preserve process capabilities that reference MCP
 resources, but they do not copy or restore MCP server registry rows. Restore

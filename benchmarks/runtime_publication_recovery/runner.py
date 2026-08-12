@@ -20,7 +20,6 @@ from agent_libos.runtime.process_manager import ProcessManager
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import sqlite as sqlite_storage
 from agent_libos.storage.repositories import CheckpointRestorePublicationWriter
-from agent_libos.storage.sql import _V4_REQUIRED_COLUMNS, _V5_REQUIRED_COLUMNS
 from agent_libos.storage.sqlite import SQLiteStore
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import dumps
@@ -41,18 +40,11 @@ _PUBLICATION_DOMAIN_SELECT = " ".join(
 )
 _SQL_TEXT_LITERAL_RE = re.compile(r"'(?:''|[^'])*'")
 _SQL_INTEGER_LITERAL_RE = re.compile(r"(?<![A-Z0-9_?])-?\d+(?![A-Z0-9_?])")
-_SQLITE_V4_MANIFEST_TABLES = tuple(sorted(_V4_REQUIRED_COLUMNS))
-_SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE = (
-    "SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN ("
-    + ", ".join("?" for _ in _SQLITE_V4_MANIFEST_TABLES)
-    + ")"
+_SQLITE_SCHEMA_CATALOG_PROBE_RE = re.compile(
+    r"SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN "
+    r"\(\?(?:, \?)+\)"
 )
-_SQLITE_V5_MANIFEST_TABLES = tuple(sorted(_V5_REQUIRED_COLUMNS))
-_SQLITE_V5_MANIFEST_SCHEMA_PROBE_SHAPE = (
-    "SELECT NAME, TYPE FROM SQLITE_MASTER WHERE NAME IN ("
-    + ", ".join("?" for _ in _SQLITE_V5_MANIFEST_TABLES)
-    + ")"
-)
+_SQLITE_SCHEMA_IDENTIFIER_RE = re.compile(r"[a-z][a-z0-9_]*")
 _OPERATION_RECONCILIATION_SELECT_RE = re.compile(
     r"SELECT \* FROM RUNTIME_PUBLICATIONS /\* OPERATION-RECONCILIATION \*/"
     r" WHERE KIND = \? AND STATE = \? AND OPERATION_RECONCILED = \?"
@@ -1837,29 +1829,8 @@ def _publication_statement_shape(sql: str) -> str | None:
     if not _is_publication_statement(sql):
         return None
     raw_sql = str(sql)
-    raw_normalized = " ".join(raw_sql.upper().split()).rstrip(";")
-    raw_normalized_literals = _normalize_publication_select(raw_normalized)
-    manifest_tables = tuple(
-        literal[1:-1].replace("''", "'")
-        for literal in _SQL_TEXT_LITERAL_RE.findall(raw_sql)
-    )
-    for version, expected_shape, expected_tables in (
-        (
-            4,
-            _SQLITE_V4_MANIFEST_SCHEMA_PROBE_SHAPE,
-            _SQLITE_V4_MANIFEST_TABLES,
-        ),
-        (
-            5,
-            _SQLITE_V5_MANIFEST_SCHEMA_PROBE_SHAPE,
-            _SQLITE_V5_MANIFEST_TABLES,
-        ),
-    ):
-        if (
-            raw_normalized_literals == expected_shape
-            and manifest_tables == expected_tables
-        ):
-            return f"v{version}_manifest_schema_probe"
+    if _is_canonical_schema_catalog_probe(raw_sql):
+        return "manifest_schema_probe"
     uncommented = _strip_sql_comments(raw_sql)
     normalized = " ".join(uncommented.upper().split()).rstrip(";")
     normalized_literals = _normalize_publication_select(normalized)
@@ -1942,6 +1913,28 @@ def _publication_statement_shape(sql: str) -> str | None:
         if index_name in _PUBLICATION_SCHEMA_INDEXES:
             return f"schema_index:{index_name}"
     return "unreviewed"
+
+
+def _is_canonical_schema_catalog_probe(sql: str) -> bool:
+    """Recognize canonical schema introspection without a versioned table list."""
+
+    raw_sql = str(sql)
+    normalized = " ".join(raw_sql.upper().split()).rstrip(";")
+    normalized_literals = _SQL_TEXT_LITERAL_RE.sub("?", normalized)
+    if _SQLITE_SCHEMA_CATALOG_PROBE_RE.fullmatch(normalized_literals) is None:
+        return False
+    table_names = tuple(
+        literal[1:-1].replace("''", "'")
+        for literal in _SQL_TEXT_LITERAL_RE.findall(raw_sql)
+    )
+    return (
+        "runtime_schema" in table_names
+        and table_names == tuple(sorted(set(table_names)))
+        and all(
+            _SQLITE_SCHEMA_IDENTIFIER_RE.fullmatch(name) is not None
+            for name in table_names
+        )
+    )
 
 
 def _is_reviewed_publication_trace(sql: str) -> bool:
@@ -2390,13 +2383,13 @@ def _assert_publication_trace_contract(
 ) -> None:
     # Existing-store validation first runs against an isolated safety snapshot,
     # then repeats on the measured main connection to close the snapshot/open
-    # race.  The latter includes the canonical v5 full-catalog probes below.
+    # race.  The latter includes one canonical full-catalog probe below.
     expected = Counter(
         {
             "schema_probe": 1,
             "payload_attempt_schema_probe": 1,
             "keyset_collation_schema_probe": 1,
-            "v5_manifest_schema_probe": 1,
+            "manifest_schema_probe": 1,
             "schema_table": 1,
             "schema_payload_attempt_table": 1,
             "domain_validation": 1,

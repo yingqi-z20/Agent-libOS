@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-libos"
-version = "1.4.0"
+version = "1.5.0"
 description = "A minimal Agent libOS runtime with process, object memory, capability, human approval, JIT tool, checkpoint, and audit primitives."
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -40,9 +40,10 @@ postgres = [
 ]
 mcp = [
     "anyio>=4.10,<5",
-    "mcp>=2.0,<3",
+    "mcp==2.0.0",
     "httpx2>=2.5,<3",
     "httpcore2>=2.5,<3",
+    "keyring==25.7.0",
     "opentelemetry-api>=1.28,<2",
 ]
 pty = [
@@ -58,7 +59,11 @@ dev = [
 release = [
     "check-wheel-contents==0.6.3",
     "hatchling==1.31.0",
+    "packaging==26.2",
     "twine==7.0.0",
+]
+desktop = [
+    "pyinstaller==6.21.0",
 ]
 
 [project.scripts]
@@ -92,7 +97,9 @@ markers = [
     "platform_darwin: requires native Darwin filesystem semantics",
     "platform_linux: requires native Linux filesystem semantics",
     "real_deno: runs by default when deno is installed; use --skip-real-deno to skip",
+    "deno_resource_monitor: isolates live Deno tests that exercise fail-closed Host resource monitoring",
     "real_llm: requires --run-real-llm and OpenAI-compatible credentials",
     "postgres: requires --run-postgres and AGENT_LIBOS_POSTGRES_DSN",
-    "mcp: requires --run-mcp and the mcp optional dependency",
+    "mcp: complete MCP product-area regression closure across all pytest lanes",
+    "mcp_transport: requires --run-mcp and the frozen mcp optional dependency",
 ]

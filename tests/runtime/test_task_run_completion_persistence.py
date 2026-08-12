@@ -20,6 +20,10 @@ from agent_libos.models import (
 def _config():
     return replace(
         DEFAULT_CONFIG,
+        llm=replace(
+            DEFAULT_CONFIG.llm,
+            prompt_layout="cache_optimized_v2",
+        ),
         task_runs=replace(
             DEFAULT_CONFIG.task_runs,
             plaintext_payloads_enabled=True,
@@ -105,8 +109,14 @@ class _DiscoverSkillGuidanceClient:
 
 
 class _CompletePersistedReviewClient:
-    def __init__(self, expected_token: str) -> None:
+    def __init__(
+        self,
+        expected_token: str,
+        *,
+        expected_requirement_count: int = 1,
+    ) -> None:
         self.expected_token = expected_token
+        self.expected_requirement_count = expected_requirement_count
         self.calls = 0
 
     def complete_action(
@@ -118,22 +128,17 @@ class _CompletePersistedReviewClient:
         review = _find_completion_review(messages)
         assert review is not None
         assert review["review_token"] == self.expected_token
-        source_refs = review["completion_source_refs"]
-        assert isinstance(source_refs, list) and source_refs
+        requirements = review.get("requirements")
+        assert isinstance(requirements, list)
+        assert len(requirements) == self.expected_requirement_count
         return _completion(
             "complete-persisted-review",
             {
                 "action": "process_exit",
                 "review_token": review["review_token"],
                 "completion_evidence": {
-                    "goal_oid": review["goal"]["oid"],
-                    "reviewed_message_ids": review[
-                        "acknowledged_human_message_ids"
-                    ],
                     "acceptance_checks": [
                         {
-                            "requirement": "inspect available skill guidance",
-                            "source_refs": source_refs,
                             "status": "completed",
                             "evidence_tool_calls": ["discover_skills"],
                             "evidence_summary": (
@@ -141,6 +146,7 @@ class _CompletePersistedReviewClient:
                                 "the requested inspection."
                             ),
                         }
+                        for _requirement in requirements
                     ],
                     "final_verification": ["discover_skills"],
                 },
@@ -179,6 +185,11 @@ def test_task_run_completion_review_token_survives_reopen_without_redispatch(
         )
         assert inspected.status is TaskRunStatus.RUNNING
         assert discover_client.calls == 1
+        follow_up = first.human.send_process_message(
+            root_pid,
+            "Also preserve this acknowledged follow-up while settling the TaskRun.",
+        )
+        first.messages.ack(root_pid, [follow_up.message_id])
 
         review_client = _RequestReviewClient()
         first.llm.client = review_client
@@ -198,6 +209,7 @@ def test_task_run_completion_review_token_survives_reopen_without_redispatch(
         assert transcript is not None and transcript.canonical_json is not None
         review = _find_completion_review(transcript.canonical_json)
         assert review is not None
+        assert len(review["requirements"]) == 2
         review_token = review["review_token"]
         ledger_before_reopen = first.task_runs.list_ledger(
             created.run_id,
@@ -214,7 +226,10 @@ def test_task_run_completion_review_token_survives_reopen_without_redispatch(
         ).records
         assert ledger_after_reopen == ledger_before_reopen
 
-        completion_client = _CompletePersistedReviewClient(review_token)
+        completion_client = _CompletePersistedReviewClient(
+            review_token,
+            expected_requirement_count=2,
+        )
         reopened.llm.client = completion_client
         current = reopened.task_runs.get(created.run_id)
         terminal = reopened.task_runs.run_until_blocked(

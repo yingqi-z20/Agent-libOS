@@ -47,6 +47,18 @@ must be text, collection fields must be lists of strings, and the active
 envelope. Model-facing tools reject unsupported metadata fields rather than
 silently discarding them.
 
+Object payloads have a separate bounded-JSON contract. Model-facing create and
+append tools accept direct JSON values; the trusted Host manager accepts values
+only when the Runtime can normalize and serialize them as finite JSON. Cycles,
+non-finite numbers such as `NaN`/infinity, and values that cannot be bounded or
+serialized are rejected before publication. Create and payload replacement
+apply `tools.memory_payload_hard_limit_bytes` to the Runtime's deterministic
+UTF-8 JSON serialization. Append applies
+`tools.memory_append_entry_max_bytes` to the new entry and then reapplies the
+whole-payload limit after inserting it. The current defaults are 200,000 bytes
+per complete payload and 32,768 bytes per append entry. A failed create,
+replacement, or append does not publish a partial Object change.
+
 The model-facing tool preserves JSON strings literally, including strings that
 contain syntactically valid object or array text. Callers must pass an actual
 JSON object/array value when a container is intended. Its named Object,
@@ -249,6 +261,29 @@ the authorized operation. An exact-name query that finds no readable Object
 returns an empty list without consuming the namespace-read use. Concurrent
 attempts cannot turn one finite namespace use into multiple successful query
 operations.
+
+### Model-facing payload reads
+
+`read_memory_object` resolves one exact namespace-local name and enforces both
+namespace and Object read authority. Its optional `json_pointer` is an RFC 6901
+pointer into the payload; the empty string selects the complete value. A
+selected value that fits both `max_payload_chars` and the live ToolResult byte
+budget is returned directly with `representation=json_value`. The configured
+default is 12,000 characters and the caller may request at most
+`tools.memory_payload_hard_limit_chars`, currently 200,000, but the independent
+UTF-8 ToolResult/payload byte envelope can produce a smaller page.
+
+Larger results use `representation=canonical_json_page`: `preview` is an exact,
+non-overlapping page of the selected value's deterministic canonical JSON,
+`page_offset_bytes` and `next_cursor` are UTF-8 byte offsets, and pages never
+split a UTF-8 character. Continue only with the returned `next_cursor`; a
+positive cursor must include the preceding page's `sha256` as
+`expected_sha256`. A cursor outside the value, one that is not on a UTF-8
+boundary, or a digest mismatch fails instead of returning an inconsistent
+continuation. `serialized_bytes`, `page_bytes`, `omitted_bytes`, `truncated`,
+the selected JSON type/shape, Object version, and digest let the caller account
+for completeness. The cursor is relative to the JSON selected by that exact
+`json_pointer`, not to the whole Object payload.
 
 ## Memory Views
 

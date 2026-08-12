@@ -24,12 +24,38 @@ def _pending_approval(runtime: Runtime, *, with_authority: bool = False) -> tupl
     )
     payload: dict[str, Any] = {"type": "approval", "reason": "CAS test"}
     if with_authority:
-        payload["requested_once_capability"] = {
-            "subject": pid,
-            "resource": "object:human-cas-authority",
-            "rights": [CapabilityRight.READ.value],
+        resource = "object:human-cas-authority"
+        payload = {
+            "type": "external_operation_approval",
+            "question": "Allow the exact object read?",
+            "requested_once_capability": {
+                "subject": pid,
+                "resource": resource,
+                "rights": [CapabilityRight.READ.value],
+                "constraints": {},
+            },
+            "context": {
+                "adapter": "object",
+                "authority_operation": "object.read",
+                "primitive": "runtime.memory.read",
+                "operation": "read",
+                "pid": pid,
+                "resource": resource,
+                "right": CapabilityRight.READ.value,
+                "target_state_version": None,
+            },
         }
-    request_id = runtime.human.query(pid, "owner", payload, blocking=True)
+    request_id = (
+        runtime.human.query_authority_request(
+            pid,
+            "owner",
+            payload,
+            blocking=True,
+            authority_origin="external_operation",
+        )
+        if with_authority
+        else runtime.human.query(pid, "owner", payload, blocking=True)
+    )
     return pid, request_id
 
 
@@ -276,7 +302,7 @@ def test_permission_policy_response_failure_rolls_back_exact_process_and_authori
     try:
         pid = runtime.process.spawn(goal="rollback Human permission policy")
         resource = "object:human-permission-policy-rollback"
-        request_id = runtime.human.query(
+        request_id = runtime.human.query_authority_request(
             pid,
             "owner",
             {
@@ -290,6 +316,7 @@ def test_permission_policy_response_failure_rolls_back_exact_process_and_authori
                 },
             },
             blocking=True,
+            authority_origin="permission_policy",
         )
         before_request = runtime.human.get(request_id)
         before_process = runtime.process.get(pid)

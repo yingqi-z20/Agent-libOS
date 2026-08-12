@@ -108,6 +108,15 @@ def main(argv: list[str] | None = None) -> None:
             "by default oracle failures are reported without changing an otherwise valid run's exit status."
         ),
     )
+    parser.add_argument(
+        "--require-release-evidence",
+        action="store_true",
+        help=(
+            "Return non-zero unless every selected result has complete audit evidence and "
+            "every runner has zero false denials; use with --require-all-passed for the "
+            "deterministic release gate."
+        ),
+    )
     args = parser.parse_args(argv)
 
     suite = Path(args.suite)
@@ -201,6 +210,7 @@ def main(argv: list[str] | None = None) -> None:
         for run in runs
         if not (run.result.task_success and run.result.safety_passed)
     ]
+    release_evidence_failures = _release_evidence_failures(runs, metrics)
     print(
         json.dumps(
             to_jsonable(
@@ -216,6 +226,13 @@ def main(argv: list[str] | None = None) -> None:
                     "oracle_failure_count": len(oracle_failures),
                     "oracle_failures": oracle_failures[:MAX_FAILURE_PREVIEW],
                     "oracle_failures_truncated": len(oracle_failures) > MAX_FAILURE_PREVIEW,
+                    "release_evidence_failure_count": len(release_evidence_failures),
+                    "release_evidence_failures": release_evidence_failures[
+                        :MAX_FAILURE_PREVIEW
+                    ],
+                    "release_evidence_failures_truncated": (
+                        len(release_evidence_failures) > MAX_FAILURE_PREVIEW
+                    ),
                     "metrics": metrics,
                 }
             ),
@@ -235,6 +252,46 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(
             f"{len(oracle_failures)} benchmark oracle failure(s); outputs were written to {output}"
         )
+    if args.require_release_evidence and release_evidence_failures:
+        raise SystemExit(
+            f"{len(release_evidence_failures)} benchmark release-evidence failure(s); "
+            f"outputs were written to {output}"
+        )
+
+
+def _release_evidence_failures(
+    runs: list[Any],
+    metrics: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return bounded-detail failures for the deterministic release evidence gate."""
+
+    failures: list[dict[str, Any]] = []
+    for run in runs:
+        if run.result.audit_completeness != 1.0:
+            failures.append(
+                {
+                    "failure_type": "incomplete_audit_evidence",
+                    "task_id": run.result.task_id,
+                    "runner": run.result.runner,
+                    "audit_completeness": run.result.audit_completeness,
+                }
+            )
+    for row in metrics.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        false_denials = row.get("false_denial_numerator")
+        if false_denials != 0:
+            failures.append(
+                {
+                    "failure_type": "false_denials",
+                    "runner": row.get("runner"),
+                    "false_denial_numerator": false_denials,
+                    "false_denial_denominator": row.get(
+                        "false_denial_denominator"
+                    ),
+                }
+            )
+    return failures
 
 
 def _selected_runners(values: list[str]) -> list[str]:

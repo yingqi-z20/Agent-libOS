@@ -1459,6 +1459,89 @@ class TestObjectMemoryName:
             if record.action == 'memory.get_object_by_name'
         ] == before_memory_audits
 
+    @pytest.mark.parametrize('state_change', ('revoked', 'expired'))
+    def test_selected_authority_stale_decision_is_denied_after_reopen(
+        self,
+        state_change: str,
+    ) -> None:
+        self.runtime.close()
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = f'{temp_dir}/selected-authority-reopen.sqlite'
+                runtime = Runtime.open(db_path)
+                try:
+                    pid = runtime.process.spawn(
+                        image='base-agent:v0',
+                        goal=f'reopened selected authority {state_change}',
+                    )
+                    resource = f'object:reopened-selected-{state_change}'
+                    selected = runtime.capability.issue_trusted(
+                        pid,
+                        resource,
+                        [CapabilityRight.READ],
+                        issued_by='test',
+                        expires_at='2999-01-01T00:00:00Z',
+                    )
+                    runtime.capability.issue_trusted(
+                        pid,
+                        'object:*',
+                        [CapabilityRight.READ],
+                        issued_by='test',
+                    )
+                    stale_decision = runtime.capability.authorize(
+                        pid,
+                        resource,
+                        CapabilityRight.READ,
+                    )
+                    assert stale_decision.allowed
+                    assert stale_decision.selected_capability_id == selected.cap_id
+                finally:
+                    runtime.close()
+
+                reopened = Runtime.open(db_path)
+                try:
+                    current = reopened.store.get_capability(selected.cap_id)
+                    assert current is not None
+                    if state_change == 'revoked':
+                        reopened.capability.revoke(
+                            selected.cap_id,
+                            revoked_by='test',
+                            reason='invalidate persisted selected authority',
+                            require_authority=False,
+                        )
+                    else:
+                        reopened.store.update_capability(
+                            replace(
+                                current,
+                                expires_at='2000-01-01T00:00:00+00:00',
+                            )
+                        )
+
+                    # The broad grant still makes a fresh global decision
+                    # legal.  It must not revive the exact grant captured by
+                    # the pre-reopen authority-bearing input.
+                    assert reopened.capability.check(
+                        pid,
+                        resource,
+                        CapabilityRight.READ,
+                    )
+                    with pytest.raises(
+                        CapabilityDenied,
+                        match='selected capability authority changed',
+                    ):
+                        with reopened.capability.selected_authority_transaction(
+                            [stale_decision],
+                            actor=pid,
+                            operation='reopened selected object read',
+                        ):
+                            raise AssertionError(
+                                'stale selected authority reached materialization'
+                            )
+                finally:
+                    reopened.close()
+        finally:
+            self.runtime = Runtime.open('local')
+
     def test_query_name_miss_and_filtered_read_do_not_consume_one_time_namespace_read(self) -> None:
         owner = self.runtime.process.spawn(image='base-agent:v0', goal='query namespace owner')
         reader = self.runtime.process.spawn(image='base-agent:v0', goal='query namespace once')

@@ -40,9 +40,8 @@ class CallJsonRpcMethodArgs(BaseModel):
     params: Any = Field(
         default=None,
         description=(
-            "JSON-RPC params object, array, scalar, or null. A provider-stringified "
-            "JSON object or array is restored before endpoint-schema validation; "
-            "ordinary scalar strings remain literal."
+            "JSON-RPC params object, array, or null. A provider-stringified JSON "
+            "object or array is restored before endpoint-schema validation."
         ),
     )
 

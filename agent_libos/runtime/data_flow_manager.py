@@ -54,12 +54,29 @@ class _DirectoryLabelWatch:
     context: DataFlowContext = field(default_factory=DataFlowContext)
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _RedactedDecisionEvidence:
+    """Identity-safe durable facts for one Host-redacted DataFlow decision."""
+
+    labels: dict[str, Any]
+    labels_sha256: str
+    source_refs_sha256: str
+    source_ref_count: int
+
+
 class DataFlowDenied(CapabilityDenied):
     """A denial carrying only the trusted, payload-free evidence to persist."""
 
-    def __init__(self, decision: DataFlowDecision, sink: DataSink) -> None:
+    def __init__(
+        self,
+        decision: DataFlowDecision,
+        sink: DataSink,
+        *,
+        redacted_evidence: _RedactedDecisionEvidence | None = None,
+    ) -> None:
         self.data_flow_decision = decision
         self.data_flow_sink = sink
+        self.data_flow_redacted_evidence = redacted_evidence
         super().__init__(
             f"data-flow denied egress to {sink.identity}: {decision.reason} "
             f"(decision_id={decision.decision_id})"
@@ -474,7 +491,12 @@ class DataFlowManager:
         reserved_release_decision: CapabilityDecision | None = None,
         reserved_release_id: str | None = None,
         minimum_integrity: DataIntegrity | str = DataIntegrity.UNTRUSTED,
+        redact_source_refs_evidence: bool = False,
     ) -> tuple[DataFlowDecision, CapabilityDecision | None]:
+        if type(redact_source_refs_evidence) is not bool:
+            raise ValidationError(
+                "data-flow evidence redaction flag must be an exact boolean"
+            )
         if (reserved_release_decision is None) != (reserved_release_id is None):
             raise ValidationError(
                 "reserved data release revalidation requires both the decision and reservation id"
@@ -490,6 +512,7 @@ class DataFlowManager:
                 payload_hash,
                 generation,
                 "Sink trust registry generation changed before dispatch",
+                redact_source_refs_evidence=redact_source_refs_evidence,
             )
         source_error = self._validate_source_refs(
             selected_context.source_refs,
@@ -503,6 +526,7 @@ class DataFlowManager:
                 payload_hash,
                 generation,
                 source_error,
+                redact_source_refs_evidence=redact_source_refs_evidence,
             )
         trust = self.resolve_sink_trust(sink)
         policy_error = self._clearance_error(
@@ -520,6 +544,7 @@ class DataFlowManager:
                 generation,
                 policy_error,
                 trust=trust,
+                redact_source_refs_evidence=redact_source_refs_evidence,
             )
         if current_target_state_version is not _TARGET_STATE_VERSION_UNRESOLVED and (
             type(current_target_state_version) is not type(target_state_version)
@@ -533,6 +558,7 @@ class DataFlowManager:
                 generation,
                 "data-flow target state version changed before dispatch",
                 trust=trust,
+                redact_source_refs_evidence=redact_source_refs_evidence,
             )
 
         trust_level = trust.trust_level if trust is not None else SinkTrustLevel.UNTRUSTED
@@ -573,6 +599,7 @@ class DataFlowManager:
                     outcome=DataFlowOutcome.RELEASE_REQUIRED,
                     reason="conditional Sink requires an exact one-shot data release",
                     trust=trust,
+                    redact_source_refs_evidence=redact_source_refs_evidence,
                 )
                 if request_release:
                     request_id = self._request_release(
@@ -604,6 +631,7 @@ class DataFlowManager:
             release_capability_id=(
                 release_decision.selected_capability_id if release_decision is not None else None
             ),
+            redact_source_refs_evidence=redact_source_refs_evidence,
         )
         return decision, release_decision
 
@@ -725,8 +753,14 @@ class DataFlowManager:
         context: DataFlowContext,
         payload: Any,
         reason: str = "Sink identity changed before provider dispatch",
+        redact_source_refs_evidence: bool = False,
     ) -> None:
         """Persist a payload-free denial for a late Host Sink identity change."""
+
+        if type(redact_source_refs_evidence) is not bool:
+            raise ValidationError(
+                "data-flow evidence redaction flag must be an exact boolean"
+            )
 
         payload_hash, _payload_bytes = self._payload_digest(payload)
         generation = int(self.store.get_sink_trust_generation())
@@ -742,6 +776,7 @@ class DataFlowManager:
             generation,
             reason,
             trust=trust,
+            redact_source_refs_evidence=redact_source_refs_evidence,
         )
 
     def release_binding(
@@ -983,6 +1018,14 @@ class DataFlowManager:
             normalized_path
         )
         return context, state_version
+
+    def current_file_label_binding(
+        self,
+        normalized_path: str,
+    ) -> FileLabelBinding | None:
+        """Read the current binding through a narrow Host provenance port."""
+
+        return self.store.get_file_label_binding(normalized_path)
 
     def file_deletion_snapshot(
         self,
@@ -1607,16 +1650,41 @@ class DataFlowManager:
         reason: str,
         trust: SinkTrustSpec | None,
         release_capability_id: str | None = None,
+        redact_source_refs_evidence: bool = False,
     ) -> DataFlowDecision:
+        redacted_evidence = (
+            self._redacted_decision_evidence(context)
+            if redact_source_refs_evidence
+            else None
+        )
+        retained_context = (
+            DataFlowContext(
+                labels=DataLabels(
+                    sensitivity=context.labels.sensitivity,
+                    trust_level=context.labels.trust_level,
+                    integrity=context.labels.integrity,
+                    origin=None,
+                    tenant=None,
+                    principal=None,
+                    declassification_authority=None,
+                )
+            )
+            if redacted_evidence is not None
+            else context
+        )
         decision = DataFlowDecision(
             decision_id=new_id("dfd"),
             pid=pid,
             sink=sink.identity,
             direction=DataFlowDirection.EGRESS,
             outcome=outcome,
-            reason=reason,
-            labels=context.labels,
-            source_refs=context.source_refs,
+            reason=(
+                self._redacted_decision_reason(outcome)
+                if redacted_evidence is not None
+                else reason
+            ),
+            labels=retained_context.labels,
+            source_refs=retained_context.source_refs,
             payload_hash=payload_hash,
             registry_generation=generation,
             created_at=utc_now(),
@@ -1624,7 +1692,11 @@ class DataFlowManager:
             trust_hash=trust.spec_hash if trust is not None else None,
             release_capability_id=release_capability_id,
         )
-        self._persist_decision(decision=decision, sink=sink)
+        self._persist_decision(
+            decision=decision,
+            sink=sink,
+            redacted_evidence=redacted_evidence,
+        )
         return decision
 
     def persist_denied_decision(
@@ -1632,6 +1704,7 @@ class DataFlowManager:
         *,
         decision: DataFlowDecision,
         sink: DataSink,
+        redacted_evidence: _RedactedDecisionEvidence | None = None,
     ) -> DataFlowDecision:
         """Persist an exact denial after a surrounding transaction rolled back.
 
@@ -1643,13 +1716,18 @@ class DataFlowManager:
 
         if decision.outcome is not DataFlowOutcome.DENY:
             raise ValidationError("only data-flow denials may be re-persisted")
-        return self._persist_decision(decision=decision, sink=sink)
+        return self._persist_decision(
+            decision=decision,
+            sink=sink,
+            redacted_evidence=redacted_evidence,
+        )
 
     def _persist_decision(
         self,
         *,
         decision: DataFlowDecision,
         sink: DataSink,
+        redacted_evidence: _RedactedDecisionEvidence | None = None,
     ) -> DataFlowDecision:
         if decision.sink != sink.identity:
             raise ValidationError("data-flow decision Sink does not match evidence Sink")
@@ -1660,9 +1738,21 @@ class DataFlowManager:
                     f"data-flow decision id conflict: {decision.decision_id}"
                 )
             return existing
-        context = DataFlowContext(
-            labels=decision.labels,
-            source_refs=decision.source_refs,
+        context = DataFlowContext(labels=decision.labels, source_refs=decision.source_refs)
+        labels_evidence = (
+            redacted_evidence.labels
+            if redacted_evidence is not None
+            else decision.labels.to_dict()
+        )
+        labels_sha256 = (
+            redacted_evidence.labels_sha256
+            if redacted_evidence is not None
+            else decision.labels.labels_hash()
+        )
+        source_refs_sha256 = (
+            redacted_evidence.source_refs_sha256
+            if redacted_evidence is not None
+            else context.source_refs_hash()
         )
         evidence = {
             "decision_id": decision.decision_id,
@@ -1673,16 +1763,21 @@ class DataFlowManager:
             "sink_identity_sha256": sink.identity_sha256,
             "sink_trust_identity": sink.registry_identity,
             "sink_trust_identity_sha256": sink.registry_identity_sha256,
-            "labels": decision.labels.to_dict(),
-            "labels_sha256": decision.labels.labels_hash(),
-            "source_refs": [item.to_dict() for item in decision.source_refs],
-            "source_refs_sha256": context.source_refs_hash(),
+            "labels": labels_evidence,
+            "labels_sha256": labels_sha256,
+            "source_refs_sha256": source_refs_sha256,
             "payload_sha256": decision.payload_hash,
             "trust_id": decision.trust_id,
             "trust_sha256": decision.trust_hash,
             "registry_generation": decision.registry_generation,
             "release_capability_id": decision.release_capability_id,
         }
+        if redacted_evidence is not None:
+            evidence["source_ref_count"] = redacted_evidence.source_ref_count
+        else:
+            evidence["source_refs"] = [
+                item.to_dict() for item in decision.source_refs
+            ]
         with self.store.transaction():
             existing = self.store.get_data_flow_decision(decision.decision_id)
             if existing is not None:
@@ -1702,7 +1797,11 @@ class DataFlowManager:
                 actor=decision.pid,
                 action="data_flow.egress",
                 target=sink.identity,
-                input_refs=[item.oid for item in decision.source_refs],
+                input_refs=(
+                    []
+                    if redacted_evidence is not None
+                    else [item.oid for item in decision.source_refs]
+                ),
                 capability_refs=(
                     [decision.release_capability_id]
                     if decision.release_capability_id
@@ -1722,6 +1821,7 @@ class DataFlowManager:
         reason: str,
         *,
         trust: SinkTrustSpec | None = None,
+        redact_source_refs_evidence: bool = False,
     ) -> tuple[DataFlowDecision, None]:
         decision = self._record_decision(
             pid=pid,
@@ -1732,8 +1832,60 @@ class DataFlowManager:
             outcome=DataFlowOutcome.DENY,
             reason=reason,
             trust=trust,
+            redact_source_refs_evidence=redact_source_refs_evidence,
         )
-        raise DataFlowDenied(decision, sink)
+        raise DataFlowDenied(
+            decision,
+            sink,
+            redacted_evidence=(
+                self._redacted_decision_evidence(context)
+                if redact_source_refs_evidence
+                else None
+            ),
+        )
+
+    @staticmethod
+    def identity_safe_evidence_labels(labels: DataLabels) -> dict[str, Any]:
+        """Return bounded label facts without raw identity or authority values."""
+
+        if not isinstance(labels, DataLabels):
+            raise TypeError("identity-safe DataFlow evidence requires DataLabels")
+        return {
+            "sensitivity": labels.sensitivity.value,
+            "integrity": labels.integrity.value,
+            "trust_level": labels.trust_level.value,
+            "identity_present": labels.tenant is not None or labels.principal is not None,
+            "identity_mixed": labels.is_mixed_identity,
+        }
+
+    @classmethod
+    def identity_safe_evidence_labels_sha256(cls, labels: DataLabels) -> str:
+        return hashlib.sha256(
+            dumps(cls.identity_safe_evidence_labels(labels)).encode("utf-8")
+        ).hexdigest()
+
+    @classmethod
+    def _redacted_decision_evidence(
+        cls,
+        context: DataFlowContext,
+    ) -> _RedactedDecisionEvidence:
+        labels = cls.identity_safe_evidence_labels(context.labels)
+        return _RedactedDecisionEvidence(
+            labels=labels,
+            labels_sha256=hashlib.sha256(dumps(labels).encode("utf-8")).hexdigest(),
+            source_refs_sha256=context.source_refs_hash(),
+            source_ref_count=len(context.source_refs),
+        )
+
+    @staticmethod
+    def _redacted_decision_reason(outcome: DataFlowOutcome) -> str:
+        return {
+            DataFlowOutcome.ALLOW: "Host DataFlow policy allowed redacted egress evidence",
+            DataFlowOutcome.DENY: "Host DataFlow policy denied redacted egress evidence",
+            DataFlowOutcome.RELEASE_REQUIRED: (
+                "Host DataFlow policy requires data release for redacted egress evidence"
+            ),
+        }[outcome]
 
     def _manifest_hash(self, pid: str) -> str:
         manifest = self.authority_manifests.get_for_process(pid)

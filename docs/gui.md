@@ -3,7 +3,7 @@
 Agent libOS includes a local desktop management console for supervising
 Durable Task Runs, processes, messages, human approvals, AgentImage selection/registration/commit,
 checkpoints, capabilities, Skills, JSON-RPC endpoints, MCP servers, audit
-records, persisted LLM calls, semantic Shadow assessments, and human Agent
+records, persisted LLM calls, semantic assessment/FlowGraph/policy evidence, and human Agent
 ratings.
 
 The GUI is a local-only Electron app. Electron starts
@@ -18,6 +18,14 @@ During development the Electron main process starts the backend without a
 shell. It first honors `AGENT_LIBOS_GUI_SERVER_BIN`, then tries the project
 `.venv` entrypoint, and only falls back to `uv run agent-libos-gui-server` if no
 local entrypoint exists.
+
+The packaged internal desktop build takes a separate fail-closed path. It
+always starts `resources/backend/agent-libos-gui-server[.exe]`, ignores
+`AGENT_LIBOS_GUI_SERVER_BIN`, never reads a checkout `.env`, serves the renderer
+from `process.resourcesPath/renderer`, and gives the child a private working
+directory below Electron's user-data directory. It prepends only
+`process.resourcesPath/bin` to the Python child's `PATH`, making the bundled
+Deno visible without changing Electron's own environment.
 
 ## Architecture
 
@@ -115,16 +123,18 @@ destination, whether that destination is remote, local, relative, `data:`, or
 than the control responsible for preventing Markdown-triggered network egress.
 
 Only the checkpoint create/restore/fork, Skill activation/unload, Capability
-grant/delegate/revoke, image registration/commit, JSON-RPC registration, and
-MCP registration endpoints accept an optional `actor`. On those endpoints,
-omitting `actor` runs in GUI admin mode; supplying a non-empty process id opts
-into process-authority mode and requires that process to hold the capability
-needed by the underlying primitive. Skill registration is deliberately
-stricter: `POST /api/skills/register` requires a non-empty process `actor` and
-reads the package path through that process's workspace filesystem authority;
-there is no GUI-admin registration mode. Other mutation endpoints use
-Host/admin authority or an explicit `pid` field and reject a top-level `actor`
-instead of treating unused attribution as an authorization boundary.
+grant/delegate/revoke, image registration/commit, JSON-RPC registration, MCP
+registration, and MCP protocol-discovery endpoints, plus MCP live-tool-refresh
+and unregistration endpoints, accept an optional `actor`.
+On those endpoints, omitting `actor` runs in GUI Host/admin mode; supplying a
+non-empty process id opts into process-authority mode and requires that process
+to hold the capability needed by the underlying primitive. Skill registration
+is deliberately stricter: `POST /api/skills/register` requires a non-empty
+process `actor` and reads the package path through that process's workspace
+filesystem authority; there is no GUI-admin registration mode. Other mutation
+endpoints use Host/admin authority or an explicit `pid` field and reject a
+top-level `actor` instead of treating unused attribution as an authorization
+boundary.
 
 Closing the GUI server pauses auto-run and asks the scheduler to stop before it
 calls `Runtime.shutdown()` on an owned runtime. Every request that reads or
@@ -256,16 +266,66 @@ npm --prefix gui run test
 The `find` command should print nothing, and the two Vitest runs should discover
 the same source tests.
 
-The Electron smoke path can be run headlessly with
+The development Electron smoke path can be run headlessly with
 `AGENT_LIBOS_GUI_SMOKE=1`. By default it verifies the Electron main process,
 Python GUI server startup, authenticated `/api/health`, and graceful shutdown
 against an in-memory `local` store without creating a BrowserWindow. Smoke
 logging redacts the temporary bearer token. Set
 `AGENT_LIBOS_GUI_SMOKE_WINDOW=1` when a machine has a working desktop/GPU stack
 and you specifically want to exercise the production Vite build through the
-custom-protocol BrowserWindow, its API origin, and the preload bridge. This is
-a production-build/custom-protocol smoke, not an installer, packaged-app,
-code-signing, or notarization test; Electron packaging is not configured here.
+custom-protocol BrowserWindow, its API origin, and the preload bridge.
+
+## Self-contained internal desktop distribution
+
+Agent libOS 1.5.0 also has a manually triggered, internal-only native desktop
+build for macOS arm64, Windows x64, and Ubuntu 24.04/glibc x64. The exact
+runtime closure is Electron 43.2.0, a PyInstaller 6.21.0 one-folder sidecar
+built with CPython 3.11.15, Agent libOS with the complete MCP extra (including
+MCP SDK 2.0.0 and keyring 25.7.0), and the official Deno 2.9.4 platform binary.
+Deno downloads are accepted only after the repository-pinned platform SHA-256
+matches; a runner-preinstalled Deno is never staged.
+
+```bash
+uv sync --frozen --group desktop --extra mcp
+npm --prefix gui ci
+npm --prefix gui run desktop:stage
+npm --prefix gui run desktop:dist
+uv run --frozen --group desktop --extra mcp \
+  python scripts/check_desktop_artifacts.py desktop-dist
+```
+
+`desktop:stage` builds the production renderer, freezes the Python sidecar,
+stages Deno, licenses, a component inventory, and a CycloneDX 1.6 SBOM under
+`gui/.desktop-stage`. `desktop:dist` then runs electron-builder 26.15.3,
+publishes the per-platform SBOM/component/third-party-notice sidecars and
+`SHA256SUMS`, and invokes the artifact checker. Python is frozen only on the
+native runner: `macos-15` produces arm64, `windows-2025` produces x64, and
+`ubuntu-24.04` produces x64. The manual workflow is
+`.github/workflows/desktop-internal.yml`; it uploads Actions artifacts and does
+not create a tag, GitHub Release, public download, or auto-update channel.
+Source-controlled electron-builder inputs such as the application icon live in
+`gui/desktop-resources`; `gui/.desktop-stage` and `desktop-dist` remain generated
+staging and output directories.
+
+The packaged default store is
+`<Electron userData>/runtime/agent-libos.sqlite`. The optional overlay is
+`<Electron userData>/config.yaml`, and GUI-created model profiles remain in
+`<Electron userData>/llm-profiles.json`. These paths are persistent and are
+reopened on the next launch. Git, external MCP Servers, the system keychain (or
+Secret Service), and the system certificate store remain explicit Host/OS
+capabilities rather than bundled substitutes.
+
+Artifacts are marked `internal-unsigned`. electron-builder applies an ad-hoc
+signature to the macOS app and the checker verifies every nested Mach-O plus
+its OS/bundle-only dynamic-library references. Windows and Linux artifacts are
+unsigned. Public distribution still requires a separately authorized signing
+and Apple-notarization workflow; none is implied by these internal packages.
+The native smoke clears Python, Node, uv, and system Deno from `PATH`, runs the
+bundled Deno offline TypeScript JIT check, exercises the frozen backend's MCP
+Resource/Template/Prompt/Completion/Tool/MRTR/Task paths, loads the custom
+renderer protocol and preload, performs graceful shutdown, and reopens the
+same SQLite store. Installer checks additionally mount/copy the DMG, silently
+install/uninstall NSIS and test its ZIP, and launch both AppImage and tar.gz.
 
 The Vite development server is bound to `127.0.0.1` and restricts file serving
 to the `gui/` directory. Production dependency audit should remain clean; any
@@ -488,9 +548,11 @@ transcript is unavailable; they fail before provider dispatch.
 
 GUI background auto-run deliberately sets `process_human_queue=false`. It may
 advance runnable model work, but it never auto-approves, auto-denies, or invents
-an answer for a pending human request. A human must decide through a request
-card (or another explicit host terminal surface), after which normal runtime
-wakeup/resume semantics apply.
+an answer for a pending Human request. An ordinary/uncertain request remains for
+a Human request card or another explicit Host terminal surface. Independently,
+the Host semantic worker may win the shared CAS for a closed hard denial or an
+eligible canary one-use grant; the GUI scheduler itself never initiates either.
+Normal runtime wakeup/resume semantics follow the single terminal winner.
 
 GUI request serialization is itself a protected Human information-flow exit.
 For a conditional high-sensitivity request, the first snapshot/list response
@@ -555,8 +617,8 @@ strings are returned as truncated strings, and truncation metadata is reported
 under the snapshot-level `_truncated` map.
 
 Top-level snapshot collections are bounded before response assembly. Processes,
-pending-first Human requests, tools, images, Skills, JSON-RPC endpoints, MCP
-servers, Runtime Modules, and LLM profiles fetch at most
+Durable Task Runs, pending-first Human requests, tools, images, Skills, JSON-RPC
+endpoints, MCP servers, Runtime Modules, and LLM profiles fetch at most
 `snapshot_collection_max_items + 1`, subject to any stricter subsystem list
 maximum. Skills, JSON-RPC, and MCP list APIs perform one additional internal
 lookahead even when that subsystem maximum is stricter than the GUI maximum.
@@ -565,7 +627,7 @@ Either kind of lookahead becomes a `source_limited` lower-bound entry in
 Event and audit rows persist a derived `gui_snapshot_visible` flag. Snapshot
 queries filter that indexed flag before applying `LIMIT`, preventing internal
 GUI-presentation evidence from displacing causal runtime rows. The flag is
-required by store schema v5; missing or malformed persisted visibility state is
+required by store schema v7; missing or malformed persisted visibility state is
 rejected rather than repaired during open. Bounded event/audit page endpoints
 can still include presentation evidence when requested.
 The process window orders non-terminal processes before the most recently
@@ -573,20 +635,24 @@ updated terminal history, so a full snapshot does not hide current work behind
 old completed rows. If the bounded window contains a child but not its parent,
 the process tree renders that child as a temporary root rather than making it
 unreachable.
-Process message/count, bounded LLM-call-window count/token usage, rating,
-ancestor reservation, and hierarchical remaining-budget data are loaded through
-batch queries. Message and LLM windows select the newest configured rows per
-process; messages are returned chronologically. Snapshot construction therefore
-does not issue one message, LLM-call, rating, or resource query for every listed
-process.
+Process message/count, bounded recent LLM-window activity, rating, ancestor
+reservation, and hierarchical resource-counter/budget data are loaded through
+batch queries. The user-facing `llm_call_count` and `token_total` take the
+maximum of the durable hierarchical resource counters and the bounded
+recent-window values. This prevents a long-running process from being
+underreported at the window limit while still covering persisted or manually
+inserted LLM-call rows that are not represented in resource counters. Message
+and LLM windows select the newest configured rows per process; messages are
+returned chronologically. Snapshot construction therefore does not issue one
+message, LLM-call, rating, or resource query for every listed process.
 
-## Semantic Shadow Panel
+## Semantic Panel
 
 The read-only Semantic tab is available at Host scope and process scope; the
-latter adds the selected `pid` filter. It fetches status and assessment history
-on demand rather than extending the Runtime snapshot. A page contains at most
-50 rows in the bundled UI, and “load more” follows the opaque keyset cursor
-while de-duplicating by `assessment_id`.
+latter adds the selected `pid` filter. It fetches status, assessment, FlowGraph,
+settlement, policy/control history, health, and metric pages on demand rather
+than extending the Runtime snapshot. Bounded “load more” follows opaque keyset
+cursors and de-duplicates by the relevant stable record id.
 
 The panel shows queue health, aggregate success/error/OOD and Shadow outcome
 counts, domain/status history filters, reason codes, normalized observed Human
@@ -597,8 +663,9 @@ provider/projection/tenant digests.
 It does not render a prompt, goal/provider content, raw response, job
 projection, model explanation, or hidden reasoning. Structured strings are
 rendered as inert text. The same-build TypeScript decoder requires status
-schema v2 with complete exact-key `by_status` and `by_domain` maps, consistent
-aggregate totals, and strict real-auto-approval `0 / 0 / null`. Assessment
+schema v3 with complete exact-key `by_status` and `by_domain` maps, consistent
+aggregate totals, control/FlowGraph/machine sections, and denominator-aware
+real-auto-approval and review rates. Assessment
 page/detail envelopes and rows remain schema v1. Their decoders require exact
 keys and enum/digest/confidence/span shapes and reject unknown or private fields
 before React receives them.
@@ -612,10 +679,10 @@ object. Each non-null value is a non-negative JavaScript-safe integer through
 billing or classifier-quality metrics, and the status response does not
 aggregate them.
 
-Because Phase 0+1 cannot auto-approve, the real auto-approval denominator is
-zero and its rate is JSON `null`. The UI displays that value as not applicable,
-not as a misleading 0% rate. All controls are filters or pagination; the panel
-contains no semantic mutation control. See [Semantic Approval and Data
+The UI displays a zero-denominator or unreviewed rate as not applicable, not as
+a misleading 0% unsafe rate. All controls are filters or pagination; the panel
+contains no semantic policy/control, settlement, or review-import mutation.
+See [Semantic Approval and Data
 Identification](semantic_shadow.md#inspection-surfaces).
 
 ## High-Risk Operations
@@ -631,8 +698,11 @@ operations before invoking the runtime:
 - checkpoint restore and fork,
 - capability grant, delegate, and revoke,
 - JSON-RPC endpoint registration and method calls,
-- MCP server registration and tool calls,
-- Skill registration, activation, and unload.
+- MCP server registration, unregistration, and tool calls,
+- accepting an MCP Prompt preview as untrusted user context, OAuth login/logout,
+  Elicitation continuation response/cancellation, remote Task update/cancellation,
+  and subscription start/stop,
+- Skill registration, activation, and unload,
 - Durable Task Run cancellation and evidence-constrained recovery.
 
 The bundled renderer provides confirmation dialogs for process exec and exit,
@@ -643,11 +713,12 @@ mutation previews explicitly identify Host-admin mode. Skill and remote
 registration can instead use the selected process authority; workspace Skill
 registration always requires it. Process cancel/terminate signals and generic
 workflow execution remain server/API-only and require a same-build client to
-present its own confirmation UX. A client calling `POST /api/workflows/run`
-must submit `confirmed: true` when the server classifies the request as
-high-risk; the bundled `LibOSClient` has no generic workflow convenience
-method. The server rejects a missing or false confirmation before invoking any
-high-risk runtime operation, regardless of renderer state.
+present their own confirmation UX. The bundled MCP panel presents confirmation
+for unregistration and the modern MCP Host mutations listed above. A client calling
+`POST /api/workflows/run` must submit `confirmed: true` when the server
+classifies the request as high-risk; the bundled `LibOSClient` has no generic
+workflow convenience method. The server rejects a missing or false confirmation
+before invoking any high-risk runtime operation, regardless of renderer state.
 
 The Object Tasks panel also presents review dialogs before start and cancel,
 but those dialogs are renderer UX rather than the server's `confirmed: true`
@@ -659,6 +730,8 @@ presence of that dialog.
 JSON-RPC endpoint and MCP server registration through the GUI accept manifest
 text only. The renderer cannot ask the Python GUI server to read an arbitrary
 host file path; file/path based registration remains a CLI/admin workflow.
+The optional registration `source` is metadata only and must be a JSON string
+or `null`; other JSON types are rejected before registry mutation.
 
 Image package registration follows the same rule. Electron may read a package
 directory selected by the user and pass bounded package file payloads to the
@@ -757,9 +830,10 @@ Important endpoints:
   `GET /api/operations/resolve?kind=...&id=...` for host-only deterministic
   operation explanations. List/detail responses support cursor pagination;
   ambiguous evidence resolution returns `409` with candidate causal roots.
-- `GET /api/semantic/status`, `GET /api/semantic/assessments`, and
-  `GET /api/semantic/assessments/{assessment_id}` expose payload-free Shadow
-  evidence. The list accepts only `pid`, `request_id`, `operation_id`, `kind`,
+- `GET /api/semantic/status`, assessment/detail, FlowGraph status/entity/edge/
+  lineage, settlements, policy epochs, control/history, health, and metrics
+  routes expose payload-free evidence. The assessment list accepts only `pid`,
+  `request_id`, `operation_id`, `kind`,
   `status`, `domain`, `action_id`, `tenant_bucket_sha256`, `after`, and `limit`;
   the action is a dotted lower-case ontology id and the tenant bucket is an
   exact lower-case SHA-256 digest. The default is 50 and the hard HTTP maximum
@@ -778,7 +852,7 @@ Important endpoints:
   Collection, ledger, and Human pages accept opaque `cursor` values and return
   `next_cursor`; clients must not parse or synthesize them. The embedded
   requirements page also returns `next_cursor`. Requirement changes are linked
-  ledger items, and 1.4.0 has no independent Task Run requirements or wait HTTP
+  ledger items, and 1.5.0 has no independent Task Run requirements or wait HTTP
   route.
 - `POST /api/task-runs/{run_id}/run|pause|resume|cancel|follow-ups|recover|rerun`.
   Every existing-Run mutation carries a command id and expected revision.
@@ -859,6 +933,11 @@ Important endpoints:
   `decision.policy` equal to `always_allow`, `always_deny`, or
   `ask_each_time`, consistent with approval/rejection. Approved questions
   require a non-empty string `answer`; other JSON types are not coerced.
+  In `enforce_deny` and `canary_auto`, an external-operation response must also
+  carry the exact top-level `expected_revision` and Host-rendered
+  `preview_sha256` returned with the pending request. Missing, stale, malformed,
+  or mismatched preview evidence is rejected before terminalization; neither
+  field can authorize or weaken a hard-deny preflight.
 - `GET /api/checkpoints`, `POST /api/checkpoints/create`,
   `GET /api/checkpoints/{checkpoint_id}`,
   `GET /api/checkpoints/{checkpoint_id}/diff`, and
@@ -886,8 +965,36 @@ Important endpoints:
   `POST /api/jsonrpc/{endpoint_id}/call`
 - `GET /api/mcp`, `GET /api/mcp/{server_id}`,
   `GET /api/mcp/{server_id}/tools`, `POST /api/mcp/register`,
-  `POST /api/mcp/{server_id}/discover`, and
-  `POST /api/mcp/{server_id}/call`
+  `POST /api/mcp/{server_id}/tools/refresh`,
+  `POST /api/mcp/{server_id}/discover`,
+  `POST /api/mcp/{server_id}/call`, and
+  `POST /api/mcp/{server_id}/unregister`
+- Manifest v3 Resources and Templates:
+  `POST /api/mcp/{server_id}/resources/list`,
+  `POST /api/mcp/{server_id}/resource-templates/list`, and
+  `POST /api/mcp/{server_id}/resources/read`
+- Manifest v3 Prompts and Completion:
+  `POST /api/mcp/{server_id}/prompts/list`,
+  `POST /api/mcp/{server_id}/prompts/get`, and
+  `POST /api/mcp/{server_id}/completion`
+- MCP OAuth: local-only status reads
+  `GET /api/mcp/auth/{profile_id}/status` and
+  `GET /api/mcp/auth/profiles`; confirmed Host profile administration through
+  `POST /api/mcp/auth/profiles` (add or replace) and
+  `POST /api/mcp/auth/profiles/{profile_id}/remove`; plus explicit
+  `POST /api/mcp/auth/{profile_id}/login|logout` and
+  `POST /api/mcp/auth/challenges/{challenge_id}/callback`
+- MCP Elicitation continuations:
+  provider-free durable inspection at
+  `POST /api/mcp/continuations/{continuation_id}/inspect`, plus explicit
+  `POST /api/mcp/continuations/{continuation_id}/respond|cancel`
+- MCP remote Tasks:
+  `POST /api/mcp/remote-tasks/{task_ref}/get|update|cancel`; `get` may omit
+  `expected_revision` only for an explicit first re-observation, while update
+  and cancel always require the loaded revision
+- MCP subscriptions:
+  `POST /api/mcp/{server_id}/subscriptions/start` and
+  `POST /api/mcp/subscriptions/{subscription_id}/status|events|stop`
 - `GET /api/modules`, `GET /api/modules/{module_id}`
 
 All non-`OPTIONS` endpoints require `Authorization: Bearer <session-token>`.
@@ -904,15 +1011,122 @@ rejects any supplied non-object value. Process exit accepts `message` only as a
 JSON string or `null`. These type failures also return `400` before the runtime
 mutation or workflow launch.
 
-The MCP panel exposes an explicit Discover action for Manifest v2 `auto` and
-`2026-07-28` servers. It displays Manifest version/configured mode plus the
+The MCP panel exposes an explicit Discover action for Manifest v2 `auto` or
+`2026-07-28` servers and exact-`2026-07-28` Manifest v3 servers. It displays
+Manifest version/configured mode plus the
 current operation's revision/era, legacy/sessionless/fallback state, bounded
 server identity, standard capabilities, and unsupported capabilities. A page
-reload returns to “not negotiated”; discovery/session state is neither placed
-in the GUI snapshot schema nor persisted by the Runtime. Discovery is a
-protected external read, not a high-risk mutation confirmation. The panel does
-not expose OAuth login, MRTR continuation, subscriptions, Resources, Prompts,
-Tasks, or other excluded MCP surfaces.
+reload returns to “not negotiated”; discovery/session state is not reusable or
+resumable MCP session state and is omitted from the GUI snapshot schema.
+The snapshot's registered `mcp_servers` collection is bounded by
+`mcp.server_page_limit`; it never reuses the deprecated Manifest v1/v2 Tools
+`mcp.list_limit` compatibility value.
+Sanitized operation projections are nevertheless retained in external-effect,
+event, and audit evidence. Discovery is a protected external read, not a
+high-risk mutation confirmation. The bundled Discover action omits `actor` and
+therefore uses GUI Host/admin authority. An API client may instead supply a
+non-empty process `actor`; that opts into the process-authority path and
+requires the process capability for the discovery read, without adding or
+bypassing a `confirmed: true` boundary.
+
+`GET /api/mcp/{server_id}/tools` is cache-only. Its optional `refresh` query is
+strict: only the literal `false` is accepted; unknown, repeated, blank,
+misspelled, or `true` values return `400` without live provider I/O. A live read
+uses `POST /api/mcp/{server_id}/tools/refresh`, optionally with a non-empty
+process `actor`; omitting it uses GUI Host/admin authority. Unregistration uses
+`POST /api/mcp/{server_id}/unregister`, requires `confirmed: true`, and supports
+the same Host-versus-process authority selection. Both POST bodies reject
+unknown fields, so a misspelled `actor` cannot silently fall back to Host mode.
+Replacement remains the
+single `POST /api/mcp/register` contract with `replace: true`; there is no
+second path-based replacement route.
+
+The modern MCP controls appear only for Manifest v3 registrations pinned to
+`2026-07-28`. Resources, Resource Templates, Prompts, Completion, remote Task
+status, and subscription events are remote/provider reads and therefore use
+authenticated `POST`, never a GET whose refresh flag could trigger hidden I/O.
+The only modern GETs above are OAuth status and profile inventory, which read
+non-secret Host-local metadata without provider I/O. Every modern route is
+Host-only: request bodies reject `actor`, URLs,
+headers, raw provider names, and unknown fields rather than silently changing
+authority. Calls pass the explicit `gui` Host principal into the Runtime MCP
+facade. If the same-build Runtime lacks a requested facade, the server returns
+`501` with `mcp_surface_unavailable`; it never substitutes an empty page or
+success result.
+
+Resource and Prompt pages expose opaque logical ids and cursors. Pagination is
+manual. Resource links stay inert and binary resource data is represented only
+by an artifact receipt. Prompt results are rendered as an untrusted preview;
+accepting one requires a separate confirmation carrying the Runtime-issued
+`expected_preview_sha256`. The Runtime binds that opaque digest to the server
+registry generation/spec, auth-principal generation, logical Prompt id,
+normalized arguments, and canonical sanitized public projection, and rejects a
+mismatch before any context injection or follow-up action. Accepted content
+preserves `untrusted_mcp_prompt` provenance. It is never inserted into a system
+or developer message. Completion `argument` and optional `context` are strict
+string maps; a numeric, nested, or otherwise non-string context value is rejected
+by both the same-build renderer and HTTP server before the Runtime facade.
+
+Elicitation forms use local request and continuation ids. Every
+respondable `input_required` projection also carries a real Runtime-created
+durable `human_request_id`, its `human_revision`, and a canonical
+`human_preview_sha256`. A requestState-only load-shedding round is respondable,
+has an empty `input_requests` array, and is rendered as an explicit empty-object
+response; it is never continued automatically. Typed Sampling/Roots unsupported
+results are not respondable, have an empty continuation id and no Human receipt,
+and cannot be submitted or cancelled. A remote Task carries the same three
+receipt fields only while its status is `input_required`. The renderer shows that receipt and the exact
+untrusted input schemas (including any display-only `inert_url`) as inert text.
+It enables response/update only after the user binds the reviewed receipt to the
+unchanged local continuation or Task reference, revision, and answer editor;
+editing any of them clears the renderer binding.
+
+The continuation `respond` and Task `update` request bodies send
+`human_request_id`, `human_expected_revision`, and `human_preview_sha256` with
+the proposed local answer object. This remains a single protected Runtime
+operation: the Runtime first settles that exact durable HumanRequest, then the
+MCP manager consumes only its canonical approved answer. The raw GUI `responses`
+object is never forwarded directly to the Provider. Cancellation does not
+consume an answer and the Runtime closes the corresponding pending HumanRequest.
+Sampling and Roots requests remain typed unsupported. Remote Tasks expose only
+the local `task_ref`. After a browser or Runtime restart, the Host can recover a
+continuation with an explicit empty-body `inspect` POST; this reads only the
+durable local continuation and performs no Provider dispatch. The renderer's
+Load/Refresh action restores the exact revision, schema, and Human receipt before
+enabling response or cancellation. Remote Task `get` accepts an omitted or null
+`expected_revision` only for the first explicit re-observation, allowing a fresh
+renderer to recover a nonzero durable revision; update and cancel still require
+that loaded revision. Subsequent refresh is one-shot and manual, cancellation acknowledgement
+is not presented as proof that work stopped. Expired or unknown local references
+clear any stale form and stay unusable. Subscription status/events are
+also manual: lost streams are not reconnected or resumed, and notifications do
+not trigger a model, Tool, or Task Run.
+
+OAuth profiles are Host-owned, exact, non-secret configuration objects. The
+panel adds or replaces a profile in the same long-lived Runtime before login;
+both operations and removal require explicit confirmation. Profile JSON cannot
+contain a client secret, DCR mode, `actor`, or unknown fields. An optional
+client secret is a separate one-shot input: the renderer clears it before the
+confirmation is shown and erases its confirmation slot on cancellation or
+after the first facade attempt; the HTTP handler removes it from the parsed
+request before profile validation and clears the entire per-request body cache
+in `finally`. It is passed only as transient bytes to the Runtime credential
+broker and is absent from Store, response, audit, event, error, and log
+projections. A failed or ambiguous attempt cannot replay it. After Runtime
+restart, the Host must explicitly resubmit the same non-secret profile to
+rehydrate a deterministic broker slot; an authorization challenge is never
+resumed.
+
+OAuth authorization URLs are shown in a read-only text area and are never
+opened automatically. The full callback URL is submitted once and cleared from
+renderer state; its authorization code exists transiently in renderer, HTTP,
+and Runtime memory only until that exchange attempt. The server clears its
+parsed request cache in `finally`, and neither callback code nor callback state
+is written to Store/evidence/logs or echoed by the server. Tokens,
+client secrets, PKCE material, authorization codes, and remote Task ids are
+rejected recursively from GUI projections. The same fail-closed projection
+rejects `ui://`, `text/html;profile=mcp-app`, and MCP Apps metadata; the renderer
+does not load remote HTML or auto-follow ResourceLink or Elicitation URLs.
 
 The process detail pane includes an Explain tab. It renders an outcome and
 evidence-completeness summary, an explicit causal tree, and a filterable

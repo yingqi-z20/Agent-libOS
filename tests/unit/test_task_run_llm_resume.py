@@ -30,6 +30,8 @@ from agent_libos.llm.task_runs import (
     completed_outcome_manifest,
     normalize_task_run_prompt_context,
     normalize_validated_action_manifest,
+    task_run_contract_message,
+    task_run_dynamic_state_message,
     validated_action_manifest,
 )
 from agent_libos.models import (
@@ -52,6 +54,80 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.utils.serde import dumps, to_jsonable
 from tests.support.fakes import RecordingActionClient
+
+
+def _v2_prompt_context(
+    requirements: list[dict[str, str]],
+    *,
+    summary: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "run_id": "run_internal_123",
+        "context_generation": "generation_internal_123",
+        "goal_text": "Preserve the business document field run_id.",
+        "requirements": requirements,
+        "transcript_messages": [],
+        "compressed_summary": summary,
+        "data_labels": {},
+    }
+
+
+def test_v2_task_run_contract_is_semantic_append_only_and_state_is_dynamic() -> None:
+    first_requirement = {
+        "requirement_id": "req_internal_1",
+        "kind": "original_goal",
+        "content_text": "Create the report.",
+        "status": "pending",
+    }
+    follow_up = {
+        "requirement_id": "req_internal_2",
+        "kind": "human_follow_up",
+        "content_text": "Keep the user payload field run_id unchanged.",
+        "status": "pending",
+    }
+    initial = _v2_prompt_context([first_requirement])
+    appended = _v2_prompt_context([first_requirement, follow_up])
+
+    first = task_run_contract_message(
+        initial,
+        prompt_layout="cache_optimized_v2",
+    )
+    second = task_run_contract_message(
+        appended,
+        prompt_layout="cache_optimized_v2",
+    )
+
+    assert second.startswith(first + "\n")
+    assert "Create the report." in second
+    assert "Keep the user payload field run_id unchanged." in second
+    for internal in (
+        "run_internal_123",
+        "generation_internal_123",
+        "req_internal_1",
+        "req_internal_2",
+        "requirement_id",
+        "schema_version",
+    ):
+        assert internal not in second
+
+    satisfied = _v2_prompt_context(
+        [{**first_requirement, "status": "satisfied"}, follow_up],
+        summary="Report generated; follow-up pending.",
+    )
+    assert task_run_contract_message(
+        satisfied,
+        prompt_layout="cache_optimized_v2",
+    ) == second
+    dynamic = task_run_dynamic_state_message(satisfied)
+    assert "Report generated; follow-up pending." in dynamic
+    assert '"order": 1' in dynamic
+    assert '"status": "satisfied"' in dynamic
+    assert "req_internal_1" not in dynamic
+
+    legacy = task_run_contract_message(initial, prompt_layout="legacy_v1")
+    assert "run_internal_123" in legacy
+    assert "req_internal_1" in legacy
 
 
 def test_task_run_result_oid_scan_ignores_non_object_argument_sentinels() -> None:
@@ -1084,7 +1160,14 @@ def test_task_run_semantic_compaction_cannot_drop_later_turns_twice(
 
 
 def test_executor_injects_local_task_run_contract_and_safe_point_order() -> None:
-    runtime = Runtime.open("local")
+    config = replace(
+        DEFAULT_CONFIG,
+        llm=replace(
+            DEFAULT_CONFIG.llm,
+            prompt_layout="cache_optimized_v2",
+        ),
+    )
+    runtime = Runtime.open("local", config=config)
     try:
         hook = _CaptureTaskRunHook(_prompt_context())
         runtime.llm._task_runs = hook
@@ -1114,14 +1197,18 @@ def test_executor_injects_local_task_run_contract_and_safe_point_order() -> None
             "user",
             "assistant",
             "user",
+            "user",
         ]
         rendered = dumps(prompt)
         assert "DURABLE_GOAL_SENTINEL" in rendered
         assert "PRESERVE_REQUIREMENT_SENTINEL" in rendered
         assert "LOCAL_TRANSCRIPT_SENTINEL" in rendered
         assert "LOCAL_SUMMARY_SENTINEL" in rendered
-        assert "pending or in_progress remains mandatory" in rendered
-        assert "blocked or model-cancelled item is not satisfied" in rendered
+        assert "Ordered requirements (append-only)" in prompt[1]["content"]
+        assert prompt[1]["_agent_libos_cache_stable"] is True
+        assert "Current TaskRun state (dynamic)" in prompt[3]["content"]
+        assert "run_local_resume" not in rendered
+        assert "requirement-1" not in rendered
         assert "provider-response-must-not-be-required" not in prompt[1]["content"]
     finally:
         runtime.close()
