@@ -62,6 +62,9 @@ release = [
     "packaging==26.2",
     "twine==7.0.0",
 ]
+desktop = [
+    "pyinstaller==6.21.0",
+]
 
 [project.scripts]
 agent-libos = "agent_libos.api.cli:cli"

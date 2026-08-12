@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "distribution_channel": "internal-unsigned",
+  "product": {
+    "name": "Agent libOS",
+    "version": "1.5.0",
+    "app_id": "io.agentlibos.desktop"
+  },
+  "toolchain": {
+    "python": "3.11.15",
+    "pyinstaller": "6.21.0",
+    "node": "24.15.0",
+    "electron": "43.2.0",
+    "electron_builder": "26.15.3",
+    "deno": "2.9.4",
+    "mcp": "2.0.0",
+    "keyring": "25.7.0"
+  },
+  "deno": {
+    "version": "2.9.4",
+    "license": {
+      "url": "https://raw.githubusercontent.com/denoland/deno/v2.9.4/LICENSE.md",
+      "sha256": "f62497fffecc0852960c8d3e6934b9db86d16396e9b604072e923892cae3a588"
+    },
+    "targets": {
+      "darwin-arm64": {
+        "asset": "deno-aarch64-apple-darwin.zip",
+        "sha256": "6d17647fdbf9c587a581dba205054c4ccf732dae0a196cc1e9b44c07589db412"
+      },
+      "win32-x64": {
+        "asset": "deno-x86_64-pc-windows-msvc.zip",
+        "sha256": "68ed08b05c56cf887e9aa509947dc3f468f7e12f47a13e5c1abd51d46d1453ef"
+      },
+      "linux-x64": {
+        "asset": "deno-x86_64-unknown-linux-gnu.zip",
+        "sha256": "c24f955d9fbfe0ea5ae2b501c8e71ae76e31e4c9782390a54a284b3364fda725"
+      }
+    }
+  }
+}

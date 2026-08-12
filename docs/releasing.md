@@ -218,6 +218,16 @@ other cells marked as environment gates are not made true by deterministic CI.
 If a release claim includes one, obtain and bind its documented clean-source
 receipt before authorization.
 
+For the 1.5.0 internal desktop candidate, native packaging is a separate
+manual workflow (`.github/workflows/desktop-internal.yml`). It builds only on
+the three locked native runners, uploads Actions artifacts for 14 days, and has
+read-only repository permission. Its macOS artifact is ad-hoc signed and not
+notarized; Windows and Linux artifacts are unsigned. Record all three workflow
+job locators, every package/SBOM/component/notice checksum, and the aggregate
+upload-verification job if the internal desktop claim is included. Do not turn
+that receipt into a public download, tag, Release, signing, notarization, or
+auto-update action without a new explicit authorization.
+
 ## 4. Explicit publication authorization
 
 Before any external mutation, a human repository/package owner reviews one

@@ -22,6 +22,15 @@ checkout or candidate artifact.
 
 ## Implemented release safeguards
 
+- A manual native workflow can build self-contained 1.5.0 internal desktop
+  packages for macOS arm64 (DMG/ZIP), Windows x64 (NSIS/ZIP), and Ubuntu
+  24.04/glibc x64 (AppImage/tar.gz). Each set carries checksums, a CycloneDX
+  SBOM, component inventory, and third-party notices and must pass frozen
+  backend, bundled Deno, renderer/preload, persistent reopen, MCP, and
+  installer smokes. These packages remain `internal-unsigned`; the macOS app
+  is ad-hoc signed but not notarized, and no public download/update claim is
+  made without a bound three-platform workflow receipt.
+
 - Durable Task Runs are a first-class, versioned Host supervision boundary for
   one root AgentProcess tree. They persist requirements, idempotent command
   receipts, append-only ledger links, and locally integrity-bound resume points;

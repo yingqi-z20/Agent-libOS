@@ -479,6 +479,23 @@ The Electron launcher fills missing backend environment values from this
 checkout's `.env`; values already inherited by Electron take precedence. This
 GUI-specific launcher behavior does not apply to the generic CLI or library API.
 
+For the native self-contained **internal** desktop candidate, use the exact
+locked toolchains and build only on the target platform:
+
+```bash
+uv sync --frozen --group desktop --extra mcp
+npm --prefix gui ci
+npm --prefix gui run desktop:dist
+python scripts/check_desktop_artifacts.py desktop-dist
+```
+
+The packaged app includes Electron 43.2.0, CPython 3.11.15 with Agent libOS and
+the MCP extra, and verified Deno 2.9.4; it does not depend on system Python,
+Node, uv, or Deno. Git, external MCP servers, OS keychains, and OS certificate
+stores remain Host dependencies. These artifacts are `internal-unsigned`
+(macOS ad-hoc only; no notarization) and are not a public release or update
+channel. See [the GUI desktop build contract](https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/gui.md#self-contained-internal-desktop-distribution).
+
 The demo does not call a real model. It exercises process spawn/fork, Object
 Memory, Deno/TypeScript JIT validation when Deno is available, checkpointing,
 capability denial before grant, human approval, filesystem write, final report

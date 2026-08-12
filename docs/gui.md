@@ -19,6 +19,14 @@ shell. It first honors `AGENT_LIBOS_GUI_SERVER_BIN`, then tries the project
 `.venv` entrypoint, and only falls back to `uv run agent-libos-gui-server` if no
 local entrypoint exists.
 
+The packaged internal desktop build takes a separate fail-closed path. It
+always starts `resources/backend/agent-libos-gui-server[.exe]`, ignores
+`AGENT_LIBOS_GUI_SERVER_BIN`, never reads a checkout `.env`, serves the renderer
+from `process.resourcesPath/renderer`, and gives the child a private working
+directory below Electron's user-data directory. It prepends only
+`process.resourcesPath/bin` to the Python child's `PATH`, making the bundled
+Deno visible without changing Electron's own environment.
+
 ## Architecture
 
 ```text
@@ -258,16 +266,63 @@ npm --prefix gui run test
 The `find` command should print nothing, and the two Vitest runs should discover
 the same source tests.
 
-The Electron smoke path can be run headlessly with
+The development Electron smoke path can be run headlessly with
 `AGENT_LIBOS_GUI_SMOKE=1`. By default it verifies the Electron main process,
 Python GUI server startup, authenticated `/api/health`, and graceful shutdown
 against an in-memory `local` store without creating a BrowserWindow. Smoke
 logging redacts the temporary bearer token. Set
 `AGENT_LIBOS_GUI_SMOKE_WINDOW=1` when a machine has a working desktop/GPU stack
 and you specifically want to exercise the production Vite build through the
-custom-protocol BrowserWindow, its API origin, and the preload bridge. This is
-a production-build/custom-protocol smoke, not an installer, packaged-app,
-code-signing, or notarization test; Electron packaging is not configured here.
+custom-protocol BrowserWindow, its API origin, and the preload bridge.
+
+## Self-contained internal desktop distribution
+
+Agent libOS 1.5.0 also has a manually triggered, internal-only native desktop
+build for macOS arm64, Windows x64, and Ubuntu 24.04/glibc x64. The exact
+runtime closure is Electron 43.2.0, a PyInstaller 6.21.0 one-folder sidecar
+built with CPython 3.11.15, Agent libOS with the complete MCP extra (including
+MCP SDK 2.0.0 and keyring 25.7.0), and the official Deno 2.9.4 platform binary.
+Deno downloads are accepted only after the repository-pinned platform SHA-256
+matches; a runner-preinstalled Deno is never staged.
+
+```bash
+uv sync --frozen --group desktop --extra mcp
+npm --prefix gui ci
+npm --prefix gui run desktop:stage
+npm --prefix gui run desktop:dist
+uv run --frozen --group desktop --extra mcp \
+  python scripts/check_desktop_artifacts.py desktop-dist
+```
+
+`desktop:stage` builds the production renderer, freezes the Python sidecar,
+stages Deno, licenses, a component inventory, and a CycloneDX 1.6 SBOM under
+`gui/.desktop-stage`. `desktop:dist` then runs electron-builder 26.15.3,
+publishes the per-platform SBOM/component/third-party-notice sidecars and
+`SHA256SUMS`, and invokes the artifact checker. Python is frozen only on the
+native runner: `macos-15` produces arm64, `windows-2025` produces x64, and
+`ubuntu-24.04` produces x64. The manual workflow is
+`.github/workflows/desktop-internal.yml`; it uploads Actions artifacts and does
+not create a tag, GitHub Release, public download, or auto-update channel.
+
+The packaged default store is
+`<Electron userData>/runtime/agent-libos.sqlite`. The optional overlay is
+`<Electron userData>/config.yaml`, and GUI-created model profiles remain in
+`<Electron userData>/llm-profiles.json`. These paths are persistent and are
+reopened on the next launch. Git, external MCP Servers, the system keychain (or
+Secret Service), and the system certificate store remain explicit Host/OS
+capabilities rather than bundled substitutes.
+
+Artifacts are marked `internal-unsigned`. electron-builder applies an ad-hoc
+signature to the macOS app and the checker verifies every nested Mach-O plus
+its OS/bundle-only dynamic-library references. Windows and Linux artifacts are
+unsigned. Public distribution still requires a separately authorized signing
+and Apple-notarization workflow; none is implied by these internal packages.
+The native smoke clears Python, Node, uv, and system Deno from `PATH`, runs the
+bundled Deno offline TypeScript JIT check, exercises the frozen backend's MCP
+Resource/Template/Prompt/Completion/Tool/MRTR/Task paths, loads the custom
+renderer protocol and preload, performs graceful shutdown, and reopens the
+same SQLite store. Installer checks additionally mount/copy the DMG, silently
+install/uninstall NSIS and test its ZIP, and launch both AppImage and tar.gz.
 
 The Vite development server is bound to `127.0.0.1` and restricts file serving
 to the `gui/` directory. Production dependency audit should remain clean; any

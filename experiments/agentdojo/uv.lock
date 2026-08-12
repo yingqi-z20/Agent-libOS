@@ -35,6 +35,7 @@ requires-dist = [
 provides-extras = ["postgres", "mcp", "pty"]
 
 [package.metadata.requires-dev]
+desktop = [{ name = "pyinstaller", specifier = "==6.21.0" }]
 dev = [
     { name = "pytest", specifier = ">=9.1.0" },
     { name = "pytest-timeout", specifier = ">=2.4.0" },

@@ -283,8 +283,10 @@ console entrypoints: `agent-libos`, `agent-libos-gui-server`, and the explicit
 offline `agent-libos-migrate-tool-groups` migration command. The source
 distribution additionally contains the
 repository-level PTY module, example Skill and Image packages, benchmarks,
-tests, and documentation. Electron sources remain repository-checkout assets
-validated by the separate GUI lane. Validate that contract before a release:
+tests, and documentation. Electron sources are not part of either Python
+artifact; they are validated by the GUI lane and used only by the separate
+native internal desktop workflow described below. Validate the Python artifact
+contract before a release:
 
 ```bash
 uv sync --frozen --no-dev --group release
@@ -315,9 +317,25 @@ demo against an in-memory store. The build job waits for its declared pre-build
 gates; the clean-install matrix is downstream of that build, so the candidate
 is not release-validated until every smoke job also succeeds.
 
-The deterministic matrix is not the full platform release matrix. See
-[support_matrix.md](support_matrix.md) before claiming Windows/macOS, packaged
-Electron, real MCP, or real LLM coverage.
+The Python pair is separate from the self-contained internal desktop artifacts.
+Native desktop builds use the exact `desktop` dependency group and GUI lock:
+
+```bash
+uv sync --frozen --group desktop --extra mcp
+npm --prefix gui ci
+npm --prefix gui run desktop:stage
+npm --prefix gui run desktop:dist
+python scripts/check_desktop_artifacts.py desktop-dist
+```
+
+`desktop:dist` is native-only and writes ignored output to `desktop-dist/`; it
+must not be used to cross-freeze Python. The manual
+`desktop-internal.yml` workflow builds macOS arm64 on `macos-15`, Windows x64
+on `windows-2025`, and Linux x64 on `ubuntu-24.04`. It uploads only internal
+Actions artifacts, SBOMs, component inventories, notices, and checksums. It has
+no GitHub Release or publication permission. See [gui.md](gui.md#self-contained-internal-desktop-distribution)
+for the packaged path and [support_matrix.md](support_matrix.md) before making
+platform, signing, real-provider, or real-LLM claims.
 
 The practical runner separates `native-live` from `modeled` scenarios. Native
 scenarios fail when a semantic effect lacks a real ToolBroker call, state

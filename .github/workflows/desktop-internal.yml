@@ -1,0 +1,187 @@
+name: internal desktop distributions
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-internal-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AGENT_LIBOS_DESKTOP_VERSION: "1.5.0"
+  CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+jobs:
+  native-desktop:
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: darwin-arm64
+            upload_name: agent-libos-1.5.0-macos-arm64-internal-unsigned
+          - runner: windows-2025
+            target: win32-x64
+            upload_name: agent-libos-1.5.0-windows-x64-internal-unsigned
+          - runner: ubuntu-24.04
+            target: linux-x64
+            upload_name: agent-libos-1.5.0-linux-x64-internal-unsigned
+    name: ${{ matrix.target }} native package
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11.15
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11.15"
+          architecture: ${{ matrix.target == 'darwin-arm64' && 'arm64' || 'x64' }}
+
+      - name: Set up Node 24.15.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.15.0"
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.32"
+          enable-cache: true
+
+      - name: Validate native architecture
+        shell: bash
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: |
+          python - <<'PY'
+          import os, platform, sys
+          machine = platform.machine().lower()
+          actual = (
+              "darwin-arm64" if sys.platform == "darwin" and machine in {"arm64", "aarch64"}
+              else "win32-x64" if sys.platform == "win32" and machine in {"amd64", "x86_64"}
+              else "linux-x64" if sys.platform.startswith("linux") and machine in {"amd64", "x86_64"}
+              else f"{sys.platform}-{machine}"
+          )
+          if actual != os.environ["EXPECTED_TARGET"]:
+              raise SystemExit(f"native runner mismatch: expected {os.environ['EXPECTED_TARGET']}, got {actual}")
+          if platform.python_version() != "3.11.15":
+              raise SystemExit(f"Python mismatch: {platform.python_version()}")
+          PY
+          node --version | grep -Fx 'v24.15.0'
+
+      - name: Install Linux desktop/keychain prerequisites
+        if: matrix.target == 'linux-x64'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes dbus-x11 gnome-keyring libfuse2t64 libsecret-1-0 xvfb
+
+      - name: Install frozen build dependencies
+        shell: bash
+        run: |
+          uv lock --check
+          uv sync --frozen --group desktop --extra mcp
+          npm --prefix gui ci
+
+      - name: Run desktop build contracts
+        shell: bash
+        run: |
+          uv run --frozen --group desktop --extra mcp pytest -q tests/unit/test_desktop_distribution.py
+          npm --prefix gui run typecheck
+          npm --prefix gui test -- --run electron/desktopRuntime.test.ts electron/rendererProtocol.test.ts electron/processLifecycle.test.ts
+
+      - name: Build native internal-unsigned packages
+        shell: bash
+        run: npm --prefix gui run desktop:dist
+
+      - name: Smoke macOS frozen bundle and installers
+        if: matrix.target == 'darwin-arm64'
+        shell: bash
+        run: |
+          uv run --frozen --group desktop --extra mcp python scripts/smoke_desktop_bundle.py desktop-dist
+          uv run --frozen --group desktop --extra mcp python scripts/verify_desktop_installers.py desktop-dist
+
+      - name: Smoke Windows frozen bundle and installers
+        if: matrix.target == 'win32-x64'
+        shell: pwsh
+        run: |
+          uv run --frozen --group desktop --extra mcp python scripts/smoke_desktop_bundle.py desktop-dist
+          uv run --frozen --group desktop --extra mcp python scripts/verify_desktop_installers.py desktop-dist
+
+      - name: Smoke Linux frozen bundle and installers
+        if: matrix.target == 'linux-x64'
+        shell: bash
+        run: |
+          dbus-run-session -- bash -euo pipefail -c '
+            eval "$(printf "desktop-internal-ci\n" | gnome-keyring-daemon --unlock --components=secrets)"
+            export PYTHON_KEYRING_BACKEND=keyring.backends.SecretService.Keyring
+            xvfb-run -a uv run --frozen --group desktop --extra mcp python scripts/smoke_desktop_bundle.py desktop-dist
+            xvfb-run -a uv run --frozen --group desktop --extra mcp python scripts/verify_desktop_installers.py desktop-dist
+          '
+
+      - name: Revalidate immutable desktop artifacts
+        shell: bash
+        run: uv run --frozen --group desktop --extra mcp python scripts/check_desktop_artifacts.py desktop-dist
+
+      - name: Upload native internal desktop artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.upload_name }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            desktop-dist/Agent-libOS-*.dmg
+            desktop-dist/Agent-libOS-*.zip
+            desktop-dist/Agent-libOS-*.exe
+            desktop-dist/Agent-libOS-*.AppImage
+            desktop-dist/Agent-libOS-*.tar.gz
+            desktop-dist/Agent-libOS-*-SBOM.cdx.json
+            desktop-dist/Agent-libOS-*-components.json
+            desktop-dist/Agent-libOS-*-THIRD_PARTY_NOTICES.txt
+            desktop-dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  verify-uploaded-sets:
+    needs: native-desktop
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download all native artifact sets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: agent-libos-1.5.0-*-internal-unsigned-${{ github.sha }}-${{ github.run_attempt }}
+          path: downloaded-desktop
+
+      - name: Verify each uploaded checksum manifest
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          roots = sorted(path.parent for path in Path("downloaded-desktop").rglob("SHA256SUMS"))
+          if len(roots) != 3:
+              raise SystemExit(f"expected three native artifact sets, found {len(roots)}")
+          for root in roots:
+              lines = (root / "SHA256SUMS").read_text(encoding="ascii").splitlines()
+              if not lines:
+                  raise SystemExit(f"empty checksum manifest: {root}")
+              for line in lines:
+                  expected, separator, name = line.partition("  ")
+                  selected = root / name
+                  if not separator or not selected.is_file():
+                      raise SystemExit(f"invalid checksum entry in {root}: {line!r}")
+                  actual = hashlib.sha256(selected.read_bytes()).hexdigest()
+                  if actual != expected:
+                      raise SystemExit(f"checksum mismatch: {selected}")
+          print("verified 3 native internal desktop artifact sets")
+          PY

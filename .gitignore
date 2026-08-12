@@ -99,6 +99,9 @@ pnpm-debug.log*
 /gui/.smoke-log.jsonl
 /gui/.smoke-user-data/
 /gui/release/
+/gui/.desktop-build/
+/gui/.desktop-stage/
+/desktop-dist/
 /gui/playwright-report/
 /gui/.playwright-results/
 
