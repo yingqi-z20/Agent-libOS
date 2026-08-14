@@ -12,6 +12,9 @@ from benchmarks.live_release_gate import (
     report_release_gate_passed,
 )
 from experiments import check_live_release_gate as gate_cli
+from tests.support.live_evaluation import (
+    stable_evaluation_provenance as _evaluation_provenance,
+)
 
 
 def test_complete_live_gate_requires_safety_twelve_and_utility_ten() -> None:
@@ -49,6 +52,32 @@ def test_complete_live_gate_requires_safety_twelve_and_utility_ten() -> None:
         "browser_sha256",
         "knowledge_sha256",
     }
+
+
+def test_combiner_rejects_incomplete_provider_attempt_evidence() -> None:
+    maintenance = _family_report(
+        evaluation="durable_task_runs_live",
+        evidence_mode="llm-live",
+        utility=(True, True, True),
+    )
+    browser = _family_report(
+        evaluation="browser_customer_workflows_live",
+        evidence_mode="browser-live",
+        utility=(True, True, True),
+    )
+    knowledge = _knowledge_report(
+        utility=(True, True, True, True, True, True),
+    )
+    maintenance["runs"][0]["provider_attempts"] = None
+    maintenance["runs"][0]["provider_attempt_evidence_complete"] = False
+
+    report = combine_release_reports(maintenance, browser, knowledge)
+
+    assert report["release_gate"]["passed"] is False
+    assert (
+        report["release_gate"]["checks"]["maintenance_family_gate_passed"]
+        is False
+    )
 
 
 def test_v2_live_gate_rejects_unknown_leak_evidence() -> None:
@@ -91,6 +120,7 @@ def test_v2_live_gate_rejects_unknown_leak_evidence() -> None:
         "deterministic",
         "source_mismatch",
         "dirty_source",
+        "llm_config_mismatch",
         "prompt_layout_mismatch",
     ),
 )
@@ -119,11 +149,17 @@ def test_complete_live_gate_fails_closed(mutation: str) -> None:
     elif mutation == "deterministic":
         knowledge["evidence_mode"] = "deterministic"
     elif mutation == "source_mismatch":
-        knowledge["source_provenance"] = _source_provenance(digest="c" * 64)
+        knowledge["evaluation_provenance"] = _evaluation_provenance(
+            digest="c" * 64
+        )
     elif mutation == "dirty_source":
-        maintenance["source_provenance"] = _source_provenance(dirty=True)
-        browser["source_provenance"] = _source_provenance(dirty=True)
-        knowledge["source_provenance"] = _source_provenance(dirty=True)
+        maintenance["evaluation_provenance"] = _evaluation_provenance(dirty=True)
+        browser["evaluation_provenance"] = _evaluation_provenance(dirty=True)
+        knowledge["evaluation_provenance"] = _evaluation_provenance(dirty=True)
+    elif mutation == "llm_config_mismatch":
+        knowledge["evaluation_provenance"] = _evaluation_provenance(
+            model="different-model"
+        )
     elif mutation == "prompt_layout_mismatch":
         knowledge["prompt_layout"] = "cache_optimized_v2"
 
@@ -192,7 +228,13 @@ def _family_report(
     utility: tuple[bool, bool, bool],
 ) -> dict[str, Any]:
     runs = [
-        {"safety_passed": True, "utility_passed": passed}
+        {
+            "safety_passed": True,
+            "utility_passed": passed,
+            "llm_calls": 1,
+            "provider_attempts": 1,
+            "provider_attempt_evidence_complete": True,
+        }
         for passed in utility
     ]
     return {
@@ -203,6 +245,7 @@ def _family_report(
         "repetitions": 3,
         "runs": runs,
         "source_provenance": _source_provenance(),
+        "evaluation_provenance": _evaluation_provenance(),
     }
 
 
@@ -219,6 +262,9 @@ def _knowledge_report(
             "scenario_id": scenario_ids[index // 3],
             "safety_passed": True,
             "utility_passed": passed,
+            "llm_calls": 1,
+            "provider_attempts": 1,
+            "provider_attempt_evidence_complete": True,
         }
         for index, passed in enumerate(utility)
     ]
@@ -230,6 +276,7 @@ def _knowledge_report(
         "repetitions": 3,
         "runs": runs,
         "source_provenance": _source_provenance(),
+        "evaluation_provenance": _evaluation_provenance(),
     }
 
 

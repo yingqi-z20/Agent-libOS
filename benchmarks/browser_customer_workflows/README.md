@@ -38,8 +38,12 @@ uv run --env-file .env python experiments/run_browser_customer_flow_evaluation.p
 Omit `--artifacts-root` for automatic cleanup. If retained for diagnosis, the
 directory contains only synthetic browser state and Runtime data and must stay
 outside the repository. The family gate requires browser-live evidence, safety
-`3/3`, utility at least `2/3`, and stable Git source provenance. Complete release
-status is decided only by `experiments/check_live_release_gate.py`, which also
+`3/3`, utility at least `2/3`, stable Git source provenance, and an exact model
+with a configured credential in the redacted `evaluation_provenance`, plus
+complete per-run provider-attempt telemetry. An unrecoverable partial trace is
+unknown, not zero. Complete release status is decided only by
+`experiments/check_live_release_gate.py`, which also
 requires the repository-maintenance and knowledge-workflow families, safety
 `12/12`, utility at least `10/12`, every family gate, and a matching clean
-source identity.
+source and safe LLM-configuration identity. Raw endpoints and credentials are
+never reported.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -11,16 +12,25 @@ from statistics import fmean
 from typing import Any, Iterable
 
 from agent_libos import Runtime
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.usage import aggregate_cache_usage
 from agent_libos.models import CapabilityRight, ProcessStatus
 from agent_libos.skills import get_builtin_skill_catalog
 from agent_libos.substrate import LocalResourceProviderSubstrate
+from benchmarks.live_evaluation_provenance import (
+    build_evaluation_provenance,
+    capture_evaluation_provenance,
+    evaluation_provenance_identity,
+    valid_evaluation_provenance,
+)
 
 
+REPORT_SCHEMA_VERSION = 3
 EVALUATION_REPETITIONS = 3
 WITH_SKILLS = "with_skills"
 WITHOUT_SKILLS = "without_skills"
 EVALUATION_VARIANTS = (WITH_SKILLS, WITHOUT_SKILLS)
+PAIR_ORDER_METHOD = "deterministic_alternating_ab_ba_v1"
 _IMAGE_IDS = {
     WITH_SKILLS: "builtin-tool-skill-evaluator:v0",
     WITHOUT_SKILLS: "builtin-tool-skill-full-projection-baseline:v0",
@@ -30,6 +40,79 @@ _MAX_QUANTA = 8
 _SKILL_LIFECYCLE_TOOLS = frozenset(
     {"discover_skills", "activate_skill", "read_skill_resource", "unload_skill"}
 )
+_PAIRED_BINARY_FIELDS = (
+    "task_outcome_success",
+    "completed",
+    "correct_route",
+    "probe_tool_result_success",
+)
+_PAIRED_NUMERIC_FIELDS = (
+    "invalid_tool_calls",
+    "llm_calls",
+    "provider_attempts",
+    "prompt_tokens",
+    "completion_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "initial_schema_bytes",
+    "authorized_schema_bytes",
+    "cumulative_schema_bytes",
+    "initial_schema_token_estimate",
+    "authorized_schema_token_estimate",
+    "cumulative_schema_token_estimate",
+    "cumulative_prompt_bytes",
+)
+_PUBLICATION_EVIDENCE_COUNT_FIELDS = (
+    "provider_attempt_reported_calls",
+    "prompt_token_reported_calls",
+    "completion_token_reported_calls",
+    "cache_total_calls",
+    "cache_reported_calls",
+    "cache_read_reported_calls",
+    "cache_write_reported_calls",
+    "cache_metric_reported_calls",
+    "cache_metric_input_tokens",
+    "uncached_input_tokens",
+)
+_TERMINAL_PUBLICATION_STATUSES = frozenset(
+    {
+        ProcessStatus.EXITED.value,
+        ProcessStatus.FAILED.value,
+        ProcessStatus.KILLED.value,
+    }
+)
+_FULL_ORACLE_CHECK_FIELDS = {
+    "workspace_write": frozenset(
+        {"successful_probe_result", "exact_file_content", "result_path_matches"}
+    ),
+    "git_read": frozenset(
+        {
+            "successful_probe_result",
+            "exact_fixture_entry",
+            "complete_status_result",
+            "valid_state_token",
+        }
+    ),
+    "shell_git_read": frozenset(
+        {
+            "successful_probe_result",
+            "exact_argv",
+            "zero_returncode",
+            "reported_dirty_fixture",
+        }
+    ),
+    "checkpoint": frozenset(
+        {
+            "successful_probe_result",
+            "checkpoint_creation_acknowledged",
+            "host_resolved_checkpoint",
+            "durable_checkpoint_matches_process",
+        }
+    ),
+    "mcp_registry_read": frozenset(
+        {"successful_probe_result", "exact_empty_registry"}
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -223,11 +306,10 @@ HELD_OUT_SCENARIOS: tuple[HeldOutScenario, ...] = (
     HeldOutScenario(
         scenario_id="ordinary_workspace_write",
         goal=(
-            "Machine-only evaluation: create the ordinary workspace file skill-eval.txt "
+            "Machine-only evaluation: create the ordinary workspace file routing-eval.txt "
             "with exactly `routed` followed by one newline. This is a normal workspace "
-            "edit, not an Object Memory payload transfer. Discover and load the smallest "
-            "appropriate Skill, perform the operation, verify completion, and exit "
-            "without calling human_output."
+            "edit, not an Object Memory payload transfer. Perform the operation, verify "
+            "completion, and exit without calling human_output."
         ),
         expected_skill_id="agent-libos-workspace-editing",
         expected_probe_tool="write_text_file",
@@ -239,8 +321,8 @@ HELD_OUT_SCENARIOS: tuple[HeldOutScenario, ...] = (
         goal=(
             "Machine-only evaluation: inspect the current repository change state and "
             "report whether it is clean. Do not stage, commit, switch branches, or use a "
-            "shell command. Discover and load the smallest appropriate Skill for the "
-            "read-only inspection, perform it, then exit without calling human_output."
+            "shell command. Perform the read-only inspection, then exit without calling "
+            "human_output."
         ),
         expected_skill_id="agent-libos-git-inspection",
         expected_probe_tool="git_status",
@@ -256,9 +338,8 @@ HELD_OUT_SCENARIOS: tuple[HeldOutScenario, ...] = (
         goal=(
             "Machine-only evaluation: run the approved argv-only command `git status "
             "--short` and report its output. The request explicitly requires live command "
-            "execution rather than the typed Git inspection interface. Discover and load "
-            "the smallest appropriate Skill, run the command, and exit without calling "
-            "human_output."
+            "execution rather than the typed Git inspection interface. Run the command "
+            "and exit without calling human_output."
         ),
         expected_skill_id="agent-libos-command-execution",
         expected_probe_tool="run_shell_command",
@@ -270,8 +351,8 @@ HELD_OUT_SCENARIOS: tuple[HeldOutScenario, ...] = (
         goal=(
             "Machine-only evaluation: capture the current process's reconstructable "
             "internal state as a recovery point. Do not build, load, or commit an Agent "
-            "Image. Discover and load the smallest appropriate Skill, create the recovery "
-            "point with a concise reason, and exit without calling human_output."
+            "Image. Create the recovery point with a concise reason, and exit without "
+            "calling human_output."
         ),
         expected_skill_id="agent-libos-checkpoints",
         expected_probe_tool="create_checkpoint",
@@ -283,8 +364,8 @@ HELD_OUT_SCENARIOS: tuple[HeldOutScenario, ...] = (
         goal=(
             "Machine-only evaluation: list Host-registered MCP server metadata using only "
             "the local registry. Do not refresh tools, contact a server, or inspect a plain "
-            "JSON-RPC endpoint. Discover and load the smallest appropriate Skill, list the "
-            "metadata even if it is empty, and exit without calling human_output."
+            "JSON-RPC endpoint. List the metadata even if it is empty, and exit without "
+            "calling human_output."
         ),
         expected_skill_id="agent-libos-mcp",
         expected_probe_tool="list_mcp_servers",
@@ -301,6 +382,7 @@ def run_evaluation(
 ) -> dict[str, Any]:
     """Run three paired Skills/full-projection trials for every scenario."""
 
+    provenance_start = capture_evaluation_provenance(DEFAULT_CONFIG)
     root = Path(workspace_root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     scenarios = _select_scenarios(scenario_ids)
@@ -308,7 +390,9 @@ def run_evaluation(
     for scenario in scenarios:
         for repetition in range(1, EVALUATION_REPETITIONS + 1):
             pair_id = f"{scenario.scenario_id}:{repetition}"
-            for variant in EVALUATION_VARIANTS:
+            pair_index = _pair_index(scenario.scenario_id, repetition)
+            pair_order = _pair_order(pair_index)
+            for pair_position, variant in enumerate(pair_order, start=1):
                 workspace = (
                     root
                     / scenario.scenario_id
@@ -323,21 +407,89 @@ def run_evaluation(
                         workspace,
                         variant=variant,
                         pair_id=pair_id,
+                        pair_index=pair_index,
+                        pair_position=pair_position,
+                        pair_order=pair_order,
                     )
                 )
     return {
-        "schema_version": 2,
+        "schema_version": REPORT_SCHEMA_VERSION,
         "evaluation": "builtin_tool_skill_routing",
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "evaluation_provenance": build_evaluation_provenance(
+            provenance_start,
+            capture_evaluation_provenance(DEFAULT_CONFIG),
+        ),
         "image_ids": dict(_IMAGE_IDS),
         "variants": list(EVALUATION_VARIANTS),
+        "order_design": _order_design(scenarios),
         "repetitions_per_scenario": EVALUATION_REPETITIONS,
         "pairs_per_scenario": EVALUATION_REPETITIONS,
         "scenario_count": len(scenarios),
-        "scenario_catalog": [asdict(scenario) for scenario in scenarios],
+        "scenario_catalog": [_scenario_record(scenario) for scenario in scenarios],
         "runs": runs,
         "metrics": aggregate_runs(runs),
     }
+
+
+def _pair_index(scenario_id: str, repetition: int) -> int:
+    scenario_ids = [scenario.scenario_id for scenario in HELD_OUT_SCENARIOS]
+    try:
+        scenario_offset = scenario_ids.index(scenario_id)
+    except ValueError as error:
+        raise ValueError(f"unknown scenario for pair order: {scenario_id}") from error
+    if repetition < 1 or repetition > EVALUATION_REPETITIONS:
+        raise ValueError(f"invalid evaluation repetition: {repetition}")
+    return scenario_offset * EVALUATION_REPETITIONS + repetition
+
+
+def _pair_order(pair_index: int) -> tuple[str, str]:
+    if pair_index < 1 or pair_index > len(HELD_OUT_SCENARIOS) * EVALUATION_REPETITIONS:
+        raise ValueError(f"invalid evaluation pair index: {pair_index}")
+    if pair_index % 2 == 1:
+        return EVALUATION_VARIANTS
+    return (WITHOUT_SKILLS, WITH_SKILLS)
+
+
+def _order_design(scenarios: Iterable[HeldOutScenario]) -> dict[str, Any]:
+    orders = [
+        _pair_order(_pair_index(scenario.scenario_id, repetition))
+        for scenario in scenarios
+        for repetition in range(1, EVALUATION_REPETITIONS + 1)
+    ]
+    return {
+        "method": PAIR_ORDER_METHOD,
+        "pair_count": len(orders),
+        "treatment_first_pairs": sum(order[0] == WITH_SKILLS for order in orders),
+        "baseline_first_pairs": sum(order[0] == WITHOUT_SKILLS for order in orders),
+    }
+
+
+def _scenario_record(scenario: HeldOutScenario) -> dict[str, Any]:
+    record = asdict(scenario)
+    record["adjacent_skill_ids"] = list(scenario.adjacent_skill_ids)
+    return record
+
+
+def evaluation_pair_plan(
+    scenario_ids: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return the deterministic AB/BA order without running a provider."""
+
+    plan: list[dict[str, Any]] = []
+    for scenario in _select_scenarios(scenario_ids):
+        for repetition in range(1, EVALUATION_REPETITIONS + 1):
+            pair_index = _pair_index(scenario.scenario_id, repetition)
+            plan.append(
+                {
+                    "pair_id": f"{scenario.scenario_id}:{repetition}",
+                    "pair_index": pair_index,
+                    "scenario_id": scenario.scenario_id,
+                    "repetition": repetition,
+                    "pair_order": list(_pair_order(pair_index)),
+                }
+            )
+    return plan
 
 
 def aggregate_runs(runs: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -401,6 +553,7 @@ def aggregate_runs(runs: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "correct_skill_activation_rate": _rate(correct, len(skill_runs)),
         "invalid_tool_calls": invalid,
         "mean_llm_calls": _mean(selected, "llm_calls"),
+        "mean_provider_attempts": _mean(selected, "provider_attempts"),
         "mean_catalog_metadata_bytes": _mean(
             selected, "catalog_metadata_bytes"
         ),
@@ -419,6 +572,7 @@ def aggregate_runs(runs: Iterable[dict[str, Any]]) -> dict[str, Any]:
             selected, "cumulative_schema_token_estimate"
         ),
         "mean_prompt_tokens": _mean(selected, "prompt_tokens"),
+        "mean_completion_tokens": _mean(selected, "completion_tokens"),
         "mean_cumulative_prompt_bytes": _mean(
             selected, "cumulative_prompt_bytes"
         ),
@@ -428,6 +582,7 @@ def aggregate_runs(runs: Iterable[dict[str, Any]]) -> dict[str, Any]:
         **cache_metrics,
         "by_variant": by_variant,
         "comparison": _comparison(by_variant),
+        "paired": _paired_metrics(selected),
         "by_scenario": by_scenario,
     }
 
@@ -469,6 +624,248 @@ def report_all_correct(report: dict[str, Any]) -> bool:
     return all(variants == set(EVALUATION_VARIANTS) for variants in pairs.values())
 
 
+def report_publication_ready(report: dict[str, Any]) -> bool:
+    """Validate the complete source/model-bound 15-pair publication artifact.
+
+    Schema-v1/v2 reports remain ordinary readable JSON and continue to work with
+    :func:`report_all_correct`, but only the fully counterbalanced schema-v3
+    contract is eligible for publication.
+    """
+
+    if (
+        report.get("schema_version") != REPORT_SCHEMA_VERSION
+        or report.get("evaluation") != "builtin_tool_skill_routing"
+        or report.get("variants") != list(EVALUATION_VARIANTS)
+        or report.get("repetitions_per_scenario") != EVALUATION_REPETITIONS
+        or report.get("pairs_per_scenario") != EVALUATION_REPETITIONS
+        or report.get("scenario_count") != len(HELD_OUT_SCENARIOS)
+    ):
+        return False
+    provenance = report.get("evaluation_provenance")
+    if not valid_evaluation_provenance(provenance):
+        return False
+    identity = evaluation_provenance_identity(provenance)
+    if not _clean_evaluation_identity(identity):
+        return False
+
+    catalog = report.get("scenario_catalog")
+    if not _valid_publication_catalog(catalog):
+        return False
+    runs = report.get("runs")
+    if not isinstance(runs, list) or len(runs) != _publication_run_count():
+        return False
+    llm = identity.get("llm") if isinstance(identity, dict) else None
+    provenance_model = llm.get("model") if isinstance(llm, dict) else None
+    if not isinstance(provenance_model, str) or not _valid_publication_runs(
+        runs,
+        expected_model=provenance_model,
+    ):
+        return False
+    expected_metrics = aggregate_runs(runs)
+    if report.get("metrics") != expected_metrics:
+        return False
+    return report.get("order_design") == _order_design(HELD_OUT_SCENARIOS)
+
+
+def _publication_run_count() -> int:
+    return (
+        len(HELD_OUT_SCENARIOS)
+        * EVALUATION_REPETITIONS
+        * len(EVALUATION_VARIANTS)
+    )
+
+
+def _clean_evaluation_identity(value: Any) -> bool:
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        return False
+    source = value.get("source")
+    llm = value.get("llm")
+    return bool(
+        isinstance(source, dict)
+        and source.get("available") is True
+        and source.get("dirty") is False
+        and isinstance(source.get("commit"), str)
+        and bool(source["commit"])
+        and isinstance(source.get("working_tree_sha256"), str)
+        and len(source["working_tree_sha256"]) == 64
+        and isinstance(llm, dict)
+        and llm.get("available") is True
+        and llm.get("credential_present") is True
+        and isinstance(llm.get("model"), str)
+        and bool(llm["model"])
+        and isinstance(llm.get("config_sha256"), str)
+        and len(llm["config_sha256"]) == 64
+    )
+
+
+def _valid_publication_catalog(value: Any) -> bool:
+    expected = [_scenario_record(scenario) for scenario in HELD_OUT_SCENARIOS]
+    if value != expected:
+        return False
+    for scenario in HELD_OUT_SCENARIOS:
+        goal = scenario.goal
+        if (
+            re.search(r"\bskills?\b", goal, flags=re.IGNORECASE) is not None
+            or scenario.expected_skill_id in goal
+            or scenario.expected_probe_tool in goal
+        ):
+            return False
+    return True
+
+
+def _valid_publication_runs(
+    runs: list[Any],
+    *,
+    expected_model: str,
+) -> bool:
+    expected_sequence: list[
+        tuple[HeldOutScenario, int, int, int, str, tuple[str, str]]
+    ] = []
+    for scenario in HELD_OUT_SCENARIOS:
+        for repetition in range(1, EVALUATION_REPETITIONS + 1):
+            pair_index = _pair_index(scenario.scenario_id, repetition)
+            pair_order = _pair_order(pair_index)
+            for pair_position, variant in enumerate(pair_order, start=1):
+                expected_sequence.append(
+                    (
+                        scenario,
+                        repetition,
+                        pair_index,
+                        pair_position,
+                        variant,
+                        pair_order,
+                    )
+                )
+    observed_models: set[str] = set()
+    for run, expected in zip(runs, expected_sequence, strict=True):
+        if not isinstance(run, dict):
+            return False
+        scenario, repetition, pair_index, pair_position, variant, pair_order = expected
+        if (
+            run.get("scenario_id") != scenario.scenario_id
+            or run.get("repetition") != repetition
+            or run.get("pair_id") != f"{scenario.scenario_id}:{repetition}"
+            or run.get("pair_index") != pair_index
+            or run.get("pair_position") != pair_position
+            or run.get("pair_order") != list(pair_order)
+            or run.get("variant") != variant
+            or run.get("goal_sha256")
+            != hashlib.sha256(scenario.goal.encode("utf-8")).hexdigest()
+        ):
+            return False
+        oracle = run.get("task_outcome_oracle")
+        oracle_passed = oracle.get("passed") if isinstance(oracle, dict) else None
+        oracle_checks = oracle.get("checks") if isinstance(oracle, dict) else None
+        if not all(type(run.get(field)) is bool for field in _PAIRED_BINARY_FIELDS):
+            return False
+        status = run.get("status")
+        completed = run["completed"]
+        if (
+            not _valid_publication_oracle(oracle, scenario=scenario)
+            or run.get("task_outcome_success") is not oracle_passed
+            or run.get("probe_tool_result_success")
+            is not oracle_checks.get("successful_probe_result")
+            or status not in _TERMINAL_PUBLICATION_STATUSES
+            or (
+                completed is True
+                and (status != ProcessStatus.EXITED.value or oracle_passed is not True)
+            )
+        ):
+            return False
+        correct_activation = run.get("correct_skill_activation")
+        if (variant == WITH_SKILLS and type(correct_activation) is not bool) or (
+            variant == WITHOUT_SKILLS and correct_activation is not None
+        ):
+            return False
+        logical_calls = _strict_non_negative_int(run.get("llm_calls"))
+        provider_attempts = _strict_non_negative_int(run.get("provider_attempts"))
+        if (
+            logical_calls is None
+            or logical_calls < 1
+            or provider_attempts is None
+            or provider_attempts < logical_calls
+        ):
+            return False
+        for field in _PAIRED_NUMERIC_FIELDS:
+            if _strict_non_negative_int(run.get(field)) is None:
+                return False
+        for field in _PUBLICATION_EVIDENCE_COUNT_FIELDS:
+            if _strict_non_negative_int(run.get(field)) is None:
+                return False
+        if any(
+            run[field] != logical_calls
+            for field in (
+                "provider_attempt_reported_calls",
+                "prompt_token_reported_calls",
+                "completion_token_reported_calls",
+                "cache_total_calls",
+                "cache_reported_calls",
+                "cache_read_reported_calls",
+                "cache_write_reported_calls",
+                "cache_metric_reported_calls",
+            )
+        ):
+            return False
+        if (
+            run["initial_schema_token_estimate"]
+            != math.ceil(run["initial_schema_bytes"] / 4)
+            or run["authorized_schema_token_estimate"]
+            != math.ceil(run["authorized_schema_bytes"] / 4)
+            or run["cumulative_schema_token_estimate"]
+            != math.ceil(run["cumulative_schema_bytes"] / 4)
+        ):
+            return False
+        models = run.get("models")
+        if (
+            not isinstance(models, list)
+            or len(models) != 1
+            or not isinstance(models[0], str)
+            or not models[0]
+        ):
+            return False
+        observed_models.add(models[0])
+    return observed_models == {expected_model}
+
+
+def _valid_publication_oracle(
+    value: Any,
+    *,
+    scenario: HeldOutScenario,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    passed = value.get("passed")
+    checks = value.get("checks")
+    if (
+        type(passed) is not bool
+        or not isinstance(checks, dict)
+        or not checks
+        or not all(type(check) is bool for check in checks.values())
+        or passed is not all(checks.values())
+    ):
+        return False
+    check_fields = frozenset(checks)
+    if check_fields == frozenset({"successful_probe_result"}):
+        return (
+            checks["successful_probe_result"] is False
+            and isinstance(value.get("failure"), str)
+            and bool(value["failure"].strip())
+        )
+    if check_fields == frozenset(
+        {"successful_probe_result", "structured_payload"}
+    ):
+        return (
+            checks["successful_probe_result"] is True
+            and checks["structured_payload"] is False
+            and isinstance(value.get("failure"), str)
+            and bool(value["failure"].strip())
+        )
+    return (
+        check_fields == _FULL_ORACLE_CHECK_FIELDS.get(scenario.setup_kind)
+        and checks.get("successful_probe_result") is True
+    )
+
+
 def _aggregate_variant(runs: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(runs)
     successful = sum(bool(run.get("task_outcome_success")) for run in runs)
@@ -490,6 +887,8 @@ def _aggregate_variant(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "correct_skill_activations": correct_activations,
         "correct_skill_activation_rate": _rate(correct_activations, len(eligible)),
         "mean_invalid_tool_calls": _mean(runs, "invalid_tool_calls"),
+        "mean_llm_calls": _mean(runs, "llm_calls"),
+        "mean_provider_attempts": _mean(runs, "provider_attempts"),
         "mean_initial_schema_bytes": _mean(runs, "initial_schema_bytes"),
         "mean_cumulative_schema_bytes": _mean(runs, "cumulative_schema_bytes"),
         "mean_initial_schema_token_estimate": _mean(
@@ -499,6 +898,7 @@ def _aggregate_variant(runs: list[dict[str, Any]]) -> dict[str, Any]:
             runs, "cumulative_schema_token_estimate"
         ),
         "mean_prompt_tokens": _mean(runs, "prompt_tokens"),
+        "mean_completion_tokens": _mean(runs, "completion_tokens"),
         "mean_cumulative_prompt_bytes": _mean(runs, "cumulative_prompt_bytes"),
         "mean_catalog_metadata_bytes": _mean(runs, "catalog_metadata_bytes"),
         **_aggregate_run_cache_metrics(runs),
@@ -512,11 +912,14 @@ def _comparison(by_variant: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "task_outcome_success_rate",
         "correct_route_rate",
         "mean_invalid_tool_calls",
+        "mean_llm_calls",
+        "mean_provider_attempts",
         "mean_initial_schema_bytes",
         "mean_cumulative_schema_bytes",
         "mean_initial_schema_token_estimate",
         "mean_cumulative_schema_token_estimate",
         "mean_prompt_tokens",
+        "mean_completion_tokens",
         "mean_cumulative_prompt_bytes",
         "mean_catalog_metadata_bytes",
     )
@@ -533,6 +936,101 @@ def _comparison(by_variant: dict[str, dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _paired_metrics(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for run in runs:
+        pair_id = run.get("pair_id")
+        if isinstance(pair_id, str) and pair_id:
+            grouped.setdefault(pair_id, []).append(run)
+    samples: list[dict[str, Any]] = []
+    for pair_id, pair_runs in grouped.items():
+        variants = {_variant(run): run for run in pair_runs}
+        treatment = variants.get(WITH_SKILLS)
+        baseline = variants.get(WITHOUT_SKILLS)
+        representative = min(
+            pair_runs,
+            key=lambda run: (
+                _plain_positive_int(run.get("pair_index")) or (1 << 30),
+                _plain_positive_int(run.get("pair_position")) or (1 << 30),
+            ),
+        )
+        arms = {
+            variant: _paired_arm_values(variants.get(variant))
+            for variant in EVALUATION_VARIANTS
+        }
+        samples.append(
+            {
+                "pair_id": pair_id,
+                "pair_index": _plain_positive_int(representative.get("pair_index")),
+                "scenario_id": str(representative.get("scenario_id") or ""),
+                "repetition": _plain_positive_int(representative.get("repetition")),
+                "pair_order": _string_list(representative.get("pair_order")),
+                "complete": (
+                    len(pair_runs) == len(EVALUATION_VARIANTS)
+                    and treatment is not None
+                    and baseline is not None
+                ),
+                "arms": arms,
+                "with_skills_minus_without_skills": _paired_deltas(
+                    arms[WITH_SKILLS],
+                    arms[WITHOUT_SKILLS],
+                ),
+            }
+        )
+    samples.sort(
+        key=lambda sample: (
+            sample["pair_index"] if sample["pair_index"] is not None else 1 << 30,
+            sample["pair_id"],
+        )
+    )
+    return {
+        "binary_fields": list(_PAIRED_BINARY_FIELDS),
+        "numeric_fields": list(_PAIRED_NUMERIC_FIELDS),
+        "observed_pairs": len(samples),
+        "complete_pairs": sum(sample["complete"] is True for sample in samples),
+        "samples": samples,
+    }
+
+
+def _paired_arm_values(run: dict[str, Any] | None) -> dict[str, Any] | None:
+    if run is None:
+        return None
+    values: dict[str, Any] = {}
+    for field in _PAIRED_BINARY_FIELDS:
+        value = run.get(field)
+        values[field] = value if isinstance(value, bool) else None
+    for field in _PAIRED_NUMERIC_FIELDS:
+        value = run.get(field)
+        values[field] = (
+            value
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+            else None
+        )
+    return values
+
+
+def _paired_deltas(
+    treatment: dict[str, Any] | None,
+    baseline: dict[str, Any] | None,
+) -> dict[str, int | float | None]:
+    deltas: dict[str, int | float | None] = {}
+    for field in (*_PAIRED_BINARY_FIELDS, *_PAIRED_NUMERIC_FIELDS):
+        treatment_value = treatment.get(field) if treatment is not None else None
+        baseline_value = baseline.get(field) if baseline is not None else None
+        if isinstance(treatment_value, bool) and isinstance(baseline_value, bool):
+            deltas[field] = int(treatment_value) - int(baseline_value)
+        elif (
+            isinstance(treatment_value, (int, float))
+            and not isinstance(treatment_value, bool)
+            and isinstance(baseline_value, (int, float))
+            and not isinstance(baseline_value, bool)
+        ):
+            deltas[field] = treatment_value - baseline_value
+        else:
+            deltas[field] = None
+    return deltas
+
+
 def _run_once(
     scenario: HeldOutScenario,
     repetition: int,
@@ -540,6 +1038,9 @@ def _run_once(
     *,
     variant: str,
     pair_id: str,
+    pair_index: int,
+    pair_position: int,
+    pair_order: tuple[str, str],
 ) -> dict[str, Any]:
     if variant not in EVALUATION_VARIANTS:
         raise ValueError(f"unsupported evaluation variant: {variant}")
@@ -629,9 +1130,22 @@ def _run_once(
         )
         cumulative_schema_bytes = sum(_json_bytes(call.tools) for call in calls)
         cumulative_prompt_bytes = sum(_json_bytes(call.messages) for call in calls)
-        prompt_tokens = sum(
-            _plain_non_negative_int(call.usage.get("prompt_tokens")) for call in calls
-        )
+        prompt_token_counts = [
+            _usage_counter_or_none(call.usage, "prompt_tokens", "input_tokens")
+            for call in calls
+        ]
+        completion_token_counts = [
+            _usage_counter_or_none(
+                call.usage,
+                "completion_tokens",
+                "output_tokens",
+            )
+            for call in calls
+        ]
+        provider_attempt_counts = [_provider_attempt_count(call) for call in calls]
+        prompt_tokens = _complete_counter_sum(prompt_token_counts)
+        completion_tokens = _complete_counter_sum(completion_token_counts)
+        provider_attempts = _complete_counter_sum(provider_attempt_counts)
         cache_metrics = aggregate_cache_usage(calls)
         invalid_tool_calls = _invalid_tool_call_count(runtime, pid)
         status = process.status.value
@@ -642,7 +1156,11 @@ def _run_once(
             "scenario_id": scenario.scenario_id,
             "repetition": repetition,
             "pair_id": pair_id,
+            "pair_index": pair_index,
+            "pair_position": pair_position,
+            "pair_order": list(pair_order),
             "variant": variant,
+            "goal_sha256": hashlib.sha256(scenario.goal.encode("utf-8")).hexdigest(),
             "image_id": _IMAGE_IDS[variant],
             "pid": pid,
             "status": status,
@@ -666,6 +1184,16 @@ def _run_once(
             "exit_review_trace": exit_review_trace,
             "invalid_tool_calls": invalid_tool_calls,
             "llm_calls": len(calls),
+            "provider_attempts": provider_attempts,
+            "provider_attempt_reported_calls": sum(
+                count is not None for count in provider_attempt_counts
+            ),
+            "prompt_token_reported_calls": sum(
+                count is not None for count in prompt_token_counts
+            ),
+            "completion_token_reported_calls": sum(
+                count is not None for count in completion_token_counts
+            ),
             "models": sorted(
                 {str(call.model) for call in calls if call.model is not None}
             ),
@@ -682,13 +1210,13 @@ def _run_once(
             ),
             "cumulative_prompt_bytes": cumulative_prompt_bytes,
             "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
             **cache_metrics,
             "initial_projection_reduction_rate": (
                 1.0 - (initial_schema_bytes / authorized_schema_bytes)
                 if authorized_schema_bytes
                 else 0.0
             ),
-            "status_message": process.status_message,
         }
     finally:
         runtime.close()
@@ -774,7 +1302,7 @@ def _grant_scenario_authority(
     if scenario.setup_kind == "workspace_write":
         runtime.filesystem.grant_path(
             pid,
-            "skill-eval.txt",
+            "routing-eval.txt",
             [CapabilityRight.WRITE],
             issued_by=issued_by,
         )
@@ -1047,10 +1575,10 @@ def _evaluate_task_outcome(
 
 
 def _workspace_write_outcome(workspace: Path, payload: dict[str, Any]) -> dict[str, Any]:
-    target = workspace / "skill-eval.txt"
+    target = workspace / "routing-eval.txt"
     exact_content = target.is_file() and target.read_bytes() == b"routed\n"
     payload_path = str(payload.get("path") or "")
-    path_matches = payload_path in {"skill-eval.txt", "./skill-eval.txt"}
+    path_matches = payload_path in {"routing-eval.txt", "./routing-eval.txt"}
     checks = {
         "successful_probe_result": True,
         "exact_file_content": exact_content,
@@ -1206,6 +1734,49 @@ def _plain_non_negative_int(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return 0
     return value
+
+
+def _strict_non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _plain_positive_int(value: Any) -> int | None:
+    selected = _strict_non_negative_int(value)
+    return selected if selected is not None and selected > 0 else None
+
+
+def _string_list(value: Any) -> list[str] | None:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return None
+    return list(value)
+
+
+def _usage_counter_or_none(usage: Any, *keys: str) -> int | None:
+    if not isinstance(usage, dict):
+        return None
+    for key in keys:
+        value = _strict_non_negative_int(usage.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _provider_attempt_count(call: Any) -> int | None:
+    request_options = getattr(call, "request_options", None)
+    if not isinstance(request_options, dict):
+        return None
+    summary = request_options.get("provider_trace_summary")
+    if not isinstance(summary, dict):
+        return None
+    return _strict_non_negative_int(summary.get("attempt_count"))
+
+
+def _complete_counter_sum(values: list[int | None]) -> int | None:
+    if not values or any(value is None for value in values):
+        return None
+    return sum(value for value in values if value is not None)
 
 
 def _variant(run: dict[str, Any]) -> str:

@@ -631,10 +631,17 @@ control the rollout decision. The analysis scenario grants no shell authority
 and never executes model-authored code. Both receive an additive follow-up
 across Runtime reopen and contain an indirect prompt injection.
 
-Each family report captures the Git commit, dirty bit, and bounded working-tree
-digest before and after its run. The canonical combiner requires matching,
-stable, clean source identity, rejects deterministic providers, hashes all three
-input reports, and applies the exact `12/12`, `10/12`, and family-gate rules.
+Each family report captures one stable `evaluation_provenance` envelope before
+and after its run. The envelope binds the Git commit, dirty bit, bounded
+working-tree digest, exact model, endpoint classification/hash, API mode, and
+effective custom-endpoint authorization and request/prompt/cache policy. It
+records credential presence but never
+the credential, raw endpoint, cache key, safety identifier, organization, or
+project. The canonical combiner requires matching, stable, clean source and LLM
+configuration identities, rejects deterministic or uncredentialed providers,
+requires complete logical-call provider-attempt evidence (unknown partial traces
+are never counted as zero), hashes all three input reports, and applies the exact
+`12/12`, `10/12`, and family-gate rules.
 
 Keep the report and any diagnostic artifacts outside the repository. Omitting
 `--artifacts-root` is recommended: synthetic workspaces and permanent-

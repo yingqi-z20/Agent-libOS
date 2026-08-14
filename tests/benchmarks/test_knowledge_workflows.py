@@ -30,6 +30,10 @@ from benchmarks.knowledge_workflows.evaluation import (
     run_evaluation,
 )
 from experiments import run_knowledge_workflow_evaluation as knowledge_cli
+from tests.support.live_evaluation import (
+    stable_evaluation_provenance,
+    stable_source_provenance,
+)
 
 
 class _DeterministicKnowledgeProvider:
@@ -110,6 +114,18 @@ def test_knowledge_evaluator_runs_both_images_with_restart_and_oracles(
         assert run["task_run_satisfied_requirement_count"] == 2
         assert run["maximum_dispatches_per_effect"] <= 1
         assert providers[run["scenario_id"]].calls == run["llm_calls"]
+        assert run["provider_attempts"] == run["llm_calls"]
+        scenario_metrics = report["metrics"]["by_scenario"][run["scenario_id"]]
+        assert scenario_metrics["provider_attempts"] == run["provider_attempts"]
+        assert scenario_metrics["mean_provider_attempts"] == float(
+            run["provider_attempts"]
+        )
+    assert report["metrics"]["provider_attempts"] == sum(
+        run["provider_attempts"] for run in report["runs"]
+    )
+    assert report["metrics"]["mean_provider_attempts"] == pytest.approx(
+        report["metrics"]["provider_attempts"] / 2
+    )
     analysis = next(
         run for run in report["runs"] if run["scenario_id"] == ANALYSIS_SCENARIO_ID
     )
@@ -142,7 +158,15 @@ def test_knowledge_release_gate_fails_closed(mutation: str) -> None:
     elif mutation == "mode":
         report["evidence_mode"] = "deterministic"
     else:
-        report["source_provenance"]["stable"] = False
+        report["evaluation_provenance"]["stable"] = False
+
+    assert report_release_gate_passed(report) is False
+
+
+def test_knowledge_release_gate_rejects_incomplete_provider_attempt_evidence() -> None:
+    report = _live_release_report()
+    report["runs"][0]["provider_attempts"] = None
+    report["runs"][0]["provider_attempt_evidence_complete"] = False
 
     assert report_release_gate_passed(report) is False
 
@@ -154,6 +178,32 @@ def test_knowledge_library_requires_explicit_real_llm_confirmation(
     with pytest.raises(ValueError, match="confirm_real_llm=True"):
         run_evaluation(root, repetitions=1)
     assert not root.exists()
+
+
+def test_knowledge_execution_errors_report_zero_provider_attempts(
+    tmp_path: Path,
+) -> None:
+    report = run_evaluation(
+        tmp_path / "execution-errors",
+        repetitions=1,
+        llm_client_factory=lambda _scenario_id, _repetition: None,
+    )
+
+    assert all(run["conclusion"] == "execution_error" for run in report["runs"])
+    assert all(run["provider_attempts"] is None for run in report["runs"])
+    assert all(
+        run["provider_attempt_evidence_complete"] is False
+        for run in report["runs"]
+    )
+    assert report["metrics"]["provider_attempts"] is None
+    assert report["metrics"]["mean_provider_attempts"] is None
+    assert report["metrics"]["provider_attempt_evidence_complete"] is False
+    assert all(
+        metrics["provider_attempts"] is None
+        and metrics["mean_provider_attempts"] is None
+        and metrics["provider_attempt_evidence_complete"] is False
+        for metrics in report["metrics"]["by_scenario"].values()
+    )
 
 
 def test_analysis_oracle_accepts_documented_guardrail_shape_and_bounds_os(
@@ -624,26 +674,18 @@ def _live_release_report() -> dict[str, Any]:
                 "scenario_id": scenario_id,
                 "safety_passed": True,
                 "utility_passed": True,
+                "llm_calls": 1,
+                "provider_attempts": 1,
+                "provider_attempt_evidence_complete": True,
             }
             for _ in range(3)
         )
-    identity = {
-        "schema_version": 1,
-        "available": True,
-        "commit": "a" * 40,
-        "dirty": False,
-        "working_tree_sha256": "b" * 64,
-    }
     return {
         "schema_version": 1,
         "evaluation": EVALUATION_ID,
         "evidence_mode": "llm-live",
         "repetitions": 3,
         "runs": runs,
-        "source_provenance": {
-            "schema_version": 1,
-            "start": identity,
-            "end": dict(identity),
-            "stable": True,
-        },
+        "source_provenance": stable_source_provenance(),
+        "evaluation_provenance": stable_evaluation_provenance(),
     }

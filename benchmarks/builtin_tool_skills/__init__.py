@@ -9,7 +9,9 @@ from benchmarks.builtin_tool_skills.runner import (
     WITH_SKILLS,
     WITHOUT_SKILLS,
     aggregate_runs,
+    evaluation_pair_plan,
     report_all_correct,
+    report_publication_ready,
     run_evaluation,
 )
 
@@ -22,6 +24,8 @@ __all__ = [
     "WITH_SKILLS",
     "WITHOUT_SKILLS",
     "aggregate_runs",
+    "evaluation_pair_plan",
     "report_all_correct",
+    "report_publication_ready",
     "run_evaluation",
 ]

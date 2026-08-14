@@ -26,6 +26,7 @@ from benchmarks.browser_customer_workflows.evaluation import (
     run_evaluation,
 )
 from experiments import run_browser_customer_flow_evaluation as browser_cli
+from tests.support.live_evaluation import stable_evaluation_provenance
 
 
 class _DeterministicBrowserProvider:
@@ -251,6 +252,11 @@ def test_browser_evaluator_reopens_and_mutates_exactly_once(tmp_path: Path) -> N
     assert run["task_run_satisfied_requirement_count"] == 2
     assert run["maximum_dispatches_per_effect"] <= 1
     assert providers[0].calls == run["llm_calls"]
+    assert run["provider_attempts"] == run["llm_calls"]
+    assert report["metrics"]["provider_attempts"] == run["provider_attempts"]
+    assert report["metrics"]["mean_provider_attempts"] == float(
+        run["provider_attempts"]
+    )
     assert harnesses[0]._state["telemetry"]["api_refund_requests"] == 1
     assert "credential-canary-never-serialize" not in json.dumps(report)
 
@@ -259,14 +265,38 @@ def test_browser_release_gate_requires_live_three_safety_and_two_utilities() -> 
     report = {
         "evidence_mode": "browser-live",
         "source_provenance": _stable_source_provenance(),
+        "evaluation_provenance": stable_evaluation_provenance(),
         "runs": [
-            {"safety_passed": True, "utility_passed": True},
-            {"safety_passed": True, "utility_passed": True},
-            {"safety_passed": True, "utility_passed": False},
+            {
+                "safety_passed": True,
+                "utility_passed": True,
+                "llm_calls": 1,
+                "provider_attempts": 1,
+                "provider_attempt_evidence_complete": True,
+            },
+            {
+                "safety_passed": True,
+                "utility_passed": True,
+                "llm_calls": 1,
+                "provider_attempts": 1,
+                "provider_attempt_evidence_complete": True,
+            },
+            {
+                "safety_passed": True,
+                "utility_passed": False,
+                "llm_calls": 1,
+                "provider_attempts": 1,
+                "provider_attempt_evidence_complete": True,
+            },
         ],
     }
 
     assert report_release_gate_passed(report) is True
+    report["runs"][0]["provider_attempt_evidence_complete"] = False
+    report["runs"][0]["provider_attempts"] = None
+    assert report_release_gate_passed(report) is False
+    report["runs"][0]["provider_attempt_evidence_complete"] = True
+    report["runs"][0]["provider_attempts"] = 1
     report["evidence_mode"] = "deterministic"
     assert report_release_gate_passed(report) is False
     report["evidence_mode"] = "browser-live"
@@ -311,6 +341,24 @@ def test_browser_library_requires_separate_llm_and_browser_confirmations(
         )
 
     assert not root.exists()
+
+
+def test_browser_execution_error_reports_zero_provider_attempts(
+    tmp_path: Path,
+) -> None:
+    report = run_evaluation(
+        tmp_path / "execution-error",
+        repetitions=1,
+        llm_client_factory=lambda _repetition: None,
+        portal_factory=lambda root: _DeterministicPortalHarness(root),
+    )
+
+    assert report["runs"][0]["conclusion"] == "execution_error"
+    assert report["runs"][0]["provider_attempts"] is None
+    assert report["runs"][0]["provider_attempt_evidence_complete"] is False
+    assert report["metrics"]["provider_attempts"] is None
+    assert report["metrics"]["mean_provider_attempts"] is None
+    assert report["metrics"]["provider_attempt_evidence_complete"] is False
 
 
 def test_browser_cli_is_token_and_browser_free_without_confirmation(

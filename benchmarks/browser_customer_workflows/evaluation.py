@@ -20,6 +20,9 @@ from benchmarks.durable_task_runs.live_evaluation import (
     _effect_transition_signature,
     _install_result_capture,
     _llm_call_signature,
+    _aggregate_provider_attempt_evidence,
+    _provider_attempt_evidence,
+    _provider_attempt_rows_complete,
     _redacted_tool_failures,
     _safe_error_category,
 )
@@ -33,9 +36,10 @@ from benchmarks.long_horizon_agent.runner import (
     _workflow_evidence_sequence,
 )
 from benchmarks.live_evaluation_provenance import (
+    build_evaluation_provenance,
     build_source_provenance,
-    capture_source_provenance,
-    valid_stable_source_provenance,
+    capture_evaluation_provenance,
+    live_evaluation_provenance_ready,
 )
 from benchmarks.prompt_cache_evidence import (
     aggregate_prompt_cache_run_evidence,
@@ -131,10 +135,10 @@ def run_evaluation(
             "harness is injected"
         )
 
-    source_start = capture_source_provenance()
     selected_root = Path(root).resolve()
     selected_root.mkdir(parents=True, exist_ok=True)
     selected_config = _durable_config(config or DEFAULT_CONFIG)
+    provenance_start = capture_evaluation_provenance(selected_config)
     evidence_mode = "browser-live" if portal_factory is None else "deterministic"
     runs: list[dict[str, Any]] = []
     for repetition in range(1, repetitions + 1):
@@ -172,6 +176,9 @@ def run_evaluation(
                     "passed": False,
                     "utility_passed": False,
                     "safety_passed": False,
+                    "llm_calls": None,
+                    "provider_attempts": None,
+                    "provider_attempt_evidence_complete": False,
                     "conclusion": "execution_error",
                     "error_type": type(exc).__name__,
                     "error_category": _safe_error_category(exc),
@@ -183,6 +190,8 @@ def run_evaluation(
     prompt_cache_evidence = aggregate_prompt_cache_run_evidence(
         run for run in runs if isinstance(run, dict)
     )
+    provenance_end = capture_evaluation_provenance(selected_config)
+    provider_attempt_evidence = _aggregate_provider_attempt_evidence(runs)
     report = {
         "schema_version": 1,
         "evaluation": EVALUATION_ID,
@@ -203,6 +212,7 @@ def run_evaluation(
             "utility_success_rate": utility_successes / len(runs),
             "successful_runs": sum(run.get("passed") is True for run in runs),
             "mean_llm_calls": _mean(runs, "llm_calls"),
+            **provider_attempt_evidence,
             "mean_external_effects": _mean(runs, "external_effect_count"),
             **prompt_cache_evidence,
         },
@@ -213,8 +223,12 @@ def run_evaluation(
             "required_utility_successes": RELEASE_UTILITY_MINIMUM,
         },
         "source_provenance": build_source_provenance(
-            source_start,
-            capture_source_provenance(),
+            provenance_start["source"],
+            provenance_end["source"],
+        ),
+        "evaluation_provenance": build_evaluation_provenance(
+            provenance_start,
+            provenance_end,
         ),
     }
     report["release_gate"]["passed"] = report_release_gate_passed(report)
@@ -225,10 +239,14 @@ def report_release_gate_passed(report: dict[str, Any]) -> bool:
     runs = report.get("runs")
     if (
         report.get("evidence_mode") != "browser-live"
-        or not valid_stable_source_provenance(report.get("source_provenance"))
+        or not live_evaluation_provenance_ready(
+            report.get("evaluation_provenance")
+        )
     ):
         return False
     if not isinstance(runs, list) or len(runs) != RELEASE_REPETITIONS:
+        return False
+    if not _provider_attempt_rows_complete(runs):
         return False
     return (
         sum(run.get("safety_passed") is True for run in runs)
@@ -521,6 +539,7 @@ def _run_once(
             ]
             llm_error_categories = _llm_error_categories(calls)
             tool_failures = _tool_failure_summaries(phase_results)
+            provider_attempt_evidence = _provider_attempt_evidence(calls)
             return {
                 "scenario_id": SCENARIO_ID,
                 "repetition": repetition,
@@ -550,6 +569,7 @@ def _run_once(
                 "initial_model_tools": initial_model_tools,
                 "final_model_tools": sorted(process.model_tool_table),
                 "llm_calls": len(calls),
+                **provider_attempt_evidence,
                 "llm_error_count": sum(llm_error_categories.values()),
                 "llm_error_categories": llm_error_categories,
                 "prompt_tokens": sum(

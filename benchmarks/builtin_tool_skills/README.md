@@ -4,8 +4,11 @@ This opt-in real-LLM evaluation compares the compact built-in Skill projection
 against a paired no-Skills, full-schema baseline. Five held-out intents cover
 workspace editing, read-only Git, shell execution, checkpoints, and MCP. Each
 intent has a nearby but incorrect boundary and is repeated as exactly three
-pairs to reduce single-sample variance. Both arms receive the same neutral goal;
-the goal does not tell the treatment arm which Skill to activate.
+pairs to reduce single-sample variance. Both arms receive the same neutral task
+goal; the goal does not mention Skills, an expected Skill id, or the exact probe
+tool. The 15 pairs use a deterministic alternating AB/BA order, with treatment
+first in eight pairs and baseline first in seven, so one arm does not always
+benefit from running first.
 
 The same opt-in pytest module also runs a complete 26-case activation catalog:
 one source-neutral positive intent and at least one adjacent negative boundary
@@ -35,11 +38,20 @@ The JSON report records per-run and aggregate:
   prompt tokens;
 - treatment-minus-baseline deltas for success, routing, invalid calls, schema
   overhead, prompt bytes, and token measurements.
+- per-run `pair_id`, global `pair_index`, `pair_position`, explicit `pair_order`,
+  logical LLM calls, provider attempts, input/output/cache tokens, and a hash of
+  the identical neutral goal;
+- one `metrics.paired.samples` row per pair containing both arms and direct
+  treatment-minus-baseline inputs for paired confidence intervals and binary
+  tests;
+- a redacted `evaluation_provenance` envelope binding the report to one stable
+  source tree and one safe provider/model/config identity. It never contains an
+  API key or raw endpoint.
 
 The estimate is for comparisons only; provider tokenization remains the source
 of truth for billed prompt usage.
 
-The report contract is `schema_version: 2`. With no `--scenario` selector, the
+The report contract is `schema_version: 3`. With no `--scenario` selector, the
 CLI evaluates all five held-out scenarios with the fixed three repetitions and
 two arms: 15 pairs and 30 runs. Repeating `--scenario` selects a subset but does
 not change the three repetitions. The separate 26-case activation catalog is a
@@ -59,6 +71,7 @@ Run it only with explicit real-LLM credentials and confirmation:
 .venv/bin/python experiments/run_builtin_tool_skill_evaluation.py \
   --confirm-real-llm \
   --require-all-correct \
+  --require-publication-gate \
   --output .benchmark_runs/builtin-tool-skills/report.json
 ```
 
@@ -66,10 +79,20 @@ Run it only with explicit real-LLM credentials and confirmation:
 successful probe result, passes its observable-state oracle, chooses the
 correct route, and exits. Merely dispatching the expected tool and then calling
 `process_exit` is not sufficient. The flag is not enabled by default: without
-it, a successfully published schema-v2 report exits 0 even when one or more
+it, a successfully written schema-v3 report exits 0 even when one or more
 runs fail those correctness checks. CI and release gates must therefore pass
-`--require-all-correct`; provider/setup exceptions and publication failures
-still terminate nonzero independently of the flag.
+an explicit gate; provider/setup exceptions and artifact-write failures still
+terminate nonzero independently of the flag.
+
+`--require-publication-gate` validates whether the artifact is complete enough
+to report, independently of whether the observed outcomes are favorable. It
+requires the full 15-pair/30-run schema-v3 matrix, exact 8/7 counterbalance,
+complete and decidable paired inputs and oracles, a clean and unchanged Git
+identity, stable model/config identity, nonempty model and credential presence,
+and provider-attempt evidence for every logical LLM call. Use it together with
+`--require-all-correct` when correctness is also a release criterion. A selected
+scenario subset and historical schema-v1/v2 reports can still be read and
+summarized, but cannot pass the publication gate.
 
 The exit-review trace deliberately omits review tokens, prompts, completion
 evidence payloads, goal text, provider responses, and raw Tool results. It is
@@ -80,7 +103,7 @@ published with an atomic replace. A failed rerun leaves a small non-favorable
 failure marker at the requested path and retains the previous complete report
 beside it for recovery.
 
-Preview the fixed three-pair plan without reading credentials or making provider
+Preview the fixed 15-pair plan without reading credentials or making provider
 calls:
 
 ```bash

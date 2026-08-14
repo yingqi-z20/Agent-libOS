@@ -17,7 +17,10 @@ from benchmarks.knowledge_workflows.evaluation import (
     EVALUATION_ID as KNOWLEDGE_EVALUATION_ID,
     report_release_gate_passed as knowledge_gate_passed,
 )
-from benchmarks.live_evaluation_provenance import valid_stable_source_provenance
+from benchmarks.live_evaluation_provenance import (
+    evaluation_provenance_identity,
+    live_evaluation_provenance_ready,
+)
 from benchmarks.prompt_cache_evidence import aggregate_prompt_cache_run_evidence
 
 
@@ -59,33 +62,63 @@ def combine_release_reports(
         family_gate=knowledge_gate_passed,
         expected_runs=REQUIRED_KNOWLEDGE_RUNS,
     )
-    maintenance_source = maintenance_report.get("source_provenance")
-    browser_source = browser_report.get("source_provenance")
-    knowledge_source = knowledge_report.get("source_provenance")
-    maintenance_source_valid = valid_stable_source_provenance(maintenance_source)
-    browser_source_valid = valid_stable_source_provenance(browser_source)
-    knowledge_source_valid = valid_stable_source_provenance(knowledge_source)
+    maintenance_provenance = maintenance_report.get("evaluation_provenance")
+    browser_provenance = browser_report.get("evaluation_provenance")
+    knowledge_provenance = knowledge_report.get("evaluation_provenance")
+    maintenance_source_valid = live_evaluation_provenance_ready(
+        maintenance_provenance
+    )
+    browser_source_valid = live_evaluation_provenance_ready(browser_provenance)
+    knowledge_source_valid = live_evaluation_provenance_ready(knowledge_provenance)
+    maintenance_identity = evaluation_provenance_identity(maintenance_provenance)
+    browser_identity = evaluation_provenance_identity(browser_provenance)
+    knowledge_identity = evaluation_provenance_identity(knowledge_provenance)
     source_identity = (
-        maintenance_source.get("end")
-        if maintenance_source_valid and isinstance(maintenance_source, dict)
+        maintenance_identity.get("source")
+        if maintenance_source_valid and isinstance(maintenance_identity, dict)
         else None
     )
-    browser_identity = (
-        browser_source.get("end")
-        if browser_source_valid and isinstance(browser_source, dict)
+    browser_source_identity = (
+        browser_identity.get("source")
+        if browser_source_valid and isinstance(browser_identity, dict)
         else None
     )
-    knowledge_identity = (
-        knowledge_source.get("end")
-        if knowledge_source_valid and isinstance(knowledge_source, dict)
+    knowledge_source_identity = (
+        knowledge_identity.get("source")
+        if knowledge_source_valid and isinstance(knowledge_identity, dict)
         else None
     )
     source_matches = bool(
         source_identity is not None
-        and source_identity == browser_identity
-        and source_identity == knowledge_identity
+        and source_identity == browser_source_identity
+        and source_identity == knowledge_source_identity
     )
     source_clean = bool(source_matches and source_identity.get("dirty") is False)
+    llm_identity = (
+        maintenance_identity.get("llm")
+        if maintenance_source_valid and isinstance(maintenance_identity, dict)
+        else None
+    )
+    browser_llm_identity = (
+        browser_identity.get("llm")
+        if browser_source_valid and isinstance(browser_identity, dict)
+        else None
+    )
+    knowledge_llm_identity = (
+        knowledge_identity.get("llm")
+        if knowledge_source_valid and isinstance(knowledge_identity, dict)
+        else None
+    )
+    llm_matches = bool(
+        llm_identity is not None
+        and llm_identity == browser_llm_identity
+        and llm_identity == knowledge_llm_identity
+    )
+    evaluation_identity_matches = bool(
+        maintenance_identity is not None
+        and maintenance_identity == browser_identity
+        and maintenance_identity == knowledge_identity
+    )
     total_runs = maintenance["runs"] + browser["runs"] + knowledge["runs"]
     total_safety = (
         maintenance["safety_successes"]
@@ -121,6 +154,8 @@ def combine_release_reports(
         "browser_source_stable": browser_source_valid,
         "knowledge_source_stable": knowledge_source_valid,
         "same_source_identity": source_matches,
+        "same_llm_config_identity": llm_matches,
+        "same_evaluation_identity": evaluation_identity_matches,
         "source_worktree_clean": source_clean,
         "prompt_layout_consistent": prompt_layout_consistent,
         "v2_forbidden_internal_id_leaks_absent": (
@@ -149,6 +184,10 @@ def combine_release_reports(
             "knowledge_sha256": _report_digest(knowledge_report),
         },
         "source_identity": source_identity if source_matches else None,
+        "llm_identity": llm_identity if llm_matches else None,
+        "evaluation_identity": (
+            maintenance_identity if evaluation_identity_matches else None
+        ),
         "prompt_layout": prompt_layout,
         "families": {
             "repository_maintenance": maintenance,

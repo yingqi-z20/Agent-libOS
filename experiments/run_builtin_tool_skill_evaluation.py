@@ -9,7 +9,9 @@ from benchmarks.builtin_tool_skills import (
     EVALUATION_REPETITIONS,
     EVALUATION_VARIANTS,
     HELD_OUT_SCENARIOS,
+    evaluation_pair_plan,
     report_all_correct,
+    report_publication_ready,
     run_evaluation,
 )
 from experiments.evaluation_cli import has_real_llm_environment
@@ -19,7 +21,7 @@ from experiments.evaluation_output import AtomicJsonOutput
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the opt-in, three-pair real-LLM evaluation comparing built-in "
+            "Run the opt-in, 15-pair real-LLM evaluation comparing built-in "
             "Tool Skill routing with a no-Skills full-projection baseline."
         )
     )
@@ -47,6 +49,15 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--require-publication-gate",
+        action="store_true",
+        help=(
+            "Exit non-zero unless this is a complete schema-v3 15-pair/30-run "
+            "report with clean stable source/model provenance, counterbalanced "
+            "order, and complete, decidable paired evidence."
+        ),
+    )
+    parser.add_argument(
         "--list-scenarios",
         action="store_true",
         help="Print scenario ids without making provider calls.",
@@ -54,7 +65,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print the selected three-pair evaluation plan without provider calls.",
+        help="Print the selected paired evaluation plan without provider calls.",
     )
     args = parser.parse_args(argv)
 
@@ -75,6 +86,9 @@ def main(argv: list[str] | None = None) -> None:
                     "repetitions_per_scenario": EVALUATION_REPETITIONS,
                     "variants": list(EVALUATION_VARIANTS),
                     "scenarios": [scenario.scenario_id for scenario in selected],
+                    "pair_plan": evaluation_pair_plan(
+                        scenario.scenario_id for scenario in selected
+                    ),
                     "planned_pairs": len(selected) * EVALUATION_REPETITIONS,
                     "planned_runs": (
                         len(selected)
@@ -87,6 +101,11 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
         return
+    if args.require_publication_gate and args.scenario:
+        parser.error(
+            "--require-publication-gate requires the complete scenario catalog; "
+            "omit --scenario"
+        )
     if not args.output:
         parser.error("--output is required")
     if not args.confirm_real_llm:
@@ -106,6 +125,8 @@ def main(argv: list[str] | None = None) -> None:
     print(rendered, end="")
 
     if args.require_all_correct and not report_all_correct(report):
+        raise SystemExit(1)
+    if args.require_publication_gate and not report_publication_ready(report):
         raise SystemExit(1)
 
 

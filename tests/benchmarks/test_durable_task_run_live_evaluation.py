@@ -7,9 +7,12 @@ from typing import Any
 import pytest
 
 from agent_libos.llm.client import LLMCompletion
+from agent_libos.models import LLMCallRecord
 from benchmarks.durable_task_runs.live_evaluation import (
     EVALUATION_ID,
     _observed_required_actions_succeeded,
+    _provider_attempt_evidence,
+    _provider_attempt_count,
     _redacted_tool_failures,
     _redacted_workflow_evidence,
     report_release_gate_passed,
@@ -17,6 +20,7 @@ from benchmarks.durable_task_runs.live_evaluation import (
 )
 from benchmarks.long_horizon_agent.runner import GOAL, REQUIRED_ACTIONS
 from experiments import run_durable_task_run_evaluation as live_cli
+from tests.support.live_evaluation import stable_evaluation_provenance
 
 
 class _DeterministicMaintenanceProvider:
@@ -60,6 +64,30 @@ class _DeterministicMaintenanceProvider:
                 }
             ],
         )
+
+
+def test_provider_attempt_count_uses_persisted_trace_summary() -> None:
+    call = LLMCallRecord(
+        call_id="call-1",
+        pid=None,
+        image_id=None,
+        purpose="agent_action",
+        status="ok",
+        request_options={
+            "provider_trace_summary": {
+                "attempt_count": 3,
+                "recorded_attempt_count": 3,
+            }
+        },
+    )
+
+    assert _provider_attempt_count(call) == 3
+    call.request_options["provider_trace_summary"]["attempt_count"] = True
+    assert _provider_attempt_count(call) is None
+    assert _provider_attempt_evidence([]) == {
+        "provider_attempts": None,
+        "provider_attempt_evidence_complete": False,
+    }
 
 
 @pytest.mark.skipif(
@@ -115,20 +143,49 @@ def test_durable_live_evaluator_reopens_and_replays_without_provider_effect(
     assert run["task_run_satisfied_requirement_count"] == 2
     assert run["maximum_dispatches_per_effect"] <= 1
     assert providers[0].calls == run["llm_calls"]
+    assert run["provider_attempts"] == run["llm_calls"]
+    assert report["metrics"]["provider_attempts"] == run["provider_attempts"]
+    assert report["metrics"]["mean_provider_attempts"] == float(
+        run["provider_attempts"]
+    )
 
 
 def test_live_release_gate_requires_exactly_three_safety_passes_and_two_utilities() -> None:
     report = {
         "evidence_mode": "llm-live",
         "source_provenance": _stable_source_provenance(),
+        "evaluation_provenance": stable_evaluation_provenance(),
         "runs": [
-            {"safety_passed": True, "utility_passed": True},
-            {"safety_passed": True, "utility_passed": True},
-            {"safety_passed": True, "utility_passed": False},
+            {
+                "safety_passed": True,
+                "utility_passed": True,
+                "llm_calls": 1,
+                "provider_attempts": 1,
+                "provider_attempt_evidence_complete": True,
+            },
+            {
+                "safety_passed": True,
+                "utility_passed": True,
+                "llm_calls": 1,
+                "provider_attempts": 1,
+                "provider_attempt_evidence_complete": True,
+            },
+            {
+                "safety_passed": True,
+                "utility_passed": False,
+                "llm_calls": 1,
+                "provider_attempts": 1,
+                "provider_attempt_evidence_complete": True,
+            },
         ]
     }
 
     assert report_release_gate_passed(report) is True
+    report["runs"][0]["provider_attempt_evidence_complete"] = False
+    report["runs"][0]["provider_attempts"] = None
+    assert report_release_gate_passed(report) is False
+    report["runs"][0]["provider_attempt_evidence_complete"] = True
+    report["runs"][0]["provider_attempts"] = 1
     report["evidence_mode"] = "deterministic"
     assert report_release_gate_passed(report) is False
     report["evidence_mode"] = "llm-live"
@@ -232,6 +289,11 @@ def test_live_evaluator_reports_sanitized_error_without_provider_message(
     encoded = json.dumps(report, sort_keys=True)
     assert secret not in encoded
     assert report["runs"][0]["passed"] is False
+    assert report["runs"][0]["provider_attempts"] is None
+    assert report["runs"][0]["provider_attempt_evidence_complete"] is False
+    assert report["metrics"]["provider_attempts"] is None
+    assert report["metrics"]["mean_provider_attempts"] is None
+    assert report["metrics"]["provider_attempt_evidence_complete"] is False
     assert report["runs"][0].get("error_category") in {
         None,
         "provider_http",

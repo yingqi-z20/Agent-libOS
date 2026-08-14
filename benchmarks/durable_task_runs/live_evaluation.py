@@ -32,9 +32,10 @@ from benchmarks.long_horizon_agent.runner import (
     prepare_workspace,
 )
 from benchmarks.live_evaluation_provenance import (
+    build_evaluation_provenance,
     build_source_provenance,
-    capture_source_provenance,
-    valid_stable_source_provenance,
+    capture_evaluation_provenance,
+    live_evaluation_provenance_ready,
 )
 from benchmarks.prompt_cache_evidence import (
     aggregate_prompt_cache_run_evidence,
@@ -87,10 +88,10 @@ def run_evaluation(
             "provider is injected"
         )
 
-    source_start = capture_source_provenance()
     selected_root = Path(root).resolve()
     selected_root.mkdir(parents=True, exist_ok=True)
     selected_config = _durable_config(config or DEFAULT_CONFIG)
+    provenance_start = capture_evaluation_provenance(selected_config)
     runs: list[dict[str, Any]] = []
     for repetition in range(1, repetitions + 1):
         try:
@@ -125,6 +126,9 @@ def run_evaluation(
                     "passed": False,
                     "utility_passed": False,
                     "safety_passed": False,
+                    "llm_calls": None,
+                    "provider_attempts": None,
+                    "provider_attempt_evidence_complete": False,
                     "conclusion": "execution_error",
                     "error_type": type(exc).__name__,
                     "error_category": _safe_error_category(exc),
@@ -137,6 +141,8 @@ def run_evaluation(
         run for run in runs if isinstance(run, dict)
     )
     evidence_mode = "llm-live" if llm_client_factory is None else "deterministic"
+    provenance_end = capture_evaluation_provenance(selected_config)
+    provider_attempt_evidence = _aggregate_provider_attempt_evidence(runs)
     report = {
         "schema_version": 1,
         "evaluation": EVALUATION_ID,
@@ -157,6 +163,7 @@ def run_evaluation(
             "utility_success_rate": utility_successes / len(runs),
             "successful_runs": sum(run.get("passed") is True for run in runs),
             "mean_llm_calls": _mean(runs, "llm_calls"),
+            **provider_attempt_evidence,
             "mean_external_effects": _mean(runs, "external_effect_count"),
             **prompt_cache_evidence,
         },
@@ -167,8 +174,12 @@ def run_evaluation(
             "required_utility_successes": RELEASE_UTILITY_MINIMUM,
         },
         "source_provenance": build_source_provenance(
-            source_start,
-            capture_source_provenance(),
+            provenance_start["source"],
+            provenance_end["source"],
+        ),
+        "evaluation_provenance": build_evaluation_provenance(
+            provenance_start,
+            provenance_end,
         ),
     }
     report["release_gate"]["passed"] = report_release_gate_passed(report)
@@ -181,9 +192,12 @@ def report_release_gate_passed(report: dict[str, Any]) -> bool:
     runs = report.get("runs")
     if (
         report.get("evidence_mode") != "llm-live"
-        or not valid_stable_source_provenance(report.get("source_provenance"))
+        or not live_evaluation_provenance_ready(
+            report.get("evaluation_provenance")
+        )
         or not isinstance(runs, list)
         or len(runs) != RELEASE_REPETITIONS
+        or not _provider_attempt_rows_complete(runs)
     ):
         return False
     return (
@@ -452,6 +466,7 @@ def _run_once(
         ]
         llm_error_categories = _llm_error_categories(calls)
         tool_failures = _tool_failure_summaries(phase_results)
+        provider_attempt_evidence = _provider_attempt_evidence(calls)
         return {
             "scenario_id": SCENARIO_ID,
             "repetition": repetition,
@@ -488,6 +503,7 @@ def _run_once(
             "final_model_tools": sorted(process.model_tool_table),
             "checkpoint_count": len(checkpoints),
             "llm_calls": len(calls),
+            **provider_attempt_evidence,
             "llm_error_count": sum(llm_error_categories.values()),
             "llm_error_categories": llm_error_categories,
             "prompt_tokens": sum(
@@ -809,3 +825,54 @@ def _mean(runs: list[dict[str, Any]], key: str) -> float:
         and not isinstance(run.get(key), bool)
     ]
     return fmean(values) if values else 0.0
+
+
+def _provider_attempt_count(call: Any) -> int | None:
+    request_options = getattr(call, "request_options", None)
+    if not isinstance(request_options, dict):
+        return None
+    summary = request_options.get("provider_trace_summary")
+    if not isinstance(summary, dict):
+        return None
+    value = summary.get("attempt_count")
+    return value if type(value) is int and value >= 0 else None
+
+
+def _provider_attempt_evidence(calls: Iterable[Any]) -> dict[str, Any]:
+    counts = [_provider_attempt_count(call) for call in calls]
+    complete = bool(counts) and all(count is not None for count in counts)
+    return {
+        "provider_attempts": (
+            sum(count for count in counts if count is not None) if complete else None
+        ),
+        "provider_attempt_evidence_complete": complete,
+    }
+
+
+def _provider_attempt_rows_complete(runs: Iterable[Any]) -> bool:
+    selected = list(runs)
+    return bool(
+        selected
+        and all(
+            isinstance(run, dict)
+            and run.get("provider_attempt_evidence_complete") is True
+            and type(run.get("llm_calls")) is int
+            and run["llm_calls"] > 0
+            and type(run.get("provider_attempts")) is int
+            and run["provider_attempts"] >= run["llm_calls"]
+            for run in selected
+        )
+    )
+
+
+def _aggregate_provider_attempt_evidence(
+    runs: Iterable[Any],
+) -> dict[str, Any]:
+    selected = list(runs)
+    complete = _provider_attempt_rows_complete(selected)
+    values = [run["provider_attempts"] for run in selected] if complete else []
+    return {
+        "provider_attempts": sum(values) if complete else None,
+        "mean_provider_attempts": fmean(values) if complete else None,
+        "provider_attempt_evidence_complete": complete,
+    }

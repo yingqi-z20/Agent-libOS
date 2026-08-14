@@ -82,10 +82,23 @@ Omitting `--artifacts-root` deletes the synthetic workspaces and permanent-
 retention v7 databases after the report is complete. If artifacts are retained
 for diagnosis, put them outside the repository and remove them after review.
 
+Every live report carries `evaluation_provenance`: stable start/end source
+identity plus a safe effective LLM configuration identity. It records the
+exact model, API mode, token/retry/prompt/cache policy, credential presence,
+and only an official/custom endpoint classification with a normalized hash and
+the effective custom-endpoint authorization boolean.
+It never records the raw endpoint, API/cache key, safety identifier,
+organization, or project. A family gate requires a model and configured
+credential plus complete per-run provider-attempt telemetry; an execution error
+whose partial trace cannot be recovered is explicitly unknown rather than zero.
+The combined gate additionally requires all three configuration identities to
+match.
+
 The complete live release gate also requires the real-Chromium customer
 workflow documented in
 [`../browser_customer_workflows/README.md`](../browser_customer_workflows/README.md)
 and the research/analysis runs in
 [`../knowledge_workflows/README.md`](../knowledge_workflows/README.md).
 `experiments/check_live_release_gate.py` requires safety `12/12`, utility at
-least `10/12`, every family gate, and one matching stable clean-source identity.
+least `10/12`, every family gate, and one matching stable clean-source and
+LLM-configuration identity.
