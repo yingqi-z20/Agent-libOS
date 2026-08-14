@@ -39,8 +39,9 @@ The JSON report records per-run and aggregate:
 - treatment-minus-baseline deltas for success, routing, invalid calls, schema
   overhead, prompt bytes, and token measurements.
 - per-run `pair_id`, global `pair_index`, `pair_position`, explicit `pair_order`,
-  logical LLM calls, provider attempts, input/output/cache tokens, and a hash of
-  the identical neutral goal;
+  `run_evidence_complete`, observed process status, `exited_via_tool`, logical
+  LLM calls, provider attempts, input/output/cache tokens, and a hash of the
+  identical neutral goal;
 - one `metrics.paired.samples` row per pair containing both arms and direct
   treatment-minus-baseline inputs for paired confidence intervals and binary
   tests;
@@ -93,6 +94,18 @@ and provider-attempt evidence for every logical LLM call. Use it together with
 `--require-all-correct` when correctness is also a release criterion. A selected
 scenario subset and historical schema-v1/v2 reports can still be read and
 summarized, but cannot pass the publication gate.
+
+Publication readiness does not require a favorable terminal state: a bounded
+run that exhausts its quanta may validly report `runnable` with complete oracle
+and telemetry evidence. The validator recomputes `completed` from the observed
+status, successful exit-tool receipt, and oracle result. An exit-tool receipt
+counts only when the Tool result is
+successful and its payload says `status: exited` and `terminal_committed: true`;
+a successful completion-review response is nonterminal. Cache-write tokens are
+provider-optional: they are a nonnegative integer only when every logical call
+reports them, and otherwise are explicitly `null`; they are therefore excluded
+from paired continuous deltas. All other provider-attempt, input/output,
+cache-read, and cache-metric reported-call counts must cover every logical call.
 
 The exit-review trace deliberately omits review tokens, prompts, completion
 evidence payloads, goal text, provider responses, and raw Tool results. It is

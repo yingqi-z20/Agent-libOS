@@ -53,7 +53,6 @@ _PAIRED_NUMERIC_FIELDS = (
     "prompt_tokens",
     "completion_tokens",
     "cache_read_tokens",
-    "cache_write_tokens",
     "initial_schema_bytes",
     "authorized_schema_bytes",
     "cumulative_schema_bytes",
@@ -74,13 +73,7 @@ _PUBLICATION_EVIDENCE_COUNT_FIELDS = (
     "cache_metric_input_tokens",
     "uncached_input_tokens",
 )
-_TERMINAL_PUBLICATION_STATUSES = frozenset(
-    {
-        ProcessStatus.EXITED.value,
-        ProcessStatus.FAILED.value,
-        ProcessStatus.KILLED.value,
-    }
-)
+_PUBLICATION_PROCESS_STATUSES = frozenset(status.value for status in ProcessStatus)
 _FULL_ORACLE_CHECK_FIELDS = {
     "workspace_write": frozenset(
         {"successful_probe_result", "exact_file_content", "result_path_matches"}
@@ -760,16 +753,25 @@ def _valid_publication_runs(
             return False
         status = run.get("status")
         completed = run["completed"]
+        exited_via_tool = run.get("exited_via_tool")
+        expected_completed = (
+            status == ProcessStatus.EXITED.value
+            and exited_via_tool is True
+            and oracle_passed is True
+        )
         if (
             not _valid_publication_oracle(oracle, scenario=scenario)
             or run.get("task_outcome_success") is not oracle_passed
             or run.get("probe_tool_result_success")
             is not oracle_checks.get("successful_probe_result")
-            or status not in _TERMINAL_PUBLICATION_STATUSES
+            or run.get("run_evidence_complete") is not True
+            or type(exited_via_tool) is not bool
+            or status not in _PUBLICATION_PROCESS_STATUSES
             or (
-                completed is True
-                and (status != ProcessStatus.EXITED.value or oracle_passed is not True)
+                exited_via_tool is True
+                and status != ProcessStatus.EXITED.value
             )
+            or completed is not expected_completed
         ):
             return False
         correct_activation = run.get("correct_skill_activation")
@@ -801,9 +803,24 @@ def _valid_publication_runs(
                 "cache_total_calls",
                 "cache_reported_calls",
                 "cache_read_reported_calls",
-                "cache_write_reported_calls",
                 "cache_metric_reported_calls",
             )
+        ):
+            return False
+        cache_write_reported_calls = run["cache_write_reported_calls"]
+        cache_write_tokens = run.get("cache_write_tokens")
+        if (
+            "cache_write_tokens" not in run
+            or cache_write_reported_calls > logical_calls
+            or (
+                cache_write_reported_calls == logical_calls
+                and _strict_non_negative_int(cache_write_tokens) is None
+            )
+            or (
+                cache_write_reported_calls < logical_calls
+                and cache_write_tokens is not None
+            )
+            or run["uncached_input_tokens"] > run["cache_metric_input_tokens"]
         ):
             return False
         if (
@@ -1149,9 +1166,7 @@ def _run_once(
         cache_metrics = aggregate_cache_usage(calls)
         invalid_tool_calls = _invalid_tool_call_count(runtime, pid)
         status = process.status.value
-        exited_via_tool = _first_successful_action_index(
-            observations, "process_exit"
-        ) is not None
+        exited_via_tool = _terminal_exit_receipt_observed(observations)
         return {
             "scenario_id": scenario.scenario_id,
             "repetition": repetition,
@@ -1164,6 +1179,8 @@ def _run_once(
             "image_id": _IMAGE_IDS[variant],
             "pid": pid,
             "status": status,
+            "run_evidence_complete": True,
+            "exited_via_tool": exited_via_tool,
             "completed": (
                 process.status == ProcessStatus.EXITED
                 and exited_via_tool
@@ -1504,6 +1521,28 @@ def _first_successful_action_index(
         if all(action.get(key) == value for key, value in expected_fields.items()):
             return index
     return None
+
+
+def _terminal_exit_receipt_observed(
+    observations: Iterable[dict[str, Any]],
+) -> bool:
+    """Recognize only the current process-exit contract's committed receipt."""
+
+    for observation in observations:
+        action = observation.get("action")
+        result = observation.get("result")
+        payload = result.get("payload") if isinstance(result, dict) else None
+        if (
+            isinstance(action, dict)
+            and action.get("action") == "process_exit"
+            and isinstance(result, dict)
+            and result.get("ok") is True
+            and isinstance(payload, dict)
+            and payload.get("status") == ProcessStatus.EXITED.value
+            and payload.get("terminal_committed") is True
+        ):
+            return True
+    return False
 
 
 def _adjacent_tool_names(scenario: HeldOutScenario) -> set[str]:

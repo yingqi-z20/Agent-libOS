@@ -584,6 +584,55 @@ def test_exit_review_trace_is_bounded_and_omits_raw_completion_content() -> None
     assert "sensitive" not in json.dumps(trace)
 
 
+def test_terminal_exit_receipt_rejects_review_required_tool_success() -> None:
+    review_required = [
+        {
+            "action": {"action": "process_exit"},
+            "result": {
+                "ok": True,
+                "payload": {
+                    "status": "completion_review_required",
+                    "terminal_committed": False,
+                },
+            },
+        }
+    ]
+    terminal = [
+        {
+            "action": {"action": "process_exit"},
+            "result": {
+                "ok": True,
+                "payload": {
+                    "status": "exited",
+                    "terminal_committed": True,
+                },
+            },
+        }
+    ]
+    uncommitted_exit = [
+        {
+            "action": {"action": "process_exit"},
+            "result": {
+                "ok": True,
+                "payload": {
+                    "status": "exited",
+                    "terminal_committed": False,
+                },
+            },
+        }
+    ]
+
+    assert (
+        evaluation_runner._terminal_exit_receipt_observed(review_required)
+        is False
+    )
+    assert (
+        evaluation_runner._terminal_exit_receipt_observed(uncommitted_exit)
+        is False
+    )
+    assert evaluation_runner._terminal_exit_receipt_observed(terminal) is True
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -768,8 +817,15 @@ def test_schema_v2_report_remains_correctness_readable_but_not_publishable() -> 
         "undeclared_oracle_shape",
         "actual_model_mismatch",
         "uniform_actual_model_mismatch",
-        "nonterminal_status",
-        "missing_cache_tokens",
+        "invalid_status",
+        "run_evidence_incomplete",
+        "completed_relation",
+        "nonexit_with_exit_receipt",
+        "missing_cache_write_field",
+        "cache_write_without_reports",
+        "cache_write_missing_full_reports",
+        "cache_write_reports_out_of_range",
+        "uncached_exceeds_input",
         "token_reported_calls",
         "schema_token_mismatch",
         "metrics_mismatch",
@@ -820,10 +876,26 @@ def test_publication_gate_rejects_incomplete_or_unbound_reports(
     elif mutation == "uniform_actual_model_mismatch":
         for run in report["runs"]:
             run["models"] = ["other-model"]
-    elif mutation == "nonterminal_status":
+    elif mutation == "invalid_status":
+        report["runs"][0]["status"] = "not-a-process-status"
+    elif mutation == "run_evidence_incomplete":
+        report["runs"][0]["run_evidence_complete"] = False
+    elif mutation == "completed_relation":
+        report["runs"][0]["completed"] = False
+    elif mutation == "nonexit_with_exit_receipt":
         report["runs"][0]["status"] = "runnable"
-    elif mutation == "missing_cache_tokens":
-        report["runs"][0]["cache_write_tokens"] = None
+        report["runs"][0]["exited_via_tool"] = True
+        report["runs"][0]["completed"] = False
+    elif mutation == "missing_cache_write_field":
+        report["runs"][0].pop("cache_write_tokens")
+    elif mutation == "cache_write_without_reports":
+        report["runs"][0]["cache_write_tokens"] = 0
+    elif mutation == "cache_write_missing_full_reports":
+        report["runs"][0]["cache_write_reported_calls"] = 2
+    elif mutation == "cache_write_reports_out_of_range":
+        report["runs"][0]["cache_write_reported_calls"] = 3
+    elif mutation == "uncached_exceeds_input":
+        report["runs"][0]["uncached_input_tokens"] = 401
     elif mutation == "token_reported_calls":
         report["runs"][0]["prompt_token_reported_calls"] = 1
     elif mutation == "schema_token_mismatch":
@@ -870,6 +942,28 @@ def test_complete_schema_v3_report_passes_publication_contract(
         "valid_evaluation_provenance",
         lambda value: isinstance(value, dict) and "identity" in value,
     )
+    monkeypatch.setattr(
+        evaluation_runner,
+        "evaluation_provenance_identity",
+        lambda value: value.get("identity") if isinstance(value, dict) else None,
+    )
+
+    assert report_publication_ready(report) is True
+    assert all(
+        run["cache_write_tokens"] is None
+        and run["cache_write_reported_calls"] == 0
+        for run in report["runs"]
+    )
+    paired = report["metrics"]["paired"]
+    assert paired["observed_pairs"] == paired["complete_pairs"] == 15
+    assert len(paired["samples"]) == 15
+    assert all(
+        set(sample["arms"]) == set(EVALUATION_VARIANTS)
+        and "provider_attempts" in sample["with_skills_minus_without_skills"]
+        and "cache_write_tokens"
+        not in sample["with_skills_minus_without_skills"]
+        for sample in paired["samples"]
+    )
 
 
 @pytest.mark.parametrize("terminal_status", ("exited", "failed", "killed"))
@@ -890,6 +984,7 @@ def test_complete_negative_observation_is_publishable_but_not_all_correct(
     )
     run = report["runs"][0]
     run["status"] = terminal_status
+    run["exited_via_tool"] = terminal_status == "exited"
     run["completed"] = False
     run["task_outcome_success"] = False
     run["task_outcome_oracle"] = {
@@ -906,21 +1001,53 @@ def test_complete_negative_observation_is_publishable_but_not_all_correct(
 
     assert report_publication_ready(report) is True
     assert report_all_correct(report) is False
+
+
+def test_runnable_oracle_success_is_complete_publishable_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _complete_publication_report()
+    monkeypatch.setattr(
+        evaluation_runner,
+        "valid_evaluation_provenance",
+        lambda value: isinstance(value, dict) and "identity" in value,
+    )
     monkeypatch.setattr(
         evaluation_runner,
         "evaluation_provenance_identity",
         lambda value: value.get("identity") if isinstance(value, dict) else None,
     )
+    run = report["runs"][0]
+    run["status"] = "runnable"
+    run["exited_via_tool"] = False
+    run["completed"] = False
+    report["metrics"] = aggregate_runs(report["runs"])
 
     assert report_publication_ready(report) is True
-    paired = report["metrics"]["paired"]
-    assert paired["observed_pairs"] == paired["complete_pairs"] == 15
-    assert len(paired["samples"]) == 15
-    assert all(
-        set(sample["arms"]) == set(EVALUATION_VARIANTS)
-        and "provider_attempts" in sample["with_skills_minus_without_skills"]
-        for sample in paired["samples"]
+    assert report_all_correct(report) is False
+
+
+def test_exited_without_terminal_tool_receipt_is_complete_negative_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _complete_publication_report()
+    monkeypatch.setattr(
+        evaluation_runner,
+        "valid_evaluation_provenance",
+        lambda value: isinstance(value, dict) and "identity" in value,
     )
+    monkeypatch.setattr(
+        evaluation_runner,
+        "evaluation_provenance_identity",
+        lambda value: value.get("identity") if isinstance(value, dict) else None,
+    )
+    run = report["runs"][0]
+    run["exited_via_tool"] = False
+    run["completed"] = False
+    report["metrics"] = aggregate_runs(report["runs"])
+
+    assert report_publication_ready(report) is True
+    assert report_all_correct(report) is False
 
 
 def _complete_publication_report() -> dict[str, object]:
@@ -943,6 +1070,8 @@ def _complete_publication_report() -> dict[str, object]:
                         scenario.goal.encode("utf-8")
                     ).hexdigest(),
                     "status": "exited",
+                    "run_evidence_complete": True,
+                    "exited_via_tool": True,
                     "completed": True,
                     "task_outcome_success": True,
                     "task_outcome_oracle": _complete_oracle(scenario.setup_kind),
@@ -969,11 +1098,11 @@ def _complete_publication_report() -> dict[str, object]:
                     "prompt_tokens": 400,
                     "completion_tokens": 40,
                     "cache_read_tokens": 0,
-                    "cache_write_tokens": 0,
+                    "cache_write_tokens": None,
                     "cache_total_calls": 2,
                     "cache_reported_calls": 2,
                     "cache_read_reported_calls": 2,
-                    "cache_write_reported_calls": 2,
+                    "cache_write_reported_calls": 0,
                     "cache_metric_reported_calls": 2,
                     "cache_metric_input_tokens": 400,
                     "uncached_input_tokens": 400,
