@@ -277,7 +277,7 @@ custom-protocol BrowserWindow, its API origin, and the preload bridge.
 
 ## Self-contained internal desktop distribution
 
-Agent libOS 1.5.0 also has a manually triggered, internal-only native desktop
+Agent libOS 1.5.1 also has a manually triggered, internal-only native desktop
 build for macOS arm64, Windows x64, and Ubuntu 24.04/glibc x64. The exact
 runtime closure is Electron 43.2.0, a PyInstaller 6.21.0 one-folder sidecar
 built with CPython 3.11.15, Agent libOS with the complete MCP extra (including
@@ -347,6 +347,14 @@ default user workspace uses a task sidebar and a dedicated conversation area.
 The first-task state starts with an empty goal instead of silently submitting a
 sample task, offers reusable starter prompts and a Ctrl/Command+Enter shortcut,
 and keeps a compact read-only launch summary beside an **Edit settings** button.
+Its explicit execution-mode selector defaults to a regular non-TaskRun process.
+This path
+uses `POST /api/processes` and remains usable with the secure default
+`task_runs.plaintext_payloads_enabled: false`; it does not persist a Durable
+TaskRun goal or resume payload. Durable mode is selectable only when the
+same-build snapshot reports both TaskRun admission and plaintext-payload opt-in
+as available. The disabled mode explains the exact Host settings and the GUI
+never changes either setting on the user's behalf.
 The **New task settings** dialog edits the image, model profile, quanta,
 working directory, workspace, Git, command, and context-maintenance choices as
 one local draft. A successful launch
@@ -608,6 +616,14 @@ process `llm_profile_id` and a non-secret `llm_profiles` summary list; profile
 secrets stay in the host process environment and are not returned by the GUI
 API.
 
+Snapshots also expose the non-secret `task_run_launch` object. Its `enabled`
+and `plaintext_payloads_enabled` booleans mirror the two Host-owned admission
+switches, while `available` additionally confirms that the local TaskRun
+component is assembled. These fields are display/admission guidance only: they
+grant no authority and contain no configuration values, endpoints, payloads,
+or credentials beyond those booleans. The renderer fails closed on a malformed
+or missing object.
+
 Process snapshots include `resource_budget`, `resource_usage`, and
 `resource_remaining` so the GUI can show quota state without treating it as a
 Capability grant. Budget exhaustion is still enforced by the runtime and
@@ -774,7 +790,8 @@ The local `/api` surface is not a complete, independently versioned public REST
 API, and compatibility for arbitrary external clients is not promised. The
 machine-readable [GUI API contract subset v2](gui_api_schema.json)
 deliberately covers the snapshot's required top-level collections, the minimal
-process/scheduler shape consumed during bootstrap, redacted Task Run
+process/scheduler shape and TaskRun launch availability consumed during
+bootstrap, redacted Task Run
 summary/detail state, the JSON error envelope, and payloads for every operation
 that the server gates with explicit confirmation.
 `GET /api/snapshot` emits `schema_version: 3`; this same-build renderer rejects
@@ -852,7 +869,7 @@ Important endpoints:
   Collection, ledger, and Human pages accept opaque `cursor` values and return
   `next_cursor`; clients must not parse or synthesize them. The embedded
   requirements page also returns `next_cursor`. Requirement changes are linked
-  ledger items, and 1.5.0 has no independent Task Run requirements or wait HTTP
+  ledger items, and 1.5.1 has no independent Task Run requirements or wait HTTP
   route.
 - `POST /api/task-runs/{run_id}/run|pause|resume|cancel|follow-ups|recover|rerun`.
   Every existing-Run mutation carries a command id and expected revision.

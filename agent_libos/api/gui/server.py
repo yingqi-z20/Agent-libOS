@@ -2421,6 +2421,7 @@ class GuiRuntimeService:
                 token=token,
                 auto_run=auto_run,
                 max_quanta=max_quanta,
+                runtime_config=selected_config,
                 user_llm_profiles=user_llm_profiles,
                 loaded_user_llm_profiles=loaded_user_llm_profiles,
             )
@@ -2434,12 +2435,12 @@ class GuiRuntimeService:
         token: str | None,
         auto_run: bool,
         max_quanta: int | None | object,
+        runtime_config: AgentLibOSConfig,
         user_llm_profiles: UserLLMProfileStore,
         loaded_user_llm_profiles: dict[str, Any],
     ) -> None:
         self.token = token or secrets.token_urlsafe(32)
         self._human_presentation_provider = _GuiHumanPresentationProvider()
-        runtime_config = self.runtime.config
         self.broadcaster = GuiEventBroadcaster(
             max_events=runtime_config.gui.event_buffer_limit
         )
@@ -2988,6 +2989,7 @@ class GuiRuntimeService:
                 "schema_version": 3,
                 "db": self.db,
                 "scheduler": self.scheduler.status(),
+                "task_run_launch": self._task_run_launch_availability(),
                 "processes": processes,
                 "task_runs": task_runs,
                 "human_requests": human_requests,
@@ -3003,6 +3005,25 @@ class GuiRuntimeService:
                 **static,
             }
             return self._bounded_snapshot(snapshot, source_truncated=source_truncated)
+
+    def _task_run_launch_availability(self) -> dict[str, bool]:
+        """Project the non-secret Host switches required for GUI Run creation."""
+
+        manager = _task_run_manager_for_runtime(self.runtime)
+        selected_config = getattr(manager, "config", self.runtime.config)
+        enabled = bool(selected_config.task_runs.enabled)
+        plaintext_payloads_enabled = bool(
+            selected_config.task_runs.plaintext_payloads_enabled
+        )
+        return {
+            "enabled": enabled,
+            "plaintext_payloads_enabled": plaintext_payloads_enabled,
+            "available": bool(
+                enabled
+                and plaintext_payloads_enabled
+                and manager is not None
+            ),
+        }
 
     def _task_run_summary_window(
         self,

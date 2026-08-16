@@ -28,10 +28,16 @@ from scripts.check_release_artifacts import (
     BUILTIN_SKILL_ARCHIVE_PATHS,
     BUILTIN_SKILL_IDS,
     CHECKSUM_MANIFEST_NAME,
+    CORE_REQUIREMENTS,
     EXPECTED_CONSOLE_SCRIPTS,
+    EXPECTED_PROVIDES_EXTRA,
     MCP_EXTRA_REQUIREMENTS,
     MCP_SDIST_REQUIRED_FILES,
     MCP_WHEEL_REQUIRED_FILES,
+    POSTGRES_EXTRA_REQUIREMENTS,
+    PTY_EXTRA_REQUIREMENTS,
+    SDIST_EXCLUDE,
+    SDIST_INCLUDE,
     SDIST_REQUIRED_FILES,
     WHEEL_REQUIRED_FILES,
     _BUILTIN_SKILL_MAX_FILE_BYTES,
@@ -39,6 +45,7 @@ from scripts.check_release_artifacts import (
     _validate_builtin_skill_archive_payloads,
     _validate_console_scripts,
     _validate_sdist,
+    _validate_sdist_source_paths,
     _validate_wheel,
     validate_artifacts,
     validate_version_alignment,
@@ -84,8 +91,9 @@ ACTION_PINS = {
 def _wheel_metadata(
     version: str,
     *,
-    include_mcp_extra: bool = True,
+    provides_extras: tuple[str, ...] = EXPECTED_PROVIDES_EXTRA,
     mcp_requirements: tuple[str, ...] = MCP_EXTRA_REQUIREMENTS,
+    requirements: tuple[str, ...] | None = None,
 ) -> bytes:
     metadata = (
         "Metadata-Version: 2.4\n"
@@ -93,10 +101,16 @@ def _wheel_metadata(
         f"Version: {version}\n"
         "Requires-Python: <3.15,>=3.11\n"
     )
-    if include_mcp_extra:
-        metadata += "Provides-Extra: mcp\n"
+    for extra in provides_extras:
+        metadata += f"Provides-Extra: {extra}\n"
+    selected_requirements = requirements if requirements is not None else (
+        *CORE_REQUIREMENTS,
+        *POSTGRES_EXTRA_REQUIREMENTS,
+        *mcp_requirements,
+        *PTY_EXTRA_REQUIREMENTS,
+    )
     metadata += "".join(
-        f"Requires-Dist: {requirement}\n" for requirement in mcp_requirements
+        f"Requires-Dist: {requirement}\n" for requirement in selected_requirements
     )
     return f"{metadata}\n".encode()
 
@@ -144,6 +158,7 @@ def _write_test_sdist(
     *,
     duplicate_path: str | None = None,
     secret_overrides: dict[str, bytes] | None = None,
+    extra_payloads: dict[str, bytes] | None = None,
     version: str = "1.0.0",
     project_metadata: bytes | None = None,
 ) -> Path:
@@ -159,6 +174,7 @@ def _write_test_sdist(
     for relative in ALLOWED_SECRET_FIXTURE_SHA256:
         payloads[relative] = (ROOT / relative).read_bytes()
     payloads.update(secret_overrides or {})
+    payloads.update(extra_payloads or {})
 
     with tarfile.open(target, "w:gz") as archive:
         for relative, raw in sorted(payloads.items()):
@@ -175,7 +191,7 @@ def _write_test_sdist(
     return target
 
 
-def _write_release_pair(target: Path, *, version: str = "1.5.0") -> tuple[Path, Path]:
+def _write_release_pair(target: Path, *, version: str = "1.5.1") -> tuple[Path, Path]:
     wheel = _write_test_wheel(
         target / f"agent_libos-{version}-py3-none-any.whl",
         version=version,
@@ -188,11 +204,11 @@ def _write_release_pair(target: Path, *, version: str = "1.5.0") -> tuple[Path, 
 
 
 def test_release_version_identifiers_are_aligned() -> None:
-    assert validate_version_alignment(ROOT) == "1.5.0"
+    assert validate_version_alignment(ROOT) == "1.5.1"
 
 
 def test_release_protocol_versions_are_independent_and_default_off() -> None:
-    assert __version__ == "1.5.0"
+    assert __version__ == "1.5.1"
     assert STORE_SCHEMA_VERSION == 7
     assert SEMANTIC_STATUS_SCHEMA_VERSION == 3
     assert DEFAULT_CONFIG.semantic.mode == "off"
@@ -206,7 +222,7 @@ def test_agentdojo_lock_tracks_current_editable_agent_libos_metadata() -> None:
         )
     )
     package = next(item for item in lock["package"] if item["name"] == "agent-libos")
-    assert package["version"] == "1.5.0"
+    assert package["version"] == "1.5.1"
     assert package["source"] == {"editable": "../../"}
     assert {
         (item["specifier"], item["marker"])
@@ -219,7 +235,7 @@ def test_root_lock_resolves_the_reviewed_mcp_sdk_v2_graph() -> None:
     lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
     packages = {item["name"]: item for item in lock["package"]}
 
-    assert packages["agent-libos"]["version"] == "1.5.0"
+    assert packages["agent-libos"]["version"] == "1.5.1"
     assert packages["mcp"]["version"] == "2.0.0"
     assert packages["mcp-types"]["version"] == "2.0.0"
     assert {
@@ -431,10 +447,28 @@ def test_wheel_validation_requires_the_mcp_provides_extra_marker(
 ) -> None:
     wheel = _write_test_wheel(
         tmp_path / "agent_libos-1.0.0-py3-none-any.whl",
-        project_metadata=_wheel_metadata("1.0.0", include_mcp_extra=False),
+        project_metadata=_wheel_metadata(
+            "1.0.0",
+            provides_extras=("postgres", "pty"),
+        ),
     )
 
-    with pytest.raises(ValueError, match="Provides-Extra: mcp exactly once"):
+    with pytest.raises(ValueError, match="Provides-Extra contract mismatch"):
+        _validate_wheel(wheel, "1.0.0")
+
+
+def test_wheel_validation_rejects_unreviewed_provides_extra(
+    tmp_path: Path,
+) -> None:
+    wheel = _write_test_wheel(
+        tmp_path / "agent_libos-1.0.0-py3-none-any.whl",
+        project_metadata=_wheel_metadata(
+            "1.0.0",
+            provides_extras=(*EXPECTED_PROVIDES_EXTRA, "debug"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Provides-Extra contract mismatch"):
         _validate_wheel(wheel, "1.0.0")
 
 
@@ -461,7 +495,7 @@ def test_sdist_validation_rejects_missing_or_widened_mcp_dependencies(
     )
 
     for artifact in (missing, widened):
-        with pytest.raises(ValueError, match="MCP extra requirements mismatch"):
+        with pytest.raises(ValueError, match="Requires-Dist contract mismatch"):
             _validate_sdist(artifact, "1.0.0")
 
 
@@ -489,10 +523,83 @@ def test_artifact_validation_rejects_widened_default_keyring_dependency(
         ),
     )
 
-    with pytest.raises(ValueError, match="MCP extra requirements mismatch"):
+    with pytest.raises(ValueError, match="Requires-Dist contract mismatch"):
         _validate_wheel(wheel, "1.0.0")
-    with pytest.raises(ValueError, match="MCP extra requirements mismatch"):
+    with pytest.raises(ValueError, match="Requires-Dist contract mismatch"):
         _validate_sdist(sdist, "1.0.0")
+
+
+def test_release_metadata_requires_exact_core_and_all_optional_dependencies(
+    tmp_path: Path,
+) -> None:
+    all_requirements = (
+        *CORE_REQUIREMENTS,
+        *POSTGRES_EXTRA_REQUIREMENTS,
+        *MCP_EXTRA_REQUIREMENTS,
+        *PTY_EXTRA_REQUIREMENTS,
+    )
+    mutations = (
+        tuple(
+            requirement
+            for requirement in all_requirements
+            if not requirement.startswith("openai")
+        ),
+        tuple(
+            requirement
+            for requirement in all_requirements
+            if not requirement.startswith("psycopg")
+        ),
+        tuple(
+            requirement
+            for requirement in all_requirements
+            if not requirement.startswith("pywinpty")
+        ),
+        (*all_requirements, "requests>=2"),
+    )
+    for index, requirements in enumerate(mutations):
+        artifact_dir = tmp_path / str(index)
+        artifact_dir.mkdir()
+        wheel = _write_test_wheel(
+            artifact_dir / "agent_libos-1.0.0-py3-none-any.whl",
+            project_metadata=_wheel_metadata(
+                "1.0.0",
+                requirements=requirements,
+            ),
+        )
+        with pytest.raises(ValueError, match="Requires-Dist contract mismatch"):
+            _validate_wheel(wheel, "1.0.0")
+
+
+def test_sdist_build_policy_is_an_exact_fail_closed_partition() -> None:
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    policy = pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]
+
+    assert policy == {
+        "include": list(SDIST_INCLUDE),
+        "exclude": list(SDIST_EXCLUDE),
+    }
+    _validate_sdist_source_paths(
+        [
+            "agent_libos/runtime/runtime.py",
+            "README.md",
+            ".github/workflows/test.yml",
+            "gui/package.json",
+        ]
+    )
+    with pytest.raises(ValueError, match="explicitly partitioned"):
+        _validate_sdist_source_paths(["ordinary-unclassified.txt"])
+
+
+def test_sdist_validation_rejects_file_outside_explicit_allowlist(
+    tmp_path: Path,
+) -> None:
+    artifact = _write_test_sdist(
+        tmp_path / "agent_libos-1.0.0.tar.gz",
+        extra_payloads={"ordinary-unclassified.txt": b"not partitioned\n"},
+    )
+
+    with pytest.raises(ValueError, match="outside the explicit release allowlist"):
+        _validate_sdist(artifact, "1.0.0")
 
 
 def test_wheel_validation_rejects_duplicate_member_paths(tmp_path: Path) -> None:
@@ -512,6 +619,89 @@ def test_sdist_validation_rejects_duplicate_member_paths(tmp_path: Path) -> None
     )
 
     with pytest.raises(ValueError, match="duplicate member paths"):
+        _validate_sdist(sdist, "1.0.0")
+
+
+@pytest.mark.parametrize(
+    "alias",
+    (
+        "agent_libos/..\\agent_libos/__init__.py",
+        "agent_libos/./__init__.py",
+    ),
+)
+def test_wheel_validation_rejects_nonportable_path_aliases(
+    tmp_path: Path,
+    alias: str,
+) -> None:
+    wheel = _write_test_wheel(tmp_path / "agent_libos-1.0.0-py3-none-any.whl")
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr(alias, b"portable alias")
+
+    with pytest.raises(ValueError, match="unsafe path"):
+        _validate_wheel(wheel, "1.0.0")
+
+
+def test_wheel_validation_rejects_unicode_normalized_path_collision(
+    tmp_path: Path,
+) -> None:
+    wheel = _write_test_wheel(tmp_path / "agent_libos-1.0.0-py3-none-any.whl")
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr("agent_libos/caf\N{LATIN SMALL LETTER E WITH ACUTE}.py", b"one")
+        archive.writestr("agent_libos/cafe\N{COMBINING ACUTE ACCENT}.py", b"two")
+
+    with pytest.raises(ValueError, match="portable member path collisions"):
+        _validate_wheel(wheel, "1.0.0")
+
+
+def test_sdist_validation_rejects_casefolded_path_collision(tmp_path: Path) -> None:
+    sdist = _write_test_sdist(
+        tmp_path / "agent_libos-1.0.0.tar.gz",
+        extra_payloads={"agent_libos/__INIT__.py": b"case alias"},
+    )
+
+    with pytest.raises(ValueError, match="portable member path collisions"):
+        _validate_sdist(sdist, "1.0.0")
+
+
+@pytest.mark.parametrize(
+    "alias",
+    (
+        "agent_libos/__init__.py.",
+        "agent_libos/__init__.py ",
+        "agent_libos/__init__.py::$DATA",
+        "agent_libos/CON.py",
+    ),
+)
+def test_wheel_validation_rejects_windows_nonportable_members(
+    tmp_path: Path,
+    alias: str,
+) -> None:
+    wheel = _write_test_wheel(tmp_path / "agent_libos-1.0.0-py3-none-any.whl")
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr(alias, b"windows alias")
+
+    with pytest.raises(ValueError, match="nonportable path"):
+        _validate_wheel(wheel, "1.0.0")
+
+
+@pytest.mark.parametrize(
+    "alias",
+    (
+        "agent_libos/__init__.py.",
+        "agent_libos/__init__.py::$DATA",
+        "agent_libos/LPT1.txt",
+    ),
+)
+def test_sdist_validation_rejects_windows_nonportable_members(
+    tmp_path: Path,
+    alias: str,
+) -> None:
+    sdist = _write_test_sdist(
+        tmp_path / "agent_libos-1.0.0.tar.gz",
+        extra_payloads={alias: b"windows alias"},
+    )
+
+    with pytest.raises(ValueError, match="nonportable path"):
         _validate_sdist(sdist, "1.0.0")
 
 
@@ -585,7 +775,7 @@ def test_release_checksum_manifest_records_and_verifies_exact_artifacts(
 
 def test_release_status_contains_current_version_state_only() -> None:
     text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
-    assert text.startswith("# Agent libOS 1.5.0 Status\n")
+    assert text.startswith("# Agent libOS 1.5.1 Status\n")
     forbidden = {
         "dirty state": r"\bdirty\b",
         "worktree state": r"\bwork(?:ing)?[ -]?tree\b",
@@ -676,7 +866,7 @@ def test_release_status_bounds_unarchived_evidence_and_volatile_counts() -> None
     text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
 
     assert "## Unarchived real-LLM observation" in text
-    assert "not Agent libOS 1.5.0 release evidence" in text
+    assert "not Agent libOS 1.5.1 release evidence" in text
     assert "AgentDojo harness is a required CI matrix" in text
     assert "collected pytest nodes" not in text
     assert not re.search(r"selects [\d,]+ tests", text)
@@ -1112,11 +1302,11 @@ def test_release_builtin_skill_validation_rejects_missing_or_unparseable_package
 def test_readme_clean_install_smoke_covers_wheel_and_source_distribution() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "dist/agent_libos-1.5.0-py3-none-any.whl" in readme
-    assert "dist/agent_libos-1.5.0.tar.gz" in readme
+    assert "dist/agent_libos-1.5.1-py3-none-any.whl" in readme
+    assert "dist/agent_libos-1.5.1.tar.gz" in readme
     assert readme.count("--require-hashes") >= 3
-    assert "--no-deps dist/agent_libos-1.5.0-py3-none-any.whl" in readme
-    assert "--no-deps --no-build-isolation dist/agent_libos-1.5.0.tar.gz" in readme
+    assert "--no-deps dist/agent_libos-1.5.1-py3-none-any.whl" in readme
+    assert "--no-deps --no-build-isolation dist/agent_libos-1.5.1.tar.gz" in readme
     for entrypoint in EXPECTED_CONSOLE_SCRIPTS:
         assert readme.count(f"/{entrypoint} --help") >= 2
     assert readme.count("uv pip check --python /tmp/agent-libos-") >= 2
@@ -1135,7 +1325,7 @@ def test_gui_dependency_baseline_is_current_and_lockfile_aligned() -> None:
         (ROOT / "gui" / "package-lock.json").read_text(encoding="utf-8")
     )
 
-    assert package["version"] == "1.5.0"
+    assert package["version"] == "1.5.1"
     assert package["dependencies"] == {
         "lucide-react": "^1.28.0",
         "react": "^19.2.8",
@@ -1165,7 +1355,7 @@ def test_gui_dependency_baseline_is_current_and_lockfile_aligned() -> None:
     }
     assert "overrides" not in package
     locked_root = lockfile["packages"][""]
-    assert locked_root["version"] == "1.5.0"
+    assert locked_root["version"] == "1.5.1"
     assert locked_root["dependencies"] == package["dependencies"]
     assert locked_root["devDependencies"] == package["devDependencies"]
     assert locked_root["engines"] == package["engines"]
@@ -2245,8 +2435,8 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         "cancel-in-progress": True,
     }
     assert parsed["env"] == {
-        "RELEASE_WHEEL": "dist/agent_libos-1.5.0-py3-none-any.whl",
-        "RELEASE_SDIST": "dist/agent_libos-1.5.0.tar.gz",
+        "RELEASE_WHEEL": "dist/agent_libos-1.5.1-py3-none-any.whl",
+        "RELEASE_SDIST": "dist/agent_libos-1.5.1.tar.gz",
         "RELEASE_CHECKSUMS": "dist/SHA256SUMS",
     }
     release_steps = release_job["steps"]

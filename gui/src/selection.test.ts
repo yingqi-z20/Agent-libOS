@@ -118,6 +118,7 @@ function snapshot(pids: string[]): RuntimeSnapshot {
       finished_at: null,
       default_max_quanta: null
     },
+    task_run_launch: { enabled: true, plaintext_payloads_enabled: false, available: false },
     processes: pids.map((pid) => ({
       pid,
       parent_pid: null,

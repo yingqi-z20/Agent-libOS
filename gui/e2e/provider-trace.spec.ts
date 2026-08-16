@@ -265,6 +265,43 @@ test("browser traffic cannot leave the allowlisted loopback origins", async ({ p
   await expectNoCredentialPersistence(page);
 });
 
+test("the default first-task path stays usable without Durable plaintext opt-in", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "one real GUI-server launch is sufficient");
+  await useView(page, "user");
+  await page.goto("/");
+
+  const newTask = page.getByRole("button", { name: "新任务", exact: true });
+  await expect(newTask).toBeEnabled();
+  await newTask.click();
+
+  const regular = page.getByRole("radio", { name: /普通进程（非 TaskRun，默认）/ });
+  const durable = page.getByRole("radio", { name: /耐久 Task Run/ });
+  await expect(regular).toBeChecked();
+  await expect(durable).toBeDisabled();
+  await expect(page.getByText(/GUI 永远不会自行更改这些设置/)).toBeVisible();
+  await expectNoSeriousAxeViolations(page, ".newTaskCard");
+
+  await page.getByRole("textbox", { name: "任务目标" }).fill("E2E 普通进程启动");
+  const taskRunRequests: string[] = [];
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.includes("/api/task-runs")) {
+      taskRunRequests.push(request.url());
+    }
+  });
+  const created = page.waitForResponse((response) => (
+    response.status() === 200
+    && new URL(response.url()).pathname === "/api/processes"
+    && response.request().method() === "POST"
+  ));
+  await page.getByRole("button", { name: "开始", exact: true }).click();
+  const response = await created;
+  const payload = await response.json() as { pid?: string };
+
+  expect(payload.pid).toMatch(/^pid_/);
+  expect(taskRunRequests).toEqual([]);
+  await expectNoCredentialPersistence(page);
+});
+
 async function installNetworkBoundary(context: BrowserContext, audit: PageAudit) {
   await context.route("**/*", async (route) => {
     const requestUrl = route.request().url();

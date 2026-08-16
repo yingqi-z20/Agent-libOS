@@ -294,21 +294,26 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.5.0-py3-none-any.whl dist/agent_libos-1.5.0.tar.gz
+  dist/agent_libos-1.5.1-py3-none-any.whl dist/agent_libos-1.5.1.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.5.0-py3-none-any.whl
+  dist/agent_libos-1.5.1-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 ```
 
 The artifact checker requires the Python package, project metadata, and
 lockfile versions to agree; when GUI sources are present, both GUI package
-versions must agree as well. The artifact directory is a closed set: extra
+versions must agree as well. It also binds the modern MCP client identity,
+desktop metadata/workflow/checkers, current changelog entry, and release-status
+heading to that same version. The artifact directory is a closed set: extra
 files, directories, symbolic links, and other non-regular entries are rejected.
 The wheel file contract closes over every `agent_libos.mcp` module plus the
 schema-v7 SQLite/PostgreSQL MCP contract files. The source-distribution contract
-also requires the reviewed MCP examples, conformance and installed-package
+uses the exact `pyproject.toml` include/exclude partition, rejects
+unpartitioned tracked ordinary source files and non-allowlisted archive
+members, and also requires the reviewed MCP examples, conformance and installed-package
 smoke scripts, and the frozen Python/TypeScript fixture sources without vendored
-`node_modules` or generated caches.
+`node_modules` or generated caches. Both artifacts must expose exactly the
+reviewed core requirements and `postgres`, `pty`, and `mcp` optional metadata.
 CI builds the pair once, records `SHA256SUMS`, and makes all four Python-version
 jobs download and verify that same pair before installing hash-checked locked
 dependencies and the artifact itself into fresh

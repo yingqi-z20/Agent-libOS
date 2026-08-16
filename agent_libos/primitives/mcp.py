@@ -113,6 +113,7 @@ from agent_libos.models import (
     McpStdioTransportSpec,
     McpToolListResult,
     McpToolSpec,
+    ProcessStatus,
     mcp_server_spec_to_jsonable,
     ResourceUsage,
 )
@@ -7668,6 +7669,8 @@ class McpPrimitive:
         source_oids: list[str] | tuple[str, ...] | None = None,
     ) -> McpCallResult | McpComplete[Any] | McpInputRequired | McpRemoteTask:
         try:
+            if self._resource_usage_pid(pid) is None:
+                raise NotFound(f"process not found: {pid}")
             selected_args = _canonical_mcp_arguments(
                 arguments,
                 max_bytes=self.config.mcp.max_request_hard_limit_bytes,
@@ -11753,7 +11756,20 @@ class McpPrimitive:
     def _resource_usage_pid(self, actor: str | None) -> str | None:
         if actor is None:
             return None
-        return actor if self.processes.get_process(actor) is not None else None
+        process = self.processes.get_process(actor)
+        if process is None:
+            return None
+        if process.status in {
+            ProcessStatus.EXITED,
+            ProcessStatus.FAILED,
+            ProcessStatus.KILLED,
+        }:
+            # A persisted process id must never fall through to the Host actor
+            # path after reopen.  Runtime-local MCP owner latches close races
+            # in the live instance; this durable status check closes the same
+            # authority boundary across Runtime incarnations.
+            raise CapabilityDenied("terminal process cannot use MCP")
+        return actor
 
     def _list_tools_effect_context(self, server: McpServerSpec, *, request_bytes: int) -> dict[str, Any]:
         return {

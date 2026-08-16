@@ -127,6 +127,81 @@ describe("mounted App TaskRun stream reconciliation", () => {
   });
 });
 
+describe("mounted App user task launch modes", () => {
+  it("starts a regular process by default when durable plaintext is not opted in", async () => {
+    vi.spyOn(LibOSClient.prototype, "snapshot").mockResolvedValue(emptyRuntimeSnapshot(false));
+    installPersistentStreamMock();
+    const spawnSpy = vi.spyOn(LibOSClient.prototype, "spawn").mockResolvedValue({ pid: "pid_ephemeral" });
+    const createSpy = vi.spyOn(LibOSClient.prototype, "createTaskRun");
+    const container = await renderApp();
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(container.textContent).toContain("What should the Agent work on?"));
+    const durable = getByRole(container, "radio", { name: /Durable Task Run/ }) as HTMLInputElement;
+    expect(durable.disabled).toBe(true);
+    expect(container.textContent).toContain("this GUI never changes those settings");
+    await act(async () => user.type(getByRole(container, "textbox", { name: "Task goal" }), "Inspect the project"));
+    await act(async () => user.click(getByRole(container, "button", { name: "Start" })));
+
+    await waitFor(() => expect(spawnSpy).toHaveBeenCalledTimes(1));
+    expect(spawnSpy.mock.calls[0][0]).toBe("Inspect the project");
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+
+  it("creates a Durable TaskRun only after the user selects an available durable mode", async () => {
+    vi.spyOn(LibOSClient.prototype, "snapshot").mockResolvedValue(emptyRuntimeSnapshot(true));
+    installPersistentStreamMock();
+    installTaskRunReadMocks();
+    const spawnSpy = vi.spyOn(LibOSClient.prototype, "spawn");
+    const created = taskRun(1);
+    const running = { ...taskRun(2), status: "running" as const };
+    const createSpy = vi.spyOn(LibOSClient.prototype, "createTaskRun").mockResolvedValue(created);
+    vi.spyOn(LibOSClient.prototype, "runTaskRun").mockResolvedValue(running);
+    const container = await renderApp();
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(container.textContent).toContain("What should the Agent work on?"));
+    await act(async () => user.click(getByRole(container, "radio", { name: /Durable Task Run/ })));
+    await act(async () => user.type(getByRole(container, "textbox", { name: "Task goal" }), "Recover after restart"));
+    await act(async () => user.click(getByRole(container, "button", { name: "Start" })));
+
+    await waitFor(() => expect(createSpy).toHaveBeenCalledTimes(1));
+    expect(createSpy.mock.calls[0][0]).toMatchObject({ goal: "Recover after restart" });
+    expect(spawnSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps a withdrawn Durable choice blocked instead of silently changing launch mode", async () => {
+    vi.spyOn(LibOSClient.prototype, "snapshot").mockResolvedValue(emptyRuntimeSnapshot(true));
+    const streams = installPersistentStreamMock();
+    const spawnSpy = vi.spyOn(LibOSClient.prototype, "spawn");
+    const createSpy = vi.spyOn(LibOSClient.prototype, "createTaskRun");
+    const container = await renderApp();
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(streams).toHaveLength(1));
+    const goal = getByRole(container, "textbox", { name: "Task goal" });
+    const durable = getByRole(container, "radio", { name: /Durable Task Run/ }) as HTMLInputElement;
+    await act(async () => user.click(durable));
+    await act(async () => user.type(goal, "Must survive restart"));
+
+    await act(async () => {
+      streams[0].onMessage({
+        id: "launch-policy-2",
+        event: "snapshot",
+        data: { snapshot: emptyRuntimeSnapshot(false) }
+      });
+    });
+
+    await waitFor(() => expect(durable.disabled).toBe(true));
+    expect(durable.checked).toBe(true);
+    expect((getByRole(container, "button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(true);
+    goal.focus();
+    await act(async () => user.keyboard("{Control>}{Enter}{/Control}"));
+    expect(spawnSpy).not.toHaveBeenCalled();
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+});
+
 function installPersistentStreamMock(): StreamSession[] {
   const streams: StreamSession[] = [];
   vi.spyOn(LibOSClient.prototype, "stream").mockImplementation((onMessage, signal, _cursor, onStatus) => {
@@ -193,6 +268,7 @@ function runtimeSnapshot(revision: number): RuntimeSnapshot {
       finished_at: null,
       default_max_quanta: null
     },
+    task_run_launch: { enabled: true, plaintext_payloads_enabled: true, available: true },
     processes: [],
     human_requests: [],
     events: [],
@@ -207,6 +283,18 @@ function runtimeSnapshot(revision: number): RuntimeSnapshot {
     jsonrpc_endpoints: [],
     mcp_servers: [],
     modules: []
+  };
+}
+
+function emptyRuntimeSnapshot(durableAvailable: boolean): RuntimeSnapshot {
+  return {
+    ...runtimeSnapshot(1),
+    task_run_launch: {
+      enabled: true,
+      plaintext_payloads_enabled: durableAvailable,
+      available: durableAvailable
+    },
+    task_runs: []
   };
 }
 

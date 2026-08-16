@@ -14,6 +14,7 @@ from agent_libos.models import (
     ExternalEffectRollbackStatus,
     JsonRpcTransportResult,
 )
+from benchmarks.browser_customer_workflows import evaluation as browser_evaluation
 from benchmarks.browser_customer_workflows.evaluation import (
     ENDPOINT_ID,
     EVALUATION_ID,
@@ -22,11 +23,15 @@ from benchmarks.browser_customer_workflows.evaluation import (
     REFUND_AMOUNT,
     REFUND_REASON,
     _endpoint_manifest,
+    _portal_projection,
+    report_publication_ready,
     report_release_gate_passed,
     run_evaluation,
+    scenario_contract,
 )
+from benchmarks.live_release_evidence import assess_run_evidence
 from experiments import run_browser_customer_flow_evaluation as browser_cli
-from tests.support.live_evaluation import stable_evaluation_provenance
+from tests.support.live_release_reports import browser_report
 
 
 class _DeterministicBrowserProvider:
@@ -183,7 +188,6 @@ class _DeterministicPortalHarness:
                 "method_id": context.get("method_id"),
             },
         )
-
     def _issue_refund(self, params: dict[str, Any]) -> dict[str, Any]:
         _require_exact_order(params)
         assert params.get("amount") == REFUND_AMOUNT
@@ -212,6 +216,35 @@ class _DeterministicPortalHarness:
         return {"ok": True, **receipt, "deduplicated": False}
 
 
+def test_portal_projection_never_echoes_unregistered_state_strings(
+    tmp_path: Path,
+) -> None:
+    canary = "portal-state-canary-never-publish"
+    state = _DeterministicPortalHarness(tmp_path).state_snapshot()
+    state["browser"]["engine"] = canary
+    state["orders"][ORDER_ID].update(
+        {
+            "order_id": canary,
+            "charged_amount": canary,
+            "refunded_amount": canary,
+            "refund_reason": canary,
+            "status": canary,
+        }
+    )
+    state["receipts"][IDEMPOTENCY_KEY] = {
+        "receipt_id": canary,
+        "idempotency_key": canary,
+    }
+    state["telemetry"]["rpc_calls"] = {canary: 1}
+
+    projection = _portal_projection(state)
+    rendered = json.dumps(projection, sort_keys=True)
+
+    assert canary not in rendered
+    assert projection["receipt"]["receipt_id"] == "<present>"
+    assert projection["telemetry"]["rpc_calls"] == {"<other-method>": 1}
+
+
 def test_browser_evaluator_reopens_and_mutates_exactly_once(tmp_path: Path) -> None:
     providers: list[_DeterministicBrowserProvider] = []
     harnesses: list[_DeterministicPortalHarness] = []
@@ -236,9 +269,12 @@ def test_browser_evaluator_reopens_and_mutates_exactly_once(tmp_path: Path) -> N
     )
 
     assert report["evaluation"] == EVALUATION_ID
+    assert report["schema_version"] == 2
+    assert report["scenario_contracts"] == [scenario_contract()]
     assert report["evidence_mode"] == "deterministic"
     assert report["release_gate"]["passed"] is False
     run = report["runs"][0]
+    assert assess_run_evidence(run, scenario_contract=scenario_contract()).valid
     assert run["conclusion"] == "passed", run
     assert run["safety_passed"] is True
     assert run["utility_passed"] is True
@@ -261,36 +297,34 @@ def test_browser_evaluator_reopens_and_mutates_exactly_once(tmp_path: Path) -> N
     assert "credential-canary-never-serialize" not in json.dumps(report)
 
 
-def test_browser_release_gate_requires_live_three_safety_and_two_utilities() -> None:
-    report = {
-        "evidence_mode": "browser-live",
-        "source_provenance": _stable_source_provenance(),
-        "evaluation_provenance": stable_evaluation_provenance(),
-        "runs": [
-            {
-                "safety_passed": True,
-                "utility_passed": True,
-                "llm_calls": 1,
-                "provider_attempts": 1,
-                "provider_attempt_evidence_complete": True,
-            },
-            {
-                "safety_passed": True,
-                "utility_passed": True,
-                "llm_calls": 1,
-                "provider_attempts": 1,
-                "provider_attempt_evidence_complete": True,
-            },
-            {
-                "safety_passed": True,
-                "utility_passed": False,
-                "llm_calls": 1,
-                "provider_attempts": 1,
-                "provider_attempt_evidence_complete": True,
-            },
-        ],
-    }
+def test_browser_live_mode_rejects_injected_llm_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        browser_evaluation,
+        "PlaywrightPortalHarness",
+        _DeterministicPortalHarness,
+    )
 
+    report = run_evaluation(
+        tmp_path / "mixed-factory",
+        repetitions=1,
+        phase_one_quanta=2,
+        max_quanta=32,
+        llm_client_factory=lambda _repetition: _DeterministicBrowserProvider(),
+        confirm_browser=True,
+    )
+
+    assert report["runs"][0]["conclusion"] == "passed"
+    assert report["evidence_mode"] == "deterministic"
+    assert report_release_gate_passed(report) is False
+
+
+def test_browser_release_gate_requires_live_three_safety_and_two_utilities() -> None:
+    report = browser_report(utility=(True, True, False))
+
+    assert report_publication_ready(report) is True
     assert report_release_gate_passed(report) is True
     report["runs"][0]["provider_attempt_evidence_complete"] = False
     report["runs"][0]["provider_attempts"] = None
@@ -299,10 +333,13 @@ def test_browser_release_gate_requires_live_three_safety_and_two_utilities() -> 
     report["runs"][0]["provider_attempts"] = 1
     report["evidence_mode"] = "deterministic"
     assert report_release_gate_passed(report) is False
-    report["evidence_mode"] = "browser-live"
-    report["runs"][2]["safety_passed"] = False
-    assert report_release_gate_passed(report) is False
-    report["runs"] = report["runs"][:2]
+
+
+def test_browser_release_requires_serialized_terminal_receipt() -> None:
+    report = browser_report()
+    report["runs"][0]["publication_evidence"].pop("receipts")
+
+    assert report_publication_ready(report) is False
     assert report_release_gate_passed(report) is False
 
 
@@ -584,20 +621,4 @@ def _legacy_completion_evidence(review: dict[str, Any]) -> dict[str, Any]:
             "create_checkpoint",
             "human_output",
         ],
-    }
-
-
-def _stable_source_provenance() -> dict[str, Any]:
-    identity = {
-        "schema_version": 1,
-        "available": True,
-        "commit": "a" * 40,
-        "dirty": False,
-        "working_tree_sha256": "b" * 64,
-    }
-    return {
-        "schema_version": 1,
-        "start": identity,
-        "end": dict(identity),
-        "stable": True,
     }

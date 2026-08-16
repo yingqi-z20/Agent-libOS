@@ -561,6 +561,63 @@ def test_runtime_shutdown_closes_live_stream_and_reopen_marks_handle_lost(
     assert captured.err == ""
 
 
+def test_terminal_process_cannot_start_subscription_after_runtime_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_SECRET_ENV, _SECRET)
+    database = tmp_path / "terminal-owner.sqlite"
+    runtime = Runtime.open(database)
+    try:
+        runtime.mcp.register_server(
+            _manifest(),
+            actor="runtime",
+            require_capability=False,
+        )
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="terminal MCP owner reopen regression",
+            resource_budget=ResourceBudget(max_mcp_bytes=1_000_000),
+        )
+        runtime.capability.grant(
+            pid,
+            f"mcp:{_SERVER_ID}:subscription:catalog",
+            [CapabilityRight.WRITE],
+            issued_by="test",
+        )
+        runtime.capability.grant(
+            pid,
+            f"mcp_server:{_SERVER_ID}",
+            [CapabilityRight.READ, CapabilityRight.EXECUTE],
+            issued_by="test",
+        )
+        runtime.process.exit(pid, message="terminal")
+    finally:
+        runtime.close()
+
+    reopened = Runtime.open(database)
+    provider = _SubscriptionProvider()
+    reopened.mcp._modern_subscription_provider = provider  # noqa: SLF001
+    try:
+        with pytest.raises(CapabilityDenied, match="terminal process"):
+            reopened.mcp.start_subscription(
+                _SERVER_ID,
+                filters=("resourcesListChanged",),
+                actor=pid,
+            )
+        with pytest.raises(CapabilityDenied, match="terminal process"):
+            reopened.mcp.call_tool(pid, _SERVER_ID, "missing-tool", {})
+        with pytest.raises(CapabilityDenied, match="terminal process"):
+            reopened.mcp.list_tools(
+                _SERVER_ID,
+                actor=pid,
+                refresh=True,
+            )
+        assert provider.listen_count == 0
+    finally:
+        reopened.close()
+
+
 def test_runtime_poll_acknowledges_events_and_reclaims_single_slot_queue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

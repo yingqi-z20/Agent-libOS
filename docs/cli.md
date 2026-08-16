@@ -446,6 +446,21 @@ validates the complete canonical source shape against a private snapshot,
 performs zero writes beside the source, and returns a deterministic
 `plan_sha256`.
 
+Plan schema v2 binds that digest to the hashed database/schema and cluster
+identity, canonical source catalog, source logical or locked PostgreSQL
+relation-state digest, source-observation receipt, plan-bound migration-receipt
+contract, migration implementation, and product version. PostgreSQL planning
+and apply hold the Runtime advisory lease and schema-qualified relation locks
+while capturing relation OIDs plus visible `ctid`/`xmin` identities in a
+repeatable-read transaction; row payloads are not recorded. Apply writes the
+exact plan-bound audit receipt atomically with DDL and the marker update. If
+commit acknowledgement or post-commit validation fails after the transaction
+actually committed, repeat `--apply` with the same reviewed digest and recovery
+evidence. Only an exact target receipt, reconstructed source state, canonical
+catalog, and postcondition return `applied=false` and `already_applied=true`;
+this is uncertain-commit reconciliation, not permission to reuse a plan for
+another, generic same-version, or subsequently modified database.
+
 For the current v6-to-v7 step:
 
 ```bash
@@ -529,11 +544,18 @@ uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" store migrate --to 5 \
   --postgres-snapshot-confirmed
 ```
 
-The PostgreSQL path takes the Runtime advisory lock, validates canonical v4,
-performs the same single-transaction DDL/marker CAS/v5 readback, and releases
-the lock. The acknowledgement records only that the operator confirms an
-external snapshot exists; Agent libOS does not create or validate that snapshot
-artifact. Never use `init` or an ordinary Runtime command as a migration tool.
+The PostgreSQL path takes the Runtime advisory lock and full frozen-relation
+locks, validates canonical v4 and the locked source-state receipt, performs the
+same single-transaction DDL/audit-receipt/marker CAS/v5 readback, and releases
+the locks. The migration role must be able to execute
+`pg_catalog.pg_control_system()`; identity fails closed when the cluster system
+identifier is unavailable, and emitted plans contain no DSN or raw host value.
+The role must also own, hold `MAINTAIN` on, or hold the applicable write
+privilege for every frozen required table so dry-run and apply can take their
+`ACCESS EXCLUSIVE` locks.
+The acknowledgement records only that the operator confirms an external
+snapshot exists; Agent libOS does not create or validate that snapshot artifact.
+Never use `init` or an ordinary Runtime command as a migration tool.
 The full runbook is in [Runtime Storage](storage.md#offline-v4-to-v5-migration).
 
 ## Workflow Run
@@ -1327,7 +1349,7 @@ uv run agent-libos --db .agent_libos.sqlite mcp resources read demo-mcp handbook
 # Prompt output is a preview requiring user confirmation; it is never trusted
 # as system/developer context.
 uv run agent-libos --db .agent_libos.sqlite mcp prompts list demo-mcp
-uv run agent-libos --db .agent_libos.sqlite mcp prompts get demo-mcp release-notes --arguments-json '{"version":"1.5.0"}'
+uv run agent-libos --db .agent_libos.sqlite mcp prompts get demo-mcp release-notes --arguments-json '{"version":"1.5.1"}'
 uv run agent-libos --db .agent_libos.sqlite mcp prompts complete demo-mcp prompt release-notes version 2
 
 # OAuth login is one foreground flow. It prints the authorization URL, waits

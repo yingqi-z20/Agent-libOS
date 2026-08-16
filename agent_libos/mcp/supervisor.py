@@ -124,6 +124,11 @@ class McpConnectionSupervisor:
         self._lock = threading.RLock()
         self._connections: dict[str, _ConnectionState] = {}
         self._openings: dict[str, _OpeningState] = {}
+        # Process termination is monotonic for a Runtime instance.  Remember
+        # every closed operation owner separately from the transient
+        # connection catalog so an invalidation/Provider cleanup failure can
+        # never make that owner's old fence reusable again.
+        self._revoked_owners: set[str] = set()
         self._sequence = 0
         self._closed = False
 
@@ -148,6 +153,10 @@ class McpConnectionSupervisor:
         with self._lock:
             if self._closed:
                 raise RuntimeError("MCP connection supervisor is closed")
+            if type(fence.owner) is not str or not fence.owner:
+                raise ValueError("MCP connection owner is invalid")
+            if fence.owner in self._revoked_owners:
+                raise RuntimeError("MCP connection owner is closed")
             if reusable and purpose != "mutation":
                 selected = self._find_reusable_locked(fence, purpose)
                 if selected is not None:
@@ -358,12 +367,31 @@ class McpConnectionSupervisor:
         )
 
     async def close_owner(self, owner: str) -> None:
+        if not self.latch_owner_revocation(owner):
+            return
         await self._invalidate(lambda fence: fence.owner == owner, "owner_closed")
 
-    def close_owner_nowait(self, owner: str) -> None:
+    def latch_owner_revocation(self, owner: str) -> bool:
+        """Monotonically deny an owner without traversing state or doing I/O."""
+
         if type(owner) is not str or not owner:
+            return False
+        with self._lock:
+            self._revoked_owners.add(owner)
+        return True
+
+    def close_owner_nowait(self, owner: str) -> None:
+        if not self.latch_owner_revocation(owner):
             return
-        self._invalidate_nowait(lambda fence: fence.owner == owner, "owner_closed")
+        # Latch before any catalog traversal or scheduling.  The latch is the
+        # authority boundary; detached-session close remains bounded,
+        # best-effort cleanup on the connection's owner loop.
+        failure = self._invalidate_nowait(
+            lambda fence: fence.owner == owner,
+            "owner_closed",
+        )
+        if failure is not None:
+            raise failure
 
     async def close(self) -> None:
         detached: list[tuple[_ConnectionState, str | None]] = []
@@ -410,7 +438,7 @@ class McpConnectionSupervisor:
         self,
         predicate: Callable[[McpConnectionFence], bool],
         reason: str,
-    ) -> None:
+    ) -> BaseException | None:
         detached: list[tuple[_ConnectionState, str | None]] = []
         try:
             with self._lock:
@@ -427,11 +455,12 @@ class McpConnectionSupervisor:
                                 reason=reason,
                             )
                         )
-        except BaseException:
+        except BaseException as exc:
             # This is a post-commit revocation latch.  Never report a false
             # registry/OAuth rollback to the caller.
-            return
+            return exc
         self._schedule_close_many(detached)
+        return None
 
     def _find_reusable_locked(
         self, fence: McpConnectionFence, purpose: str

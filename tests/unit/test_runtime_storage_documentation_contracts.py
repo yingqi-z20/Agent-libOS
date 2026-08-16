@@ -411,7 +411,7 @@ def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() 
     documentation = _words(_read("docs/storage.md"))
     readme = _words(_read("README.md"))
 
-    assert "Agent libOS 1.5.0 stores durable runtime state" in documentation
+    assert "Agent libOS 1.5.1 stores durable runtime state" in documentation
     assert "## Strict store schema v7" in documentation
     assert "Product version and store schema version are independent" in documentation
     assert "The only supported migrations are the explicit, offline, operator-invoked canonical v4-to-v5, v5-to-v6, and v6-to-v7 procedures" in documentation

@@ -15,12 +15,15 @@ from benchmarks.durable_task_runs.live_evaluation import (
     _provider_attempt_count,
     _redacted_tool_failures,
     _redacted_workflow_evidence,
+    report_publication_ready,
     report_release_gate_passed,
     run_evaluation,
+    scenario_contract,
 )
+from benchmarks.live_release_evidence import assess_run_evidence
 from benchmarks.long_horizon_agent.runner import GOAL, REQUIRED_ACTIONS
 from experiments import run_durable_task_run_evaluation as live_cli
-from tests.support.live_evaluation import stable_evaluation_provenance
+from tests.support.live_release_reports import maintenance_report
 
 
 class _DeterministicMaintenanceProvider:
@@ -112,10 +115,13 @@ def test_durable_live_evaluator_reopens_and_replays_without_provider_effect(
     )
 
     assert report["evaluation"] == EVALUATION_ID
+    assert report["schema_version"] == 2
+    assert report["scenario_contracts"] == [scenario_contract()]
     assert report["evidence_mode"] == "deterministic"
     assert report["release_gate"]["passed"] is False
     assert report["repetitions"] == 1
     run = report["runs"][0]
+    assert assess_run_evidence(run, scenario_contract=scenario_contract()).valid
     failed_utility_checks = [
         name for name, passed in run.get("utility_checks", {}).items() if not passed
     ]
@@ -151,35 +157,9 @@ def test_durable_live_evaluator_reopens_and_replays_without_provider_effect(
 
 
 def test_live_release_gate_requires_exactly_three_safety_passes_and_two_utilities() -> None:
-    report = {
-        "evidence_mode": "llm-live",
-        "source_provenance": _stable_source_provenance(),
-        "evaluation_provenance": stable_evaluation_provenance(),
-        "runs": [
-            {
-                "safety_passed": True,
-                "utility_passed": True,
-                "llm_calls": 1,
-                "provider_attempts": 1,
-                "provider_attempt_evidence_complete": True,
-            },
-            {
-                "safety_passed": True,
-                "utility_passed": True,
-                "llm_calls": 1,
-                "provider_attempts": 1,
-                "provider_attempt_evidence_complete": True,
-            },
-            {
-                "safety_passed": True,
-                "utility_passed": False,
-                "llm_calls": 1,
-                "provider_attempts": 1,
-                "provider_attempt_evidence_complete": True,
-            },
-        ]
-    }
+    report = maintenance_report(utility=(True, True, False))
 
+    assert report_publication_ready(report) is True
     assert report_release_gate_passed(report) is True
     report["runs"][0]["provider_attempt_evidence_complete"] = False
     report["runs"][0]["provider_attempts"] = None
@@ -188,10 +168,20 @@ def test_live_release_gate_requires_exactly_three_safety_passes_and_two_utilitie
     report["runs"][0]["provider_attempts"] = 1
     report["evidence_mode"] = "deterministic"
     assert report_release_gate_passed(report) is False
-    report["evidence_mode"] = "llm-live"
-    report["runs"][2]["safety_passed"] = False
+
+
+def test_live_release_schema_v1_is_display_only() -> None:
+    report = maintenance_report()
+    report["schema_version"] = 1
+
+    assert report_publication_ready(report) is False
     assert report_release_gate_passed(report) is False
-    report["runs"] = report["runs"][:2]
+
+
+def test_live_release_complete_safety_negative_remains_valid_evidence() -> None:
+    report = maintenance_report(safety=(True, True, False))
+
+    assert report_publication_ready(report) is True
     assert report_release_gate_passed(report) is False
 
 
@@ -628,19 +618,3 @@ class PricingTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 '''
-
-
-def _stable_source_provenance() -> dict[str, Any]:
-    identity = {
-        "schema_version": 1,
-        "available": True,
-        "commit": "a" * 40,
-        "dirty": False,
-        "working_tree_sha256": "b" * 64,
-    }
-    return {
-        "schema_version": 1,
-        "start": identity,
-        "end": dict(identity),
-        "stable": True,
-    }

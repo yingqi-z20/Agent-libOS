@@ -187,6 +187,7 @@ function snapshot(): RuntimeSnapshot {
       finished_at: null,
       default_max_quanta: null
     },
+    task_run_launch: { enabled: true, plaintext_payloads_enabled: false, available: false },
     processes: [
       {
         pid: "pid_1",

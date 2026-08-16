@@ -1493,6 +1493,7 @@ export type RuntimeSnapshot = {
   schema_version: 3;
   db: string;
   scheduler: SchedulerStatus;
+  task_run_launch: TaskRunLaunchAvailability;
   processes: RuntimeProcess[];
   human_requests: HumanRequest[];
   events: RuntimeEvent[];
@@ -1508,6 +1509,12 @@ export type RuntimeSnapshot = {
   mcp_servers: McpServerSummary[];
   modules: ModuleSummary[];
   _truncated?: Record<string, unknown>;
+};
+
+export type TaskRunLaunchAvailability = {
+  enabled: boolean;
+  plaintext_payloads_enabled: boolean;
+  available: boolean;
 };
 
 export type OperationSummary = {
@@ -2795,6 +2802,9 @@ const snapshotCollections = [
   "mcp_servers",
   "modules"
 ] as const;
+const taskRunLaunchAvailabilityKeys = new Set([
+  "enabled", "plaintext_payloads_enabled", "available"
+]);
 
 const llmTraceCoverages = ["complete", "custom_client_incomplete", "legacy_final_only"] as const;
 const llmReasoningAvailabilities = ["returned", "not_returned", "not_persisted", "purged", "limited"] as const;
@@ -2985,6 +2995,15 @@ export function assertRuntimeSnapshot(value: unknown): asserts value is RuntimeS
     assertSchedulerStatus(value.scheduler);
   } catch {
     throw new Error("GUI snapshot scheduler state is malformed.");
+  }
+  if (!isRecord(value.task_run_launch)
+      || !hasOnlyKeys(value.task_run_launch, taskRunLaunchAvailabilityKeys)
+      || typeof value.task_run_launch.enabled !== "boolean"
+      || typeof value.task_run_launch.plaintext_payloads_enabled !== "boolean"
+      || typeof value.task_run_launch.available !== "boolean"
+      || (value.task_run_launch.available
+        && (!value.task_run_launch.enabled || !value.task_run_launch.plaintext_payloads_enabled))) {
+    throw new Error("GUI snapshot TaskRun launch availability is malformed.");
   }
   for (const key of snapshotCollections) {
     if (!Array.isArray(value[key])) throw new Error(`GUI snapshot collection is malformed: ${key}.`);

@@ -7,6 +7,7 @@ import type { ImageSummary, LLMProfileInput, LLMProfileSummary } from "../api/ty
 import { I18nProvider } from "../i18n";
 import {
   UserTaskSettingsDialog,
+  type TaskLaunchMode,
   type TaskLaunchSettings
 } from "./UserTaskSettingsDialog";
 
@@ -129,6 +130,19 @@ describe("UserTaskSettingsDialog", () => {
     expect(button(container, "Save settings").disabled).toBe(true);
   });
 
+  it("does not require or enable a Durable authority template for a regular process", async () => {
+    const onApply = vi.fn();
+    const container = await renderDialog({ onApply, launchMode: "ephemeral" });
+    const manifest = inputFor(container, "Durable authority template ID");
+
+    expect(manifest.disabled).toBe(true);
+    expect(manifest.getAttribute("aria-invalid")).toBeNull();
+    expect(container.textContent).toContain("no Durable authority template is referenced");
+    expect(button(container, "Save settings").disabled).toBe(false);
+    await click(button(container, "Save settings"));
+    expect(onApply).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps one dialog and preserves the draft while managing profiles", async () => {
     const container = await renderDialog();
     await setInput(inputFor(container, "Quanta"), "37");
@@ -197,6 +211,7 @@ type RenderOptions = {
   busy?: boolean;
   initialOpen?: boolean;
   language?: "en" | "zh-CN";
+  launchMode?: TaskLaunchMode;
   onApply?: (next: TaskLaunchSettings) => void;
   onClose?: () => void;
   onDelete?: (profileId: string) => Promise<boolean>;
@@ -212,6 +227,7 @@ async function renderDialog(options: RenderOptions = {}): Promise<HTMLDivElement
       <I18nProvider initialLanguage={options.language ?? "en"}>
         <UserTaskSettingsDialog
           value={initialSettings}
+          launchMode={options.launchMode ?? "durable"}
           images={images}
           llmProfiles={[profile("alpha"), profile("beta")]}
           busy={options.busy}
@@ -242,7 +258,7 @@ async function renderHarness(options: RenderOptions = {}): Promise<HTMLDivElemen
   return container;
 }
 
-function DialogHarness({ busy, initialOpen = true, onApply, onClose, onDelete }: RenderOptions) {
+function DialogHarness({ busy, initialOpen = true, launchMode = "durable", onApply, onClose, onDelete }: RenderOptions) {
   const [open, setOpen] = useState(initialOpen);
   const [settings, setSettings] = useState(initialSettings);
   return (
@@ -251,6 +267,7 @@ function DialogHarness({ busy, initialOpen = true, onApply, onClose, onDelete }:
       {open ? (
         <UserTaskSettingsDialog
           value={settings}
+          launchMode={launchMode}
           images={images}
           llmProfiles={[profile("alpha"), profile("beta")]}
           busy={busy}

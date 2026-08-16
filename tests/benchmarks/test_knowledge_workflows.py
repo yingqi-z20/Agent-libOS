@@ -26,14 +26,14 @@ from benchmarks.knowledge_workflows.evaluation import (
     _prohibited_action_checks,
     _workspace_snapshot,
     prepare_analysis_workspace,
+    report_publication_ready,
     report_release_gate_passed,
     run_evaluation,
+    scenario_contracts,
 )
+from benchmarks.live_release_evidence import assess_run_evidence
 from experiments import run_knowledge_workflow_evaluation as knowledge_cli
-from tests.support.live_evaluation import (
-    stable_evaluation_provenance,
-    stable_source_provenance,
-)
+from tests.support.live_release_reports import knowledge_report
 
 
 class _DeterministicKnowledgeProvider:
@@ -97,6 +97,8 @@ def test_knowledge_evaluator_runs_both_images_with_restart_and_oracles(
     )
 
     assert report["evaluation"] == EVALUATION_ID
+    assert report["schema_version"] == 2
+    assert report["scenario_contracts"] == scenario_contracts()
     assert report["evidence_mode"] == "deterministic"
     assert report["release_gate"]["passed"] is False
     assert report["metrics"]["runs"] == 2
@@ -107,6 +109,12 @@ def test_knowledge_evaluator_runs_both_images_with_restart_and_oracles(
         ANALYSIS_SCENARIO_ID,
     }
     for run in report["runs"]:
+        contract = next(
+            item
+            for item in scenario_contracts()
+            if item["scenario_id"] == run["scenario_id"]
+        )
+        assert assess_run_evidence(run, scenario_contract=contract).valid
         assert run["conclusion"] == "passed", run
         assert all(run["safety_checks"].values()), run["safety_checks"]
         assert all(run["utility_checks"].values()), run["utility_checks"]
@@ -145,6 +153,7 @@ def test_knowledge_evaluator_runs_both_images_with_restart_and_oracles(
 )
 def test_knowledge_release_gate_fails_closed(mutation: str) -> None:
     report = _live_release_report()
+    assert report_publication_ready(report) is True
     assert report_release_gate_passed(report) is True
 
     if mutation == "safety":
@@ -339,6 +348,16 @@ def test_analysis_oracle_reports_bounded_semantic_mismatch_codes() -> None:
     assert _analysis_artifact_validation_errors(artifact) == [
         "value_mismatch:mobile.B.conversion_rate"
     ]
+
+
+def test_analysis_oracle_does_not_echo_unexpected_top_level_keys() -> None:
+    artifact = copy.deepcopy(_EXPECTED_ANALYSIS_RESULT)
+    artifact[CANARY] = "must not enter publication evidence"
+
+    errors = _analysis_artifact_validation_errors(artifact)
+
+    assert errors == ["unexpected_top_level"]
+    assert CANARY not in json.dumps(errors)
 
 
 def test_denied_prohibited_attempt_is_safety_success_but_instruction_failure() -> None:
@@ -667,25 +686,4 @@ def _legacy_completion_evidence(review: dict[str, Any]) -> dict[str, Any]:
 
 
 def _live_release_report() -> dict[str, Any]:
-    runs = []
-    for scenario_id in (RESEARCH_SCENARIO_ID, ANALYSIS_SCENARIO_ID):
-        runs.extend(
-            {
-                "scenario_id": scenario_id,
-                "safety_passed": True,
-                "utility_passed": True,
-                "llm_calls": 1,
-                "provider_attempts": 1,
-                "provider_attempt_evidence_complete": True,
-            }
-            for _ in range(3)
-        )
-    return {
-        "schema_version": 1,
-        "evaluation": EVALUATION_ID,
-        "evidence_mode": "llm-live",
-        "repetitions": 3,
-        "runs": runs,
-        "source_provenance": stable_source_provenance(),
-        "evaluation_provenance": stable_evaluation_provenance(),
-    }
+    return knowledge_report()

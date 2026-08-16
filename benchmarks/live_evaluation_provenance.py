@@ -18,6 +18,8 @@ _MAX_UNTRACKED_FILE_BYTES = 16 * 1024 * 1024
 _MAX_UNTRACKED_TOTAL_BYTES = 64 * 1024 * 1024
 _DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1"
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_EVALUATION_PROVENANCE_SCHEMA_VERSION = 2
+_EVALUATION_SNAPSHOT_SCHEMA_VERSION = 2
 
 
 class EvaluationProvenance(TypedDict):
@@ -115,21 +117,20 @@ def build_source_provenance(
 
 
 def valid_stable_source_provenance(value: Any) -> bool:
-    if not isinstance(value, dict) or value.get("schema_version") != 1:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "start", "end", "stable"}
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+    ):
         return False
     start = value.get("start")
     end = value.get("end")
     return bool(
         value.get("stable") is True
-        and isinstance(start, dict)
-        and isinstance(end, dict)
+        and _valid_source_identity(start)
+        and _valid_source_identity(end)
         and start == end
-        and start.get("available") is True
-        and isinstance(start.get("commit"), str)
-        and len(start["commit"]) in {40, 64}
-        and isinstance(start.get("dirty"), bool)
-        and isinstance(start.get("working_tree_sha256"), str)
-        and len(start["working_tree_sha256"]) == 64
     )
 
 
@@ -146,9 +147,12 @@ def capture_evaluation_provenance(
 
     selected_config = config or DEFAULT_CONFIG
     return {
-        "schema_version": 1,
+        "schema_version": _EVALUATION_SNAPSHOT_SCHEMA_VERSION,
         "source": capture_source_provenance(),
         "llm": _capture_safe_llm_config(selected_config),
+        "evidence_capture": _capture_safe_evidence_capture_config(
+            selected_config
+        ),
     }
 
 
@@ -159,7 +163,7 @@ def build_evaluation_provenance(
     """Bind a report to one unchanged source and effective LLM identity."""
 
     return {
-        "schema_version": 1,
+        "schema_version": _EVALUATION_PROVENANCE_SCHEMA_VERSION,
         "start": start,
         "end": end,
         "stable": start == end and _valid_evaluation_snapshot(start),
@@ -179,7 +183,9 @@ def valid_evaluation_provenance(value: Any) -> bool:
     start = value.get("start")
     end = value.get("end")
     return bool(
-        value.get("schema_version") == 1
+        type(value.get("schema_version")) is int
+        and value.get("schema_version")
+        == _EVALUATION_PROVENANCE_SCHEMA_VERSION
         and value.get("stable") is True
         and isinstance(start, dict)
         and isinstance(end, dict)
@@ -384,17 +390,55 @@ def _capture_safe_llm_config(config: AgentLibOSConfig) -> dict[str, Any]:
         return _unavailable_llm_config()
 
 
+def _capture_safe_evidence_capture_config(
+    config: AgentLibOSConfig,
+) -> dict[str, Any]:
+    """Record bounded-ledger limits that determine publication completeness."""
+
+    return {
+        "schema_version": 1,
+        "llm_call_record_list_limit": config.llm.call_record_list_limit,
+        "llm_call_record_hard_limit": config.llm.call_record_hard_limit,
+        "checkpoint_list_limit": config.checkpoint.list_limit,
+    }
+
+
 def _valid_evaluation_snapshot(value: Any) -> bool:
     if not isinstance(value, dict) or set(value) != {
         "schema_version",
         "source",
         "llm",
+        "evidence_capture",
     }:
         return False
     return bool(
-        value.get("schema_version") == 1
+        type(value.get("schema_version")) is int
+        and value.get("schema_version") == _EVALUATION_SNAPSHOT_SCHEMA_VERSION
         and _valid_source_identity(value.get("source"))
         and _valid_safe_llm_config(value.get("llm"))
+        and _valid_safe_evidence_capture_config(
+            value.get("evidence_capture")
+        )
+    )
+
+
+def _valid_safe_evidence_capture_config(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "llm_call_record_list_limit",
+        "llm_call_record_hard_limit",
+        "checkpoint_list_limit",
+    }:
+        return False
+    list_limit = value.get("llm_call_record_list_limit")
+    hard_limit = value.get("llm_call_record_hard_limit")
+    return bool(
+        type(value.get("schema_version")) is int
+        and value.get("schema_version") == 1
+        and _is_positive_int(list_limit)
+        and _is_positive_int(hard_limit)
+        and list_limit <= hard_limit
+        and _is_positive_int(value.get("checkpoint_list_limit"))
     )
 
 
@@ -409,6 +453,7 @@ def _valid_source_identity(value: Any) -> bool:
             "dirty",
             "working_tree_sha256",
         }
+        and type(value.get("schema_version")) is int
         and value.get("schema_version") == 1
         and value.get("available") is True
         and _is_hex_digest(value.get("commit"), lengths={40, 64})
@@ -473,7 +518,8 @@ def _valid_safe_llm_config(value: Any) -> bool:
     without_digest = dict(value)
     without_digest.pop("config_sha256", None)
     return bool(
-        value.get("schema_version") == 1
+        type(value.get("schema_version")) is int
+        and value.get("schema_version") == 1
         and value.get("available") is True
         and value.get("provider_kind") == "openai_compatible"
         and isinstance(value.get("profile_id"), str)

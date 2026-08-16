@@ -285,6 +285,10 @@ class McpSubscriptionManager:
         self._stopping: dict[str, _LiveSubscription] = {}
         self._terminal: OrderedDict[str, _TerminalSubscription] = OrderedDict()
         self._event_reads: set[str] = set()
+        # This is an authority latch, not a cleanup cache.  Once a process
+        # owner is terminal it may never open or resume a subscription in this
+        # Runtime instance, even when durable/provider cleanup needs a retry.
+        self._revoked_owners: set[str] = set()
         self._closed = False
         self._validate_policy(reconcile_on_start=reconcile_on_start)
         if reconcile_on_start:
@@ -400,12 +404,7 @@ class McpSubscriptionManager:
             provider_cleanup_done,
             origin_effect_id=origin_effect_id,
         )
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("MCP subscription manager is closed")
-            if len(self._live) + len(self._opening) >= self._policy.max_open:
-                raise RuntimeError("MCP subscription limit reached")
-            self._opening[subscription_id] = opening
+        self._reserve_opening(subscription_id, opening)
         if self._store is not None:
             try:
                 with self._mutation_admission():
@@ -471,7 +470,11 @@ class McpSubscriptionManager:
                 acknowledged_filters=acknowledged,
             )
             with self._lock:
-                if self._closed or self._opening.get(subscription_id) is not opening:
+                if (
+                    self._closed
+                    or fence.owner in self._revoked_owners
+                    or self._opening.get(subscription_id) is not opening
+                ):
                     raise RuntimeError("MCP subscription opening was cancelled")
                 queue: asyncio.Queue[McpSubscriptionEvent] = asyncio.Queue(
                     maxsize=self._policy.queue_events
@@ -522,6 +525,22 @@ class McpSubscriptionManager:
                     cleanup_done=provider_cleanup_done,
                 )
             raise
+
+    def _reserve_opening(
+        self,
+        subscription_id: str,
+        opening: _OpeningSubscription,
+    ) -> None:
+        """Reserve one opening slot after checking the owner revocation latch."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("MCP subscription manager is closed")
+            if opening.fence.owner in self._revoked_owners:
+                raise RuntimeError("MCP subscription owner is closed")
+            if len(self._live) + len(self._opening) >= self._policy.max_open:
+                raise RuntimeError("MCP subscription limit reached")
+            self._opening[subscription_id] = opening
 
     def commit_prepared_start_deferred(
         self,
@@ -576,6 +595,8 @@ class McpSubscriptionManager:
                 raise ValidationError("MCP subscription start was not committed")
             if self._closed:
                 raise RuntimeError("MCP subscription manager is closed")
+            if opening.fence.owner in self._revoked_owners:
+                raise RuntimeError("MCP subscription owner is closed")
             live = opening.prepared
             if live is None:
                 raise ValidationError("MCP subscription start is not prepared")
@@ -735,12 +756,18 @@ class McpSubscriptionManager:
         with self._lock:
             selected = self._live.get(subscription_id)
             if selected is not None:
+                if selected.connection.fence.owner in self._revoked_owners:
+                    raise RuntimeError("MCP subscription owner is closed")
                 return selected.public
             opening = self._opening.get(subscription_id)
             if opening is not None:
+                if opening.fence.owner in self._revoked_owners:
+                    raise RuntimeError("MCP subscription owner is closed")
                 return opening.public
             stopping = self._stopping.get(subscription_id)
             if stopping is not None:
+                if stopping.connection.fence.owner in self._revoked_owners:
+                    raise RuntimeError("MCP subscription owner is closed")
                 return stopping.public
             terminal = self._terminal.get(subscription_id)
             if terminal is not None:
@@ -779,6 +806,8 @@ class McpSubscriptionManager:
             with self._lock:
                 selected = self._live.get(subscription_id)
                 if selected is not None:
+                    if selected.connection.fence.owner in self._revoked_owners:
+                        raise RuntimeError("MCP subscription owner is closed")
                     if after != selected.event_cursor:
                         raise ValidationError(
                             "MCP subscription event cursor is stale or has multiple readers"
@@ -1001,7 +1030,11 @@ class McpSubscriptionManager:
     ) -> McpSubscriptionEvent | None:
         with self._lock:
             selected = self._live.get(subscription_id)
-            if selected is None or selected.stop.is_set():
+            if (
+                selected is None
+                or selected.stop.is_set()
+                or selected.connection.fence.owner in self._revoked_owners
+            ):
                 return None
             provider = selected.provider
             handle = selected.provider_handle
@@ -1016,7 +1049,11 @@ class McpSubscriptionManager:
         receive_task = _provider_receive_task(provider, handle, deadline=deadline)
         with self._lock:
             selected = self._live.get(subscription_id)
-            if selected is None or selected.stop.is_set():
+            if (
+                selected is None
+                or selected.stop.is_set()
+                or selected.connection.fence.owner in self._revoked_owners
+            ):
                 receive_task.cancel()
                 return None
             selected.receive_task = receive_task
@@ -1044,7 +1081,11 @@ class McpSubscriptionManager:
     ) -> bool | None:
         with self._lock:
             selected = self._live.get(subscription_id)
-            if selected is None or selected.stop.is_set():
+            if (
+                selected is None
+                or selected.stop.is_set()
+                or selected.connection.fence.owner in self._revoked_owners
+            ):
                 return None
             event = replace(
                 event,
@@ -1336,12 +1377,40 @@ class McpSubscriptionManager:
     def close_owner_nowait(self, owner: str) -> None:
         if type(owner) is not str or not owner:
             return
-        self._invalidate_nowait(
-            live_predicate=lambda selected: selected.connection.fence.owner == owner,
-            opening_predicate=lambda selected: selected.fence.owner == owner,
-            reason="owner_closed",
-        )
-        self._supervisor.close_owner_nowait(owner)
+        # Latch first, then attempt the independent subscription and
+        # connection cleanup branches.  A failure in either branch is
+        # reported to durable process terminal-cleanup, but cannot reopen
+        # authority because both latches precede Provider cleanup.
+        with self._lock:
+            self._revoked_owners.add(owner)
+            # A prepared subscription has no consumer task to cancel yet.
+            # Closing its publication token at the latch linearization point
+            # prevents a concurrent protected operation from committing it
+            # after its process owner became terminal.
+            for opening in self._opening.values():
+                if opening.fence.owner == owner:
+                    opening.closed = True
+        # Both authority latches must precede Store transitions, catalog
+        # traversal, and Provider cleanup.  In particular, a blocked local
+        # durable CAS must not leave the connection supervisor able to admit
+        # another session for this terminal owner.
+        self._supervisor.latch_owner_revocation(owner)
+        failures: list[BaseException] = []
+        try:
+            local_failure = self._invalidate_nowait(
+                live_predicate=lambda selected: selected.connection.fence.owner == owner,
+                opening_predicate=lambda selected: selected.fence.owner == owner,
+                reason="owner_closed",
+            )
+            if local_failure is not None:
+                failures.append(local_failure)
+        except BaseException as exc:
+            failures.append(exc)
+        try:
+            self._supervisor.close_owner_nowait(owner)
+        except BaseException as exc:
+            failures.append(exc)
+        _raise_owner_revocation_failures(failures)
 
     def _invalidate_nowait(
         self,
@@ -1349,8 +1418,9 @@ class McpSubscriptionManager:
         live_predicate: Callable[[_LiveSubscription], bool],
         opening_predicate: Callable[[_OpeningSubscription], bool],
         reason: str,
-    ) -> None:
+    ) -> BaseException | None:
         cancelled: list[asyncio.Task[Any]] = []
+        failure: BaseException | None = None
         try:
             with self._lock:
                 for subscription_id, selected in tuple(self._live.items()):
@@ -1427,12 +1497,13 @@ class McpSubscriptionManager:
                         event_cursor=event_cursor,
                         cleanup_done=selected.cleanup_done,
                     )
-        except BaseException:
+        except BaseException as exc:
             # Registry/OAuth state is already committed.  Keep the in-memory
             # revocation latch and never report a false rollback.
-            pass
+            failure = exc
         for task in dict.fromkeys(cancelled):
             _cancel_task_threadsafe(task)
+        return failure
 
     def _lose_selected_nowait(
         self,
@@ -1722,6 +1793,19 @@ def _cancel_task_threadsafe(task: asyncio.Task[Any]) -> None:
             loop.call_soon_threadsafe(task.cancel)
     except RuntimeError:
         return
+
+
+def _raise_owner_revocation_failures(failures: list[BaseException]) -> None:
+    """Surface cleanup faults after both monotonic owner latches ran."""
+
+    if not failures:
+        return
+    if len(failures) == 1:
+        raise failures[0]
+    ordinary = [error for error in failures if isinstance(error, Exception)]
+    if len(ordinary) == len(failures):
+        raise ExceptionGroup("MCP owner revocation failed", ordinary)
+    raise BaseExceptionGroup("MCP owner revocation interrupted", failures)
 
 
 def _running_loop_or_none() -> asyncio.AbstractEventLoop | None:

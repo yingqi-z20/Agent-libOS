@@ -393,6 +393,11 @@ def test_gui_api_schema_validates_snapshot_and_error_envelopes() -> None:
         "schema_version": 3,
         "db": "local",
         "scheduler": {"auto_run": True, "running": False, "paused": False},
+        "task_run_launch": {
+            "enabled": True,
+            "plaintext_payloads_enabled": False,
+            "available": False,
+        },
         "processes": [{"pid": "pid_1", "status": "waiting"}],
         "human_requests": [],
         "events": [],
@@ -424,6 +429,23 @@ def test_gui_api_schema_validates_snapshot_and_error_envelopes() -> None:
     }
     snapshot_validator = _validator_for("snapshotResponse")
     snapshot_validator.validate(snapshot)
+    invalid_launch = {
+        **snapshot,
+        "task_run_launch": {
+            **snapshot["task_run_launch"],
+            "api_key": "must-not-be-projected",
+        },
+    }
+    assert list(snapshot_validator.iter_errors(invalid_launch))
+    inconsistent_launch = {
+        **snapshot,
+        "task_run_launch": {
+            "enabled": True,
+            "plaintext_payloads_enabled": False,
+            "available": True,
+        },
+    }
+    assert list(snapshot_validator.iter_errors(inconsistent_launch))
     private_summary = {
         **snapshot["task_runs"][0],
         "goal": "must not cross summary boundary",

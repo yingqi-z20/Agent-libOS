@@ -49,7 +49,7 @@ import { HumanRequestCard, type HumanResponseOutcome } from "./HumanRequestCard"
 import { ImageSelect } from "./ImageSelect";
 import { LanguageSwitch } from "./LanguageSwitch";
 import { RatingPanel } from "./RatingPanel";
-import { UserTaskSettingsDialog, type TaskLaunchSettings } from "./UserTaskSettingsDialog";
+import { UserTaskSettingsDialog, type TaskLaunchMode, type TaskLaunchSettings } from "./UserTaskSettingsDialog";
 import { ProviderTracePanel, type ProviderTraceClient } from "./ProviderTracePanel";
 
 const MarkdownMessage = lazy(async () => {
@@ -144,6 +144,8 @@ type UserPageProps = {
   taskRuns?: TaskRunSummary[];
   taskLabels: Readonly<Record<string, string>>;
   taskSettings: TaskLaunchSettings;
+  taskLaunchMode: TaskLaunchMode;
+  durableTaskLaunchAvailable: boolean;
   quantaValid?: boolean;
   spawnGoal: string;
   message: string;
@@ -156,6 +158,7 @@ type UserPageProps = {
   onSpawnGoalChange(value: string): void;
   onSpawnImageChange(value: string): void;
   onApplyTaskSettings(next: TaskLaunchSettings): void;
+  onTaskLaunchModeChange(mode: TaskLaunchMode): void;
   onMessageChange(value: string): void;
   onSpawn(): void;
   onImportImage(): void;
@@ -194,6 +197,8 @@ export function UserPage({
   taskRuns = [],
   taskLabels,
   taskSettings,
+  taskLaunchMode,
+  durableTaskLaunchAvailable,
   quantaValid = true,
   spawnGoal,
   message,
@@ -206,6 +211,7 @@ export function UserPage({
   onSpawnGoalChange,
   onSpawnImageChange,
   onApplyTaskSettings,
+  onTaskLaunchModeChange,
   onMessageChange,
   onSpawn,
   onImportImage,
@@ -237,6 +243,8 @@ export function UserPage({
   const [showReasoning, setShowReasoning] = useState(false);
   const sidebarQuantaErrorId = useId();
   const newTaskStatusId = useId();
+  const taskLaunchModeName = useId();
+  const durableTaskLaunchHintId = useId();
   const conversation = useMemo(() => deriveUserConversation(snapshot, selectedPid), [snapshot, selectedPid]);
   const conversationPendingRequests = conversation.filter((item): item is Extract<UserConversationItem, { role: "request" }> => item.role === "request");
   const pendingRequests = selectedRun && taskRunHumanRequests !== null
@@ -677,7 +685,11 @@ export function UserPage({
                     placeholder={t("user.goalPlaceholder")}
                     onChange={(event) => onSpawnGoalChange(event.currentTarget.value)}
                     onKeyDown={(event) => {
-                      if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && spawnGoal.trim() && !busy) {
+                      if ((event.metaKey || event.ctrlKey)
+                          && event.key === "Enter"
+                          && spawnGoal.trim()
+                          && !busy
+                          && (taskLaunchMode !== "durable" || durableTaskLaunchAvailable)) {
                         event.preventDefault();
                         onSpawn();
                       }
@@ -695,6 +707,49 @@ export function UserPage({
                     ))}
                   </div>
                 </div>
+
+                <fieldset
+                  className="taskLaunchMode"
+                  aria-describedby={!durableTaskLaunchAvailable ? durableTaskLaunchHintId : undefined}
+                >
+                  <legend>{t("user.launchMode")}</legend>
+                  <div className="taskLaunchModeOptions">
+                    <label className={taskLaunchMode === "ephemeral" ? "selected" : undefined}>
+                      <input
+                        type="radio"
+                        name={taskLaunchModeName}
+                        value="ephemeral"
+                        checked={taskLaunchMode === "ephemeral"}
+                        disabled={busy}
+                        onChange={() => onTaskLaunchModeChange("ephemeral")}
+                      />
+                      <span>
+                        <strong>{t("user.ephemeralMode")}</strong>
+                        <small>{t("user.ephemeralModeHint")}</small>
+                      </span>
+                    </label>
+                    <label className={taskLaunchMode === "durable" ? "selected" : undefined}>
+                      <input
+                        type="radio"
+                        name={taskLaunchModeName}
+                        value="durable"
+                        checked={taskLaunchMode === "durable"}
+                        disabled={busy || !durableTaskLaunchAvailable}
+                        onChange={() => onTaskLaunchModeChange("durable")}
+                      />
+                      <span>
+                        <strong>{t("user.durableMode")}</strong>
+                        <small>{t("user.durableModeHint")}</small>
+                      </span>
+                    </label>
+                  </div>
+                  {!durableTaskLaunchAvailable ? (
+                    <p id={durableTaskLaunchHintId} className="taskLaunchModeNotice">
+                      <AlertTriangle size={14} aria-hidden="true" />
+                      {t("user.durableUnavailable")}
+                    </p>
+                  ) : null}
+                </fieldset>
 
                 <section className="taskSettingsLauncher" aria-label={t("user.taskSettings")}>
                   <div className="taskSettingsLauncherCopy">
@@ -743,6 +798,7 @@ export function UserPage({
                 {taskSettingsOpen ? (
                   <UserTaskSettingsDialog
                     value={taskSettings}
+                    launchMode={taskLaunchMode}
                     images={images}
                     llmProfiles={llmProfiles}
                     busy={busy}
@@ -757,10 +813,16 @@ export function UserPage({
                 <footer className="newTaskActions">
                   <span id={newTaskStatusId} className={!quantaValid ? "actionHintError" : undefined}>
                     {quantaValid
-                      ? `${t("user.startTaskHint")} ${t("user.startShortcut")}`
+                      ? `${t(taskLaunchMode === "durable" ? "user.durableStartHint" : "user.ephemeralStartHint")} ${t("user.startTaskHint")} ${t("user.startShortcut")}`
                       : t("scheduler.invalidQuanta")}
                   </span>
-                  <button type="button" className="primary startTaskButton" aria-describedby={newTaskStatusId} disabled={busy || !quantaValid || !spawnGoal.trim()} onClick={onSpawn}>
+                  <button
+                    type="button"
+                    className="primary startTaskButton"
+                    aria-describedby={newTaskStatusId}
+                    disabled={busy || !quantaValid || !spawnGoal.trim() || (taskLaunchMode === "durable" && !durableTaskLaunchAvailable)}
+                    onClick={onSpawn}
+                  >
                     {busy ? <LoaderCircle className="spin" size={16} aria-hidden="true" /> : <Play size={16} />}
                     {busy ? t("user.working") : t("user.start")}
                   </button>

@@ -35,7 +35,7 @@ distribution metadata:
 | --- | --- | --- |
 | v1 legacy wire | `mcp` | `0.1.0` |
 | v2 governed Tools compatibility | `agent-libos` | `1.4.2` |
-| v3 exact `2026-07-28` | `agent-libos` | `1.5.0` |
+| v3 exact `2026-07-28` | `agent-libos` | `1.5.1` |
 
 The v1 and v2 values are frozen compatibility identities. Only exact-v3 uses
 the current modern product identity; changing the package version must never
@@ -499,6 +499,23 @@ the supervisor. A Prompt preview carries a deterministic `preview_sha256`
 computed inside the same registry/auth binding used for its provider call;
 confirmation must present that exact digest or the Prompt is fetched only as a
 new unconfirmed preview.
+
+When a process becomes terminal, both the subscription manager and connection
+supervisor synchronously latch its owner as revoked for the rest of that
+Runtime instance before either side performs Store transitions, catalog
+traversal, or Provider cleanup. After reopen, MCP facade admission checks the
+durable process status and rejects a terminal process id rather than treating it
+as a Host actor. The managers detach the owner's local handles and independently
+schedule bounded session close;
+subsequent acquire, start, prepared-publication, resume, or live-stream
+consumption attempts fail closed even if cleanup blocks or faults. Terminal
+`lost` status and bounded events already queued before revocation remain
+Host-inspectable through the existing owner- and authority-bound facade.
+Asynchronous Provider `close` is best-effort because an in-memory, task-affine
+handle cannot be reconstructed after restart and MCP does not make close
+idempotent. Therefore terminal cleanup certifies local owner denial and catalog
+detachment, not eventual remote shutdown, rollback, or a safely retryable
+Provider close.
 
 ### Subscriptions, MRTR, Tasks, and OAuth lifecycle
 

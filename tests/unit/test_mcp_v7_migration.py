@@ -4,6 +4,7 @@ import hashlib
 import os
 import shutil
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,9 @@ def test_v6_to_v7_plan_is_zero_write_and_apply_reopens_canonical_v7(
     assert plan.from_schema_version == 6
     assert plan.to_schema_version == 7
     assert plan.backend == "sqlite"
+    assert plan.schema_version == 2
+    assert plan.migration_implementation_version == "v6-to-v7/3"
+    assert len(plan.receipt_contract_sha256) == 64
     assert hashlib.sha256(source.read_bytes()).hexdigest() == source_before
     assert hashlib.sha256(backup.read_bytes()).hexdigest() == backup_before
     with pytest.raises(StoreV7MigrationError, match="plan digest"):
@@ -93,6 +97,14 @@ def test_v6_to_v7_plan_is_zero_write_and_apply_reopens_canonical_v7(
 
     assert result.applied
     assert not result.already_applied
+    repeated = apply_store_v7_migration(
+        source,
+        expected_plan_sha256=plan.plan_sha256,
+        sqlite_backup=backup,
+    )
+    assert repeated.applied is False
+    assert repeated.already_applied is True
+    assert repeated.plan == plan
     assert _schema_marker(source) == 7
     assert _schema_marker(backup) == 6
     assert hashlib.sha256(backup.read_bytes()).hexdigest() == backup_before
@@ -111,6 +123,126 @@ def test_v6_to_v7_plan_is_zero_write_and_apply_reopens_canonical_v7(
         ).fetchone()[0] == 7
     finally:
         reopened.close()
+
+
+def test_v7_plan_is_bound_to_the_selected_sqlite_database(
+    tmp_path: Path,
+) -> None:
+    first_source = tmp_path / "first.sqlite"
+    first_backup = tmp_path / "first-backup.sqlite"
+    second_source = tmp_path / "second.sqlite"
+    second_backup = tmp_path / "second-backup.sqlite"
+    _v6_store(first_source)
+    _backup(first_source, first_backup)
+    _backup(first_source, second_source)
+    _backup(second_source, second_backup)
+
+    first_plan = plan_store_v7_migration(
+        first_source,
+        sqlite_backup=first_backup,
+    )
+    second_plan = plan_store_v7_migration(
+        second_source,
+        sqlite_backup=second_backup,
+    )
+
+    assert first_plan.source_digest_sha256 == second_plan.source_digest_sha256
+    assert first_plan.database_identity_sha256 != second_plan.database_identity_sha256
+    assert first_plan.plan_sha256 != second_plan.plan_sha256
+    with pytest.raises(StoreV7MigrationError, match="plan digest"):
+        apply_store_v7_migration(
+            second_source,
+            sqlite_backup=second_backup,
+            expected_plan_sha256=first_plan.plan_sha256,
+        )
+
+
+@pytest.mark.parametrize("fault", ["commit_ack", "post_commit_readback"])
+def test_v7_apply_reconciles_exact_target_after_uncertain_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    source = tmp_path / "source.sqlite"
+    backup = tmp_path / "backup.sqlite"
+    _v6_store(source)
+    _backup(source, backup)
+    plan = plan_store_v7_migration(source, sqlite_backup=backup)
+
+    if fault == "commit_ack":
+        real_open = SQLiteStore._migration_apply_connection
+
+        @contextmanager
+        def lost_commit_ack(
+            cls: type[SQLiteStore],
+            path: Path,
+            *,
+            error_type: type[Exception],
+            migration_label: str,
+        ):
+            del cls
+            with real_open(
+                path,
+                error_type=error_type,
+                migration_label=migration_label,
+            ) as connection:
+                class ConnectionProxy:
+                    def __getattr__(self, name: str) -> object:
+                        return getattr(connection, name)
+
+                    def commit(self) -> None:
+                        connection.commit()
+                        raise RuntimeError("injected lost commit ACK")
+
+                yield ConnectionProxy()
+
+        monkeypatch.setattr(
+            SQLiteStore,
+            "_migration_apply_connection",
+            classmethod(lost_commit_ack),
+        )
+        expected_error = "lost commit ACK"
+    else:
+        real_require = mcp_v7_migration._require_canonical_v7
+        calls = 0
+
+        def fail_post_commit_readback(backend: object, connection: object) -> None:
+            nonlocal calls
+            real_require(backend, connection)
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected post-commit readback failure")
+
+        monkeypatch.setattr(
+            mcp_v7_migration,
+            "_require_canonical_v7",
+            fail_post_commit_readback,
+        )
+        expected_error = "post-commit readback"
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        apply_store_v7_migration(
+            source,
+            expected_plan_sha256=plan.plan_sha256,
+            sqlite_backup=backup,
+        )
+    assert _schema_marker(source) == 7
+
+    with pytest.raises(StoreV7MigrationError, match="plan digest"):
+        apply_store_v7_migration(
+            source,
+            expected_plan_sha256="0" * 64,
+            sqlite_backup=backup,
+        )
+
+    result = apply_store_v7_migration(
+        source,
+        expected_plan_sha256=plan.plan_sha256,
+        sqlite_backup=backup,
+    )
+    assert result.applied is False
+    assert result.already_applied is True
+    assert result.plan == plan
 
 
 def test_v7_plan_requires_an_independent_exact_v6_backup(tmp_path: Path) -> None:

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://agent-libos.local/schemas/gui-api/v2.json",
   "title": "Agent libOS local GUI API contract subset v2",
-  "description": "Machine-readable same-build schema registry for the snapshot's top-level structure, process identity/state, content-free LLM call summaries, redacted Durable Task Run summaries/details, JSON error envelopes, and explicit-confirmation mutation payloads. The document root deliberately rejects instances: validators must select one of the named $defs entry points with a JSON Pointer fragment. Snapshot collection item semantics outside process, LLM call, and Task Run state remain renderer/server implementation details. This is not a complete public REST/OpenAPI specification.",
+  "description": "Machine-readable same-build schema registry for the snapshot's top-level structure and non-secret TaskRun launch availability, process identity/state, content-free LLM call summaries, redacted Durable Task Run summaries/details, JSON error envelopes, and explicit-confirmation mutation payloads. The document root deliberately rejects instances: validators must select one of the named $defs entry points with a JSON Pointer fragment. Snapshot collection item semantics outside process, LLM call, and Task Run state remain renderer/server implementation details. This is not a complete public REST/OpenAPI specification.",
   "x-agent-libos-schema-version": 2,
   "x-agent-libos-contract-scope": {
     "snapshot": "GET /api/snapshot",
@@ -662,6 +662,7 @@
         "schema_version",
         "db",
         "scheduler",
+        "task_run_launch",
         "processes",
         "human_requests",
         "events",
@@ -681,6 +682,27 @@
         "schema_version": { "const": 3 },
         "db": { "type": "string" },
         "scheduler": { "$ref": "#/$defs/schedulerStatus" },
+        "task_run_launch": {
+          "type": "object",
+          "required": ["enabled", "plaintext_payloads_enabled", "available"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "plaintext_payloads_enabled": { "type": "boolean" },
+            "available": { "type": "boolean" }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "available": { "const": true } } },
+              "then": {
+                "properties": {
+                  "enabled": { "const": true },
+                  "plaintext_payloads_enabled": { "const": true }
+                }
+              }
+            }
+          ],
+          "additionalProperties": false
+        },
         "processes": { "type": "array", "items": { "$ref": "#/$defs/processSummary" } },
         "human_requests": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },
         "events": { "type": "array", "items": { "$ref": "#/$defs/jsonObject" } },

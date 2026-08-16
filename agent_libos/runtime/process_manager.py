@@ -1820,10 +1820,14 @@ class ProcessManager:
         context: dict[str, Any] | None,
     ) -> NoReturn:
         failed_phase, first_error = phase_failures[0]
-        errors = [
-            {"phase": phase, **internal_exception_observation(exc)}
-            for phase, exc in phase_failures
-        ]
+        errors: list[dict[str, Any]] = []
+        for phase, exc in phase_failures:
+            observation = internal_exception_observation(exc)
+            if phase == "terminal_notify":
+                component_failures = _terminal_notification_failures(exc)
+                if component_failures:
+                    observation["component_failures"] = component_failures
+            errors.append({"phase": phase, **observation})
         durable_error: dict[str, Any] = {
             **internal_exception_observation(first_error),
             "errors": errors,
@@ -4535,3 +4539,69 @@ class ProcessManager:
         if self._object_task_terminal_notifier is None:
             return
         self._object_task_terminal_notifier(pid)
+
+
+_TERMINAL_NOTIFICATION_COMPONENTS = frozenset({"mcp", "human", "object_tasks"})
+_LOWER_HEX = frozenset("0123456789abcdef")
+
+
+def _terminal_notification_failures(error: BaseException) -> list[dict[str, Any]]:
+    """Project Runtime notifier subphases into bounded durable evidence.
+
+    Only the exact Runtime-owned aggregate shape is accepted.  Callback
+    exception text is already represented by a length and SHA-256 digest; no
+    provider-authored text crosses this boundary.
+    """
+
+    if type(error) is not RuntimeError:
+        return []
+    raw = vars(error).get("cleanup_failures")
+    if type(raw) is not tuple or not 1 <= len(raw) <= len(
+        _TERMINAL_NOTIFICATION_COMPONENTS
+    ):
+        return []
+    selected: list[dict[str, Any]] = []
+    for item in raw:
+        if type(item) is not dict or set(item) != {
+            "phase",
+            "error_type",
+            "correlation_id",
+            "exception_text",
+        }:
+            return []
+        phase = item["phase"]
+        error_type = item["error_type"]
+        correlation_id = item["correlation_id"]
+        fingerprint = item["exception_text"]
+        if (
+            phase not in _TERMINAL_NOTIFICATION_COMPONENTS
+            or type(error_type) is not str
+            or not 1 <= len(error_type) <= 128
+            or type(correlation_id) is not str
+            or not 1 <= len(correlation_id) <= 128
+            or type(fingerprint) is not dict
+            or set(fingerprint) != {"bytes", "sha256"}
+        ):
+            return []
+        byte_count = fingerprint["bytes"]
+        digest = fingerprint["sha256"]
+        if (
+            type(byte_count) is not int
+            or not 0 <= byte_count <= 262_144
+            or type(digest) is not str
+            or len(digest) != 64
+            or not set(digest) <= _LOWER_HEX
+        ):
+            return []
+        selected.append(
+            {
+                "phase": phase,
+                "error_type": error_type,
+                "correlation_id": correlation_id,
+                "exception_text": {
+                    "bytes": byte_count,
+                    "sha256": digest,
+                },
+            }
+        )
+    return selected

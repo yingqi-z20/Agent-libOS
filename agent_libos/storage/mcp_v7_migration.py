@@ -18,16 +18,35 @@ from agent_libos.storage.postgres import (
 from agent_libos.storage.semantic_v5_migration import (
     StoreV5MigrationError,
     _backend_for_target,
-    _canonical_sqlite_value,
-    _framed_bytes,
+    _expected_postgres_catalog_sha256,
+    _insert_postgres_migration_receipt,
+    _migration_receipt_contract_sha256,
+    _migration_receipt_record_id,
+    _open_postgres_migration_connection,
+    _postgres_catalog_sha256,
+    _postgres_database_identity_sha256_from_parts,
+    _postgres_identity,
+    _postgres_lock_source_relations,
+    _postgres_source_state_sha256,
+    _product_version,
+    _read_schema_marker_version,
     _require_exact_bool,
+    _require_postgres_migration_receipt,
     _require_secure_regular_file,
+    _snapshot_receipt_sha256,
+    _sqlite_database_identity_sha256,
+    _sqlite_logical_projection_sha256,
+    _sqlite_source_catalog_sha256,
     _sqlite_path,
     _sqlite_snapshot,
     _validated_expected_plan_sha256,
     _validated_sqlite_backup_path,
 )
-from agent_libos.storage.sql import SQLRuntimeStore, _V6_REQUIRED_COLUMNS
+from agent_libos.storage.sql import (
+    SQLRuntimeStore,
+    _V6_REQUIRED_COLUMNS,
+    _V7_REQUIRED_COLUMNS,
+)
 from agent_libos.storage.sqlite import SQLiteStore
 from agent_libos.storage.v7_schema_contract import (
     V7_INDEX_CONTRACTS,
@@ -35,12 +54,14 @@ from agent_libos.storage.v7_schema_contract import (
     V7_STORAGE_FOREIGN_KEYS,
     V7_STORAGE_KEY_CONSTRAINTS,
     V7_STORAGE_SQLITE_CHECKS,
+    V7_TABLES,
 )
 
 
-MIGRATION_PLAN_SCHEMA_VERSION = 1
+MIGRATION_PLAN_SCHEMA_VERSION = 2
 MIGRATION_FROM_SCHEMA_VERSION = 6
 MIGRATION_TO_SCHEMA_VERSION = 7
+MIGRATION_IMPLEMENTATION_VERSION = "v6-to-v7/3"
 
 
 class StoreV7MigrationError(ValidationError):
@@ -64,6 +85,14 @@ _MIGRATION_STEPS = (
 class StoreV7MigrationPlan:
     backend: str
     ddl_sha256: str
+    database_identity_sha256: str
+    source_catalog_sha256: str
+    source_digest_kind: str
+    source_digest_sha256: str
+    snapshot_receipt_sha256: str
+    receipt_contract_sha256: str
+    migration_implementation_version: str
+    product_version: str
     plan_sha256: str
 
     @property
@@ -90,6 +119,16 @@ class StoreV7MigrationPlan:
             "to_schema_version": self.to_schema_version,
             "steps": list(self.steps),
             "ddl_sha256": self.ddl_sha256,
+            "database_identity_sha256": self.database_identity_sha256,
+            "source_catalog_sha256": self.source_catalog_sha256,
+            "source_digest_kind": self.source_digest_kind,
+            "source_digest_sha256": self.source_digest_sha256,
+            "snapshot_receipt_sha256": self.snapshot_receipt_sha256,
+            "receipt_contract_sha256": self.receipt_contract_sha256,
+            "migration_implementation_version": (
+                self.migration_implementation_version
+            ),
+            "product_version": self.product_version,
             "plan_sha256": self.plan_sha256,
         }
 
@@ -143,6 +182,7 @@ def _plan_store_v7_migration(
                 "SQLite schema-v7 planning requires an independent verified backup"
             )
         source_path = _sqlite_path(target, migration_label="schema-v7")
+        database_identity_sha256 = _sqlite_database_identity_sha256(source_path)
         with _sqlite_snapshot(
             source_path, label="SQLite source", migration_label="schema-v7"
         ) as source:
@@ -161,17 +201,102 @@ def _plan_store_v7_migration(
             raise StoreV7MigrationError(
                 "SQLite backup does not match the canonical v6 source store"
             )
+        plan = _build_plan(
+            backend,
+            database_identity_sha256=database_identity_sha256,
+            source_catalog_sha256=_sqlite_source_catalog_sha256(
+                MIGRATION_FROM_SCHEMA_VERSION
+            ),
+            source_digest_kind="sqlite-logical-v6",
+            source_digest_sha256=source_digest,
+        )
     else:
         if sqlite_backup is not None:
             raise StoreV7MigrationError(
                 "sqlite_backup is valid only for a SQLite migration"
             )
-        connection = _PostgresConnection(str(target))
+        connection = _open_postgres_migration_connection(
+            str(target),
+            connection_factory=_PostgresConnection,
+            error_type=StoreV7MigrationError,
+            to_schema_version=MIGRATION_TO_SCHEMA_VERSION,
+        )
+        transaction_started = False
         try:
+            database, schema, endpoint_sha256 = _postgres_identity(connection)
+            pre_identity_sha256 = _postgres_database_identity_sha256_from_parts(
+                database,
+                schema,
+                endpoint_sha256,
+            )
+            lease_key = _postgres_runtime_lock_key(database, schema)
+            lease = connection.execute(
+                "SELECT pg_try_advisory_lock(?) AS acquired",
+                (lease_key,),
+            ).fetchone()
+            if not lease or not lease.get("acquired"):
+                raise StoreV7MigrationError(
+                    "PostgreSQL runtime store is already open"
+                )
+            connection.execute(
+                "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
+            transaction_started = True
+            source_tables = tuple(sorted(_V6_REQUIRED_COLUMNS))
+            _postgres_lock_source_relations(
+                connection,
+                schema=schema,
+                tables=source_tables,
+            )
+            tx_database, tx_schema, tx_endpoint_sha256 = _postgres_identity(
+                connection
+            )
+            database_identity_sha256 = (
+                _postgres_database_identity_sha256_from_parts(
+                    tx_database,
+                    tx_schema,
+                    tx_endpoint_sha256,
+                )
+            )
+            if (
+                tx_database != database
+                or tx_schema != schema
+                or not hmac.compare_digest(
+                    database_identity_sha256,
+                    pre_identity_sha256,
+                )
+            ):
+                raise StoreV7MigrationError(
+                    "PostgreSQL migration identity changed before source capture"
+                )
             _require_canonical_v6(PostgresStore, connection)
+            source_catalog_sha256 = _postgres_catalog_sha256(connection)
+            source_digest_sha256 = _postgres_source_state_sha256(
+                connection,
+                schema=schema,
+                tables=source_tables,
+                source_schema_version=MIGRATION_FROM_SCHEMA_VERSION,
+                observed_schema_version=MIGRATION_FROM_SCHEMA_VERSION,
+            )
+            plan = _build_plan(
+                backend,
+                database_identity_sha256=database_identity_sha256,
+                source_catalog_sha256=source_catalog_sha256,
+                source_digest_kind="postgres-relation-state-v6",
+                source_digest_sha256=source_digest_sha256,
+            )
+            connection.rollback()
+            transaction_started = False
+        except BaseException:
+            if transaction_started:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            raise
         finally:
             connection.close()
-    return _build_plan(backend)
+    return plan
 
 
 def apply_store_v7_migration(
@@ -256,7 +381,14 @@ def _contract_projection() -> dict[str, Any]:
     }
 
 
-def _build_plan(backend: str) -> StoreV7MigrationPlan:
+def _build_plan(
+    backend: str,
+    *,
+    database_identity_sha256: str,
+    source_catalog_sha256: str,
+    source_digest_kind: str,
+    source_digest_sha256: str,
+) -> StoreV7MigrationPlan:
     encoded_contract = json.dumps(
         {"backend": backend, "contract": _contract_projection()},
         ensure_ascii=True,
@@ -264,6 +396,21 @@ def _build_plan(backend: str) -> StoreV7MigrationPlan:
         separators=(",", ":"),
     ).encode("utf-8")
     ddl_sha256 = hashlib.sha256(encoded_contract).hexdigest()
+    product_version = _product_version()
+    snapshot_receipt_sha256 = _snapshot_receipt_sha256(
+        backend=backend,
+        database_identity_sha256=database_identity_sha256,
+        source_catalog_sha256=source_catalog_sha256,
+        source_digest_kind=source_digest_kind,
+        source_digest_sha256=source_digest_sha256,
+        from_schema_version=MIGRATION_FROM_SCHEMA_VERSION,
+        to_schema_version=MIGRATION_TO_SCHEMA_VERSION,
+    )
+    receipt_contract_sha256 = _migration_receipt_contract_sha256(
+        backend=backend,
+        from_schema_version=MIGRATION_FROM_SCHEMA_VERSION,
+        to_schema_version=MIGRATION_TO_SCHEMA_VERSION,
+    )
     body = {
         "schema_version": MIGRATION_PLAN_SCHEMA_VERSION,
         "backend": backend,
@@ -271,6 +418,14 @@ def _build_plan(backend: str) -> StoreV7MigrationPlan:
         "to_schema_version": MIGRATION_TO_SCHEMA_VERSION,
         "steps": list(_MIGRATION_STEPS),
         "ddl_sha256": ddl_sha256,
+        "database_identity_sha256": database_identity_sha256,
+        "source_catalog_sha256": source_catalog_sha256,
+        "source_digest_kind": source_digest_kind,
+        "source_digest_sha256": source_digest_sha256,
+        "snapshot_receipt_sha256": snapshot_receipt_sha256,
+        "receipt_contract_sha256": receipt_contract_sha256,
+        "migration_implementation_version": MIGRATION_IMPLEMENTATION_VERSION,
+        "product_version": product_version,
     }
     encoded_plan = json.dumps(
         body,
@@ -281,6 +436,14 @@ def _build_plan(backend: str) -> StoreV7MigrationPlan:
     return StoreV7MigrationPlan(
         backend=backend,
         ddl_sha256=ddl_sha256,
+        database_identity_sha256=database_identity_sha256,
+        source_catalog_sha256=source_catalog_sha256,
+        source_digest_kind=source_digest_kind,
+        source_digest_sha256=source_digest_sha256,
+        snapshot_receipt_sha256=snapshot_receipt_sha256,
+        receipt_contract_sha256=receipt_contract_sha256,
+        migration_implementation_version=MIGRATION_IMPLEMENTATION_VERSION,
+        product_version=product_version,
         plan_sha256=hashlib.sha256(encoded_plan).hexdigest(),
     )
 
@@ -332,28 +495,23 @@ def _require_sqlite_integrity(
         )
 
 
+def _require_v7_migration_postcondition(connection: Any) -> None:
+    for table in sorted(V7_TABLES):
+        row = connection.execute(
+            f'SELECT COUNT(*) AS count FROM "{table}"'
+        ).fetchone()
+        if row is None or int(row["count"]) != 0:
+            raise StoreV7MigrationError(
+                "canonical v7 store is not the exact result of the planned v6 migration"
+            )
+
+
 def _sqlite_logical_v6_sha256(connection: Any) -> str:
-    digest = hashlib.sha256()
-    for table in sorted(_V6_REQUIRED_COLUMNS):
-        columns = [
-            str(row["name"])
-            for row in connection.execute(f'PRAGMA table_info("{table}")')
-        ]
-        digest.update(_framed_bytes(b"table", table.encode("utf-8")))
-        for column in columns:
-            digest.update(_framed_bytes(b"column", column.encode("utf-8")))
-        quoted_columns = ", ".join(f'"{column}"' for column in columns)
-        order = ", ".join(f'"{column}" COLLATE BINARY' for column in columns)
-        row_count = 0
-        for row in connection.execute(
-            f'SELECT {quoted_columns} FROM "{table}" ORDER BY {order}'
-        ):
-            row_count += 1
-            digest.update(b"row")
-            for value in row:
-                digest.update(_canonical_sqlite_value(value))
-        digest.update(_framed_bytes(b"rows", str(row_count).encode("ascii")))
-    return digest.hexdigest()
+    return _sqlite_logical_projection_sha256(
+        connection,
+        required_columns=_V6_REQUIRED_COLUMNS,
+        source_schema_version=MIGRATION_FROM_SCHEMA_VERSION,
+    )
 
 
 def _execute_v7_ddl(connection: Any) -> None:
@@ -374,19 +532,52 @@ def _apply_sqlite(
     ) as backup:
         _require_canonical_v6(SQLiteStore, backup)
         backup_digest = _sqlite_logical_v6_sha256(backup)
-    plan = _build_plan("sqlite")
-    _require_expected_plan(plan, expected_plan_sha256)
     with SQLiteStore._migration_apply_connection(
         path,
         error_type=StoreV7MigrationError,
         migration_label="schema-v7",
     ) as connection:
+        database_identity_sha256 = _sqlite_database_identity_sha256(path)
+        marker_version = _read_schema_marker_version(connection)
+        if marker_version == MIGRATION_TO_SCHEMA_VERSION:
+            plan = _build_plan(
+                "sqlite",
+                database_identity_sha256=database_identity_sha256,
+                source_catalog_sha256=_sqlite_source_catalog_sha256(
+                    MIGRATION_FROM_SCHEMA_VERSION
+                ),
+                source_digest_kind="sqlite-logical-v6",
+                source_digest_sha256=backup_digest,
+            )
+            _require_expected_plan(plan, expected_plan_sha256)
+            _require_canonical_v7(SQLiteStore, connection)
+            _require_v7_migration_postcondition(connection)
+            migrated_source_digest = _sqlite_logical_v6_sha256(connection)
+            if not hmac.compare_digest(migrated_source_digest, backup_digest):
+                raise StoreV7MigrationError(
+                    "canonical v7 store does not match the planned v6 source snapshot"
+                )
+            return StoreV7MigrationResult(
+                plan=plan,
+                applied=False,
+                already_applied=True,
+            )
         _require_canonical_v6(SQLiteStore, connection)
         source_digest = _sqlite_logical_v6_sha256(connection)
         if not hmac.compare_digest(source_digest, backup_digest):
             raise StoreV7MigrationError(
                 "SQLite backup does not match the locked canonical v6 source store"
             )
+        plan = _build_plan(
+            "sqlite",
+            database_identity_sha256=database_identity_sha256,
+            source_catalog_sha256=_sqlite_source_catalog_sha256(
+                MIGRATION_FROM_SCHEMA_VERSION
+            ),
+            source_digest_kind="sqlite-logical-v6",
+            source_digest_sha256=source_digest,
+        )
+        _require_expected_plan(plan, expected_plan_sha256)
         _execute_v7_ddl(connection)
         marker = connection.execute(
             "UPDATE runtime_schema SET schema_version = 7 "
@@ -397,8 +588,10 @@ def _apply_sqlite(
                 "schema marker compare-and-swap from v6 to v7 lost its race"
             )
         _require_canonical_v7(SQLiteStore, connection)
+        _require_v7_migration_postcondition(connection)
         connection.commit()
         _require_canonical_v7(SQLiteStore, connection)
+        _require_v7_migration_postcondition(connection)
     return StoreV7MigrationResult(plan=plan, applied=True)
 
 
@@ -407,32 +600,136 @@ def _apply_postgres(
     *,
     expected_plan_sha256: str,
 ) -> StoreV7MigrationResult:
-    plan = _build_plan("postgres")
-    _require_expected_plan(plan, expected_plan_sha256)
-    connection = _PostgresConnection(dsn)
+    connection = _open_postgres_migration_connection(
+        dsn,
+        connection_factory=_PostgresConnection,
+        error_type=StoreV7MigrationError,
+        to_schema_version=MIGRATION_TO_SCHEMA_VERSION,
+    )
     transaction_started = False
     try:
-        identity = connection.execute(
-            "SELECT current_database() AS database_name, current_schema() AS schema_name"
-        ).fetchone()
-        database = str(identity.get("database_name") or "") if identity else ""
-        schema = str(identity.get("schema_name") or "") if identity else ""
-        if not database or not schema:
-            raise StoreV7MigrationError(
-                "unable to resolve PostgreSQL database/schema for migration lease"
-            )
+        database, schema, endpoint_sha256 = _postgres_identity(connection)
+        pre_identity_sha256 = _postgres_database_identity_sha256_from_parts(
+            database,
+            schema,
+            endpoint_sha256,
+        )
         lease_key = _postgres_runtime_lock_key(database, schema)
         lease = connection.execute(
             "SELECT pg_try_advisory_lock(?) AS acquired", (lease_key,)
         ).fetchone()
         if not lease or not lease.get("acquired"):
             raise StoreV7MigrationError(
-                f"runtime store is already open: postgres:{database}/{schema}"
+                "PostgreSQL runtime store is already open"
             )
-        connection.execute("BEGIN")
+        marker_version = _read_schema_marker_version(connection)
+        if marker_version == MIGRATION_FROM_SCHEMA_VERSION:
+            locked_tables = tuple(sorted(_V6_REQUIRED_COLUMNS))
+        elif marker_version == MIGRATION_TO_SCHEMA_VERSION:
+            locked_tables = tuple(sorted(_V7_REQUIRED_COLUMNS))
+        else:
+            _require_schema_marker(
+                connection,
+                expected=MIGRATION_FROM_SCHEMA_VERSION,
+            )
+            raise AssertionError("unreachable unsupported migration marker")
+        connection.execute(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ WRITE"
+        )
         transaction_started = True
+        _postgres_lock_source_relations(
+            connection,
+            schema=schema,
+            tables=locked_tables,
+        )
+        tx_database, tx_schema, tx_endpoint_sha256 = _postgres_identity(connection)
+        database_identity_sha256 = _postgres_database_identity_sha256_from_parts(
+            tx_database,
+            tx_schema,
+            tx_endpoint_sha256,
+        )
+        tx_marker_version = _read_schema_marker_version(connection)
+        if (
+            tx_database != database
+            or tx_schema != schema
+            or tx_marker_version != marker_version
+            or not hmac.compare_digest(
+                database_identity_sha256,
+                pre_identity_sha256,
+            )
+        ):
+            raise StoreV7MigrationError(
+                "PostgreSQL migration identity or marker changed before source lock"
+            )
+        source_tables = tuple(sorted(_V6_REQUIRED_COLUMNS))
+        if marker_version == MIGRATION_TO_SCHEMA_VERSION:
+            _require_canonical_v7(PostgresStore, connection)
+            source_digest_sha256 = _postgres_source_state_sha256(
+                connection,
+                schema=schema,
+                tables=source_tables,
+                source_schema_version=MIGRATION_FROM_SCHEMA_VERSION,
+                observed_schema_version=MIGRATION_TO_SCHEMA_VERSION,
+                excluded_audit_record_id=(
+                    f"store-migration-v{MIGRATION_FROM_SCHEMA_VERSION}-to-"
+                    f"v{MIGRATION_TO_SCHEMA_VERSION}:{expected_plan_sha256}"
+                ),
+            )
+            source_catalog_sha256 = _expected_postgres_catalog_sha256(
+                MIGRATION_FROM_SCHEMA_VERSION
+            )
+            plan = _build_plan(
+                "postgres",
+                database_identity_sha256=database_identity_sha256,
+                source_catalog_sha256=source_catalog_sha256,
+                source_digest_kind="postgres-relation-state-v6",
+                source_digest_sha256=source_digest_sha256,
+            )
+            _require_expected_plan(plan, expected_plan_sha256)
+            _require_postgres_migration_receipt(connection, plan)
+            _require_v7_migration_postcondition(connection)
+            connection.rollback()
+            transaction_started = False
+            return StoreV7MigrationResult(
+                plan=plan,
+                applied=False,
+                already_applied=True,
+            )
         _require_canonical_v6(PostgresStore, connection)
+        source_catalog_sha256 = _postgres_catalog_sha256(connection)
+        source_digest_sha256 = _postgres_source_state_sha256(
+            connection,
+            schema=schema,
+            tables=source_tables,
+            source_schema_version=MIGRATION_FROM_SCHEMA_VERSION,
+            observed_schema_version=MIGRATION_FROM_SCHEMA_VERSION,
+        )
+        plan = _build_plan(
+            "postgres",
+            database_identity_sha256=database_identity_sha256,
+            source_catalog_sha256=source_catalog_sha256,
+            source_digest_kind="postgres-relation-state-v6",
+            source_digest_sha256=source_digest_sha256,
+        )
+        _require_expected_plan(plan, expected_plan_sha256)
         _execute_v7_ddl(connection)
+        _insert_postgres_migration_receipt(connection, plan)
+        migrated_source_digest_sha256 = _postgres_source_state_sha256(
+            connection,
+            schema=schema,
+            tables=source_tables,
+            source_schema_version=MIGRATION_FROM_SCHEMA_VERSION,
+            observed_schema_version=MIGRATION_FROM_SCHEMA_VERSION,
+            excluded_audit_record_id=_migration_receipt_record_id(plan),
+        )
+        if not hmac.compare_digest(
+            migrated_source_digest_sha256,
+            source_digest_sha256,
+        ):
+            raise StoreV7MigrationError(
+                "PostgreSQL schema-v7 DDL changed the locked source state"
+            )
+        _require_postgres_migration_receipt(connection, plan)
         marker = connection.execute(
             "UPDATE runtime_schema SET schema_version = 7 "
             "WHERE singleton = 1 AND schema_version = 6"
@@ -442,9 +739,13 @@ def _apply_postgres(
                 "schema marker compare-and-swap from v6 to v7 lost its race"
             )
         _require_canonical_v7(PostgresStore, connection)
+        _require_v7_migration_postcondition(connection)
+        _require_postgres_migration_receipt(connection, plan)
         connection.commit()
         transaction_started = False
         _require_canonical_v7(PostgresStore, connection)
+        _require_v7_migration_postcondition(connection)
+        _require_postgres_migration_receipt(connection, plan)
     except BaseException:
         if transaction_started:
             try:

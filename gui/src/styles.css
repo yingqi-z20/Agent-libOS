@@ -6671,6 +6671,96 @@ button.timelineExplain:hover:not(:disabled) {
 
 /* New-task settings ---------------------------------------------------- */
 
+.taskLaunchMode {
+  min-width: 0;
+  display: grid;
+  gap: 9px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.taskLaunchMode > legend {
+  margin-bottom: 7px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.taskLaunchModeOptions {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.taskLaunchModeOptions label {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  padding: 11px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: #fff;
+  cursor: pointer;
+}
+
+.taskLaunchModeOptions label.selected {
+  border-color: var(--color-accent-border);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px rgb(124 58 237 / 10%);
+}
+
+.taskLaunchModeOptions label:has(input:disabled) {
+  background: var(--color-subtle);
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.taskLaunchModeOptions input {
+  margin: 3px 0 0;
+}
+
+.taskLaunchModeOptions span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.taskLaunchModeOptions strong {
+  color: #344054;
+  font-size: 12px;
+}
+
+.taskLaunchModeOptions small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.taskLaunchModeOptions label.selected small {
+  color: var(--color-text-secondary);
+}
+
+.taskLaunchModeNotice {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  color: var(--warning);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.taskLaunchModeNotice svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
 .taskSettingsLauncher {
   min-width: 0;
   display: grid;
@@ -6963,6 +7053,10 @@ button.timelineExplain:hover:not(:disabled) {
   }
 
   .taskSettingsPrimarySummary {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .taskLaunchModeOptions {
     grid-template-columns: minmax(0, 1fr);
   }
 

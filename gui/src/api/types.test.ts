@@ -48,6 +48,23 @@ describe("assertRuntimeSnapshot", () => {
     expect(() => assertRuntimeSnapshot({ ...snapshot(), events: {} })).toThrow(/events/);
   });
 
+  it("requires consistent TaskRun launch availability", () => {
+    const valid = snapshot();
+    expect(() => assertRuntimeSnapshot({
+      ...valid,
+      task_run_launch: { enabled: true, plaintext_payloads_enabled: true, available: true }
+    })).not.toThrow();
+    expect(() => assertRuntimeSnapshot({ ...valid, task_run_launch: undefined })).toThrow(/TaskRun launch/);
+    expect(() => assertRuntimeSnapshot({
+      ...valid,
+      task_run_launch: { enabled: true, plaintext_payloads_enabled: false, available: true }
+    })).toThrow(/TaskRun launch/);
+    expect(() => assertRuntimeSnapshot({
+      ...valid,
+      task_run_launch: { enabled: true, plaintext_payloads_enabled: false, available: false, secret: "no" }
+    })).toThrow(/TaskRun launch/);
+  });
+
   it("requires schema v3 and validates durable run controls", () => {
     expect(() => assertRuntimeSnapshot({ ...snapshot(), schema_version: 2 })).toThrow(/schema_version/);
     expect(() => assertRuntimeSnapshot({ ...snapshot(), task_runs: [{ ...run(), allowed_actions: ["retry"] }] })).toThrow(/allowed_actions/);
@@ -945,6 +962,7 @@ function snapshot(): Record<string, unknown> {
     schema_version: 3,
     db: "local",
     scheduler: { auto_run: true, running: false, paused: false },
+    task_run_launch: { enabled: true, plaintext_payloads_enabled: false, available: false },
     processes: [],
     human_requests: [],
     events: [],

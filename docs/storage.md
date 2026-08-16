@@ -1,6 +1,6 @@
 # Runtime Storage
 
-Agent libOS 1.5.0 stores durable runtime state through a `UnitOfWork` composed of
+Agent libOS 1.5.1 stores durable runtime state through a `UnitOfWork` composed of
 explicit domain boundaries, including `ProcessRepository`,
 `ResourceRepository`, `RuntimePublicationRepository`,
 `SnapshotCheckpointRepository`, `RuntimeModuleRepository`,
@@ -91,11 +91,11 @@ this repository has a connection pool or concurrent per-Runtime transactions.
 
 ## Strict store schema v7
 
-Fresh databases created by Agent libOS 1.5.0 use store schema v7 and create a
+Fresh databases created by Agent libOS 1.5.1 use store schema v7 and create a
 `runtime_schema` table with one marker row; the canonical DDL constrains its
 `singleton` value to `1`. Opening an existing store requires the row selected
 by `singleton = 1` to contain schema version `7`. Product version and store
-schema version are independent identifiers: `1.5.0` is the current product
+schema version are independent identifiers: `1.5.1` is the current product
 release, while `7` is the persisted schema contract. Both backends apply
 the same acceptance rules, with one backend-specific initial probe order:
 
@@ -252,7 +252,7 @@ in order.
 There are no automatic migrations, backfills, read-only compatibility modes,
 or dual runtime schema paths. A v3
 database remains archive-only and must be opened with Agent libOS 1.0.1.
-Agent libOS 1.5.0 raises `UnsupportedStoreVersion` during ordinary Runtime
+Agent libOS 1.5.1 raises `UnsupportedStoreVersion` during ordinary Runtime
 preflight, before initialization, index creation, seed insertion, recovery,
 audit, or any other write. The same zero-write rule applies to v4/v5 before the
 matching offline migrator runs, older/unversioned stores, and malformed v7 stores.
@@ -389,7 +389,24 @@ exclusive SQLite lease or PostgreSQL advisory lock as Runtime startup,
 revalidates the source and recovery evidence, creates the five MCP v7 tables,
 compare-and-swaps the singleton marker `6 -> 7`, and validates the complete
 canonical v7 catalog before commit. Any DDL, marker, catalog, lease, backup, or
-digest failure rolls back the whole transaction.
+digest failure rolls back the whole transaction, including its migration
+receipt.
+
+Migration plan schema v2 binds the digest to the hashed database/schema and
+cluster identity, exact source catalog, source logical or locked PostgreSQL
+relation-state digest, source-observation receipt, migration-receipt contract,
+migration implementation, and Agent libOS version. PostgreSQL planning and
+apply hold the Runtime advisory lease, use a repeatable-read transaction, and
+take schema-qualified `ACCESS EXCLUSIVE NOWAIT` locks on every frozen source
+relation before capturing relation OIDs and visible `ctid`/`xmin` identities;
+row payloads are neither persisted nor included in the plan. Apply appends an
+exact plan-bound record to `audit_records` in the same transaction as DDL and
+the marker update. If commit acknowledgement or the post-commit readback is
+lost, retain the reviewed plan and recovery point and repeat `--apply` with the
+same digest. Only a target with that exact receipt, reconstructed source state,
+canonical catalog, and migration postconditions is reconciled, returning
+`applied=false` and `already_applied=true`; a different database, modified
+target, missing/tampered receipt, or generic same-version store is rejected.
 
 The migration does not copy provider content or create auth credentials. New
 tables begin empty. OAuth tokens, client secrets, authorization codes,
@@ -416,7 +433,7 @@ PostgreSQL advisory lock, repeat source/backup validation, and run DDL plus
 singleton marker CAS `5 -> 6` in one transaction. It then validates the
 complete canonical v6 storage catalog, including every captured relation,
 column, constraint, index, and backend hook, before commit. Failure at any
-point rolls back both DDL and marker.
+point rolls back DDL, the PostgreSQL migration receipt, and the marker.
 
 SQLite dry-run is zero-write and requires `--sqlite-backup` to validate an
 independent, current-user-owned, single-link `0600` regular file without live
@@ -426,6 +443,13 @@ operator, not Agent libOS, owns and verifies that snapshot. The plan digest is
 deterministic for the locked logical source and must be supplied exactly to
 apply. A v4 store is not accepted by `--to 6`; it must independently complete
 the v4-to-v5 workflow first.
+
+The PostgreSQL migration role must be able to execute
+`pg_catalog.pg_control_system()`. Migration identity fails closed if the
+cluster system identifier is unavailable; only hashes of cluster/endpoint
+identity are emitted, never the DSN or raw host values. The role must also own,
+hold `MAINTAIN` on, or hold the applicable write privilege for every frozen
+required table so both dry-run and apply can take `ACCESS EXCLUSIVE` locks.
 
 ## Offline v4 to v5 migration
 
@@ -448,9 +472,12 @@ The supported procedure is:
    PostgreSQL, create and verify an operator-managed snapshot of the exact
    `current_database()` and `current_schema()`.
 3. Run `--dry-run` (with `--sqlite-backup` when validating SQLite). It inspects
-   a private snapshot, validates the complete canonical v4 storage catalog and
-   logical digest, performs zero source/lease/sidecar writes, and prints a
-   versioned plan plus deterministic `ddl_sha256` and `plan_sha256`.
+   a private SQLite snapshot, or holds the PostgreSQL advisory lease and
+   schema-qualified relation locks in a read-only repeatable-read transaction,
+   validates the complete canonical v4 storage catalog and source digest,
+   performs zero source/lease/sidecar writes (the PostgreSQL locks are
+   session-only), and prints a versioned plan plus deterministic `ddl_sha256`
+   and `plan_sha256`.
 4. Review the plan. Run `--apply` with that exact
    `--expected-plan-sha256`. SQLite additionally requires the same verified
    `--sqlite-backup`; PostgreSQL requires
@@ -458,8 +485,9 @@ The supported procedure is:
 5. Apply obtains SQLite's exclusive offline lease or PostgreSQL's Runtime
    advisory lock, repeats canonical v4 and backup/source validation, and opens
    one transaction. It adds `human_requests.revision`, creates the two semantic
-   tables/indexes, compare-and-swaps the singleton marker from 4 to 5, runs the
-   complete canonical v5 storage catalog validator, and only then commits.
+   tables/indexes, appends the exact plan-bound PostgreSQL migration receipt,
+   compare-and-swaps the singleton marker from 4 to 5, runs the complete
+   canonical v5 storage catalog validator, and only then commits.
 6. Open the migrated target with this release and archive the plan/result with
    the operator recovery record. Keep the backup until application validation
    is complete.
@@ -467,11 +495,14 @@ The supported procedure is:
 A missing/mismatched plan digest, stale or non-self-contained SQLite backup,
 absent PostgreSQL confirmation, lock conflict, noncanonical v4 input, failed
 DDL, marker CAS miss, or failed v5 readback aborts. The transaction rolls back
-both schema changes and marker; it never silently repairs a malformed source.
-Planning an already-v5/newer or pre-v4 store is also not an idempotent
-“success”: this command accepts only an exact canonical v4 source and has
-exactly one target version. See [CLI Reference](cli.md#offline-store-migration)
-for concrete commands.
+schema changes, the PostgreSQL migration receipt, and the marker; it never
+silently repairs a malformed source.
+Planning an already-v5/newer or pre-v4 store is not an idempotent “success”:
+planning accepts only an exact canonical v4 source. The narrower exception is
+an apply retry with the same schema-v2 plan and recovery evidence after an
+uncertain commit; an exact v5 migration result is reported as
+`already_applied=true`. See [CLI Reference](cli.md#offline-store-migration) for
+concrete commands.
 
 On POSIX, SQLite apply additionally requires both source and independent backup
 to be current-user-owned, single-link regular files with exact mode `0600`.
@@ -942,7 +973,7 @@ Before either backend is backed up:
    not proceed from a recovery-required or incomplete shutdown result.
 4. Record the Agent libOS product version, backend configuration, and the value
    of `runtime_schema.schema_version`. For this release the expected pair is
-   product `1.5.0`, store schema `7`.
+   product `1.5.1`, store schema `7`.
 5. Prepare an owner-only backup directory and run the dump-producing command
    under `umask 077`. Before accepting either backend's archive, verify it is a
    regular, current-user-owned, single-link file with mode `0600`.

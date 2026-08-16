@@ -26,8 +26,11 @@ export type TaskLaunchSettings = {
   authorityManifestId: string;
 };
 
+export type TaskLaunchMode = "ephemeral" | "durable";
+
 export type UserTaskSettingsDialogProps = {
   value: TaskLaunchSettings;
+  launchMode: TaskLaunchMode;
   images: ImageSummary[];
   llmProfiles: LLMProfileSummary[];
   busy?: boolean;
@@ -43,6 +46,7 @@ type DialogView = "settings" | "profiles";
 /** Edits the launch-only task configuration as one local, atomic draft. */
 export function UserTaskSettingsDialog({
   value,
+  launchMode,
   images,
   llmProfiles,
   busy = false,
@@ -69,7 +73,8 @@ export function UserTaskSettingsDialog({
       return false;
     }
   }, [draft.workingDirectory]);
-  const requiresAuthorityManifest = draft.workspaceAccess !== "none" || draft.allowGitRequests;
+  const requiresAuthorityManifest = launchMode === "durable"
+    && (draft.workspaceAccess !== "none" || draft.allowGitRequests);
   const authorityManifestValid = !requiresAuthorityManifest || Boolean(draft.authorityManifestId.trim());
   const valid = quanta.valid && workingDirectoryValid && authorityManifestValid;
 
@@ -233,9 +238,9 @@ export function UserTaskSettingsDialog({
                 <span>{t("taskAuthority.manifestId")}</span>
                 <input
                   value={draft.authorityManifestId}
-                  disabled={busy}
+                  disabled={busy || launchMode !== "durable"}
                   aria-invalid={!authorityManifestValid || undefined}
-                  aria-describedby={!authorityManifestValid ? authorityManifestErrorId : undefined}
+                  aria-describedby={authorityManifestErrorId}
                   placeholder={t("taskAuthority.manifestIdPlaceholder")}
                   onChange={(event) => {
                     const authorityManifestId = event.currentTarget.value;
@@ -248,7 +253,9 @@ export function UserTaskSettingsDialog({
                   role={authorityManifestValid ? undefined : "alert"}
                 >
                   {authorityManifestValid
-                    ? t("taskAuthority.manifestIdHint")
+                    ? t(launchMode === "durable"
+                      ? "taskAuthority.manifestIdHint"
+                      : "taskAuthority.manifestIdEphemeralHint")
                     : t("taskRuns.authorityManifestRequired")}
                 </small>
               </label>

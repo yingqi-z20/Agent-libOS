@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import threading
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from datetime import UTC, datetime
@@ -1430,6 +1431,250 @@ def test_release_invalidate_race_closes_session_once() -> None:
     asyncio.run(exercise())
 
 
+def test_connection_owner_revocation_latches_before_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        supervisor = McpConnectionSupervisor()
+        session = _Session()
+        await supervisor.acquire(
+            _fence(),
+            "read",
+            _async_factory(session),
+            reusable=True,
+        )
+        original_invalidate = supervisor._invalidate_nowait  # noqa: SLF001
+        secret = "SECRET /private/provider-close"
+
+        def fail_invalidation(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError(secret)
+
+        monkeypatch.setattr(supervisor, "_invalidate_nowait", fail_invalidation)
+        with pytest.raises(RuntimeError, match="provider-close"):
+            supervisor.close_owner_nowait("pid:1")
+
+        factory_called = False
+
+        async def forbidden_factory() -> _Session:
+            nonlocal factory_called
+            factory_called = True
+            return _Session()
+
+        with pytest.raises(RuntimeError, match="owner is closed"):
+            await supervisor.acquire(
+                _fence(),
+                "read",
+                forbidden_factory,
+                reusable=True,
+            )
+        assert factory_called is False
+
+        # A terminal-cleanup retry can still detach the old handle, but the
+        # monotonic owner denial does not depend on that retry succeeding.
+        monkeypatch.setattr(supervisor, "_invalidate_nowait", original_invalidate)
+        supervisor.close_owner_nowait("pid:1")
+        assert await supervisor.snapshot() == ()
+        await _wait_until(lambda: session.close_count == 1)
+
+    asyncio.run(exercise())
+
+
+def test_subscription_owner_revocation_runs_connection_branch_after_local_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        supervisor = McpConnectionSupervisor()
+        manager = McpSubscriptionManager(supervisor)
+        provider = _EventsProvider([])
+        active = await manager.start(
+            _server(),
+            _fence(),
+            provider,
+            ("resourcesListChanged",),
+        )
+        original_invalidate = manager._invalidate_nowait  # noqa: SLF001
+
+        def fail_local_invalidation(**_kwargs: Any) -> None:
+            raise RuntimeError("injected subscription revocation failure")
+
+        monkeypatch.setattr(manager, "_invalidate_nowait", fail_local_invalidation)
+        with pytest.raises(RuntimeError, match="subscription revocation"):
+            manager.close_owner_nowait("pid:1")
+
+        # The independent connection branch still detaches and schedules the
+        # Provider close, while both managers deny all later reuse.
+        assert await supervisor.snapshot() == ()
+        with pytest.raises(RuntimeError, match="owner is closed"):
+            await manager.status(active.subscription_id)
+        with pytest.raises(RuntimeError, match="owner is closed"):
+            await manager.events(active.subscription_id)
+        replacement = _EventsProvider([])
+        with pytest.raises(RuntimeError, match="owner is closed"):
+            await manager.start(
+                _server(),
+                _fence(),
+                replacement,
+                ("resourcesListChanged",),
+            )
+        assert replacement.listen_count == 0
+        with pytest.raises(RuntimeError, match="owner is closed"):
+            await supervisor.acquire(
+                _fence(),
+                "read",
+                _async_factory(_Session()),
+            )
+
+        monkeypatch.setattr(manager, "_invalidate_nowait", original_invalidate)
+        manager.close_owner_nowait("pid:1")
+        await _wait_for_status(
+            manager,
+            active.subscription_id,
+            McpSubscriptionStatus.LOST,
+        )
+        await _wait_until(lambda: provider.close_count == 1)
+
+    asyncio.run(exercise())
+
+
+def test_subscription_owner_revocation_latches_supervisor_before_local_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        supervisor = McpConnectionSupervisor()
+        manager = McpSubscriptionManager(supervisor)
+        local_cleanup_entered = threading.Event()
+        release_local_cleanup = threading.Event()
+
+        def block_local_cleanup(**_kwargs: Any) -> None:
+            local_cleanup_entered.set()
+            assert release_local_cleanup.wait(timeout=5.0)
+
+        monkeypatch.setattr(manager, "_invalidate_nowait", block_local_cleanup)
+        revocation = asyncio.create_task(
+            asyncio.to_thread(manager.close_owner_nowait, "pid:1")
+        )
+        assert await asyncio.to_thread(local_cleanup_entered.wait, 5.0)
+
+        factory_called = False
+
+        async def forbidden_factory() -> _Session:
+            nonlocal factory_called
+            factory_called = True
+            return _Session()
+
+        try:
+            with pytest.raises(RuntimeError, match="owner is closed"):
+                await supervisor.acquire(
+                    _fence(),
+                    "read",
+                    forbidden_factory,
+                )
+            assert factory_called is False
+        finally:
+            release_local_cleanup.set()
+            await revocation
+
+    asyncio.run(exercise())
+
+
+def test_owner_revocation_keeps_authority_closed_when_provider_close_fails() -> None:
+    async def exercise() -> None:
+        secret = "SECRET provider close failure"
+
+        class FailingClose:
+            close_count = 0
+
+            async def aclose(self) -> None:
+                self.close_count += 1
+                raise RuntimeError(secret)
+
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop_errors: list[dict[str, Any]] = []
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        try:
+            supervisor = McpConnectionSupervisor(close_timeout_s=0.02)
+            session = FailingClose()
+            await supervisor.acquire(
+                _fence(),
+                "read",
+                _async_factory(session),
+                task_affine=False,
+            )
+            supervisor.close_owner_nowait("pid:1")
+            await _wait_until(lambda: session.close_count == 1)
+            assert await supervisor.snapshot() == ()
+
+            factory_called = False
+
+            async def forbidden_factory() -> _Session:
+                nonlocal factory_called
+                factory_called = True
+                return _Session()
+
+            with pytest.raises(RuntimeError, match="owner is closed"):
+                await supervisor.acquire(_fence(), "read", forbidden_factory)
+            supervisor.close_owner_nowait("pid:1")
+            await asyncio.sleep(0)
+            assert factory_called is False
+            assert session.close_count == 1
+        finally:
+            loop.set_exception_handler(previous_handler)
+        assert loop_errors == []
+
+    asyncio.run(exercise())
+
+
+def test_owner_revocation_keeps_authority_closed_when_provider_close_times_out() -> None:
+    async def exercise() -> None:
+        class HangingClose:
+            def __init__(self) -> None:
+                self.close_count = 0
+                self.entered = asyncio.Event()
+                self.cancelled = asyncio.Event()
+
+            async def aclose(self) -> None:
+                self.close_count += 1
+                self.entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    raise
+
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop_errors: list[dict[str, Any]] = []
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        try:
+            supervisor = McpConnectionSupervisor(close_timeout_s=0.01)
+            session = HangingClose()
+            await supervisor.acquire(
+                _fence(),
+                "read",
+                _async_factory(session),
+                task_affine=False,
+            )
+            supervisor.close_owner_nowait("pid:1")
+            await asyncio.wait_for(session.entered.wait(), timeout=1.0)
+            await asyncio.wait_for(session.cancelled.wait(), timeout=1.0)
+            assert await supervisor.snapshot() == ()
+            with pytest.raises(RuntimeError, match="owner is closed"):
+                await supervisor.acquire(
+                    _fence(),
+                    "read",
+                    _async_factory(_Session()),
+                )
+            supervisor.close_owner_nowait("pid:1")
+            await asyncio.sleep(0)
+            assert session.close_count == 1
+        finally:
+            loop.set_exception_handler(previous_handler)
+        assert loop_errors == []
+
+    asyncio.run(exercise())
+
+
 def test_process_terminal_revokes_mcp_owner_before_other_notifications() -> None:
     calls: list[tuple[str, str]] = []
 
@@ -1456,3 +1701,41 @@ def test_process_terminal_revokes_mcp_owner_before_other_notifications() -> None
         ("human", "pid:terminal"),
         ("object_tasks", "pid:terminal"),
     ]
+
+
+def test_process_terminal_reports_mcp_revocation_failure_and_continues() -> None:
+    calls: list[tuple[str, str]] = []
+    secret = "SECRET /private/mcp-revocation"
+
+    class Subscriptions:
+        def close_owner_nowait(self, owner: str) -> None:
+            calls.append(("mcp", owner))
+            raise RuntimeError(secret)
+
+    class Human:
+        def cancel_pending_for_process(self, pid: str, **_keywords: Any) -> None:
+            calls.append(("human", pid))
+
+    class ObjectTasks:
+        def notify_process_terminal(self, pid: str) -> None:
+            calls.append(("object_tasks", pid))
+
+    runtime = object.__new__(Runtime)
+    runtime._mcp_subscription_manager = Subscriptions()
+    runtime.human = Human()
+    runtime.object_tasks = ObjectTasks()
+
+    with pytest.raises(RuntimeError, match="terminal_cleanup_failed") as caught:
+        runtime._notify_process_terminal("pid:terminal")
+
+    assert calls == [
+        ("mcp", "pid:terminal"),
+        ("human", "pid:terminal"),
+        ("object_tasks", "pid:terminal"),
+    ]
+    assert secret not in str(caught.value)
+    assert caught.value.cleanup_failures[0]["phase"] == "mcp"
+    assert caught.value.cleanup_failures[0]["error_type"] == "RuntimeError"
+    assert len(
+        caught.value.cleanup_failures[0]["exception_text"]["sha256"]
+    ) == 64

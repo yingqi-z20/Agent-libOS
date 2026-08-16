@@ -13,6 +13,7 @@ from benchmarks.live_evaluation_provenance import (
     evaluation_provenance_identity,
     live_evaluation_provenance_ready,
     valid_evaluation_provenance,
+    valid_stable_source_provenance,
 )
 from tests.support.live_evaluation import stable_evaluation_provenance
 
@@ -46,6 +47,12 @@ def test_capture_records_effective_config_without_provider_secrets(
     assert identity["llm"]["endpoint"]["custom_endpoint_allowed"] is True
     assert identity["llm"]["credential_present"] is True
     assert identity["llm"]["prompt"]["cache_key_configured"] is True
+    assert identity["evidence_capture"] == {
+        "schema_version": 1,
+        "llm_call_record_list_limit": DEFAULT_CONFIG.llm.call_record_list_limit,
+        "llm_call_record_hard_limit": DEFAULT_CONFIG.llm.call_record_hard_limit,
+        "checkpoint_list_limit": DEFAULT_CONFIG.checkpoint.list_limit,
+    }
     assert "gateway.example" not in rendered
     for secret in secrets.values():
         if secret == "publication-model":
@@ -77,6 +84,34 @@ def test_validator_recomputes_config_digest_and_rejects_unknown_fields() -> None
 
     assert valid_evaluation_provenance(provenance) is False
 
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("schema_version", True),
+        ("llm_call_record_list_limit", 0),
+        ("llm_call_record_hard_limit", 0),
+        ("checkpoint_list_limit", True),
+    ),
+)
+def test_evidence_capture_limits_are_strict_provenance_identity(
+    field: str,
+    value: object,
+) -> None:
+    provenance = stable_evaluation_provenance()
+    for boundary in ("start", "end"):
+        provenance[boundary]["evidence_capture"][field] = value
+
+    assert valid_evaluation_provenance(provenance) is False
+
+    provenance = stable_evaluation_provenance()
+    for boundary in ("start", "end"):
+        capture = provenance[boundary]["evidence_capture"]
+        capture["llm_call_record_list_limit"] = 101
+        capture["llm_call_record_hard_limit"] = 100
+
+    assert valid_evaluation_provenance(provenance) is False
+
     provenance = stable_evaluation_provenance()
     provenance["start"]["llm"]["base_url"] = "https://must-not-survive.test"
     provenance["end"] = copy.deepcopy(provenance["start"])
@@ -105,3 +140,41 @@ def test_live_gate_requires_exact_model_and_present_credential(
 
     assert valid_evaluation_provenance(provenance) is True
     assert live_evaluation_provenance_ready(provenance) is False
+
+
+@pytest.mark.parametrize(
+    "location",
+    ("envelope", "snapshot", "source", "llm"),
+)
+def test_provenance_schema_versions_reject_boolean_alias(location: str) -> None:
+    provenance = stable_evaluation_provenance()
+    if location == "envelope":
+        provenance["schema_version"] = True
+    else:
+        for boundary in ("start", "end"):
+            selected = provenance[boundary]
+            if location == "snapshot":
+                selected["schema_version"] = True
+            elif location == "source":
+                selected["source"]["schema_version"] = True
+            else:
+                llm = selected["llm"]
+                llm["schema_version"] = True
+                safe = dict(llm)
+                safe.pop("config_sha256")
+                llm["config_sha256"] = _safe_llm_config_digest(safe)
+
+    assert valid_evaluation_provenance(provenance) is False
+    assert live_evaluation_provenance_ready(provenance) is False
+
+
+def test_stable_source_provenance_rejects_boolean_schema_version() -> None:
+    identity = stable_evaluation_provenance()["start"]["source"]
+    source = {
+        "schema_version": True,
+        "start": copy.deepcopy(identity),
+        "end": copy.deepcopy(identity),
+        "stable": True,
+    }
+
+    assert valid_stable_source_provenance(source) is False

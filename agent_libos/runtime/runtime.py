@@ -383,8 +383,13 @@ class Runtime:
                 close_owner = getattr(supervisor, "close_owner_nowait", None)
                 if callable(close_owner):
                     close_owner(pid)
-        except BaseException:
-            pass
+        except BaseException as exc:
+            # MCP owner revocation is a terminal-cleanup phase, not a
+            # best-effort diagnostic.  The MCP managers latch the owner before
+            # Provider cleanup, so reporting this failure cannot roll back the
+            # terminal outcome or restore authority; it makes the durable
+            # cleanup intent retryable instead.
+            errors.append(("mcp", exc))
         try:
             self.human.cancel_pending_for_process(
                 pid,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -51,7 +52,6 @@ def _make_v4_store(path: Path) -> None:
     finally:
         connection.close()
 
-
 def _backup(source: Path, destination: Path) -> None:
     source_connection = sqlite3.connect(source)
     destination_connection = sqlite3.connect(destination)
@@ -77,6 +77,50 @@ def _schema_version(path: Path) -> int:
         return int(row[0])
     finally:
         connection.close()
+
+
+def test_postgres_identity_binds_hashed_driver_endpoint_without_exposing_it() -> None:
+    class _Cursor:
+        def fetchone(self) -> dict[str, object]:
+            return {
+                "database_name": "runtime",
+                "schema_name": "agent_libos",
+                "database_oid": 100,
+                "schema_oid": 200,
+                "server_address": "203.0.113.10",
+                "server_port": "5432",
+                "control_system_allowed": True,
+                "system_identifier": "10000000000000000001",
+            }
+
+    class _Info:
+        def __init__(self, host: str):
+            self.host = host
+            self.hostaddr = "203.0.113.10"
+            self.port = 5432
+
+    class _Driver:
+        def __init__(self, host: str):
+            self.info = _Info(host)
+
+    class _Connection:
+        def __init__(self, host: str):
+            self._conn = _Driver(host)
+
+        def execute(self, _statement: str) -> _Cursor:
+            return _Cursor()
+
+    first = migration_module._postgres_identity(
+        _Connection("postgres-a.internal")
+    )
+    second = migration_module._postgres_identity(
+        _Connection("postgres-b.internal")
+    )
+
+    assert first[:2] == second[:2] == ("runtime", "agent_libos")
+    assert first[2] != second[2]
+    assert len(first[2]) == 64
+    assert "postgres-a.internal" not in first[2]
 
 
 def _user_tables(path: Path) -> set[str]:
@@ -129,7 +173,17 @@ def test_v5_plan_is_deterministic_and_dry_run_is_zero_write(
     assert first.to_schema_version == 5
     assert len(first.plan_sha256) == 64
     assert len(first.ddl_sha256) == 64
-    assert first.to_dict()["schema_version"] == 1
+    payload = first.to_dict()
+    assert payload["schema_version"] == 2
+    assert payload["migration_implementation_version"] == "v4-to-v5/3"
+    assert len(payload["receipt_contract_sha256"]) == 64
+    for field in (
+        "database_identity_sha256",
+        "source_catalog_sha256",
+        "source_digest_sha256",
+        "snapshot_receipt_sha256",
+    ):
+        assert len(payload[field]) == 64
     assert _file_sha256(source) == before_source
     assert _file_sha256(backup) == before_backup
     assert {path.name for path in tmp_path.iterdir()} == before_names
@@ -207,6 +261,15 @@ def test_v5_apply_requires_expected_plan_and_verified_backup(
     finally:
         connection.close()
 
+    repeated = apply_store_v5_migration(
+        source,
+        sqlite_backup=backup,
+        expected_plan_sha256=plan.plan_sha256,
+    )
+    assert repeated.applied is False
+    assert repeated.already_applied is True
+    assert repeated.plan == plan
+
 
 def test_v5_apply_rejects_plan_digest_mismatch_without_schema_writes(
     tmp_path: Path,
@@ -226,6 +289,116 @@ def test_v5_apply_rejects_plan_digest_mismatch_without_schema_writes(
     assert _schema_version(source) == 4
     assert "revision" not in _human_columns(source)
     assert "semantic_assessments" not in _user_tables(source)
+
+
+def test_v5_plan_is_bound_to_the_selected_sqlite_database(
+    tmp_path: Path,
+) -> None:
+    first_source = tmp_path / "first.sqlite"
+    first_backup = tmp_path / "first-backup.sqlite"
+    second_source = tmp_path / "second.sqlite"
+    second_backup = tmp_path / "second-backup.sqlite"
+    _make_v4_store(first_source)
+    _backup(first_source, first_backup)
+    _backup(first_source, second_source)
+    _backup(second_source, second_backup)
+
+    first_plan = plan_store_v5_migration(
+        first_source,
+        sqlite_backup=first_backup,
+    )
+    second_plan = plan_store_v5_migration(
+        second_source,
+        sqlite_backup=second_backup,
+    )
+
+    assert first_plan.source_digest_sha256 == second_plan.source_digest_sha256
+    assert first_plan.database_identity_sha256 != second_plan.database_identity_sha256
+    assert first_plan.plan_sha256 != second_plan.plan_sha256
+    with pytest.raises(StoreV5MigrationError, match="plan digest"):
+        apply_store_v5_migration(
+            second_source,
+            sqlite_backup=second_backup,
+            expected_plan_sha256=first_plan.plan_sha256,
+        )
+    assert _schema_version(second_source) == 4
+
+
+@pytest.mark.parametrize("fault", ["commit_ack", "post_commit_readback"])
+def test_v5_apply_reconciles_exact_target_after_uncertain_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    source = tmp_path / "runtime.sqlite"
+    backup = tmp_path / "runtime-v4-backup.sqlite"
+    _make_v4_store(source)
+    _backup(source, backup)
+    plan = plan_store_v5_migration(source, sqlite_backup=backup)
+
+    if fault == "commit_ack":
+        real_open = migration_module._sqlite_apply_connection
+
+        @contextmanager
+        def lost_commit_ack(path: Path):
+            with real_open(path) as connection:
+                class ConnectionProxy:
+                    def __getattr__(self, name: str) -> object:
+                        return getattr(connection, name)
+
+                    def commit(self) -> None:
+                        connection.commit()
+                        raise RuntimeError("injected lost commit ACK")
+
+                yield ConnectionProxy()
+
+        monkeypatch.setattr(
+            migration_module,
+            "_sqlite_apply_connection",
+            lost_commit_ack,
+        )
+        expected_error = "lost commit ACK"
+    else:
+        real_require = migration_module._require_canonical_v5
+        calls = 0
+
+        def fail_post_commit_readback(backend: object, connection: object) -> None:
+            nonlocal calls
+            real_require(backend, connection)
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected post-commit readback failure")
+
+        monkeypatch.setattr(
+            migration_module,
+            "_require_canonical_v5",
+            fail_post_commit_readback,
+        )
+        expected_error = "post-commit readback"
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        apply_store_v5_migration(
+            source,
+            sqlite_backup=backup,
+            expected_plan_sha256=plan.plan_sha256,
+        )
+    assert _schema_version(source) == 5
+
+    with pytest.raises(StoreV5MigrationError, match="plan digest"):
+        apply_store_v5_migration(
+            source,
+            sqlite_backup=backup,
+            expected_plan_sha256="0" * 64,
+        )
+
+    result = apply_store_v5_migration(
+        source,
+        sqlite_backup=backup,
+        expected_plan_sha256=plan.plan_sha256,
+    )
+    assert result.applied is False
+    assert result.already_applied is True
+    assert result.plan == plan
 
 
 def test_v5_apply_rejects_stale_backup_under_locked_source(

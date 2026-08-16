@@ -94,6 +94,13 @@ whose partial trace cannot be recovered is explicitly unknown rather than zero.
 The combined gate additionally requires all three configuration identities to
 match.
 
+The live report contract is schema v2. It freezes the scenario and repetition
+grid and records per-run terminal, oracle, external-effect, workflow-receipt,
+and telemetry evidence. Publication validation recomputes outcome fields and
+metrics from that envelope. A complete negative oracle result is retained as a
+valid observation; a missing evidence section invalidates the report. Legacy
+schema-v1 reports may be inspected but cannot pass this gate and must be rerun.
+
 The complete live release gate also requires the real-Chromium customer
 workflow documented in
 [`../browser_customer_workflows/README.md`](../browser_customer_workflows/README.md)

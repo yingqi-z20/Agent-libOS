@@ -37,6 +37,8 @@ Align all current version-bearing surfaces:
 - `gui/package.json`, `gui/package-lock.json`, and its root package entry;
 - `experiments/agentdojo/uv.lock`'s editable Agent libOS metadata;
 - release artifact names in `.github/workflows/test.yml`;
+- the modern MCP `clientInfo`, `desktop/runtime-manifest.json`, desktop checker
+  constants, and every versioned name in `.github/workflows/desktop-internal.yml`;
 - current-version assertions in release-contract tests;
 - [release status](release_status.md), relevant versioned compatibility
   documentation, and the [changelog](../CHANGELOG.md); and
@@ -67,8 +69,11 @@ release.
 
 The local release checker proves only that checked-in version identifiers are
 aligned and use the final ASCII `X.Y.Z` spelling without leading zeros. It does
-not contact a package index or inspect remote Git references. For this release
-line it additionally pins the exact target `1.5.0`; a future release must
+not contact a package index or inspect remote Git references. It also verifies
+that every tracked ordinary source file belongs to the exact sdist
+include/exclude partition; an unclassified top-level file blocks the build
+until a maintainer makes an explicit inclusion decision. For this release
+line it additionally pins the exact target `1.5.1`; a future release must
 intentionally update that target and its regression contract rather than
 passing merely because stale identifiers agree with one another. Immediately
 before publication authorization, the human owner must re-check the complete
@@ -218,7 +223,7 @@ other cells marked as environment gates are not made true by deterministic CI.
 If a release claim includes one, obtain and bind its documented clean-source
 receipt before authorization.
 
-For the 1.5.0 internal desktop candidate, native packaging is a separate
+For the 1.5.1 internal desktop candidate, native packaging is a separate
 manual workflow (`.github/workflows/desktop-internal.yml`). It builds only on
 the three locked native runners, uploads Actions artifacts for 14 days, and has
 read-only repository permission. Its macOS artifact is ad-hoc signed and not

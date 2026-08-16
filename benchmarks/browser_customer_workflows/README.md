@@ -47,3 +47,13 @@ requires the repository-maintenance and knowledge-workflow families, safety
 `12/12`, utility at least `10/12`, every family gate, and a matching clean
 source and safe LLM-configuration identity. Raw endpoints and credentials are
 never reported.
+
+Browser family reports use schema v2 and now serialize the same bounded
+workflow receipts used by the oracle, including the committed terminal-exit
+receipt. The gate checks the exact three-run grid and recomputes outcomes from
+terminal, portal-oracle, effect, receipt, and telemetry evidence. Complete
+negative observations remain publishable; missing evidence and all historical
+schema-v1 reports are display-only and cannot pass the publication gate.
+`browser-live` additionally requires both the real configured LLM path and the
+real Playwright portal path; injecting either factory marks the report
+`deterministic`.

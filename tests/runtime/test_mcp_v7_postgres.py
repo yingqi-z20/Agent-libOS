@@ -634,3 +634,92 @@ def test_postgres_v6_to_v7_failure_rolls_back(
                 )
             }
         assert present.isdisjoint(V7_TABLES)
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("fault", ["commit_ack", "post_commit_readback"])
+def test_postgres_v7_reconciles_exact_target_after_uncertain_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    import psycopg
+
+    with _postgres_schema_dsn() as dsn:
+        _downgrade_to_v6(dsn)
+        plan = plan_store_v7_migration(dsn)
+        if fault == "commit_ack":
+            real_commit = mcp_v7_migration._PostgresConnection.commit
+
+            def lost_commit_ack(connection: object) -> None:
+                real_commit(connection)
+                raise RuntimeError("injected lost commit ACK")
+
+            monkeypatch.setattr(
+                mcp_v7_migration._PostgresConnection,
+                "commit",
+                lost_commit_ack,
+            )
+            expected_error = "lost commit ACK"
+        else:
+            real_require = mcp_v7_migration._require_canonical_v7
+            calls = 0
+
+            def fail_post_commit_readback(
+                backend: object,
+                connection: object,
+            ) -> None:
+                nonlocal calls
+                real_require(backend, connection)
+                calls += 1
+                if calls == 2:
+                    raise RuntimeError("injected post-commit readback failure")
+
+            monkeypatch.setattr(
+                mcp_v7_migration,
+                "_require_canonical_v7",
+                fail_post_commit_readback,
+            )
+            expected_error = "post-commit readback"
+
+        with pytest.raises(RuntimeError, match=expected_error):
+            apply_store_v7_migration(
+                dsn,
+                expected_plan_sha256=plan.plan_sha256,
+                postgres_snapshot_confirmed=True,
+            )
+        with psycopg.connect(dsn, autocommit=True) as connection:
+            assert connection.execute(
+                "SELECT schema_version FROM runtime_schema WHERE singleton = 1"
+            ).fetchone() == (7,)
+
+        result = apply_store_v7_migration(
+            dsn,
+            expected_plan_sha256=plan.plan_sha256,
+            postgres_snapshot_confirmed=True,
+        )
+        assert result.applied is False
+        assert result.already_applied is True
+        assert result.plan == plan
+
+
+@pytest.mark.postgres
+def test_postgres_v7_plan_rejects_a_different_database_schema() -> None:
+    with _postgres_schema_dsn() as first_dsn, _postgres_schema_dsn() as second_dsn:
+        _downgrade_to_v6(first_dsn)
+        _downgrade_to_v6(second_dsn)
+        first_plan = plan_store_v7_migration(first_dsn)
+        second_plan = plan_store_v7_migration(second_dsn)
+
+        assert first_plan.source_catalog_sha256 == second_plan.source_catalog_sha256
+        assert first_plan.source_digest_sha256 != second_plan.source_digest_sha256
+        assert (
+            first_plan.database_identity_sha256
+            != second_plan.database_identity_sha256
+        )
+        assert first_plan.plan_sha256 != second_plan.plan_sha256
+        with pytest.raises(StoreV7MigrationError, match="plan digest"):
+            apply_store_v7_migration(
+                second_dsn,
+                expected_plan_sha256=first_plan.plan_sha256,
+                postgres_snapshot_confirmed=True,
+            )

@@ -1,6 +1,6 @@
 # Durable Task Runs
 
-Durable Task Runs, introduced in Agent libOS 1.1.0, remain the 1.5.0
+Durable Task Runs, introduced in Agent libOS 1.1.0, remain the 1.5.1
 Host-supervised unit for long-running
 agent work. One `TaskRun` owns one root `AgentProcess` and the child-process
 tree created from that root. The Run adds a durable goal, requirement ledger,
@@ -35,6 +35,13 @@ by toggling this setting. `enabled` does not imply consent to write readable
 payloads. Hosts should keep
 `plaintext_payloads_enabled` false unless their data-retention agreement covers
 the SQL database and its backups.
+
+The bundled GUI therefore starts new work as a regular non-TaskRun process by
+default. Its
+Durable Task Run option is disabled until the Host enables both switches above;
+the renderer reports the requirement but never edits configuration or silently
+opts in to plaintext persistence. Selecting Durable mode remains a separate,
+explicit user action after Host opt-in.
 
 Each `TaskRunSpecV1` selects one retention policy:
 
@@ -496,7 +503,7 @@ paged listing, optionally quantum-bounded execution, passive waiting,
 pause/resume, cancellation,
 follow-ups, evidence-constrained recovery, whole-Run rerun operations, and an
 audited `purge_payloads` operation for a terminal `permanent` Run. The explicit
-purge is a Python Host/admin surface in 1.5.0; it is not offered to ordinary
+purge is a Python Host/admin surface in 1.5.1; it is not offered to ordinary
 CLI or GUI users.
 Rerun creates a new Run id and links it to the prior Run; it never rewinds the
 old ledger. After either `purge_on_terminal` cleanup or an explicit Host purge
@@ -513,7 +520,7 @@ its stable client request id instead of an expected revision.
 ## CLI
 
 The `task-run` command group mirrors the ordinary Host controls (the
-Host/admin-only explicit payload purge remains Python-only in 1.5.0):
+Host/admin-only explicit payload purge remains Python-only in 1.5.1):
 
 ```text
 task-run start
@@ -556,7 +563,7 @@ The private local API provides `/api/task-runs` collection/detail routes,
 paged ledger and Human-request reads, and run, pause, resume, cancel, follow-up,
 recover, and rerun mutations. Collection, ledger, and Human pages accept an
 opaque `cursor` and return `next_cursor`; clients must not parse it. There is no
-separate Task Run requirements or wait HTTP route in 1.5.0: the detail response
+separate Task Run requirements or wait HTTP route in 1.5.1: the detail response
 embeds a bounded requirements page selected with `requirements_limit` and
 `requirements_cursor`, requirement changes are also ledger items, and waiting
 is ordinary state observation. Cancel/recover require the same explicit

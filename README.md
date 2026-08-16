@@ -340,7 +340,7 @@ verified by the release procedure:
 ```bash
 uv venv .venv
 uv pip install --python .venv/bin/python \
-  ./dist/agent_libos-1.5.0-py3-none-any.whl
+  ./dist/agent_libos-1.5.1-py3-none-any.whl
 .venv/bin/agent-libos --help
 ```
 
@@ -362,6 +362,10 @@ archive and source checkout, not installed into the core wheel. The
 Electron sources are repository-checkout assets and are validated by their
 separate GUI lane. A wheel installation may load separately supplied modules,
 Skills, Images, and configuration through their normal explicit paths.
+The sdist uses a checked explicit include/exclude partition, and release
+validation rejects unpartitioned tracked source files or archive members outside
+the include allowlist. Wheel and sdist metadata must contain exactly the
+reviewed core dependencies and `postgres`, `pty`, and `mcp` extras.
 
 Build and validate both release artifacts with:
 
@@ -370,9 +374,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.5.0-py3-none-any.whl dist/agent_libos-1.5.0.tar.gz
+  dist/agent_libos-1.5.1-py3-none-any.whl dist/agent_libos-1.5.1.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.5.0-py3-none-any.whl
+  dist/agent_libos-1.5.1-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 uv export --frozen --no-dev --no-emit-project --output-file runtime-requirements.txt
 uv export --frozen --only-group release --no-emit-project --output-file release-build-requirements.txt
@@ -386,7 +390,7 @@ uv venv /tmp/agent-libos-wheel-check
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
   --require-hashes -r runtime-requirements.txt
 uv pip install --python /tmp/agent-libos-wheel-check/bin/python \
-  --no-deps dist/agent_libos-1.5.0-py3-none-any.whl
+  --no-deps dist/agent_libos-1.5.1-py3-none-any.whl
 uv pip check --python /tmp/agent-libos-wheel-check/bin/python
 /tmp/agent-libos-wheel-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-wheel-check/bin/agent-libos --help
@@ -399,7 +403,7 @@ uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
   --require-hashes -r release-build-requirements.txt
 uv pip install --python /tmp/agent-libos-sdist-check/bin/python \
-  --no-deps --no-build-isolation dist/agent_libos-1.5.0.tar.gz
+  --no-deps --no-build-isolation dist/agent_libos-1.5.1.tar.gz
 uv pip check --python /tmp/agent-libos-sdist-check/bin/python
 /tmp/agent-libos-sdist-check/bin/python -c "from agent_libos.skills import get_builtin_skill_catalog; assert len(get_builtin_skill_catalog().list()) == 26"
 /tmp/agent-libos-sdist-check/bin/agent-libos --help

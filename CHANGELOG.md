@@ -9,12 +9,31 @@ Git history remains the record for earlier development snapshots.
 Changes intended for the next published version must be summarized here before
 release. Do not treat an entry in this section as shipped behavior.
 
+## 1.5.1
+
+`1.5.1` is the current stabilization release version aligned across the Python
+project, package lockfiles, GUI package, MCP client identity, desktop metadata,
+and release workflows. It preserves the Runtime authority and data-flow
+semantics while hardening first-run behavior, offline migration reconciliation,
+terminal-owner cleanup, live-evaluation evidence recomputation, and release
+artifact validation.
+
+The source distribution now uses an explicit include/exclude partition. Its
+checker rejects ordinary source files outside that partition and validates the
+exact core, PostgreSQL, PTY, and MCP `Requires-Dist`/`Provides-Extra` metadata
+in both the wheel and source archive. See
+[docs/release_status.md](docs/release_status.md) for the implemented scope and
+remaining environment gates.
+
+As with every version entry here, publication still requires the separately
+authorized, receipt-bound process in [docs/releasing.md](docs/releasing.md).
+This entry alone does not claim a tag, package-index upload, signed desktop
+distribution, or completed external-provider gate.
+
 ## 1.5.0
 
-`1.5.0` is the current release version aligned across the Python project,
-package lockfiles, GUI package, and release-artifact workflow. Its implemented
-scope, validation contract, and remaining environment gates are maintained in
-[docs/release_status.md](docs/release_status.md).
+`1.5.0` was the preceding aligned release version across the Python project,
+package lockfiles, GUI package, and release-artifact workflow.
 
 This release preserves Manifest v1/v2 governed Tools compatibility and adds
 the exact-`2026-07-28` Manifest v3 client for governed Tools, Resources,

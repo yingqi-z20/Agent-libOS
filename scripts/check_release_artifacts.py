@@ -10,8 +10,10 @@ import json
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import subprocess
 import tarfile
 import tomllib
+import unicodedata
 import zipfile
 
 from packaging.requirements import InvalidRequirement, Requirement
@@ -21,7 +23,18 @@ from packaging.utils import canonicalize_name
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT_NAME = "agent-libos"
 ARCHIVE_NAME = "agent_libos"
-RELEASE_TARGET_VERSION = "1.5.0"
+RELEASE_TARGET_VERSION = "1.5.1"
+CORE_REQUIREMENTS = (
+    "jsonschema<5,>=4.25.0",
+    "openai<3,>=2.43.0",
+    "psutil<8,>=7.0.0",
+    "pydantic<3,>=2.13.4",
+    "pyyaml<7,>=6.0.3",
+    "regex<2027,>=2024.11.6",
+)
+POSTGRES_EXTRA_REQUIREMENTS = (
+    "psycopg[binary]<4,>=3.2; extra == 'postgres'",
+)
 MCP_EXTRA_REQUIREMENTS = (
     "anyio<5,>=4.10; extra == 'mcp'",
     "httpcore2<3,>=2.5; extra == 'mcp'",
@@ -29,6 +42,40 @@ MCP_EXTRA_REQUIREMENTS = (
     "keyring==25.7.0; extra == 'mcp'",
     "mcp==2.0.0; extra == 'mcp'",
     "opentelemetry-api<2,>=1.28; extra == 'mcp'",
+)
+PTY_EXTRA_REQUIREMENTS = (
+    "pywinpty<4,>=3.0.5; (sys_platform == 'win32') and extra == 'pty'",
+)
+EXPECTED_PROVIDES_EXTRA = ("mcp", "postgres", "pty")
+SDIST_INCLUDE = (
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+    "/.gitignore",
+    "/LICENSE",
+    "/README.md",
+    "/SECURITY.md",
+    "/agent_libos",
+    "/benchmarks",
+    "/config.yaml",
+    "/docs",
+    "/examples",
+    "/experiments",
+    "/images",
+    "/modules",
+    "/pyproject.toml",
+    "/scripts",
+    "/skills",
+    "/tests",
+)
+SDIST_EXCLUDE = (
+    "/.gitattributes",
+    "/.github",
+    "/AGENTS.md",
+    "/agent_libos_design_doc.md",
+    "/desktop",
+    "/gui",
+    "/plan.md",
+    "/uv.lock",
 )
 EXPECTED_CONSOLE_SCRIPTS = {
     "agent-libos": "agent_libos.api.cli:cli",
@@ -76,6 +123,13 @@ _BUILTIN_SKILL_FRONTMATTER_FIELDS = frozenset(
     {"name", "description", "allowed-tools"}
 )
 _BUILTIN_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
+_WINDOWS_FORBIDDEN_ARCHIVE_CHARS = frozenset('<>:"|?*')
+_WINDOWS_RESERVED_ARCHIVE_STEMS = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+    | {f"{prefix}{index}" for prefix in ("com", "lpt") for index in "¹²³"}
+)
 
 
 MCP_WHEEL_REQUIRED_FILES = frozenset(
@@ -147,6 +201,7 @@ WHEEL_REQUIRED_FILES = frozenset(
 ) | BUILTIN_SKILL_ARCHIVE_PATHS | MCP_WHEEL_REQUIRED_FILES
 SDIST_REQUIRED_FILES = frozenset(
     {
+        ".gitignore",
         "LICENSE",
         "PKG-INFO",
         "README.md",
@@ -197,17 +252,196 @@ _FINAL_RELEASE_VERSION = re.compile(
     r"(?:0|[1-9][0-9]*)\."
     r"(?:0|[1-9][0-9]*)\Z"
 )
+_SDIST_INCLUDE_DIRECTORIES = frozenset(
+    {
+        "/agent_libos",
+        "/benchmarks",
+        "/docs",
+        "/examples",
+        "/experiments",
+        "/images",
+        "/modules",
+        "/scripts",
+        "/skills",
+        "/tests",
+    }
+)
+_SDIST_EXCLUDE_DIRECTORIES = frozenset(
+    {"/.github", "/desktop", "/gui"}
+)
 
 
-def _python_package_version(root: Path) -> str:
-    tree = ast.parse((root / "agent_libos" / "__init__.py").read_text(encoding="utf-8"))
+def _sdist_source_partition(relative_path: str) -> str | None:
+    path = PurePosixPath(relative_path)
+    if (
+        path.is_absolute()
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or "\\" in relative_path
+    ):
+        return None
+    root_entry = f"/{path.parts[0]}"
+    if len(path.parts) == 1:
+        included = root_entry in SDIST_INCLUDE
+        excluded = root_entry in SDIST_EXCLUDE
+    else:
+        included = root_entry in _SDIST_INCLUDE_DIRECTORIES
+        excluded = root_entry in _SDIST_EXCLUDE_DIRECTORIES
+    if included == excluded:
+        return None
+    return "include" if included else "exclude"
+
+
+def _validate_sdist_source_paths(relative_paths: list[str]) -> None:
+    unpartitioned = sorted(
+        path for path in relative_paths if _sdist_source_partition(path) is None
+    )
+    if unpartitioned:
+        raise ValueError(
+            "ordinary source files must be explicitly partitioned by the sdist "
+            f"include/exclude policy: {unpartitioned}"
+        )
+
+
+def _tracked_ordinary_source_paths(root: Path) -> list[str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--stage", "-z"],
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("tracked source-file partition cannot be inspected") from exc
+    paths: list[str] = []
+    for record in completed.stdout.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        mode = metadata.partition(b" ")[0]
+        if not separator:
+            raise ValueError("tracked source-file record is malformed")
+        if mode not in {b"100644", b"100755"}:
+            continue
+        try:
+            paths.append(raw_path.decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise ValueError("tracked source-file path is not UTF-8") from exc
+    return paths
+
+
+def validate_sdist_source_policy(root: Path = ROOT) -> None:
+    try:
+        pyproject = tomllib.loads(
+            (root / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        configuration = pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError, KeyError, TypeError) as exc:
+        raise ValueError("sdist build policy cannot be inspected") from exc
+    include = configuration.get("include")
+    exclude = configuration.get("exclude")
+    if include != list(SDIST_INCLUDE) or exclude != list(SDIST_EXCLUDE):
+        raise ValueError(
+            "sdist build policy must use the exact explicit include/exclude partition"
+        )
+    if (root / ".git").exists():
+        _validate_sdist_source_paths(_tracked_ordinary_source_paths(root))
+
+
+def _module_string_assignment(root: Path, relative_path: str, name: str) -> str:
+    tree = ast.parse((root / relative_path).read_text(encoding="utf-8"))
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
-        if any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets):
+        if any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in node.targets
+        ):
             if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
                 return node.value.value
-    raise ValueError("agent_libos.__version__ must be a string literal")
+    raise ValueError(f"{relative_path} {name} must be a string literal")
+
+
+def _python_package_version(root: Path) -> str:
+    return _module_string_assignment(
+        root,
+        "agent_libos/__init__.py",
+        "__version__",
+    )
+
+
+def _desktop_manifest_version(root: Path) -> str:
+    value = json.loads(
+        (root / "desktop" / "runtime-manifest.json").read_text(encoding="utf-8")
+    )
+    version = value.get("product", {}).get("version") if isinstance(value, dict) else None
+    if not isinstance(version, str):
+        raise ValueError("desktop/runtime-manifest.json product version is invalid")
+    return version
+
+
+def _desktop_workflow_version(root: Path) -> str:
+    text = (root / ".github" / "workflows" / "desktop-internal.yml").read_text(
+        encoding="utf-8"
+    )
+    matches = re.findall(
+        r'^\s*AGENT_LIBOS_DESKTOP_VERSION:\s*["\']([^"\']+)["\']\s*$',
+        text,
+        flags=re.MULTILINE,
+    )
+    if len(matches) != 1:
+        raise ValueError(
+            "desktop workflow must define AGENT_LIBOS_DESKTOP_VERSION exactly once"
+        )
+    version = matches[0]
+    expected_names = (
+        f"agent-libos-{version}-macos-arm64-internal-unsigned",
+        f"agent-libos-{version}-windows-x64-internal-unsigned",
+        f"agent-libos-{version}-linux-x64-internal-unsigned",
+        f"agent-libos-{version}-*-internal-unsigned-${{{{ github.sha }}}}-${{{{ github.run_attempt }}}}",
+    )
+    missing = [name for name in expected_names if text.count(name) != 1]
+    artifact_versions = set(
+        re.findall(r"agent-libos-(\d+\.\d+\.\d+)-[^\s]+-internal-unsigned", text)
+    )
+    if missing or artifact_versions != {version}:
+        raise ValueError(
+            "desktop workflow artifact names do not match its product version"
+        )
+    return version
+
+
+def _mcp_modern_client_version(root: Path) -> str:
+    text = (root / "agent_libos" / "substrate" / "local.py").read_text(
+        encoding="utf-8"
+    )
+    matches = re.findall(
+        r'version="([^"]+)"\s+if\s+governed_modern\s+else\s+"1\.4\.2"',
+        text,
+    )
+    if len(matches) != 1:
+        raise ValueError("modern MCP clientInfo version must be a single literal")
+    return matches[0]
+
+
+def _current_changelog_version(root: Path) -> str:
+    headings = re.findall(
+        r"^## ([0-9]+\.[0-9]+\.[0-9]+)\s*$",
+        (root / "CHANGELOG.md").read_text(encoding="utf-8"),
+        flags=re.MULTILINE,
+    )
+    if not headings:
+        raise ValueError("CHANGELOG.md must contain a current numeric release heading")
+    return headings[0]
+
+
+def _release_status_version(root: Path) -> str:
+    first_line = (root / "docs" / "release_status.md").read_text(
+        encoding="utf-8"
+    ).splitlines()[0]
+    match = re.fullmatch(r"# Agent libOS ([0-9]+\.[0-9]+\.[0-9]+) Status", first_line)
+    if match is None:
+        raise ValueError("docs/release_status.md heading is invalid")
+    return match.group(1)
 
 
 def _editable_lock_version(
@@ -304,6 +538,23 @@ def release_versions(root: Path = ROOT) -> dict[str, str]:
             suffix=".tar.gz",
         ),
         "skills/swe-agent/SKILL.md": _swe_agent_compatibility_version(root),
+        "agent_libos/substrate/local.py MCP clientInfo": (
+            _mcp_modern_client_version(root)
+        ),
+        "desktop/runtime-manifest.json": _desktop_manifest_version(root),
+        ".github/workflows/desktop-internal.yml": _desktop_workflow_version(root),
+        "scripts/check_desktop_artifacts.py": _module_string_assignment(
+            root,
+            "scripts/check_desktop_artifacts.py",
+            "VERSION",
+        ),
+        "scripts/verify_desktop_installers.py": _module_string_assignment(
+            root,
+            "scripts/verify_desktop_installers.py",
+            "VERSION",
+        ),
+        "CHANGELOG.md current release": _current_changelog_version(root),
+        "docs/release_status.md": _release_status_version(root),
     }
     gui_package_path = root / "gui" / "package.json"
     gui_lock_path = root / "gui" / "package-lock.json"
@@ -326,8 +577,21 @@ def release_versions(root: Path = ROOT) -> dict[str, str]:
 
 
 def validate_version_alignment(root: Path = ROOT) -> str:
+    validate_sdist_source_policy(root)
+    try:
+        selected = str(
+            tomllib.loads(
+                (root / "pyproject.toml").read_text(encoding="utf-8")
+            )["project"]["version"]
+        )
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError, KeyError, TypeError) as exc:
+        raise ValueError("pyproject.toml release version cannot be inspected") from exc
+    if _FINAL_RELEASE_VERSION.fullmatch(selected) is None:
+        raise ValueError(
+            "release version must use final-form numeric X.Y.Z with ASCII digits "
+            "and no leading zeros"
+        )
     versions = release_versions(root)
-    selected = versions["pyproject.toml"]
     mismatches = {
         source: version
         for source, version in versions.items()
@@ -340,11 +604,6 @@ def validate_version_alignment(root: Path = ROOT) -> str:
         raise ValueError(
             f"release version identifiers do not match {selected}: {details}"
         )
-    if _FINAL_RELEASE_VERSION.fullmatch(selected) is None:
-        raise ValueError(
-            "release version must use final-form numeric X.Y.Z with ASCII digits "
-            "and no leading zeros"
-        )
     if selected != RELEASE_TARGET_VERSION:
         raise ValueError(
             f"release target version must be exactly {RELEASE_TARGET_VERSION}, "
@@ -354,8 +613,22 @@ def validate_version_alignment(root: Path = ROOT) -> str:
 
 
 def _safe_archive_path(name: str) -> PurePosixPath:
+    if type(name) is not str or not name or "\x00" in name or "\\" in name:
+        raise ValueError(f"archive contains unsafe path: {name!r}")
+    raw_parts = name.split("/")
+    if any(part in {"", ".", ".."} for part in raw_parts):
+        raise ValueError(f"archive contains unsafe path: {name}")
+    for part in raw_parts:
+        if (
+            part.endswith((".", " "))
+            or any(character in _WINDOWS_FORBIDDEN_ARCHIVE_CHARS for character in part)
+            or any(ord(character) < 32 for character in part)
+            or part.split(".", 1)[0].rstrip(" .").casefold()
+            in _WINDOWS_RESERVED_ARCHIVE_STEMS
+        ):
+            raise ValueError(f"archive contains nonportable path: {name}")
     path = PurePosixPath(name)
-    if path.is_absolute() or ".." in path.parts:
+    if path.is_absolute() or tuple(path.parts) != tuple(raw_parts):
         raise ValueError(f"archive contains unsafe path: {name}")
     return path
 
@@ -363,13 +636,27 @@ def _safe_archive_path(name: str) -> PurePosixPath:
 def _reject_duplicate_archive_paths(names: list[str], *, kind: str) -> None:
     seen: set[str] = set()
     duplicates: set[str] = set()
+    portable: dict[str, str] = {}
+    collisions: set[tuple[str, str]] = set()
     for name in names:
         canonical = _safe_archive_path(name).as_posix()
         if canonical in seen:
             duplicates.add(canonical)
         seen.add(canonical)
+        portable_key = "/".join(
+            unicodedata.normalize("NFC", part).casefold()
+            for part in PurePosixPath(canonical).parts
+        )
+        previous = portable.setdefault(portable_key, canonical)
+        if previous != canonical:
+            collisions.add(tuple(sorted((previous, canonical))))
     if duplicates:
         raise ValueError(f"{kind} contains duplicate member paths: {sorted(duplicates)}")
+    if collisions:
+        raise ValueError(
+            f"{kind} contains portable member path collisions: "
+            f"{sorted(collisions)}"
+        )
 
 
 def _require_regular_artifact(path: Path) -> None:
@@ -629,23 +916,16 @@ def _requirement_signature(requirement: Requirement) -> tuple[str, tuple[str, ..
     )
 
 
-def _is_mcp_extra_requirement(requirement: Requirement) -> bool:
-    marker = str(requirement.marker or "")
-    return bool(
-        re.search(r'\bextra\s*==\s*["\']mcp["\']', marker)
-        or re.search(r'["\']mcp["\']\s*==\s*extra\b', marker)
-    )
-
-
-def _validate_mcp_extra_metadata(metadata: object, *, artifact: str) -> None:
+def _validate_dependency_metadata(metadata: object, *, artifact: str) -> None:
     get_all = getattr(metadata, "get_all", None)
     if not callable(get_all):
         raise ValueError(f"{artifact} metadata cannot be inspected")
 
     extras = [canonicalize_name(value) for value in get_all("Provides-Extra", [])]
-    if extras.count("mcp") != 1:
+    if sorted(extras) != list(EXPECTED_PROVIDES_EXTRA):
         raise ValueError(
-            f"{artifact} metadata must declare Provides-Extra: mcp exactly once"
+            f"{artifact} metadata Provides-Extra contract mismatch: "
+            f"expected={list(EXPECTED_PROVIDES_EXTRA)!r}, actual={sorted(extras)!r}"
         )
 
     parsed: list[Requirement] = []
@@ -656,18 +936,19 @@ def _validate_mcp_extra_metadata(metadata: object, *, artifact: str) -> None:
             raise ValueError(
                 f"{artifact} metadata contains an invalid Requires-Dist: {value!r}"
             ) from exc
-    actual = [
-        _requirement_signature(requirement)
-        for requirement in parsed
-        if _is_mcp_extra_requirement(requirement)
-    ]
+    actual = [_requirement_signature(requirement) for requirement in parsed]
     expected = [
         _requirement_signature(Requirement(value))
-        for value in MCP_EXTRA_REQUIREMENTS
+        for value in (
+            *CORE_REQUIREMENTS,
+            *POSTGRES_EXTRA_REQUIREMENTS,
+            *MCP_EXTRA_REQUIREMENTS,
+            *PTY_EXTRA_REQUIREMENTS,
+        )
     ]
     if sorted(actual) != sorted(expected):
         raise ValueError(
-            f"{artifact} metadata MCP extra requirements mismatch: "
+            f"{artifact} metadata Requires-Dist contract mismatch: "
             f"expected={sorted(expected)!r}, actual={sorted(actual)!r}"
         )
 
@@ -728,7 +1009,7 @@ def _validate_wheel(wheel_path: Path, version: str) -> None:
             raise ValueError(
                 "wheel Requires-Python must remain >=3.11,<3.15"
             )
-        _validate_mcp_extra_metadata(metadata, artifact="wheel")
+        _validate_dependency_metadata(metadata, artifact="wheel")
         wheel_metadata = BytesParser(policy=policy.default).parsebytes(
             archive.read(wheel_metadata_path)
         )
@@ -775,6 +1056,14 @@ def _validate_sdist(sdist_path: Path, version: str) -> None:
             relative = PurePosixPath(*path.parts[1:])
             relative_text = relative.as_posix()
             relative_files.add(relative_text)
+            if (
+                relative_text != "PKG-INFO"
+                and _sdist_source_partition(relative_text) != "include"
+            ):
+                raise ValueError(
+                    "sdist contains a file outside the explicit release allowlist: "
+                    f"{relative_text}"
+                )
             if SDIST_FORBIDDEN_PARTS.intersection(relative.parts):
                 raise ValueError(f"sdist contains generated or private path: {relative_text}")
             if relative.suffix.lower() in SDIST_FORBIDDEN_SUFFIXES:
@@ -807,7 +1096,7 @@ def _validate_sdist(sdist_path: Path, version: str) -> None:
             raise ValueError(
                 "sdist Requires-Python must remain >=3.11,<3.15"
             )
-        _validate_mcp_extra_metadata(metadata, artifact="sdist")
+        _validate_dependency_metadata(metadata, artifact="sdist")
         builtin_paths = {
             path
             for path in relative_files

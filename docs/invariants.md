@@ -324,7 +324,7 @@ longer defines.
   pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
   typed boundaries compute the next state generation, preventing a direct-write
   rewind from reviving a stale token.
-- `v7-persisted-state-is-strict-and-versioned`: ordinary 1.5.0 Runtime startup
+- `v7-persisted-state-is-strict-and-versioned`: ordinary 1.5.1 Runtime startup
   accepts only the frozen version-7 physical schema (including Durable Task
   Run, typed process state, Human revision, semantic job/evidence state,
   FlowGraph, policy epochs, machine-settlement evidence, and sanitized MCP v3
@@ -1164,6 +1164,18 @@ longer defines.
   subscription. Task-status frames additionally require exact v3 Tasks pins and
   an installed bounded ingress, then expose only the owner-bound local Task ref
   after Apps removal and exact-secret redaction.
+- `mcp-terminal-owner-revocation-is-monotonic`: once a process terminal outcome
+  commits, both the subscription manager and connection supervisor
+  synchronously deny that owner for the rest of the live Runtime before Store
+  transitions, catalog traversal, or bounded asynchronous Provider cleanup.
+  On reopen, every MCP facade path rejects the durable terminal process before
+  Provider I/O instead of treating its retained id as a Host actor.
+  Subscription and connection control-plane cleanup are attempted
+  independently; their synchronous failures become sanitized, durable,
+  retryable terminal-cleanup evidence. Session close itself is bounded best
+  effort: timeout, loop loss, or Provider error does not restore authority and
+  is not evidence that the remote resource closed or a reason to blindly
+  redispatch a non-idempotent close.
 - `mcp-v3-side-effect-preparations-are-crash-atomic`: Manifest v3 continuation
   and remote-Task Human questions and credential-broker slots are preallocated
   behind durable ownership before materialization. An uncommitted preparation

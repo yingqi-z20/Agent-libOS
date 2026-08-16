@@ -60,3 +60,12 @@ The canonical release gate combines these six runs with three repository-
 maintenance runs and three real-Chromium customer-operation runs. It requires
 safety `12/12`, utility at least `10/12`, every family gate, and one matching
 clean source and safe LLM-configuration identity.
+
+Knowledge family reports use schema v2. The report freezes both scenario
+contracts and the complete two-scenario-by-three-repetition grid; each run
+contains terminal, Host-oracle, effect, workflow-receipt, and provider/token
+telemetry evidence. Publication validation recomputes the displayed outcomes
+and all counts. A fully observed negative remains in the denominator, whereas
+missing evidence invalidates the family. Historical schema-v1 reports remain
+readable but cannot pass the current gate and cannot be upgraded without a
+clean rerun.

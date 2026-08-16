@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-libos"
-version = "1.5.0"
+version = "1.5.1"
 description = "A minimal Agent libOS runtime with process, object memory, capability, human approval, JIT tool, checkpoint, and audit primitives."
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -73,6 +73,38 @@ agent-libos-migrate-tool-groups = "agent_libos.storage.tool_skill_migration:cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agent_libos"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+    "/.gitignore",
+    "/LICENSE",
+    "/README.md",
+    "/SECURITY.md",
+    "/agent_libos",
+    "/benchmarks",
+    "/config.yaml",
+    "/docs",
+    "/examples",
+    "/experiments",
+    "/images",
+    "/modules",
+    "/pyproject.toml",
+    "/scripts",
+    "/skills",
+    "/tests",
+]
+exclude = [
+    "/.gitattributes",
+    "/.github",
+    "/AGENTS.md",
+    "/agent_libos_design_doc.md",
+    "/desktop",
+    "/gui",
+    "/plan.md",
+    "/uv.lock",
+]
 
 [tool.pytest.ini_options]
 minversion = "9.1"

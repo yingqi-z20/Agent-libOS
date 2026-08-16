@@ -3664,7 +3664,7 @@ def _mcp_client_info(
         return mcp_types.Implementation(name="mcp", version="0.1.0")
     return mcp_types.Implementation(
         name="agent-libos",
-        version="1.5.0" if governed_modern else "1.4.2",
+        version="1.5.1" if governed_modern else "1.4.2",
     )
 
 

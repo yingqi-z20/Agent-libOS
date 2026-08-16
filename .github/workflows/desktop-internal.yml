@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  AGENT_LIBOS_DESKTOP_VERSION: "1.5.0"
+  AGENT_LIBOS_DESKTOP_VERSION: "1.5.1"
   CSC_IDENTITY_AUTO_DISCOVERY: "false"
 
 jobs:
@@ -23,13 +23,13 @@ jobs:
         include:
           - runner: macos-15
             target: darwin-arm64
-            upload_name: agent-libos-1.5.0-macos-arm64-internal-unsigned
+            upload_name: agent-libos-1.5.1-macos-arm64-internal-unsigned
           - runner: windows-2025
             target: win32-x64
-            upload_name: agent-libos-1.5.0-windows-x64-internal-unsigned
+            upload_name: agent-libos-1.5.1-windows-x64-internal-unsigned
           - runner: ubuntu-24.04
             target: linux-x64
-            upload_name: agent-libos-1.5.0-linux-x64-internal-unsigned
+            upload_name: agent-libos-1.5.1-linux-x64-internal-unsigned
     name: ${{ matrix.target }} native package
     runs-on: ${{ matrix.runner }}
 
@@ -158,7 +158,7 @@ jobs:
       - name: Download all native artifact sets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: agent-libos-1.5.0-*-internal-unsigned-${{ github.sha }}-${{ github.run_attempt }}
+          pattern: agent-libos-1.5.1-*-internal-unsigned-${{ github.sha }}-${{ github.run_attempt }}
           path: downloaded-desktop
 
       - name: Verify each uploaded checksum manifest

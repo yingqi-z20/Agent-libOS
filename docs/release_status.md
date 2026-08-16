@@ -1,6 +1,6 @@
-# Agent libOS 1.5.0 Status
+# Agent libOS 1.5.1 Status
 
-Agent libOS 1.5.0 is the current release line for the core Python runtime scope
+Agent libOS 1.5.1 is the current release line for the core Python runtime scope
 defined in `docs/support_matrix.md`. Release status for any source tree is
 conditional on that exact tree passing the checked-in CI workflow; local
 deterministic results do not substitute for its Python-version, PostgreSQL, and
@@ -22,7 +22,7 @@ checkout or release artifact.
 
 ## Implemented release safeguards
 
-- A manual native workflow can build self-contained 1.5.0 internal desktop
+- A manual native workflow can build self-contained 1.5.1 internal desktop
   packages for macOS arm64 (DMG/ZIP), Windows x64 (NSIS/ZIP), and Ubuntu
   24.04/glibc x64 (AppImage/tar.gz). Each set carries checksums, a CycloneDX
   SBOM, component inventory, and third-party notices and must pass frozen
@@ -35,7 +35,7 @@ checkout or release artifact.
   one root AgentProcess tree. They persist requirements, idempotent command
   receipts, append-only ledger links, and locally integrity-bound resume points;
   they do not introduce a generic workflow DSL or distributed scheduler.
-- RuntimeStore schema v7 is the only store format accepted by ordinary 1.5.0
+- RuntimeStore schema v7 is the only store format accepted by ordinary 1.5.1
   startup. A canonical v6 store has one explicit offline, digest-bound migration
   path to v7; v5 must first migrate to v6 and v4 must first migrate to v5.
   Runtime startup never migrates a store. Schema v3 remains archive-only under
@@ -342,6 +342,17 @@ checkout or release artifact.
   Git repository-content identity. The combined gate rejects deterministic
   evidence, unstable or different source identities, and uncommitted source
   changes.
+  Family reports must use the current schema-v2 publication contract and the
+  combined receipt uses schema v3. The gate checks the frozen run grid and
+  recomputes outcomes from terminal, oracle, effect, receipt, and telemetry
+  evidence before aggregating the `12/12` and `10/12` thresholds. Fully
+  observed negative runs remain valid denominator rows; missing evidence is an
+  invalid report. Historical schema-v1 family reports are readable diagnostics
+  only and require a clean rerun rather than an in-place upgrade.
+  The persisted schema-v3 receipt embeds the three redacted family inputs and
+  verifies their hashes before reconstructing the exact identities, checks,
+  thresholds, run verdicts, and telemetry totals; detached self-asserted hashes
+  or synchronized edits to derived summaries cannot pass.
   Recommended invocations omit `--artifacts-root`, so synthetic workspaces,
   browser state, and permanent-retention v7 databases are removed after the
   bounded reports are written. Put all reports in the operating system's
@@ -396,7 +407,7 @@ checkout or release artifact.
   The profile must validate exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The `release-artifacts` CI job is configured to build one canonical 1.5.0
+- The `release-artifacts` CI job is configured to build one canonical 1.5.1
   wheel/source pair, reject extra or non-regular output, and record an exact
   checksum manifest.
   Python 3.11 through 3.14 smoke jobs download and verify that same pair, install
@@ -419,7 +430,11 @@ checkout or release artifact.
   connection leaks, and missing protected audit actions. The artifact checker
   requires every `agent_libos.mcp` module and the schema-v7 SQLite/PostgreSQL MCP
   contract files in the wheel, and requires the reviewed examples, scripts, and
-  frozen Python/TypeScript fixture sources in the sdist. The build waits for its
+  frozen Python/TypeScript fixture sources in the sdist. The sdist build uses an
+  exact top-level include/exclude partition; its checker rejects unpartitioned
+  ordinary source files and archive members outside the include allowlist. Both
+  artifacts must expose exactly the reviewed core dependencies and the
+  PostgreSQL, PTY, and MCP optional-dependency metadata. The build waits for its
   declared pre-build gates; these
   smoke jobs run afterward, and the artifacts are not release-validated until
   the full downstream matrix succeeds. No workflow publishes or pushes
@@ -432,7 +447,7 @@ endpoint to read a policy and CSV, compute a report, emit `human_output`, and
 exit. No provenance-bearing report for that run is checked in with the source
 revision, model/profile identity, redacted configuration, environment, and raw
 test outcome needed to reproduce or compare it. It is therefore an unarchived
-observation, not Agent libOS 1.5.0 release evidence, and supports no call-count,
+observation, not Agent libOS 1.5.1 release evidence, and supports no call-count,
 token-count, approval-count, latency, or serial-versus-parallel claim. Promote a
 future rerun only after using a documented opt-in real-model gate and preserving
 its reproducible report outside this status summary.
@@ -471,7 +486,7 @@ its reproducible report outside this status summary.
   non-bare workspace repository and system Git 2.26 or newer; unavailable Git
   fails individual calls without preventing Runtime startup. Host-configured
   remotes are the only first-class Git network exception. There is no Git CLI,
-  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.5.0.
+  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.5.1.
 
 ## Remaining environment gates and non-blocking debt
 

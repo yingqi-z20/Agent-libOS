@@ -17,7 +17,7 @@ import { ProcessTree } from "./components/ProcessTree";
 import { Timeline } from "./components/Timeline";
 import { TopBar } from "./components/TopBar";
 import { processStatusLabel, processStatusTone, UserPage } from "./components/UserPage";
-import type { TaskLaunchSettings } from "./components/UserTaskSettingsDialog";
+import type { TaskLaunchMode, TaskLaunchSettings } from "./components/UserTaskSettingsDialog";
 import { useI18n } from "./i18n";
 import { parseQuantaDraft } from "./quanta";
 import { mergeRuntimeTaskRuns, processFromMutationResult, reconcileSelectedPid, reconcileSelectedRunId, upsertRuntimeProcess, upsertRuntimeTaskRun } from "./selection";
@@ -76,6 +76,7 @@ export function App() {
   const [spawnCommandAccess, setSpawnCommandAccess] = useState<CommandAccess>(DEFAULT_DURABLE_TASK_LAUNCH.commandAccess);
   const [spawnContextMaintenance, setSpawnContextMaintenance] = useState<boolean>(DEFAULT_DURABLE_TASK_LAUNCH.contextMaintenance);
   const [spawnAuthorityManifestId, setSpawnAuthorityManifestId] = useState<string>(DEFAULT_DURABLE_TASK_LAUNCH.authorityManifestId);
+  const [taskLaunchMode, setTaskLaunchMode] = useState<TaskLaunchMode>("ephemeral");
   const [spawnPanelOpen, setSpawnPanelOpen] = useState(false);
   const [taskLabels, setTaskLabels] = useState<Record<string, string>>(readStoredTaskLabels);
   const [messageDrafts, setMessageDrafts] = useState<Record<string, string>>({});
@@ -113,6 +114,7 @@ export function App() {
   const taskRunMutationIntentsRef = useRef(new Map<string, TaskRunMutationIntent>());
   const quantaDraft = useMemo(() => parseQuantaDraft(maxQuantaInput), [maxQuantaInput]);
   const maxQuanta = quantaDraft.value;
+  const durableTaskLaunchAvailable = Boolean(snapshot?.task_run_launch.available);
   const taskLaunchSettings = useMemo<TaskLaunchSettings>(() => ({
     image: spawnImage,
     llmProfile: spawnLlmProfile,
@@ -561,6 +563,7 @@ export function App() {
       updateSnapshotState((current) => current ? upsertRuntimeProcess(current, spawnedProcess!) : current);
     }
     setTaskLabels((current) => ({ ...current, [pid]: submittedLabel }));
+    setSelectedRunId(null);
     setSelectedPid(pid);
     setSpawnGoal("");
     setSpawnPanelOpen(false);
@@ -638,6 +641,18 @@ export function App() {
     }
     setSpawnGoal("");
     setSpawnPanelOpen(false);
+  }
+
+  function launchUserTask() {
+    if (taskLaunchMode === "ephemeral") {
+      void spawnProcess();
+      return;
+    }
+    if (!durableTaskLaunchAvailable) {
+      setError(t("user.durableUnavailable"));
+      return;
+    }
+    void startTaskRun();
   }
 
   function selectTaskRun(runId: string) {
@@ -1212,6 +1227,8 @@ export function App() {
           taskRuns={snapshot?.task_runs ?? []}
           taskLabels={taskLabels}
           taskSettings={taskLaunchSettings}
+          taskLaunchMode={taskLaunchMode}
+          durableTaskLaunchAvailable={durableTaskLaunchAvailable}
           quantaValid={quantaDraft.valid}
           spawnGoal={spawnGoal}
           message={message}
@@ -1224,8 +1241,9 @@ export function App() {
           onSpawnGoalChange={setSpawnGoal}
           onSpawnImageChange={setSpawnImage}
           onApplyTaskSettings={applyTaskLaunchSettings}
+          onTaskLaunchModeChange={setTaskLaunchMode}
           onMessageChange={setMessage}
-          onSpawn={() => void startTaskRun()}
+          onSpawn={launchUserTask}
           onImportImage={() => void chooseAndConfirmImageImport(false)}
           onCommitImage={confirmCommitImage}
           onSend={(kind) => void send(kind)}

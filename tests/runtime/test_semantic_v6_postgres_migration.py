@@ -50,6 +50,48 @@ def _issued_settlement(identity: str) -> SemanticMachineSettlementRecord:
     )
 
 
+def _downgrade_to_v5(dsn: str, *, assessment_count: int = 0) -> None:
+    import psycopg
+    from psycopg import sql
+
+    PostgresStore(dsn).close()
+    with psycopg.connect(dsn, autocommit=True) as connection:
+        for table in sorted(V7_TABLES | V6_TABLES):
+            connection.execute(
+                sql.SQL("DROP TABLE {}").format(sql.Identifier(table))
+            )
+        connection.execute(
+            "UPDATE runtime_schema SET schema_version = 5 WHERE singleton = 1"
+        )
+        for index in range(assessment_count):
+            connection.execute(
+                "INSERT INTO semantic_assessments "
+                "(assessment_id, job_id, kind, status, domain, action_id, "
+                "tenant_bucket_sha256, pid, request_id, operation_id, effect_id, "
+                "shadow_outcome, ood, record_json, created_at, completed_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s, %s, %s, %s, %s)",
+                (
+                    f"legacy-pg-assessment-{index}",
+                    f"legacy-pg-job-{index}",
+                    "approval",
+                    "succeeded",
+                    "filesystem",
+                    "filesystem.read",
+                    "a" * 64,
+                    f"legacy-pg-pid-{index}",
+                    f"legacy-pg-request-{index}",
+                    None,
+                    None,
+                    "require_human",
+                    0,
+                    "{}",
+                    "2026-08-07T00:00:00+00:00",
+                    "2026-08-07T00:00:00+00:00",
+                ),
+            )
+
+
 @pytest.mark.postgres
 def test_postgres_v5_to_v6_migration_round_trip() -> None:
     import psycopg
@@ -194,6 +236,95 @@ def test_postgres_v5_to_v6_failure_rolls_back(
                 "WHERE table_schema = current_schema() "
                 "AND table_name = 'semantic_flow_entities'"
             ).fetchone() == (0,)
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("fault", ["commit_ack", "post_commit_readback"])
+def test_postgres_v6_reconciles_exact_target_after_uncertain_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    import psycopg
+
+    with _postgres_schema_dsn() as dsn:
+        _downgrade_to_v5(dsn, assessment_count=2)
+        plan = plan_store_v6_migration(dsn)
+        if fault == "commit_ack":
+            real_commit = semantic_v6_migration._PostgresConnection.commit
+
+            def lost_commit_ack(connection: object) -> None:
+                real_commit(connection)
+                raise RuntimeError("injected lost commit ACK")
+
+            monkeypatch.setattr(
+                semantic_v6_migration._PostgresConnection,
+                "commit",
+                lost_commit_ack,
+            )
+            expected_error = "lost commit ACK"
+        else:
+            real_require = semantic_v6_migration._require_canonical_v6
+            calls = 0
+
+            def fail_post_commit_readback(
+                backend: object,
+                connection: object,
+            ) -> None:
+                nonlocal calls
+                real_require(backend, connection)
+                calls += 1
+                if calls == 2:
+                    raise RuntimeError("injected post-commit readback failure")
+
+            monkeypatch.setattr(
+                semantic_v6_migration,
+                "_require_canonical_v6",
+                fail_post_commit_readback,
+            )
+            expected_error = "post-commit readback"
+
+        with pytest.raises(RuntimeError, match=expected_error):
+            apply_store_v6_migration(
+                dsn,
+                expected_plan_sha256=plan.plan_sha256,
+                postgres_snapshot_confirmed=True,
+            )
+        with psycopg.connect(dsn, autocommit=True) as connection:
+            assert connection.execute(
+                "SELECT schema_version FROM runtime_schema WHERE singleton = 1"
+            ).fetchone() == (6,)
+
+        result = apply_store_v6_migration(
+            dsn,
+            expected_plan_sha256=plan.plan_sha256,
+            postgres_snapshot_confirmed=True,
+        )
+        assert result.applied is False
+        assert result.already_applied is True
+        assert result.plan == plan
+
+
+@pytest.mark.postgres
+def test_postgres_v6_plan_rejects_a_different_database_schema() -> None:
+    with _postgres_schema_dsn() as first_dsn, _postgres_schema_dsn() as second_dsn:
+        _downgrade_to_v5(first_dsn, assessment_count=1)
+        _downgrade_to_v5(second_dsn, assessment_count=1)
+        first_plan = plan_store_v6_migration(first_dsn)
+        second_plan = plan_store_v6_migration(second_dsn)
+
+        assert first_plan.source_catalog_sha256 == second_plan.source_catalog_sha256
+        assert first_plan.source_digest_sha256 != second_plan.source_digest_sha256
+        assert (
+            first_plan.database_identity_sha256
+            != second_plan.database_identity_sha256
+        )
+        assert first_plan.plan_sha256 != second_plan.plan_sha256
+        with pytest.raises(StoreV6MigrationError, match="plan digest"):
+            apply_store_v6_migration(
+                second_dsn,
+                expected_plan_sha256=first_plan.plan_sha256,
+                postgres_snapshot_confirmed=True,
+            )
 
 
 @pytest.mark.postgres

@@ -257,6 +257,48 @@ def test_exit_cleanup_failure_is_durable_idempotent_and_retryable(
         runtime.close()
 
 
+def test_mcp_revocation_failure_is_durable_and_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(goal="fail closed MCP terminal revocation")
+        manager = runtime._mcp_subscription_manager  # noqa: SLF001
+        original_invalidate = manager._invalidate_nowait  # noqa: SLF001
+        secret = secrets.token_urlsafe(48)
+
+        def fail_local_invalidation(**_kwargs: object) -> None:
+            raise RuntimeError(secret)
+
+        monkeypatch.setattr(manager, "_invalidate_nowait", fail_local_invalidation)
+        with pytest.raises(ProcessTerminalCleanupRequired):
+            runtime.process.exit(pid, message="terminal outcome remains committed")
+
+        assert runtime.process.get(pid).status is ProcessStatus.EXITED
+        cleanup = runtime.process.terminal_cleanup_state(pid)
+        assert cleanup["state"] == "failed"
+        assert cleanup["failed_phase"] == "terminal_notify"
+        assert cleanup["completed_phases"] == ["process_finalize"]
+        component = cleanup["last_error"]["errors"][0][
+            "component_failures"
+        ][0]
+        assert component["phase"] == "mcp"
+        assert component["error_type"] == "RuntimeError"
+        assert set(component["exception_text"]) == {"bytes", "sha256"}
+        assert secret not in dumps(cleanup)
+
+        monkeypatch.setattr(manager, "_invalidate_nowait", original_invalidate)
+        repaired = runtime.process.retry_terminal_cleanup(pid)
+        assert repaired["state"] == "completed"
+        assert repaired["completed_phases"] == [
+            "terminal_notify",
+            "process_finalize",
+        ]
+        assert repaired["attempt_count"] == 2
+    finally:
+        runtime.close()
+
+
 def test_process_exit_tool_reports_committed_outcome_when_cleanup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

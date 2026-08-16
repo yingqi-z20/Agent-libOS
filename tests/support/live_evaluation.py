@@ -76,9 +76,19 @@ def stable_evaluation_provenance(
         },
     }
     llm["config_sha256"] = _safe_llm_config_digest(llm)
-    snapshot = {"schema_version": 1, "source": source, "llm": llm}
+    snapshot = {
+        "schema_version": 2,
+        "source": source,
+        "llm": llm,
+        "evidence_capture": {
+            "schema_version": 1,
+            "llm_call_record_list_limit": 100,
+            "llm_call_record_hard_limit": 1_000,
+            "checkpoint_list_limit": 100,
+        },
+    }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "start": snapshot,
         "end": json.loads(json.dumps(snapshot)),
         "stable": True,

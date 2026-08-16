@@ -1017,32 +1017,55 @@ def _tool_failure_summaries(results: Iterable[Any]) -> list[dict[str, Any]]:
     for result in results:
         if not isinstance(result, dict):
             continue
+        batch_actions = result.get("actions")
+        batch_results = result.get("results")
+        if isinstance(batch_actions, list):
+            selected_results = batch_results if isinstance(batch_results, list) else []
+            for index, action in enumerate(batch_actions):
+                if not isinstance(action, dict):
+                    continue
+                tool_result = (
+                    selected_results[index]
+                    if index < len(selected_results)
+                    and isinstance(selected_results[index], dict)
+                    else {}
+                )
+                failure = _tool_failure_summary(action, tool_result)
+                if failure is not None:
+                    failures.append(failure)
+            continue
         action = result.get("action")
         tool_result = result.get("result")
         if not isinstance(action, dict) or not isinstance(tool_result, dict):
             continue
-        if tool_result.get("ok") is not False:
-            continue
-        payload = tool_result.get("payload")
-        error_data = payload.get("error") if isinstance(payload, dict) else None
-        failures.append(
-            {
-                "action": str(action.get("action") or ""),
-                "error": str(tool_result.get("error") or "")[:500],
-                "code": (
-                    str(error_data.get("code") or "")
-                    if isinstance(error_data, dict)
-                    else ""
-                ),
-                "details": (
-                    error_data.get("details", {})
-                    if isinstance(error_data, dict)
-                    and isinstance(error_data.get("details"), dict)
-                    else {}
-                ),
-            }
-        )
+        failure = _tool_failure_summary(action, tool_result)
+        if failure is not None:
+            failures.append(failure)
     return failures
+
+
+def _tool_failure_summary(
+    action: dict[str, Any], tool_result: dict[str, Any]
+) -> dict[str, Any] | None:
+    if tool_result.get("ok") is not False:
+        return None
+    payload = tool_result.get("payload")
+    error_data = payload.get("error") if isinstance(payload, dict) else None
+    return {
+        "action": str(action.get("action") or ""),
+        "error": str(tool_result.get("error") or "")[:500],
+        "code": (
+            str(error_data.get("code") or "")
+            if isinstance(error_data, dict)
+            else ""
+        ),
+        "details": (
+            error_data.get("details", {})
+            if isinstance(error_data, dict)
+            and isinstance(error_data.get("details"), dict)
+            else {}
+        ),
+    }
 
 
 def _git(root: Path, *args: str) -> str:

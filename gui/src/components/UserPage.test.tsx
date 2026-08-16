@@ -55,6 +55,8 @@ describe("UserPage", () => {
             contextMaintenance: true,
             authorityManifestId: "authm_test"
           }}
+          taskLaunchMode="ephemeral"
+          durableTaskLaunchAvailable={false}
           spawnGoal="Review this project"
           message=""
           images={[]}
@@ -64,6 +66,7 @@ describe("UserPage", () => {
           onSpawnGoalChange={() => undefined}
           onSpawnImageChange={() => undefined}
           onApplyTaskSettings={() => undefined}
+          onTaskLaunchModeChange={() => undefined}
           onMessageChange={() => undefined}
           onSpawn={() => undefined}
           onImportImage={() => undefined}
@@ -91,6 +94,12 @@ describe("UserPage", () => {
     expect(html).toContain('aria-label="Task navigation and controls"');
     expect(html).toContain('aria-controls="task-sidebar"');
     expect(html).toContain("What should the Agent work on?");
+    expect(html).toContain("Execution mode");
+    expect(html).toContain("Regular process (non-TaskRun, default)");
+    expect(html).toContain("Durable Task Run");
+    expect(html).toContain("task_runs.plaintext_payloads_enabled");
+    expect(html).toMatch(/<input(?=[^>]*value="ephemeral")(?=[^>]*checked)/);
+    expect(html).toMatch(/<input(?=[^>]*value="durable")(?=[^>]*disabled)/);
     expect(html).toContain("Task settings");
     expect(html).toContain('aria-haspopup="dialog"');
     expect(html).toContain("Edit settings");
@@ -136,6 +145,8 @@ describe("UserPage", () => {
             contextMaintenance: false,
             authorityManifestId: ""
           }}
+          taskLaunchMode="ephemeral"
+          durableTaskLaunchAvailable={false}
           spawnGoal=""
           message=""
           images={[]}
@@ -147,6 +158,7 @@ describe("UserPage", () => {
           onSpawnGoalChange={() => undefined}
           onSpawnImageChange={() => undefined}
           onApplyTaskSettings={() => undefined}
+          onTaskLaunchModeChange={() => undefined}
           onMessageChange={() => undefined}
           onSpawn={() => undefined}
           onImportImage={() => undefined}
@@ -289,6 +301,7 @@ function emptySnapshot(): RuntimeSnapshot {
       finished_at: null,
       default_max_quanta: 4
     },
+    task_run_launch: { enabled: true, plaintext_payloads_enabled: false, available: false },
     processes: [],
     human_requests: [],
     events: [],

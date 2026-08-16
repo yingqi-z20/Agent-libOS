@@ -949,6 +949,57 @@ def _gui_provider_trace_record(
     )
 
 
+@pytest.mark.parametrize(
+    ("enabled", "plaintext_payloads_enabled", "expected_available"),
+    ((True, True, True), (False, True, False)),
+)
+def test_gui_snapshot_reports_task_run_launch_availability_truth_table(
+    tmp_path: Path,
+    enabled: bool,
+    plaintext_payloads_enabled: bool,
+    expected_available: bool,
+) -> None:
+    config = replace(
+        DEFAULT_CONFIG,
+        task_runs=replace(
+            DEFAULT_CONFIG.task_runs,
+            enabled=enabled,
+            plaintext_payloads_enabled=plaintext_payloads_enabled,
+        ),
+    )
+    runtime = Runtime.open(
+        tmp_path / f"gui-task-run-launch-{enabled}.sqlite",
+        config=config,
+    )
+    service = GuiRuntimeService(
+        runtime=runtime,
+        config=config,
+        auto_run=False,
+        token="task-run-launch-test",
+        llm_profiles_file=tmp_path / "profiles.json",
+    )
+    try:
+        assert service.snapshot()["task_run_launch"] == {
+            "enabled": enabled,
+            "plaintext_payloads_enabled": plaintext_payloads_enabled,
+            "available": expected_available,
+        }
+        if expected_available:
+            manager = runtime.task_runs
+            runtime.task_runs = None
+            try:
+                assert service.snapshot()["task_run_launch"] == {
+                    "enabled": enabled,
+                    "plaintext_payloads_enabled": plaintext_payloads_enabled,
+                    "available": False,
+                }
+            finally:
+                runtime.task_runs = manager
+    finally:
+        service.shutdown(timeout_s=1.0)
+        runtime.close()
+
+
 class TestGuiServer:
 
     def setup_method(self) -> None:
@@ -1040,6 +1091,17 @@ class TestGuiServer:
         conn.close()
         decoded = json.loads(data.decode('utf-8')) if data else None
         return response.status, decoded
+
+    def test_snapshot_reports_fail_closed_task_run_launch_availability(self) -> None:
+        status, snapshot = self.request("GET", "/api/snapshot")
+
+        assert status == 200
+        assert snapshot["task_run_launch"] == {
+            "enabled": True,
+            "plaintext_payloads_enabled": False,
+            "available": False,
+        }
+        assert "api_key" not in json.dumps(snapshot["task_run_launch"])
 
     def test_capability_list_limit_is_validated_and_applied_before_decode(self) -> None:
         runtime = self.server.service.runtime

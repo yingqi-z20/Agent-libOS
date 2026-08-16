@@ -165,6 +165,8 @@ async function renderUserPage(snapshot: RuntimeSnapshot): Promise<string> {
           contextMaintenance: true,
           authorityManifestId: "authm_test"
         }}
+        taskLaunchMode="ephemeral"
+        durableTaskLaunchAvailable={false}
         spawnGoal="goal"
         message=""
         images={[]}
@@ -174,6 +176,7 @@ async function renderUserPage(snapshot: RuntimeSnapshot): Promise<string> {
         onSpawnGoalChange={() => undefined}
         onSpawnImageChange={() => undefined}
         onApplyTaskSettings={() => undefined}
+        onTaskLaunchModeChange={() => undefined}
         onMessageChange={() => undefined}
         onSpawn={() => undefined}
         onImportImage={() => undefined}
@@ -217,6 +220,7 @@ function userPageSnapshot(): RuntimeSnapshot {
       finished_at: null,
       default_max_quanta: null
     },
+    task_run_launch: { enabled: true, plaintext_payloads_enabled: false, available: false },
     processes: [
       {
         pid: "pid_1",
