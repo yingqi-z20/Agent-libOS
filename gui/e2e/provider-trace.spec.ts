@@ -124,12 +124,20 @@ test("operator jumps from the timeline into a real retried Provider trace", asyn
 
 test("user reasoning drawer is generic, keyboard-bounded, and session-only", async ({ page }) => {
   await useView(page, "user");
+  const initialSnapshot = page.waitForResponse((response) => (
+    response.request().method() === "GET"
+    && new URL(response.url()).pathname === "/api/snapshot"
+    && response.status() === 200
+  ));
   await page.goto("/");
+  await initialSnapshot;
 
   const toggle = page.getByTestId("user-reasoning-toggle");
   await expect(toggle).toHaveAttribute("aria-pressed", "false");
+  await expect(toggle).toBeEnabled();
   await toggle.focus();
   await toggle.press("Enter");
+  await expect(toggle).toHaveAttribute("aria-pressed", "true");
 
   const drawer = page.getByTestId("user-reasoning-drawer");
   await expect(drawer).toBeVisible();

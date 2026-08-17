@@ -885,7 +885,26 @@ class ObjectTaskManager:
                 }
                 and not self._has_active_future(task.task_id)
             ):
-                return task
+                # The worker can publish the waiting notification and clear
+                # its future between the row read above and the lifetime
+                # check. Re-read after observing it inactive so callers do
+                # not receive the stale pre-notification snapshot. If a
+                # concurrent resume advanced the task, evaluate that newer
+                # state through the normal loop instead of returning it as a
+                # settled wait.
+                settled = self.get(task_id)
+                if (
+                    settled.status
+                    in {
+                        ObjectTaskStatus.WAITING_HUMAN,
+                        ObjectTaskStatus.WAITING_PROCESS,
+                        ObjectTaskStatus.WAITING_MESSAGE,
+                    }
+                    and not self._has_active_future(settled.task_id)
+                ):
+                    return settled
+                task = settled
+                continue
             if deadline is not None and time.monotonic() >= deadline:
                 return task
             time.sleep(0.01)

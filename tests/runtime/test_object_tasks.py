@@ -2782,6 +2782,92 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
+    def test_wait_reloads_waiting_notification_after_worker_settlement(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="observe settled waiting notification",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+
+            notification_started = threading.Event()
+            release_notification = threading.Event()
+            notification_done = threading.Event()
+            original_notify = runtime.object_tasks._notifications.notify
+            original_has_active_future = runtime.object_tasks._has_active_future
+
+            def controlled_notify(
+                task: ObjectTask,
+                *,
+                phase: str,
+            ) -> ObjectTask:
+                if phase != "waiting":
+                    return original_notify(task, phase=phase)
+                notification_started.set()
+                assert release_notification.wait(timeout=2)
+                try:
+                    return original_notify(task, phase=phase)
+                finally:
+                    notification_done.set()
+
+            released = False
+
+            def settle_before_inactive_check(task_id: str) -> bool:
+                nonlocal released
+                if notification_started.is_set() and not released:
+                    released = True
+                    release_notification.set()
+                    assert notification_done.wait(timeout=2)
+                    return False
+                return original_has_active_future(task_id)
+
+            monkeypatch.setattr(
+                runtime.object_tasks._notifications,
+                "notify",
+                controlled_notify,
+            )
+            monkeypatch.setattr(
+                runtime.object_tasks,
+                "_has_active_future",
+                settle_before_inactive_check,
+            )
+
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "receive_process_messages",
+                {"channel": "settled-wait-notification"},
+            )
+            waiting = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+
+            assert notification_started.is_set()
+            assert notification_done.is_set()
+            assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+            assert (
+                waiting.notification.status
+                == ObjectTaskNotificationStatus.DELIVERED
+            )
+            notifications = _object_task_notification_messages(
+                runtime,
+                pid,
+                task.task_id,
+            )
+            assert [message.payload["phase"] for message in notifications] == [
+                "waiting",
+            ]
+            assert waiting.notification.message_id == notifications[0].message_id
+        finally:
+            runtime.close()
+
     def test_posted_process_message_only_resumes_recipient_object_task_runner(self) -> None:
         runtime = Runtime.open("local")
         try:
