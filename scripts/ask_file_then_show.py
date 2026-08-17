@@ -106,6 +106,11 @@ async def run_file_viewer(
             max_quanta=max_quanta,
             pids=(pid,),
             human_auto_answer=auto_answer,
+            # The final admitted quantum may publish the terminal process state
+            # just before its scheduler worker returns the corresponding result.
+            # Preserve that result instead of detaching it at the exact budget
+            # boundary so this script's action report is complete.
+            cancel_inflight_on_budget_exhaustion=False,
         )
         process = runtime.process.get(pid)
         report = {
