@@ -4,6 +4,18 @@ This page describes the supported Python entrypoints for the current Agent
 libOS release. Agent libOS is still experimental; the compatibility boundary
 at the end of this page is part of the API contract.
 
+## In this guide
+
+- [Import the supported public surface](#imports)
+- [Open and close a Runtime](#opening-and-closing-a-runtime)
+- [Choose synchronous or asynchronous execution](#synchronous-and-asynchronous-execution)
+- [Use Runtime managers and primitives](#runtime-managers-and-primitives)
+- [Inspect semantic evidence and settlement](#semantic-evidence-control-and-settlement-boundary)
+- [Use JSON-RPC and MCP Host APIs](#json-rpc-and-mcp-host-apis)
+- [Handle common exceptions](#common-exceptions)
+- [Apply the compatibility boundary](#compatibility-boundary)
+- Return to the [documentation home](index.md).
+
 ## Imports
 
 Applications should import the Runtime and common interchange models from the
@@ -24,7 +36,7 @@ surface. They are grouped below by purpose.
 | Object Memory | `AgentObject`, `MaterializedContext`, `MemoryView`, `ObjectHandle`, `ObjectMetadata`, `ObjectNamespace`, `ObjectQuery`, `ObjectRight`, `ObjectType`, `RelationType`, `ViewMode` |
 | Object tasks | `ObjectTask`, `ObjectTaskNotification`, `ObjectTaskNotificationStatus`, `ObjectTaskOwnerWatch`, `ObjectTaskStatus` |
 | Durable Task Runs | `TaskRunSpecV1`, `TaskRunStatus`, `TaskRunAction`, `TaskRunRetention`, `TaskRunSummary`, `TaskRunLedgerItem` |
-| MCP client | `McpProtocolMode`, `McpProtocolEra`, `McpConnectionInfo`, `McpDiscoveryResult`, `McpToolListResult`, `McpProviderCallResult`, `McpCallResult` |
+| MCP client | `McpProtocolMode`, `McpProtocolEra`, `McpDispatchState`, `McpRetryClass`, `McpConnectionInfo`, `McpDiscoveryResult`, `McpToolListResult`, `McpProviderCallResult`, `McpCallResult` |
 | Operations and evidence | `ContextMaterializationManifest`, `OperationEvidenceLink`, `OperationEvidenceRole`, `OperationKind`, `OperationOutcome`, `OperationRecord`, `OperationState` |
 | Human, events, tools, and workflows | `HumanRequest`, `Event`, `EventType`, `ToolCallResult`, `ToolCandidate`, `ToolHandle`, `ToolSpec`, `ValidationResult`, `WorkflowRunResult` |
 
@@ -249,7 +261,8 @@ enforce their own authority.
 | `checkpoint`, `image_registry`, `image_artifacts`, `skills`, `modules` | Checkpoint, image, Skill, and trusted-module registries |
 | `operations`, `explain`, `audit`, `events`, `payload_retention` | Causal operations, evidence, audit/events, and payload-retention maintenance |
 | `llms`, `llm` | LLM profile registry and process executor |
-| `semantic` | Host evidence/query service for status v3, assessments, FlowGraph, settlements, policy/control history, health, metrics, and review import; machine settlement and policy control remain private Runtime composition ports |
+| `semantic` | Host evidence/query/review service plus the trusted Host-only, one-way live kill switch `set_mode("off")` |
+| `semantic_control` | Trusted Host composition/control port for startup policy admission and authority-narrowing disable; never a remote or model-facing surface |
 | `substrate`, `store`, `uow` | Provider substrate and persistence composition boundary |
 
 Manager methods have per-operation authority contracts; the presence of an
@@ -312,8 +325,35 @@ every process action still goes through the normal Tool/Skill and primitive
 authority boundaries. See [Durable Task Runs](durable_task_runs.md) for payload
 opt-in, retention, recovery, and external-effect semantics.
 
-`Runtime.semantic` is an evidence and review service, not a general
-authorization manager. Its complete public Host evidence/review surface is:
+### Semantic evidence, control, and settlement boundary
+
+The semantic surface has four deliberately separate layers:
+
+1. **Evidence and review.** `Runtime.semantic` is the stable public Host facade
+   for the status, query, metrics, and review-evidence methods listed below.
+   `append_review_label(...)` appends evidence only; it does not authorize or
+   settle an operation.
+2. **Trusted Host kill switch and control.** A local Host that owns the Runtime
+   may call `runtime.semantic.set_mode("off")`. This is a supported one-way live
+   kill switch: it durably disables semantic authority before publishing the
+   in-memory `off` mode, stops new capture and claim work, and invalidates
+   unconsumed or undispatched semantic grants. It returns `None`. Re-enabling
+   from `off`, or changing between active modes, requires Runtime restart and
+   startup admission. The Host-owned Python component graph also exposes
+   `runtime.semantic_control` for startup policy admission and
+   authority-narrowing disable; callers must treat it as trusted composition
+   control and never pass it to process or model code.
+3. **Private settlement.** Machine allow/deny settlement ports are builder-wired
+   implementation components that share the Human revision/status CAS and
+   terminal kernel. They are not Runtime facade methods and are not part of the
+   supported evidence/review or Host-control APIs.
+4. **Remote and model boundary.** There is no HTTP, GUI, model Tool, Skill, JIT,
+   Module, or other remote/model write entrypoint for semantic review, policy,
+   control, or settlement. The local Host CLI's `semantic review import` command
+   is only a wrapper around the evidence-only review append; it exposes no
+   policy, control, or settlement mutation.
+
+Within the first layer, the complete public Host evidence/review surface is:
 
 | Method | Return |
 | --- | --- |
@@ -347,10 +387,10 @@ through `2^53 - 1`, matching JSON/TypeScript safe-integer decoding.
 conflict invalidates only that counter. Unknown/raw
 usage fields are never returned. Deterministic/scripted, missing, non-exact, or
 invalid telemetry remains `None`, and populated values are not authoritative
-billing evidence. `append_review_label(...)` is the only public write and is a
-strict Host review-evidence append; it cannot settle a request, issue/revoke a
-Capability, activate/revoke an epoch, change control state, mutate labels, or
-call a provider. Runtime-internal
+billing evidence. `append_review_label(...)` is the only public evidence/review
+write and is a strict Host review-evidence append; it cannot settle a request,
+issue/revoke a Capability, activate/revoke an epoch, change control state,
+mutate labels, or call a provider. Runtime-internal
 capture, enforcement, and worker methods are not exported as model Tools,
 Skills, JIT syscalls, Modules, HTTP writes, or Runtime facade settlement APIs.
 See [Semantic Approval and Data

@@ -12,6 +12,18 @@ credential, and provider-success audit evidence may be written only after the
 provider returns. This lets self-evolving agents change their action surface
 without implicitly changing what resources they can affect.
 
+## In this guide
+
+- [Capability record](#capability-record)
+- [Resource matching](#resource-matching)
+- [Authorization API](#authorization-api)
+- [Issue, delegate, and revoke](#issue-delegate-revoke)
+- [Permission policy and Human approval](#permission-policy-and-human-approval)
+- [Data release as separate authority](#data-release-is-separate-authority)
+- [Tool, Skill, and JIT boundary](#tool-skill-and-jit-boundary)
+- [Filesystem authority](#filesystem-authority)
+- Return to the [documentation home](index.md).
+
 ## Capability Record
 
 Durable `Capability` records are structured authority statements:
@@ -67,11 +79,24 @@ finite decision in the same transaction as local prepare state and the effect
 intent, then commits on the first effectful provider phase. The public
 `CapabilityManager.restore_reserved_use(...)` operation is revoke-safe; the SDK
 is its sole provider-effect caller.
-On reopen, prepared protected operations first restore exact still-live
-reservations only when their durable intent proves that no provider phase
-began. After that reconciliation, every other stale `reserved` row is abandoned
-fail-closed. Once the commit/provider boundary was crossed, the one-shot use
-remains consumed even if the remote or follow-on result is a failure.
+On reopen, the Runtime holds its lifecycle recovery lease and first validates
+recoverable TaskRun plaintext and integrity bindings without dispatch. It then
+uses the builder-defined dependency order: crash-interrupted MCP continuations,
+MCP remote Tasks, and MCP subscriptions; prepared protected operations; pending
+external effects; semantic authority; stale capability-use reservations;
+resource-usage reservations; process-exec, process-launch, and
+checkpoint-restore publications; root-spawn initial-goal payloads; missing
+volatile Object payloads; registered JIT rehydration; stale Explainable
+Operations; stale process execution leases; Object Tasks; incomplete
+process-terminal cleanup intents; and finally TaskRun startup recovery. The
+three MCP steps are durable restart reconciliation, never provider replay.
+Prepared protected operations restore exact still-live reservations only when
+their durable intent proves that no provider phase began. Pending external
+effects must then be reconciled before every other stale `reserved` row is
+abandoned fail-closed, because a provider receipt may prove that an effect never
+started and atomically restore its bound reservation. Once the commit/provider
+boundary was crossed, the one-shot use remains consumed even if the remote or
+follow-on result is a failure.
 Checkpoint inspect/diff/replay reserve the selected exact-checkpoint or
 checkpoint-process read lease across the diagnostic, restore it if the
 diagnostic raises, and commit it once on success. Actor-mode checkpoint list

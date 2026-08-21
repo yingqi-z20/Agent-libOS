@@ -28,6 +28,18 @@ This is a living model for the current implementation. Platform and provider
 claims are limited by the [Support Matrix](support_matrix.md); historical design
 documents and benchmark results do not widen the boundary described here.
 
+## In this guide
+
+- [Identify protected assets](#assets)
+- [Classify untrusted inputs](#untrusted-and-operator-controlled-inputs)
+- [Understand the trusted computing base](#trusted-computing-base)
+- [Review principal trust boundaries](#principal-trust-boundaries)
+- [Check guarantees and assumptions](#guarantees-assuming-the-tcb-holds)
+- [Review explicit non-goals](#explicit-non-goals)
+- [Trace attacker stories and mitigations](#attack-surface-mitigations-and-attacker-stories)
+- [Calibrate finding severity](#severity-calibration)
+- Return to the [documentation home](index.md).
+
 ## Threat Model, Trust Boundaries, and Assumptions
 
 ### Assets
@@ -436,17 +448,36 @@ absence of risk. Model label assertions can only raise sensitivity or lower
 integrity/trust; they cannot remove Host edges, declassify, endorse, write
 ambient labels, or relax a Sink decision.
 
+The semantic surface is divided into four security layers:
+
+1. **Evidence and review:** the stable `Runtime.semantic` facade exposes bounded
+   evidence reads and the append-only `append_review_label(...)` Host write. A
+   review label is evidence only and cannot authorize or settle an operation.
+2. **Trusted Host kill switch and control:** the local Host that owns the Runtime
+   may call `runtime.semantic.set_mode("off")`. This is a supported one-way live
+   kill switch. Durable semantic authority is disabled before the in-memory mode
+   is published as `off`; re-enablement or active-mode changes require Runtime
+   restart and startup admission. The Host-owned Python component graph also
+   exposes `semantic_control` for startup policy admission and
+   authority-narrowing disable. Neither surface may be handed to untrusted or
+   model code.
+3. **Private settlement:** the builder-wired allow/deny settlement ports share
+   Human request revision/status CAS, recheck all live Host facts, and can issue
+   only a short-lived, nondelegable, revocable, one-use Capability. They are not
+   Runtime facade methods.
+4. **Remote and model boundary:** there is no HTTP, GUI, model Tool, Skill, JIT,
+   Module, or other remote/model write entrypoint for semantic review, policy,
+   control, or settlement. The local Host CLI's `semantic review import` is only
+   an evidence-append wrapper; it cannot reach policy, control, or settlement.
+
 `enforce_deny` reaches only the closed Host hard-deny set. `canary_auto` reaches
 only catalog-v1 exact reads under an immutable static Host epoch and exact
-tenant bucket. The private settlement port shares Human request revision/status
-CAS, rechecks all live Host facts, and can issue only a short-lived,
-nondelegable, revocable, one-use Capability. Protected Operation checks the
+tenant bucket. Protected Operation checks the private settlement port's
 versioned binding and durable control generation through dispatch. There is no
-Runtime/model/CLI/HTTP/GUI policy or settlement entrypoint, and no machine path
-to `always_allow`, data release, permission administration, writes, network,
-Shell, JSON-RPC, or MCP. `off`, revoke, or safety trip blocks every unconsumed
-or undispatched semantic grant; already dispatched external effects are
-evidence, not rollback claims.
+machine path to `always_allow`, data release, permission administration, writes,
+network, Shell, JSON-RPC, or MCP. `off`, revoke, or safety trip blocks every
+unconsumed or undispatched semantic grant; already dispatched external effects
+are evidence, not rollback claims.
 
 Semantic assessment, FlowGraph history, policy epoch, machine settlement,
 health, and review rows are append-only through the Runtime API and carry

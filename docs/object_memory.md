@@ -3,6 +3,18 @@
 Object Memory is typed, capability-controlled runtime memory for agent state.
 It is not a plain key/value store and object names are not capabilities.
 
+## In this guide
+
+- [Objects](#objects)
+- [Name resolution](#name-resolution)
+- [Query API](#query-api)
+- [Memory Views](#memory-views)
+- [Object Tasks](#object-tasks)
+- [File/Object bridge](#fileobject-bridge)
+- [Context materialization](#context-materialization)
+- [Persistence invariant](#persistence-invariant)
+- Return to the [documentation home](index.md).
+
 ## Objects
 
 Objects have:

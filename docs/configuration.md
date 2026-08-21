@@ -1,10 +1,24 @@
-# Configuration Reference
+# Configuration Guide
 
 Agent libOS keeps non-secret runtime defaults in the frozen, validated
 `agent_libos.config.DEFAULT_CONFIG` object. The canonical field declarations
 and numeric defaults live in `agent_libos/config/defaults.py`; this document
-defines loading, precedence, security handling, and a field-level inventory so
-operators do not have to infer those rules from example YAML.
+defines loading, precedence, security handling, and subsystem semantics so
+operators do not have to infer those rules from example YAML. The generated
+[exact configuration reference](configuration_reference.md) records every
+field path, resolved type, and default value for the current checkout; this
+handwritten page remains the authority for semantics, ranges, precedence, and
+security rules.
+
+## In this guide
+
+- [Load overlays with the documented precedence](#loading-and-precedence)
+- [Apply bounded YAML input rules](#bounded-yaml-input)
+- [Inspect exact defaults](#inspecting-exact-defaults)
+- [Configure semantic phases](#semantic-phase-24-configuration)
+- [Review security-sensitive settings](#security-sensitive-settings)
+- [Understand bounded windows](#bounded-windows)
+- Return to the [documentation home](index.md).
 
 ## Loading and precedence
 
@@ -27,9 +41,10 @@ Product entrypoints use this order:
    field may coerce YAML booleans to `1` or `0`. Callers that generate overlays
    must not treat this loader as a strict JSON-type validator and should never
    use booleans for numeric values. Fields declared with Pydantic's `StrictInt`
-   or `StrictFloat` are the authoritative exceptions: non-null values must be
-   numbers rather than strings, and booleans are rejected. The complete current
-   strict set comprises:
+   or `StrictFloat` are the authoritative numeric exceptions: non-null values
+   must be numbers rather than strings, and booleans are rejected. `StrictBool`
+   fields accept only booleans and reject integers and strings. The complete
+   current strict set comprises:
 
    - `runtime.publication_recovery_max_attempts`,
      `runtime.publication_artifact_lookup_hard_limit`, both payload-retention
@@ -59,10 +74,36 @@ Product entrypoints use this order:
      `command_result_max_bytes`, all list/recovery/ledger page sizes and hard
      limits, and `recovery_sample_limit`.
 
+   MCP's strict declarations are enumerated explicitly so generated overlays can
+   distinguish them from its ordinary coercing numeric fields:
+
+   - MCP `StrictInt` (25 fields): `mcp.server_page_limit`,
+     `mcp.tool_catalog_limit`, `mcp.resource_catalog_limit`,
+     `mcp.resource_template_limit`, `mcp.prompt_catalog_limit`,
+     `mcp.provider_capability_limit`, `mcp.max_content_blocks`,
+     `mcp.max_prompt_messages`, `mcp.max_completion_values`,
+     `mcp.schema_regex_pattern_max_bytes`,
+     `mcp.schema_regex_max_evaluations`, `mcp.connection_max_open`,
+     `mcp.mrtr_max_rounds`, `mcp.mrtr_max_input_requests`,
+     `mcp.mrtr_request_state_max_bytes`, `mcp.continuation_max_records`,
+     `mcp.continuation_terminal_records`, `mcp.subscription_max_open`,
+     `mcp.subscription_queue_events`, `mcp.subscription_event_max_bytes`,
+     `mcp.remote_task_max_records`, `mcp.remote_task_terminal_records`,
+     `mcp.cursor_handle_limit`, `mcp.subscription_terminal_records`, and
+     `mcp.cache_hint_ttl_cap_ms`;
+   - MCP `StrictFloat` (8 fields): `mcp.schema_regex_match_timeout_s`,
+     `mcp.connection_idle_ttl_s`, `mcp.connection_absolute_ttl_s`,
+     `mcp.continuation_ttl_s`, `mcp.subscription_max_lifetime_s`,
+     `mcp.remote_task_poll_min_interval_s`, `mcp.remote_task_max_wait_s`, and
+     `mcp.oauth_state_ttl_s`;
+   - MCP `StrictBool` (2 fields): `mcp.oauth_enabled` and
+     `mcp.tasks_extension_enabled`.
+
    Strict integer fields require integers; strict floating fields accept numeric
-   integer or floating-point values. Post-construction checks then reject
-   non-finite, negative, zero, or inverted values as applicable. The typed
-   declarations remain authoritative if a later release adds a field.
+   integer or floating-point values; strict boolean fields require YAML/JSON
+   booleans rather than `0`, `1`, or string spellings. Post-construction checks
+   then reject non-finite, negative, zero, or inverted values as applicable. The
+   typed declarations remain authoritative if a later release adds a field.
 
 The config dataclasses are frozen and have no runtime hot reload. In addition,
 security-critical `shell.rules[*].conditions` values are defensively copied and
@@ -230,43 +271,44 @@ A custom base URL is permitted when either the profile sets
 
 ## Inspecting exact defaults
 
-Defaults change with the code. Print the exact values for the current checkout
+Defaults change with the code. Use the generated
+[exact configuration reference](configuration_reference.md) for the complete
+path/type/default snapshot, or print the exact values for the current checkout
 instead of copying a stale sample:
 
 ```bash
 uv run python -c 'import json; from agent_libos.config import DEFAULT_CONFIG; from agent_libos.utils.serde import to_jsonable; print(json.dumps(to_jsonable(DEFAULT_CONFIG), indent=2, sort_keys=True))'
 ```
 
-The following inventory is intentionally field-level but leaves values in the
-typed source and live dump above. A field addition must update this table in the
-same change.
+The generated reference is the single exhaustive field inventory. It is grouped
+for quick navigation:
 
-| Group | Fields |
-| --- | --- |
-| `runtime` | `local_store_target`, `runtime_db_filename`, `store_backend`, `store_dsn`, `workspace_namespace`, `default_image_id`, `coding_image_id`, `default_human`, `terminal_channel`, `run_until_idle_max_quanta`, `launcher_max_quanta`, `launch_authority_mode`, `publication_recovery_max_attempts`, `publication_reconciliation_page_size`, `publication_reconciliation_page_hard_limit`, `publication_artifact_lookup_hard_limit`, `resource_usage_reservation_recovery_page_size`, `resource_usage_reservation_recovery_page_hard_limit`, `capability_use_reservation_recovery_page_size`, `capability_use_reservation_recovery_page_hard_limit`, `object_payload_recovery_page_size`, `object_payload_recovery_page_hard_limit`, `object_task_recovery_page_size`, `object_task_recovery_page_hard_limit`, `jit_rehydration_page_size`, `jit_rehydration_page_hard_limit`, `external_effect_recovery_page_size`, `external_effect_recovery_page_hard_limit`, `operation_recovery_page_size`, `operation_recovery_page_hard_limit`, `payload_retention_enabled`, `payload_retention_summary_after_seconds`, `payload_retention_hash_only_after_seconds`, `payload_retention_page_size`, `payload_retention_page_hard_limit`, `process_terminal_cleanup_recovery_page_size`, `process_terminal_cleanup_recovery_page_hard_limit` |
-| `gui` | `event_buffer_limit`, `request_body_max_bytes`, `scheduler_shutdown_join_timeout_s`, `http_shutdown_delay_s`, `object_task_wait_default_timeout_s`, `object_task_wait_max_timeout_s`, `snapshot_event_limit`, `snapshot_audit_limit`, `snapshot_llm_call_limit`, `snapshot_process_message_limit`, `snapshot_process_llm_call_limit`, `snapshot_object_task_limit`, `snapshot_collection_max_items`, `snapshot_string_max_chars`, `sse_payload_max_bytes`, `agent_rating_comment_max_chars` |
-| `capability` | `default_delegation_depth`, `max_rights_per_capability`, `max_constraints_bytes`, `list_limit`, `decision_explain_preview_chars`, `regex_pattern_max_bytes`, `regex_token_max_bytes`, `regex_match_timeout_s` |
-| `data_flow` | `default_trust_level`, `default_max_sensitivity`, `sink_rules`, `operation_minimum_integrity`, `registry_resource`, `registry_list_limit`, `decision_list_limit`, `file_binding_list_limit` |
-| `scheduler` | `max_quanta`, `poll_interval_s`, `max_workers`, `drain_window_s`, `shutdown_join_timeout_s` |
-| `process` | `max_tool_calls`, `max_child_processes`, `max_runtime_seconds`, `max_context_materialization_tokens`, `max_context_materialization_total_tokens`, `max_llm_calls`, `max_llm_total_tokens`, `max_subprocess_wall_seconds`, `max_subprocess_cpu_seconds`, `max_subprocess_memory_bytes`, `max_external_read_bytes`, `max_external_write_bytes`, `max_jsonrpc_bytes`, `max_mcp_bytes`, `max_deno_syscalls`, `default_goal_text`, `default_working_directory`, `fork_budget_divisor`, `fork_min_tool_calls`, `fork_min_child_processes` |
-| `llm` | `default_profile_id`, `profiles`, `temperature`, `max_tokens`, `max_input_tokens_per_call`, `max_total_tokens_per_call`, `context_window_tokens`, `timeout_s`, `max_retries`, `api_mode`, `store`, `safety_identifier`, `prompt_layout`, `prompt_cache_key`, `prompt_cache_retention`, `prompt_cache_mode`, `prompt_cache_ttl`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `fallback_json_actions`, `compatibility_retry_attempts`, `action_repair_attempts`, `tool_output_prompt_max_chars`, `content_preview_chars`, `tool_arguments_preview_chars`, `call_record_preview_chars`, `call_record_list_limit`, `call_record_hard_limit`, `persist_full_io`, `json_instruction`, `fallback_status_codes` |
-| `tools` | `version`, `default_timeout_s`, `standard_timeout_s`, `interactive_timeout_s`, `default_text_encoding`, `tool_observability_preview_chars`, `tool_call_args_hard_limit_bytes`, `tool_result_payload_hard_limit_bytes`, `filesystem_read_max_bytes`, `filesystem_read_hard_limit_bytes`, `directory_entry_limit`, `directory_entry_hard_limit`, `executable_snapshot_sibling_limit`, `memory_payload_chars`, `memory_payload_hard_limit_chars`, `memory_payload_hard_limit_bytes`, `memory_append_entry_max_bytes`, `message_subject_max_chars`, `message_body_max_chars`, `message_payload_max_bytes`, `message_id_max_chars`, `message_read_limit`, `message_read_hard_limit`, `message_filter_ids_hard_limit`, `message_filter_json_max_bytes`, `message_wait_status_max_chars`, `human_request_payload_max_bytes`, `human_output_max_chars`, `human_request_list_limit`, `object_file_max_bytes`, `object_file_hard_limit_bytes`, `shell_timeout_s`, `sandbox_timeout_s`, `jit_source_max_chars`, `jit_tests_max_count`, `jit_test_case_max_bytes`, `jit_validation_timeout_s`, `jit_validation_log_max_chars`, `deno_executable`, `deno_timeout_s`, `deno_timeout_hard_limit_s`, `deno_max_rpc_calls`, `deno_max_stdout_bytes`, `deno_max_stderr_bytes`, `deno_jsr_allowlist`, `static_tool_id_digest_chars`, `approval_preview_chars`, `clock_timezone`, `max_sleep_seconds`, `sleep_timeout_grace_s`, `human_response_payload_max_bytes`, `human_response_max_depth`, `human_response_max_nodes` |
-| `shell` | `policy_capability_key`, `policy_resource`, `default_policy_level`, `timeout_hard_limit_s`, `max_stdout_chars`, `max_stderr_chars`, `stdout_hard_limit_chars`, `stderr_hard_limit_chars`, `rules`, `whitelist`, `blacklist` |
-| `git` | `enabled`, `executable`, `minimum_version`, `repository_resource`, `worktree_root`, `trusted_metadata_roots`, `local_timeout_s`, `remote_timeout_s`, `timeout_hard_limit_s`, `lock_timeout_s`, `status_entry_limit`, `status_entry_hard_limit`, `log_entry_limit`, `log_entry_hard_limit`, `output_max_bytes`, `output_hard_limit_bytes`, `patch_max_bytes`, `patch_hard_limit_bytes`, `state_content_hard_limit_bytes`, `allowed_remote_schemes`, `allow_scp_style_ssh`, `allow_file_remotes`, `inherit_credential_helpers`, `inherit_ssh_agent`, `protect_git_metadata`, `ref_list_limit`, `pull_request_list_limit` |
-| `jsonrpc` | `registry_resource`, `endpoint_id_max_chars`, `method_id_max_chars`, `rpc_method_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `audit_preview_chars`, `header_env_allowlist` |
-| `mcp` | `registry_resource`, `server_id_max_chars`, `tool_id_max_chars`, `mcp_name_max_chars`, `header_name_max_chars`, `header_value_max_chars`, `manifest_max_bytes`, `timeout_s`, `timeout_hard_limit_s`, `max_request_bytes`, `max_response_bytes`, `max_request_hard_limit_bytes`, `max_response_hard_limit_bytes`, `list_limit`, `server_page_limit`, `tool_catalog_limit`, `resource_catalog_limit`, `resource_template_limit`, `prompt_catalog_limit`, `provider_capability_limit`, `max_content_blocks`, `max_prompt_messages`, `max_completion_values`, `protocol_probe_timeout_s`, `list_max_pages`, `schema_max_depth`, `schema_max_nodes`, `schema_max_ref_hops`, `schema_max_composition_expansions`, `schema_regex_pattern_max_bytes`, `schema_regex_max_evaluations`, `schema_regex_match_timeout_s`, `connection_idle_ttl_s`, `connection_absolute_ttl_s`, `connection_max_open`, `mrtr_max_rounds`, `mrtr_max_input_requests`, `mrtr_request_state_max_bytes`, `continuation_ttl_s`, `continuation_max_records`, `continuation_terminal_records`, `subscription_max_open`, `subscription_queue_events`, `subscription_event_max_bytes`, `subscription_max_lifetime_s`, `remote_task_poll_min_interval_s`, `remote_task_max_wait_s`, `remote_task_max_records`, `remote_task_terminal_records`, `cursor_handle_limit`, `subscription_terminal_records`, `cache_hint_ttl_cap_ms`, `oauth_enabled`, `oauth_state_ttl_s`, `tasks_extension_enabled`, `tasks_extension_spec_sha256`, `audit_preview_chars`, `header_env_allowlist`, `stdio_env_allowlist` |
-| `image` | `registry_resource`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `manifest_hard_limit_bytes`, `structured_field_hard_limit_bytes`, `max_default_tools`, `max_required_capabilities`, `max_required_modules`, `package_manifest_name`, `package_workspace_dir`, `package_tools_dir`, `package_resources_dir`, `materialized_workspace_root`, `package_manifest_max_bytes`, `package_manifest_hard_limit_bytes`, `package_file_max_bytes`, `package_max_bytes`, `package_max_files`, `prompt_max_chars`, `max_package_jit_tools`, `max_workspace_grants` |
-| `image_commit` | `artifact_version`, `artifact_hard_limit_bytes`, `payload_capture_limit_bytes`, `max_required_capabilities`, `max_committed_tools`, `max_committed_jit_sources`, `metadata_preview_chars` |
-| `memory` | `object_schema_version`, `materialize_budget_tokens`, `query_limit`, `context_policy`, `metadata_sensitivity`, `metadata_retention_policy`, `process_namespace_prefix`, `query_scan_page_size`, `query_scan_ceiling`, `metadata_text_max_chars`, `metadata_collection_max_items`, `metadata_collection_item_max_chars`, `metadata_max_bytes` |
-| `object_tasks` | `max_running_global`, `max_running_per_object`, `notification_channel`, `owner_watch_channel`, `owner_watch_events`, `shutdown_join_timeout_s` |
-| `task_runs` | `enabled`, `plaintext_payloads_enabled`, `payload_max_bytes`, `command_result_max_bytes`, `recovery_page_size`, `recovery_page_hard_limit`, `list_page_size`, `list_hard_limit`, `ledger_page_size`, `ledger_page_hard_limit`, `recovery_sample_limit` |
-| `llm_context` | `policy`, `schema_version`, `object_name_prefix`, `recent_event_limit`, `prompt_event_payload_max_chars`, `storage_compaction_threshold_bytes`, `storage_compaction_max_chunks`, `storage_compaction_preserve_recent_entries` |
-| `checkpoint` | `list_limit`, `payload_capture_limit_bytes`, `snapshot_hard_limit_bytes`, `diff_preview_items` |
-| `skills` | `schema_version`, `registry_resource`, `trust_resource`, `global_dirs`, `workspace_dirs`, `resource_dirs`, `trusted_global_package_sha256`, `global_requires_trust`, `skill_md_max_bytes`, `skill_md_hard_limit_bytes`, `resource_read_max_bytes`, `package_max_bytes`, `max_package_files`, `max_prompt_instruction_chars`, `max_jit_source_chars`, `discover_limit`, `id_max_chars`, `name_max_chars`, `description_max_chars`, `version_max_chars`, `max_tools`, `max_actions`, `max_jit_tools`, `max_required_capabilities`, `max_package_directories`, `max_package_depth`, `catalog_scan_limit` |
-| `modules` | `schema_version`, `manifest_paths`, `trusted_modules`, `trusted_sha256`, `manifest_max_bytes`, `manifest_hard_limit_bytes`, `source_max_bytes`, `package_max_bytes`, `max_package_files`, `load_policy`, `discover_limit`, `id_max_chars`, `name_max_chars`, `version_max_chars`, `entrypoint_max_chars`, `max_declared_tools`, `max_declared_images`, `max_declared_syscalls`, `max_declared_provider_hooks`, `max_declared_startup_hooks` |
-| `launcher` | `permission_presets`, `default_permission_preset`, `read_only_preset`, `edit_preset`, `full_preset` |
-| `scripts` | `ask_file_max_bytes`, `ask_file_max_quanta`, `document_summary_max_bytes`, `document_summary_max_read_bytes`, `document_summary_max_quanta`, `document_context_min_tokens`, `document_context_slack_tokens`, `document_context_max_tokens`, `object_copy_max_quanta`, `llm_write_smoke_max_quanta`, `clock_demo_iterations`, `clock_demo_interval_s`, `clock_demo_timezone`, `chat_max_turns`, `chat_context_tokens`, `chat_quanta_per_turn`, `chat_quanta_overhead` |
-| `semantic` | `mode`, `adapter`, `external_profile_id`, `policy_epoch`, `max_concurrency`, `assessment_timeout_s`, `job_lease_s`, `shutdown_join_timeout_s`, `projection_ttl_s`, `recovery_batch_limit`, `intent_max_chars`, `projection_max_bytes`, `assessment_list_limit`, `assessment_list_hard_limit`, `flow_query_limit`, `flow_query_hard_limit`, `settlement_list_limit`, `settlement_list_hard_limit` |
+- lifecycle and execution: [`runtime`](configuration_reference.md#runtime),
+  [`scheduler`](configuration_reference.md#scheduler),
+  [`process`](configuration_reference.md#process), and
+  [`tools`](configuration_reference.md#tools);
+- authority and provider boundaries:
+  [`capability`](configuration_reference.md#capability),
+  [`data_flow`](configuration_reference.md#data_flow),
+  [`shell`](configuration_reference.md#shell),
+  [`git`](configuration_reference.md#git),
+  [`jsonrpc`](configuration_reference.md#jsonrpc), and
+  [`mcp`](configuration_reference.md#mcp);
+- model and semantic behavior: [`llm`](configuration_reference.md#llm),
+  [`llm_context`](configuration_reference.md#llm_context), and
+  [`semantic`](configuration_reference.md#semantic);
+- durable artifacts and extension catalogs:
+  [`memory`](configuration_reference.md#memory),
+  [`object_tasks`](configuration_reference.md#object_tasks),
+  [`task_runs`](configuration_reference.md#task_runs),
+  [`checkpoint`](configuration_reference.md#checkpoint),
+  [`image`](configuration_reference.md#image),
+  [`image_commit`](configuration_reference.md#image_commit),
+  [`skills`](configuration_reference.md#skills), and
+  [`modules`](configuration_reference.md#modules); and
+- Host/UI/default catalogs: [`gui`](configuration_reference.md#gui),
+  [`launcher`](configuration_reference.md#launcher), and
+  [`scripts`](configuration_reference.md#scripts).
 
 Three fields remain accepted only so existing 1.x configuration files keep
 loading: `runtime.runtime_db_filename`, `tools.sandbox_timeout_s`, and
@@ -290,8 +332,9 @@ built-in images. They must also not collide with the fixed
 `context-compressor:v0` ids; startup fails on a collision rather than allowing
 one built-in definition to replace another.
 
-The table is checked against the dataclass fields by
-`tests/unit/test_configuration_docs.py`.
+The generator contract in `tests/unit/test_generated_documentation.py` walks
+the dataclass graph, including nested mapping/sequence templates, and compares
+the resulting paths and scalar defaults with the checked-in generated page.
 
 Skill package topology and catalog discovery have independent Host ceilings:
 
@@ -301,16 +344,11 @@ Skill package topology and catalog discovery have independent Host ceilings:
 | `skills.max_package_depth` | `32` | Maximum resource-directory depth in one Skill package, with each configured resource root at depth 1. A deeper package is rejected before descending further. |
 | `skills.catalog_scan_limit` | `1000` | Maximum Host catalog entries or registered Skill rows examined for one metadata discovery. Detecting entry or row N+1 fails explicitly instead of returning an incomplete search result. |
 
-Each entry under `llm.profiles.<profile_id>` accepts exactly these fields:
-
-| Profile | Fields |
-| --- | --- |
-| `llm.profiles.<profile_id>` | `kind`, `base_url`, `model`, `api_key_env`, `api_mode`, `timeout_s`, `max_retries`, `store`, `reasoning_effort`, `verbosity`, `safety_identifier`, `safety_identifier_env`, `prompt_cache_key`, `prompt_cache_retention`, `prompt_cache_mode`, `prompt_cache_ttl`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `fallback_json_actions`, `temperature`, `max_tokens`, `max_input_tokens_per_call`, `max_total_tokens_per_call`, `context_window_tokens`, `allow_custom_base_url` |
-
-The same test checks this nested inventory. Exact values remain authoritative
-in the live dump and typed source. Optional Runtime
-Modules may also own module-local settings that are not fields of
-`AgentLibOSConfig`.
+The generated [`llm.profiles.<key>`
+template](configuration_reference.md#llm) lists every accepted profile field;
+the same expansion covers sequence templates such as Shell command rules and
+the optional semantic policy epoch. Optional Runtime Modules may also own
+module-local settings that are not fields of `AgentLibOSConfig`.
 
 ### Semantic Phase 2–4 configuration
 

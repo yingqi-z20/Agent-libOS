@@ -16,6 +16,16 @@ operation may contain several ordered provider phases, but uses one durable
 effect id, one deduplicated reservation set, and one explicit operation/evidence
 chain. Waiting/resume behavior remains part of the enclosing logical operation.
 
+## In this guide
+
+- [Durable Task Run supervision](#durable-task-run-supervision)
+- [Process lifecycle](#process-lifecycle)
+- [Images and tool tables](#images-and-tool-tables)
+- [External effect ledger](#external-effect-ledger)
+- [Resource budgets](#resource-budgets)
+- [Human queue](#human-queue)
+- Return to the [documentation home](index.md).
+
 ## Durable Task Run supervision
 
 A [`TaskRun`](durable_task_runs.md) is a Host-supervised durable envelope around
@@ -884,15 +894,38 @@ runtime continues opening and reconciling other providers; the exception text
 is not persisted.
 
 All startup recovery runs while the new Runtime owns the lifecycle recovery
-lease and before normal mutation admission opens. The builder first reconciles
-prepared protected operations and stale finite capability reservations, then
-pending external effects and resource-usage reservations. It next recovers
-incomplete process-exec, process-launch, and checkpoint-restore publications,
-rehydrates recoverable Object/JIT state, interrupts stale operation/execution
-claims, and recovers Object Tasks. Each backlog is read in configured,
-hard-bounded keyset pages. Runtime publications are also durably bound to their
-Explainable Operation rows, so startup converges a terminal publication and its
-operation outcome instead of inferring an outcome from process state alone.
+lease and before normal mutation admission opens. The builder first validates
+recoverable TaskRun plaintext and integrity bindings without dispatch. It then
+drains recovery work in this exact dependency order:
+
+1. reconcile crash-interrupted MCP continuations;
+2. reconcile crash-interrupted MCP remote Tasks;
+3. reconcile crash-interrupted MCP subscriptions;
+4. recover prepared protected operations;
+5. reconcile pending external effects;
+6. recover semantic authority;
+7. abandon stale capability-use reservations;
+8. recover resource-usage reservations;
+9. recover incomplete process-exec publications;
+10. recover incomplete process-launch publications;
+11. recover incomplete checkpoint-restore publications;
+12. recover root-spawn initial-goal payloads;
+13. recover missing volatile Object payloads;
+14. rehydrate registered JIT tools;
+15. interrupt stale Explainable Operations;
+16. recover stale process execution leases;
+17. recover Object Tasks;
+18. recover incomplete process-terminal cleanup intents; and
+19. perform TaskRun startup recovery.
+
+The three MCP restart reconciliations are durable CAS transitions, not provider
+replay, and occur only after the TaskRun read-only preflight. Pending-effect
+reconciliation must precede stale capability-reservation abandonment because a
+provider receipt may prove that an effect never started and atomically restore
+its bound reservation. Each backlog is read in configured, hard-bounded keyset
+pages. Runtime publications are also durably bound to their Explainable
+Operation rows, so startup converges a terminal publication and its operation
+outcome instead of inferring an outcome from process state alone.
 
 The Runtime then remains non-`OPEN` while it runs startup hooks, starts the
 ObjectTask worker, performs any checkpoint payload delivery handshake,

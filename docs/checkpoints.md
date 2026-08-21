@@ -4,6 +4,18 @@ Checkpoints are capability-controlled durable snapshots of reconstructable
 runtime state for one process subtree. They are a durable execution building
 block, not a mechanism for rewinding the outside world.
 
+## In this guide
+
+- [Captured state](#captured-state)
+- [Append-only boundary](#append-only-boundary)
+- [Capability model](#capability-model)
+- [Public operations](#public-operations)
+- [Restore](#restore)
+- [Commit to Image](#commit-to-image)
+- [Fork from checkpoint](#fork-from-checkpoint)
+- [Limits](#limits)
+- Return to the [documentation home](index.md).
+
 ## Captured State
 
 A checkpoint captures scoped state needed to reconstruct the owner subtree:

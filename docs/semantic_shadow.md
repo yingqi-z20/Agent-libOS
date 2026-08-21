@@ -13,6 +13,18 @@ or mutate labels. Every machine settlement is produced by Host code after
 live Task Authority, DataFlow, binding, epoch, state, and budget checks. The
 normal Capability and Protected Operation path still owns provider dispatch.
 
+## In this guide
+
+- [Confirm the release boundary](#release-boundary)
+- [Understand the authority architecture](#authority-architecture)
+- [Set the Host-authored semantic ceiling](#host-authored-semantic-ceiling)
+- [Follow decision and enforcement](#decision-and-enforcement-contract)
+- [Interpret FlowGraph findings](#flowgraph-and-monotonic-data-findings)
+- [Configure an external classifier](#external-classifier-configuration)
+- [Use inspection surfaces](#inspection-surfaces)
+- [Apply the operational checklist](#operational-checklist)
+- Return to the [documentation home](index.md).
+
 ## Release boundary
 
 Agent libOS 1.5.1 implements:

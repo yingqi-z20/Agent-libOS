@@ -12,6 +12,18 @@ contains declaration metadata such as `declared_permissions` and
 `declared_confirmation_required`; it is shown in tool specs for humans and UI,
 but it does not grant permissions or approve execution.
 
+## In this guide
+
+- [Built-in tools](#built-in-tools)
+- [On-demand Tool Skills](#on-demand-tool-skills)
+- [Writing Python tools](#writing-python-tools)
+- [JIT tool lifecycle](#jit-tool-lifecycle)
+- [LLM exposure strategy](#llm-exposure-strategy)
+- [TypeScript entry point](#typescript-entry-point)
+- [Syscall semantics](#syscall-semantics)
+- [Sandbox rules](#sandbox-rules)
+- Return to the [documentation home](index.md).
+
 ## Built-In Tools
 
 The current built-in tool surface includes tools for:

@@ -7,6 +7,17 @@ an already-open Runtime. Both paths extend the Host composition root; neither
 gives an AgentProcess extra authority or exposes module loading as
 model-controlled installation.
 
+## In this guide
+
+- [Trust boundary](#boundary)
+- [Manifest v1](#manifest-v1)
+- [Entrypoint](#entrypoint)
+- [Registration surfaces](#registration-surfaces)
+- [PTY module](#pty-module)
+- [CLI](#cli)
+- [Persistence and checkpoints](#persistence-and-checkpoints)
+- Return to the [documentation home](index.md).
+
 ## Boundary
 
 Modules are part of the host trusted computing base:

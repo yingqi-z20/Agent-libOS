@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
+
+import agent_libos
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -12,6 +15,25 @@ def _read(path: str) -> str:
 
 def _words(value: str) -> str:
     return " ".join(value.split())
+
+
+def test_python_api_import_table_exactly_matches_top_level_all() -> None:
+    lines = _read("docs/python_api.md").splitlines()
+    header_index = lines.index("| Area | Top-level names |")
+    table_rows: list[str] = []
+    for line in lines[header_index + 2 :]:
+        if not line.startswith("|"):
+            break
+        table_rows.append(line)
+
+    documented = [
+        name
+        for row in table_rows
+        for name in re.findall(r"`([A-Za-z][A-Za-z0-9_]*)`", row)
+    ]
+
+    assert len(documented) == len(set(documented))
+    assert set(documented) == set(agent_libos.__all__)
 
 
 def test_jsonrpc_docs_keep_retry_and_dns_phase_contracts() -> None:

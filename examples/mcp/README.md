@@ -4,6 +4,23 @@ These examples are credential-free and deterministic. They exercise the exact
 MCP `2026-07-28` revision without external network access. Run every command
 from the repository root.
 
+The frozen `uv` commands on this page are reproducible only from a Git checkout
+that contains the root `uv.lock`. The source distribution includes these
+example and support files for inspection and execution, but deliberately does
+not include that repository lock. From an extracted sdist, create a separate
+environment and resolve the published dependency bounds instead:
+
+```bash
+uv venv --python 3.11 .venv-example
+uv pip install --python .venv-example/bin/python '.[mcp]'
+.venv-example/bin/python scripts/mcp_dx.py validate examples/mcp/stdio-v3.yaml
+```
+
+For the remaining examples, replace `uv run python` with
+`.venv-example/bin/python`. This validates the sdist against a newly resolved
+compatible dependency graph; it is not a frozen-lock reproduction or a release
+receipt. Use the Git checkout and root lock whenever that distinction matters.
+
 ## Install and validate
 
 ```bash

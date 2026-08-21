@@ -206,7 +206,96 @@ def test_document_inventory_covers_tracked_and_untracked_markdown_files() -> Non
     assert builtin_skills
     assert experiment_documents
     assert Path("docs/events.md") in relative_documents
+    assert Path("docs/index.md") in relative_documents
+    assert Path("docs/glossary.md") in relative_documents
+    assert Path("docs/troubleshooting.md") in relative_documents
+    assert Path("docs/agent_images.md") in relative_documents
+    assert Path("docs/cli_reference.md") in relative_documents
+    assert Path("docs/configuration_reference.md") in relative_documents
     assert Path("benchmarks/runtime_safety/README.md") in relative_documents
+
+
+def test_current_document_heading_levels_do_not_skip() -> None:
+    documents = (ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md")))
+    failures: list[str] = []
+
+    for document in documents:
+        cleaned = _without_code(document.read_text(encoding="utf-8"))
+        previous_level = 0
+        for match in re.finditer(
+            r"^(?P<marks>#{1,6})\s+",
+            cleaned,
+            flags=re.MULTILINE,
+        ):
+            level = len(match.group("marks"))
+            line = cleaned.count("\n", 0, match.start()) + 1
+            if previous_level == 0 and level != 1:
+                failures.append(
+                    f"{document.relative_to(ROOT)}:{line} starts at heading level {level}"
+                )
+            elif previous_level and level > previous_level + 1:
+                failures.append(
+                    f"{document.relative_to(ROOT)}:{line} jumps from H{previous_level} to H{level}"
+                )
+            previous_level = level
+
+    assert not failures, "\n" + "\n".join(failures)
+
+
+def test_long_current_contract_documents_have_navigation_and_home_links() -> None:
+    excluded = {
+        # Generated references have generator-checked indexes of their own.
+        "cli_reference.md",
+        "configuration_reference.md",
+        # This commit-bound research report is explicitly historical.
+        "semantic_permission_and_dataflow_research.md",
+    }
+    failures: list[str] = []
+
+    for document in sorted((ROOT / "docs").glob("*.md")):
+        text = document.read_text(encoding="utf-8")
+        if document.name in excluded or len(text.splitlines()) < 500:
+            continue
+        if "## In this guide" not in text:
+            failures.append(f"{document.relative_to(ROOT)} -> missing task navigation")
+        if re.search(r"\[[Dd]ocumentation home\]\(index\.md\)", text) is None:
+            failures.append(f"{document.relative_to(ROOT)} -> missing documentation-home link")
+
+    assert not failures, "\n" + "\n".join(failures)
+
+
+def test_readme_and_docs_home_link_narrative_and_generated_entrypoints() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    docs_home = (ROOT / "docs" / "index.md").read_text(encoding="utf-8")
+    cli_guide = (ROOT / "docs" / "cli.md").read_text(encoding="utf-8")
+
+    assert "github.com/yingqi-z20/Agent-libOS/blob/main/" not in readme
+    for target in (
+        "docs/index.md",
+        "docs/cli.md",
+        "docs/cli_reference.md",
+        "docs/configuration.md",
+        "docs/configuration_reference.md",
+        "docs/glossary.md",
+        "docs/troubleshooting.md",
+        "docs/agent_images.md",
+    ):
+        assert f"]({target})" in readme
+
+    for target in (
+        "cli.md",
+        "cli_reference.md",
+        "configuration.md",
+        "configuration_reference.md",
+        "glossary.md",
+        "troubleshooting.md",
+        "agent_images.md",
+    ):
+        assert f"]({target})" in docs_home
+
+    assert cli_guide.startswith("# CLI Guide\n")
+    assert "](cli_reference.md)" in cli_guide
+    assert "same installed version's `agent-libos ... --help`" in cli_guide
 
 
 def test_cli_reference_tracks_every_top_level_command() -> None:

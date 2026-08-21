@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "agent-libos"
 version = "1.5.1"
 description = "A minimal Agent libOS runtime with process, object memory, capability, human approval, JIT tool, checkpoint, and audit primitives."
-readme = "README.md"
+readme = "README.pypi.md"
 requires-python = ">=3.11,<3.15"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Agent libOS contributors" }]
@@ -29,10 +29,10 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/yingqi-z20/Agent-libOS"
-Documentation = "https://github.com/yingqi-z20/Agent-libOS/blob/main/README.md#documentation"
+Documentation = "https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/README.md#documentation"
 Repository = "https://github.com/yingqi-z20/Agent-libOS"
 Issues = "https://github.com/yingqi-z20/Agent-libOS/issues"
-"Release status" = "https://github.com/yingqi-z20/Agent-libOS/blob/main/docs/release_status.md"
+"Release status" = "https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/release_status.md"
 
 [project.optional-dependencies]
 postgres = [
@@ -81,6 +81,7 @@ include = [
     "/.gitignore",
     "/LICENSE",
     "/README.md",
+    "/README.pypi.md",
     "/SECURITY.md",
     "/agent_libos",
     "/benchmarks",

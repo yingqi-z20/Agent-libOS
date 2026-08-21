@@ -13,6 +13,18 @@ This release targets one trusted Host and one writable Runtime per SQL
 database/schema. The store lease and Runtime epoch fence cooperating writers;
 Durable Task Runs are not a distributed workflow service.
 
+## In this guide
+
+- [Enable durable payloads deliberately](#enabling-durable-payloads)
+- [Understand the public model](#public-model)
+- [Follow crash-safe command settlement](#crash-safe-command-settlement)
+- [Recover execution after restart](#execution-and-restart-recovery)
+- [Use the Python Host API](#python-host-api)
+- [Use the CLI](#cli)
+- [Use the GUI and local HTTP API](#gui-and-local-http-api)
+- [Respect existing subsystem boundaries](#boundaries-with-existing-subsystems)
+- Return to the [documentation home](index.md).
+
 ## Enabling durable payloads
 
 Run metadata and hashes are persisted in store schema v7. Resuming useful work

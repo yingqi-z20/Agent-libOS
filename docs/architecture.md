@@ -8,6 +8,17 @@ process-selected external effects enter a primitive and the Protected Operation
 SDK under that process id. Trusted Runtime artifact publication is the narrow
 TCB exception described below; it is not a model-facing authority path.
 
+## In this guide
+
+- [Layer model](#layer-model)
+- [Composition root and internal dependencies](#composition-root-and-internal-dependencies)
+- [Tool boundary](#tool-boundary)
+- [Primitive boundary](#primitive-boundary)
+- [Semantic approval and flow plane](#semantic-approval-and-flow-plane)
+- [Persistence and audit](#persistence-and-audit)
+- [Module map](#module-map)
+- Return to the [documentation home](index.md).
+
 ## Layer Model
 
 ```text

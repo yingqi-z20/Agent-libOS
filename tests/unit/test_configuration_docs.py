@@ -5,11 +5,11 @@ import re
 from pathlib import Path
 from typing import get_type_hints
 
-from pydantic import StrictFloat, StrictInt
+from pydantic import StrictBool, StrictFloat, StrictInt
 
 from agent_libos.config import (
     DEFAULT_CONFIG,
-    LLMProfile,
+    McpDefaults,
     SemanticDefaults,
     load_config_file,
 )
@@ -18,35 +18,16 @@ from agent_libos.config import (
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DOC = ROOT / "docs" / "configuration.md"
 CLI_DOC = ROOT / "docs" / "cli.md"
-_ROW = re.compile(r"^\| `(?P<group>[a-z_]+)` \| (?P<fields>.+) \|$")
-_FIELD = re.compile(r"`([a-z][a-z0-9_]*)`")
-_LLM_PROFILE_ROW = re.compile(r"^\| `llm\.profiles\.<profile_id>` \| (?P<fields>.+) \|$")
 _SEMANTIC_STRICT_FIELD = re.compile(r"`semantic\.([a-z][a-z0-9_]*)`")
 
 
-def test_configuration_reference_lists_every_default_dataclass_field() -> None:
-    documented: dict[str, list[str]] = {}
-    for line in CONFIG_DOC.read_text(encoding="utf-8").splitlines():
-        match = _ROW.match(line)
-        if match:
-            documented[match.group("group")] = _FIELD.findall(match.group("fields"))
+def test_configuration_guide_delegates_exact_inventory_to_generated_reference() -> None:
+    text = CONFIG_DOC.read_text(encoding="utf-8")
 
-    expected = {
-        field.name: [nested.name for nested in fields(getattr(DEFAULT_CONFIG, field.name))]
-        for field in fields(DEFAULT_CONFIG)
-    }
-
-    assert documented == expected
-
-
-def test_configuration_reference_lists_every_llm_profile_field() -> None:
-    profile_fields: list[str] | None = None
-    for line in CONFIG_DOC.read_text(encoding="utf-8").splitlines():
-        match = _LLM_PROFILE_ROW.match(line)
-        if match:
-            profile_fields = _FIELD.findall(match.group("fields"))
-
-    assert profile_fields == [field.name for field in fields(LLMProfile)]
+    assert "[exact configuration reference](configuration_reference.md)" in text
+    assert "single exhaustive field inventory" in text
+    assert "| Group | Fields |" not in text
+    assert "| `llm.profiles.<profile_id>` |" not in text
 
 
 def test_configuration_reference_lists_every_strict_semantic_field() -> None:
@@ -64,6 +45,50 @@ def test_configuration_reference_lists_every_strict_semantic_field() -> None:
     ]
 
     assert documented == expected
+
+
+def test_configuration_reference_lists_mcp_strict_fields_by_annotation() -> None:
+    text = CONFIG_DOC.read_text(encoding="utf-8")
+    strict_section = text.split("MCP's strict declarations", 1)[1].split(
+        "Strict integer fields", 1
+    )[0]
+    normalized = " ".join(strict_section.split())
+    declarations = list(
+        re.finditer(
+            r"MCP `(?P<kind>StrictInt|StrictFloat|StrictBool)` "
+            r"\((?P<count>[0-9]+) fields\):",
+            normalized,
+        )
+    )
+    annotations = get_type_hints(McpDefaults, include_extras=True)
+    strict_annotations = {
+        "StrictInt": StrictInt,
+        "StrictFloat": StrictFloat,
+        "StrictBool": StrictBool,
+    }
+
+    assert [match.group("kind") for match in declarations] == list(
+        strict_annotations
+    )
+    for index, declaration in enumerate(declarations):
+        body_end = (
+            declarations[index + 1].start()
+            if index + 1 < len(declarations)
+            else len(normalized)
+        )
+        documented = re.findall(
+            r"`mcp\.([a-z][a-z0-9_]*)`",
+            normalized[declaration.end() : body_end],
+        )
+        expected = [
+            field.name
+            for field in fields(McpDefaults)
+            if annotations[field.name]
+            == strict_annotations[declaration.group("kind")]
+        ]
+
+        assert int(declaration.group("count")) == len(expected)
+        assert documented == expected
 
 
 def test_documented_semantic_default_yaml_loads(tmp_path: Path) -> None:

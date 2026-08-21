@@ -274,9 +274,7 @@ def _shutdown_runtime_before_exit(runtime: Runtime) -> None:
         )
 
 
-def _parse_cli_args(
-    argv: list[str] | None,
-) -> tuple[argparse.ArgumentParser, argparse.Namespace]:
+def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-libos")
     parser.add_argument(
         "--config",
@@ -438,6 +436,13 @@ def _parse_cli_args(
         help="Perform explicit offline Runtime store administration",
     )
     _add_store_parser_args(store_parser)
+    return parser
+
+
+def _parse_cli_args(
+    argv: list[str] | None,
+) -> tuple[argparse.ArgumentParser, argparse.Namespace]:
+    parser = _build_cli_parser()
     return parser, parser.parse_args(argv)
 
 

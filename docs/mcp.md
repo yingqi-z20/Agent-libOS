@@ -1,5 +1,8 @@
 # MCP Client
 
+[Documentation home](index.md) · [Configuration](configuration.md) ·
+[Troubleshooting](troubleshooting.md) · [Glossary](glossary.md)
+
 Agent libOS is an MCP **client**, never an MCP server. Two deliberately separate
 contracts coexist:
 
@@ -10,7 +13,25 @@ contracts coexist:
   governed Tools with the modern closed result union, plus closed allowlists
   for Resources, Resource Templates, Prompts, Completion, subscriptions,
   Host-owned OAuth profiles, MRTR continuations, and a digest-pinned Tasks
-  extension without silently reinterpreting v1/v2.
+extension without silently reinterpreting v1/v2.
+
+## In this guide
+
+- Choose and author a manifest: [v1](#server-manifest-v1),
+  [v2](#server-manifest-v2), or [v3](#server-manifest-v3).
+- Integrate modern Host surfaces through the
+  [modern Host client API](#modern-host-client-api).
+- Review enforcement boundaries in [Authority](#authority),
+  [Data-flow Sink](#data-flow-sink), [Security Rules](#security-rules), and
+  [External Effects](#external-effects).
+- Interpret results in [Call And Tool-List Results](#call-and-tool-list-results).
+- Operate and diagnose through the [CLI](#cli) and
+  [Host DX workflow](#host-dx-workflow).
+- Check lifecycle boundaries in [Persistence And Checkpoints](#persistence-and-checkpoints).
+
+Manifest schema, MCP wire protocol, SDK, product, and Store versions are
+independent; see the [version map](glossary.md#version-map) before changing a
+version-bearing field.
 
 Neither contract lets an agent supply transports, commands, URLs, headers,
 credentials, raw remote identifiers, or server configuration at call time.

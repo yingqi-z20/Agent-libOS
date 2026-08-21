@@ -139,7 +139,7 @@ version in the one-shot capability. The capability reservation carries that
 same id into the provider intent, so a same-argument call cannot create a
 different approved effect ledger entry.
 
-### Semantic auto-approval ceiling
+## Semantic auto-approval ceiling
 
 `approval_policy.semantic_auto_approval` is a separate, strict version-1
 ceiling. It is candidate evidence in Shadow and one mandatory Host predicate

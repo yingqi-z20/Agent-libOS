@@ -13,6 +13,18 @@ self-evolving action surface, not the authority subsystem. Filesystem, shell,
 Object Memory, JSON-RPC, process, checkpoint, and human effects still go
 through primitives and Capability.
 
+## In this guide
+
+- [Package shape](#package-shape)
+- [Progressive disclosure](#progressive-disclosure)
+- [libOS extensions](#libos-extensions)
+- [Sources and trust](#sources-and-trust)
+- [Activation and unload](#activation-and-unload)
+- [Process semantics](#process-semantics)
+- [SWE-Agent style Skill](#swe-agent-style-skill)
+- [Task Plan Skill](#task-plan-skill)
+- Return to the [documentation home](index.md).
+
 ## Package Shape
 
 ```text
@@ -120,8 +132,10 @@ longer matches its declared size/SHA is rejected. SHA-256 here is an unkeyed
 content fingerprint, not a digital signature, MAC, publisher identity, or proof
 that the instructions are safe. Global trust records are exact hash pins whose
 authenticity depends on how the Host obtained and approved that hash.
-The exact fields, defaults, and cross-field validation rules are listed in the
-[configuration reference](configuration.md#configuration-reference).
+The exact paths, types, and defaults are listed in the generated
+[configuration field reference](configuration_reference.md#skills); loading,
+security, and cross-field semantics remain in the
+[configuration guide](configuration.md).
 
 ## Progressive Disclosure
 
@@ -558,6 +572,17 @@ The workspace also includes `skills/task-plan`, named and registerable as
 - `read_task_plan` validates and returns the latest complete snapshot;
 - `update_task_plan` appends a replacement snapshot after checking the expected
   logical revision.
+
+`skills/task-plan/agents/openai.yaml` is repository-side OpenAI client display
+metadata, not an Agent libOS Skill resource. The configured package resource
+roots are only `scripts/`, `references/`, and `assets/`; `agents/` is outside
+that set. Consequently this YAML file is not loaded into the Skill snapshot,
+is not readable through `read_skill_resource`, and does not contribute bytes to
+the Skill package SHA-256. Editing it cannot change the loaded Runtime
+instructions, activate a tool, grant Capability, or satisfy a package-hash
+trust pin. A client or distribution that consumes `agents/openai.yaml` must
+review and, when needed, integrity-pin it independently at that client boundary;
+approval of the Agent libOS Skill hash does not authenticate it.
 
 Call each exact name under direct JIT exposure. Under multiplexed exposure call
 `run_jit_tool` with that name in `tool_name` and its published object in

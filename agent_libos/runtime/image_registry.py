@@ -66,6 +66,30 @@ from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 _IMAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+IMAGE_PACKAGE_MANIFEST_FIELDS = frozenset(
+    {
+        "image_id",
+        "name",
+        "version",
+        "prompt",
+        "prompt_mode",
+        "jit_tool_exposure",
+        "planner",
+        "action_schema",
+        "default_skills",
+        "default_tools",
+        "context_policy",
+        "safety_profile",
+        "llm_profile",
+        "required_capabilities",
+        "required_modules",
+        "metadata",
+        "signature",
+        "jit_tools",
+        "workspace",
+    }
+)
+IMAGE_PACKAGE_REQUIRED_MANIFEST_FIELDS = frozenset({"image_id", "name", "prompt"})
 _WINDOWS_FORBIDDEN_PATH_CHARS = set('<>:"|?*')
 _WINDOWS_RESERVED_PATH_NAMES = {
     "CON",
@@ -1281,31 +1305,10 @@ class ImageRegistryPrimitive:
         return image, artifact
 
     def _normalize_image_package_manifest(self, data: dict[str, Any]) -> dict[str, Any]:
-        fields = {
-            "image_id",
-            "name",
-            "version",
-            "prompt",
-            "prompt_mode",
-            "jit_tool_exposure",
-            "planner",
-            "action_schema",
-            "default_skills",
-            "default_tools",
-            "context_policy",
-            "safety_profile",
-            "llm_profile",
-            "required_capabilities",
-            "required_modules",
-            "metadata",
-            "signature",
-            "jit_tools",
-            "workspace",
-        }
-        unknown = sorted(set(data) - fields)
+        unknown = sorted(set(data) - IMAGE_PACKAGE_MANIFEST_FIELDS)
         if unknown:
             raise ValidationError(f"unknown IMAGE.yaml fields: {unknown}")
-        missing = sorted(key for key in ["image_id", "name", "prompt"] if key not in data)
+        missing = sorted(IMAGE_PACKAGE_REQUIRED_MANIFEST_FIELDS - set(data))
         if missing:
             raise ValidationError(f"missing required IMAGE.yaml fields: {missing}")
         return dict(data)

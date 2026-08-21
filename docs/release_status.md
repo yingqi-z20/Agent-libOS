@@ -1,7 +1,7 @@
 # Agent libOS 1.5.1 Status
 
 Agent libOS 1.5.1 is the current release line for the core Python runtime scope
-defined in `docs/support_matrix.md`. Release status for any source tree is
+defined in the [support matrix](support_matrix.md). Release status for any source tree is
 conditional on that exact tree passing the checked-in CI workflow; local
 deterministic results do not substitute for its Python-version, PostgreSQL, and
 artifact gates. This is not a claim that every platform, desktop package, or
@@ -19,6 +19,15 @@ following immutable locators:
 Without that complete binding, wording below such as “requires”, “gates”, or
 “checks” describes the workflow contract only, not an observed pass for a
 checkout or release artifact.
+
+## In this guide
+
+- [Review implemented release safeguards](#implemented-release-safeguards)
+- [Understand the CI receipt contract](#validation-contract-ci-receipt-required)
+- [Interpret the unarchived real-LLM observation](#unarchived-real-llm-observation)
+- [Confirm supported release scope](#supported-release-scope)
+- [Track remaining gates and non-blocking debt](#remaining-environment-gates-and-non-blocking-debt)
+- Return to the [documentation home](index.md).
 
 ## Implemented release safeguards
 

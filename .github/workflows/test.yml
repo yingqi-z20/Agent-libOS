@@ -57,6 +57,22 @@ jobs:
       - name: Compile Python sources
         run: uv run python -m compileall agent_libos tests scripts experiments benchmarks modules
 
+      - name: Check version-pinned PyPI README
+        run: uv run python scripts/generate_pypi_readme.py --check
+
+      - name: Check generated CLI reference
+        run: uv run python scripts/generate_cli_reference.py --check
+
+      - name: Check generated configuration reference
+        run: uv run python scripts/generate_config_reference.py --check
+
+      - name: Check documentation navigation and workflow contracts
+        run: >-
+          uv run python -m pytest -q
+          tests/unit/test_documentation_links.py
+          tests/unit/test_generated_documentation.py
+          tests/unit/test_documented_workflow_contracts.py
+
       - name: Check architecture and blocking-work boundaries
         run: uv run python scripts/check_architecture.py
 

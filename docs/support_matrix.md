@@ -27,10 +27,34 @@ Legend:
 | PTY Runtime Module | POSIX PTY plus optional Windows `pywinpty`/ConPTY session I/O; source checkout/source distribution only, not the core wheel | POSIX paths on Ubuntu; Windows 3.11 installs the `pty` extra before running the complete deterministic matrix | Current Windows backend has no Job Object, parent-death containment, or wall/CPU/RSS supervision; budgeted `SubprocessLimits` spawns fail closed. Native CI coverage does not expand those implementation guarantees |
 | Typed Git provider | System Git 2.26+, fixed non-bare workspace repository; local operations, managed worktrees, patch Objects, existing remotes, and repository-local simulated PRs | Deterministic provider/security/runtime tests use temporary SHA-1/SHA-256 repositories and local bare remotes on Ubuntu, with the complete deterministic matrix also running on Windows 3.11; Shell/PTY/provenance hardening is parameterized | Credential-manager integrations and real HTTPS/OpenSSH authentication require environment-gated runs; GitHub/GitLab APIs are not implemented |
 | JSON-RPC client | Registered HTTP endpoints only | Deterministic loopback/provider tests | Real network proxy/TLS/DNS policy is deployment-specific |
-| MCP client | Client-only Manifest v1/v2 governed Tools compatibility plus exact-`2026-07-28` Manifest v3 Tools, Resources, Resource Templates, Prompts, Completion, MRTR, bounded subscriptions, Host-preconfigured OAuth, and an optional digest-pinned Tasks extension over Streamable HTTP or stdio | Deterministic primitive/provider/security/DX tests; real loopback stdio, HTTP, and pinned-TLS OAuth/PKCE/Bearer Runtime gates; frozen Python/TypeScript SDK integration; reviewed fixed-upstream Tools/HTTP-schema (including Resource/Prompt request-header branches), MRTR, and Host-pinned pre-registration/CIMD OAuth client conformance on Ubuntu Python 3.11 and 3.14; native stdio/HTTP smokes on Windows/macOS; and clean-installed wheel/sdist stdio+HTTP Resource/Resource Template/Prompt/Completion/subscription/Tool, pinned-TLS OAuth/PKCE/Bearer, durable Runtime/Store/CLI MRTR+Tasks reopen, and Store-v6-to-v7 migration/reopen gates on Python 3.11–3.14 | Real remote identity/proxy/TLS/OAuth topology remains a deployment gate. OAuth conformance never enables DCR or promotes PRM/401 discovery into authority; authorization-code scenarios whose runner lacks a pre-Runtime Host issuer pin are reviewed-but-unavailable, not passing. Apps, Roots, Sampling, Logging, OTel product integration, OAuth DCR, OAuth client-credentials/enterprise-managed/DPoP/workload-identity and 2025-03-26 backcompat modes, deprecated standalone SSE, and an MCP server surface are excluded |
+| MCP client | Client-only Manifest v1/v2 governed Tools compatibility and exact-`2026-07-28` Manifest v3 over Streamable HTTP or stdio; see the detail below | Deterministic, real loopback, conformance, native-platform, and clean-artifact gates described below | Remote deployment topology remains an operator gate; excluded protocol/product surfaces are listed below |
 | Real LLM | OpenAI Responses and OpenAI-compatible Chat profiles | Mock/action-selection paths only | Credentials and token-spending smoke are opt-in with `--run-real-llm`; run one scoped task/profile per release target |
 | Semantic approval/data identification | Default-off Phase 2–4 plane: payload-free FlowGraph, closed Host hard denial, and exact-once canary authority for frozen low-risk actions under a static immutable policy epoch | Deterministic unit/runtime/security/provider tests cover strict models, monotonic labels, coverage, authority ceiling, shared request CAS, exact binding/epoch revocation, budgets, privacy, read-only HTTP/GUI, Host-only review import, and fake provider failures | Label writeback, declassification/endorsement, high-risk/write/network auto approval, remote policy mutation, and automatic cohort expansion are not implemented. Real classifier smoke is opt-in and never a safety oracle; production calibration and native environment evidence remain operator gates |
 | Data-label egress enforcement | Host Sink registry and a unified gate cover LLM, Human, JSON-RPC, MCP, typed Git, filesystem writes, Shell/PTY, and internal process handoff | Deterministic unit/runtime/security/provider/benchmark tests, including pre-provider denial and exact conditional release | The guarantee covers runtime-mediated payloads; trusted modules/providers, native child I/O, Sink re-forwarding, and direct store administration remain operator trust boundaries |
+
+### MCP validation detail
+
+- **Implemented surface:** Client-only Manifest v1/v2 governed Tools
+  compatibility plus exact-`2026-07-28` Manifest v3 Tools, Resources,
+  Resource Templates, Prompts, Completion, MRTR,
+  bounded subscriptions, Host-preconfigured OAuth, and an optional
+  digest-pinned Tasks extension.
+- **Checked evidence:** deterministic primitive/provider/security/DX tests;
+  real loopback stdio, HTTP, and pinned-TLS OAuth/PKCE/Bearer Runtime gates;
+  frozen Python/TypeScript SDK integration; reviewed fixed-upstream Tools and
+  HTTP-schema, MRTR, and Host-pinned pre-registration/CIMD OAuth conformance on
+  Ubuntu Python 3.11 and 3.14; native stdio/HTTP smokes on Windows and macOS;
+  and clean-installed wheel/sdist coverage for modern read/call surfaces,
+  subscriptions, OAuth, durable MRTR/Tasks reopen, and Store v6-to-v7 migration
+  on Python 3.11–3.14.
+- **Remaining gates and exclusions:** real remote identity, proxy, TLS, and
+  OAuth topology remain deployment-specific. Conformance never enables DCR or
+  promotes PRM/401 discovery into authority; authorization-code scenarios
+  without a pre-Runtime Host issuer pin are reviewed-but-unavailable. Apps,
+  Roots, Sampling, Logging, OTel product integration, DCR,
+  client-credentials/enterprise-managed/DPoP/workload-identity OAuth,
+  `2025-03-26` OAuth backcompat, standalone SSE, and an MCP server surface are
+  excluded.
 
 ### MCP OAuth default credential-backend support
 
@@ -106,7 +130,8 @@ service, GUI, AgentDojo, scale, and artifact gates nor repeats the equivalent
 per-lane CI matrix. Before advertising a platform or provider configuration as
 release-validated, record a fresh native run for the corresponding
 environment-gate cells above. Do not copy counts or “remaining gates” from
-prior revisions of `docs/prelaunch_hardening_report.md`; that path now contains
+prior revisions of the [historical prelaunch notice](prelaunch_hardening_report.md);
+that path now contains
 only a retirement notice for the old commit-bound report.
 
 The checked-in Windows 3.11 jobs are CI evidence for the deterministic paths
@@ -133,4 +158,5 @@ external release mutation; publication still requires an explicit environment
 and credential authorization.
 
 When a new environment becomes CI-covered, update this matrix and
-`docs/invariants.md` Known Test Gaps in the same change.
+the [Runtime Invariants: Known Test Gaps](invariants.md#known-test-gaps) in the
+same change.

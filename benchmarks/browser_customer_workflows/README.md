@@ -24,7 +24,29 @@ paths:
 uv run python -m pytest tests/benchmarks/test_browser_customer_workflows.py -q
 ```
 
-The live family requires both explicit confirmations and exactly three runs:
+The live family additionally requires Node, the repository-locked Playwright
+package, and its matching Chromium executable. The Python dependency sync does
+not install these. Node must satisfy the `gui/package.json` engine
+(`^24.15.0 || >=26.0.0`) and npm must be 11 or newer. Provision and verify the
+browser runtime before consuming any paid LLM calls:
+
+```bash
+node --version
+npm --version
+npm --prefix gui ci
+npm --prefix gui exec -- playwright install --with-deps chromium
+npm --prefix gui exec -- playwright --version
+```
+
+The Playwright version must match `gui/package-lock.json`, and the Chromium
+install must complete successfully. `--with-deps` is the CI/Linux-parity path
+and can require Host administrator authority for system packages. If system
+dependencies are already provisioned, use
+`npm --prefix gui exec -- playwright install chromium` for the browser-only
+step.
+
+The live family then requires both explicit confirmations and exactly three
+runs:
 
 ```bash
 uv run --env-file .env python experiments/run_browser_customer_flow_evaluation.py \

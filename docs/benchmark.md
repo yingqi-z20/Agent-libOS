@@ -10,6 +10,18 @@ child processes, checkpoints, Object Memory, and registered remote resources.
 The task schema is defined in
 [benchmarks/runtime_safety/schema.md](../benchmarks/runtime_safety/schema.md).
 
+## In this guide
+
+- [Understand the task suite](#task-suite)
+- [Choose a runner](#runners)
+- [Run deterministic or comparative evaluations](#running)
+- [Opt in to real-LLM mode](#real-llm-mode)
+- [Interpret outputs and metrics](#outputs)
+- [Run recovery scale gates](#recovery-scale-gates)
+- [Publish benchmark evidence](#publishing-benchmark-evidence)
+- [Distinguish practical evidence levels](#practical-workflow-evidence-levels)
+- Return to the [documentation home](index.md).
+
 ## Task Suite
 
 The checked-in suite contains 33 schema-v1 YAML tasks under
@@ -598,6 +610,27 @@ The complete release claim additionally requires three browser-driven
 customer-flow repetitions and three repetitions each of the research and data-
 analysis scenarios. Safety/authority/zero-duplicate effects must be `12/12`,
 utility must be at least `10/12` overall, and every family gate must pass.
+
+Before selecting the browser-live family, provision the repository-locked GUI
+runtime. The bridge starts `node`, imports `@playwright/test` from
+`gui/node_modules`, and launches its downloaded Chromium; `uv sync` alone does
+not provide any of those three prerequisites. Node must satisfy the
+`gui/package.json` engine (`^24.15.0 || >=26.0.0`) and npm must be 11 or newer.
+For CI/Linux parity run:
+
+```bash
+node --version
+npm --version
+npm --prefix gui ci
+npm --prefix gui exec -- playwright install --with-deps chromium
+npm --prefix gui exec -- playwright --version
+```
+
+The final command must report the Playwright version selected by
+`gui/package-lock.json`. The Chromium install must succeed before any paid LLM
+run; `--with-deps` may require Host administrator authority for system
+packages. Where those system packages are already present, the browser-only
+equivalent is `npm --prefix gui exec -- playwright install chromium`.
 
 Run the browser and knowledge-workflow families, then combine all three reports:
 

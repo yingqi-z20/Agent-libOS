@@ -248,9 +248,10 @@ tokens are evidence for reconciliation, not permission to replay.
 
 ## Repository configuration and command hardening
 
-The complete typed `git.*` field inventory is maintained in
-[Configuration](configuration.md#configuration-reference); inspect the live
-defaults with the `DEFAULT_CONFIG` command shown there. In particular,
+The complete typed `git.*` field inventory is maintained in the generated
+[configuration field reference](configuration_reference.md#git); inspect the
+live defaults and their loading/security semantics with the
+[configuration guide](configuration.md). In particular,
 deployment review should cover the state-content, output, status, log, patch,
 and timeout bounds; allowed remote schemes; SCP-style SSH, credential-helper,
 and SSH-agent inheritance; and ref and pull-request list limits. This document

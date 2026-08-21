@@ -3,6 +3,19 @@
 This guide covers local setup, regression checks, real Deno behavior, optional
 real LLM paths, and documentation rules for Agent libOS contributors.
 
+## In this guide
+
+- [Set up the locked development environments](#setup)
+- [Choose focused or complete checks](#standard-checks)
+- [Build and inspect release artifacts](#release-artifacts)
+- [Run opt-in real-LLM evidence](#real-llm-smoke)
+- [Understand configuration defaults](#configuration-defaults)
+- [Validate manifest YAML](#manifest-yaml)
+- [Update documentation](#documentation-rules)
+- [Add runtime code](#adding-runtime-code)
+- [Change dependencies](#dependencies)
+- Return to the [documentation home](index.md).
+
 ## Setup
 
 Use Python 3.11–3.14 and uv. CI currently pins uv `0.11.32`; use that exact
@@ -47,7 +60,10 @@ built with `dataclasses.replace(DEFAULT_CONFIG, tools=replace(...))`.
 
 ## Standard Checks
 
-Run:
+### Focused feedback (not complete)
+
+For quick feedback on a typical runtime change, start with the three common
+day-to-day lanes and the static contract checks:
 
 ```bash
 uv run python -m compileall agent_libos tests scripts experiments benchmarks modules
@@ -57,15 +73,34 @@ uv run python scripts/test_matrix.py --lane runtime
 uv run python scripts/check_architecture.py
 uv run python scripts/check_test_invariants.py
 uv run python scripts/check_protected_operations.py
+```
+
+This focused set is a starter set, not complete repository evidence. In
+particular, it omits the `self-evolution`, `providers`, and `benchmark` Python
+lanes and all GUI checks. Select an omitted lane directly when it owns the
+change.
+
+### Complete deterministic root-project baseline
+
+Before claiming the complete deterministic Python and GUI baseline, install
+the checked-in locks and run:
+
+```bash
+uv sync --frozen
+uv run python -m compileall agent_libos tests scripts experiments benchmarks modules
+uv run python scripts/check_architecture.py
+uv run python scripts/check_test_invariants.py
+uv run python scripts/check_protected_operations.py
+uv run python scripts/test_matrix.py --lane all
+npm --prefix gui ci
 uv run python scripts/test_matrix.py --lane gui
 git diff --check
 ```
 
-Run all deterministic Python lanes:
-
-```bash
-uv run python scripts/test_matrix.py --lane all
-```
+The Python `all` selection covers `unit`, `runtime`, `security`,
+`self-evolution`, `providers`, and `benchmark`; it does not include the GUI,
+AgentDojo subproject, PostgreSQL, MCP, real-LLM, or other separately gated
+environment cells described below.
 
 ### Isolated AgentDojo harness
 
@@ -200,15 +235,25 @@ execution with at most four workers and `--dist worksteal`, which balances long
 persistence and runtime-reopen tests. Pass `--workers 1` for serial failure
 diagnosis, or set `AGENT_LIBOS_TEST_WORKERS` / `AGENT_LIBOS_TEST_DIST` to
 override defaults. Pass `--durations 25` to report the slowest tests.
-`--max-lane-seconds` is a hard process-tree timeout for each selected command;
-its local default is 600 seconds. `--dist loadfile|loadscope|load|worksteal`
-selects the xdist scheduler when more than one worker is used. Deterministic
-file-weighted `--shard-count N --shard-index I` applies only to one Python lane
-(not `all` or `gui`); indices are zero-based, and every shard must contain at
-least one selected test file. The Python `all` lane is one command, while the
-GUI test, typecheck, and build commands each receive the full timeout
-independently. Timeout exits with status 124 after terminating the process
-group/tree. Standard lanes deselect `postgres` tests because the PostgreSQL CI
+`--max-lane-seconds` is a hard process-tree timeout applied independently to
+each command that the selected lane expands into; its local default is 600
+seconds. A parallel Python lane normally runs one non-Deno pytest command. When
+Deno is installed, more than one worker is selected, and real Deno has not been
+skipped, the affected lanes add a serial real-Deno command; `security`,
+`self-evolution`, and `all` also run the Deno resource-monitor selection as its
+own serial command before the parallel phase. Thus `all` can execute three
+commands sequentially, each with a fresh `--max-lane-seconds` window; the
+option is not one aggregate timeout for the entire lane. With `--workers 1`, no
+Deno installation, or `--skip-real-deno`, the Python selection remains one
+command. The GUI test, typecheck, and build commands likewise receive the full
+timeout independently.
+
+`--dist loadfile|loadscope|load|worksteal` selects the xdist scheduler when more
+than one worker is used. Deterministic file-weighted `--shard-count N
+--shard-index I` applies only to one Python lane (not `all` or `gui`); indices
+are zero-based, and every shard must contain at least one selected test file.
+Timeout exits with status 124 after terminating the process group/tree.
+Standard lanes deselect `postgres` tests because the PostgreSQL CI
 service runs them separately with `pytest -m postgres --run-postgres`. Linux CI
 uses a 480-second process deadline for the runtime and benchmark lanes and 360
 seconds for the other standard lanes, within a 15-minute step. The Windows
@@ -327,15 +372,27 @@ The Python pair is separate from the self-contained internal desktop artifacts.
 Native desktop builds use the exact `desktop` dependency group and GUI lock:
 
 ```bash
+uv python install 3.11.15
+export UV_PYTHON=3.11.15
+export UV_MANAGED_PYTHON=1
 uv sync --frozen --group desktop --extra mcp
+uv run python - <<'PY'
+import platform
+
+assert platform.python_implementation() == "CPython"
+assert platform.python_version() == "3.11.15"
+PY
+node --version | grep -Fx 'v24.15.0'
 npm --prefix gui ci
-npm --prefix gui run desktop:stage
 npm --prefix gui run desktop:dist
-python scripts/check_desktop_artifacts.py desktop-dist
 ```
 
-`desktop:dist` is native-only and writes ignored output to `desktop-dist/`; it
-must not be used to cross-freeze Python. The manual
+The exported uv selection makes every `uv run` nested inside the npm script use
+the managed CPython 3.11.15 project environment. `desktop:dist` already invokes
+`desktop:stage` and finishes by running `scripts/check_desktop_artifacts.py`, so
+running either command separately before or after it only repeats work. It is
+native-only and writes ignored output to `desktop-dist/`; it must not be used to
+cross-freeze Python. The manual
 `desktop-internal.yml` workflow builds macOS arm64 on `macos-15`, Windows x64
 on `windows-2025`, and Linux x64 on `ubuntu-24.04`. It uploads only internal
 Actions artifacts, SBOMs, component inventories, notices, and checksums. It has
@@ -710,8 +767,29 @@ manifests fail closed instead of silently overwriting earlier declarations.
 
 ## Documentation Rules
 
-README is the entrypoint. Detailed implementation documentation belongs in
-`docs/`.
+README is the short project and quick-start entrypoint. The audience- and
+task-oriented documentation home is [docs/index.md](index.md); detailed and
+normative subsystem contracts belong in `docs/`. Keep one handwritten source
+of truth for each workflow: README summarizes and links instead of copying
+release, migration, test, GUI, benchmark, CLI, or configuration procedures.
+
+Do not hand-edit generated references. Changes to the CLI parser, configuration
+dataclasses/defaults, or repository README must regenerate and verify their
+derived artifacts:
+
+```bash
+uv run python scripts/generate_cli_reference.py
+uv run python scripts/generate_config_reference.py
+uv run python scripts/generate_pypi_readme.py
+uv run python scripts/generate_cli_reference.py --check
+uv run python scripts/generate_config_reference.py --check
+uv run python scripts/generate_pypi_readme.py --check
+```
+
+Repository README links stay checkout-relative. `README.pypi.md` is the
+generated package-index long description and pins repository targets to the
+immutable `v<product-version>` tag. A release must reject mutable `main` links,
+stale generated output, or a tag/version mismatch.
 
 When behavior changes, update the relevant doc. If the change affects a runtime
 invariant, update the machine-readable source in `tests/invariants.yaml` and

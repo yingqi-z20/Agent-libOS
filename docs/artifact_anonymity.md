@@ -7,6 +7,18 @@ The commands below are intentionally fail closed: an unreadable input, failed
 detector, unreviewed match, changed byte, unsafe archive member, or incomplete
 final rescan stops publication.
 
+## In this guide
+
+- [Confirm names and license](#paper-title-system-name-and-license)
+- [Define the complete scan scope](#what-must-be-scanned)
+- [Start one strict review session](#one-strict-review-session)
+- [Materialize and extract safely](#safe-materialization-and-archive-extraction)
+- [Apply equal scans to every inventory](#equal-scans-for-all-three-inventories)
+- [Complete format-aware and visual review](#format-aware-and-visual-review)
+- [Build, hash, unpack, and rescan](#build-hash-safely-unpack-and-rescan-the-final-archive)
+- [Apply the publication exit gate](#publication-exit-gate)
+- Return to the [documentation home](index.md).
+
 ## Paper title, system name, and license
 
 The paper title is fixed as:

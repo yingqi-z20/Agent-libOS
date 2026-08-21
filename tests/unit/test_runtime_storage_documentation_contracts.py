@@ -586,6 +586,101 @@ def test_architecture_docs_track_recovery_and_host_control_boundaries() -> None:
     assert "current 46-value event catalog" not in documentation
 
 
+def test_core_runtime_docs_match_builder_startup_recovery_order() -> None:
+    builder = _read("agent_libos/runtime/builder.py")
+    builder_recovery = builder[
+        builder.index("def _recover_runtime_state") : builder.index(
+            "def _record_stale_execution_recovery"
+        )
+    ]
+    builder_markers = (
+        "validate_recoverable_payloads",
+        "recovered_mcp_continuations",
+        "recovered_mcp_remote_tasks",
+        "recovered_mcp_subscriptions",
+        "recovered_prepared_operations",
+        "reconciled_external_effects",
+        "recovered_semantic_authority",
+        "recovered_capability_use_reservations",
+        "recovered_resource_usage_reservations",
+        "recovered_exec_publications",
+        "recovered_runtime_publications",
+        "recovered_checkpoint_restore_publications",
+        "recovered_root_spawn_initial_goal_payloads",
+        "recovered_missing_object_payloads",
+        "rehydrate_registered_jit_tools",
+        "recovered_stale_operations",
+        "recovered_stale_executions",
+        "recovered_object_tasks",
+        "recovered_terminal_cleanups",
+        "recovered_task_runs",
+    )
+    documentation_markers = (
+        "recoverable TaskRun plaintext and integrity bindings",
+        "MCP continuations",
+        "MCP remote Tasks",
+        "MCP subscriptions",
+        "prepared protected operations",
+        "pending external effects",
+        "semantic authority",
+        "stale capability-use reservations",
+        "resource-usage reservations",
+        "process-exec",
+        "process-launch",
+        "checkpoint-restore",
+        "root-spawn initial-goal payloads",
+        "missing volatile Object payloads",
+        "registered JIT",
+        "stale Explainable Operations",
+        "stale process execution leases",
+        "Object Tasks",
+        "incomplete process-terminal cleanup intents",
+        "TaskRun startup recovery",
+    )
+
+    _assert_in_order(builder_recovery, *builder_markers)
+    for path, start_marker in (
+        ("docs/runtime_model.md", "The builder first validates"),
+        ("docs/storage.md", "While holding the lifecycle recovery lease"),
+        ("docs/capabilities.md", "On reopen, the Runtime holds"),
+    ):
+        documentation = _words(_read(path)).split(start_marker, 1)[1]
+        _assert_in_order(documentation, *documentation_markers)
+        assert "provider receipt" in documentation
+        assert "provider replay" in documentation
+        assert "restore its bound reservation" in documentation
+
+
+def test_semantic_docs_separate_evidence_control_settlement_and_remote_layers() -> None:
+    python_api = _words(_read("docs/python_api.md"))
+    threat_model = _words(_read("docs/threat_model.md"))
+
+    for documentation in (python_api, threat_model):
+        _assert_in_order(
+            documentation,
+            "Evidence and review",
+            "Trusted Host kill switch and control",
+            "Private settlement",
+            "Remote and model boundary",
+        )
+        for required in (
+            '`runtime.semantic.set_mode("off")`',
+            "supported one-way live kill switch",
+            "restart and startup admission",
+            "semantic_control",
+            "not Runtime facade methods",
+            "no HTTP, GUI, model Tool, Skill, JIT",
+            "`semantic review import`",
+        ):
+            assert required in documentation
+
+    assert "only public evidence/review write" in python_api
+    assert (
+        "There is no Runtime/model/CLI/HTTP/GUI policy or settlement entrypoint"
+        not in threat_model
+    )
+
+
 def test_runtime_docs_keep_prompt_layout_cache_and_projection_contract() -> None:
     documentation = _words(_read("docs/runtime_model.md"))
     thresholds = PromptCacheGateThresholds()

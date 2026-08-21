@@ -15,6 +15,16 @@ passed to a small set of reviewed legacy services such as Explain; it is not yet
 hidden from every runtime component. New domain persistence should use the
 typed/repository boundary rather than extending that compatibility surface.
 
+## In this guide
+
+- [Strict store schema v7](#strict-store-schema-v7)
+- [Offline migrations](#offline-v6-to-v7-migration)
+- [Transaction model](#transaction-model)
+- [Durable authority and evidence](#durable-authority-and-evidence)
+- [Backup and restore runbook](#backup-and-restore-runbook)
+- [Active-runtime leases](#active-runtime-leases)
+- Return to the [documentation home](index.md).
+
 Process, resource-accounting, runtime-publication, operation/evidence,
 module-publication, and Snapshot/Checkpoint persistence have explicit typed
 Protocols and facade methods. Snapshot services exchange canonical `SnapshotRows` and
@@ -799,14 +809,42 @@ compensate startup work, and a same-shaped arbitrary ContextVar value cannot
 impersonate the recovery lease. Recovery diagnostics are typed summaries with
 exact totals and page-bounded samples rather than full-backlog lists.
 
-Prepared protected-effect recovery runs before stale capability-use cleanup.
-Once every valid prepared intent has restored its exact linked reservations,
-the authority repository abandons remaining `reserved` rows through the
+While holding the lifecycle recovery lease, the builder validates recoverable
+TaskRun plaintext and integrity bindings without dispatch. It then drains
+durable recovery work in this exact dependency order:
+
+1. reconcile crash-interrupted MCP continuations;
+2. reconcile crash-interrupted MCP remote Tasks;
+3. reconcile crash-interrupted MCP subscriptions;
+4. recover prepared protected operations;
+5. reconcile pending external effects;
+6. recover semantic authority;
+7. abandon stale capability-use reservations;
+8. recover resource-usage reservations;
+9. recover incomplete process-exec publications;
+10. recover incomplete process-launch publications;
+11. recover incomplete checkpoint-restore publications;
+12. recover root-spawn initial-goal payloads;
+13. recover missing volatile Object payloads;
+14. rehydrate registered JIT tools;
+15. interrupt stale Explainable Operations;
+16. recover stale process execution leases;
+17. recover Object Tasks;
+18. recover incomplete process-terminal cleanup intents; and
+19. perform TaskRun startup recovery.
+
+The three MCP restart reconciliations use durable compare-and-set transitions
+and are never provider replay. Prepared protected-effect recovery restores exact
+linked reservations only when its intent proves that no provider phase began.
+Pending-effect reconciliation follows and must complete before the authority
+repository abandons remaining `reserved` rows: a provider receipt can prove
+that an effect never started and atomically restore its bound reservation. The
+subsequent stale cleanup uses the
 `(status, created_at, reservation_id)` keyset index. This ordering eliminates
 the former startup-wide external-effect JSON scan and its unbounded protected
-reservation set. Pending external effects are then reconciled without replay.
+reservation set.
 
-Active resource-usage reservations are recovered next through bounded
+Active resource-usage reservations are then recovered through bounded
 `(status, created_at, reservation_id)` keyset pages. A reservation whose linked
 effect is absent or still `prepared` is released as not started; a reservation
 whose surviving effect is in any other transaction state is conservatively

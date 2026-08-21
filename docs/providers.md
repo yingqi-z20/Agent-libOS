@@ -66,8 +66,25 @@ injection and Host-API contract.
 | Git | `LocalGitProvider` pinned to the Runtime workspace repository | configured repository resource (default `git:workspace`), affected filesystem resources, per-remote `git_remote:workspace:<name>`, per-PR `git_pr:workspace:<id>`, state-token CAS, and mandatory approval for destructive operations | Reads are ingress; local mutations, fetch, push, and simulated-PR transitions use distinct protected-operation descriptors and local query-only reconciliation | System Git 2.26+, byte-safe parsing, repository/config identity validation, cross-process lock, no arbitrary argv/URL, executable extensions disabled, bounded output |
 | Human | `LocalHumanProvider` plus GUI/terminal host surfaces | Typed question/permission request and explicit policy decision | Terminal read/write and GUI request presentation are protected information-flow operations; conditional GUI views expose only bound metadata and reject parent responses until their exact one-shot release is consumed through presentation | Typed responses, queue state, bounded payload/output, lock-free blocking I/O with claimed request state |
 | JSON-RPC | `HttpJsonRpcProvider` | Registered endpoint and exact method capability; model-supplied URLs are forbidden | Registry metadata is gated before lookup; calls prepare the reservation/intent before resolving header values, then remote DNS starts inside that intent; transport/classification settles the same effect id | Closed manifest shape, header-env allowlist, request/response hard limits, timeout, resolved-address policy, client-only JSON-RPC 2.0 |
-| MCP | `SdkMcpProvider` for the stable Manifest v1/v2 Tools contract, plus typed exact-v3 Tool and Host client/providers for Streamable HTTP and stdio | Registered server/tool/read-surface authority; protected discovery/refresh additionally needs exact server read+execute, and stdio operations require `process:spawn` plus exact `mcp_stdio:<digest>` execute authority | Tool calls retain negative clearance precheck, exact Sink/registry fencing, pending-first effects, and bounded detached results. V2/v3 negotiation and operation phases share an absolute deadline and cumulative bounds; v3 Tool/Resource/Prompt/MRTR/Task results remain untrusted until Host validation | Exact-version manifests, header/stdio-env allowlists, purpose-specific catalog/content limits, fenced connection lifecycle, no automatic replay, and contained stdio lifecycle |
+| MCP | `SdkMcpProvider` plus typed exact-v3 Host clients over Streamable HTTP and stdio | Registered server/tool/read-surface authority plus the process/stdio rules summarized below | Pending-first, Sink-fenced effects and Host-validated detached results | Exact manifests, environment/catalog/content bounds, fenced connections, no replay, and contained stdio |
 | PTY | Trusted `modules/pty` Runtime Module provider hooks | Startup hash trust plus normal process/shell authority; published sessions are Object Memory `EXTERNAL_REF` handles with Object rights | Spawn is bidirectional; read/continuous ingest are ingress; write/resize/public close are egress. Effectful operations use protected pending-to-finalized evidence; write raises the session label high-water even after an ambiguous provider outcome | Output bounds on both backends; independent reader/monitor workers and process-tree wall/CPU/RSS supervision on POSIX. Windows uses `pywinpty`/ConPTY, has no Job Object or resource supervisor, and rejects `SubprocessLimits` before spawn |
+
+### MCP provider detail
+
+- Manifest v1/v2 retains the stable governed Tools contract. Exact-v3 adds
+  typed Tool and Host Resource/Prompt/MRTR/Task clients without making Host
+  read surfaces automatically model-visible.
+- Registered server, tool, and read-surface authority is required. Protected
+  discovery and refresh additionally require exact server read plus execute;
+  stdio operations require `process:spawn` and exact
+  `mcp_stdio:<digest>` execute authority.
+- Tool calls retain the negative-clearance precheck, exact Sink/registry
+  fencing, pending-first effects, and bounded detached results. Negotiation and
+  operation phases share an absolute deadline and cumulative bounds; v3
+  Tool/Resource/Prompt/MRTR/Task results remain untrusted until Host validation.
+- Exact-version manifests, header and stdio-environment allowlists,
+  purpose-specific catalog/content limits, fenced connection lifecycle, no
+  automatic replay, and contained stdio lifecycle form the provider boundary.
 
 Filesystem compare-and-swap is an optional provider extension, not a breaking
 change to `FilesystemProvider.write_text`. Existing custom providers continue

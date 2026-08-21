@@ -27,6 +27,46 @@ directory below Electron's user-data directory. It prepends only
 `process.resourcesPath/bin` to the Python child's `PATH`, making the bundled
 Deno visible without changing Electron's own environment.
 
+## In this guide
+
+- [Complete a first task](#first-task-user-path)
+- [Develop and test the GUI](#development)
+- [Build the internal desktop distribution](#self-contained-internal-desktop-distribution)
+- [Understand the user and operator workspace](#current-workspace)
+- [Inspect semantic evidence](#semantic-panel)
+- [Review high-risk operations](#high-risk-operations)
+- [Use the API contract boundary and summary](#api-contract-boundary)
+- Return to the [documentation home](index.md).
+
+## First task: user path
+
+1. **Launch the app.** Open an installed internal desktop package, or follow
+   [Development](#development) to start Electron from a checkout. Wait for the
+   user workspace to show a connected runtime; an initialization error or
+   disconnected stream is a service problem to retry, not a completed task.
+2. **Create the task.** In **New task**, describe the outcome and constraints.
+   Review **Edit settings** if the image, model profile, working directory,
+   workspace/Git request scope, or command policy needs to change. Leave the
+   default regular-process mode selected unless the Host has explicitly enabled
+   Durable Task Runs, then choose **Start** or press Ctrl/Command+Enter.
+3. **Follow execution.** Select the new task in the sidebar and read its
+   conversation, localized state, and wait reason. `Working` means execution is
+   active; a tool, child, message, paused, or Host-resume wait is not itself a
+   permission grant or a failure.
+4. **Handle input and permissions deliberately.** `Needs input` and
+   `waiting_human` put the pending Human card ahead of the conversation. Read
+   the exact question or requested permission scope, then answer, approve, or
+   reject it and select the intended permission policy. Workspace, Git, and
+   command choices made at launch are only request ceilings; they do not grant
+   the requested operation before this Runtime approval flow.
+5. **Read the outcome.** Successful Agent output appears in the conversation,
+   followed by terminal status; when content is withheld by data-flow policy the
+   UI shows a protected-output notice. For `failed`, `killed`, or Durable
+   `needs_attention`, read the displayed reason/blocker and use the operator
+   **Audit** or **Explain** view when more evidence is needed. Do not treat a
+   missing message or an unknown external effect as success; start another task
+   only after the terminal evidence is understood.
+
 ## Architecture
 
 ```text
@@ -229,12 +269,26 @@ npm --prefix gui run build
 uv run python scripts/test_matrix.py --lane gui
 ```
 
-The browser end-to-end suite also needs the version-matched Chromium binary:
+The browser end-to-end suite also needs the lock-installed Playwright package
+and its version-matched Chromium binary. `npm ci` above installs the JavaScript
+package; it does not download the browser executable. For CI/Linux parity,
+install both Chromium and its operating-system dependencies before running the
+suite:
 
 ```bash
-npm --prefix gui exec -- playwright install chromium
+npm --prefix gui ci
+npm --prefix gui exec -- playwright install --with-deps chromium
+npm --prefix gui exec -- playwright --version
 npm --prefix gui run test:e2e
 ```
+
+The version command must report the Playwright version resolved by
+`gui/package-lock.json`. `--with-deps` can require Host administrator authority
+to install system libraries. On a macOS/Windows Host, or a Linux Host whose
+system dependencies are already provisioned, use
+`npm --prefix gui exec -- playwright install chromium` for the browser-only
+step. The live browser customer-workflow gate uses this same Node, Playwright,
+and Chromium installation; a Python environment by itself is insufficient.
 
 The E2E runner creates a temporary SQLite store, starts the real loopback GUI
 HTTP/SSE service and Vite bridge with an ephemeral bearer token, and blocks
@@ -286,21 +340,32 @@ Deno downloads are accepted only after the repository-pinned platform SHA-256
 matches; a runner-preinstalled Deno is never staged.
 
 ```bash
+uv python install 3.11.15
+export UV_PYTHON=3.11.15
+export UV_MANAGED_PYTHON=1
 uv sync --frozen --group desktop --extra mcp
+uv run python - <<'PY'
+import platform
+
+assert platform.python_implementation() == "CPython"
+assert platform.python_version() == "3.11.15"
+PY
+node --version | grep -Fx 'v24.15.0'
 npm --prefix gui ci
-npm --prefix gui run desktop:stage
 npm --prefix gui run desktop:dist
-uv run --frozen --group desktop --extra mcp \
-  python scripts/check_desktop_artifacts.py desktop-dist
 ```
 
 `desktop:stage` builds the production renderer, freezes the Python sidecar,
 stages Deno, licenses, a component inventory, and a CycloneDX 1.6 SBOM under
-`gui/.desktop-stage`. `desktop:dist` then runs electron-builder 26.15.3,
-publishes the per-platform SBOM/component/third-party-notice sidecars and
-`SHA256SUMS`, and invokes the artifact checker. Python is frozen only on the
-native runner: `macos-15` produces arm64, `windows-2025` produces x64, and
-`ubuntu-24.04` produces x64. The manual workflow is
+`gui/.desktop-stage`. The `desktop:dist` script already calls that staging
+script, then runs electron-builder 26.15.3, publishes the per-platform
+SBOM/component/third-party-notice sidecars and `SHA256SUMS`, and invokes the
+artifact checker. Do not run `desktop:stage` first or repeat the checker after
+`desktop:dist`; both would duplicate work. The exported uv selection makes the
+nested `uv run` commands use managed CPython 3.11.15, and the inline assertion
+fails before packaging if the implementation or patch version differs. Python
+is frozen only on the native runner: `macos-15` produces arm64, `windows-2025`
+produces x64, and `ubuntu-24.04` produces x64. The manual workflow is
 `.github/workflows/desktop-internal.yml`; it uploads Actions artifacts and does
 not create a tag, GitHub Release, public download, or auto-update channel.
 Source-controlled electron-builder inputs such as the application icon live in

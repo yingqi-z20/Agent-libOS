@@ -12,6 +12,16 @@ primitive still validates arguments, chooses the exact capability decisions,
 and supplies safe evidence. The SDK controls when those decisions are reserved
 and committed and how provider ambiguity is represented.
 
+## In this guide
+
+- [Define and invoke a protected contract](#contract-and-invocation)
+- [Implement a synchronous operation](#synchronous-operation)
+- [Compose async providers](#async-and-composite-providers)
+- [Handle failure and at-most-once behavior](#failure-and-at-most-once-behavior)
+- [Use prepare, settle, and compensation hooks](#prepare-settle-and-compensation-hooks)
+- [Understand enforcement](#enforcement)
+- Return to the [documentation home](index.md).
+
 ## Contract and invocation
 
 Register contracts during trusted Runtime composition:

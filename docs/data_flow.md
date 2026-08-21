@@ -12,6 +12,18 @@ grant filesystem write, shell execute, Human output, JSON-RPC method, MCP tool,
 process, resource-budget, provider-registration, or Task Authority effect
 permission. All of those checks still apply.
 
+## In this guide
+
+- [Labels and derivation](#labels-and-derivation)
+- [Operation integrity floors](#operation-integrity-floors)
+- [Sink trust registry](#sink-trust-registry)
+- [Stable Sink identities](#stable-sink-identities)
+- [Enforcement order](#enforcement-order)
+- [Exact conditional release](#exact-conditional-release)
+- [Process domains and persistence](#process-domains-and-persistence)
+- [Guarantee boundary](#guarantee-boundary)
+- Return to the [documentation home](index.md).
+
 ## Labels and derivation
 
 `DataLabels` contains strictly validated fields:

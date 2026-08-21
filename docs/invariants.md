@@ -1,8 +1,21 @@
 # Agent libOS Runtime Invariants
 
+[Documentation home](index.md) · [Architecture](architecture.md) ·
+[Threat model](threat_model.md) · [Support matrix](support_matrix.md)
+
 The machine-checked runtime invariant map lives in
 `tests/invariants.yaml`. It is the authoritative source for connecting safety
 claims to pytest node ids and benchmark attack classes.
+
+## In this guide
+
+- [Current Invariant Groups](#current-invariant-groups) is the human-readable
+  explanation of every machine-declared invariant.
+- [Known Test Gaps](#known-test-gaps) records boundaries that current
+  deterministic evidence does not close.
+- `tests/invariants.yaml` is the machine-readable index. Search this page by an
+  exact invariant id from that manifest to reach its explanation; the checker
+  rejects missing, duplicate, or unknown ids.
 
 Validate it with:
 
@@ -1427,7 +1440,7 @@ longer defines.
 - Practical and recovery benchmarks validate their documented deterministic
   profiles. Hosted-provider workflows, real-model benchmark breadth, and the
   unimplemented million-publication recovery profile remain outside the
-  per-change gate. See `docs/support_matrix.md` for the authoritative coverage
+  per-change gate. See the [support matrix](support_matrix.md) for the authoritative coverage
   matrix and release-gate procedure.
 - Release-artifact CI uses remote Actions pinned to reviewed full commit SHAs,
   builds one canonical wheel/source pair with a frozen release tool group,
