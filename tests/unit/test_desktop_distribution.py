@@ -33,7 +33,7 @@ def test_desktop_runtime_manifest_locks_exact_internal_toolchain() -> None:
         "node": "24.15.0",
         "electron": "43.2.0",
         "electron_builder": "26.15.3",
-        "deno": "2.9.4",
+        "deno": "2.9.5",
         "mcp": "2.0.0",
         "keyring": "25.7.0",
     }
@@ -178,7 +178,7 @@ def test_desktop_sbom_requires_runtime_mcp_keyring_electron_deno_and_python(
         for name, version in {
             "agent-libos": "1.5.1",
             "CPython": "3.11.15",
-            "Deno": "2.9.4",
+            "Deno": "2.9.5",
             "electron": "43.2.0",
             "keyring": "25.7.0",
             "mcp": "2.0.0",

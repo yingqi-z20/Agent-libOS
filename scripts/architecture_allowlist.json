@@ -10,7 +10,7 @@
     "agent_libos/utils/openai_schema.py::_normalize_schema": 27,
     "agent_libos/memory/object_memory.py::ObjectMemoryManager.update_object": 26,
     "agent_libos/runtime/authority_manifest_manager.py::AuthorityManifestManager.prepare_launch": 21,
-    "agent_libos/runtime/checkpoint_manager.py::CheckpointManager._remap_snapshot": 25,
+    "agent_libos/runtime/checkpoint_manager.py::CheckpointManager._remap_snapshot": 24,
     "agent_libos/runtime/explain_manager.py::ExplainManager._deterministic_summary": 25,
     "agent_libos/runtime/image_registry.py::ImageRegistryPrimitive._image_package_from_files": 26,
     "agent_libos/runtime/resource_manager.py::ResourceManager.remaining_budgets": 25,
@@ -91,7 +91,10 @@
     "runtime-storage-sql-bypass": {},
     "typed-storage-reflection-bypass": {},
     "untracked-blocking-dispatch": {},
-    "undeclared-runtime-component": {},
+    "undeclared-runtime-component": {
+      "agent_libos/runtime/builder.py::RuntimeBuilder._recover_runtime_state::windows_store_identity_post_recovery": 1,
+      "agent_libos/runtime/builder.py::RuntimeBuilder._recover_runtime_state::windows_store_identity_preflight": 1
+    },
     "whole-process-write": {}
   }
 }

@@ -13,7 +13,7 @@ import time
 import unicodedata
 from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Any, Iterator, Literal, Mapping, Protocol, runtime_checkable
@@ -1018,6 +1018,11 @@ class ResolvedPath:
     relative: str
     display: str
     is_root: bool = False
+    provider_identity: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)

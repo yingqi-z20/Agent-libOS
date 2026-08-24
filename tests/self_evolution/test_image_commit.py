@@ -610,7 +610,7 @@ class TestImageCommit:
 
     @pytest.mark.real_deno
     def test_committed_jit_tool_source_survives_runtime_reopen(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / 'runtime.sqlite'
             runtime = Runtime.open(db_path)
             try:
@@ -769,7 +769,7 @@ class TestImageCommit:
                 runtime.image_registry.commit_from_checkpoint(actor=pid, checkpoint_id=checkpoint_id, image_id='dupe:v0', name='dupe')
 
     def test_cli_images_commit_list_and_inspect(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / 'runtime.sqlite')
             spawned = _run_cli_json(['--db', db_path, 'spawn', '--goal', 'source'])
             created = _run_cli_json(['--db', db_path, 'checkpoint', 'create', spawned['pid'], 'commit'])

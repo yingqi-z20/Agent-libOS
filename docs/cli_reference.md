@@ -62,7 +62,7 @@ usage: agent-libos [-h] [--config CONFIG] [--db DB] [--module-manifest MODULE_MA
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
 | `--config CONFIG` | no | `None` | YAML config overlay. Defaults to the project-root config.yaml when present. |
-| `--db DB` | no | `None` | Runtime store target. Paths/local use SQLite; postgresql:// DSNs use PostgreSQL. If omitted, uses the selected config runtime store settings (default 'local' is in-memory SQLite). |
+| `--db DB` | no | `None` | Runtime store target. 'user' uses the persistent per-user SQLite store; paths use file SQLite; local/:memory:/sqlite:// use in-memory SQLite; postgresql:// DSNs use PostgreSQL. If omitted, uses the selected config runtime store settings (default 'user' is persistent SQLite). |
 | `--module-manifest MODULE_MANIFEST` | no | `[]` | Trusted startup module manifest to load before the runtime is used. May be passed multiple times. |
 | `--trusted-module TRUSTED_MODULE` | no | `[]` | Trusted startup module entry in the form '<module_id>:<manifest_sha256>:<source_sha256>'. Use the trust_key from `modules verify`. |
 | `--trusted-module-sha256 TRUSTED_MODULE_SHA256` | no | `[]` | Trusted startup module digest pair in the form '<manifest_sha256>:<source_sha256>', regardless of module id. Intended for local development only. |

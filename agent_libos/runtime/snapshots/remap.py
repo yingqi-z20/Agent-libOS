@@ -4,7 +4,9 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.capability.resources import ResourceAuthority
+from agent_libos.models.capability import ResourcePattern, ResourceScope
+from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.models.snapshot import ProcessSnapshot, SnapshotHeader, SnapshotRows
 from agent_libos.models.process_state import (
     StaleExecutionProcessWait,
@@ -77,12 +79,13 @@ class SnapshotRemapper:
         "tools": ("tools", "tool_id"),
         "candidates": ("tool_candidates", "candidate_id"),
     }
+    _RESOURCE_AUTHORITY = ResourceAuthority()
     _RESOURCE_MAPS = (
-        ("checkpoint:process:", "pids"),
-        ("object_namespace:", "namespaces"),
-        ("process:", "pids"),
-        ("object:", "objects"),
-        ("tool:", "tools"),
+        ("checkpoint", "process:", "pids"),
+        ("object_namespace", "", "namespaces"),
+        ("process", "", "pids"),
+        ("object", "", "objects"),
+        ("tool", "", "tools"),
     )
 
     @classmethod
@@ -407,27 +410,70 @@ class SnapshotRemapper:
         cls,
         row: dict[str, Any],
         identities: SnapshotIdentityMap,
+        *,
+        field_name: str = "capabilities.resource",
     ) -> None:
         resource = row.get("resource")
+        row["resource"] = cls._expected_resource(
+            resource,
+            identities,
+            field_name=field_name,
+        )
+
+    @classmethod
+    def parse_capability_resource(
+        cls,
+        resource: Any,
+        *,
+        field_name: str = "capability resource",
+    ) -> ResourcePattern:
+        """Parse one canonical snapshot capability resource or fail closed."""
+
         if not isinstance(resource, str):
-            return
-        row["resource"] = cls._expected_resource(resource, identities)
+            raise ValidationError(f"snapshot {field_name} must be a string")
+        try:
+            pattern = cls._RESOURCE_AUTHORITY.parse(resource)
+        except CapabilityDenied as exc:
+            raise ValidationError(
+                f"snapshot {field_name} is not a valid capability resource"
+            ) from exc
+        if pattern.raw != resource:
+            raise ValidationError(
+                f"snapshot {field_name} must be a canonical capability resource"
+            )
+        return pattern
+
+    @staticmethod
+    def _resource_with_body(pattern: ResourcePattern, body: str) -> str:
+        base = f"{pattern.kind}:{body}"
+        if pattern.scope == ResourceScope.SUBTREE:
+            return f"{base}/*"
+        if pattern.scope == ResourceScope.PREFIX:
+            return f"{base}:*"
+        return base
 
     @classmethod
     def _expected_resource(
         cls,
-        resource: str,
+        resource: Any,
         identities: SnapshotIdentityMap,
+        *,
+        field_name: str = "capability resource",
     ) -> str:
-        for prefix, map_name in cls._RESOURCE_MAPS:
-            if not resource.startswith(prefix):
+        pattern = cls.parse_capability_resource(
+            resource,
+            field_name=field_name,
+        )
+        for kind, body_prefix, map_name in cls._RESOURCE_MAPS:
+            if pattern.kind != kind or not pattern.body.startswith(body_prefix):
                 continue
-            identity = resource[len(prefix) :]
+            identity = pattern.body[len(body_prefix) :]
             selected_map = getattr(identities, map_name)
             if identity in selected_map:
-                return f"{prefix}{selected_map[identity]}"
-            return resource
-        return resource
+                remapped_body = f"{body_prefix}{selected_map[identity]}"
+                return cls._resource_with_body(pattern, remapped_body)
+            return pattern.raw
+        return pattern.raw
 
     @classmethod
     def _remap_message_carriers(
@@ -456,14 +502,7 @@ class SnapshotRemapper:
         identities: SnapshotIdentityMap,
     ) -> None:
         raw = row.get("requested_capabilities_json")
-        if raw is None or not any(
-            (
-                identities.pids,
-                identities.objects,
-                identities.namespaces,
-                identities.tools,
-            )
-        ):
+        if raw is None:
             return
         requested = cls._json_container(
             raw,
@@ -476,8 +515,15 @@ class SnapshotRemapper:
                 "must be a list of objects"
             )
         remapped = deepcopy(requested)
-        for item in remapped:
-            cls._remap_capability_resource(item, identities)
+        for index, item in enumerate(remapped):
+            cls._remap_capability_resource(
+                item,
+                identities,
+                field_name=(
+                    "tool_candidates.requested_capabilities_json"
+                    f"[{index}].resource"
+                ),
+            )
         if remapped != requested:
             row["requested_capabilities_json"] = dumps(remapped)
 
@@ -977,12 +1023,17 @@ class SnapshotRemapper:
             expected_type=list,
         )
         expected_requested = deepcopy(source_requested)
-        for item in expected_requested:
+        for item_index, item in enumerate(expected_requested):
             if not isinstance(item, dict):
                 continue
-            resource = item.get("resource")
-            if isinstance(resource, str):
-                item["resource"] = cls._expected_resource(resource, identities)
+            item["resource"] = cls._expected_resource(
+                item.get("resource"),
+                identities,
+                field_name=(
+                    "tool_candidates.requested_capabilities_json"
+                    f"[{item_index}].resource"
+                ),
+            )
         if actual_requested != expected_requested:
             cls._reference_error(
                 "tool_candidates",

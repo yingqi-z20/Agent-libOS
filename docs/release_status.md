@@ -474,11 +474,11 @@ its reproducible report outside this status summary.
 - The GUI package declares Node `^24.15.0 || >=26.0.0` and npm `>=11`.
   Per-change CI checks the Node 24 LTS line with its supplied npm version;
   Node 26 Current satisfies the engine contract but is not a separate job.
-- The release workflow configures a separate Ubuntu/macOS 14 Python 3.11 matrix
-  for the manifest v2 host-filesystem-identity platform nodes. Each shard uses
-  its platform marker with `--fail-on-skip`, and canonical release artifacts
-  depend on that job. This is a configured CI gate, not a claim that a separate
-  local macOS CI run was performed.
+- The release workflow configures a separate Ubuntu/macOS 14/Windows Python
+  3.11 matrix for the manifest v2 host-filesystem-identity platform nodes. Each
+  shard uses its platform marker with `--fail-on-skip`, and canonical release
+  artifacts depend on that job. This is a configured CI gate, not a claim that
+  a separate local macOS or Windows CI run was performed.
 - SQLite and PostgreSQL implement the covered RuntimeStore contract. This
   release accepts only store schema v7 at Runtime startup. A canonical v6 store
   may use the explicit offline v6-to-v7 migration; v5 must first migrate to v6,

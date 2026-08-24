@@ -358,8 +358,8 @@ be trusted before registration, either through configured
 `trusted_global_package_sha256` values or a durable trust record:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite skills trust ~/.agent-libos/skills/review-helper
-uv run agent-libos --db .agent_libos.sqlite skills register ~/.agent-libos/skills/review-helper --source-type global
+uv run agent-libos --db user skills trust ~/.agent-libos/skills/review-helper
+uv run agent-libos --db user skills register ~/.agent-libos/skills/review-helper --source-type global
 ```
 
 Setting `skills.global_requires_trust: false` disables only this hash-trust
@@ -375,10 +375,10 @@ of the Host's trusted computing base.
 Admin CLI registration can read and snapshot a workspace package directly:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite skills validate skills/swe-agent
-uv run agent-libos --db .agent_libos.sqlite skills register skills/swe-agent
-uv run agent-libos --db .agent_libos.sqlite skills discover --text swe-agent
-uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent --expected-package-sha256 <package_sha256-from-discover>
+uv run agent-libos --db user skills validate skills/swe-agent
+uv run agent-libos --db user skills register skills/swe-agent
+uv run agent-libos --db user skills discover --text swe-agent
+uv run agent-libos --db user skills activate <pid> swe-agent --expected-package-sha256 <package_sha256-from-discover>
 ```
 
 Activation requires the exact lowercase package hash from discovery and fails

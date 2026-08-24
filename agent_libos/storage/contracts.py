@@ -133,6 +133,30 @@ class ProcessScaffoldCleanup:
         return sum(self.deleted_by_table.values())
 
 
+@dataclass(frozen=True, slots=True)
+class PersistedCapabilityResourceIdentity:
+    """Lean, payload-free authority identity used by startup validation."""
+
+    capability_id: str
+    resource: str
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedFileLabelPathIdentity:
+    """Lean, payload-free live file-label identity used at startup."""
+
+    binding_id: str
+    normalized_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedCheckpointCapabilityInventory:
+    """Capability resources from one bounded, canonical checkpoint document."""
+
+    checkpoint_id: str
+    capabilities: tuple[PersistedCapabilityResourceIdentity, ...]
+
+
 class SemanticAssessmentBackendProtocol(Protocol):
     """Durable queue and append-only semantic evidence surface."""
 
@@ -1308,6 +1332,13 @@ class SnapshotCheckpointRepositoryProtocol(Protocol):
         limit: int | None = None,
     ) -> list[Checkpoint]: ...
 
+    def query_checkpoint_capability_inventories(
+        self,
+        *,
+        after_checkpoint_id: str | None,
+        limit: int,
+    ) -> list[PersistedCheckpointCapabilityInventory]: ...
+
     def capture_checkpoint_rows(
         self,
         process_rows: Iterable[Mapping[str, Any]],
@@ -1478,6 +1509,20 @@ class AuthorityRecoveryBackendProtocol(TransactionBackendProtocol, Protocol):
         after_cap_id: str | None,
         limit: int,
     ) -> list[Capability]: ...
+
+    def query_active_capability_resource_identities(
+        self,
+        *,
+        after_cap_id: str | None,
+        limit: int,
+    ) -> list[PersistedCapabilityResourceIdentity]: ...
+
+    def query_live_file_label_path_identities(
+        self,
+        *,
+        after_binding_id: str | None,
+        limit: int,
+    ) -> list[PersistedFileLabelPathIdentity]: ...
 
 
 class ObjectRecoveryBackendProtocol(TransactionBackendProtocol, Protocol):
@@ -2181,6 +2226,13 @@ class SnapshotCheckpointBackendProtocol(
         pid: str | None = None,
         limit: int | None = None,
     ) -> list[Checkpoint]: ...
+
+    def query_checkpoint_snapshots(
+        self,
+        *,
+        after_checkpoint_id: str | None,
+        limit: int,
+    ) -> list[tuple[Checkpoint, Mapping[str, Any]]]: ...
 
     def reserve_process_restore_epoch(
         self,

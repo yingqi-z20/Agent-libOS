@@ -535,10 +535,13 @@ class TestProcessWorkingDirectory:
                 runtime.close()
 
     def test_process_working_directory_persists_in_sqlite(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            tempfile.TemporaryDirectory() as store_dir,
+        ):
             root = Path(temp_dir)
             (root / 'persisted').mkdir()
-            db_path = root / 'runtime.sqlite'
+            db_path = Path(store_dir) / 'runtime.sqlite'
             runtime = Runtime.open(db_path, substrate=LocalResourceProviderSubstrate(root))
             try:
                 pid = runtime.process.spawn(image='review-agent:v0', goal='persist cwd')

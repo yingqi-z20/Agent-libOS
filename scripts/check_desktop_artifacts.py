@@ -179,7 +179,7 @@ def _validate_sbom(path: Path, target: str) -> None:
     expected = {
         "agent-libos": VERSION,
         "cpython": "3.11.15",
-        "deno": "2.9.4",
+        "deno": "2.9.5",
         "electron": "43.2.0",
         "keyring": "25.7.0",
         "mcp": "2.0.0",
@@ -393,7 +393,7 @@ def _validate_internal_metadata(
         raise ValueError("packaged runtime identity is invalid")
     toolchain = runtime.get("toolchain")
     if toolchain != {
-        "deno": "2.9.4",
+        "deno": "2.9.5",
         "electron": "43.2.0",
         "electron_builder": "26.15.3",
         "keyring": "25.7.0",
@@ -525,7 +525,7 @@ def validate(root: Path) -> dict[str, Any]:
     _validate_sbom(root / sidecar_names[0], target)
     notice = (root / sidecar_names[2]).read_text(encoding="utf-8")
     folded_notice = notice.casefold()
-    for marker in ("Deno 2.9.4", "Electron 43.2.0", "keyring 25.7.0", "mcp 2.0.0"):
+    for marker in ("Deno 2.9.5", "Electron 43.2.0", "keyring 25.7.0", "mcp 2.0.0"):
         if marker.casefold() not in folded_notice:
             raise ValueError(f"third-party notice is missing {marker}")
     portable = root / package_names[1]

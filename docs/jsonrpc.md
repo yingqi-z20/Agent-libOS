@@ -384,11 +384,11 @@ runtime error boundary.
 Register and inspect endpoints:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite jsonrpc register endpoint.yaml
-uv run agent-libos --db .agent_libos.sqlite jsonrpc list
-uv run agent-libos --db .agent_libos.sqlite jsonrpc list --text weather --limit 20
-uv run agent-libos --db .agent_libos.sqlite jsonrpc inspect demo-weather
-uv run agent-libos --db .agent_libos.sqlite jsonrpc register endpoint.yaml --replace
+uv run agent-libos --db user jsonrpc register endpoint.yaml
+uv run agent-libos --db user jsonrpc list
+uv run agent-libos --db user jsonrpc list --text weather --limit 20
+uv run agent-libos --db user jsonrpc inspect demo-weather
+uv run agent-libos --db user jsonrpc register endpoint.yaml --replace
 ```
 
 `endpoint.yaml` is the user-created, adapted manifest described above; it is
@@ -398,14 +398,14 @@ not make these commands a live remote demo.
 Grant method authority and call as a process:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> jsonrpc:demo-weather:forecast --rights read
-uv run agent-libos --db .agent_libos.sqlite jsonrpc call <pid> demo-weather forecast --params-json '{"city":"Beijing"}'
+uv run agent-libos --db user capabilities grant <pid> jsonrpc:demo-weather:forecast --rights read
+uv run agent-libos --db user jsonrpc call <pid> demo-weather forecast --params-json '{"city":"Beijing"}'
 ```
 
 Delete an endpoint:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite jsonrpc unregister demo-weather
+uv run agent-libos --db user jsonrpc unregister demo-weather
 ```
 
 `list` accepts `--text` and `--limit`; `register --replace` replaces an existing

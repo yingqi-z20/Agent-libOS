@@ -802,9 +802,9 @@ Agents`.
 Invariant manifest schema v2 uses `required_platform_nodes` when a claim needs
 native host evidence. Each platform list must contain exact node ids from the
 invariant's main `node_ids` list and those tests must carry the corresponding
-`platform_darwin` or `platform_linux` marker. Release CI runs each marker in its
-own native shard with `--fail-on-skip`; ordinary cross-platform collection does
-not substitute for that platform evidence.
+`platform_darwin`, `platform_linux`, or `platform_windows` marker. Release CI
+runs each marker in its own native shard with `--fail-on-skip`; ordinary
+cross-platform collection does not substitute for that platform evidence.
 
 Current behavior must not claim:
 

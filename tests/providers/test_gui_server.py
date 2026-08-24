@@ -5613,7 +5613,7 @@ class TestGuiServer:
             runtime=RuntimeDefaults(default_image_id='gui-base:v0', coding_image_id='gui-coding:v0'),
             gui=replace(DEFAULT_CONFIG.gui, object_task_wait_default_timeout_s=0.25, object_task_wait_max_timeout_s=0.5),
         )
-        runtime = Runtime.open(config=config)
+        runtime = Runtime.open("local", config=config)
         server = create_gui_http_server(runtime=runtime, port=0, token='custom-token', auto_run=False)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         seen: list[float | None] = []
@@ -5727,7 +5727,10 @@ class TestGuiServer:
             server.server_close()
 
     def test_injected_runtime_config_controls_request_body_limit(self) -> None:
-        runtime = Runtime.open(config=AgentLibOSConfig(gui=GuiDefaults(request_body_max_bytes=8)))
+        runtime = Runtime.open(
+            "local",
+            config=AgentLibOSConfig(gui=GuiDefaults(request_body_max_bytes=8)),
+        )
         server = create_gui_http_server(runtime=runtime, port=0, token='custom-token', auto_run=False)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()

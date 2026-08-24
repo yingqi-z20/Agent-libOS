@@ -257,50 +257,48 @@ def test_legacy_git_reads_share_case_insensitive_exact_hardening(
 @pytest.mark.parametrize(
     "requested",
     [
+        ["env", "-P", ".", "git", "push"],
         ["env", "git", "branch", "wrapper-created"],
-        ["nohup", "GiT.ExE", "push"],
-        ["env", "FOO=bar", "nohup", "git", "reset", "--hard"],
-        ["env", "-a", "masked", "git", "branch", "wrapper-created"],
-        ["timeout", "30", "git", "push"],
-        ["nice", "-n", "5", "git", "reset", "--hard"],
-        ["setsid", "git", "branch", "wrapper-created"],
-        ["stdbuf", "-o0", "git", "push"],
+        [r"C:\Program Files\Git\usr\bin\NoHuP.ExE", "printf"],
+        ["/usr/bin/NiCe", "-n", "5", "printf"],
+        ["SETSID.EXE", "--", "printf"],
+        ["/usr/bin/stdbuf", "-o0", "printf"],
+        ["Timeout.exe", "30", "printf"],
+        ["env", "FOO=bar", "nohup", "printf"],
+        ["env", "-Sprintf unsafe"],
+        ["env", "--unknown-option", "printf"],
     ],
 )
-def test_raw_git_policy_rejects_launcher_wrapped_git(requested: list[str]) -> None:
-    with pytest.raises(ValidationError, match="typed git_"):
+def test_shared_argv_policy_rejects_transparent_launcher_dispatch(
+    requested: list[str],
+) -> None:
+    with pytest.raises(ValidationError, match="launcher dispatch"):
         validate_and_normalize_raw_git(requested)
+    with pytest.raises(ValidationError, match="launcher dispatch"):
+        harden_read_only_git_argv(requested)
 
 
 @pytest.mark.parametrize(
     "requested",
     [
-        ["env", "printf", "git"],
-        ["nohup", "printf", "git"],
-        ["timeout", "30", "printf", "git"],
-        ["nice", "printf", "git"],
-        ["setsid", "printf", "git"],
-        ["stdbuf", "-o0", "printf", "git"],
+        ["env"],
+        ["NOHUP.EXE"],
+        ["/usr/bin/nice"],
+        [r"C:\Windows\System32\SetSid.ExE"],
+        ["stdbuf"],
+        ["TIMEOUT"],
     ],
 )
-def test_raw_git_policy_preserves_non_git_launcher_arguments(
+def test_shared_argv_policy_allows_standalone_launcher(
     requested: list[str],
 ) -> None:
     assert validate_and_normalize_raw_git(requested) == requested
 
 
-@pytest.mark.parametrize(
-    "requested",
-    [
-        ["env", "-Sgit branch wrapper-created"],
-        ["env", "--split-string=git branch wrapper-created"],
-    ],
-)
-def test_raw_git_policy_rejects_uninspectable_env_split_string(
-    requested: list[str],
-) -> None:
-    with pytest.raises(ValidationError, match="split-string"):
-        validate_and_normalize_raw_git(requested)
+def test_shared_argv_policy_preserves_direct_non_launcher_arguments() -> None:
+    requested = ["printf", "git"]
+
+    assert validate_and_normalize_raw_git(requested) == requested
 
 
 def test_default_git_version_supports_config_scope_inspection() -> None:

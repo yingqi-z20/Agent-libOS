@@ -690,6 +690,19 @@ directory. The filesystem primitive enforces workspace containment before host
 provider calls. Path strings that escape the workspace are rejected even if a
 model can produce them.
 
+On Windows, authorization identity is derived before capability lookup from a
+Win32 handle for existing entries, including stored long spelling rather than a
+caller-supplied case or DOS 8.3 alias. Missing targets canonicalize the nearest
+existing parent and each future component under the directory's
+`FileCaseSensitiveInfo` policy; if that policy cannot be proven, resolution
+fails closed. Alternate data streams, device names/paths, drive-relative or
+root-relative spellings, trailing dots/spaces, control characters, and invalid
+components are rejected before identity or effects. Capability resources,
+hierarchical locks, evidence paths, and file-label keys all use the resulting
+one canonical relative path. Sink-time handle revalidation requires exact
+canonical spelling, so a case rename, short-name rebind, or other identity drift
+after authorization is rejected before the side effect.
+
 Read, write, and delete are separate rights. Granting read over a directory does
 not grant write or delete.
 
@@ -901,9 +914,14 @@ Authorization and returned results retain the original argv. Every other direct
 Git argv—including mutation and remote commands—is deterministically rejected
 before Shell policy or Human approval, even under `always_allow`; callers should
 use the typed `Runtime.git` boundary for capability-, state-, and evidence-aware
-Git operations. The shared Shell/PTY check also unwraps supported transparent
-executable launchers. `env --split-string`/`env -S` dispatch is rejected because
-its eventual executable cannot be validated as an argv token.
+Git operations. The shared Shell/PTY argv check rejects `env`, `nice`, `nohup`,
+`setsid`, `stdbuf`, and `timeout` whenever any trailing token is present. The
+match uses the case-insensitive executable basename and accepts an optional
+`.exe` suffix, so paths, options, environment assignments, `--`, unknown
+options, and nested launchers cannot change the executable identity after
+authorization. Rejection precedes policy, Human approval, data-flow, evidence,
+and provider resolution. A single-token invocation such as `env` remains
+available through ordinary Shell authority.
 
 This is an argv compatibility policy, not an operating-system process boundary.
 An authorized interpreter, script, or native program can invoke Git later or

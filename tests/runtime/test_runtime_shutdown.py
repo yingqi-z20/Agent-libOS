@@ -4710,7 +4710,7 @@ class TestRuntimeShutdown:
 
         async def exercise() -> None:
             with pytest.raises(BaseExceptionGroup) as caught:
-                await Runtime.aopen("ignored")
+                await Runtime.aopen("local")
             assert caught.value.subgroup(RuntimeError) is not None
             handles = RuntimeAssemblyCleanupRequired.extract(caught.value)
             assert len(handles) == 1
@@ -4745,7 +4745,7 @@ class TestRuntimeShutdown:
             staticmethod(fail_with_deferred_scheduler),
         )
         with pytest.raises(BaseExceptionGroup) as caught:
-            Runtime.open("ignored")
+            Runtime.open("local")
         assert caught.value.subgroup(RuntimeError) is not None
         handles = RuntimeAssemblyCleanupRequired.extract(caught.value)
         assert len(handles) == 1
@@ -4792,7 +4792,7 @@ class TestRuntimeShutdown:
         )
 
         with pytest.raises(BaseExceptionGroup) as caught:
-            Runtime.open("ignored")
+            Runtime.open("local")
         handles = RuntimeAssemblyCleanupRequired.extract(caught.value)
         assert len(handles) == 1
         handle = handles[0]
@@ -5113,7 +5113,7 @@ class TestRuntimeShutdown:
 
         async def exercise() -> None:
             with pytest.raises(BaseExceptionGroup) as caught:
-                await Runtime.aopen("ignored", substrate=substrate)
+                await Runtime.aopen("local", substrate=substrate)
             handles = RuntimeAssemblyCleanupRequired.extract(caught.value)
             assert len(handles) == 1
             handle = handles[0]
@@ -5191,7 +5191,7 @@ class TestRuntimeShutdown:
                 TypeError,
                 match=r"overrides Runtime\.__init__.*override allocate_unassembled",
             ):
-                await RuntimeBuilder.configured(CustomInitRuntime).aopen("ignored")
+                await RuntimeBuilder.configured(CustomInitRuntime).aopen("local")
 
         asyncio.run(exercise())
         assert open_calls == 0
@@ -5227,7 +5227,7 @@ class TestRuntimeShutdown:
 
         async def exercise() -> None:
             with pytest.raises(BaseExceptionGroup) as caught:
-                await Runtime.aopen("ignored")
+                await Runtime.aopen("local")
             assert caught.value.subgroup(RuntimeError) is not None
             assert caught.value.subgroup(OSError) is not None
             handles = RuntimeAssemblyCleanupRequired.extract(caught.value)

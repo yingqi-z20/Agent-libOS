@@ -28,7 +28,7 @@ BACKENDS = [
 
 
 def test_registry_projects_typed_module_record_to_public_dictionary() -> None:
-    runtime = Runtime.open()
+    runtime = Runtime.open("local")
     try:
         persisted = runtime.uow.module_publications.get_runtime_module(
             "agent-libos-core:v0"

@@ -51,6 +51,9 @@ dispatch and external-effect classification method in `JsonRpcProvider` and
 `McpProvider`. Starting from `LocalResourceProviderSubstrate` preserves the
 other required filesystem, Git, clock, Shell, and Human providers. A fully
 custom composition must implement all fields of `ResourceProviderSubstrate`.
+Persistent SQLite `target` paths must be outside `workspace`; Runtime assembly
+rejects overlap before installing model primitives or creating sidecars. The
+reserved `user` target is valid only when its resolved path is also outside.
 Provider code remains trusted Host code and does not inherit authority,
 data-flow, resource, evidence, or error-sanitization responsibilities from the
 model. See [Python API](python_api.md#provider-protocols-and-injection) for the

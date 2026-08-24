@@ -115,9 +115,12 @@ class TestSkillCli:
         }
 
     def test_skill_cli_actor_pid_register_reads_workspace_package_through_primitive(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+        with (
+            tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir,
+            tempfile.TemporaryDirectory() as state_dir,
+        ):
             root = Path(temp_dir).resolve()
-            db_path = str(root / 'runtime.sqlite')
+            db_path = str(Path(state_dir).resolve() / 'runtime.sqlite')
             skill_dir = write_skill_package(root, 'cli-actor-skill', allowed_tools=['echo'])
             relative_skill = skill_dir.relative_to(Path.cwd().resolve()).as_posix()
             skill_md = f'{relative_skill}/SKILL.md'

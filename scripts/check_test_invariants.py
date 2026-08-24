@@ -28,6 +28,7 @@ DEFAULT_DETERMINISTIC_MARKER_EXPRESSION = (
 PLATFORM_MARKERS = {
     "darwin": "platform_darwin",
     "linux": "platform_linux",
+    "windows": "platform_windows",
 }
 INVARIANT_EXECUTION_RECEIPT_ENV = "AGENT_LIBOS_INVARIANT_EXECUTION_RECEIPT"
 EXECUTION_RECEIPT_SCHEMA_VERSION = 1
@@ -248,6 +249,8 @@ def _current_platform_key() -> str | None:
         return "darwin"
     if sys.platform.startswith("linux"):
         return "linux"
+    if sys.platform == "win32":
+        return "windows"
     return None
 
 

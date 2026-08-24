@@ -444,7 +444,18 @@ def test_operation_recovery_queries_have_backend_indexes(backend: str) -> None:
             plans["stale_page"].lower().replace('"', "").replace(" ", "")
         )
         assert "(started_at,operation_id)<" in normalized_stale_plan
-        assert "idx_external_effects_recovery_transaction" in plans["temp_build"]
+        if backend == "postgres":
+            assert "idx_external_effects_recovery_transaction" in plans["temp_build"]
+        else:
+            # Recent SQLite planners may split the two predicates across the
+            # narrower state indexes instead of choosing the composite index.
+            assert any(
+                index_name in plans["temp_build"]
+                for index_name in (
+                    "idx_external_effects_recovery_transaction",
+                    "idx_external_effects_recovery_state",
+                )
+            )
         assert "idx_external_effects_transaction_state" in plans["temp_build"]
         assert "idx_operation_evidence_lookup" in plans["temp_build"]
         assert "idx_operations_parent_root" in plans["online_exists"]

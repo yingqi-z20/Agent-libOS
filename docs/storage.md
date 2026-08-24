@@ -72,18 +72,43 @@ tested, manifest-generation baseline. Another 17.x release is not rejected by
 the major-version field alone, but remains outside the validated release matrix
 and must still match the complete canonical storage catalog.
 
-Library defaults are deliberately ephemeral. `Runtime.open()` and
-`Runtime.aopen()` do not load the repository's `config.yaml`; with neither an
-explicit target nor an explicit config they use `DEFAULT_CONFIG`, whose
-`runtime.local_store_target` is `local`. The store factory maps both `local`
-and `:memory:` to an in-memory SQLite database, and `SQLiteStore()` has the
-same `:memory:` default. Each such connection is a separate store and all of
-its state disappears when it is closed. A bare `sqlite://` target also maps to
-`:memory:`. Persistence therefore requires an explicit filesystem path or
-`sqlite:///...` file target, a config whose local target is a file, or a
-PostgreSQL DSN. Product CLI and GUI entrypoints may load project
-configuration before calling `Runtime.open`; that Host behavior does not
-change the library default.
+The library default is the reserved SQLite target `user`.
+`Runtime.open()` and `Runtime.aopen()` do not load the repository's
+`config.yaml`; with neither an explicit target nor an explicit config they use
+`DEFAULT_CONFIG`, whose `runtime.local_store_target` is `user`. That target
+resolves to `~/.agent-libos/runtime/agent-libos.sqlite`, so state survives a
+close and reopen without placing the RuntimeStore in the model-visible
+workspace. On POSIX, the `~/.agent-libos/runtime` directory must be owned by the
+current user and is fixed to mode `0700`; symlink or reparse-point components
+are rejected on every supported platform.
+
+Explicit `local` and `:memory:` targets remain independent in-memory SQLite
+stores whose state disappears when closed; a bare `sqlite://` target has the
+same in-memory meaning. An explicit filesystem path or `sqlite:///...` target
+selects persistent SQLite, while a PostgreSQL DSN selects PostgreSQL. Before a
+persistent SQLite database, runtime lease, journal, WAL, or SHM sidecar can be
+created, Runtime startup Host-canonicalizes both the target and the effective
+local workspace and rejects a target equal to or below that workspace. This
+applies to implicit and explicit local substrates and
+to caller-owned stores before model primitives are installed. In-memory
+SQLite, PostgreSQL, and non-local substrates do not have this filesystem
+overlap check.
+
+There is no automatic migration from a legacy project-root
+`.agent_libos.sqlite`. Stop every writer and move or restore that database to a
+location outside the effective workspace before selecting its explicit path;
+do not copy a live SQLite database or omit its required sidecars.
+
+On Windows, startup also treats persisted filesystem identity as an authority
+boundary. Before recovery, and again after recovery while its lease is held, it
+uses bounded keyset pages to validate every active filesystem capability, live
+file-label binding, and checkpoint capability row that restore could reactivate
+against the current canonical resolver. A non-canonical record stops startup
+before `STARTING`/`OPEN` with only its opaque capability, binding, or checkpoint
+identifier in the error; no path is disclosed and no record is rewritten.
+Inactive or tombstoned history that cannot become effective is excluded. There
+is no automatic migration for legacy Windows aliases: an operator must inspect
+and repair or replace the store offline before reopening it.
 
 This release supports one writable Runtime per database/schema on either
 backend. PostgreSQL's session advisory lease enforces that product boundary;
@@ -1018,8 +1043,9 @@ Before either backend is backed up:
 
 ### SQLite
 
-Use this procedure only for a file-backed SQLite target; `local` and
-`:memory:` databases have no persistent file to back up.
+Use this procedure only for a file-backed SQLite target, including the resolved
+`user` path `~/.agent-libos/runtime/agent-libos.sqlite`; `local`, `:memory:`,
+and bare `sqlite://` databases have no persistent file to back up.
 
 1. After the Runtime has released its active-store lease, create an owner-only
    backup directory and use a restrictive umask with SQLite's own backup command:
@@ -1150,7 +1176,9 @@ a recovery plan.
 
 ## Active-runtime leases
 
-A persistent target is owned by one writable Runtime at a time.
+A persistent target is owned by one writable Runtime at a time. The reserved
+`user` target follows the same file-backed SQLite lease rules after it resolves
+to `~/.agent-libos/runtime/agent-libos.sqlite`.
 
 - File-backed SQLite canonicalizes the database path on every platform. On the
   tested POSIX path, when `O_NOFOLLOW` and `fchmod` are available, it rejects

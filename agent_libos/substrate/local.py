@@ -30,7 +30,7 @@ from collections.abc import Callable, Iterator
 from itertools import islice
 from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Literal, Mapping
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -135,6 +135,28 @@ _DARWIN_ATTR_VOL_FSTYPENAME = 0x00100000
 _DARWIN_VOL_CAP_FMT_CASE_SENSITIVE = 0x00000100
 _DARWIN_VOL_CAP_FMT_CASE_PRESERVING = 0x00000200
 _DARWIN_NORMALIZATION_INSENSITIVE_FILESYSTEMS = {"apfs"}
+_WINDOWS_RESERVED_COMPONENTS = {
+    "aux",
+    "clock$",
+    "con",
+    "conin$",
+    "conout$",
+    "nul",
+    "prn",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+    "com¹",
+    "com²",
+    "com³",
+    "lpt¹",
+    "lpt²",
+    "lpt³",
+}
+_WINDOWS_ILLEGAL_COMPONENT_CHARACTERS = frozenset('<>:"|?*')
+_WINDOWS_DOS_SHORT_NAME_PATTERN = re.compile(
+    r"^[^.]{1,6}~[0-9]+(?:\..*)?$",
+    flags=re.IGNORECASE,
+)
 _SAFE_SHELL_ENV_KEYS = {
     "COMSPEC",
     "LANG",
@@ -181,6 +203,21 @@ class _FilesystemContentSnapshot:
     changed_ns: int
 
 
+@dataclass(frozen=True)
+class _WindowsFileId:
+    volume_serial_number: int
+    identifier: bytes
+
+
+@dataclass(frozen=True)
+class _WindowsResolvedIdentity:
+    target_path: str
+    target_exists: bool
+    anchor_path: str
+    anchor_file_id: _WindowsFileId
+    case_sensitive: bool | None
+
+
 class _DarwinAttrList(ctypes.Structure):
     _fields_ = [
         ("bitmapcount", ctypes.c_uint16),
@@ -199,6 +236,48 @@ class _DarwinVolumeIdentityPolicy:
     case_preserving: bool
     normalization_insensitive: bool
     filesystem_type: str
+
+
+def _validate_windows_path_syntax(path: Any) -> None:
+    """Reject Win32 spellings that do not have one stable file identity.
+
+    Win32 silently rewrites trailing dots/spaces, interprets colons as
+    alternate data streams, and recognizes device names even when they have an
+    extension.  Those forms must be rejected before a capability resource or
+    data-label key is derived.  Existing DOS 8.3 names are handled separately:
+    they are safe only when a handle can expand them to the stored long name.
+    """
+
+    try:
+        value = os.fspath(path)
+    except TypeError as exc:
+        raise CapabilityDenied("invalid Windows filesystem path") from exc
+    if not isinstance(value, str):
+        raise CapabilityDenied("Windows filesystem paths must be text")
+    folded = value.replace("/", "\\").casefold()
+    if folded.startswith(("\\\\?\\", "\\\\.\\", "\\??\\")):
+        raise CapabilityDenied("Windows device paths are not supported")
+    parsed = PureWindowsPath(value)
+    if parsed.drive and not parsed.root:
+        raise CapabilityDenied("drive-relative Windows paths are not supported")
+    if parsed.root and not parsed.drive:
+        raise CapabilityDenied("root-relative Windows paths are not supported")
+    components = parsed.parts[1:] if parsed.anchor else parsed.parts
+    for component in components:
+        if component in {".", ".."}:
+            continue
+        if not component or component[-1] in {".", " "}:
+            raise CapabilityDenied("invalid Windows filesystem path component")
+        if any(ord(character) < 32 for character in component):
+            raise CapabilityDenied("invalid Windows filesystem path component")
+        if any(
+            character in _WINDOWS_ILLEGAL_COMPONENT_CHARACTERS
+            for character in component
+        ):
+            raise CapabilityDenied("invalid Windows filesystem path component")
+        base_name = component.split(".", 1)[0].rstrip(" .").casefold()
+        if base_name in _WINDOWS_RESERVED_COMPONENTS:
+            raise CapabilityDenied("reserved Windows device name is not supported")
 
 
 if os.name == "nt":
@@ -239,6 +318,47 @@ if os.name == "nt":
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
+    class _FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
+        _fields_ = [
+            ("FileAttributes", ctypes.c_uint32),
+            ("ReparseTag", ctypes.c_uint32),
+        ]
+
+    class _FILE_CASE_SENSITIVE_INFO(ctypes.Structure):
+        _fields_ = [("Flags", ctypes.c_uint32)]
+
+    class _FILE_ID_128(ctypes.Structure):
+        _fields_ = [("Identifier", ctypes.c_ubyte * 16)]
+
+    class _FILE_ID_INFO(ctypes.Structure):
+        _fields_ = [
+            ("VolumeSerialNumber", ctypes.c_uint64),
+            ("FileId", _FILE_ID_128),
+        ]
+
+    class _FILE_DISPOSITION_INFO(ctypes.Structure):
+        _fields_ = [("DeleteFile", ctypes.c_ubyte)]
+
+    class _FILETIME(ctypes.Structure):
+        _fields_ = [
+            ("dwLowDateTime", ctypes.c_uint32),
+            ("dwHighDateTime", ctypes.c_uint32),
+        ]
+
+    class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", ctypes.c_uint32),
+            ("ftCreationTime", _FILETIME),
+            ("ftLastAccessTime", _FILETIME),
+            ("ftLastWriteTime", _FILETIME),
+            ("dwVolumeSerialNumber", ctypes.c_uint32),
+            ("nFileSizeHigh", ctypes.c_uint32),
+            ("nFileSizeLow", ctypes.c_uint32),
+            ("nNumberOfLinks", ctypes.c_uint32),
+            ("nFileIndexHigh", ctypes.c_uint32),
+            ("nFileIndexLow", ctypes.c_uint32),
+        ]
+
     _kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
     _kernel32.CreateJobObjectW.restype = ctypes.c_void_p
     _kernel32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
@@ -261,6 +381,25 @@ if os.name == "nt":
     _kernel32.CloseHandle.restype = ctypes.c_int
     _kernel32.GetFinalPathNameByHandleW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32]
     _kernel32.GetFinalPathNameByHandleW.restype = ctypes.c_uint32
+    _kernel32.GetFileInformationByHandleEx.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    _kernel32.GetFileInformationByHandleEx.restype = ctypes.c_int
+    _kernel32.GetFileInformationByHandle.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    _kernel32.GetFileInformationByHandle.restype = ctypes.c_int
+    _kernel32.SetFileInformationByHandle.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    _kernel32.SetFileInformationByHandle.restype = ctypes.c_int
 
     _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
     _JOB_OBJECT_LIMIT_JOB_TIME = 0x00000004
@@ -268,13 +407,21 @@ if os.name == "nt":
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
     _PROCESS_TERMINATE = 0x0001
     _PROCESS_SET_QUOTA = 0x0100
-    _GENERIC_READ = 0x80000000
+    _DELETE = 0x00010000
+    _FILE_READ_ATTRIBUTES = 0x00000080
     _FILE_SHARE_READ = 0x00000001
-    _FILE_SHARE_WRITE = 0x00000002
     _OPEN_EXISTING = 3
     _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
     _FILE_NAME_NORMALIZED = 0
     _VOLUME_NAME_DOS = 0
+    _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+    _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+    _FILE_ATTRIBUTE_TAG_INFO_CLASS = 9
+    _FILE_ID_INFO_CLASS = 18
+    _FILE_DISPOSITION_INFO_CLASS = 4
+    _FILE_CASE_SENSITIVE_INFO_CLASS = 23
+    _FILE_CS_FLAG_CASE_SENSITIVE_DIR = 0x00000001
     _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
@@ -359,16 +506,21 @@ class _WindowsDirectoryGuard:
         self._closed = False
 
     @classmethod
-    def open(cls, path: Path) -> "_WindowsDirectoryGuard":
+    def open(
+        cls,
+        path: Path,
+        *,
+        desired_access: int | None = None,
+    ) -> "_WindowsDirectoryGuard":
         if os.name != "nt":
             raise OSError("Windows directory guards are only available on Windows")
         handle = _kernel32.CreateFileW(
             os.fspath(path),
-            _GENERIC_READ,
-            _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+            _FILE_READ_ATTRIBUTES if desired_access is None else desired_access,
+            _FILE_SHARE_READ,
             None,
             _OPEN_EXISTING,
-            _FILE_FLAG_BACKUP_SEMANTICS,
+            _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
             None,
         )
         if not handle or handle == _INVALID_HANDLE_VALUE:
@@ -381,6 +533,24 @@ class _WindowsDirectoryGuard:
         self._closed = True
         if os.name == "nt":
             _kernel32.CloseHandle(self.handle)
+
+
+class _WindowsDirectoryGuardChain:
+    """Retain every canonical ancestor handle through a Windows path sink."""
+
+    def __init__(self, guards: list[_WindowsDirectoryGuard]):
+        if not guards:
+            raise ValueError("Windows directory guard chain cannot be empty")
+        self._guards = guards
+        self.handle = guards[-1].handle
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for guard in reversed(self._guards):
+            guard.close()
 
 
 def _darwin_volume_identity_policy(path: Path) -> _DarwinVolumeIdentityPolicy:
@@ -502,7 +672,14 @@ class LocalFilesystemProvider:
     """Local-workspace implementation of the filesystem substrate."""
 
     def __init__(self, root: str | Path, namespace: str = _RUNTIME_DEFAULTS.workspace_namespace):
-        lexical_root = Path(root).resolve()
+        windows_root_file_id: _WindowsFileId | None = None
+        if os.name == "nt":
+            _validate_windows_path_syntax(root)
+            lexical_root = Path(
+                os.path.abspath(os.path.normpath(os.fspath(Path(root))))
+            )
+        else:
+            lexical_root = Path(root).resolve()
         if sys.platform == "darwin":
             self.root = self._darwin_existing_descriptor_path(
                 lexical_root,
@@ -515,11 +692,31 @@ class LocalFilesystemProvider:
             # handle so later containment checks use one Windows identity.
             guard = _WindowsDirectoryGuard.open(lexical_root)
             try:
-                self.root = self._windows_final_path_from_handle(guard.handle)
+                try:
+                    attributes = self._windows_attributes_from_handle(guard.handle)
+                    if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                        raise CapabilityDenied(
+                            "filesystem adapter root cannot be a Windows reparse point"
+                        )
+                    if not attributes & _FILE_ATTRIBUTE_DIRECTORY:
+                        raise CapabilityDenied(
+                            "filesystem adapter root is not a directory"
+                        )
+                    self.root = self._windows_final_path_from_handle(guard.handle)
+                    windows_root_file_id = self._windows_file_id_from_handle(
+                        guard.handle
+                    )
+                except CapabilityDenied:
+                    raise
+                except OSError as exc:
+                    raise CapabilityDenied(
+                        "cannot canonicalize Windows filesystem adapter root"
+                    ) from exc
             finally:
                 guard.close()
         else:
             self.root = lexical_root
+        self._windows_root_file_id = windows_root_file_id
         self._darwin_volume_policy = (
             _optional_darwin_volume_identity_policy(self.root)
             if sys.platform == "darwin"
@@ -530,16 +727,19 @@ class LocalFilesystemProvider:
         self._path_lock = HierarchicalPathLock()
 
     def resolve(self, path: Any) -> ResolvedPath:
+        windows_identity: _WindowsResolvedIdentity | None = None
+        if os.name == "nt":
+            _validate_windows_path_syntax(path)
         raw = Path(path)
         candidate = raw if raw.is_absolute() else self.root / raw
         # Resource derivation runs before capability authorization. Most Hosts
-        # keep this step purely lexical. Darwin's default filesystems can map
-        # several case/Unicode spellings to one directory entry, however, so a
-        # lexical resource would let the same file acquire several authority
-        # and data-label identities. F_GETPATH exposes only descriptor identity
-        # and the Host-stored spelling; it does not read file content. Existing
-        # paths (or the nearest existing parent of a create) are canonicalized
-        # before deriving every downstream resource/lock/label key.
+        # keep this step purely lexical. Darwin and Windows filesystems can map
+        # several case, Unicode, or DOS spellings to one directory entry,
+        # however, so a lexical resource would let the same file acquire
+        # several authority and data-label identities. Host descriptor APIs
+        # expose only entry identity and stored spelling; they do not read file
+        # content. Existing paths (or the nearest existing parent of a create)
+        # are canonicalized before every downstream resource/lock/label key.
         target = Path(os.path.abspath(os.path.normpath(os.fspath(candidate))))
         if sys.platform == "darwin":
             try:
@@ -556,12 +756,206 @@ class LocalFilesystemProvider:
                 pass
             else:
                 target = self._darwin_canonical_path(target)
-        try:
-            relative_path = target.relative_to(self.root)
-        except ValueError as exc:
-            raise CapabilityDenied(f"path escapes filesystem adapter root: {path}") from exc
+        elif os.name == "nt":
+            try:
+                self._windows_relative_to_root_exact(target)
+            except CapabilityDenied as exc:
+                raise CapabilityDenied(
+                    f"path escapes filesystem adapter root: {path}"
+                ) from exc
+            target, windows_identity = self._windows_canonical_path(target)
+        if os.name == "nt":
+            relative_path = self._windows_relative_to_root_exact(target)
+        else:
+            try:
+                relative_path = target.relative_to(self.root)
+            except ValueError as exc:
+                raise CapabilityDenied(
+                    f"path escapes filesystem adapter root: {path}"
+                ) from exc
         relative = relative_path.as_posix()
-        return ResolvedPath(relative=relative, display=str(target), is_root=target == self.root)
+        is_root = (
+            self._windows_paths_match_exactly(target, self.root)
+            if os.name == "nt"
+            else target == self.root
+        )
+        return ResolvedPath(
+            relative=relative,
+            display=str(target),
+            is_root=is_root,
+            provider_identity=windows_identity,
+        )
+
+    def _windows_canonical_path(
+        self,
+        target: Path,
+    ) -> tuple[Path, _WindowsResolvedIdentity]:
+        root_guard = self._windows_open_verified_root()
+        try:
+            return self._windows_canonical_path_with_verified_root(
+                target,
+                root_guard,
+            )
+        finally:
+            root_guard.close()
+
+    def _windows_canonical_path_with_verified_root(
+        self,
+        target: Path,
+        root_guard: _WindowsDirectoryGuard,
+    ) -> tuple[Path, _WindowsResolvedIdentity]:
+        """Return the one authority spelling for a Windows path.
+
+        Existing entries come from a non-reparse handle, which expands caller
+        casing and DOS 8.3 aliases to the stored long path.  For creates, the
+        nearest existing directory is canonicalized first and every future
+        component is derived from its case-sensitivity policy.  There is no
+        lexical fallback when the Host cannot prove that policy.
+        """
+
+        if os.name != "nt":
+            raise OSError("Windows path canonicalization is only available on Windows")
+        lexical_parts = self._windows_relative_to_root_exact(target).parts
+        canonical = self.root
+        current_guard = root_guard
+        current_attributes = self._windows_attributes_from_handle(
+            root_guard.handle
+        )
+        opened_guards: list[_WindowsDirectoryGuard] = []
+        missing_parts: list[str] = []
+        anchor_path = self.root
+        anchor_file_id = self._windows_file_id_from_handle(root_guard.handle)
+        case_sensitive: bool | None = None
+        try:
+            for index, component in enumerate(lexical_parts):
+                if not current_attributes & _FILE_ATTRIBUTE_DIRECTORY:
+                    raise CapabilityDenied(
+                        "Windows filesystem path has a non-directory parent"
+                    )
+                candidate = canonical / component
+                try:
+                    guard = _WindowsDirectoryGuard.open(candidate)
+                except OSError as exc:
+                    if not self._windows_path_is_missing_error(exc):
+                        raise CapabilityDenied(
+                            "cannot canonicalize Windows filesystem path identity"
+                        ) from exc
+                    missing_parts = list(lexical_parts[index:])
+                    anchor_path = canonical
+                    anchor_file_id = self._windows_file_id_from_handle(
+                        current_guard.handle
+                    )
+                    case_sensitive = self._windows_directory_case_sensitive(
+                        current_guard.handle
+                    )
+                    break
+                try:
+                    attributes = self._windows_attributes_from_handle(
+                        guard.handle
+                    )
+                    if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                        raise CapabilityDenied(
+                            "Windows filesystem path contains a reparse point"
+                        )
+                    if (
+                        index < len(lexical_parts) - 1
+                        and not attributes & _FILE_ATTRIBUTE_DIRECTORY
+                    ):
+                        raise CapabilityDenied(
+                            "Windows filesystem path has a non-directory parent"
+                        )
+                    opened = self._windows_final_path_from_handle(guard.handle)
+                    self._windows_relative_to_root_exact(opened)
+                except CapabilityDenied:
+                    guard.close()
+                    raise
+                except OSError as exc:
+                    guard.close()
+                    raise CapabilityDenied(
+                        "cannot canonicalize Windows filesystem path identity"
+                    ) from exc
+                canonical = opened
+                current_guard = guard
+                current_attributes = attributes
+                opened_guards.append(guard)
+            else:
+                anchor_path = canonical
+                anchor_file_id = self._windows_file_id_from_handle(
+                    current_guard.handle
+                )
+        finally:
+            for guard in reversed(opened_guards):
+                guard.close()
+
+        for component in missing_parts:
+            if case_sensitive is None:
+                raise CapabilityDenied(
+                    "Windows directory path identity policy is unavailable"
+                )
+            canonical = canonical / self._windows_future_component(
+                component,
+                case_sensitive=case_sensitive,
+            )
+        canonical = Path(os.path.abspath(os.path.normpath(os.fspath(canonical))))
+        self._windows_relative_to_root_exact(canonical)
+        return canonical, _WindowsResolvedIdentity(
+            target_path=os.fspath(canonical),
+            target_exists=not missing_parts,
+            anchor_path=os.fspath(anchor_path),
+            anchor_file_id=anchor_file_id,
+            case_sensitive=case_sensitive,
+        )
+
+    def _windows_relative_to_root_exact(self, path: Path) -> Path:
+        """Return a relative path using exact stored Windows components."""
+
+        return self._windows_relative_to_exact_base(path, self.root)
+
+    @staticmethod
+    def _windows_relative_to_exact_base(path: Path, base: Path) -> Path:
+        """Return ``path`` below ``base`` without Win32 case folding."""
+
+        path_parts = path.parts
+        root_parts = base.parts
+        if (
+            len(path_parts) < len(root_parts)
+            or path_parts[: len(root_parts)] != root_parts
+        ):
+            raise CapabilityDenied(
+                "Windows filesystem path escapes its exact canonical base"
+            )
+        remaining = path_parts[len(root_parts) :]
+        return Path(*remaining) if remaining else Path(".")
+
+    @staticmethod
+    def _windows_path_is_missing_error(exc: OSError) -> bool:
+        return isinstance(exc, (FileNotFoundError, NotADirectoryError)) or getattr(
+            exc,
+            "winerror",
+            None,
+        ) in {2, 3}
+
+    @staticmethod
+    def _windows_future_component(
+        component: str,
+        *,
+        case_sensitive: bool,
+    ) -> str:
+        _validate_windows_path_syntax(component)
+        if component in {"", ".", ".."}:
+            raise CapabilityDenied("invalid canonical Windows future path component")
+        if _WINDOWS_DOS_SHORT_NAME_PATTERN.fullmatch(component):
+            raise CapabilityDenied(
+                "ambiguous DOS short name cannot identify a future Windows path"
+            )
+        if case_sensitive:
+            return component
+        if not component.isascii():
+            raise CapabilityDenied(
+                "cannot derive a safe non-ASCII future path identity in a "
+                "case-insensitive Windows directory"
+            )
+        return component.lower()
 
     @staticmethod
     def _darwin_existing_descriptor_path(
@@ -704,18 +1098,28 @@ class LocalFilesystemProvider:
 
     def state(self, path: ResolvedPath) -> PathState:
         with self._path_lock.hold(path.relative):
-            target = self._target(path)
-            return self._state_under_root(target)
+            with self._hold_windows_root_identity():
+                target = self._target(path)
+                return self._state_under_root(path, target)
 
     def read_bytes(self, path: ResolvedPath, *, max_bytes: int | None = None) -> bytes:
         with self._path_lock.hold(path.relative):
-            target = self._target(path)
-            self._before_path_sink("read_bytes", target)
-            target = self._target(path)
-            with self._open_existing_file(target, os.O_RDONLY) as handle:
-                if max_bytes is None:
-                    return handle.read()
-                return handle.read(max(0, max_bytes))
+            with self._hold_windows_root_identity():
+                target = self._target(path)
+                self._before_path_sink("read_bytes", target)
+                target = self._target(path)
+                with self._open_existing_file(
+                    target,
+                    os.O_RDONLY,
+                    windows_identity=(
+                        self._windows_resolved_identity(path)
+                        if os.name == "nt"
+                        else None
+                    ),
+                ) as handle:
+                    if max_bytes is None:
+                        return handle.read()
+                    return handle.read(max(0, max_bytes))
 
     def write_text(
         self,
@@ -765,59 +1169,85 @@ class LocalFilesystemProvider:
         expected_content_sha256: str | None,
     ) -> None:
         self._validate_expected_content_sha256(expected_content_sha256)
+        windows_identity = (
+            self._windows_resolved_identity(path) if os.name == "nt" else None
+        )
         with self._path_lock.hold(HierarchicalPathLock.creation_scope(path.relative)):
-            target = self._target(path)
-            if expected_content_sha256 is not None:
-                initial = self._content_snapshot_under_root(target)
-                self._require_expected_content(
-                    initial,
-                    expected_content_sha256,
-                    target=target,
+            with self._hold_windows_root_identity():
+                target = self._target(path)
+                if expected_content_sha256 is not None:
+                    initial = self._content_snapshot_under_root(
+                        target,
+                        windows_identity=windows_identity,
+                    )
+                    self._require_expected_content(
+                        initial,
+                        expected_content_sha256,
+                        target=target,
+                    )
+                self._before_path_sink_checked("write_parent", target.parent)
+                parent_guard = self._ensure_parent_dirs_under_root(
+                    target,
+                    windows_identity=windows_identity,
                 )
-            self._before_path_sink_checked("write_parent", target.parent)
-            self._ensure_parent_dirs_under_root(target)
-            target = self._target(path)
-            self._before_path_sink("write_text", target)
-            target = self._target(path)
-            expected_snapshot = None
-            expected_missing = False
-            if expected_content_sha256 is not None:
-                expected_snapshot = self._content_snapshot_under_root(target)
-                self._require_expected_content(
-                    expected_snapshot,
-                    expected_content_sha256,
-                    target=target,
-                )
-                expected_missing = expected_content_sha256 == "missing"
-            with self._open_write_file(
-                target,
-                encoding=encoding,
-                newline=newline,
-                overwrite=overwrite,
-                expected_snapshot=expected_snapshot,
-                expected_missing=expected_missing,
-            ) as handle:
-                handle.write(text)
-            self._target(path)
+                try:
+                    target = self._target(path)
+                    self._before_path_sink("write_text", target)
+                    target = self._target(path)
+                    expected_snapshot = None
+                    expected_missing = False
+                    if expected_content_sha256 is not None:
+                        expected_snapshot = self._content_snapshot_under_root(
+                            target,
+                            windows_identity=windows_identity,
+                        )
+                        self._require_expected_content(
+                            expected_snapshot,
+                            expected_content_sha256,
+                            target=target,
+                        )
+                        expected_missing = expected_content_sha256 == "missing"
+                    with self._open_write_file(
+                        target,
+                        encoding=encoding,
+                        newline=newline,
+                        overwrite=overwrite,
+                        expected_snapshot=expected_snapshot,
+                        expected_missing=expected_missing,
+                        windows_identity=windows_identity,
+                    ) as handle:
+                        handle.write(text)
+                    self._target(path)
+                finally:
+                    if parent_guard is not None:
+                        parent_guard.close()
 
     def make_directory(self, path: ResolvedPath, *, parents: bool, exist_ok: bool) -> None:
         with self._path_lock.hold(HierarchicalPathLock.creation_scope(path.relative)):
-            target = self._target(path)
-            self._before_path_sink_checked("make_directory", target)
-            self._make_directory_under_root(target, parents=parents, exist_ok=exist_ok)
-            self._target(path)
+            with self._hold_windows_root_identity():
+                target = self._target(path)
+                self._before_path_sink_checked("make_directory", target)
+                self._make_directory_under_root(
+                    path,
+                    target,
+                    parents=parents,
+                    exist_ok=exist_ok,
+                )
+                self._target(path)
 
     def list_directory(self, path: ResolvedPath, *, limit: int | None = None) -> list[DirectoryEntrySnapshot]:
         with self._path_lock.hold(path.relative):
-            target = self._target(path)
-            self._before_path_sink_checked("list_directory", target)
-            return self._list_directory_under_root(target, limit=limit)
+            with self._hold_windows_root_identity():
+                target = self._target(path)
+                self._before_path_sink_checked("list_directory", target)
+                return self._list_directory_under_root(path, target, limit=limit)
 
     def delete_file(self, path: ResolvedPath) -> None:
         with self._path_lock.hold(path.relative):
-            target = self._target(path)
-            self._delete_file_under_root(path, target)
-            self._target(path)
+            with self._hold_windows_root_identity():
+                target = self._target(path)
+                self._delete_file_under_root(path, target)
+                self._target(path)
 
     def contains_descendant_name(
         self,
@@ -826,19 +1256,33 @@ class LocalFilesystemProvider:
         names: tuple[str, ...],
     ) -> bool:
         with self._path_lock.hold(path.relative):
-            target = self._target(path)
-            return self._contains_descendant_name(target, names)
+            with self._hold_windows_root_identity():
+                target = self._target(path)
+                if os.name == "nt":
+                    identity = self._windows_resolved_identity(path)
+                    guard = self._windows_directory_guard(target)
+                    try:
+                        self._windows_verify_handle_binding(
+                            guard.handle,
+                            target,
+                            identity,
+                        )
+                        return self._contains_descendant_name(target, names)
+                    finally:
+                        guard.close()
+                return self._contains_descendant_name(target, names)
 
     def delete_directory(self, path: ResolvedPath, *, recursive: bool) -> None:
         with self._path_lock.hold(path.relative):
-            target = self._target(path)
-            self._delete_directory_under_root(
-                path,
-                target,
-                recursive=recursive,
-                protected_descendant_names=(),
-            )
-            self._target(path)
+            with self._hold_windows_root_identity():
+                target = self._target(path)
+                self._delete_directory_under_root(
+                    path,
+                    target,
+                    recursive=recursive,
+                    protected_descendant_names=(),
+                )
+                self._target(path)
 
     def delete_directory_protected(
         self,
@@ -848,14 +1292,15 @@ class LocalFilesystemProvider:
         protected_descendant_names: tuple[str, ...],
     ) -> None:
         with self._path_lock.hold(path.relative):
-            target = self._target(path)
-            self._delete_directory_under_root(
-                path,
-                target,
-                recursive=recursive,
-                protected_descendant_names=protected_descendant_names,
-            )
-            self._target(path)
+            with self._hold_windows_root_identity():
+                target = self._target(path)
+                self._delete_directory_under_root(
+                    path,
+                    target,
+                    recursive=recursive,
+                    protected_descendant_names=protected_descendant_names,
+                )
+                self._target(path)
 
     def classify_external_effect(
         self,
@@ -887,16 +1332,91 @@ class LocalFilesystemProvider:
         # string, and keep Darwin case/Unicode aliases pinned to the spelling
         # used for capability and data-label settlement.
         target = self.root / path.relative
-        resolved = target.resolve()
-        if self.root not in resolved.parents and resolved != self.root:
-            raise CapabilityDenied(f"path escapes filesystem adapter root: {path.relative}")
+        if os.name == "nt":
+            target = Path(
+                os.path.abspath(os.path.normpath(os.fspath(target)))
+            )
+            self._windows_relative_to_root_exact(target)
+        else:
+            resolved = target.resolve()
+            if self.root in resolved.parents or resolved == self.root:
+                self._reject_reparse_components(target)
+                return target
+            raise CapabilityDenied(
+                f"path escapes filesystem adapter root: {path.relative}"
+            )
         self._reject_reparse_components(target)
         return target
 
     def _before_path_sink(self, operation: str, target: Path) -> None:
         return None
 
+    def _after_windows_path_guarded(self, operation: str, target: Path) -> None:
+        """Deterministic race-test hook invoked while a Win32 guard is held."""
+
+        return None
+
+    def _after_windows_descendant_enumerated(self, target: Path) -> None:
+        """Race-test hook before a Windows descendant receives its own handle."""
+
+        return None
+
+    def _after_windows_descendant_guarded(self, target: Path) -> None:
+        """Race-test hook while a Windows descendant handle remains held."""
+
+        return None
+
+    @contextlib.contextmanager
+    def _hold_windows_root_identity(self) -> Iterator[None]:
+        guard = self._windows_open_verified_root() if os.name == "nt" else None
+        try:
+            yield
+        finally:
+            if guard is not None:
+                guard.close()
+
     def _reject_reparse_components(self, target: Path) -> None:
+        if os.name == "nt":
+            relative_parts = self._windows_relative_to_root_exact(target).parts
+            current = self.root
+            root_guard = self._windows_open_verified_root()
+            opened_guards = [root_guard]
+            try:
+                for part in relative_parts:
+                    current = current / part
+                    try:
+                        guard = _WindowsDirectoryGuard.open(current)
+                    except OSError as exc:
+                        if self._windows_path_is_missing_error(exc):
+                            break
+                        raise CapabilityDenied(
+                            "cannot inspect Windows filesystem path identity"
+                        ) from exc
+                    try:
+                        try:
+                            attributes = self._windows_attributes_from_handle(
+                                guard.handle
+                            )
+                            if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                                raise CapabilityDenied(
+                                    "Windows filesystem path contains a reparse point"
+                                )
+                            opened = self._windows_final_path_from_handle(guard.handle)
+                            self._windows_relative_to_root_exact(opened)
+                        except CapabilityDenied:
+                            raise
+                        except OSError as exc:
+                            raise CapabilityDenied(
+                                "cannot inspect Windows filesystem path identity"
+                            ) from exc
+                    except Exception:
+                        guard.close()
+                        raise
+                    opened_guards.append(guard)
+            finally:
+                for opened_guard in reversed(opened_guards):
+                    opened_guard.close()
+            return
         try:
             relative_parts = target.relative_to(self.root).parts
         except ValueError as exc:
@@ -915,8 +1435,18 @@ class LocalFilesystemProvider:
         is_junction = getattr(path, "is_junction", None)
         return bool(is_junction()) if callable(is_junction) else False
 
-    def _open_existing_file(self, target: Path, flags: int) -> Any:
-        fd = self._open_under_root(target, flags)
+    def _open_existing_file(
+        self,
+        target: Path,
+        flags: int,
+        *,
+        windows_identity: _WindowsResolvedIdentity | None = None,
+    ) -> Any:
+        fd = self._open_under_root(
+            target,
+            flags,
+            windows_identity=windows_identity,
+        )
         try:
             self._validate_open_regular_file(fd, target)
             return os.fdopen(fd, "rb")
@@ -933,6 +1463,7 @@ class LocalFilesystemProvider:
         overwrite: bool,
         expected_snapshot: _FilesystemContentSnapshot | None = None,
         expected_missing: bool = False,
+        windows_identity: _WindowsResolvedIdentity | None = None,
     ) -> Any:
         try:
             if expected_snapshot is not None:
@@ -940,20 +1471,37 @@ class LocalFilesystemProvider:
                     raise ValidationError(
                         "filesystem CAS overwrite of existing content requires overwrite=true"
                     )
-                fd = self._open_under_root(target, os.O_WRONLY)
+                fd = self._open_under_root(
+                    target,
+                    os.O_WRONLY,
+                    windows_identity=windows_identity,
+                )
             else:
                 fd = self._open_under_root(
                     target,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    windows_identity=windows_identity,
+                    allow_created_windows_target=(
+                        windows_identity is not None
+                        and not windows_identity.target_exists
+                    ),
                 )
         except FileExistsError:
+            if windows_identity is not None and not windows_identity.target_exists:
+                raise CapabilityDenied(
+                    "missing Windows filesystem target appeared after authorization"
+                ) from None
             if expected_missing:
                 raise FilesystemContentConflict(
                     "filesystem content changed before compare-and-swap write"
                 ) from None
             if not overwrite:
                 raise
-            fd = self._open_under_root(target, os.O_WRONLY)
+            fd = self._open_under_root(
+                target,
+                os.O_WRONLY,
+                windows_identity=windows_identity,
+            )
         except FileNotFoundError:
             if expected_snapshot is not None:
                 raise FilesystemContentConflict(
@@ -977,9 +1525,23 @@ class LocalFilesystemProvider:
             os.close(fd)
             raise
 
-    def _open_under_root(self, target: Path, flags: int, mode: int = 0o666) -> int:
+    def _open_under_root(
+        self,
+        target: Path,
+        flags: int,
+        mode: int = 0o666,
+        *,
+        windows_identity: _WindowsResolvedIdentity | None = None,
+        allow_created_windows_target: bool = False,
+    ) -> int:
         if os.open not in os.supports_dir_fd:
-            return self._open_under_root_fallback(target, flags, mode)
+            return self._open_under_root_fallback(
+                target,
+                flags,
+                mode,
+                windows_identity=windows_identity,
+                allow_created_windows_target=allow_created_windows_target,
+            )
         parts = self._relative_parts(target)
         if not parts:
             raise CapabilityDenied("filesystem operation requires a file path below the adapter root")
@@ -994,11 +1556,11 @@ class LocalFilesystemProvider:
             with contextlib.suppress(OSError):
                 os.close(dir_fd)
 
-    def _state_under_root(self, target: Path) -> PathState:
+    def _state_under_root(self, path: ResolvedPath, target: Path) -> PathState:
         if self._supports_dir_fd_state():
             return self._state_under_root_dir_fd(target)
         if os.name == "nt":
-            return self._state_under_root_windows(target)
+            return self._state_under_root_windows(path, target)
         raise CapabilityDenied(
             "filesystem state requires descriptor-bound path inspection"
         )
@@ -1031,31 +1593,60 @@ class LocalFilesystemProvider:
         finally:
             os.close(parent_fd)
 
-    def _state_under_root_windows(self, target: Path) -> PathState:
-        guard_target = target if target == self.root else target.parent
-        while guard_target != self.root and not guard_target.exists():
-            guard_target = guard_target.parent
-        guard = self._windows_directory_guard(guard_target)
-        if guard is None:
-            raise CapabilityDenied(
-                "filesystem state requires a guarded Windows path"
-            )
+    def _state_under_root_windows(
+        self,
+        path: ResolvedPath,
+        target: Path,
+    ) -> PathState:
+        identity = self._windows_resolved_identity(path)
+        if identity.target_exists:
+            guard_target = target if target == self.root else target.parent
+            guard = self._windows_directory_guard(guard_target)
+        else:
+            guard_target = Path(identity.anchor_path)
+            guard = self._windows_open_verified_anchor(identity)
         try:
             self._before_path_sink_checked("state", target)
-            self._reject_reparse_components(target)
-            try:
-                observed = target.lstat()
-            except (FileNotFoundError, NotADirectoryError):
-                return PathState(exists=False, kind="missing")
-            file_attributes = int(getattr(observed, "st_file_attributes", 0))
-            reparse_attribute = int(
-                getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
-            )
-            if stat.S_ISLNK(observed.st_mode) or file_attributes & reparse_attribute:
-                raise CapabilityDenied(
-                    f"filesystem path contains a symlink or junction: {target}"
+            if not identity.target_exists:
+                future_parts = self._windows_relative_to_exact_base(
+                    target,
+                    guard_target,
+                ).parts
+                if not future_parts:
+                    raise CapabilityDenied(
+                        "invalid missing Windows filesystem identity"
+                    )
+                first_future = guard_target / future_parts[0]
+                try:
+                    appeared = _WindowsDirectoryGuard.open(first_future)
+                except OSError as exc:
+                    if self._windows_path_is_missing_error(exc):
+                        return PathState(exists=False, kind="missing")
+                    raise CapabilityDenied(
+                        "cannot revalidate missing Windows filesystem path"
+                    ) from exc
+                else:
+                    appeared.close()
+                    raise CapabilityDenied(
+                        "missing Windows filesystem path appeared after authorization"
+                    )
+            if target == self.root:
+                self._windows_verify_handle_binding(
+                    guard.handle,
+                    target,
+                    identity,
                 )
-            return self._path_state_from_stat(observed)
+                return self._windows_path_state_from_handle(guard.handle)
+            target_guard = _WindowsDirectoryGuard.open(target)
+            try:
+                self._windows_verify_handle_binding(
+                    target_guard.handle,
+                    target,
+                    identity,
+                )
+                return self._windows_path_state_from_handle(target_guard.handle)
+            finally:
+                target_guard.close()
         finally:
             guard.close()
 
@@ -1093,11 +1684,41 @@ class LocalFilesystemProvider:
         if guard is None:
             raise CapabilityDenied("file delete requires dir_fd support on this platform")
         try:
-            self._require_existing_single_link_file(target)
+            identity = self._windows_resolved_identity(path)
             self._before_path_sink_checked("delete_file", target)
             self._target(path)
-            self._require_existing_single_link_file(target)
-            target.unlink()
+            target_guard = _WindowsDirectoryGuard.open(
+                target,
+                desired_access=_FILE_READ_ATTRIBUTES | _DELETE,
+            )
+            try:
+                self._windows_verify_handle_binding(
+                    target_guard.handle,
+                    target,
+                    identity,
+                )
+                attributes = self._windows_attributes_from_handle(
+                    target_guard.handle
+                )
+                if attributes & _FILE_ATTRIBUTE_DIRECTORY:
+                    raise CapabilityDenied(
+                        "Windows file delete target is a directory"
+                    )
+                information = self._windows_handle_information(
+                    target_guard.handle
+                )
+                if int(information.nNumberOfLinks) > 1:
+                    raise CapabilityDenied(
+                        "Windows file delete target has multiple hard links"
+                    )
+                try:
+                    self._windows_mark_handle_for_delete(target_guard.handle)
+                except OSError as exc:
+                    raise CapabilityDenied(
+                        "Windows file could not be deleted by verified handle"
+                    ) from exc
+            finally:
+                target_guard.close()
         finally:
             guard.close()
 
@@ -1140,28 +1761,56 @@ class LocalFilesystemProvider:
 
         guard = self._windows_parent_directory_guard(target)
         try:
+            identity = self._windows_resolved_identity(path)
             self._before_path_sink_checked("delete_directory", target)
             self._target(path)
-            if recursive:
-                self._reject_protected_descendants(
+            target_guard = _WindowsDirectoryGuard.open(
+                target,
+                desired_access=_FILE_READ_ATTRIBUTES | _DELETE,
+            )
+            try:
+                self._windows_verify_handle_binding(
+                    target_guard.handle,
                     target,
-                    protected_descendant_names,
+                    identity,
                 )
-                if protected_descendant_names:
-                    if os.name != "nt":
-                        raise CapabilityDenied(
-                            "protected recursive delete requires descriptor-bound "
-                            "directory operations on this platform"
-                        )
+                attributes = self._windows_attributes_from_handle(
+                    target_guard.handle
+                )
+                if not attributes & _FILE_ATTRIBUTE_DIRECTORY:
+                    raise CapabilityDenied(
+                        "Windows directory delete target is not a directory"
+                    )
+                self._after_windows_path_guarded(
+                    "delete_directory",
+                    target,
+                )
+                delete_state = _ProtectedDeleteState()
+                if recursive:
+                    self._reject_protected_descendants(
+                        target,
+                        protected_descendant_names,
+                    )
                     self._delete_protected_directory_path(
                         target,
                         protected_descendant_names,
-                        _ProtectedDeleteState(),
+                        delete_state,
+                        remove_root=False,
+                        guard_target=False,
                     )
-                else:
-                    shutil.rmtree(target)
-            else:
-                target.rmdir()
+                try:
+                    self._windows_mark_handle_for_delete(target_guard.handle)
+                except OSError as exc:
+                    message = (
+                        "Windows directory could not be deleted by verified handle"
+                    )
+                    if delete_state.mutation_started:
+                        raise CapabilityDenied(message) from exc
+                    raise _ProtectedMetadataDeleteDenied(message) from exc
+                delete_state.mutation_started = True
+                self._after_protected_delete_entry(target)
+            finally:
+                target_guard.close()
         finally:
             if guard is not None:
                 guard.close()
@@ -1275,8 +1924,15 @@ class LocalFilesystemProvider:
         target: Path,
         protected_descendant_names: tuple[str, ...],
         delete_state: _ProtectedDeleteState,
+        *,
+        remove_root: bool = True,
+        guard_target: bool = True,
     ) -> None:
-        guard = self._windows_directory_guard(target)
+        guard = (
+            self._windows_open_guarded_child_directory_for_delete(target)
+            if guard_target
+            else None
+        )
         try:
             with os.scandir(target) as iterator:
                 entries = sorted(iterator, key=lambda entry: entry.name)
@@ -1306,14 +1962,21 @@ class LocalFilesystemProvider:
                         self._after_protected_delete_entry(child)
                 except FileNotFoundError:
                     continue
+            if remove_root:
+                if guard is not None:
+                    try:
+                        self._windows_mark_handle_for_delete(guard.handle)
+                    except OSError as exc:
+                        raise CapabilityDenied(
+                            "Windows recursive directory changed before handle delete"
+                        ) from exc
+                else:
+                    target.rmdir()
+                delete_state.mutation_started = True
+                self._after_protected_delete_entry(target)
         finally:
-            guard.close()
-        # Do not rescan after processing the captured entry set. If another
-        # actor inserted metadata in the meantime, rmdir fails non-empty and
-        # leaves that new entry untouched.
-        target.rmdir()
-        delete_state.mutation_started = True
-        self._after_protected_delete_entry(target)
+            if guard is not None:
+                guard.close()
 
     def _reject_protected_descendants(
         self,
@@ -1333,6 +1996,8 @@ class LocalFilesystemProvider:
         protected = {name.casefold() for name in names}
         if not protected:
             return False
+        if os.name == "nt":
+            return self._windows_contains_descendant_name(target, protected)
 
         scan_failed = False
 
@@ -1366,6 +2031,58 @@ class LocalFilesystemProvider:
         # inspected. The caller deliberately receives only a boolean so path
         # names discovered during this policy scan are never exposed.
         return scan_failed
+
+    def _windows_contains_descendant_name(
+        self,
+        target: Path,
+        protected: set[str],
+    ) -> bool:
+        """Scan descendants without following an unverified Win32 name.
+
+        Both Windows call sites retain a verified handle for ``target``. Each
+        recursive frame then keeps its own non-reparse directory handle open,
+        so ``os.scandir`` cannot be redirected by a rename or reparse mutation.
+        Entry names are checked before traversal, and each possible directory
+        receives an ``OPEN_REPARSE_POINT`` handle before it can be scanned.
+        Any unprovable entry fails closed as a protected-name match.
+        """
+
+        try:
+            with os.scandir(target) as iterator:
+                names = sorted(entry.name for entry in iterator)
+        except OSError:
+            return True
+        if any(name.casefold() in protected for name in names):
+            return True
+
+        for name in names:
+            child = target / name
+            try:
+                self._after_windows_descendant_enumerated(child)
+                guard = _WindowsDirectoryGuard.open(child)
+            except OSError:
+                return True
+            try:
+                attributes = self._windows_attributes_from_handle(guard.handle)
+                if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                    continue
+                if not attributes & _FILE_ATTRIBUTE_DIRECTORY:
+                    continue
+                opened = self._windows_final_path_from_handle(guard.handle)
+                requested = Path(
+                    os.path.abspath(os.path.normpath(os.fspath(child)))
+                )
+                if not self._windows_paths_match_exactly(opened, requested):
+                    return True
+                self._windows_relative_to_root_exact(opened)
+                self._after_windows_descendant_guarded(child)
+                if self._windows_contains_descendant_name(child, protected):
+                    return True
+            except (CapabilityDenied, OSError):
+                return True
+            finally:
+                guard.close()
+        return False
 
     def _supports_dir_fd_deletes(self) -> bool:
         return (
@@ -1409,13 +2126,20 @@ class LocalFilesystemProvider:
             supported = supported and os.scandir in os.supports_fd
         return supported
 
-    def _ensure_parent_dirs_under_root(self, target: Path) -> None:
+    def _ensure_parent_dirs_under_root(
+        self,
+        target: Path,
+        *,
+        windows_identity: _WindowsResolvedIdentity | None = None,
+    ) -> _WindowsDirectoryGuardChain | None:
         parts = self._relative_parts(target)
-        if len(parts) <= 1:
-            return
         if not self._supports_dir_fd_directory_ops():
-            self._fallback_create_parent_dirs(target)
-            return
+            return self._fallback_create_parent_dirs(
+                target,
+                windows_identity=windows_identity,
+            )
+        if len(parts) <= 1:
+            return None
         dir_fd = self._open_root_dir_fd()
         try:
             for part in parts[:-1]:
@@ -1424,15 +2148,32 @@ class LocalFilesystemProvider:
                 dir_fd = next_fd
         finally:
             os.close(dir_fd)
+        return None
 
-    def _make_directory_under_root(self, target: Path, *, parents: bool, exist_ok: bool) -> None:
+    def _make_directory_under_root(
+        self,
+        path: ResolvedPath,
+        target: Path,
+        *,
+        parents: bool,
+        exist_ok: bool,
+    ) -> None:
         parts = self._relative_parts(target)
         if not parts:
             if exist_ok:
                 return
             raise FileExistsError(os.fspath(target))
         if not self._supports_dir_fd_directory_ops():
-            self._fallback_make_directory(target, parents=parents, exist_ok=exist_ok)
+            self._fallback_make_directory(
+                target,
+                parents=parents,
+                exist_ok=exist_ok,
+                windows_identity=(
+                    self._windows_resolved_identity(path)
+                    if os.name == "nt"
+                    else None
+                ),
+            )
             return
         if parents:
             dir_fd = self._open_root_dir_fd()
@@ -1478,9 +2219,23 @@ class LocalFilesystemProvider:
                 raise CapabilityDenied(f"filesystem path contains a symlink or non-directory component: {target}") from exc
             raise
 
-    def _list_directory_under_root(self, target: Path, *, limit: int | None) -> list[DirectoryEntrySnapshot]:
+    def _list_directory_under_root(
+        self,
+        path: ResolvedPath,
+        target: Path,
+        *,
+        limit: int | None,
+    ) -> list[DirectoryEntrySnapshot]:
         if not self._supports_dir_fd_directory_ops(require_list=True):
-            return self._fallback_list_directory(target, limit=limit)
+            return self._fallback_list_directory(
+                target,
+                limit=limit,
+                windows_identity=(
+                    self._windows_resolved_identity(path)
+                    if os.name == "nt"
+                    else None
+                ),
+            )
         selected_limit, reject_overflow = self._directory_scan_limit(limit)
         dir_fd = self._open_directory_under_root(target)
         try:
@@ -1544,57 +2299,237 @@ class LocalFilesystemProvider:
                 f"filesystem path contains a symlink or junction, or changed before {operation}: {target}"
             ) from exc
 
-    def _fallback_create_parent_dirs(self, target: Path) -> None:
-        if target.parent == self.root:
-            return
+    def _fallback_create_parent_dirs(
+        self,
+        target: Path,
+        *,
+        windows_identity: _WindowsResolvedIdentity | None = None,
+    ) -> _WindowsDirectoryGuardChain:
         if os.name != "nt":
             raise CapabilityDenied(
                 "filesystem parent creation requires descriptor-bound directory operations"
             )
+        if windows_identity is None:
+            raise CapabilityDenied(
+                "Windows parent creation requires a provider-issued identity"
+            )
         parts = self._relative_parts(target)
         current = self.root
         guard = self._windows_directory_guard(current)
+        anchor = Path(windows_identity.anchor_path)
+        anchor_seen = windows_identity.target_exists
         try:
+            if not windows_identity.target_exists and self._windows_paths_match_exactly(
+                current,
+                anchor,
+            ):
+                self._windows_verify_anchor_handle(
+                    guard.handle,
+                    current,
+                    windows_identity,
+                )
+                anchor_seen = True
             for part in parts[:-1]:
                 child = current / part
-                try:
-                    child.mkdir()
-                except FileExistsError:
-                    pass
-                except OSError as exc:
+                created = False
+                if windows_identity.target_exists or not anchor_seen:
+                    try:
+                        child_guard = self._windows_directory_guard(child)
+                    except CapabilityDenied as exc:
+                        cause = exc.__cause__
+                        if isinstance(cause, OSError) and self._windows_path_is_missing_error(
+                            cause
+                        ):
+                            raise CapabilityDenied(
+                                "Windows filesystem parent disappeared after authorization"
+                            ) from None
+                        raise
+                else:
+                    try:
+                        child.mkdir()
+                        created = True
+                    except FileExistsError as exc:
+                        raise CapabilityDenied(
+                            "missing Windows filesystem parent appeared after authorization"
+                        ) from exc
+                    except OSError as exc:
+                        raise CapabilityDenied(
+                            "Windows filesystem parent could not be created safely"
+                        ) from exc
+                    child_guard = self._windows_directory_guard(child)
+                if not windows_identity.target_exists and self._windows_paths_match_exactly(
+                    child,
+                    anchor,
+                ):
+                    self._windows_verify_anchor_handle(
+                        child_guard.handle,
+                        child,
+                        windows_identity,
+                    )
+                    anchor_seen = True
+                elif created and (
+                    self._windows_directory_case_sensitive(child_guard.handle)
+                    != windows_identity.case_sensitive
+                ):
+                    child_guard.close()
                     raise CapabilityDenied(
-                        f"filesystem parent path could not be created safely: {child}"
-                    ) from exc
-                child_guard = self._windows_directory_guard(child)
+                        "created Windows parent has an unexpected case policy"
+                    )
                 guard.close()
                 guard = child_guard
                 current = child
-        finally:
+            if not anchor_seen:
+                raise CapabilityDenied(
+                    "Windows filesystem parent identity changed after authorization"
+                )
+            return guard
+        except OSError as exc:
             guard.close()
+            raise CapabilityDenied(
+                "Windows filesystem parent path could not be guarded"
+            ) from exc
+        except Exception:
+            guard.close()
+            raise
 
-    def _fallback_make_directory(self, target: Path, *, parents: bool, exist_ok: bool) -> None:
+    def _fallback_make_directory(
+        self,
+        target: Path,
+        *,
+        parents: bool,
+        exist_ok: bool,
+        windows_identity: _WindowsResolvedIdentity | None = None,
+    ) -> None:
+        if windows_identity is None:
+            raise CapabilityDenied(
+                "Windows directory create requires a provider-issued identity"
+            )
         if parents:
-            self._fallback_create_parent_dirs(target)
-        guard = self._windows_parent_directory_guard(target)
+            guard = self._fallback_create_parent_dirs(
+                target,
+                windows_identity=windows_identity,
+            )
+        else:
+            guard = self._windows_parent_directory_guard(target)
         try:
-            self._target(ResolvedPath(display=os.fspath(target), relative=target.relative_to(self.root).as_posix()))
-            target.mkdir(parents=False, exist_ok=exist_ok)
+            if windows_identity.target_exists:
+                target_guard = _WindowsDirectoryGuard.open(target)
+                try:
+                    self._windows_verify_handle_binding(
+                        target_guard.handle,
+                        target,
+                        windows_identity,
+                    )
+                    attributes = self._windows_attributes_from_handle(
+                        target_guard.handle
+                    )
+                    if not attributes & _FILE_ATTRIBUTE_DIRECTORY:
+                        raise CapabilityDenied(
+                            "Windows directory create target is not a directory"
+                        )
+                finally:
+                    target_guard.close()
+                if exist_ok:
+                    return
+                raise FileExistsError(os.fspath(target))
+            else:
+                anchor = Path(windows_identity.anchor_path)
+                if self._windows_paths_match_exactly(target.parent, anchor):
+                    if guard is None:
+                        raise CapabilityDenied(
+                            "Windows directory create requires a guarded parent"
+                        )
+                    self._windows_verify_anchor_handle(
+                        guard.handle,
+                        anchor,
+                        windows_identity,
+                    )
+                elif not parents:
+                    raise CapabilityDenied(
+                        "Windows directory parent appeared after authorization"
+                    )
+                self._after_windows_path_guarded(
+                    "make_directory_parent",
+                    target.parent,
+                )
+                try:
+                    appeared = _WindowsDirectoryGuard.open(target)
+                except OSError as exc:
+                    if not self._windows_path_is_missing_error(exc):
+                        raise CapabilityDenied(
+                            "cannot revalidate missing Windows directory"
+                        ) from exc
+                else:
+                    appeared.close()
+                    raise CapabilityDenied(
+                        "missing Windows directory appeared after authorization"
+                    )
+            try:
+                target.mkdir(parents=False, exist_ok=False)
+            except FileExistsError as exc:
+                raise CapabilityDenied(
+                    "missing Windows directory appeared after authorization"
+                ) from exc
+            target_guard = _WindowsDirectoryGuard.open(target)
+            try:
+                self._windows_verify_handle_binding(
+                    target_guard.handle,
+                    target,
+                    windows_identity,
+                    allow_created_target=not windows_identity.target_exists,
+                )
+                attributes = self._windows_attributes_from_handle(
+                    target_guard.handle
+                )
+                if not attributes & _FILE_ATTRIBUTE_DIRECTORY:
+                    raise CapabilityDenied(
+                        "Windows directory create produced a non-directory"
+                    )
+            finally:
+                target_guard.close()
         finally:
             if guard is not None:
                 guard.close()
 
-    def _fallback_list_directory(self, target: Path, *, limit: int | None) -> list[DirectoryEntrySnapshot]:
+    def _fallback_list_directory(
+        self,
+        target: Path,
+        *,
+        limit: int | None,
+        windows_identity: _WindowsResolvedIdentity | None = None,
+    ) -> list[DirectoryEntrySnapshot]:
         selected_limit, reject_overflow = self._directory_scan_limit(limit)
-        guard = _WindowsDirectoryGuard.open(target) if os.name == "nt" else None
+        guard = self._windows_directory_guard(target) if os.name == "nt" else None
         try:
             if guard is None:
                 raise CapabilityDenied("directory listing requires descriptor-bound directory operations")
-            opened = self._windows_final_path_from_handle(guard.handle)
+            if windows_identity is None:
+                raise CapabilityDenied(
+                    "Windows directory listing requires a provider-issued identity"
+                )
+            self._windows_verify_handle_binding(
+                guard.handle,
+                target,
+                windows_identity,
+            )
+            attributes = self._windows_attributes_from_handle(guard.handle)
+            if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                raise CapabilityDenied(
+                    "filesystem directory changed to a Windows reparse point"
+                )
+            if not attributes & _FILE_ATTRIBUTE_DIRECTORY:
+                raise CapabilityDenied("filesystem listing path is not a directory")
+            self._after_windows_path_guarded("list_directory", target)
+            try:
+                opened = self._windows_final_path_from_handle(guard.handle)
+            except OSError as exc:
+                raise CapabilityDenied(
+                    "cannot revalidate Windows directory identity"
+                ) from exc
             requested = Path(os.path.abspath(os.fspath(target)))
-            if os.path.normcase(os.fspath(opened)) != os.path.normcase(os.fspath(requested)):
+            if not self._windows_paths_match_exactly(opened, requested):
                 raise CapabilityDenied(f"filesystem directory path changed during validation: {target}")
-            if self.root not in opened.parents and opened != self.root:
-                raise CapabilityDenied(f"filesystem directory path escapes adapter root: {target}")
+            self._windows_relative_to_root_exact(opened)
             with os.scandir(target) as iterator:
                 children = [
                     Path(entry.path)
@@ -1613,39 +2548,116 @@ class LocalFilesystemProvider:
             if guard is not None:
                 guard.close()
 
-    def _windows_parent_directory_guard(self, target: Path) -> _WindowsDirectoryGuard | None:
+    def _windows_parent_directory_guard(
+        self,
+        target: Path,
+    ) -> _WindowsDirectoryGuardChain | None:
         if os.name != "nt":
             return None
         return self._windows_directory_guard(target.parent)
 
-    def _windows_directory_guard(self, directory: Path) -> _WindowsDirectoryGuard:
+    def _windows_directory_guard(
+        self,
+        directory: Path,
+        *,
+        desired_access: int | None = None,
+    ) -> _WindowsDirectoryGuardChain:
+        requested = Path(
+            os.path.abspath(os.path.normpath(os.fspath(directory)))
+        )
+        relative_parts = self._windows_relative_to_root_exact(requested).parts
+        root_guard = self._windows_open_verified_root()
+        guards = [root_guard]
         try:
-            if self._is_reparse_path(directory) or not directory.is_dir():
-                raise CapabilityDenied(
-                    f"filesystem path contains a symlink, junction, or non-directory: {directory}"
+            if not relative_parts:
+                if desired_access not in {None, _FILE_READ_ATTRIBUTES}:
+                    raise CapabilityDenied(
+                        "Windows filesystem adapter root cannot be mutated"
+                    )
+                return _WindowsDirectoryGuardChain(guards)
+            current = self.root
+            for index, part in enumerate(relative_parts):
+                current = current / part
+                selected_access = (
+                    desired_access
+                    if index == len(relative_parts) - 1
+                    else None
                 )
-            guard = _WindowsDirectoryGuard.open(directory)
-            opened = self._windows_final_path_from_handle(guard.handle)
-            requested = Path(os.path.abspath(os.fspath(directory)))
-            if os.path.normcase(os.fspath(opened)) != os.path.normcase(os.fspath(requested)):
+                try:
+                    guard = _WindowsDirectoryGuard.open(
+                        current,
+                        desired_access=selected_access,
+                    )
+                except OSError as exc:
+                    raise CapabilityDenied(
+                        "filesystem directory path could not be guarded"
+                    ) from exc
+                try:
+                    attributes = self._windows_attributes_from_handle(
+                        guard.handle
+                    )
+                    if (
+                        attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+                        or not attributes & _FILE_ATTRIBUTE_DIRECTORY
+                    ):
+                        raise CapabilityDenied(
+                            "filesystem path is a reparse point or non-directory"
+                        )
+                    opened = self._windows_final_path_from_handle(guard.handle)
+                    if not self._windows_paths_match_exactly(opened, current):
+                        raise CapabilityDenied(
+                            "filesystem directory spelling changed during validation"
+                        )
+                    self._windows_relative_to_root_exact(opened)
+                except OSError as exc:
+                    guard.close()
+                    raise CapabilityDenied(
+                        "filesystem directory path could not be validated"
+                    ) from exc
+                except Exception:
+                    guard.close()
+                    raise
+                guards.append(guard)
+            if not self._windows_paths_match_exactly(current, requested):
+                raise CapabilityDenied(
+                    "filesystem directory path changed during validation"
+                )
+            return _WindowsDirectoryGuardChain(guards)
+        except Exception:
+            for guard in reversed(guards):
                 guard.close()
-                raise CapabilityDenied(
-                    f"filesystem directory path changed during validation: {directory}"
-                )
-            if self.root not in opened.parents and opened != self.root:
-                guard.close()
-                raise CapabilityDenied(
-                    f"filesystem directory path escapes adapter root: {directory}"
-                )
-            return guard
-        except OSError as exc:
-            raise CapabilityDenied(
-                f"filesystem directory path could not be guarded: {directory}"
-            ) from exc
+            raise
 
-    def _open_under_root_fallback(self, target: Path, flags: int, mode: int) -> int:
+    def _open_under_root_fallback(
+        self,
+        target: Path,
+        flags: int,
+        mode: int,
+        *,
+        windows_identity: _WindowsResolvedIdentity | None = None,
+        allow_created_windows_target: bool = False,
+    ) -> int:
         guard = self._windows_parent_directory_guard(target)
         try:
+            if windows_identity is not None and not windows_identity.target_exists:
+                anchor = Path(windows_identity.anchor_path)
+                if self._windows_paths_match_exactly(target.parent, anchor):
+                    if guard is None:
+                        raise CapabilityDenied(
+                            "Windows filesystem create requires a guarded parent"
+                        )
+                    self._windows_verify_anchor_handle(
+                        guard.handle,
+                        anchor,
+                        windows_identity,
+                    )
+                else:
+                    anchor_guard = self._windows_open_verified_anchor(
+                        windows_identity
+                    )
+                    anchor_guard.close()
+            if guard is not None:
+                self._after_windows_path_guarded("open_parent", target.parent)
             self._require_existing_single_link_file(
                 target,
                 allow_missing=bool(flags & os.O_CREAT),
@@ -1658,7 +2670,12 @@ class LocalFilesystemProvider:
                 ) from exc
             fd = os.open(target, flags, mode)
             try:
-                self._validate_open_target_matches_request(fd, target)
+                self._validate_open_target_matches_request(
+                    fd,
+                    target,
+                    windows_identity=windows_identity,
+                    allow_created_windows_target=allow_created_windows_target,
+                )
             except Exception:
                 os.close(fd)
                 raise
@@ -1670,15 +2687,33 @@ class LocalFilesystemProvider:
     def _before_fallback_open(self, target: Path, flags: int) -> None:
         return None
 
-    def _validate_open_target_matches_request(self, fd: int, target: Path) -> None:
+    def _validate_open_target_matches_request(
+        self,
+        fd: int,
+        target: Path,
+        *,
+        windows_identity: _WindowsResolvedIdentity | None = None,
+        allow_created_windows_target: bool = False,
+    ) -> None:
         if os.name != "nt":
             return
-        opened = self._windows_final_path_from_fd(fd)
+        try:
+            opened = self._windows_final_path_from_fd(fd)
+        except OSError as exc:
+            raise CapabilityDenied(
+                "cannot revalidate Windows filesystem sink identity"
+            ) from exc
         requested = Path(os.path.abspath(os.fspath(target)))
-        if os.path.normcase(os.fspath(opened)) != os.path.normcase(os.fspath(requested)):
+        if not self._windows_paths_match_exactly(opened, requested):
             raise CapabilityDenied(f"filesystem opened path changed during validation: {target}")
-        if self.root not in opened.parents and opened != self.root:
-            raise CapabilityDenied(f"filesystem opened path escapes adapter root: {target}")
+        self._windows_relative_to_root_exact(opened)
+        if windows_identity is not None:
+            self._windows_verify_handle_binding(
+                int(msvcrt.get_osfhandle(fd)),
+                target,
+                windows_identity,
+                allow_created_target=allow_created_windows_target,
+            )
 
     def _windows_final_path_from_fd(self, fd: int) -> Path:
         if os.name != "nt":
@@ -1709,11 +2744,289 @@ class LocalFilesystemProvider:
                 return Path(value)
             size = int(result) + 1
 
-    def _relative_parts(self, target: Path) -> tuple[str, ...]:
+    @staticmethod
+    def _windows_attributes_from_handle(handle: int) -> int:
+        if os.name != "nt":
+            raise OSError("Windows handle attributes are only available on Windows")
+        information = _FILE_ATTRIBUTE_TAG_INFO()
+        if not _kernel32.GetFileInformationByHandleEx(
+            ctypes.c_void_p(handle),
+            _FILE_ATTRIBUTE_TAG_INFO_CLASS,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(information.FileAttributes)
+
+    @staticmethod
+    def _windows_file_id_from_handle(handle: int) -> _WindowsFileId:
+        if os.name != "nt":
+            raise OSError("Windows file identity is only available on Windows")
+        information = _FILE_ID_INFO()
+        if not _kernel32.GetFileInformationByHandleEx(
+            ctypes.c_void_p(handle),
+            _FILE_ID_INFO_CLASS,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return _WindowsFileId(
+            volume_serial_number=int(information.VolumeSerialNumber),
+            identifier=bytes(information.FileId.Identifier),
+        )
+
+    @staticmethod
+    def _windows_handle_information(handle: int) -> Any:
+        if os.name != "nt":
+            raise OSError("Windows handle information is only available on Windows")
+        information = _BY_HANDLE_FILE_INFORMATION()
+        if not _kernel32.GetFileInformationByHandle(
+            ctypes.c_void_p(handle),
+            ctypes.byref(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return information
+
+    @classmethod
+    def _windows_path_state_from_handle(cls, handle: int) -> PathState:
+        information = cls._windows_handle_information(handle)
+        attributes = int(information.dwFileAttributes)
+        is_directory = bool(attributes & _FILE_ATTRIBUTE_DIRECTORY)
+        size = (int(information.nFileSizeHigh) << 32) | int(
+            information.nFileSizeLow
+        )
+        last_write_ticks = (int(information.ftLastWriteTime.dwHighDateTime) << 32) | int(
+            information.ftLastWriteTime.dwLowDateTime
+        )
+        # FILETIME counts 100 ns intervals since 1601-01-01 UTC.
+        unix_seconds = max(
+            0.0,
+            (last_write_ticks - 116_444_736_000_000_000) / 10_000_000,
+        )
+        return PathState(
+            exists=True,
+            kind="directory" if is_directory else "file",
+            size_bytes=None if is_directory else size,
+            modified_at=datetime.fromtimestamp(
+                unix_seconds,
+                timezone.utc,
+            ).isoformat(),
+        )
+
+    @staticmethod
+    def _windows_directory_case_sensitive(handle: int) -> bool:
+        if os.name != "nt":
+            raise OSError(
+                "Windows directory case policy is only available on Windows"
+            )
+        information = _FILE_CASE_SENSITIVE_INFO()
+        if not _kernel32.GetFileInformationByHandleEx(
+            ctypes.c_void_p(handle),
+            _FILE_CASE_SENSITIVE_INFO_CLASS,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            raise CapabilityDenied(
+                "Windows directory path identity policy is unavailable"
+            ) from error
+        return bool(information.Flags & _FILE_CS_FLAG_CASE_SENSITIVE_DIR)
+
+    @staticmethod
+    def _windows_paths_match_exactly(left: Path, right: Path) -> bool:
+        return os.fspath(left) == os.fspath(right)
+
+    def _windows_resolved_identity(
+        self,
+        path: ResolvedPath,
+    ) -> _WindowsResolvedIdentity:
+        selected = path.provider_identity
+        if not isinstance(selected, _WindowsResolvedIdentity):
+            raise CapabilityDenied(
+                "Windows filesystem operation requires a provider-issued identity"
+            )
+        target = Path(
+            os.path.abspath(
+                os.path.normpath(os.fspath(self.root / path.relative))
+            )
+        )
+        if not self._windows_paths_match_exactly(
+            target,
+            Path(selected.target_path),
+        ):
+            raise CapabilityDenied(
+                "Windows filesystem operation identity does not match its path"
+            )
+        return selected
+
+    def _windows_verify_handle_binding(
+        self,
+        handle: int,
+        target: Path,
+        identity: _WindowsResolvedIdentity,
+        *,
+        allow_created_target: bool = False,
+    ) -> None:
+        attributes = self._windows_attributes_from_handle(handle)
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise CapabilityDenied(
+                "Windows filesystem path changed to a reparse point"
+            )
+        opened = self._windows_final_path_from_handle(handle)
+        requested = Path(os.path.abspath(os.path.normpath(os.fspath(target))))
+        if not self._windows_paths_match_exactly(opened, requested):
+            raise CapabilityDenied(
+                "Windows filesystem path identity changed after authorization"
+            )
+        self._windows_relative_to_root_exact(opened)
+        if identity.target_exists:
+            if self._windows_file_id_from_handle(handle) != identity.anchor_file_id:
+                raise CapabilityDenied(
+                    "Windows filesystem object identity changed after authorization"
+                )
+        elif not allow_created_target:
+            raise CapabilityDenied(
+                "missing Windows filesystem target appeared after authorization"
+            )
+
+    def _windows_open_verified_anchor(
+        self,
+        identity: _WindowsResolvedIdentity,
+    ) -> _WindowsDirectoryGuardChain:
+        anchor = Path(identity.anchor_path)
+        guard = self._windows_directory_guard(anchor)
         try:
-            parts = target.relative_to(self.root).parts
-        except ValueError as exc:
-            raise CapabilityDenied(f"path escapes filesystem adapter root: {target}") from exc
+            self._windows_verify_anchor_handle(guard.handle, anchor, identity)
+            return guard
+        except Exception:
+            guard.close()
+            raise
+
+    def _windows_open_verified_root(self) -> _WindowsDirectoryGuard:
+        expected_file_id = self._windows_root_file_id
+        if expected_file_id is None:
+            raise CapabilityDenied("Windows filesystem root identity is unavailable")
+        try:
+            guard = _WindowsDirectoryGuard.open(self.root)
+        except OSError as exc:
+            raise CapabilityDenied(
+                "Windows filesystem root could not be guarded"
+            ) from exc
+        try:
+            attributes = self._windows_attributes_from_handle(guard.handle)
+            if (
+                attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+                or not attributes & _FILE_ATTRIBUTE_DIRECTORY
+            ):
+                raise CapabilityDenied(
+                    "Windows filesystem root identity changed after initialization"
+                )
+            opened = self._windows_final_path_from_handle(guard.handle)
+            if not self._windows_paths_match_exactly(opened, self.root):
+                raise CapabilityDenied(
+                    "Windows filesystem root spelling changed after initialization"
+                )
+            if self._windows_file_id_from_handle(guard.handle) != expected_file_id:
+                raise CapabilityDenied(
+                    "Windows filesystem root identity changed after initialization"
+                )
+            return guard
+        except Exception:
+            guard.close()
+            raise
+
+    def _windows_verify_anchor_handle(
+        self,
+        handle: int,
+        anchor: Path,
+        identity: _WindowsResolvedIdentity,
+    ) -> None:
+        attributes = self._windows_attributes_from_handle(handle)
+        if (
+            attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+            or not attributes & _FILE_ATTRIBUTE_DIRECTORY
+        ):
+            raise CapabilityDenied(
+                "Windows filesystem parent identity changed after authorization"
+            )
+        opened = self._windows_final_path_from_handle(handle)
+        if not self._windows_paths_match_exactly(opened, anchor):
+            raise CapabilityDenied(
+                "Windows filesystem parent spelling changed after authorization"
+            )
+        self._windows_relative_to_root_exact(opened)
+        if self._windows_file_id_from_handle(handle) != identity.anchor_file_id:
+            raise CapabilityDenied(
+                "Windows filesystem parent identity changed after authorization"
+            )
+        if identity.case_sensitive is not None and (
+            self._windows_directory_case_sensitive(handle) != identity.case_sensitive
+        ):
+            raise CapabilityDenied(
+                "Windows filesystem parent case policy changed after authorization"
+            )
+
+    def _windows_open_guarded_child_directory_for_delete(
+        self,
+        target: Path,
+    ) -> _WindowsDirectoryGuard:
+        """Open a child while its full ancestor guard chain remains held."""
+
+        try:
+            guard = _WindowsDirectoryGuard.open(
+                target,
+                desired_access=_FILE_READ_ATTRIBUTES | _DELETE,
+            )
+        except OSError as exc:
+            raise CapabilityDenied(
+                "Windows recursive directory could not be guarded"
+            ) from exc
+        try:
+            attributes = self._windows_attributes_from_handle(guard.handle)
+            if (
+                attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+                or not attributes & _FILE_ATTRIBUTE_DIRECTORY
+            ):
+                raise CapabilityDenied(
+                    "Windows recursive path is a reparse point or non-directory"
+                )
+            opened = self._windows_final_path_from_handle(guard.handle)
+            requested = Path(
+                os.path.abspath(os.path.normpath(os.fspath(target)))
+            )
+            if not self._windows_paths_match_exactly(opened, requested):
+                raise CapabilityDenied(
+                    "Windows recursive directory spelling changed"
+                )
+            self._windows_relative_to_root_exact(opened)
+            return guard
+        except Exception:
+            guard.close()
+            raise
+
+    @staticmethod
+    def _windows_mark_handle_for_delete(handle: int) -> None:
+        if os.name != "nt":
+            raise OSError("Windows handle delete is only available on Windows")
+        information = _FILE_DISPOSITION_INFO(DeleteFile=1)
+        if not _kernel32.SetFileInformationByHandle(
+            ctypes.c_void_p(handle),
+            _FILE_DISPOSITION_INFO_CLASS,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def _relative_parts(self, target: Path) -> tuple[str, ...]:
+        if os.name == "nt":
+            parts = self._windows_relative_to_root_exact(target).parts
+        else:
+            try:
+                parts = target.relative_to(self.root).parts
+            except ValueError as exc:
+                raise CapabilityDenied(
+                    f"path escapes filesystem adapter root: {target}"
+                ) from exc
         if any(part in {"", ".", ".."} for part in parts):
             raise CapabilityDenied(f"invalid filesystem path component: {target}")
         return tuple(parts)
@@ -1758,9 +3071,15 @@ class LocalFilesystemProvider:
     def _content_snapshot_under_root(
         self,
         target: Path,
+        *,
+        windows_identity: _WindowsResolvedIdentity | None = None,
     ) -> _FilesystemContentSnapshot | None:
         try:
-            handle = self._open_existing_file(target, os.O_RDONLY)
+            handle = self._open_existing_file(
+                target,
+                os.O_RDONLY,
+                windows_identity=windows_identity,
+            )
         except FileNotFoundError:
             return None
         with handle:
@@ -1847,9 +3166,14 @@ class LocalFilesystemProvider:
             else "other"
         )
         target = parent / name
+        relative = (
+            self._windows_relative_to_root_exact(target).as_posix()
+            if os.name == "nt"
+            else target.relative_to(self.root).as_posix()
+        )
         return DirectoryEntrySnapshot(
             name=name,
-            path=target.relative_to(self.root).as_posix(),
+            path=relative,
             kind=kind,
             size_bytes=stat_result.st_size if kind == "file" else None,
             modified_at=datetime.fromtimestamp(stat_result.st_mtime, timezone.utc).isoformat(),
@@ -7939,7 +9263,11 @@ class LocalResourceProviderSubstrate:
         *,
         git_config: GitDefaults | None = None,
     ):
-        requested_root = Path(workspace_root).resolve()
+        requested_root = (
+            Path(workspace_root)
+            if os.name == "nt"
+            else Path(workspace_root).resolve()
+        )
         self.filesystem = LocalFilesystemProvider(requested_root, namespace=namespace)
         # Use the filesystem provider's descriptor-canonical root everywhere.
         # On Darwin Path.resolve() preserves a caller's case spelling even

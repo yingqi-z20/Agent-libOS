@@ -26,6 +26,9 @@ from agent_libos.models import (
     PausedProcessWait,
     ProcessStatus,
     ResourceBudget,
+    ToolCandidate,
+    ToolCandidateStatus,
+    ToolSpec,
 )
 from agent_libos.models.exceptions import (
     CapabilityDenied,
@@ -103,6 +106,42 @@ def _assert_only_checkpoint_authorization_audit(
     assert decision.capability_refs == [capability_id]
     assert decision.decision['allowed'] is True
     assert decision.decision['right'] == CapabilityRight.EXECUTE.value
+
+
+def _insert_tool_candidate(
+    runtime: Runtime,
+    *,
+    candidate_id: str,
+    pid: str,
+    requested_capabilities: list[dict[str, object]],
+) -> str:
+    runtime.store.insert_tool_candidate(
+        ToolCandidate(
+            candidate_id=candidate_id,
+            pid=pid,
+            spec=ToolSpec(
+                name=candidate_id.replace('_', '-'),
+                description='checkpoint resource remap fixture',
+            ),
+            source_code='export function run() { return {}; }',
+            tests=[],
+            requested_capabilities=requested_capabilities,
+            status=ToolCandidateStatus.PROPOSED,
+            validation=None,
+            created_at='2040-01-01T00:00:00+00:00',
+            updated_at='2040-01-01T00:00:00+00:00',
+        )
+    )
+    descriptor = runtime.memory.create_object(
+        pid,
+        ObjectType.TOOL_CANDIDATE,
+        {
+            'candidate_id': candidate_id,
+            'requested_capabilities': requested_capabilities,
+        },
+        name=f'{candidate_id}.descriptor',
+    )
+    return descriptor.oid
 
 
 class TestCheckpointFork:
@@ -440,6 +479,157 @@ class TestCheckpointFork:
             assert runtime.events.list() == before_events
             assert runtime.store.list_runtime_publications() == before_publications
             assert cache_calls == []
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        'carrier',
+        ['capability_row', 'tool_candidate', 'tool_candidate_object'],
+        ids=['capability-row', 'tool-candidate', 'tool-candidate-object'],
+    )
+    def test_fork_rejects_malformed_capability_resource_before_publication(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        carrier: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='reject malformed resource during fork',
+            )
+            obj = runtime.memory.create_object(
+                pid,
+                ObjectType.SUMMARY,
+                {'value': 1},
+                name='malformed-resource-fixture',
+            )
+            capability = runtime.capability.grant(
+                pid,
+                f'object:{obj.oid}/*',
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
+            descriptor_oid = _insert_tool_candidate(
+                runtime,
+                candidate_id='candidate_malformed_resource',
+                pid=pid,
+                requested_capabilities=[
+                    {
+                        'resource': f'object:{obj.oid}:*',
+                        'rights': ['read'],
+                    }
+                ],
+            )
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'malformed capability resource',
+                actor=pid,
+            )
+            fork_authority = runtime.capability.grant_once(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            found = runtime.store.get_checkpoint_snapshot(checkpoint_id)
+            assert found is not None
+            _, snapshot = found
+            malformed_resource = f'object:{obj.oid}/*/escape'
+            if carrier == 'capability_row':
+                capability_row = next(
+                    row
+                    for row in snapshot['rows']['capabilities']
+                    if row['cap_id'] == capability.cap_id
+                )
+                capability_row['resource'] = malformed_resource
+            elif carrier == 'tool_candidate':
+                candidate_row = next(
+                    row
+                    for row in snapshot['rows']['tool_candidates']
+                    if row['candidate_id'] == 'candidate_malformed_resource'
+                )
+                candidate_row['requested_capabilities_json'] = dumps(
+                    [
+                        {
+                            'resource': malformed_resource,
+                            'rights': ['read'],
+                        }
+                    ]
+                )
+            else:
+                snapshot['object_payloads'][descriptor_oid][
+                    'requested_capabilities'
+                ] = [
+                    {
+                        'resource': malformed_resource,
+                        'rights': ['read'],
+                    }
+                ]
+            runtime.store._execute(
+                'UPDATE checkpoints SET snapshot_json = ? WHERE checkpoint_id = ?',
+                (dumps(snapshot), checkpoint_id),
+            )
+
+            boundary_calls: list[str] = []
+
+            def unexpected_cache_or_publication(
+                *_args: object,
+                **_kwargs: object,
+            ) -> None:
+                boundary_calls.append('called')
+                raise AssertionError(
+                    'malformed resource reached cache or publication'
+                )
+
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_restore_jit_sources',
+                unexpected_cache_or_publication,
+            )
+            monkeypatch.setattr(
+                runtime.checkpoint,
+                '_insert_fork_rows',
+                unexpected_cache_or_publication,
+            )
+            before_processes = runtime.store.list_processes()
+            before_capabilities = runtime.store.list_capabilities()
+            before_audit_ids = {
+                record.record_id for record in runtime.store.list_audit()
+            }
+            before_events = runtime.events.list()
+            before_publications = runtime.store.list_runtime_publications()
+
+            with pytest.raises(
+                ValidationError,
+                match='not a valid capability resource',
+            ):
+                runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            assert runtime.store.list_processes() == before_processes
+            assert runtime.store.list_capabilities() == before_capabilities
+            assert runtime.store.get_capability(
+                fork_authority.cap_id
+            ).uses_remaining == 1
+            new_audit_records = [
+                record
+                for record in runtime.store.list_audit()
+                if record.record_id not in before_audit_ids
+            ]
+            assert any(
+                record.actor == pid
+                and record.action == 'capability.authorize'
+                and record.target == f'checkpoint:{checkpoint_id}'
+                and record.capability_refs == [fork_authority.cap_id]
+                for record in new_audit_records
+            )
+            assert all(
+                record.action != 'checkpoint.fork'
+                for record in new_audit_records
+            )
+            assert runtime.events.list() == before_events
+            assert runtime.store.list_runtime_publications() == before_publications
+            assert boundary_calls == []
         finally:
             runtime.close()
 
@@ -1429,6 +1619,313 @@ class TestCheckpointFork:
             fork_roots = {handle.oid for handle in runtime.process.get(fork_pid).memory_view.roots}
             assert external.oid not in fork_roots
             assert borrowed_external.oid not in fork_roots
+        finally:
+            runtime.close()
+
+    def test_fork_remaps_scoped_object_authority_and_drops_non_clonable_scopes(
+        self,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            task_marker = {
+                '$task_run_ref': {
+                    'run_id': 'trun_scoped_authority_source',
+                    'payload_sha256': 'a' * 64,
+                    'schema_version': 1,
+                }
+            }
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal=task_marker,
+            )
+            task_reference_oid = runtime.process.get(pid).goal_oid
+            assert task_reference_oid is not None
+            clonable = runtime.memory.create_object(
+                pid,
+                ObjectType.SUMMARY,
+                {'value': 7},
+                name='clonable.scoped',
+            )
+            external = runtime.memory.create_object(
+                pid,
+                ObjectType.EXTERNAL_REF,
+                {'provider': 'remote', 'handle': 'opaque'},
+                name='external.scoped',
+            )
+            external_owner = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='unobserved external owner',
+            )
+            unobserved_external = runtime.memory.create_object(
+                external_owner,
+                ObjectType.EXTERNAL_REF,
+                {'provider': 'remote', 'handle': 'capability-only'},
+                name='external.capability-only',
+            )
+            task_reference_owner = runtime.process.spawn(
+                image='base-agent:v0',
+                goal={
+                    '$task_run_ref': {
+                        'run_id': 'trun_capability_only_source',
+                        'payload_sha256': 'b' * 64,
+                        'schema_version': 1,
+                    }
+                },
+            )
+            unobserved_task_reference_oid = runtime.process.get(
+                task_reference_owner
+            ).goal_oid
+            assert unobserved_task_reference_oid is not None
+            clone_resources = {
+                f'object:{clonable.oid}',
+                f'object:{clonable.oid}/*',
+                f'object:{clonable.oid}:*',
+            }
+            non_clonable_resources = {
+                f'object:{external.oid}',
+                f'object:{external.oid}/*',
+                f'object:{external.oid}:*',
+                f'object:{task_reference_oid}',
+                f'object:{task_reference_oid}/*',
+                f'object:{task_reference_oid}:*',
+                f'object:{unobserved_external.oid}',
+                f'object:{unobserved_external.oid}/*',
+                f'object:{unobserved_external.oid}:*',
+                f'object:{unobserved_task_reference_oid}',
+                f'object:{unobserved_task_reference_oid}/*',
+                f'object:{unobserved_task_reference_oid}:*',
+            }
+            global_object_resource = 'object:*'
+            explicit_source_capabilities = [
+                runtime.capability.grant(
+                    pid,
+                    resource,
+                    [CapabilityRight.READ],
+                    issued_by='test.scoped-object-fork',
+                )
+                for resource in sorted(
+                    clone_resources
+                    | non_clonable_resources
+                    | {global_object_resource}
+                )
+            ]
+            filesystem_resource = 'filesystem:workspace:README.md'
+            runtime.capability.grant(
+                pid,
+                filesystem_resource,
+                [CapabilityRight.READ],
+                issued_by='test.scoped-object-fork-control',
+            )
+            requested_resources = sorted(
+                clone_resources
+                | non_clonable_resources
+                | {global_object_resource, filesystem_resource}
+            )
+            descriptor_oid = _insert_tool_candidate(
+                runtime,
+                candidate_id='candidate_scoped_object_fork',
+                pid=pid,
+                requested_capabilities=[
+                    {'resource': resource, 'rights': ['read']}
+                    for resource in requested_resources
+                ],
+            )
+
+            checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'scoped object authority fork',
+                actor=pid,
+            )
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+
+            forked = runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+            fork_pid = forked['fork_root_pid']
+            cloned_oid = forked['object_map'][clonable.oid]
+            remapped_clone_resources = {
+                f'object:{cloned_oid}',
+                f'object:{cloned_oid}/*',
+                f'object:{cloned_oid}:*',
+            }
+            fork_resources = {
+                capability.resource
+                for capability in runtime.capability.list_subject(fork_pid)
+            }
+
+            assert remapped_clone_resources <= fork_resources
+            assert clone_resources.isdisjoint(fork_resources)
+            assert non_clonable_resources.isdisjoint(fork_resources)
+            assert global_object_resource not in fork_resources
+            assert filesystem_resource in fork_resources
+            for source_capability in explicit_source_capabilities:
+                persisted = runtime.store.get_capability(source_capability.cap_id)
+                assert persisted is not None
+                assert persisted.active
+                assert persisted.resource == source_capability.resource
+
+            candidate_rows = runtime.store._query(
+                'SELECT candidate_id FROM tool_candidates WHERE pid = ?',
+                (fork_pid,),
+            )
+            assert len(candidate_rows) == 1
+            fork_candidate = runtime.store.get_tool_candidate(
+                str(candidate_rows[0]['candidate_id'])
+            )
+            assert fork_candidate is not None
+            fork_requested_resources = {
+                str(spec['resource'])
+                for spec in fork_candidate.requested_capabilities
+            }
+            assert fork_requested_resources == {
+                *remapped_clone_resources,
+                filesystem_resource,
+            }
+            fork_descriptor = runtime.store.get_object(
+                forked['object_map'][descriptor_oid]
+            )
+            assert fork_descriptor is not None
+            descriptor_requested_resources = {
+                str(spec['resource'])
+                for spec in fork_descriptor.payload['requested_capabilities']
+            }
+            assert descriptor_requested_resources == fork_requested_resources
+
+            assert any(
+                event.type == EventType.PROCESS_FORKED
+                and event.target == fork_pid
+                and event.payload['checkpoint_id'] == checkpoint_id
+                for event in runtime.events.list()
+            )
+            assert any(
+                record.action == 'checkpoint.fork'
+                and record.target == f'checkpoint:{checkpoint_id}'
+                and record.decision['fork_root_pid'] == fork_pid
+                for record in runtime.store.list_audit()
+            )
+        finally:
+            runtime.close()
+
+    def test_fork_drops_released_unmapped_object_authority_before_later_restore(
+        self,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0',
+                goal='drop dormant object authority during fork',
+            )
+            external = runtime.memory.create_object(
+                pid,
+                ObjectType.EXTERNAL_REF,
+                {'provider': 'remote', 'handle': 'dormant'},
+                name='released.external.ref',
+            )
+            dormant_resources = {
+                f'object:{external.oid}',
+                f'object:{external.oid}/*',
+                f'object:{external.oid}:*',
+            }
+            capabilities = {
+                capability.resource: capability
+                for capability in (
+                    runtime.capability.grant(
+                        pid,
+                        resource,
+                        [CapabilityRight.READ],
+                        issued_by='test.released-object-fork',
+                    )
+                    for resource in sorted(dormant_resources)
+                )
+            }
+            restorable_checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'external ref remains live',
+                actor=pid,
+            )
+
+            assert runtime.memory.delete_object_trusted(
+                'test',
+                external.oid,
+                reason='exercise dormant scoped authority',
+            )
+            assert runtime.store.get_object(external.oid) is None
+            assert runtime.store.get_capability(
+                capabilities[f'object:{external.oid}/*'].cap_id
+            ).active
+            assert runtime.store.get_capability(
+                capabilities[f'object:{external.oid}:*'].cap_id
+            ).active
+
+            descriptor_oid = _insert_tool_candidate(
+                runtime,
+                candidate_id='candidate_released_object_authority',
+                pid=pid,
+                requested_capabilities=[
+                    {'resource': resource, 'rights': ['read']}
+                    for resource in sorted(dormant_resources)
+                ],
+            )
+            dormant_checkpoint_id = runtime.checkpoint.create(
+                pid,
+                'external ref is released',
+                actor=pid,
+            )
+
+            forked = runtime.checkpoint.fork_from_checkpoint(
+                pid,
+                dormant_checkpoint_id,
+                require_capability=False,
+            )
+            fork_pid = forked['fork_root_pid']
+            fork_resources = {
+                capability.resource
+                for capability in runtime.capability.list_subject(fork_pid)
+            }
+            assert dormant_resources.isdisjoint(fork_resources)
+            assert external.oid not in forked['object_map']
+            assert external.oid not in {
+                root.oid for root in runtime.process.get(fork_pid).memory_view.roots
+            }
+            assert runtime.store.get_capability(
+                capabilities[f'object:{external.oid}/*'].cap_id
+            ).active
+            assert runtime.store.get_capability(
+                capabilities[f'object:{external.oid}:*'].cap_id
+            ).active
+
+            candidate_rows = runtime.store._query(
+                'SELECT candidate_id FROM tool_candidates WHERE pid = ?',
+                (fork_pid,),
+            )
+            assert len(candidate_rows) == 1
+            fork_candidate = runtime.store.get_tool_candidate(
+                str(candidate_rows[0]['candidate_id'])
+            )
+            assert fork_candidate is not None
+            assert fork_candidate.requested_capabilities == []
+            fork_descriptor = runtime.store.get_object(
+                forked['object_map'][descriptor_oid]
+            )
+            assert fork_descriptor is not None
+            assert fork_descriptor.payload['requested_capabilities'] == []
+
+            runtime.checkpoint.restore(
+                pid,
+                restorable_checkpoint_id,
+                require_capability=False,
+            )
+            restored_external = runtime.store.get_object(external.oid)
+            assert restored_external is not None
+            assert restored_external.type == ObjectType.EXTERNAL_REF
+            assert not runtime.capability.check(
+                fork_pid,
+                f'object:{external.oid}',
+                CapabilityRight.READ,
+            )
         finally:
             runtime.close()
 

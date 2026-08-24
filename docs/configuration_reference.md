@@ -63,7 +63,7 @@ PY
 
 | Path | Type | Default | Unit |
 | --- | --- | --- | --- |
-| `runtime.local_store_target` | `str` | `"local"` | — |
+| `runtime.local_store_target` | `str` | `"user"` | — |
 | `runtime.runtime_db_filename` | `str` | `".agent_libos.sqlite"` | — |
 | `runtime.store_backend` | `Literal['sqlite', 'postgres']` | `"sqlite"` | — |
 | `runtime.store_dsn` | `str \| None` | `null` | — |

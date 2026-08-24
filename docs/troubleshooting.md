@@ -130,10 +130,10 @@ bounded JIT result instead of retrying an ambiguous external effect blindly.
 ### `local` unexpectedly loses state
 
 `--db local` is in-memory and intentionally disappears when the Runtime closes.
-Use an explicit SQLite path for persistence:
+Use the explicit persistent user target:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite init
+uv run agent-libos --db user init
 ```
 
 The CLI loads the project-root `config.yaml` when `--config` is omitted. In this
@@ -195,7 +195,7 @@ The generic CLI and Python Runtime do not load `.env` implicitly. Export values
 into the Host environment or make the CLI load one explicit file:
 
 ```bash
-uv run --env-file .env agent-libos --db .agent_libos.sqlite processes
+uv run --env-file .env agent-libos --db user processes
 ```
 
 The Electron development launcher and `scripts/run_coding_agent.py` have their
@@ -238,8 +238,8 @@ An operation may be denied even when its tool is visible. Check the exact
 process, resource, and right:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite capabilities list --subject <pid>
-uv run agent-libos --db .agent_libos.sqlite capabilities explain <pid> filesystem:workspace:README.md read
+uv run agent-libos --db user capabilities list --subject <pid>
+uv run agent-libos --db user capabilities explain <pid> filesystem:workspace:README.md read
 ```
 
 Common independent causes are:
@@ -277,7 +277,7 @@ The development launcher tries `AGENT_LIBOS_GUI_SERVER_BIN`, then the checkout
 to separate Python startup from Electron rendering:
 
 ```bash
-uv run agent-libos-gui-server --db .agent_libos.sqlite --port 0
+uv run agent-libos-gui-server --db user --port 0
 ```
 
 Its startup JSON includes a loopback URL and bearer token. Treat both the token

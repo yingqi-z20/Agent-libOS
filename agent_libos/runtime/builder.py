@@ -7,7 +7,7 @@ import json
 import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import partial
@@ -103,6 +103,9 @@ from agent_libos.runtime.syscall_router import SyscallRouter
 from agent_libos.runtime.syscalls import BUILTIN_SYSCALL_NAMES, LibOSSyscallSession
 from agent_libos.runtime.snapshots import ProcessExecStateService
 from agent_libos.runtime.task_runs import TaskRunManager
+from agent_libos.runtime.windows_store_identity import (
+    validate_legacy_windows_store_identities,
+)
 from agent_libos.sdk import ProtectedOperationSDK
 from agent_libos.semantic.control import SemanticRuntimeControl
 from agent_libos.semantic.enforcement import (
@@ -136,6 +139,7 @@ from agent_libos.semantic.service import (
 from agent_libos.skills.manager import SkillManager
 from agent_libos.storage import (
     RuntimeStore,
+    ResolvedStoreTarget,
     StoreAssemblyReadiness,
     StoreAssemblyReservation,
     StoreCloseClaimOutcome,
@@ -144,6 +148,9 @@ from agent_libos.storage import (
     SemanticMachineOutcomeRecord,
     UnitOfWork,
     open_store,
+    resolve_store_target,
+    validate_runtime_store_workspace_isolation,
+    validate_store_target_workspace_isolation,
 )
 from agent_libos.substrate import (
     HttpJsonRpcProvider,
@@ -1018,11 +1025,17 @@ class RuntimeBuilder(Generic[RuntimeT]):
     trusted_module_sha256: tuple[str, ...] | None = None
     semantic_assessor: Any | None = None
     semantic_tenant_bucketer: Callable[[str], str] | None = None
+    _default_workspace_root: Path | None = None
+    _store_target_base: Path | None = None
 
     def open(self, target: str | Path | None = None) -> RuntimeT:
         self._require_sync_assembly_context()
         self._validate_runtime_allocation_contract()
-        store = open_store(target, config=self.config)
+        effective = self._with_frozen_open_context()
+        if effective is not self:
+            return effective.open(target)
+        resolved_target = self._resolve_target_store_workspace_isolation(target)
+        store = open_store(resolved_target, config=self.config)
         close_reservation = self._new_owned_store_close_reservation()
         try:
             return self._from_store(
@@ -1042,6 +1055,9 @@ class RuntimeBuilder(Generic[RuntimeT]):
         """Open and assemble a Runtime on the caller's event loop."""
 
         self._validate_runtime_allocation_contract()
+        effective = self._with_frozen_open_context()
+        if effective is not self:
+            return await effective.aopen(target)
         close_reservation = self._new_owned_store_close_reservation()
         captured, worker_error, cancellations = (
             await self._acapture_owned_runtime_assembly(target)
@@ -1102,6 +1118,9 @@ class RuntimeBuilder(Generic[RuntimeT]):
         llm_client: LLMClient | None = None,
     ) -> RuntimeT:
         self._require_sync_assembly_context()
+        effective = self._with_frozen_default_workspace()
+        if effective is not self:
+            return effective.from_store(store, llm_client=llm_client)
         return self._from_store(
             store,
             llm_client=llm_client,
@@ -1115,6 +1134,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
         llm_client: LLMClient | None,
         owned_store_close_reservation: Any | None,
     ) -> RuntimeT:
+        self._validate_concrete_store_workspace_isolation(store)
         assembly_reservation = self._new_runtime_assembly_reservation()
         # A builder-owned Store has not been published and cannot have a
         # competing Runtime. Allocate first so an allocation-hook failure is
@@ -1160,6 +1180,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             trusted_module_sha256=self.trusted_module_sha256,
             owned_store_close_reservation=owned_store_close_reservation,
             _assembly_reservation=assembly_reservation,
+            _default_workspace_root=self._default_workspace_root,
         )
         return host
 
@@ -1169,6 +1190,9 @@ class RuntimeBuilder(Generic[RuntimeT]):
         *,
         llm_client: LLMClient | None = None,
     ) -> RuntimeT:
+        effective = self._with_frozen_default_workspace()
+        if effective is not self:
+            return await effective.afrom_store(store, llm_client=llm_client)
         return await self._afrom_store(
             store,
             llm_client=llm_client,
@@ -1182,6 +1206,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
         llm_client: LLMClient | None,
         owned_store_close_reservation: Any | None,
     ) -> RuntimeT:
+        self._validate_concrete_store_workspace_isolation(store)
         assembly_reservation = self._new_runtime_assembly_reservation()
         readiness_error = self._runtime_assembly_reservation_error(
             store,
@@ -1326,13 +1351,16 @@ class RuntimeBuilder(Generic[RuntimeT]):
         handshake: _OwnedStartupHandshake,
         caller_loop: asyncio.AbstractEventLoop,
     ) -> _CapturedRuntimeAssembly[RuntimeT]:
+        store: RuntimeStore | None = None
         try:
-            store = open_store(target, config=self.config)
+            resolved_target = self._resolve_target_store_workspace_isolation(target)
+            store = open_store(resolved_target, config=self.config)
+            self._validate_concrete_store_workspace_isolation(store)
         except BaseException as open_error:
             handshake.open_error = open_error
             caller_loop.call_soon_threadsafe(handshake.phase_one_ready.set)
             return _CapturedRuntimeAssembly(
-                store=None,
+                store=store,
                 host=None,
                 error=open_error,
             )
@@ -1420,6 +1448,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
                     host,
                     store,
                     substrate=self.substrate,
+                    default_workspace_root=self._default_workspace_root,
                     config=self.config,
                     llm_client=llm_client,
                     startup_module_manifests=self.module_manifests,
@@ -1490,6 +1519,78 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 "it must also override allocate_unassembled for builder assembly"
             )
 
+    @staticmethod
+    def _local_store_workspace_root(
+        substrate: ResourceProviderSubstrate | None,
+        default_workspace_root: Path | None = None,
+    ) -> Path | None:
+        if substrate is None:
+            return default_workspace_root or Path.cwd().resolve()
+        if isinstance(substrate, LocalResourceProviderSubstrate):
+            return Path(substrate.workspace_root)
+        return None
+
+    def _with_frozen_default_workspace(self) -> RuntimeBuilder[RuntimeT]:
+        if self.substrate is not None or self._default_workspace_root is not None:
+            return self
+        return replace(
+            self,
+            _default_workspace_root=Path.cwd().resolve(),
+        )
+
+    def _with_frozen_open_context(self) -> RuntimeBuilder[RuntimeT]:
+        if self._store_target_base is not None and (
+            self.substrate is not None or self._default_workspace_root is not None
+        ):
+            return self
+        current_directory = Path.cwd().resolve()
+        return replace(
+            self,
+            _default_workspace_root=(
+                self._default_workspace_root
+                if self.substrate is not None
+                or self._default_workspace_root is not None
+                else current_directory
+            ),
+            _store_target_base=self._store_target_base or current_directory,
+        )
+
+    def _resolve_target_store_workspace_isolation(
+        self,
+        target: str | Path | None,
+    ) -> ResolvedStoreTarget:
+        workspace_root = self._local_store_workspace_root(
+            self.substrate,
+            self._default_workspace_root,
+        )
+        if workspace_root is None:
+            return resolve_store_target(
+                target,
+                config=self.config,
+                base_directory=self._store_target_base,
+            )
+        return validate_store_target_workspace_isolation(
+            target,
+            workspace_root=workspace_root,
+            config=self.config,
+            base_directory=self._store_target_base,
+        )
+
+    def _validate_concrete_store_workspace_isolation(
+        self,
+        store: RuntimeStore,
+    ) -> None:
+        workspace_root = self._local_store_workspace_root(
+            self.substrate,
+            self._default_workspace_root,
+        )
+        if workspace_root is None:
+            return
+        validate_runtime_store_workspace_isolation(
+            store,
+            workspace_root=workspace_root,
+        )
+
     @classmethod
     def assemble_existing(
         cls,
@@ -1504,8 +1605,25 @@ class RuntimeBuilder(Generic[RuntimeT]):
         trusted_module_sha256: list[str] | tuple[str, ...] | None,
         owned_store_close_reservation: Any | None = None,
         _assembly_reservation: StoreAssemblyReservation | None = None,
+        _default_workspace_root: Path | None = None,
     ) -> None:
         cls._require_sync_assembly_context()
+        default_workspace_root = (
+            _default_workspace_root
+            if substrate is None and _default_workspace_root is not None
+            else Path.cwd().resolve()
+            if substrate is None
+            else None
+        )
+        workspace_root = cls._local_store_workspace_root(
+            substrate,
+            default_workspace_root,
+        )
+        if workspace_root is not None:
+            validate_runtime_store_workspace_isolation(
+                store,
+                workspace_root=workspace_root,
+            )
         # Match the async entry point: reserve the Store before allocating or
         # mutating any dependency graph.  A rejected second Runtime must not
         # rebind Store configuration or assume cleanup ownership of a
@@ -1525,6 +1643,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             store,
             assembly_reservation,
             substrate=substrate,
+            default_workspace_root=default_workspace_root,
             config=config,
             llm_client=llm_client,
             startup_module_manifests=startup_module_manifests,
@@ -1590,6 +1709,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
         *,
         llm_client: LLMClient | None,
         substrate: ResourceProviderSubstrate | None,
+        default_workspace_root: Path | None,
         config: AgentLibOSConfig | None,
         startup_module_manifests: list[str | Path] | tuple[str | Path, ...] | None,
         trusted_modules: list[str] | tuple[str, ...] | None,
@@ -1610,6 +1730,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
                     host,
                     store,
                     substrate=substrate,
+                    default_workspace_root=default_workspace_root,
                     config=config,
                     llm_client=llm_client,
                     startup_module_manifests=startup_module_manifests,
@@ -1651,6 +1772,18 @@ class RuntimeBuilder(Generic[RuntimeT]):
         trusted_module_sha256: list[str] | tuple[str, ...] | None,
         owned_store_close_reservation: Any | None = None,
     ) -> None:
+        default_workspace_root = (
+            Path.cwd().resolve() if substrate is None else None
+        )
+        workspace_root = cls._local_store_workspace_root(
+            substrate,
+            default_workspace_root,
+        )
+        if workspace_root is not None:
+            validate_runtime_store_workspace_isolation(
+                store,
+                workspace_root=workspace_root,
+            )
         assembly_reservation = cls._new_runtime_assembly_reservation()
         readiness_error = cls._runtime_assembly_reservation_error(
             store,
@@ -1666,6 +1799,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
                     store,
                     assembly_reservation,
                     substrate=substrate,
+                    default_workspace_root=default_workspace_root,
                     config=config,
                     llm_client=llm_client,
                     startup_module_manifests=startup_module_manifests,
@@ -1940,12 +2074,19 @@ class RuntimeBuilder(Generic[RuntimeT]):
         *,
         llm_client: LLMClient | None,
         substrate: ResourceProviderSubstrate | None,
+        default_workspace_root: Path | None,
         config: AgentLibOSConfig | None,
         startup_module_manifests: list[str | Path] | tuple[str | Path, ...] | None,
         trusted_modules: list[str] | tuple[str, ...] | None,
         trusted_module_sha256: list[str] | tuple[str, ...] | None,
     ) -> None:
-        cls._configure_foundation(host, store, substrate=substrate, config=config)
+        cls._configure_foundation(
+            host,
+            store,
+            substrate=substrate,
+            default_workspace_root=default_workspace_root,
+            config=config,
+        )
         cls._configure_evidence_and_authority(host)
         cls._configure_host_services(host)
         cls._configure_human_and_primitives(host)
@@ -2507,12 +2648,13 @@ class RuntimeBuilder(Generic[RuntimeT]):
         store: RuntimeStore,
         *,
         substrate: ResourceProviderSubstrate | None,
+        default_workspace_root: Path | None,
         config: AgentLibOSConfig | None,
     ) -> None:
         host.config = config or DEFAULT_CONFIG
         if substrate is None:
             host.substrate = LocalResourceProviderSubstrate(
-                Path.cwd().resolve(),
+                default_workspace_root or Path.cwd().resolve(),
                 namespace=host.config.runtime.workspace_namespace,
                 git_config=host.config.git,
             )
@@ -5661,6 +5803,19 @@ class RuntimeBuilder(Generic[RuntimeT]):
     @staticmethod
     def _recover_runtime_state(host: Runtime) -> None:
         with host.lifecycle.recovery_lease():
+            windows_identity_page_size = min(
+                host.config.capability.list_limit,
+                host.config.data_flow.file_binding_list_limit,
+                host.config.checkpoint.list_limit,
+            )
+            host.windows_store_identity_preflight = (
+                validate_legacy_windows_store_identities(
+                    authority=host.uow.authority,
+                    checkpoints=host.uow.snapshots,
+                    filesystem=host.filesystem,
+                    page_size=windows_identity_page_size,
+                )
+            )
             # TaskRun plaintext and integrity bindings are validated first and
             # without dispatch.  Durable recovery effects run only after this
             # read-only preflight has classified missing/corrupt payloads.
@@ -5740,6 +5895,14 @@ class RuntimeBuilder(Generic[RuntimeT]):
             host.recovered_terminal_cleanups = host.process.recover_terminal_cleanups()
             host.recovered_task_runs = host.task_runs.recover_startup()
             host.recovered_task_run_count = host.task_runs.recovered_total_count
+            host.windows_store_identity_post_recovery = (
+                validate_legacy_windows_store_identities(
+                    authority=host.uow.authority,
+                    checkpoints=host.uow.snapshots,
+                    filesystem=host.filesystem,
+                    page_size=windows_identity_page_size,
+                )
+            )
 
     @staticmethod
     def _record_stale_execution_recovery(host: Runtime, pid: str) -> None:

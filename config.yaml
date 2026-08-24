@@ -1,5 +1,5 @@
 runtime:
-  local_store_target: .agent_libos.sqlite
+  local_store_target: user
 
 task_runs:
   enabled: true

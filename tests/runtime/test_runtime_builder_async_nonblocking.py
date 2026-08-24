@@ -44,7 +44,7 @@ def test_async_open_yields_caller_loop_while_opening_store(
     async def exercise() -> None:
         asyncio.get_running_loop().call_soon(caller_loop_advanced.set)
         with pytest.raises(RuntimeError, match="injected open-store failure"):
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
 
     asyncio.run(exercise())
 
@@ -81,7 +81,7 @@ def test_async_open_keeps_store_open_and_assembly_on_one_worker(
             RuntimeError,
             match="injected same-worker recovery failure",
         ):
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
 
     try:
         asyncio.run(exercise())
@@ -113,7 +113,7 @@ def test_cancelled_async_open_closes_store_returned_by_open_worker(
     )
 
     async def exercise() -> tuple[BaseException | None, bool]:
-        opening = asyncio.create_task(Runtime.aopen("ignored"))
+        opening = asyncio.create_task(Runtime.aopen("local"))
         assert await asyncio.to_thread(open_entered.wait, 2.0)
         opening.cancel()
         allow_open_to_finish.set()
@@ -317,7 +317,7 @@ def test_cancelled_open_publishes_retriable_normal_shutdown_handle(
     )
 
     async def exercise() -> RuntimeAssemblyCleanupRequired:
-        opening = asyncio.create_task(Runtime.aopen("ignored"))
+        opening = asyncio.create_task(Runtime.aopen("local"))
         assert await asyncio.to_thread(assembly_succeeded.wait, 2.0)
         opening.cancel()
         allow_assembly_to_return.set()
@@ -469,7 +469,7 @@ def test_async_assembly_reservation_closes_readiness_to_worker_gap(
 
     async def assemble() -> Runtime:
         if entrypoint == "aopen":
-            return await Runtime.aopen("ignored")
+            return await Runtime.aopen("local")
         builder = RuntimeBuilder.configured(Runtime)
         if entrypoint == "afrom_store":
             return await builder.afrom_store(store)

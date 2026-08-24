@@ -295,7 +295,7 @@ jobs:
       - name: Set up Deno
         uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
-          deno-version: "2.9.4"
+          deno-version: "2.9.5"
 
       - name: Install dependencies
         run: uv sync --frozen
@@ -340,7 +340,7 @@ jobs:
       - name: Set up Deno
         uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
-          deno-version: "2.9.4"
+          deno-version: "2.9.5"
 
       - name: Install dependencies
         run: uv sync --frozen
@@ -363,6 +363,8 @@ jobs:
             marker: platform_linux
           - runner: macos-14
             marker: platform_darwin
+          - runner: windows-latest
+            marker: platform_windows
 
     name: host filesystem identity (${{ matrix.marker }})
 
@@ -390,6 +392,7 @@ jobs:
         run: >-
           uv run python -m pytest -q
           tests/security/test_filesystem_path_identity.py
+          tests/security/test_windows_legacy_store_identity.py
           -m ${{ matrix.marker }} --fail-on-skip
 
   mcp-sdk:
@@ -422,7 +425,7 @@ jobs:
       - name: Set up Deno
         uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
-          deno-version: "2.9.4"
+          deno-version: "2.9.5"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -562,7 +565,7 @@ jobs:
       - name: Set up Deno
         uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
-          deno-version: "2.9.4"
+          deno-version: "2.9.5"
 
       - name: Install dependencies with native PTY support
         run: uv sync --frozen --extra pty

@@ -1224,7 +1224,7 @@ def test_public_overview_records_corrected_security_and_release_boundaries() -> 
     for required in (
         "Trusted Runtime artifact publication is a narrow TCB exception",
         "typed Git, filesystem writes",
-        "Any recognized transparent executable-launcher",
+        "Shell/PTY reject `env`, `nice`, `nohup`, `setsid`, `stdbuf`, and `timeout`",
         "## Real LLM Configuration",
         "### Upgrading stores that contain Tool Groups",
         "benchmarks/builtin_tool_skills/README.md",
@@ -1829,7 +1829,7 @@ def test_ci_actions_and_downloaded_toolchains_are_immutable() -> None:
                 if action == "astral-sh/setup-uv":
                     assert step.get("with", {}).get("version") == "0.11.32"
                 elif action == "denoland/setup-deno":
-                    assert step.get("with", {}).get("deno-version") == "2.9.4"
+                    assert step.get("with", {}).get("deno-version") == "2.9.5"
                 elif action == "actions/upload-artifact":
                     assert step.get("with", {}).get("retention-days") == 14
 
@@ -2145,6 +2145,10 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
                     "runner": "macos-14",
                     "marker": "platform_darwin",
                 },
+                {
+                    "runner": "windows-latest",
+                    "marker": "platform_windows",
+                },
             ]
         },
     }
@@ -2168,6 +2172,7 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
     host_identity_command = str(host_identity_test["run"])
     for required in (
         "tests/security/test_filesystem_path_identity.py",
+        "tests/security/test_windows_legacy_store_identity.py",
         "-m ${{ matrix.marker }}",
         "--fail-on-skip",
     ):
@@ -2240,7 +2245,7 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         )
         expected_sha, _ = ACTION_PINS["denoland/setup-deno"]
         assert deno_step["uses"] == f"denoland/setup-deno@{expected_sha}"
-        assert deno_step["with"]["deno-version"] == "2.9.4"
+        assert deno_step["with"]["deno-version"] == "2.9.5"
         assert "if" not in deno_step
         assert "continue-on-error" not in deno_step
     critical_upstream_steps = (

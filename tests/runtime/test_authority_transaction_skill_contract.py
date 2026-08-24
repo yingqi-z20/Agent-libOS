@@ -400,8 +400,10 @@ def test_workspace_skill_shared_authority_settlement_failure_restores_jit_state(
 ) -> None:
     skill_id = "workspace-shared-jit-settlement"
     tool_name = "workspace_shared_jit_settlement_tool"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     skill_dir = _write_jit_skill(
-        tmp_path,
+        workspace,
         skill_id=skill_id,
         tool_name=tool_name,
         source=_JIT_SOURCE_V1,
@@ -410,7 +412,7 @@ def test_workspace_skill_shared_authority_settlement_failure_restores_jit_state(
         runtime = Runtime.open(
             target,
             config=config,
-            substrate=LocalResourceProviderSubstrate(tmp_path),
+            substrate=LocalResourceProviderSubstrate(workspace),
         )
         runtime.tools.sandbox = _PassingSandbox()
         try:
@@ -433,7 +435,7 @@ def test_workspace_skill_shared_authority_settlement_failure_restores_jit_state(
             assert old_handle is not None
 
             _write_jit_skill(
-                tmp_path,
+                workspace,
                 skill_id=skill_id,
                 tool_name=tool_name,
                 source=_JIT_SOURCE_V2,

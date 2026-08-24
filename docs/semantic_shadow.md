@@ -449,21 +449,21 @@ surface is an offline Host-only review-evidence append, which cannot alter an
 epoch, control state, request, Capability, label, or provider operation:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite semantic status
-uv run agent-libos --db .agent_libos.sqlite semantic assessments \
+uv run agent-libos --db user semantic status
+uv run agent-libos --db user semantic assessments \
   --pid <pid> --domain filesystem --status success --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic show <assessment_id>
-uv run agent-libos --db .agent_libos.sqlite semantic flow status
-uv run agent-libos --db .agent_libos.sqlite semantic flow entities --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic flow edges --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic flow lineage <node_id>
-uv run agent-libos --db .agent_libos.sqlite semantic settlements --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic policy epochs --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic control status
-uv run agent-libos --db .agent_libos.sqlite semantic control history --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic health --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic metrics
-uv run agent-libos --db .agent_libos.sqlite semantic review import \
+uv run agent-libos --db user semantic show <assessment_id>
+uv run agent-libos --db user semantic flow status
+uv run agent-libos --db user semantic flow entities --limit 50
+uv run agent-libos --db user semantic flow edges --limit 50
+uv run agent-libos --db user semantic flow lineage <node_id>
+uv run agent-libos --db user semantic settlements --limit 50
+uv run agent-libos --db user semantic policy epochs --limit 50
+uv run agent-libos --db user semantic control status
+uv run agent-libos --db user semantic control history --limit 50
+uv run agent-libos --db user semantic health --limit 50
+uv run agent-libos --db user semantic metrics
+uv run agent-libos --db user semantic review import \
   --file <strict-json-review-evidence>
 ```
 

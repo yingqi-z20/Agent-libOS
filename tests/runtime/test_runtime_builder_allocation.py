@@ -34,7 +34,7 @@ def test_sync_open_rejects_custom_init_before_opening_store(
         TypeError,
         match=r"overrides Runtime\.__init__.*override allocate_unassembled",
     ):
-        RuntimeBuilder.configured(CustomInitRuntime).open("ignored")
+        RuntimeBuilder.configured(CustomInitRuntime).open("local")
 
     assert init_calls == 0
     assert open_calls == 0

@@ -617,11 +617,14 @@ class SQLiteStore(SQLRuntimeStore):
         *,
         config: AgentLibOSConfig | None = None,
         initialize_schema: bool = True,
+        _frozen_target: bool = False,
     ) -> None:
         selected_path = str(path)
         connection_path = selected_path
         connection_target = selected_path
         connection_uri = False
+        self.canonical_path: str | None = None
+        self.lexical_path: str | None = None
         self._lease_handle: Any | None = None
         self._sqlite_connection_closed = False
         self._database_identity: tuple[int, int] | None = None
@@ -636,67 +639,13 @@ class SQLiteStore(SQLRuntimeStore):
                 "offline migration requires an existing initialized Agent libOS store"
             )
         if selected_path != ":memory:":
-            db_path = Path(selected_path)
-            # Resolve existing symlinks and relative aliases before deriving
-            # the lock path. Otherwise the same SQLite file can be opened by
-            # two runtimes through distinct path spellings and receive two
-            # independent lease files.
-            canonical_path = db_path.resolve()
-            existing_store = canonical_path.exists()
-            if not existing_store:
-                if not initialize_schema:
-                    raise ValidationError(
-                        "offline migration requires an existing initialized "
-                        "Agent libOS store"
-                    )
-                canonical_path.parent.mkdir(parents=True, exist_ok=True)
-            if existing_store:
-                # Validate without mutation before even the read-only schema
-                # probe can ask SQLite to open a pre-existing sidecar. An
-                # unsupported store must remain byte- and mode-identical.
-                self._secure_database_files(
-                    canonical_path,
-                    tighten=False,
-                    create_if_missing=False,
+            connection_path, connection_target, connection_uri = (
+                self._prepare_persistent_connection(
+                    selected_path,
+                    initialize_schema=initialize_schema,
+                    frozen_target=_frozen_target,
                 )
-                existing_stat = os.stat(
-                    canonical_path,
-                    follow_symlinks=False,
-                )
-                self._database_identity = (
-                    existing_stat.st_dev,
-                    existing_stat.st_ino,
-                )
-                self._retry_failed_owner(self._database_identity)
-                fresh_store = self._preflight_existing_store(canonical_path)
-                if not initialize_schema and fresh_store:
-                    raise ValidationError(
-                        "offline migration requires an existing initialized "
-                        "Agent libOS store"
-                    )
-            # A supported existing store is tightened only after its version
-            # gate. A fresh database is created owner-only here.
-            self._secure_database_files(
-                canonical_path,
-                create_if_missing=not existing_store,
             )
-            if self._database_identity is None:
-                database_stat = os.stat(canonical_path, follow_symlinks=False)
-                self._database_identity = (
-                    database_stat.st_dev,
-                    database_stat.st_ino,
-                )
-            connection_path = str(canonical_path)
-            if existing_store:
-                # Re-open an existing store in explicit rw mode so a final
-                # disappearance after preflight cannot make sqlite3 create an
-                # unrelated empty database at the same pathname.
-                connection_target = f"{canonical_path.as_uri()}?mode=rw"
-                connection_uri = True
-            else:
-                connection_target = connection_path
-            if fcntl is not None and hasattr(os, "O_NOFOLLOW"):
-                self._lease_handle = self._acquire_runtime_lease(canonical_path)
             # SQLite's kernel-managed EXCLUSIVE lock is crash-recoverable and
             # complements the POSIX path/inode leases. Where those sidecars are
             # unavailable, including Windows, it is the sole runtime lease.
@@ -733,6 +682,107 @@ class SQLiteStore(SQLRuntimeStore):
                 "SQLite store initialization and cleanup failed",
                 [primary_error, *cleanup_errors],
             ) from None
+
+    def _prepare_persistent_connection(
+        self,
+        selected_path: str,
+        *,
+        initialize_schema: bool,
+        frozen_target: bool,
+    ) -> tuple[str, str, bool]:
+        db_path = Path(os.path.abspath(selected_path))
+        self.lexical_path = str(db_path)
+        # Direct callers are canonicalized here. Factory callers pass the
+        # exact target already canonicalized and isolated by the builder.
+        canonical_path = db_path if frozen_target else db_path.resolve()
+        if frozen_target:
+            self._require_frozen_target_spelling(canonical_path)
+        self.canonical_path = str(canonical_path)
+        existing_store = canonical_path.exists()
+        if not existing_store:
+            if not initialize_schema:
+                raise ValidationError(
+                    "offline migration requires an existing initialized "
+                    "Agent libOS store"
+                )
+            canonical_path.parent.mkdir(parents=True, exist_ok=True)
+            if frozen_target:
+                self._require_frozen_target_spelling(canonical_path)
+        if existing_store:
+            # Validate without mutation before even the read-only schema probe
+            # can ask SQLite to open a pre-existing sidecar. An unsupported
+            # store must remain byte- and mode-identical.
+            self._secure_database_files(
+                canonical_path,
+                tighten=False,
+                create_if_missing=False,
+            )
+            existing_stat = os.stat(canonical_path, follow_symlinks=False)
+            self._database_identity = (
+                existing_stat.st_dev,
+                existing_stat.st_ino,
+            )
+            self._retry_failed_owner(self._database_identity)
+            fresh_store = self._preflight_existing_store(canonical_path)
+            if not initialize_schema and fresh_store:
+                raise ValidationError(
+                    "offline migration requires an existing initialized "
+                    "Agent libOS store"
+                )
+        # A supported existing store is tightened only after its version gate.
+        # A fresh database is created owner-only here.
+        self._secure_database_files(
+            canonical_path,
+            create_if_missing=not existing_store,
+        )
+        if self._database_identity is None:
+            database_stat = os.stat(canonical_path, follow_symlinks=False)
+            self._database_identity = (
+                database_stat.st_dev,
+                database_stat.st_ino,
+            )
+        connection_path = str(canonical_path)
+        if existing_store:
+            # Re-open an existing store in explicit rw mode so a final
+            # disappearance after preflight cannot make sqlite3 create an
+            # unrelated empty database at the same pathname.
+            connection_target = f"{canonical_path.as_uri()}?mode=rw"
+            connection_uri = True
+        else:
+            connection_target = connection_path
+            connection_uri = False
+        # Keep all URI/path construction ahead of lease acquisition. This
+        # helper runs before the connection cleanup region in __init__, so no
+        # subsequent fallible preparation may strand an acquired lease.
+        if fcntl is not None and hasattr(os, "O_NOFOLLOW"):
+            self._lease_handle = self._acquire_runtime_lease(canonical_path)
+        return connection_path, connection_target, connection_uri
+
+    @staticmethod
+    def _require_frozen_target_spelling(path: Path) -> None:
+        """Reject a parent alias introduced after factory canonicalization."""
+
+        try:
+            observed = path.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValidationError(
+                "unsafe frozen SQLite database path changed while opening"
+            ) from exc
+        if SQLiteStore._exact_path_spelling(observed) != SQLiteStore._exact_path_spelling(path):
+            raise ValidationError(
+                "unsafe frozen SQLite database path changed while opening"
+            )
+
+    @staticmethod
+    def _exact_path_spelling(path: Path) -> str:
+        value = os.path.normpath(os.fspath(path))
+        if os.name != "nt":
+            return value
+        if value.startswith("\\\\?\\UNC\\"):
+            return f"\\\\{value[8:]}"
+        if value.startswith("\\\\?\\"):
+            return value[4:]
+        return value
 
     @classmethod
     def _retry_failed_owner(cls, identity: tuple[int, int]) -> None:

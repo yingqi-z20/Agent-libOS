@@ -170,12 +170,15 @@ config = load_config_file("host-overrides.yaml", base=base)
 runtime = Runtime.open(config=config)
 ```
 
-The checked-in repository `config.yaml` selects `.agent_libos.sqlite` and loads
-the trusted PTY Runtime Module. Consequently, omitting `--db` while using this
-checkout selects that persistent store. In an installed package or source tree
-without a project-root config, `DEFAULT_CONFIG.runtime.local_store_target` is
-`local`, an in-memory SQLite store. Scripts and documentation that require state
-across separate CLI invocations should always pass `--db` explicitly.
+The checked-in repository `config.yaml` selects the reserved `user` target and
+loads the trusted PTY Runtime Module. `DEFAULT_CONFIG.runtime.local_store_target`
+is also `user`, so the CLI, directly launched development GUI server, and bare
+`Runtime.open()`/`Runtime.aopen()` resolve by default to
+`~/.agent-libos/runtime/agent-libos.sqlite`. Packaged Electron explicitly keeps
+`<Electron userData>/runtime/agent-libos.sqlite`, outside its separate packaged
+workspace. Scripts and documentation that require state across separate CLI
+invocations should pass `--db user` explicitly. Explicit `local`, `:memory:`,
+and bare `sqlite://` targets remain independent in-memory stores.
 That persistence covers process metadata, authority, evidence, and other SQL
 records, not ordinary Object payloads. Current Object rows hold runtime-memory
 markers; if their payload cache is unavailable on reopen they are released
@@ -199,10 +202,14 @@ Relative paths intentionally have different owners. `--config` and explicit
 configured `modules.manifest_paths` resolve from the Agent libOS project root.
 A relative SQLite `--db` or `runtime.local_store_target` resolves from the
 current working directory when the store opens. With the default local
-substrate, that same directory is the workspace root, and a relative
-`git.worktree_root` resolves below it. An injected substrate can select a
-different workspace root, so library hosts should use explicit absolute store
-and module paths when those roots must not depend on process startup location.
+substrate, that same directory is the workspace root, so Runtime startup
+rejects such a database before creating it or any SQLite lease/WAL/SHM sidecar.
+An injected local substrate is checked against its explicit workspace root.
+Use `user` or an absolute SQLite path outside that effective workspace; there
+is no unsafe overlap override and no automatic move of a legacy project-root
+`.agent_libos.sqlite`. A relative `git.worktree_root` still resolves below the
+workspace. Library hosts should use explicit absolute store and module paths
+when their roots must not depend on process startup location.
 
 ### Effective LLM profile precedence
 

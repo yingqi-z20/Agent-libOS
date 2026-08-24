@@ -657,7 +657,7 @@ def test_runtime_rehydrate_validates_owner_before_loaded_fast_path_and_bounds_au
 def test_open_runtime_rejects_jit_rehydrate_before_durable_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = Runtime.open()
+    runtime = Runtime.open("local")
     read_attempted = False
 
     def unexpected_read(*_args: object, **_kwargs: object) -> ProcessToolBindingPage:

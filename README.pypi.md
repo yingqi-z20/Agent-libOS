@@ -340,16 +340,26 @@ migration, benchmark, or test recipe from an older README or another version.
 
 ## Persistent Runtime
 
-`--db local` is in-memory. A filesystem path selects persistent SQLite, while a
-`postgresql://` or `postgres://` DSN selects the optional PostgreSQL backend.
-Both use the same RuntimeStore contract and enforce a single active writable
-Runtime lease for one store target.
+`--db user` selects the persistent
+`~/.agent-libos/runtime/agent-libos.sqlite` and is the default for the CLI,
+development GUI server, and bare `Runtime.open()`/`Runtime.aopen()`. Packaged
+Electron keeps its existing explicit
+`<Electron userData>/runtime/agent-libos.sqlite` target. `--db local` and
+`--db :memory:` are in-memory. A filesystem path outside the effective
+model-visible workspace selects persistent SQLite, while a `postgresql://` or
+`postgres://` DSN selects the optional PostgreSQL backend. Persistent targets
+use the same RuntimeStore contract and enforce a single active writable Runtime
+lease for one store target. A custom SQLite target inside the workspace is
+rejected before database or sidecar creation; there is no unsafe override.
 
 The current Runtime creates and opens only RuntimeStore schema v7. A canonical
 v6 store requires the explicit, offline, digest-bound v6-to-v7 migration; older
 supported stores must traverse the documented ordered migrations. Startup never
 performs an automatic migration, backfill, dual-schema bridge, or speculative
-repair.
+repair. Legacy project-root `.agent_libos.sqlite` databases are not moved
+automatically. Stop all writers and move or restore the database to an external
+owner-only location before selecting it, or use the default `user` target for a
+fresh store.
 
 Durable metadata does not make every Object payload durable. Ordinary payloads
 remain Runtime-memory state. With the documented default retention setting, one
@@ -410,9 +420,13 @@ explicit opt-in smoke path.
   effects remain available only through governed syscalls.
 - The local Shell/PTY provider is mediation for commands, environment, cwd,
   resources, effects, and evidence. It is not a hostile-native-code sandbox.
+- Shell/PTY reject `env`, `nice`, `nohup`, `setsid`, `stdbuf`, and `timeout`
+  whenever the launcher argv has a trailing token, before policy, Human
+  approval, data-flow, evidence, or provider resolution. A single-token
+  invocation such as `env` remains available through ordinary Shell authority.
 - Typed Git mutating operations bind repository state and affected filesystem
-  authority. Any recognized transparent executable-launcher wrapper around Git
-  is rejected before Shell policy or Human approval.
+  authority; the six exact legacy direct Git reads remain the only raw Git
+  compatibility surface.
 - JSON-RPC and MCP calls require the exact registered endpoint/server operation
   authority before provider metadata or input schemas can be used.
 - Trusted Sinks delimit Runtime-mediated egress. The guarantee ends at the Sink;

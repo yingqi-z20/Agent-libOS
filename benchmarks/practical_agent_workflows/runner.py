@@ -225,7 +225,9 @@ def _run_native_scenario(
     try:
         root = Path(owner.name)
         provider = StatefulConnectorProvider()
-        substrate = LocalResourceProviderSubstrate(root)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        substrate = LocalResourceProviderSubstrate(workspace)
         substrate.jsonrpc = provider
         runtime = Runtime.open(root / "runtime.sqlite", substrate=substrate)
         try:

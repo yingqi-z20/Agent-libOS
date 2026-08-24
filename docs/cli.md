@@ -32,14 +32,17 @@ The wheel also installs `agent-libos-migrate-tool-groups`, an explicit offline,
 one-time migration command for legacy stores. It defaults to a rolled-back dry
 run and is not a normal Runtime control surface; see [Tool Skills](tools_and_jit.md).
 
-Use `--db` to select a runtime store. The sentinel target `local` is in-memory
-SQLite. Any other filesystem path creates or opens a persistent SQLite
-database. A `postgresql://` or `postgres://` DSN opens a PostgreSQL runtime
-store. PostgreSQL support is optional; install it before using a DSN, for
-example with `uv sync --frozen --extra postgres`.
+Use `--db` to select a runtime store. The reserved `user` target resolves to
+the persistent `~/.agent-libos/runtime/agent-libos.sqlite`; it is also the
+default when `--db` is omitted. The `local` and `:memory:` sentinels are
+in-memory SQLite. Any other filesystem path creates or opens a persistent
+SQLite database, provided it is outside the effective model-visible workspace.
+A `postgresql://` or `postgres://` DSN opens a PostgreSQL runtime store.
+PostgreSQL support is optional; install it before using a DSN, for example with
+`uv sync --frozen --extra postgres`.
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite <command>
+uv run agent-libos --db user <command>
 ```
 
 Global options (`--config`, `--db`, `--module-manifest`, and the two module
@@ -84,7 +87,7 @@ default, and unit inventory, use the
 
 ```yaml
 runtime:
-  local_store_target: .agent_libos.sqlite
+  local_store_target: user
   store_backend: sqlite
   run_until_idle_max_quanta: 10
 llm:
@@ -100,17 +103,18 @@ llm:
       fallback_json_actions: true
 ```
 
-Explicit CLI options still win over config defaults. Passing `--db local`,
-`--db :memory:`, or a filesystem path selects SQLite even when the config
-default backend is PostgreSQL. When `--db` is omitted, the CLI uses
+Explicit CLI options still win over config defaults. Passing `--db user`,
+`--db local`, `--db :memory:`, or a filesystem path selects SQLite even when
+the config default backend is PostgreSQL. When `--db` is omitted, the CLI uses
 `runtime.local_store_target` for SQLite or `runtime.store_dsn` for PostgreSQL.
 If `runtime.store_backend: postgres` is selected without `runtime.store_dsn`,
 config loading fails. A configured PostgreSQL DSN must use `postgres://` or
 `postgresql://`; `runtime.store_dsn` is rejected for the SQLite backend, and a
 PostgreSQL URI in `runtime.local_store_target` is rejected instead of silently
-overriding `runtime.store_backend`. Explicit `--db` targets accept filesystem
-paths, the SQLite sentinels/URI, or URI-form PostgreSQL DSNs; other URI schemes
-and libpq `key=value` DSNs fail closed rather than becoming SQLite filenames.
+overriding `runtime.store_backend`. Explicit `--db` targets accept `user`,
+filesystem paths, the in-memory SQLite sentinels/URI, or URI-form PostgreSQL
+DSNs; other URI schemes and libpq `key=value` DSNs fail closed rather than
+becoming SQLite filenames.
 Prefer environment variables or environment-specific config so DSN credentials
 are not committed. SQLite and PostgreSQL implement the same runtime store
 contract. Ordinary Object Memory payloads are runtime-only; SQL object rows
@@ -143,9 +147,12 @@ the project root, not the shell's current working directory.
 By contrast, a relative `--config`, explicit `--module-manifest`, SQLite
 `--db`, or `runtime.local_store_target` is rooted at the current working
 directory. With the default local substrate that directory is also the Runtime
-workspace; `git.worktree_root` is relative to that workspace and must remain
-below it. See [Configuration](configuration.md) before combining these settings
-from different launch directories.
+workspace, so a relative persistent SQLite target is rejected before the
+database, lease, WAL, or SHM file is created. Use `--db user` or an absolute
+SQLite path outside the effective workspace. `git.worktree_root` is relative to
+that workspace and must remain below it. See
+[Configuration](configuration.md) before combining these settings from
+different launch directories.
 `llm.parallel_tool_calls` is opt-in and can be overridden per profile. When it
 is enabled, OpenAI may return multiple tool calls in one action-selection
 response; Agent libOS dispatches them sequentially in the same quantum rather
@@ -180,7 +187,7 @@ Use `--module-manifest` and `--trusted-module` before the command name to load a
 trusted Runtime Module that is not already named by the selected config:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite \
+uv run agent-libos --db user \
   --module-manifest <path-to-module.yaml> \
   --trusted-module <module_id>:<manifest_sha256>:<source_sha256> \
   <command>
@@ -257,7 +264,7 @@ labelled “useful options” are intentionally not exhaustive.
 overwrite mode. Preserve or move an existing file at that path before running
 the demo if it contains user data. In this source checkout, project-root
 `config.yaml` loads its configured PTY Runtime Module; omitting `--db` also
-opens the persistent `.agent_libos.sqlite` selected by that config. Use
+opens the persistent `user` target selected by that config. Use
 `agent-libos --db local demo` when the Runtime records should be in-memory. The
 preview file is still written in either mode.
 
@@ -267,8 +274,8 @@ and before the subcommand; placing it after the subcommand is rejected by
 argparse. For example:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite capabilities --actor-pid <actor_pid> grant <subject_pid> filesystem:workspace:README.md --rights read
-uv run agent-libos --db .agent_libos.sqlite checkpoint --actor-pid <actor_pid> inspect <checkpoint_id>
+uv run agent-libos --db user capabilities --actor-pid <actor_pid> grant <subject_pid> filesystem:workspace:README.md --rights read
+uv run agent-libos --db user checkpoint --actor-pid <actor_pid> inspect <checkpoint_id>
 ```
 
 ## Persistent Runtime Basics
@@ -300,16 +307,16 @@ load `.env`; export them first or invoke it as
 Configuration](../README.md#real-llm-configuration).
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite init
-uv run agent-libos --db .agent_libos.sqlite spawn --image coding-agent:v0 --goal "Summarize README.md"
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> filesystem:workspace:README.md --rights read
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> human:owner --rights write
-uv run agent-libos --db .agent_libos.sqlite run --max-quanta 10
-uv run agent-libos --db .agent_libos.sqlite processes
-uv run agent-libos --db .agent_libos.sqlite resources <pid>
-uv run agent-libos --db .agent_libos.sqlite audit
-uv run agent-libos --db .agent_libos.sqlite tools
-uv run agent-libos --db .agent_libos.sqlite workflow run get_working_directory
+uv run agent-libos --db user init
+uv run agent-libos --db user spawn --image coding-agent:v0 --goal "Summarize README.md"
+uv run agent-libos --db user capabilities grant <pid> filesystem:workspace:README.md --rights read
+uv run agent-libos --db user capabilities grant <pid> human:owner --rights write
+uv run agent-libos --db user run --max-quanta 10
+uv run agent-libos --db user processes
+uv run agent-libos --db user resources <pid>
+uv run agent-libos --db user audit
+uv run agent-libos --db user tools
+uv run agent-libos --db user workflow run get_working_directory
 ```
 
 The initial `spawn` prints the pid to substitute for `<pid>`. The exact
@@ -343,7 +350,7 @@ spawn/image or shell authority gates.
 Manual queue processing remains available:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite human
+uv run agent-libos --db user human
 ```
 
 `spawn` and `exec` accept `--llm-profile <profile-id>` for host-selected
@@ -402,26 +409,26 @@ control state, settle a request, issue a Capability, mutate labels, or call a
 provider.
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite semantic status
-uv run agent-libos --db .agent_libos.sqlite semantic assessments \
+uv run agent-libos --db user semantic status
+uv run agent-libos --db user semantic assessments \
   --pid <pid> --request-id <request_id> --operation-id <operation_id> \
   --kind approval --status success --domain filesystem \
   --action-id filesystem.read \
   --tenant-bucket-sha256 <lowercase_sha256> --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic assessments \
+uv run agent-libos --db user semantic assessments \
   --after <opaque_next_cursor> --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic show <assessment_id>
-uv run agent-libos --db .agent_libos.sqlite semantic flow status
-uv run agent-libos --db .agent_libos.sqlite semantic flow entities --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic flow edges --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic flow lineage <node_id>
-uv run agent-libos --db .agent_libos.sqlite semantic settlements --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic policy epochs --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic control status
-uv run agent-libos --db .agent_libos.sqlite semantic control history --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic health --limit 50
-uv run agent-libos --db .agent_libos.sqlite semantic metrics
-uv run agent-libos --db .agent_libos.sqlite semantic review import \
+uv run agent-libos --db user semantic show <assessment_id>
+uv run agent-libos --db user semantic flow status
+uv run agent-libos --db user semantic flow entities --limit 50
+uv run agent-libos --db user semantic flow edges --limit 50
+uv run agent-libos --db user semantic flow lineage <node_id>
+uv run agent-libos --db user semantic settlements --limit 50
+uv run agent-libos --db user semantic policy epochs --limit 50
+uv run agent-libos --db user semantic control status
+uv run agent-libos --db user semantic control history --limit 50
+uv run agent-libos --db user semantic health --limit 50
+uv run agent-libos --db user semantic metrics
+uv run agent-libos --db user semantic review import \
   --file <strict-json-review-evidence>
 ```
 
@@ -471,6 +478,13 @@ validates the complete canonical source shape against a private snapshot,
 performs zero writes beside the source, and returns a deterministic
 `plan_sha256`.
 
+The SQLite examples below are offline-only and deliberately use absolute paths
+outside the effective workspace. Replace those example paths with the
+quiesced legacy database and an independent backup location. A legacy
+project-root `.agent_libos.sqlite` is not moved automatically; move it while
+all Runtimes are stopped before migrating or reopening it. Ordinary Runtime
+startup rejects a persistent SQLite database that remains inside its workspace.
+
 Plan schema v2 binds that digest to the hashed database/schema and cluster
 identity, canonical source catalog, source logical or locked PostgreSQL
 relation-state digest, source-observation receipt, plan-bound migration-receipt
@@ -489,15 +503,17 @@ another, generic same-version, or subsequently modified database.
 For the current v6-to-v7 step:
 
 ```bash
-# Create an independent, quiesced, owner-only backup first.
-sqlite3 .agent_libos.sqlite ".backup '.agent_libos.v6.backup.sqlite'"
-chmod 600 .agent_libos.v6.backup.sqlite
+# Replace both paths; keep the quiesced source and backup outside the workspace.
+LEGACY_DB=/absolute/external/store/agent-libos.sqlite
+LEGACY_BACKUP=/absolute/external/backup/agent-libos.v6.backup.sqlite
+sqlite3 "$LEGACY_DB" ".backup '$LEGACY_BACKUP'"
+chmod 600 "$LEGACY_BACKUP"
 
-uv run agent-libos --db .agent_libos.sqlite store migrate --to 7 \
-  --dry-run --sqlite-backup .agent_libos.v6.backup.sqlite
-uv run agent-libos --db .agent_libos.sqlite store migrate --to 7 \
+uv run agent-libos --db "$LEGACY_DB" store migrate --to 7 \
+  --dry-run --sqlite-backup "$LEGACY_BACKUP"
+uv run agent-libos --db "$LEGACY_DB" store migrate --to 7 \
   --apply --expected-plan-sha256 <plan_sha256> \
-  --sqlite-backup .agent_libos.v6.backup.sqlite
+  --sqlite-backup "$LEGACY_BACKUP"
 ```
 
 The PostgreSQL form uses the same target/digest flow and requires
@@ -508,15 +524,17 @@ catalog, lease, backup, and rollback checks.
 For the preceding v5-to-v6 step:
 
 ```bash
-# Create an independent, quiesced, owner-only backup first.
-sqlite3 .agent_libos.sqlite ".backup '.agent_libos.v5.backup.sqlite'"
-chmod 600 .agent_libos.v5.backup.sqlite
+# Replace both paths; keep the quiesced source and backup outside the workspace.
+LEGACY_DB=/absolute/external/store/agent-libos.sqlite
+LEGACY_BACKUP=/absolute/external/backup/agent-libos.v5.backup.sqlite
+sqlite3 "$LEGACY_DB" ".backup '$LEGACY_BACKUP'"
+chmod 600 "$LEGACY_BACKUP"
 
-uv run agent-libos --db .agent_libos.sqlite store migrate --to 6 \
-  --dry-run --sqlite-backup .agent_libos.v5.backup.sqlite
-uv run agent-libos --db .agent_libos.sqlite store migrate --to 6 \
+uv run agent-libos --db "$LEGACY_DB" store migrate --to 6 \
+  --dry-run --sqlite-backup "$LEGACY_BACKUP"
+uv run agent-libos --db "$LEGACY_DB" store migrate --to 6 \
   --apply --expected-plan-sha256 <plan_sha256> \
-  --sqlite-backup .agent_libos.v5.backup.sqlite
+  --sqlite-backup "$LEGACY_BACKUP"
 ```
 
 The PostgreSQL v5-to-v6 form uses the same target and plan digest, plus the
@@ -532,20 +550,22 @@ uv run agent-libos --db "$AGENT_LIBOS_POSTGRES_DSN" store migrate --to 6 \
 The legacy v4-to-v5 step remains:
 
 ```bash
-# Create an independent, quiesced, owner-only backup first.
-sqlite3 .agent_libos.sqlite ".backup '.agent_libos.v4.backup.sqlite'"
-chmod 600 .agent_libos.v4.backup.sqlite
+# Replace both paths; keep the quiesced source and backup outside the workspace.
+LEGACY_DB=/absolute/external/store/agent-libos.sqlite
+LEGACY_BACKUP=/absolute/external/backup/agent-libos.v4.backup.sqlite
+sqlite3 "$LEGACY_DB" ".backup '$LEGACY_BACKUP'"
+chmod 600 "$LEGACY_BACKUP"
 
-uv run agent-libos --db .agent_libos.sqlite store migrate --to 5 \
-  --dry-run --sqlite-backup .agent_libos.v4.backup.sqlite
+uv run agent-libos --db "$LEGACY_DB" store migrate --to 5 \
+  --dry-run --sqlite-backup "$LEGACY_BACKUP"
 ```
 
 Review the plan and pass its exact digest to apply:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite store migrate --to 5 \
+uv run agent-libos --db "$LEGACY_DB" store migrate --to 5 \
   --apply --expected-plan-sha256 <plan_sha256> \
-  --sqlite-backup .agent_libos.v4.backup.sqlite
+  --sqlite-backup "$LEGACY_BACKUP"
 ```
 
 For apply, both the SQLite source and independent backup must be regular files
@@ -594,10 +614,10 @@ also does not bypass primitive capability checks, resource budgets, human
 approval, result-object persistence, events, or audit.
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite \
+uv run agent-libos --db user \
   workflow run get_working_directory
 
-uv run agent-libos --db .agent_libos.sqlite \
+uv run agent-libos --db user \
   workflow run parse_pytest_log \
   --image coding-agent:v0 \
   --args-json '{"log":"FAILED tests/example.py::test_case"}'
@@ -647,16 +667,16 @@ For example, after enabling `task_runs.plaintext_payloads_enabled` in the Host
 configuration:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite task-run start \
+uv run agent-libos --db user task-run start \
   --goal "inspect the repository and fix the reported failure" \
   --title "repair reported failure" \
   --retention purge_on_terminal
 
-uv run agent-libos --db .agent_libos.sqlite task-run start \
+uv run agent-libos --db user task-run start \
   --goal "continue until the acceptance checks pass" \
   --title "release validation" --run --max-quanta 20
 
-uv run agent-libos --db .agent_libos.sqlite task-run follow-up <run_id> \
+uv run agent-libos --db user task-run follow-up <run_id> \
   "also document the compatibility boundary" \
   --expected-revision <revision> --command-id <stable-id>
 ```
@@ -720,9 +740,9 @@ live creator process in the same Runtime; an object id recorded in a database is
 not sufficient.
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite object-task list --pid <pid>
-uv run agent-libos --db .agent_libos.sqlite object-task get <task_id> --pid <pid>
-uv run agent-libos --db .agent_libos.sqlite object-task wait <task_id> --pid <pid>
+uv run agent-libos --db user object-task list --pid <pid>
+uv run agent-libos --db user object-task get <task_id> --pid <pid>
+uv run agent-libos --db user object-task wait <task_id> --pid <pid>
 ```
 
 Those one-shot reads are useful for terminal records. For completeness, the
@@ -767,8 +787,8 @@ Host surface.
 Inspect persisted LLM action-selection calls:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite llm-calls --pid <pid>
-uv run agent-libos --db .agent_libos.sqlite llm-calls --limit 20
+uv run agent-libos --db user llm-calls --pid <pid>
+uv run agent-libos --db user llm-calls --limit 20
 ```
 
 With the default full-I/O policy, records include provider ids, model/API mode,
@@ -809,9 +829,9 @@ the Host policy under `runtime.payload_retention_*`, then preview one bounded
 page before applying it:
 
 ```bash
-uv run agent-libos --config config.yaml --db .agent_libos.sqlite payload-retention llm_call
-uv run agent-libos --config config.yaml --db .agent_libos.sqlite payload-retention llm_call --apply
-uv run agent-libos --config config.yaml --db .agent_libos.sqlite payload-retention external_effect --apply
+uv run agent-libos --config config.yaml --db user payload-retention llm_call
+uv run agent-libos --config config.yaml --db user payload-retention llm_call --apply
+uv run agent-libos --config config.yaml --db user payload-retention external_effect --apply
 ```
 
 The command returns counts and an optional `next_cursor`. Continue with both
@@ -828,20 +848,20 @@ are not eligible. See
 List causal-root operations for one process or explain one causal tree:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite explain process <pid>
-uv run agent-libos --db .agent_libos.sqlite explain operation <operation_id>
+uv run agent-libos --db user explain process <pid>
+uv run agent-libos --db user explain operation <operation_id>
 ```
 
 Resolve an explicit evidence id:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite explain call <call_id>
-uv run agent-libos --db .agent_libos.sqlite explain effect <effect_id>
-uv run agent-libos --db .agent_libos.sqlite explain request <request_id>
-uv run agent-libos --db .agent_libos.sqlite explain audit <record_id>
-uv run agent-libos --db .agent_libos.sqlite explain event <event_id>
-uv run agent-libos --db .agent_libos.sqlite explain reservation <reservation_id>
-uv run agent-libos --db .agent_libos.sqlite explain context <materialization_id>
+uv run agent-libos --db user explain call <call_id>
+uv run agent-libos --db user explain effect <effect_id>
+uv run agent-libos --db user explain request <request_id>
+uv run agent-libos --db user explain audit <record_id>
+uv run agent-libos --db user explain event <event_id>
+uv run agent-libos --db user explain reservation <reservation_id>
+uv run agent-libos --db user explain context <materialization_id>
 ```
 
 Process lists accept `--limit` and `--cursor`; detail/evidence lookups accept
@@ -881,7 +901,7 @@ authority is part of the launch manifest rather than a grant after spawn. See
 Inspect one process's configured budget, observed usage, and remaining budget:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite resources <pid>
+uv run agent-libos --db user resources <pid>
 ```
 
 Resource accounting is process-tree scoped. Tool calls, LLM calls/tokens,
@@ -913,7 +933,7 @@ numeric configuration values.
 For a Codex CLI-style loop:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite run --interactive --pid <pid> --max-quanta 20
+uv run agent-libos --db user run --interactive --pid <pid> --max-quanta 20
 ```
 
 `--pid` may be omitted only when the Runtime has exactly one non-terminal
@@ -945,9 +965,9 @@ Interactive slash commands:
 ## Process Messages
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite message <pid> "Please inspect the latest result"
-uv run agent-libos --db .agent_libos.sqlite interrupt <pid> "Stop current work and read this first"
-uv run agent-libos --db .agent_libos.sqlite message <pid> "Use this as job input" --channel human --correlation-id job-42 --run
+uv run agent-libos --db user message <pid> "Please inspect the latest result"
+uv run agent-libos --db user interrupt <pid> "Stop current work and read this first"
+uv run agent-libos --db user message <pid> "Use this as job input" --channel human --correlation-id job-42 --run
 ```
 
 Useful options:
@@ -968,11 +988,11 @@ Useful options:
 ## Process Builtins
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> 'filesystem:workspace:agent_libos/*' --rights read
-uv run agent-libos --db .agent_libos.sqlite cd <pid> agent_libos
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> image:review-agent:v0 --rights read
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> human:owner --rights write
-uv run agent-libos --db .agent_libos.sqlite exec review-agent:v0 "Review runtime/runtime.py" \
+uv run agent-libos --db user capabilities grant <pid> 'filesystem:workspace:agent_libos/*' --rights read
+uv run agent-libos --db user cd <pid> agent_libos
+uv run agent-libos --db user capabilities grant <pid> image:review-agent:v0 --rights read
+uv run agent-libos --db user capabilities grant <pid> human:owner --rights write
+uv run agent-libos --db user exec review-agent:v0 "Review runtime/runtime.py" \
   --pid <pid> --no-preserve-memory --preserve-capabilities --run --max-quanta 10
 ```
 
@@ -1048,11 +1068,11 @@ general workspace authority outside the package.
 ## Image Commands
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite images list
-uv run agent-libos --db .agent_libos.sqlite images inspect coding-agent:v0
-uv run agent-libos --db .agent_libos.sqlite images validate images/mini-swe-agent
-uv run agent-libos --db .agent_libos.sqlite images register images/mini-swe-agent
-uv run agent-libos --db .agent_libos.sqlite images commit <checkpoint_id> stateful-agent:v0 --name stateful-agent
+uv run agent-libos --db user images list
+uv run agent-libos --db user images inspect coding-agent:v0
+uv run agent-libos --db user images validate images/mini-swe-agent
+uv run agent-libos --db user images register images/mini-swe-agent
+uv run agent-libos --db user images commit <checkpoint_id> stateful-agent:v0 --name stateful-agent
 ```
 
 | Image subcommand | Arguments and option defaults |
@@ -1093,13 +1113,13 @@ image. Without `--actor-pid`, the command runs as audited admin CLI.
 ## Checkpoint Commands
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite checkpoint create <pid> "before risky edit"
-uv run agent-libos --db .agent_libos.sqlite checkpoint list --pid <pid>
-uv run agent-libos --db .agent_libos.sqlite checkpoint inspect <checkpoint_id>
-uv run agent-libos --db .agent_libos.sqlite checkpoint diff <checkpoint_id>
-uv run agent-libos --db .agent_libos.sqlite checkpoint restore <checkpoint_id>
-uv run agent-libos --db .agent_libos.sqlite checkpoint fork <checkpoint_id> --parent-pid <pid>
-uv run agent-libos --db .agent_libos.sqlite checkpoint replay <checkpoint_id> <event_id>
+uv run agent-libos --db user checkpoint create <pid> "before risky edit"
+uv run agent-libos --db user checkpoint list --pid <pid>
+uv run agent-libos --db user checkpoint inspect <checkpoint_id>
+uv run agent-libos --db user checkpoint diff <checkpoint_id>
+uv run agent-libos --db user checkpoint restore <checkpoint_id>
+uv run agent-libos --db user checkpoint fork <checkpoint_id> --parent-pid <pid>
+uv run agent-libos --db user checkpoint replay <checkpoint_id> <event_id>
 ```
 
 | Checkpoint subcommand | Arguments and option defaults |
@@ -1141,13 +1161,13 @@ contract. Treat this as reviewed contract drift, not replay equivalence; see
 ## Skill Commands
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite skills discover
-uv run agent-libos --db .agent_libos.sqlite skills validate skills/swe-agent
-uv run agent-libos --db .agent_libos.sqlite skills register skills/swe-agent
-uv run agent-libos --db .agent_libos.sqlite skills inspect swe-agent
-uv run agent-libos --db .agent_libos.sqlite skills discover --text swe-agent
-uv run agent-libos --db .agent_libos.sqlite skills activate <pid> swe-agent --expected-package-sha256 <package_sha256-from-discover>
-uv run agent-libos --db .agent_libos.sqlite skills unload <pid> swe-agent
+uv run agent-libos --db user skills discover
+uv run agent-libos --db user skills validate skills/swe-agent
+uv run agent-libos --db user skills register skills/swe-agent
+uv run agent-libos --db user skills inspect swe-agent
+uv run agent-libos --db user skills discover --text swe-agent
+uv run agent-libos --db user skills activate <pid> swe-agent --expected-package-sha256 <package_sha256-from-discover>
+uv run agent-libos --db user skills unload <pid> swe-agent
 ```
 
 | Skill subcommand | Arguments and option defaults |
@@ -1167,9 +1187,9 @@ if package content changes.
 Global Skills require exact package SHA-256 trust:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite skills trust ~/.agent-libos/skills/review-helper
-uv run agent-libos --db .agent_libos.sqlite skills register ~/.agent-libos/skills/review-helper --source-type global
-uv run agent-libos --db .agent_libos.sqlite skills untrust ~/.agent-libos/skills/review-helper
+uv run agent-libos --db user skills trust ~/.agent-libos/skills/review-helper
+uv run agent-libos --db user skills register ~/.agent-libos/skills/review-helper --source-type global
+uv run agent-libos --db user skills untrust ~/.agent-libos/skills/review-helper
 ```
 
 `--actor-pid <pid>` makes `discover`, `inspect`, `register`, `activate`,
@@ -1182,12 +1202,12 @@ read through the actor's workspace filesystem authority.
 ## Capability Commands
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite capabilities list --subject <pid>
-uv run agent-libos --db .agent_libos.sqlite capabilities inspect <capability_id>
-uv run agent-libos --db .agent_libos.sqlite capabilities explain <pid> filesystem:workspace:README.md read
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> filesystem:workspace:README.md --rights read
-uv run agent-libos --db .agent_libos.sqlite capabilities delegate <parent_pid> <child_pid> 'filesystem:workspace:src/*' --rights read
-uv run agent-libos --db .agent_libos.sqlite capabilities revoke <capability_id> --reason "no longer needed"
+uv run agent-libos --db user capabilities list --subject <pid>
+uv run agent-libos --db user capabilities inspect <capability_id>
+uv run agent-libos --db user capabilities explain <pid> filesystem:workspace:README.md read
+uv run agent-libos --db user capabilities grant <pid> filesystem:workspace:README.md --rights read
+uv run agent-libos --db user capabilities delegate <parent_pid> <child_pid> 'filesystem:workspace:src/*' --rights read
+uv run agent-libos --db user capabilities revoke <capability_id> --reason "no longer needed"
 ```
 
 | Capability subcommand | Arguments and option defaults |
@@ -1228,12 +1248,12 @@ an `allow`; a subject cannot remove its own restrictive `ask` or `deny` record.
 ## JSON-RPC Commands
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite jsonrpc register <path-to-endpoint-manifest.yaml>
-uv run agent-libos --db .agent_libos.sqlite jsonrpc list
-uv run agent-libos --db .agent_libos.sqlite jsonrpc inspect demo-weather
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> jsonrpc:demo-weather:forecast --rights read
-uv run agent-libos --db .agent_libos.sqlite jsonrpc call <pid> demo-weather forecast --params-json '{"city":"Beijing"}'
-uv run agent-libos --db .agent_libos.sqlite jsonrpc unregister demo-weather
+uv run agent-libos --db user jsonrpc register <path-to-endpoint-manifest.yaml>
+uv run agent-libos --db user jsonrpc list
+uv run agent-libos --db user jsonrpc inspect demo-weather
+uv run agent-libos --db user capabilities grant <pid> jsonrpc:demo-weather:forecast --rights read
+uv run agent-libos --db user jsonrpc call <pid> demo-weather forecast --params-json '{"city":"Beijing"}'
+uv run agent-libos --db user jsonrpc unregister demo-weather
 ```
 
 The manifest path is user supplied; copy and adapt the complete example in
@@ -1265,17 +1285,17 @@ values are rejected before authority or registry lookup.
 
 ```bash
 uv sync --frozen --extra mcp
-uv run agent-libos --db .agent_libos.sqlite mcp register <path-to-server-manifest.yaml>
-uv run agent-libos --db .agent_libos.sqlite mcp list
-uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-mcp
+uv run agent-libos --db user mcp register <path-to-server-manifest.yaml>
+uv run agent-libos --db user mcp list
+uv run agent-libos --db user mcp inspect demo-mcp
 # Manifest v2 with protocol_mode auto or 2026-07-28 only:
-uv run agent-libos --db .agent_libos.sqlite mcp discover demo-mcp
-uv run agent-libos --db .agent_libos.sqlite mcp tools demo-mcp
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> process:spawn --rights write
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> <stdio_authority_resource-from-inspect> --rights execute
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-mcp:forecast --rights read
-uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --arguments-json '{"city":"Beijing"}'
-uv run agent-libos --db .agent_libos.sqlite mcp unregister demo-mcp
+uv run agent-libos --db user mcp discover demo-mcp
+uv run agent-libos --db user mcp tools demo-mcp
+uv run agent-libos --db user capabilities grant <pid> process:spawn --rights write
+uv run agent-libos --db user capabilities grant <pid> <stdio_authority_resource-from-inspect> --rights execute
+uv run agent-libos --db user capabilities grant <pid> mcp:demo-mcp:forecast --rights read
+uv run agent-libos --db user mcp call <pid> demo-mcp forecast --arguments-json '{"city":"Beijing"}'
+uv run agent-libos --db user mcp unregister demo-mcp
 ```
 
 Manifest v3 servers pinned to exact protocol revision `2026-07-28` expose the
@@ -1283,38 +1303,38 @@ modern Host client commands:
 
 ```bash
 # Resources and Templates are addressed only by registered logical ids.
-uv run agent-libos --db .agent_libos.sqlite mcp resources list demo-mcp
-uv run agent-libos --db .agent_libos.sqlite mcp resources templates demo-mcp
-uv run agent-libos --db .agent_libos.sqlite mcp resources read demo-mcp handbook --variables-json '{"locale":"zh-CN"}'
+uv run agent-libos --db user mcp resources list demo-mcp
+uv run agent-libos --db user mcp resources templates demo-mcp
+uv run agent-libos --db user mcp resources read demo-mcp handbook --variables-json '{"locale":"zh-CN"}'
 
 # Prompt output is a preview requiring user confirmation; it is never trusted
 # as system/developer context.
-uv run agent-libos --db .agent_libos.sqlite mcp prompts list demo-mcp
-uv run agent-libos --db .agent_libos.sqlite mcp prompts get demo-mcp release-notes --arguments-json '{"version":"1.5.1"}'
-uv run agent-libos --db .agent_libos.sqlite mcp prompts complete demo-mcp prompt release-notes version 2
+uv run agent-libos --db user mcp prompts list demo-mcp
+uv run agent-libos --db user mcp prompts get demo-mcp release-notes --arguments-json '{"version":"1.5.1"}'
+uv run agent-libos --db user mcp prompts complete demo-mcp prompt release-notes version 2
 
 # OAuth login is one foreground flow. It prints the authorization URL, waits
 # for the full callback URL, and completes before this Runtime exits.
-uv run agent-libos --db .agent_libos.sqlite mcp auth login work-oauth --profile-file oauth-profile.json --scope resources.read
+uv run agent-libos --db user mcp auth login work-oauth --profile-file oauth-profile.json --scope resources.read
 # Every later one-shot command explicitly rebinds the same strict Host profile.
-uv run agent-libos --db .agent_libos.sqlite mcp --oauth-profile-file oauth-profile.json auth status work-oauth
-uv run agent-libos --db .agent_libos.sqlite mcp --oauth-profile-file oauth-profile.json resources list demo-mcp
+uv run agent-libos --db user mcp --oauth-profile-file oauth-profile.json auth status work-oauth
+uv run agent-libos --db user mcp --oauth-profile-file oauth-profile.json resources list demo-mcp
 # Confidential clients supply their secret through an inherited fd, never argv.
-uv run agent-libos --db .agent_libos.sqlite mcp auth login work-oauth --profile-file oauth-profile.json --client-secret-fd 3 3<client-secret
-uv run agent-libos --db .agent_libos.sqlite mcp auth logout work-oauth --profile-file oauth-profile.json
+uv run agent-libos --db user mcp auth login work-oauth --profile-file oauth-profile.json --client-secret-fd 3 3<client-secret
+uv run agent-libos --db user mcp auth logout work-oauth --profile-file oauth-profile.json
 
 # Durable Elicitation and Tasks use local ids plus revision CAS only.
-uv run agent-libos --db .agent_libos.sqlite mcp continuations inspect continuation-id
-uv run agent-libos --db .agent_libos.sqlite mcp continuations respond continuation-id --expected-revision 1 --human-request-id human-request-id --human-expected-revision 3 --human-preview-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --responses-json '{"input-1":{"action":"accept","content":{"approved":true}}}'
-uv run agent-libos --db .agent_libos.sqlite mcp continuations cancel continuation-id --expected-revision 1
-uv run agent-libos --db .agent_libos.sqlite mcp remote-tasks get local-task-ref
-uv run agent-libos --db .agent_libos.sqlite mcp remote-tasks update local-task-ref --expected-revision 1 --human-request-id human-request-id --human-expected-revision 4 --human-preview-sha256 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --responses-json '{"input-1":{"action":"accept","content":{"approved":true}}}'
-uv run agent-libos --db .agent_libos.sqlite mcp remote-tasks cancel local-task-ref --expected-revision 2
+uv run agent-libos --db user mcp continuations inspect continuation-id
+uv run agent-libos --db user mcp continuations respond continuation-id --expected-revision 1 --human-request-id human-request-id --human-expected-revision 3 --human-preview-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --responses-json '{"input-1":{"action":"accept","content":{"approved":true}}}'
+uv run agent-libos --db user mcp continuations cancel continuation-id --expected-revision 1
+uv run agent-libos --db user mcp remote-tasks get local-task-ref
+uv run agent-libos --db user mcp remote-tasks update local-task-ref --expected-revision 1 --human-request-id human-request-id --human-expected-revision 4 --human-preview-sha256 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --responses-json '{"input-1":{"action":"accept","content":{"approved":true}}}'
+uv run agent-libos --db user mcp remote-tasks cancel local-task-ref --expected-revision 2
 
 # Notifications are inert Host ingress. The CLI owns one listener in this
 # foreground Runtime, streams events to stderr, and prints a final JSON summary
 # to stdout after its bound, terminal state, or Ctrl-C performs explicit stop.
-uv run agent-libos --db .agent_libos.sqlite mcp subscriptions listen demo-mcp --filter resourcesListChanged --max-seconds 300
+uv run agent-libos --db user mcp subscriptions listen demo-mcp --filter resourcesListChanged --max-seconds 300
 ```
 
 Manifest and registry developer-experience commands are also Host-only. Live
@@ -1322,14 +1342,14 @@ probe, scaffold transitions, and import apply require a named reviewer, a
 reason, and the matching explicit confirmation flag:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite mcp validate server.yaml
-uv run agent-libos --db .agent_libos.sqlite mcp doctor server.yaml
-uv run agent-libos --db .agent_libos.sqlite mcp probe server.yaml --confirm-probe --reviewer alice --reason 'review the unregistered full catalog'
-uv run agent-libos --db .agent_libos.sqlite mcp scaffold create base.yaml complete-probe.json --confirm-scaffold --reviewer alice --reason 'prepare allowlist candidate'
-uv run agent-libos --db .agent_libos.sqlite mcp scaffold approve reviewed-candidate.json --confirm-review --reviewer alice --reason 'approve edited authority contract'
-uv run agent-libos --db .agent_libos.sqlite mcp export --server demo-mcp > registry-export.json
-uv run agent-libos --db .agent_libos.sqlite mcp import plan registry-export.json
-uv run agent-libos --db .agent_libos.sqlite mcp import apply registry-export.json demo-mcp --confirm-import --reviewer alice --reason 'apply reviewed CAS plan'
+uv run agent-libos --db user mcp validate server.yaml
+uv run agent-libos --db user mcp doctor server.yaml
+uv run agent-libos --db user mcp probe server.yaml --confirm-probe --reviewer alice --reason 'review the unregistered full catalog'
+uv run agent-libos --db user mcp scaffold create base.yaml complete-probe.json --confirm-scaffold --reviewer alice --reason 'prepare allowlist candidate'
+uv run agent-libos --db user mcp scaffold approve reviewed-candidate.json --confirm-review --reviewer alice --reason 'approve edited authority contract'
+uv run agent-libos --db user mcp export --server demo-mcp > registry-export.json
+uv run agent-libos --db user mcp import plan registry-export.json
+uv run agent-libos --db user mcp import apply registry-export.json demo-mcp --confirm-import --reviewer alice --reason 'apply reviewed CAS plan'
 ```
 
 `validate`, `doctor`, and both `scaffold` operations always open an ephemeral
@@ -1491,9 +1511,9 @@ project config already loads and trusts the PTY module, so inspect that
 configured instance without repeating its manifest:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite modules verify modules/pty/module.yaml
-uv run agent-libos --db .agent_libos.sqlite modules list
-uv run agent-libos --db .agent_libos.sqlite modules inspect agent-libos-pty:v0
+uv run agent-libos --db user modules verify modules/pty/module.yaml
+uv run agent-libos --db user modules list
+uv run agent-libos --db user modules inspect agent-libos-pty:v0
 ```
 
 | Module subcommand | Arguments and option defaults |

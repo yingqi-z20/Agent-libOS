@@ -322,7 +322,7 @@ from agent_libos import Runtime
 from agent_libos.runtime import RuntimeAssemblyCleanupRequired
 
 try:
-    runtime = await Runtime.aopen("runtime.sqlite")
+    runtime = await Runtime.aopen()
 except BaseException as error:
     for handle in RuntimeAssemblyCleanupRequired.extract(error):
         await handle.arelease()

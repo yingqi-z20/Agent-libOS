@@ -486,13 +486,15 @@ def test_real_llm_provider_result_links_to_model_output_and_tightens_labels(
     tmp_path: Path,
 ) -> None:
     sentinel = "FLOW_REAL_LLM_PASSWORD_SENTINEL_781e"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     database = tmp_path / "provider-model-lineage.db"
     runtime = Runtime.open(
         database,
         config=AgentLibOSConfig(
             semantic=SemanticDefaults(mode="shadow", adapter="deterministic")
         ),
-        substrate=LocalResourceProviderSubstrate(tmp_path),
+        substrate=LocalResourceProviderSubstrate(workspace),
     )
     try:
         runtime.llm.client = _FlowGraphLLMClient(f"password={sentinel}")
@@ -684,6 +686,8 @@ def test_capture_failure_health_is_digest_only_and_survives_reopen(
     tmp_path: Path,
 ) -> None:
     sentinel = "CAPTURE_FAILURE_SECRET_SENTINEL_b73f"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     database = tmp_path / "capture-health.db"
     config = AgentLibOSConfig(
         semantic=SemanticDefaults(mode="shadow", adapter="deterministic")
@@ -691,7 +695,7 @@ def test_capture_failure_health_is_digest_only_and_survives_reopen(
     runtime = Runtime.open(
         database,
         config=config,
-        substrate=LocalResourceProviderSubstrate(tmp_path),
+        substrate=LocalResourceProviderSubstrate(workspace),
     )
     try:
         runtime.semantic_runtime_flow.observe_memory(
@@ -706,7 +710,7 @@ def test_capture_failure_health_is_digest_only_and_survives_reopen(
     reopened = Runtime.open(
         database,
         config=config,
-        substrate=LocalResourceProviderSubstrate(tmp_path),
+        substrate=LocalResourceProviderSubstrate(workspace),
     )
     try:
         assert reopened.semantic_flow.status()["capture_failures"] >= 1

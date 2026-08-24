@@ -95,10 +95,28 @@ longer defines.
   lock upgrades fail.
 - `filesystem-host-aliases-share-one-authority-and-label-identity`: host path
   aliases that name the same filesystem entry share capability and data-label
-  identity, while genuinely distinct host names remain distinct. Manifest
-  schema v2 records the exact Darwin and Linux nodes required for this claim;
-  the configured native-platform CI matrix selects those markers separately
-  and fails if any selected platform node skips.
+  identity, while genuinely distinct host names remain distinct. Windows
+  existing entries use handle-derived stored long spelling, future components
+  use the parent directory's case-sensitivity policy, and ambiguous ADS/device/
+  trailing-dot-or-space forms fail before identity derivation. The workspace
+  root is rejected before following a reparse point. Sink-time exact canonical
+  spelling and File ID revalidation reject post-authorization rename, alias,
+  target rebind, or parent rebind drift; state and delete effects remain bound
+  to the validated handle, and creation fails if a previously missing component
+  appears. Manifest schema v2 records the exact Darwin, Linux, and Windows
+  nodes required for this claim; the configured native-platform CI matrix
+  selects those markers separately and fails if any selected platform node
+  skips.
+- `windows-persisted-filesystem-identities-are-canonical`: before Runtime OPEN,
+  Windows startup performs bounded keyset scans of every active capability,
+  live file-label binding, and checkpoint capability row that restore could
+  reactivate. It repeats the read-only validation after recovery while the
+  recovery lease is held. Any stored spelling that does not round-trip through
+  the current canonical resolver fails closed with only an opaque capability,
+  binding, or checkpoint id. Provider, parse, and paging failures discard their
+  exception context and cause so formatted tracebacks cannot recover a sensitive
+  path; startup neither exposes the path nor migrates the record. Inactive and
+  tombstoned history that cannot become effective does not block startup.
 - `task-authority-manifest-bounds-launch`: image requirements are declarations;
   Host manifest inputs are closed and strictly typed. Unknown fields, invalid
   scalar types, and malformed provider-effect wildcard forms fail closed before
@@ -289,6 +307,15 @@ longer defines.
   aliases and replacement races, while same-UID mutation of the owning directory
   remains a trusted Host boundary and the live path/parent must not be renamed or
   replaced. PostgreSQL keys advisory leases by exact database/schema.
+- `runtime-store-is-outside-model-visible-workspace`: before opening a
+  persistent SQLite store, RuntimeBuilder compares its Host-canonical path with
+  the effective local substrate workspace and rejects equality or containment
+  before database, lease, journal, WAL, or SHM creation. The same check applies
+  to sync, async, configured, and caller-owned store assembly before model
+  primitives are installed. `user` resolves to the persistent owner-only
+  `~/.agent-libos/runtime/agent-libos.sqlite`; explicit `local`, `:memory:`,
+  bare `sqlite://`, external SQLite, PostgreSQL, and non-local substrates retain
+  their documented behavior.
 - `storage-transactions-recover-or-fail-closed`: commit/savepoint finalization
   failure restores SQL and lazily journaled per-Object payload state when the
   transaction is definitely rollbackable. A commit diagnostic after the driver
@@ -521,8 +548,11 @@ longer defines.
   close can durably record its intent; `swe_edit` refuses truncated source.
   Auto-allowed direct Git inspection disables optional locks, repository
   fsmonitor, and external diff helpers before the provider boundary. Direct Git
-  argv and supported transparent launcher wrappers are limited to six exact
-  inspection commands even under an always-allow shell policy. Authorized
+  argv is limited to six exact inspection commands even under an always-allow
+  shell policy. Shell and PTY reject any recognized transparent launcher with
+  trailing argv before policy, approval, data flow, evidence, or provider
+  resolution; a standalone launcher such as `env` remains governed by ordinary
+  Shell authority. Authorized
   interpreters and native programs retain the documented host-user I/O boundary
   of Local Shell and are not claimed to be mediated as nested Git operations.
 - `git-provider-is-pinned-and-non-executable`: the typed Git provider operates
@@ -1027,9 +1057,14 @@ longer defines.
   concurrency tokens. Persistent SQLite-file and PostgreSQL contracts prove
   those high-water marks and fork identities survive reopen, and that a writer
   paused behind restore's transaction cannot commit against the old epoch.
-  Borrowed/`EXTERNAL_REF` state is not cloned, JIT
-  tool/candidate ids are remapped and atomically published, and finite-use
-  snapshot authority is never copied. Restore reauthorizes its composite
+  Borrowed/`EXTERNAL_REF` state is not cloned. Exact, subtree, and prefix
+  authority for clonable Objects is remapped to the new OID without widening;
+  every scoped grant for borrowed, non-clonable, released, or otherwise
+  unmapped Objects and domain-wide `object:*` is dropped. This includes dormant
+  authority whose source OID could become live after a later restore. Malformed
+  capability or tool-candidate resources reject the fork before publication.
+  JIT tool/candidate ids are remapped and atomically
+  published, and finite-use snapshot authority is never copied. Restore reauthorizes its composite
   decision set, publishes reconstructable state and core event/audit evidence,
   and settles finite uses in one AuthorityTransaction; a sink or settlement
   failure rolls back the full unit without fallible compensation. Fork revalidates/consumes actor authority
@@ -1400,8 +1435,8 @@ longer defines.
 - Per-change Python CI exercises 3.11 and 3.14 on Ubuntu and the complete
   deterministic `all` lane on native Windows Python 3.11 with Deno and the
   optional PTY dependency installed. A separate configured Python 3.11 matrix
-  runs the required host-filesystem-identity nodes on Ubuntu and macOS 14 with
-  `--fail-on-skip`. Python 3.12/3.13 are inside the declared package range but
+  runs the required host-filesystem-identity nodes on Ubuntu, macOS 14, and
+  Windows with `--fail-on-skip`. Python 3.12/3.13 are inside the declared package range but
   are not separate root-runtime jobs, and broader macOS runtime behavior remains
   environment-gated. Windows CI does not create guarantees the implementation
   does not provide: ConPTY still lacks Job Object/parent-death and wall/CPU/RSS

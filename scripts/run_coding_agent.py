@@ -66,7 +66,7 @@ async def amain(args: argparse.Namespace) -> None:
         audit_counts = _audit_counts_for_process(runtime.audit.trace(), pid)
         summary = {
             "workspace": str(workspace),
-            "database": _RUNTIME_DEFAULTS.local_store_target if args.ephemeral_db else str(_resolve_db_path(args, workspace)),
+            "database": "local" if args.ephemeral_db else str(_resolve_db_path(args, workspace)),
             "pid": pid,
             "image": _RUNTIME_DEFAULTS.coding_image_id,
             "permission_preset": args.permission_preset,
@@ -197,7 +197,7 @@ def _load_env(args: argparse.Namespace) -> None:
 async def _aopen_runtime(args: argparse.Namespace, workspace: Path) -> Runtime:
     substrate = LocalResourceProviderSubstrate(workspace)
     target = (
-        _RUNTIME_DEFAULTS.local_store_target
+        "local"
         if args.ephemeral_db
         else _resolve_db_path(args, workspace)
     )

@@ -6321,8 +6321,13 @@ def test_filesystem_and_direct_raw_shell_git_respect_typed_git_controls(tmp_path
                 runtime.config.shell.always_allow_level,
                 issued_by="git-provider-test",
             )
-            with pytest.raises(ValidationError, match="typed git_"):
+            with pytest.raises(
+                ValidationError,
+                match="transparent executable launcher dispatch is unavailable",
+            ):
                 runtime.shell.run(pid, ["env", "git", "branch", "wrapper-created"])
+            with pytest.raises(ValidationError, match="typed git_"):
+                runtime.shell.run(pid, ["git", "branch", "direct-created"])
             wrapped_ref = subprocess.run(
                 ["git", "show-ref", "--verify", "refs/heads/wrapper-created"],
                 cwd=root,
@@ -6331,6 +6336,14 @@ def test_filesystem_and_direct_raw_shell_git_respect_typed_git_controls(tmp_path
                 check=False,
             )
             assert wrapped_ref.returncode != 0
+            direct_ref = subprocess.run(
+                ["git", "show-ref", "--verify", "refs/heads/direct-created"],
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert direct_ref.returncode != 0
     finally:
         runtime.close()
 

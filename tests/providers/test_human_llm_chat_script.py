@@ -16,7 +16,15 @@ class TestHumanLLMChatScript:
         assert 'ask_human' in CHAT_PROCESS_GOAL
 
     def test_chat_uses_human_question_and_output_tools(self) -> None:
-        report = asyncio.run(run_chat(responder=EchoResponder(), max_turns=5, auto_messages=['hello', '/exit'], echo=False))
+        report = asyncio.run(
+            run_chat(
+                db="local",
+                responder=EchoResponder(),
+                max_turns=5,
+                auto_messages=['hello', '/exit'],
+                echo=False,
+            )
+        )
         assert report['process_status'] == 'exited'
         assert report['turns'] == 1
         assert report['history'] == [{'role': 'user', 'content': 'hello'}, {'role': 'assistant', 'content': 'Echo: hello'}]

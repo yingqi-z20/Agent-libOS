@@ -2577,9 +2577,6 @@ class CheckpointManager:
             self._remap_capability_row(row, identities)
             for row in rows.get("capabilities", [])
             if row["subject"] in identities.pids
-            and not row["resource"].startswith(
-                self.CHECKPOINT_RESOURCE_PREFIX
-            )
         ]
         rows["process_resource_reservations"] = [
             self._remap_resource_reservation_row(row, identities)
@@ -2594,7 +2591,10 @@ class CheckpointManager:
         ]
         rows["llm_pending_actions"] = []
         rows["tool_candidates"] = [
-            self._remap_tool_candidate_row(row, identities)
+            self._remap_tool_candidate_row(
+                row,
+                identities,
+            )
             for row in rows.get("tool_candidates", [])
             if row["pid"] in identities.pids
         ]
@@ -2607,6 +2607,7 @@ class CheckpointManager:
             identities.objects[oid]: self._remap_object_payload(
                 payload,
                 object_type=object_types.get(str(oid)),
+                identities=identities,
                 candidate_map=dict(identities.candidates),
             )
             for oid, payload in snapshot.get("object_payloads", {}).items()
@@ -2638,6 +2639,10 @@ class CheckpointManager:
         snapshot: dict[str, Any],
         rows: dict[str, list[dict[str, Any]]],
     ) -> tuple[SnapshotIdentityMap, set[str], dict[str, dict[str, Any]]]:
+        # Validate every authority carrier before transition-policy evaluation.
+        # Those evaluations append audit evidence, so a malformed later row
+        # must not leave a misleading partial fork-transition trace.
+        self._validate_fork_capability_resources(snapshot, rows)
         pid_map = {pid: new_id("pid") for pid in snapshot["subtree_pids"]}
         owned_object_oids = self._snapshot_owned_object_oids(snapshot)
         non_clonable_object_oids = self._non_clonable_object_oids(snapshot)
@@ -2661,12 +2666,13 @@ class CheckpointManager:
             str(row["candidate_id"]): new_id("tcand")
             for row in rows.get("tool_candidates", [])
         }
+        clonable_object_oids = set(object_map)
         source_rows = [
             row
             for row in rows.get("capabilities", [])
-            if not self._capability_references_any_object(
+            if not self._fork_resource_must_be_dropped(
                 row,
-                non_clonable_object_oids,
+                clonable_object_oids=clonable_object_oids,
             )
         ]
         rows["capabilities"] = self._fork_capability_rows(source_rows)
@@ -2688,10 +2694,77 @@ class CheckpointManager:
         )
         return identities, non_clonable_object_oids, source_capability_rows
 
+    @staticmethod
+    def _validate_fork_capability_resources(
+        snapshot: Mapping[str, Any],
+        rows: Mapping[str, list[dict[str, Any]]],
+    ) -> None:
+        for index, row in enumerate(rows.get("capabilities", [])):
+            SnapshotRemapper.parse_capability_resource(
+                row.get("resource"),
+                field_name=f"rows.capabilities[{index}].resource",
+            )
+        for row_index, row in enumerate(rows.get("tool_candidates", [])):
+            requested = SnapshotRemapper._json_container(
+                row.get("requested_capabilities_json"),
+                field_name=(
+                    f"rows.tool_candidates[{row_index}]"
+                    ".requested_capabilities_json"
+                ),
+                expected_type=list,
+            )
+            CheckpointManager._validated_requested_capability_specs(
+                requested,
+                field_name=(
+                    f"rows.tool_candidates[{row_index}]"
+                    ".requested_capabilities_json"
+                ),
+            )
+        object_types = {
+            str(row.get("oid")): str(row.get("type"))
+            for row in rows.get("objects", [])
+        }
+        for oid, payload in snapshot.get("object_payloads", {}).items():
+            if object_types.get(str(oid)) != ObjectType.TOOL_CANDIDATE.value:
+                continue
+            if not isinstance(payload, dict):
+                raise ValidationError(
+                    "snapshot tool candidate Object payload must be an object"
+                )
+            requested = payload.get("requested_capabilities")
+            if requested is None:
+                continue
+            CheckpointManager._validated_requested_capability_specs(
+                requested,
+                field_name="tool candidate Object requested_capabilities",
+            )
+
+    @staticmethod
+    def _validated_requested_capability_specs(
+        raw: Any,
+        *,
+        field_name: str,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(raw, list) or any(
+            not isinstance(spec, dict) for spec in raw
+        ):
+            raise ValidationError(
+                f"snapshot {field_name} must be a list of objects"
+            )
+        specs = list(raw)
+        for index, spec in enumerate(specs):
+            SnapshotRemapper.parse_capability_resource(
+                spec.get("resource"),
+                field_name=f"{field_name}[{index}].resource",
+            )
+        return specs
+
     def _non_clonable_object_oids(self, snapshot: dict[str, Any]) -> set[str]:
         candidate_oids = self._snapshot_owned_object_oids(snapshot) | {
             str(oid) for oid in snapshot.get("referenced_object_oids", [])
-        } | self._process_row_referenced_oids(snapshot.get("rows", {}).get("processes", []))
+        } | self._process_row_referenced_oids(
+            snapshot.get("rows", {}).get("processes", [])
+        ) | self._snapshot_object_resource_oids(snapshot)
         snapshot_types = {
             str(row.get("oid")): str(row.get("type"))
             for row in snapshot.get("rows", {}).get("objects", [])
@@ -2704,27 +2777,104 @@ class CheckpointManager:
         )
         non_clonable: set[str] = set()
         for oid in candidate_oids:
-            if is_task_run_reference_payload(
-                snapshot.get("object_payloads", {}).get(oid)
-            ):
+            current = None
+            payloads = snapshot.get("object_payloads", {})
+            payload = payloads.get(oid) if oid in payloads else None
+            if oid not in payloads:
+                current = self._objects.get_object(oid)
+                payload = current.payload if current is not None else None
+            if is_task_run_reference_payload(payload):
                 non_clonable.add(oid)
                 continue
             object_type = snapshot_types.get(oid)
             if object_type is None:
-                current = self._objects.get_object(oid)
+                if current is None:
+                    current = self._objects.get_object(oid)
                 object_type = current.type.value if current is not None else None
             if object_type == ObjectType.EXTERNAL_REF.value:
                 non_clonable.add(oid)
         return non_clonable
 
-    def _capability_references_any_object(self, row: dict[str, Any], object_oids: set[str]) -> bool:
-        resource = row["resource"]
-        return resource.startswith("object:") and resource.split(":", 1)[1] in object_oids
+    @classmethod
+    def _snapshot_object_resource_oids(
+        cls,
+        snapshot: Mapping[str, Any],
+    ) -> set[str]:
+        rows = snapshot.get("rows", {})
+        selected: set[str] = set()
+        for row in rows.get("capabilities", []):
+            pattern = SnapshotRemapper.parse_capability_resource(
+                row.get("resource"),
+                field_name="rows.capabilities[].resource",
+            )
+            if pattern.kind == "object" and pattern.body:
+                selected.add(pattern.body)
+        for row in rows.get("tool_candidates", []):
+            requested = SnapshotRemapper._json_container(
+                row.get("requested_capabilities_json"),
+                field_name="tool_candidates.requested_capabilities_json",
+                expected_type=list,
+            )
+            for spec in cls._validated_requested_capability_specs(
+                requested,
+                field_name="tool_candidates.requested_capabilities_json",
+            ):
+                pattern = SnapshotRemapper.parse_capability_resource(
+                    spec["resource"],
+                )
+                if pattern.kind == "object" and pattern.body:
+                    selected.add(pattern.body)
+        object_types = {
+            str(row.get("oid")): str(row.get("type"))
+            for row in rows.get("objects", [])
+        }
+        for oid, payload in snapshot.get("object_payloads", {}).items():
+            if (
+                object_types.get(str(oid)) != ObjectType.TOOL_CANDIDATE.value
+                or not isinstance(payload, dict)
+                or payload.get("requested_capabilities") is None
+            ):
+                continue
+            for spec in cls._validated_requested_capability_specs(
+                payload["requested_capabilities"],
+                field_name="tool candidate Object requested_capabilities",
+            ):
+                pattern = SnapshotRemapper.parse_capability_resource(
+                    spec["resource"],
+                )
+                if pattern.kind == "object" and pattern.body:
+                    selected.add(pattern.body)
+        return selected
+
+    @staticmethod
+    def _fork_resource_must_be_dropped(
+        row: Mapping[str, Any],
+        *,
+        clonable_object_oids: set[str],
+    ) -> bool:
+        pattern = SnapshotRemapper.parse_capability_resource(
+            row.get("resource"),
+            field_name="rows.capabilities[].resource",
+        )
+        if pattern.kind != "object":
+            return False
+        # A fork may publish Object authority only when the corresponding
+        # owned Object is cloned under a fresh identity.  This drops global,
+        # borrowed, non-clonable, released, and otherwise unknown Object
+        # resources instead of leaving a dormant source identity that could
+        # become live after a later restore.
+        return not pattern.body or pattern.body not in clonable_object_oids
 
     def _fork_capability_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         kept: list[dict[str, Any]] = []
         for row in rows:
-            if row["resource"].startswith(self.CHECKPOINT_RESOURCE_PREFIX):
+            pattern = SnapshotRemapper.parse_capability_resource(
+                row.get("resource"),
+                field_name="rows.capabilities[].resource",
+            )
+            if pattern.kind == "checkpoint":
+                continue
+            if pattern.kind == "object" and not pattern.body:
                 continue
             current = self._authority.get_capability(row["cap_id"])
             if current is None or not current.active:
@@ -4498,15 +4648,11 @@ class CheckpointManager:
         identities: SnapshotIdentityMap,
     ) -> dict[str, Any]:
         item = SnapshotRemapper.remap_row(row, identities)
-        object_map = identities.objects
-        namespace_map = identities.namespaces
-        resource = item["resource"]
-        if resource.startswith("object:"):
-            oid = resource.split(":", 1)[1]
-            item["resource"] = f"object:{object_map.get(oid, oid)}"
-        elif resource.startswith("object_namespace:"):
-            namespace = resource.split(":", 1)[1]
-            item["resource"] = f"object_namespace:{namespace_map.get(namespace, namespace)}"
+        item["resource"] = SnapshotRemapper._expected_resource(
+            item.get("resource"),
+            identities,
+            field_name="rows.capabilities[].resource",
+        )
         item["issued_by"] = f"checkpoint.fork:{item['issued_by']}"
         item["issued_at"] = utc_now()
         return item
@@ -4565,9 +4711,51 @@ class CheckpointManager:
         identities: SnapshotIdentityMap,
     ) -> dict[str, Any]:
         item = SnapshotRemapper.remap_row(row, identities)
+        requested = SnapshotRemapper._json_container(
+            item.get("requested_capabilities_json"),
+            field_name="tool_candidates.requested_capabilities_json",
+            expected_type=list,
+        )
+        item["requested_capabilities_json"] = dumps(
+            self._remap_fork_requested_capability_specs(
+                requested,
+                identities=identities,
+                field_name="tool_candidates.requested_capabilities_json",
+            )
+        )
         item["created_at"] = utc_now()
         item["updated_at"] = utc_now()
         return item
+
+    @staticmethod
+    def _remap_fork_requested_capability_specs(
+        raw: Any,
+        *,
+        identities: SnapshotIdentityMap,
+        field_name: str,
+    ) -> list[dict[str, Any]]:
+        remapped_requested: list[dict[str, Any]] = []
+        specs = CheckpointManager._validated_requested_capability_specs(
+            raw,
+            field_name=field_name,
+        )
+        for index, spec in enumerate(specs):
+            pattern = SnapshotRemapper.parse_capability_resource(
+                spec.get("resource"),
+                field_name=f"{field_name}[{index}].resource",
+            )
+            if pattern.kind == "object" and (
+                not pattern.body or pattern.body not in identities.objects
+            ):
+                continue
+            remapped_spec = deepcopy(spec)
+            remapped_spec["resource"] = SnapshotRemapper._expected_resource(
+                pattern.raw,
+                identities,
+                field_name=f"{field_name}[{index}].resource",
+            )
+            remapped_requested.append(remapped_spec)
+        return remapped_requested
 
     def _remap_tool_row(
         self,
@@ -4581,6 +4769,7 @@ class CheckpointManager:
         payload: Any,
         *,
         object_type: str | None,
+        identities: SnapshotIdentityMap,
         candidate_map: dict[str, str],
     ) -> Any:
         item = deepcopy(payload)
@@ -4589,6 +4778,15 @@ class CheckpointManager:
         candidate_id = item.get("candidate_id")
         if candidate_id is not None:
             item["candidate_id"] = candidate_map.get(str(candidate_id), str(candidate_id))
+        requested = item.get("requested_capabilities")
+        if requested is not None:
+            item["requested_capabilities"] = (
+                self._remap_fork_requested_capability_specs(
+                    requested,
+                    identities=identities,
+                    field_name="tool candidate Object requested_capabilities",
+                )
+            )
         return item
 
 

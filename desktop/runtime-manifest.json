@@ -12,14 +12,14 @@
     "node": "24.15.0",
     "electron": "43.2.0",
     "electron_builder": "26.15.3",
-    "deno": "2.9.4",
+    "deno": "2.9.5",
     "mcp": "2.0.0",
     "keyring": "25.7.0"
   },
   "deno": {
-    "version": "2.9.4",
+    "version": "2.9.5",
     "license": {
-      "url": "https://raw.githubusercontent.com/denoland/deno/v2.9.4/LICENSE.md",
+      "url": "https://raw.githubusercontent.com/denoland/deno/v2.9.5/LICENSE.md",
       "sha256": "f62497fffecc0852960c8d3e6934b9db86d16396e9b604072e923892cae3a588"
     },
     "targets": {

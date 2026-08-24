@@ -820,8 +820,8 @@ class TestCLIBuiltinCommand:
 
     def test_cli_ignores_config_yaml_from_cwd_for_default_image(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            db = root / 'runtime.sqlite'
+            case_root, root = _isolated_cli_workspace(temp_dir)
+            db = case_root / 'runtime.sqlite'
             root.joinpath('config.yaml').write_text(
                 'runtime:\n  default_image_id: configured-base:v0\n',
                 encoding='utf-8',
@@ -835,8 +835,8 @@ class TestCLIBuiltinCommand:
 
     def test_cli_config_argument_overrides_default_project_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            db = root / 'runtime.sqlite'
+            case_root, root = _isolated_cli_workspace(temp_dir)
+            db = case_root / 'runtime.sqlite'
             root.joinpath('config.yaml').write_text(
                 'runtime:\n  default_image_id: cwd-base:v0\n',
                 encoding='utf-8',
@@ -854,9 +854,9 @@ class TestCLIBuiltinCommand:
 
     def test_cli_explicit_db_overrides_configured_local_store_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            configured = root / 'configured.sqlite'
-            explicit = root / 'explicit.sqlite'
+            case_root, root = _isolated_cli_workspace(temp_dir)
+            configured = case_root / 'configured.sqlite'
+            explicit = case_root / 'explicit.sqlite'
             config = root / 'config.yaml'
             config.write_text(
                 f'runtime:\n  local_store_target: {configured.as_posix()}\n',
@@ -874,8 +874,8 @@ class TestCLIBuiltinCommand:
 
     def test_cli_uses_configured_local_store_target_when_db_is_omitted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            configured = root / 'configured.sqlite'
+            case_root, root = _isolated_cli_workspace(temp_dir)
+            configured = case_root / 'configured.sqlite'
             config = root / 'config.yaml'
             config.write_text(
                 f'runtime:\n  local_store_target: {configured.as_posix()}\n',
@@ -1012,9 +1012,9 @@ class TestCLIBuiltinCommand:
 
     def test_cli_cd_changes_process_working_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            case_root, root = _isolated_cli_workspace(temp_dir)
             (root / 'pkg').mkdir()
-            db = root / 'runtime.sqlite'
+            db = case_root / 'runtime.sqlite'
             with _temporary_cwd(root):
                 spawn = _run_cli_json(['--db', str(db), 'spawn', '--image', 'review-agent:v0', '--goal', 'set cwd'])
                 _run_cli_json([
@@ -1038,8 +1038,8 @@ class TestCLIBuiltinCommand:
 
     def test_cli_spawn_and_exec_accept_llm_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            db = root / 'runtime.sqlite'
+            case_root, root = _isolated_cli_workspace(temp_dir)
+            db = case_root / 'runtime.sqlite'
             with _temporary_cwd(root):
                 spawn = _run_cli_json([
                     '--db',
@@ -1076,8 +1076,8 @@ class TestCLIBuiltinCommand:
 
     def test_cli_exit_marks_process_exited_with_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            db = root / 'runtime.sqlite'
+            case_root, root = _isolated_cli_workspace(temp_dir)
+            db = case_root / 'runtime.sqlite'
             with _temporary_cwd(root):
                 spawn = _run_cli_json(['--db', str(db), 'spawn', '--image', 'base-agent:v0', '--goal', 'finish'])
                 result = _run_cli_json(['--db', str(db), 'exit', spawn['pid'], '--payload', '{"done": true}'])
@@ -1095,8 +1095,8 @@ class TestCLIBuiltinCommand:
     def test_cli_exit_message_returns_the_durable_typed_outcome(self) -> None:
         for failed in (False, True):
             with tempfile.TemporaryDirectory() as temp_dir:
-                root = Path(temp_dir)
-                db = root / 'runtime.sqlite'
+                case_root, root = _isolated_cli_workspace(temp_dir)
+                db = case_root / 'runtime.sqlite'
                 with _temporary_cwd(root):
                     spawn = _run_cli_json(
                         [
@@ -1142,8 +1142,8 @@ class TestCLIBuiltinCommand:
 
     def test_cli_exec_loads_image_package_from_first_arg_and_uses_second_arg_as_goal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            db = root / 'runtime.sqlite'
+            case_root, root = _isolated_cli_workspace(temp_dir)
+            db = case_root / 'runtime.sqlite'
             package = root / 'cli-image'
             _write_cli_image_package(package)
             with _temporary_cwd(root):
@@ -1170,8 +1170,8 @@ class TestCLIBuiltinCommand:
 
     def test_cli_message_and_interrupt_post_human_messages(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            db = root / 'runtime.sqlite'
+            case_root, root = _isolated_cli_workspace(temp_dir)
+            db = case_root / 'runtime.sqlite'
             with _temporary_cwd(root):
                 spawn = _run_cli_json(['--db', str(db), 'spawn', '--image', 'base-agent:v0', '--goal', 'listen'])
                 normal = _run_cli_json(['--db', str(db), 'message', spawn['pid'], 'please inspect the latest result', '--subject', 'status'])
@@ -1190,8 +1190,8 @@ class TestCLIBuiltinCommand:
 
     def test_cli_workflow_run_prints_result_and_persists_exited_process(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            db = root / 'runtime.sqlite'
+            case_root, root = _isolated_cli_workspace(temp_dir)
+            db = case_root / 'runtime.sqlite'
             with _temporary_cwd(root):
                 result = _run_cli_json(['--db', str(db), 'workflow', 'run', 'get_working_directory'])
             runtime = Runtime.open(db, substrate=LocalResourceProviderSubstrate(root))
@@ -1206,8 +1206,8 @@ class TestCLIBuiltinCommand:
 
     def test_cli_workflow_run_failure_exits_nonzero_after_printing_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            db = root / 'runtime.sqlite'
+            case_root, root = _isolated_cli_workspace(temp_dir)
+            db = case_root / 'runtime.sqlite'
             with _temporary_cwd(root):
                 stdout = io.StringIO()
                 with contextlib.redirect_stdout(stdout), pytest.raises(SystemExit) as raised:
@@ -1534,6 +1534,14 @@ def _temporary_cwd(path: Path):
         yield
     finally:
         os.chdir(previous)
+
+
+def _isolated_cli_workspace(temp_dir: str) -> tuple[Path, Path]:
+    case_root = Path(temp_dir)
+    workspace = case_root / 'workspace'
+    workspace.mkdir()
+    return case_root, workspace
+
 
 def _run_cli_json(argv: list[str]) -> dict[str, object]:
     stdout = io.StringIO()

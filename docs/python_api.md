@@ -118,9 +118,11 @@ must use `try`/`finally`. `close()` remains a compatibility alias for
 Both factories accept the same inputs:
 
 - `target`: store target. `None` selects the target from the supplied config.
-  `"local"` and `":memory:"` create separate ephemeral SQLite stores; a
-  filesystem path or `sqlite:///...` target is persistent SQLite, and a
-  `postgres://` or `postgresql://` URI selects PostgreSQL.
+  With the default config this is the reserved `"user"` target, which resolves
+  to the persistent `~/.agent-libos/runtime/agent-libos.sqlite`. `"local"`,
+  `":memory:"`, and bare `sqlite://` create separate ephemeral SQLite stores;
+  a filesystem path or file SQLite URI is persistent SQLite, and a `postgres://`
+  or `postgresql://` URI selects PostgreSQL.
 - `config`: an explicit `AgentLibOSConfig`. The library factories do not load
   the repository's `config.yaml` or a workspace `.env` file.
 - `substrate`: an injected `ResourceProviderSubstrate`. If omitted, the
@@ -133,6 +135,12 @@ Both factories accept the same inputs:
 See [Configuration](configuration.md), [Storage](storage.md),
 [Providers](providers.md), and [Runtime Modules](modules.md) for the complete
 contracts behind these arguments.
+
+A persistent SQLite database must be outside the effective local workspace.
+The factories reject overlap before creating the database, lease, WAL, or SHM
+file, including when the caller supplies an already-open store to
+`RuntimeBuilder`. There is no unsafe override. In-memory SQLite, PostgreSQL,
+and non-local substrates are not subject to this filesystem-containment check.
 
 `Runtime.open(...)` rejects use inside an active event loop. Use
 `await Runtime.aopen(...)` there. The asynchronous factory performs store open

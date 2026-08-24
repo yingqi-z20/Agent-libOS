@@ -1495,8 +1495,10 @@ workspace:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            target = root / 'runtime.sqlite'
+            container = Path(temp_dir)
+            root = container / 'workspace'
+            root.mkdir()
+            target = container / 'runtime.sqlite'
             _write_image_package(root / 'package-agent')
             runtime = Runtime.open(
                 target,
@@ -1580,8 +1582,10 @@ workspace:
             pass
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            target = root / 'runtime.sqlite'
+            container = Path(temp_dir)
+            root = container / 'workspace'
+            root.mkdir()
+            target = container / 'runtime.sqlite'
             _write_image_package(root / 'package-agent')
             runtime = Runtime.open(
                 target,
@@ -1673,8 +1677,10 @@ workspace:
             pass
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            target = root / 'runtime.sqlite'
+            container = Path(temp_dir)
+            root = container / 'workspace'
+            root.mkdir()
+            target = container / 'runtime.sqlite'
             runtime = Runtime.open(
                 target,
                 substrate=LocalResourceProviderSubstrate(root),

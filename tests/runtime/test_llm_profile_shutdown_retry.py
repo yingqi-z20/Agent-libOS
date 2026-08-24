@@ -174,7 +174,7 @@ def test_sync_failed_assembly_cleanup_retries_llm_before_owned_store_close(
     )
 
     with pytest.raises(BaseExceptionGroup) as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
     handles = RuntimeAssemblyCleanupRequired.extract(caught.value)
     assert len(handles) == 1
     handle = handles[0]
@@ -219,7 +219,7 @@ def test_async_failed_assembly_cleanup_retries_llm_before_owned_store_close(
 
     async def exercise() -> None:
         with pytest.raises(BaseExceptionGroup) as caught:
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
         assert caught.value.subgroup(asyncio.CancelledError) is not None
         handles = RuntimeAssemblyCleanupRequired.extract(caught.value)
         assert len(handles) == 1
@@ -292,7 +292,7 @@ def test_async_failed_assembly_retains_sync_client_that_raises_cancelled_error(
 
     async def exercise() -> None:
         with pytest.raises(BaseExceptionGroup) as caught:
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
         assert caught.value.subgroup(asyncio.CancelledError) is not None
         handles = RuntimeAssemblyCleanupRequired.extract(caught.value)
         assert len(handles) == 1

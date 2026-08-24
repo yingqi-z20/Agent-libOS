@@ -73,7 +73,7 @@ narrow, task-appropriate path when launching the process.
 Static validation does not register or boot the Image:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite \
+uv run agent-libos --db user \
   images validate images/custom-review-agent
 ```
 
@@ -81,9 +81,9 @@ When validation succeeds, register the immutable package artifact and inspect
 the result:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite \
+uv run agent-libos --db user \
   images register images/custom-review-agent
-uv run agent-libos --db .agent_libos.sqlite \
+uv run agent-libos --db user \
   images inspect custom-review-agent:v0
 ```
 
@@ -96,7 +96,7 @@ To exercise a registered Image, spawn it in the same persistent database. The
 spawn output supplies the pid used for subsequent narrow grants and execution:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite \
+uv run agent-libos --db user \
   spawn --image custom-review-agent:v0 --goal "Review the selected file"
 ```
 
@@ -305,7 +305,7 @@ inherit the default profile's ambient endpoint/model policy; see
 To create an Image from a checkpoint rather than a directory package:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite \
+uv run agent-libos --db user \
   images commit <checkpoint_id> stateful-agent:v0 --name stateful-agent
 ```
 

@@ -6,7 +6,10 @@ import * as http from "node:http";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  assertDatabaseOutsideWorkspace,
+  developmentRuntimeArguments,
   ensurePrivateRuntimeDirectory,
+  ensurePrivateWorkspaceDirectory,
   packagedRuntimeArguments,
   packagedRuntimeLayout,
   resolveRuntimeServerCommand,
@@ -256,6 +259,12 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 
 async function startRuntimeServer(db?: string): Promise<ServerConnection> {
   if (quittingAfterServerStop) throw new Error("GUI server cannot start while the application is quitting.");
+  if (db !== undefined) {
+    const workspaceDirectory = app.isPackaged
+      ? packagedRuntimeLayout(process.resourcesPath, app.getPath("userData")).workspaceDirectory
+      : repoRoot;
+    assertDatabaseOutsideWorkspace(db, workspaceDirectory);
+  }
   if (stoppingServer) await stoppingServer;
   if (quittingAfterServerStop) throw new Error("GUI server cannot start while the application is quitting.");
   if (startingServer) {
@@ -292,15 +301,19 @@ async function doStartRuntimeServer(db?: string): Promise<ServerConnection> {
     ? packagedRuntimeLayout(process.resourcesPath, userDataPath)
     : null;
   const llmProfilesFile = packagedLayout?.llmProfilesFile ?? path.join(userDataPath, "llm-profiles.json");
+  const workspaceDirectory = packagedLayout?.workspaceDirectory ?? repoRoot;
+  const selectedDatabase = db ?? (packagedLayout ? packagedLayout.databaseFile : "user");
+  assertDatabaseOutsideWorkspace(selectedDatabase, workspaceDirectory);
   fs.mkdirSync(path.dirname(llmProfilesFile), { recursive: true });
-  if (packagedLayout) ensurePrivateRuntimeDirectory(packagedLayout.runtimeDirectory);
+  if (packagedLayout) {
+    ensurePrivateRuntimeDirectory(packagedLayout.runtimeDirectory);
+    ensurePrivateWorkspaceDirectory(packagedLayout.workspaceDirectory);
+  }
   const serverArgs = packagedLayout
     ? [...serverCommand.args, ...packagedRuntimeArguments(packagedLayout, db)]
-    : db === undefined
-      ? [...serverCommand.args, "--port", "0", "--llm-profiles-file", llmProfilesFile]
-      : [...serverCommand.args, "--db", db, "--port", "0", "--llm-profiles-file", llmProfilesFile];
+    : [...serverCommand.args, ...developmentRuntimeArguments(llmProfilesFile, db)];
   const child = spawn(serverCommand.command, serverArgs, {
-    cwd: packagedLayout?.runtimeDirectory ?? repoRoot,
+    cwd: workspaceDirectory,
     env: runtimeChildEnvironment({
       packaged: app.isPackaged,
       repoRoot,

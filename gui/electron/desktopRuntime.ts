@@ -15,6 +15,7 @@ export type PackagedRuntimeLayout = {
   llmProfilesFile: string;
   rendererRoot: string;
   runtimeDirectory: string;
+  workspaceDirectory: string;
 };
 
 export const packagedBackendDirectoryName = "backend";
@@ -40,7 +41,8 @@ export function packagedRuntimeLayout(
     denoBinDirectory: path.join(resourcesPath, packagedDenoDirectoryName),
     llmProfilesFile: path.join(userDataPath, "llm-profiles.json"),
     rendererRoot: path.join(resourcesPath, packagedRendererDirectoryName),
-    runtimeDirectory
+    runtimeDirectory,
+    workspaceDirectory: path.join(userDataPath, "workspace")
   };
 }
 
@@ -104,11 +106,46 @@ export function runtimeChildEnvironment({
 }
 
 export function ensurePrivateRuntimeDirectory(selectedPath: string, platform: NodeJS.Platform = process.platform): void {
-  requireAbsoluteDirectoryRoot(selectedPath, "Runtime data");
+  ensurePrivateDirectory(selectedPath, "Runtime data", platform);
+}
+
+export function ensurePrivateWorkspaceDirectory(selectedPath: string, platform: NodeJS.Platform = process.platform): void {
+  ensurePrivateDirectory(selectedPath, "Runtime workspace", platform);
+}
+
+export function assertDatabaseOutsideWorkspace(
+  selectedDatabase: string,
+  workspaceDirectory: string,
+  platform: NodeJS.Platform = process.platform
+): void {
+  requireAbsoluteDirectoryRoot(workspaceDirectory, "Runtime workspace");
+  const databasePath = persistentSqlitePath(selectedDatabase, workspaceDirectory);
+  if (databasePath === null) return;
+  rejectMutablePathComponents(databasePath, platform);
+  const canonicalWorkspace = canonicalPath(workspaceDirectory);
+  const canonicalDatabase = canonicalPath(databasePath);
+  if (pathContains(canonicalWorkspace, canonicalDatabase)) {
+    throw new Error("Selected database must be outside the Runtime workspace.");
+  }
+}
+
+export function developmentRuntimeArguments(llmProfilesFile: string, selectedDatabase?: string): string[] {
+  return [
+    "--db",
+    selectedDatabase ?? "user",
+    "--port",
+    "0",
+    "--llm-profiles-file",
+    llmProfilesFile
+  ];
+}
+
+function ensurePrivateDirectory(selectedPath: string, label: string, platform: NodeJS.Platform): void {
+  requireAbsoluteDirectoryRoot(selectedPath, label);
   fs.mkdirSync(selectedPath, { recursive: true, mode: 0o700 });
   const selected = fs.lstatSync(selectedPath);
   if (!selected.isDirectory() || selected.isSymbolicLink()) {
-    throw new Error("Packaged Runtime data path must be a real directory.");
+    throw new Error(`Packaged ${label} path must be a real directory.`);
   }
   if (platform !== "win32") fs.chmodSync(selectedPath, 0o700);
 }
@@ -135,6 +172,123 @@ export function packagedRuntimeArguments(layout: PackagedRuntimeLayout, selected
 function environmentPathKey(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
   if (platform !== "win32") return "PATH";
   return Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "Path";
+}
+
+function canonicalPath(selectedPath: string): string {
+  let existing = path.resolve(selectedPath);
+  const missingComponents: string[] = [];
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) {
+      throw new Error("Selected database path cannot be resolved safely.");
+    }
+    missingComponents.unshift(path.basename(existing));
+    existing = parent;
+  }
+  return path.join(fs.realpathSync.native(existing), ...missingComponents);
+}
+
+function pathContains(parent: string, selected: string): boolean {
+  const parentComponents = pathComponents(parent);
+  const selectedComponents = pathComponents(selected);
+  return parentComponents.length <= selectedComponents.length
+    && parentComponents.every((component, index) => component === selectedComponents[index]);
+}
+
+function pathComponents(selectedPath: string): string[] {
+  const parsed = path.parse(selectedPath);
+  return [parsed.root, ...selectedPath.slice(parsed.root.length).split(path.sep).filter(Boolean)];
+}
+
+function persistentSqlitePath(selectedDatabase: string, workspaceDirectory: string): string | null {
+  if (selectedDatabase === "user" || selectedDatabase === "local" || selectedDatabase === ":memory:") {
+    return null;
+  }
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(selectedDatabase)?.[1].toLowerCase();
+  if (scheme === "postgres" || scheme === "postgresql") {
+    if (!selectedDatabase.includes("://")) throw new Error("Unsupported Runtime store target.");
+    return null;
+  }
+  if (scheme === "sqlite") {
+    const sqlitePath = sqliteUriPath(selectedDatabase);
+    if (sqlitePath === null) return null;
+    return path.isAbsolute(sqlitePath) ? sqlitePath : path.resolve(workspaceDirectory, sqlitePath);
+  }
+  if (selectedDatabase.includes("://")) throw new Error("Unsupported Runtime store target.");
+  if (/(?:^|\s)(?:dbname|host|hostaddr|options|password|port|service|sslmode|target_session_attrs|user)\s*=/i.test(selectedDatabase)) {
+    throw new Error("Unsupported Runtime store target.");
+  }
+  return path.isAbsolute(selectedDatabase)
+    ? selectedDatabase
+    : path.resolve(workspaceDirectory, selectedDatabase);
+}
+
+function sqliteUriPath(selectedDatabase: string): string | null {
+  const schemeEnd = selectedDatabase.indexOf(":") + 1;
+  let remainder = selectedDatabase.slice(schemeEnd);
+  let authority = "";
+  let rawPath = "";
+  if (remainder.startsWith("//")) {
+    remainder = remainder.slice(2);
+    const suffixIndex = firstIndex(remainder, "?", "#");
+    const authorityAndPath = suffixIndex === -1 ? remainder : remainder.slice(0, suffixIndex);
+    const pathIndex = authorityAndPath.indexOf("/");
+    if (pathIndex !== -1) {
+      authority = authorityAndPath.slice(0, pathIndex);
+      rawPath = authorityAndPath.slice(pathIndex);
+    }
+  } else {
+    const suffixIndex = firstIndex(remainder, "?", "#");
+    rawPath = suffixIndex === -1 ? remainder : remainder.slice(0, suffixIndex);
+  }
+  if (!rawPath) return null;
+  let decodedPath: string;
+  try {
+    decodedPath = decodeURIComponent(rawPath);
+  } catch (error) {
+    throw new Error("Unsupported Runtime store target.", { cause: error });
+  }
+  if (authority) return `//${authority}${decodedPath}`;
+  if (decodedPath.startsWith("//")) decodedPath = `/${decodedPath.replace(/^\/+/, "")}`;
+  if (decodedPath.startsWith("/") && decodedPath.length > 2 && decodedPath[2] === ":") {
+    return decodedPath.slice(1);
+  }
+  return decodedPath;
+}
+
+function firstIndex(value: string, ...needles: string[]): number {
+  const selected = needles.map((needle) => value.indexOf(needle)).filter((index) => index !== -1);
+  return selected.length === 0 ? -1 : Math.min(...selected);
+}
+
+function rejectMutablePathComponents(selectedPath: string, platform: NodeJS.Platform): void {
+  const absolute = path.resolve(selectedPath);
+  const parsed = path.parse(absolute);
+  let current = parsed.root;
+  for (const component of absolute.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    let metadata: fs.Stats;
+    try {
+      metadata = fs.lstatSync(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw new Error("Selected database path cannot be resolved safely.", { cause: error });
+    }
+    if (metadata.isSymbolicLink() || (platform === "win32" && isWindowsReparsePoint(current, metadata))) {
+      throw new Error("Selected database path must not contain a symlink or reparse point.");
+    }
+  }
+}
+
+function isWindowsReparsePoint(selectedPath: string, metadata: fs.Stats): boolean {
+  const attributes = (metadata as fs.Stats & { fileAttributes?: number; st_file_attributes?: number });
+  if (((attributes.fileAttributes ?? attributes.st_file_attributes ?? 0) & 0x400) !== 0) return true;
+  try {
+    const followed = fs.statSync(selectedPath);
+    return followed.dev !== metadata.dev || followed.ino !== metadata.ino;
+  } catch (error) {
+    throw new Error("Selected database path cannot be resolved safely.", { cause: error });
+  }
 }
 
 function requireAbsoluteDirectoryRoot(value: string, label: string): void {

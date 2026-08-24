@@ -129,6 +129,7 @@ markers = [
     "invariant(id): runtime safety invariant covered by the test",
     "platform_darwin: requires native Darwin filesystem semantics",
     "platform_linux: requires native Linux filesystem semantics",
+    "platform_windows: requires native Windows filesystem semantics",
     "real_deno: runs by default when deno is installed; use --skip-real-deno to skip",
     "deno_resource_monitor: isolates live Deno tests that exercise fail-closed Host resource monitoring",
     "real_llm: requires --run-real-llm and OpenAI-compatible credentials",

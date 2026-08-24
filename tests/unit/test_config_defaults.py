@@ -2,6 +2,8 @@ from __future__ import annotations
 import pytest
 import asyncio
 import json
+import os
+import stat
 import warnings
 from dataclasses import asdict, fields, replace
 from pathlib import Path
@@ -1647,12 +1649,41 @@ class TestConfigDefaults:
         finally:
             runtime.close()
 
-    def test_runtime_open_uses_default_local_store_sentinel_as_memory(self) -> None:
+    def test_runtime_open_uses_default_user_store_and_reopens_persisted_state(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        home = tmp_path / "home"
+        workspace = tmp_path / "workspace"
+        home.mkdir()
+        workspace.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.chdir(workspace)
+        expected = home / ".agent-libos" / "runtime" / "agent-libos.sqlite"
+
         runtime = Runtime.open()
         try:
-            assert runtime.store.path == ':memory:'
+            assert runtime.store.path == str(expected)
+            persisted = runtime.audit.record(
+                actor="test:user-store",
+                action="test.user_store.persisted",
+            )
         finally:
             runtime.close()
+
+        reopened = Runtime.open()
+        try:
+            assert reopened.store.path == str(expected)
+            assert any(
+                record.record_id == persisted.record_id
+                for record in reopened.audit.trace(actor="test:user-store")
+            )
+            if os.name == "posix":
+                assert stat.S_IMODE(expected.parent.stat().st_mode) == 0o700
+                assert stat.S_IMODE(expected.parent.parent.stat().st_mode) == 0o700
+        finally:
+            reopened.close()
 
     def test_runtime_open_uses_configured_local_store_target_when_target_is_omitted(self, tmp_path: Path) -> None:
         db = tmp_path / 'configured.sqlite'
@@ -1666,6 +1697,7 @@ class TestConfigDefaults:
 
     def test_runtime_store_defaults_to_sqlite_backend(self) -> None:
         assert DEFAULT_CONFIG.runtime.store_backend == 'sqlite'
+        assert DEFAULT_CONFIG.runtime.local_store_target == 'user'
         assert DEFAULT_CONFIG.runtime.store_dsn is None
         assert DEFAULT_CONFIG.gui.agent_rating_comment_max_chars > 0
         assert DEFAULT_CONFIG.gui.request_body_max_bytes > (16_777_216 * 4 // 3) + 1_024
@@ -1788,7 +1820,7 @@ class TestConfigDefaults:
         config = AgentLibOSConfig(
             runtime=RuntimeDefaults(default_image_id='custom-base:v0', coding_image_id='custom-coding:v0')
         )
-        runtime = Runtime.open(config=config)
+        runtime = Runtime.open("local", config=config)
         try:
             pid = runtime.process.spawn(goal='custom image')
             assert runtime.process.get(pid).image_id == 'custom-base:v0'
@@ -1826,7 +1858,7 @@ class TestConfigDefaults:
 
     def test_sqlite_store_llm_call_limits_use_runtime_config(self) -> None:
         config = AgentLibOSConfig(llm=LLMDefaults(call_record_list_limit=1, call_record_hard_limit=2))
-        runtime = Runtime.open(config=config)
+        runtime = Runtime.open("local", config=config)
         try:
             assert runtime.store.list_llm_calls() == []
             with pytest.raises(ValidationError, match='hard cap 2'):
@@ -1839,7 +1871,7 @@ class TestConfigDefaults:
             tools=replace(DEFAULT_CONFIG.tools, shell_timeout_s=6.0, standard_timeout_s=2.5),
             shell=replace(DEFAULT_CONFIG.shell, timeout_hard_limit_s=7.0, max_stdout_chars=9, stdout_hard_limit_chars=11),
         )
-        runtime = Runtime.open(config=config)
+        runtime = Runtime.open("local", config=config)
         try:
             row = next(item for item in runtime.tools.list() if item['name'] == 'read_text_file')
             spec = json.loads(row['spec_json'])
@@ -1852,7 +1884,7 @@ class TestConfigDefaults:
 
     def test_runtime_tool_argument_defaults_use_runtime_config(self) -> None:
         config = AgentLibOSConfig(runtime=RuntimeDefaults(default_human='admin'))
-        runtime = Runtime.open(config=config)
+        runtime = Runtime.open("local", config=config)
         try:
             pid = runtime.process.spawn(
                 goal='configured human default',

@@ -7,8 +7,8 @@ an optional `submit` boolean. This package does not claim drop-in or versioned
 compatibility with an unpinned upstream revision.
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite images validate images/mini-swe-agent
-uv run agent-libos --db .agent_libos.sqlite images register images/mini-swe-agent
+uv run agent-libos --db user images validate images/mini-swe-agent
+uv run agent-libos --db user images register images/mini-swe-agent
 ```
 
 Package validation and registration can inspect the package without Deno, but
@@ -26,14 +26,14 @@ the lossless native assistant/tool transcript. With
 closed before LLM provider dispatch rather than falling back to a lossy prompt.
 
 The CLI loads the project-root `config.yaml` when it is present. In this
-checkout that configuration selects `.agent_libos.sqlite`, so omitting `--db`
-persists the registration there. A checkout without project configuration
-falls back to `DEFAULT_CONFIG`, whose `local` store is in memory and therefore
-does not survive a later CLI invocation. Use an explicit `--db` when the
-artifact must survive later invocations. Relative database paths are still
-resolved from the CLI process's current working directory; use an absolute
-`--db` path when invocations from different directories must select the same
-store independently of local configuration.
+checkout that configuration selects `user`, so omitting `--db` persists the
+registration in `~/.agent-libos/runtime/agent-libos.sqlite`. A checkout without
+project configuration falls back to the same `user` target in `DEFAULT_CONFIG`.
+Use explicit `--db local` only when state should disappear on close. Relative
+custom database paths are resolved from the CLI process's current working
+directory and are rejected inside the effective workspace; use `user` or an
+absolute external path when invocations must select the same store independently
+of local configuration.
 
 The package uses `prompt_mode: image_only`, `jit_tool_exposure: direct`, and
 `default_tools: []`. At boot, the image package registers one process-local JIT

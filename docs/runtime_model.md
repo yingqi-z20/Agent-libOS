@@ -754,7 +754,7 @@ but does not itself perform a provider existence/read observation.
 The CLI command:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite cd <pid> <workspace-relative-dir>
+uv run agent-libos --db user cd <pid> <workspace-relative-dir>
 ```
 
 After the Host grants that process directory-read authority for the selected
@@ -1092,7 +1092,7 @@ synchronous host:
 ```python
 from agent_libos import Runtime
 
-runtime = Runtime.open("runtime.sqlite")
+runtime = Runtime.open()
 try:
     run_host(runtime)
 finally:
@@ -1105,7 +1105,7 @@ and components run on the caller loop:
 ```python
 from agent_libos import Runtime
 
-runtime = await Runtime.aopen("runtime.sqlite")
+runtime = await Runtime.aopen()
 try:
     await run_host(runtime)
 finally:
@@ -1117,6 +1117,9 @@ finally:
 the Runtime has async-only shutdown work; event-loop hosts should not select it
 dynamically. In either form the host must inspect `shutdown_result["ok"]` and
 retain the Runtime for a retry or diagnostics handoff when it is false.
+The no-argument factories above use the persistent per-user `user` target.
+Pass `"local"` explicitly for an isolated in-memory Runtime, or use an absolute
+SQLite path outside the effective workspace for another persistent store.
 Store-readiness misuse such as calling shutdown from the current store
 transaction raises during preflight before a shutdown attempt or result exists.
 
@@ -1492,8 +1495,8 @@ outcome may already be unknown.
 CLI examples:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite message <pid> "Please inspect the result"
-uv run agent-libos --db .agent_libos.sqlite interrupt <pid> "Stop and read this first"
+uv run agent-libos --db user message <pid> "Please inspect the result"
+uv run agent-libos --db user interrupt <pid> "Stop and read this first"
 ```
 
 ## Fork, Spawn, Exec, Wait, Signal

@@ -278,6 +278,10 @@ from agent_libos.storage.semantic_v6 import (
     decode_flow_path_sha256s_json,
     semantic_v6_record_sha256,
 )
+from agent_libos.storage.contracts import (
+    PersistedCapabilityResourceIdentity,
+    PersistedFileLabelPathIdentity,
+)
 from agent_libos.utils.serde import bounded_json_loads, dumps, loads
 
 _RUNTIME_OBJECT_PRESENT_PAYLOAD_MARKERS = (
@@ -13494,6 +13498,50 @@ class SQLRuntimeStore:
         )
         return [self._row_to_capability(row) for row in rows]
 
+    def query_active_capability_resource_identities(
+        self,
+        *,
+        after_cap_id: str | None,
+        limit: int,
+    ) -> list[PersistedCapabilityResourceIdentity]:
+        """Return one payload-free active-authority page ordered by ID."""
+
+        if after_cap_id is not None and (
+            type(after_cap_id) is not str or not after_cap_id
+        ):
+            raise ValidationError(
+                "active capability identity cursor must be a non-empty string when set"
+            )
+        if (
+            type(limit) is not int
+            or limit <= 0
+            or limit > self.config.capability.list_limit
+        ):
+            raise ValidationError(
+                "active capability identity page limit must be a positive integer "
+                "no greater than "
+                f"capability.list_limit={self.config.capability.list_limit}"
+            )
+        clauses = ["status = ?"]
+        params: list[Any] = [CapabilityStatus.ACTIVE.value]
+        if after_cap_id is not None:
+            clauses.append("cap_id COLLATE BINARY > ? COLLATE BINARY")
+            params.append(after_cap_id)
+        params.append(limit)
+        rows = self._query(
+            "SELECT cap_id, resource FROM capabilities "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY cap_id COLLATE BINARY ASC LIMIT ?",
+            params,
+        )
+        return [
+            PersistedCapabilityResourceIdentity(
+                capability_id=str(row["cap_id"]),
+                resource=str(row["resource"]),
+            )
+            for row in rows
+        ]
+
     def register_sink_trust(self, spec: SinkTrustSpec, *, replace: bool = False) -> SinkTrustSpec:
         if not isinstance(spec, SinkTrustSpec):
             raise ValidationError("sink trust registration requires a validated SinkTrustSpec")
@@ -13805,6 +13853,50 @@ class SQLRuntimeStore:
             [*params, selected_limit],
         )
         return [self._row_to_file_label_binding(row) for row in rows]
+
+    def query_live_file_label_path_identities(
+        self,
+        *,
+        after_binding_id: str | None,
+        limit: int,
+    ) -> list[PersistedFileLabelPathIdentity]:
+        """Return one payload-free live file-label page ordered by binding ID."""
+
+        if after_binding_id is not None and (
+            type(after_binding_id) is not str or not after_binding_id
+        ):
+            raise ValidationError(
+                "live file-label identity cursor must be a non-empty string when set"
+            )
+        if (
+            type(limit) is not int
+            or limit <= 0
+            or limit > self.config.data_flow.file_binding_list_limit
+        ):
+            raise ValidationError(
+                "live file-label identity page limit must be a positive integer "
+                "no greater than data_flow.file_binding_list_limit="
+                f"{self.config.data_flow.file_binding_list_limit}"
+            )
+        clauses = ["active = 1", "tombstoned = 0"]
+        params: list[Any] = []
+        if after_binding_id is not None:
+            clauses.append("binding_id COLLATE BINARY > ? COLLATE BINARY")
+            params.append(after_binding_id)
+        params.append(limit)
+        rows = self._query(
+            "SELECT binding_id, normalized_path FROM file_label_bindings "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY binding_id COLLATE BINARY ASC LIMIT ?",
+            params,
+        )
+        return [
+            PersistedFileLabelPathIdentity(
+                binding_id=str(row["binding_id"]),
+                normalized_path=str(row["normalized_path"]),
+            )
+            for row in rows
+        ]
 
     def list_file_label_bindings_for_tree(
         self,
@@ -21530,6 +21622,71 @@ class SQLRuntimeStore:
             sql += " LIMIT ?"
             params.append(limit)
         return [self._row_to_checkpoint(row) for row in self._query(sql, params)]
+
+    def query_checkpoint_snapshots(
+        self,
+        *,
+        after_checkpoint_id: str | None,
+        limit: int,
+    ) -> list[tuple[Checkpoint, Mapping[str, Any]]]:
+        """Return a keyset page of byte-bounded checkpoint documents."""
+
+        if after_checkpoint_id is not None and (
+            type(after_checkpoint_id) is not str or not after_checkpoint_id
+        ):
+            raise ValidationError(
+                "checkpoint inventory cursor must be a non-empty string when set"
+            )
+        if (
+            type(limit) is not int
+            or limit <= 0
+            or limit > self.config.checkpoint.list_limit
+        ):
+            raise ValidationError(
+                "checkpoint inventory page limit must be a positive integer no "
+                "greater than "
+                f"checkpoint.list_limit={self.config.checkpoint.list_limit}"
+            )
+        params: list[Any] = []
+        where = ""
+        if after_checkpoint_id is not None:
+            where = " WHERE checkpoint_id COLLATE BINARY > ? COLLATE BINARY"
+            params.append(after_checkpoint_id)
+        params.append(limit)
+        rows = self._query(
+            "SELECT * FROM checkpoints"
+            f"{where} ORDER BY checkpoint_id COLLATE BINARY ASC LIMIT ?",
+            params,
+        )
+        found: list[tuple[Checkpoint, Mapping[str, Any]]] = []
+        for row in rows:
+            try:
+                snapshot = bounded_json_loads(
+                    row["snapshot_json"],
+                    max_bytes=self.config.checkpoint.snapshot_hard_limit_bytes,
+                )
+                metadata = bounded_json_loads(
+                    row["metadata_json"],
+                    max_bytes=self.config.checkpoint.snapshot_hard_limit_bytes,
+                )
+                if not isinstance(snapshot, Mapping) or not isinstance(metadata, dict):
+                    raise ValueError("checkpoint documents must be JSON objects")
+                checkpoint = Checkpoint(
+                    checkpoint_id=row["checkpoint_id"],
+                    pid=row["pid"],
+                    reason=row["reason"],
+                    created_at=row["created_at"],
+                    created_by=row["created_by"],
+                    snapshot_version=int(row["snapshot_version"]),
+                    metadata=metadata,
+                    effect_ledger_seq=int(row["effect_ledger_seq"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                raise ValidationError(
+                    "invalid persisted checkpoint inventory document"
+                ) from None
+            found.append((checkpoint, snapshot))
+        return found
 
     def snapshot_tables(self) -> dict[str, list[dict[str, Any]]]:
         raise RuntimeError(

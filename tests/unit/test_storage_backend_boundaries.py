@@ -500,6 +500,52 @@ class TestStorageBackendBoundaries:
         second = SQLiteStore(db_path)
         second.close()
 
+    def test_sqlite_uri_failure_precedes_lease_and_allows_successor(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if sqlite_backend.fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+            pytest.skip("POSIX secure runtime lease is unavailable")
+        database = tmp_path / "uri-preparation-failure.sqlite"
+        seeded = SQLiteStore(database)
+        seeded.close()
+
+        canonical_database = database.resolve()
+        original_as_uri = Path.as_uri
+        original_acquire = SQLiteStore._acquire_runtime_lease
+        acquire_calls = 0
+        preparation_error = RuntimeError("injected database URI preparation failure")
+
+        def fail_database_uri(path: Path) -> str:
+            if path == canonical_database:
+                raise preparation_error
+            return original_as_uri(path)
+
+        def record_lease_acquisition(
+            store: SQLiteStore,
+            path: Path,
+        ) -> sqlite_backend._SQLiteRuntimeLease:
+            nonlocal acquire_calls
+            acquire_calls += 1
+            return original_acquire(store, path)
+
+        monkeypatch.setattr(Path, "as_uri", fail_database_uri)
+        monkeypatch.setattr(
+            SQLiteStore,
+            "_acquire_runtime_lease",
+            record_lease_acquisition,
+        )
+
+        with pytest.raises(RuntimeError) as caught:
+            SQLiteStore(database)
+
+        assert caught.value is preparation_error
+        assert acquire_calls == 0
+        monkeypatch.setattr(Path, "as_uri", original_as_uri)
+        successor = SQLiteStore(database)
+        successor.close()
+
     def test_sqlite_runtime_lease_rejects_symlink_alias(self, tmp_path: Path) -> None:
         db_path = tmp_path / "runtime.sqlite"
         alias = tmp_path / "runtime-alias.sqlite"

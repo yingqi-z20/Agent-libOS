@@ -1534,27 +1534,84 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
-    def test_pty_create_rejects_launcher_wrapped_git_before_provider_spawn(self) -> None:
+    def test_pty_create_rejects_transparent_launcher_dispatch_before_evidence(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            provider = FakePtyProvider()
+            provider = ResolvingPtyProvider()
             runtime = _open_pty_runtime(temp_dir, provider)
             try:
-                pid = runtime.process.spawn(image="pty-agent:v0", goal="reject wrapped Git")
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="reject transparent executable launchers",
+                )
+                runtime.shell.grant_policy(
+                    pid,
+                    runtime.config.shell.always_allow_level,
+                    issued_by="test",
+                )
+                durable_before = _durable_pty_snapshot(runtime)
+                flow_decisions_before = runtime.store.list_data_flow_decisions(
+                    pid=pid
+                )
+                human_before = runtime.human.pending()
+
+                launcher_commands = (
+                    ["env", "-P", ".", "git", "push"],
+                    ["env", "git", "branch", "wrapper-created"],
+                    ["/usr/bin/NiCe.ExE", "-n", "5", "printf"],
+                    ["NOHUP", "printf"],
+                    ["setsid.exe", "--", "printf"],
+                    ["/usr/bin/stdbuf", "-o0", "printf"],
+                    ["Timeout.EXE", "30", "printf"],
+                )
+                for requested in launcher_commands:
+                    with pytest.raises(ValidationError, match="launcher dispatch"):
+                        _pty_adapter(runtime).create(
+                            pid,
+                            requested,
+                            cwd=".",
+                            startup_timeout_s=0,
+                        )
+
+                assert provider.resolver_calls == []
+                assert provider.spawned == []
+                assert runtime.human.pending() == human_before
+                assert _durable_pty_snapshot(runtime) == durable_before
+                assert (
+                    runtime.store.list_data_flow_decisions(pid=pid)
+                    == flow_decisions_before
+                )
+            finally:
+                runtime.close()
+
+    def test_pty_create_allows_standalone_launcher_without_nested_program(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = ResolvingPtyProvider()
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="run standalone environment inspector",
+                )
                 runtime.shell.grant_policy(
                     pid,
                     runtime.config.shell.always_allow_level,
                     issued_by="test",
                 )
 
-                with pytest.raises(ValidationError, match="typed git_"):
-                    _pty_adapter(runtime).create(
-                        pid,
-                        ["env", "git", "branch", "wrapper-created"],
-                        cwd=".",
-                        startup_timeout_s=0,
-                    )
+                created = _pty_adapter(runtime).create(
+                    pid,
+                    ["env"],
+                    cwd=".",
+                    startup_timeout_s=0,
+                )
 
-                assert provider.spawned == []
+                assert created.session_oid
+                assert provider.resolver_calls == [["env"]]
+                assert [item["argv"] for item in provider.spawned] == [["env"]]
             finally:
                 runtime.close()
 
@@ -3477,12 +3534,14 @@ class TestPtyModule:
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Path(temp_dir) / "pty-recovery-handoff.sqlite"
+            workspace = Path(temp_dir) / "workspace"
+            workspace.mkdir()
             provider = FakePtyProvider(
                 initial_outputs=[],
                 session_pid=os.getpid(),
             )
             runtime = _open_pty_runtime(
-                temp_dir,
+                str(workspace),
                 provider,
                 target=database,
             )
@@ -3551,7 +3610,7 @@ class TestPtyModule:
                 assert finalizer_calls == []
 
                 reopened = _open_pty_runtime(
-                    temp_dir,
+                    str(workspace),
                     FakePtyProvider(initial_outputs=[]),
                     target=database,
                 )
@@ -3606,9 +3665,11 @@ class TestPtyModule:
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Path(temp_dir) / "pty-recovery-handoff-retry.sqlite"
+            workspace = Path(temp_dir) / "workspace"
+            workspace.mkdir()
             provider = FakePtyProvider(initial_outputs=[], close_failures=1)
             runtime = _open_pty_runtime(
-                temp_dir,
+                str(workspace),
                 provider,
                 target=database,
             )
@@ -3670,9 +3731,11 @@ class TestPtyModule:
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Path(temp_dir) / "pty-recovery-handoff-interrupt.sqlite"
+            workspace = Path(temp_dir) / "workspace"
+            workspace.mkdir()
             provider = FakePtyProvider(initial_outputs=[])
             runtime = _open_pty_runtime(
-                temp_dir,
+                str(workspace),
                 provider,
                 target=database,
             )

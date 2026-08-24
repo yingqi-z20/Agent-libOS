@@ -30,7 +30,15 @@ from agent_libos.storage.contracts import (
     RuntimeModuleRepositoryProtocol,
 )
 from agent_libos.storage.engine import SqlEngine, SqlSession
-from agent_libos.storage.factory import display_store_target, open_store, redact_store_target
+from agent_libos.storage.factory import (
+    ResolvedStoreTarget,
+    display_store_target,
+    open_store,
+    redact_store_target,
+    resolve_store_target,
+    validate_runtime_store_workspace_isolation,
+    validate_store_target_workspace_isolation,
+)
 from agent_libos.storage.postgres import PostgresStore
 from agent_libos.storage.repositories import (
     AuthorityRepository,
@@ -202,4 +210,8 @@ __all__ = [
     "display_store_target",
     "open_store",
     "redact_store_target",
+    "ResolvedStoreTarget",
+    "resolve_store_target",
+    "validate_runtime_store_workspace_isolation",
+    "validate_store_target_workspace_isolation",
 ]

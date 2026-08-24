@@ -305,19 +305,21 @@ JIT syscalls:
 CLI commands:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite checkpoint create <pid> "before risky edit"
-uv run agent-libos --db .agent_libos.sqlite checkpoint list --pid <pid>
-uv run agent-libos --db .agent_libos.sqlite checkpoint inspect <checkpoint_id>
-uv run agent-libos --db .agent_libos.sqlite checkpoint diff <checkpoint_id>
-uv run agent-libos --db .agent_libos.sqlite checkpoint restore <checkpoint_id>
-uv run agent-libos --db .agent_libos.sqlite checkpoint fork <checkpoint_id>
-uv run agent-libos --db .agent_libos.sqlite checkpoint replay <checkpoint_id> <event_id>
+uv run agent-libos --db user checkpoint create <pid> "before risky edit"
+uv run agent-libos --db user checkpoint list --pid <pid>
+uv run agent-libos --db user checkpoint inspect <checkpoint_id>
+uv run agent-libos --db user checkpoint diff <checkpoint_id>
+uv run agent-libos --db user checkpoint restore <checkpoint_id>
+uv run agent-libos --db user checkpoint fork <checkpoint_id>
+uv run agent-libos --db user checkpoint replay <checkpoint_id> <event_id>
 ```
 
-A relative `--db` path such as `.agent_libos.sqlite` is resolved from the CLI
-process's current working directory. Use an absolute path when separate CLI
-invocations must select the same database independently of their working
-directory.
+The reserved `--db user` target resolves to
+`~/.agent-libos/runtime/agent-libos.sqlite` across working directories; it is
+not a relative filesystem path. An actual custom relative `--db` path resolves
+from the CLI process's current working directory and is rejected when it falls
+inside the effective model-visible workspace. Use `user` or an absolute
+external path when separate CLI invocations must select the same database.
 
 Passing `--actor-pid` makes the CLI enforce that process's checkpoint
 capabilities. Omitting it runs as the trusted `cli` administrator and bypasses
@@ -712,8 +714,8 @@ not repeat that read check. A declaration such as `image:*` in
 CLI example:
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite images commit <checkpoint_id> stateful-agent:v0 --name stateful-agent
-uv run agent-libos --db .agent_libos.sqlite spawn --image stateful-agent:v0 --goal "use baked memory"
+uv run agent-libos --db user images commit <checkpoint_id> stateful-agent:v0 --name stateful-agent
+uv run agent-libos --db user spawn --image stateful-agent:v0 --goal "use baked memory"
 ```
 
 The registered model-tool wrapper is `commit_checkpoint_to_image`, owned by the
@@ -807,9 +809,20 @@ one-shot authority.
 
 `EXTERNAL_REF` Objects are host-handle descriptions, not clonable runtime
 resources. Fork drops both owned and borrowed `EXTERNAL_REF` roots and filters
-their object capabilities; it never reconnects or aliases the source PTY or
-other host handle. Destructive restore likewise mutates only subtree-owned
-Objects and does not roll back a borrowed Object or its lender's capability.
+their object capabilities; the same rule applies to durable TaskRun reference
+Objects. For a clonable Object, exact `object:<oid>`, subtree
+`object:<oid>/*`, and prefix `object:<oid>:*` resources retain their scope while
+the OID is remapped. All scopes for a borrowed, non-clonable, released, or
+otherwise unmapped Object are dropped, as is the domain-wide `object:*`
+resource. A dormant source OID therefore cannot regain authority in the fork
+if a later source restore makes that Object live again. Fork applies these
+rules to captured capability rows, durable tool-candidate requested
+capabilities, and the matching tool-candidate descriptor Object. A malformed
+or non-canonical resource in any carrier rejects the fork before publication
+rather than being copied as opaque text. The fork never reconnects or aliases
+the source PTY or other host handle.
+Destructive restore likewise mutates only subtree-owned Objects and does not
+roll back a borrowed Object or its lender's capability.
 
 Fork first performs non-consuming preparation checks: the requested parent must
 exist and be non-terminal, cross-subject parent attachment needs `admin` on the

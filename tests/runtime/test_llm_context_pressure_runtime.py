@@ -1434,7 +1434,10 @@ def test_auto_attempt_marker_prevents_replay_after_interrupted_reopen(
         pass
 
     monkeypatch.setattr("agent_libos.llm.executor.assess_context_pressure", _forced_pressure)
-    with tempfile.TemporaryDirectory() as temp_dir:
+    with (
+        tempfile.TemporaryDirectory() as temp_dir,
+        tempfile.TemporaryDirectory() as workspace_dir,
+    ):
         db = f"{temp_dir}/runtime.sqlite"
         image = AgentImage(
             image_id="durable-attempt-context:v0",
@@ -1444,7 +1447,7 @@ def test_auto_attempt_marker_prevents_replay_after_interrupted_reopen(
         )
         runtime = Runtime.open(
             db,
-            substrate=LocalResourceProviderSubstrate(temp_dir),
+            substrate=LocalResourceProviderSubstrate(workspace_dir),
         )
         runtime.register_image(image, actor="test")
         initial_client = RecordingActionClient(
@@ -1503,7 +1506,7 @@ def test_auto_attempt_marker_prevents_replay_after_interrupted_reopen(
 
         reopened = Runtime.open(
             db,
-            substrate=LocalResourceProviderSubstrate(temp_dir),
+            substrate=LocalResourceProviderSubstrate(workspace_dir),
         )
         client = RecordingActionClient(
             [{"action": "process_exit", "payload": {"done": True}}]
@@ -1766,9 +1769,12 @@ def test_auto_context_approval_reopens_and_failure_continues_model_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("agent_libos.llm.executor.assess_context_pressure", _forced_pressure)
-    with tempfile.TemporaryDirectory() as temp_dir:
+    with (
+        tempfile.TemporaryDirectory() as temp_dir,
+        tempfile.TemporaryDirectory() as workspace_dir,
+    ):
         db = f"{temp_dir}/runtime.sqlite"
-        substrate = LocalResourceProviderSubstrate(temp_dir)
+        substrate = LocalResourceProviderSubstrate(workspace_dir)
         path = "agent_outputs/auto-context-approval.txt"
         runtime = Runtime.open(db, substrate=substrate)
         image = AgentImage(
@@ -1814,7 +1820,7 @@ def test_auto_context_approval_reopens_and_failure_continues_model_call(
         finally:
             runtime.close()
 
-        reopened = Runtime.open(db, substrate=LocalResourceProviderSubstrate(temp_dir))
+        reopened = Runtime.open(db, substrate=LocalResourceProviderSubstrate(workspace_dir))
         client = RecordingActionClient(
             [{"action": "process_exit", "payload": {"done": True}}]
         )

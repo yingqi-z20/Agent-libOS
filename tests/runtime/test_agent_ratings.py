@@ -48,7 +48,7 @@ class TestAgentRatings:
 
     def test_agent_rating_rejects_invalid_process_score_and_comment(self) -> None:
         config = AgentLibOSConfig(gui=replace(DEFAULT_CONFIG.gui, agent_rating_comment_max_chars=4))
-        runtime = Runtime.open(config=config)
+        runtime = Runtime.open("local", config=config)
         try:
             pid = runtime.process.spawn(goal="validate rating")
             with pytest.raises(NotFound, match="process not found"):

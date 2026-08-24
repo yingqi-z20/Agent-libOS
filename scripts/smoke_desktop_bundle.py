@@ -101,7 +101,7 @@ def _run_deno(deno: Path, expected_arch: str, root: Path) -> dict[str, Any]:
         timeout=30,
     )
     value = json.loads(result.stdout)
-    if value != {"marker": "desktop-deno-jit", "version": "2.9.4", "arch": expected_arch}:
+    if value != {"marker": "desktop-deno-jit", "version": "2.9.5", "arch": expected_arch}:
         raise RuntimeError(f"bundled Deno identity/JIT smoke failed: {value!r}")
     return value
 

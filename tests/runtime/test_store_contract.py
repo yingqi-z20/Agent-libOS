@@ -4894,6 +4894,73 @@ def test_task_run_command_result_read_cap_fails_closed_across_backends(
             reopened.close()
 
 
+@pytest.mark.parametrize("kind", STORE_BACKENDS)
+def test_windows_legacy_identity_inventories_are_backend_neutral(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    with _runtime_for_backend(kind, tmp_path) as runtime:
+        pid = runtime.process.spawn(goal=f"{kind} identity inventory")
+        active = runtime.capability.grant(
+            pid,
+            "filesystem:workspace:Report.txt",
+            [CapabilityRight.READ],
+            issued_by="test",
+        )
+        inactive = runtime.capability.grant(
+            pid,
+            "filesystem:workspace:Old.txt",
+            [CapabilityRight.READ],
+            issued_by="test",
+        )
+        runtime.capability.revoke(
+            inactive.cap_id,
+            revoked_by="test",
+            require_authority=False,
+        )
+        binding = runtime.data_flow.bind_written_file(
+            pid=pid,
+            normalized_path="Report.txt",
+            content=b"report",
+            context=DataFlowContext(),
+        )
+        checkpoint_id = runtime.checkpoint.create(
+            pid,
+            "identity inventory",
+            actor=pid,
+            require_capability=False,
+        )
+
+        capability_page = runtime.uow.authority.query_active_capability_resource_identities(
+            after_cap_id=None,
+            limit=runtime.config.capability.list_limit,
+        )
+        label_page = runtime.uow.authority.query_live_file_label_path_identities(
+            after_binding_id=None,
+            limit=runtime.config.data_flow.file_binding_list_limit,
+        )
+        checkpoint_page = runtime.uow.snapshots.query_checkpoint_capability_inventories(
+            after_checkpoint_id=None,
+            limit=runtime.config.checkpoint.list_limit,
+        )
+
+        assert (active.cap_id, active.resource) in {
+            (item.capability_id, item.resource) for item in capability_page
+        }
+        assert inactive.cap_id not in {
+            item.capability_id for item in capability_page
+        }
+        assert (binding.binding_id, binding.normalized_path) in {
+            (item.binding_id, item.normalized_path) for item in label_page
+        }
+        selected = next(
+            item for item in checkpoint_page if item.checkpoint_id == checkpoint_id
+        )
+        assert (active.cap_id, active.resource) in {
+            (item.capability_id, item.resource) for item in selected.capabilities
+        }
+
+
 @contextlib.contextmanager
 def _runtime_for_backend(kind: str, tmp_path: Path) -> Iterator[Runtime]:
     target: str | Path | None

@@ -754,10 +754,16 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
-    def test_launcher_wrapped_git_is_rejected_before_policy_or_evidence(self) -> None:
-        runtime, provider = self._runtime_with_fake_shell()
+    def test_transparent_launcher_dispatch_is_rejected_before_policy_or_evidence(
+        self,
+    ) -> None:
+        provider = ResolvingShellProvider()
+        runtime = self._runtime_with_shell_provider(provider)
         try:
-            pid = runtime.process.spawn(image='review-agent:v0', goal='reject wrapped Git')
+            pid = runtime.process.spawn(
+                image='review-agent:v0',
+                goal='reject transparent executable launchers',
+            )
             runtime.shell.grant_policy(
                 pid,
                 runtime.config.shell.always_allow_level,
@@ -766,23 +772,31 @@ class TestShellPrimitive:
             audit_before = runtime.audit.trace()
             events_before = runtime.events.list()
             effects_before = runtime.store.list_external_effects(pid=pid)
+            flow_decisions_before = runtime.store.list_data_flow_decisions(pid=pid)
 
-            wrapped_commands = (
+            launcher_commands = (
+                ['env', '-P', '.', 'git', 'push'],
                 ['env', 'git', 'branch', 'wrapper-created'],
-                ['timeout', '30', 'git', 'push'],
-                ['nice', '-n', '5', 'git', 'reset', '--hard'],
-                ['setsid', 'git', 'branch', 'wrapper-created'],
-                ['stdbuf', '-o0', 'git', 'push'],
+                ['/usr/bin/NiCe.ExE', '-n', '5', 'printf'],
+                ['NOHUP', 'printf'],
+                ['setsid.exe', '--', 'printf'],
+                ['/usr/bin/stdbuf', '-o0', 'printf'],
+                ['Timeout.EXE', '30', 'printf'],
             )
-            for requested in wrapped_commands:
-                with pytest.raises(ValidationError, match='typed git_'):
+            for requested in launcher_commands:
+                with pytest.raises(ValidationError, match='launcher dispatch'):
                     runtime.shell.run(pid, requested)
 
+            assert provider.resolver_calls == []
             assert provider.calls == []
             assert runtime.human.pending() == []
             assert runtime.audit.trace() == audit_before
             assert runtime.events.list() == events_before
             assert runtime.store.list_external_effects(pid=pid) == effects_before
+            assert (
+                runtime.store.list_data_flow_decisions(pid=pid)
+                == flow_decisions_before
+            )
         finally:
             runtime.close()
 
@@ -1469,7 +1483,7 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
-    def test_interpreter_wrapped_git_is_governed_by_interpreter_policy(self) -> None:
+    def test_interpreter_started_git_is_governed_by_interpreter_policy(self) -> None:
         runtime, _provider = self._runtime_with_fake_shell()
         try:
             pid = runtime.process.spawn(image='review-agent:v0', goal='blacklist shell')
@@ -1477,7 +1491,7 @@ class TestShellPrimitive:
             with pytest.raises(HumanApprovalRequired):
                 runtime.shell.run(
                     pid,
-                    ['env', 'bash', '-c', 'git branch wrapper-created'],
+                    ['bash', '-c', 'git branch wrapper-created'],
                 )
             request = runtime.human.pending()[0]
             assert request.payload['context']['matched_rule'] == ['bash']

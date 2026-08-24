@@ -531,6 +531,79 @@ def test_snapshot_remapper_updates_nested_identity_carriers_without_global_repla
     assert raw == before
 
 
+@pytest.mark.parametrize(
+    ("resource", "expected"),
+    [
+        ("object:obj_1", "object:obj_2"),
+        ("object:obj_1/*", "object:obj_2/*"),
+        ("object:obj_1:*", "object:obj_2:*"),
+    ],
+    ids=("exact", "subtree", "prefix"),
+)
+def test_snapshot_remapper_preserves_object_resource_scope(
+    resource: str,
+    expected: str,
+) -> None:
+    raw = _snapshot()
+    raw["rows"]["capabilities"][0]["resource"] = resource
+    raw["rows"]["tool_candidates"] = [
+        _row(
+            "tool_candidates",
+            candidate_id="candidate_1",
+            pid="pid_1",
+            requested_capabilities_json=dumps(
+                [{"resource": resource, "rights": ["read"]}]
+            ),
+        )
+    ]
+
+    remapped = SnapshotRemapper.remap(
+        SnapshotCodec.decode_mapping(raw),
+        SnapshotIdentityMap(objects={"obj_1": "obj_2"}),
+    )
+    encoded = SnapshotCodec.encode_mapping(remapped)
+    requested = SnapshotRemapper._json_container(
+        encoded["rows"]["tool_candidates"][0][
+            "requested_capabilities_json"
+        ],
+        field_name="test.requested_capabilities_json",
+        expected_type=list,
+    )
+
+    assert encoded["rows"]["capabilities"][0]["resource"] == expected
+    assert requested[0]["resource"] == expected
+
+
+@pytest.mark.parametrize(
+    "carrier",
+    ["capability", "tool_candidate"],
+)
+def test_snapshot_remapper_rejects_malformed_capability_resources(
+    carrier: str,
+) -> None:
+    raw = _snapshot()
+    malformed = "object:obj_1/*/escape"
+    if carrier == "capability":
+        raw["rows"]["capabilities"][0]["resource"] = malformed
+    else:
+        raw["rows"]["tool_candidates"] = [
+            _row(
+                "tool_candidates",
+                candidate_id="candidate_1",
+                pid="pid_1",
+                requested_capabilities_json=dumps(
+                    [{"resource": malformed, "rights": ["read"]}]
+                ),
+            )
+        ]
+
+    with pytest.raises(ValidationError, match="valid capability resource"):
+        SnapshotRemapper.remap(
+            SnapshotCodec.decode_mapping(raw),
+            SnapshotIdentityMap(objects={"obj_1": "obj_2"}),
+        )
+
+
 @pytest.mark.parametrize("domain", ["pids", "objects", "capabilities", "tools"])
 def test_snapshot_remapper_rejects_partial_map_targeting_unchanged_identity(
     domain: str,

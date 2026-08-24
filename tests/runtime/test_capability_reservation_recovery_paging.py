@@ -228,7 +228,7 @@ def test_prepared_effect_recovery_precedes_stale_reservation_abandonment(
 def test_open_runtime_rejects_capability_reservation_recovery_before_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = Runtime.open()
+    runtime = Runtime.open("local")
     transaction_attempted = False
 
     def unexpected_transaction(*_args: object, **_kwargs: object) -> object:

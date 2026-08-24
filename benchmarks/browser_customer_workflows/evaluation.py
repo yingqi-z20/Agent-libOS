@@ -353,7 +353,9 @@ def _run_once(
     state_dir = run_root / "state"
     state_dir.mkdir(exist_ok=True)
     database = state_dir / "runtime.sqlite"
-    substrate = LocalResourceProviderSubstrate(run_root)
+    workspace = run_root / "workspace"
+    workspace.mkdir(exist_ok=True)
+    substrate = LocalResourceProviderSubstrate(workspace)
     install = getattr(harness, "install", None)
     if callable(install):
         install(substrate)

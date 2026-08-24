@@ -373,8 +373,10 @@ def test_host_skill_resource_topology_is_aggregate_bounded(
 def test_workspace_skill_resource_topology_is_aggregate_bounded(
     tmp_path: Path,
 ) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     package = _write_minimal_skill(
-        tmp_path,
+        workspace,
         "workspace-topology-bound",
         description="Reject excessive workspace directory topology.",
     )
@@ -388,7 +390,7 @@ def test_workspace_skill_resource_topology_is_aggregate_bounded(
     )
     runtime = Runtime.open(
         tmp_path / "workspace-topology.sqlite",
-        substrate=LocalResourceProviderSubstrate(tmp_path),
+        substrate=LocalResourceProviderSubstrate(workspace),
         config=config,
     )
     try:
@@ -418,15 +420,17 @@ def test_workspace_registration_requires_write_before_descendant_traversal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     package = _write_minimal_skill(
-        tmp_path,
+        workspace,
         "workspace-preauthorized-traversal",
         description="Require Skill WRITE before reading package descendants.",
     )
     (package / "references" / "one" / "two").mkdir(parents=True)
     runtime = Runtime.open(
         tmp_path / "workspace-preauthorized-traversal.sqlite",
-        substrate=LocalResourceProviderSubstrate(tmp_path),
+        substrate=LocalResourceProviderSubstrate(workspace),
     )
     try:
         pid = runtime.process.spawn(
@@ -472,15 +476,17 @@ def test_workspace_registration_requires_write_before_descendant_traversal(
 def test_workspace_topology_failure_restores_finite_write_authority(
     tmp_path: Path,
 ) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     package = _write_minimal_skill(
-        tmp_path,
+        workspace,
         "workspace-topology-rollback",
         description="Restore finite WRITE after a bounded topology rejection.",
     )
     (package / "references" / "one" / "two").mkdir(parents=True)
     runtime = Runtime.open(
         tmp_path / "workspace-topology-rollback.sqlite",
-        substrate=LocalResourceProviderSubstrate(tmp_path),
+        substrate=LocalResourceProviderSubstrate(workspace),
         config=AgentLibOSConfig(
             skills=replace(
                 SkillDefaults(),

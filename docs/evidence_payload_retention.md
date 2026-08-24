@@ -198,9 +198,9 @@ The CLI performs one page at a time and defaults to preview. Mutation requires
 both enabled configuration and the explicit `--apply` flag:
 
 ```console
-agent-libos --config config.yaml --db .agent_libos.sqlite payload-retention llm_call
-agent-libos --config config.yaml --db .agent_libos.sqlite payload-retention llm_call --apply
-agent-libos --config config.yaml --db .agent_libos.sqlite payload-retention external_effect --apply
+agent-libos --config config.yaml --db user payload-retention llm_call
+agent-libos --config config.yaml --db user payload-retention llm_call --apply
+agent-libos --config config.yaml --db user payload-retention external_effect --apply
 ```
 
 Use the returned `next_cursor.created_at` and `next_cursor.record_id` as

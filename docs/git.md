@@ -303,9 +303,13 @@ inspection commands: `git status`, `git status --short`,
 `git diff --stat`. Executable matching is case-insensitive and accepts the
 platform `git.exe` spelling. The commands receive the same
 no-pager/no-lock/no-fsmonitor/no-external-diff and no-lazy-fetch hardening. Every
-other direct Git command, including supported transparent launcher wrappers, is
-rejected before shell policy or Human approval even when Shell policy is
-`always_allow`.
+other direct Git command is rejected before shell policy or Human approval even
+when Shell policy is `always_allow`. Shell and PTY also reject every recognized
+transparent launcher (`env`, `nice`, `nohup`, `setsid`, `stdbuf`, or `timeout`)
+that has any trailing argv token. This fail-closed launcher rule applies to Git
+and non-Git programs alike; callers must invoke the intended executable
+directly. A single-token launcher invocation such as `env` remains governed by
+ordinary Shell authority.
 
 That check is argv mediation, not an OS sandbox. An authorized interpreter,
 script, or native executable can invoke Git later or modify `.git` directly as

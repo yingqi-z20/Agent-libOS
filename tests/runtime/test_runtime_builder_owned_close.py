@@ -107,7 +107,7 @@ def test_owned_close_failure_blocks_successor_until_exact_sync_retry(
     _install_failed_open(monkeypatch, store)
 
     with pytest.raises(BaseExceptionGroup) as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
     handle = _extract_one(caught.value)
     reservation = handle._owned_store_close_reservation
 
@@ -140,7 +140,7 @@ def test_owned_close_failure_blocks_successor_until_exact_async_retry(
 
     async def exercise() -> None:
         with pytest.raises(BaseExceptionGroup) as caught:
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
         handle = _extract_one(caught.value)
         reservation = handle._owned_store_close_reservation
 
@@ -174,7 +174,7 @@ def test_stale_owned_handle_never_closes_successor_runtime(
     _install_failed_open(monkeypatch, store)
 
     with pytest.raises(BaseExceptionGroup) as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
     handle = _extract_one(caught.value)
     reservation = handle._owned_store_close_reservation
     assert store.unbind_admission_commit_guard(reservation) is True
@@ -213,7 +213,7 @@ def test_pre_lifecycle_failed_open_reserves_exact_close_before_retry(
     )
 
     with pytest.raises(BaseExceptionGroup) as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
     handle = _extract_one(caught.value)
 
     assert handle.partial_runtime is not None
@@ -242,7 +242,7 @@ def test_sync_failed_open_poisoned_store_closes_and_releases_file_lease(
     )
 
     with pytest.raises(ValidationError, match="injected rollback failure") as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
 
     assert RuntimeAssemblyCleanupRequired.extract(caught.value) == ()
     assert store._runtime_ownership_released() is True
@@ -271,7 +271,7 @@ def test_async_failed_open_poisoned_store_closes_and_releases_file_lease(
             ValidationError,
             match="injected rollback failure",
         ) as caught:
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
 
         assert RuntimeAssemblyCleanupRequired.extract(caught.value) == ()
         assert store._runtime_ownership_released() is True
@@ -309,7 +309,7 @@ def test_sync_failed_open_poisoned_store_retained_close_publishes_retry_handle(
     )
 
     with pytest.raises(BaseExceptionGroup) as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
     handle = _extract_one(caught.value)
 
     assert handle.owns_store is True
@@ -355,7 +355,7 @@ def test_async_failed_open_poisoned_store_retained_close_publishes_retry_handle(
 
     async def exercise() -> None:
         with pytest.raises(BaseExceptionGroup) as caught:
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
         handle = _extract_one(caught.value)
 
         assert handle.owns_store is True
@@ -392,7 +392,7 @@ def test_windows_poisoned_file_store_terminalizes_released_connection_lease(
     )
 
     with pytest.raises(BaseExceptionGroup) as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
     handle = _extract_one(caught.value)
 
     assert handle.owns_store is False
@@ -413,7 +413,7 @@ def test_sync_failed_open_already_released_memory_store_terminalizes_handle(
     )
 
     with pytest.raises(BaseExceptionGroup) as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
     handle = _extract_one(caught.value)
 
     assert handle.owns_store is False
@@ -434,7 +434,7 @@ def test_async_failed_open_already_released_memory_store_terminalizes_handle(
 
     async def exercise() -> None:
         with pytest.raises(BaseExceptionGroup) as caught:
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
         handle = _extract_one(caught.value)
 
         assert handle.owns_store is False
@@ -467,7 +467,7 @@ def test_sync_failed_open_already_released_session_does_not_publish_handle(
     monkeypatch.setattr(RuntimeBuilder, "_allocate_host", fail_allocation)
 
     with pytest.raises(RuntimeError) as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
 
     assert caught.value is failure
     assert RuntimeAssemblyCleanupRequired.extract(caught.value) == ()
@@ -509,7 +509,7 @@ def test_async_failed_open_already_released_session_does_not_publish_handle(
 
     async def exercise() -> None:
         with pytest.raises(RuntimeError) as caught:
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
 
         assert caught.value is failure
         assert RuntimeAssemblyCleanupRequired.extract(caught.value) == ()
@@ -530,7 +530,7 @@ def test_active_transaction_reservation_failure_is_retryable_after_transaction(
 
     with store.transaction():
         with pytest.raises(BaseExceptionGroup) as caught:
-            Runtime.open("ignored")
+            Runtime.open("local")
         handle = _extract_one(caught.value)
         assert handle.owns_store is True
         assert handle.released is False
@@ -565,7 +565,7 @@ def test_sync_owned_release_rejects_current_thread_store_scope_before_cleanup(
     _install_failed_open(monkeypatch, store)
 
     with pytest.raises(BaseExceptionGroup) as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
     handle = _extract_one(caught.value)
     with handle._lock:
         handle._cleanup_completed = False
@@ -616,7 +616,7 @@ def test_async_owned_release_rejects_current_thread_store_scope_before_cleanup(
 
     async def exercise() -> None:
         with pytest.raises(BaseExceptionGroup) as caught:
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
         handle = _extract_one(caught.value)
         with handle._lock:
             handle._cleanup_completed = False
@@ -691,7 +691,7 @@ def test_async_stale_owned_handle_never_closes_successor_runtime(
 
     async def exercise() -> None:
         with pytest.raises(BaseExceptionGroup) as caught:
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
         handle = _extract_one(caught.value)
         reservation = handle._owned_store_close_reservation
         assert store.unbind_admission_commit_guard(reservation) is True
@@ -731,7 +731,7 @@ def test_async_failed_open_publishes_handle_before_current_thread_close_scope(
         scope = getattr(store, scope_name)
         with scope():
             with pytest.raises(BaseExceptionGroup) as caught:
-                await Runtime.aopen("ignored")
+                await Runtime.aopen("local")
             handle = _extract_one(caught.value)
             assert store._runtime_assembly_reservation is None
             assert (
@@ -776,7 +776,7 @@ def test_async_failed_open_publishes_handle_when_assembly_store_lock_is_busy(
 
     async def exercise() -> RuntimeAssemblyCleanupRequired:
         with pytest.raises(BaseExceptionGroup) as caught:
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
         handle = _extract_one(caught.value)
         assert caught.value.subgroup(
             lambda item: isinstance(item, RuntimeError)
@@ -810,7 +810,7 @@ def test_concurrent_sync_owned_release_has_one_preflight_and_close_leader(
     _install_failed_open(monkeypatch, store)
 
     with pytest.raises(BaseExceptionGroup) as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
     handle = _extract_one(caught.value)
     original_probe = store.probe_admission_guard_close
     probe_entered = threading.Event()
@@ -862,7 +862,7 @@ def test_concurrent_async_owned_release_has_one_preflight_claim_and_close_leader
 
     async def exercise() -> None:
         with pytest.raises(BaseExceptionGroup) as caught:
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
         handle = _extract_one(caught.value)
         original_probe = store.probe_admission_guard_close
         original_claim = store.claim_admission_guard_close
@@ -935,7 +935,7 @@ def test_reservation_failure_still_drains_started_object_task_worker(
     monkeypatch.setattr(RuntimeLifecycle, "mark_open", fail_after_worker_start)
 
     with pytest.raises(BaseExceptionGroup) as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
     handle = _extract_one(caught.value)
     assert handle.partial_runtime is not None
     assert handle.partial_runtime.object_tasks._closed is True
@@ -956,7 +956,7 @@ def test_concurrent_successor_cannot_cross_owned_close_reservation(
     _install_failed_open(monkeypatch, store)
 
     with pytest.raises(BaseExceptionGroup) as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
     handle = _extract_one(caught.value)
     close_entered = threading.Event()
     allow_close = threading.Event()
@@ -1023,7 +1023,7 @@ def test_async_owned_close_is_offloaded_drained_and_cancellation_visible(
 
     async def exercise() -> None:
         with pytest.raises(BaseExceptionGroup) as caught:
-            await Runtime.aopen("ignored")
+            await Runtime.aopen("local")
         handle = _extract_one(caught.value)
         close_entered = threading.Event()
         allow_close = threading.Event()
@@ -1087,7 +1087,7 @@ def test_async_failed_open_close_is_offloaded_drained_and_cancellation_visible(
                 await asyncio.sleep(0)
 
         heartbeat_task = asyncio.create_task(heartbeat())
-        open_task = asyncio.create_task(Runtime.aopen("ignored"))
+        open_task = asyncio.create_task(Runtime.aopen("local"))
         while not close_entered.is_set():
             await asyncio.sleep(0)
         await heartbeat_task
@@ -1115,7 +1115,7 @@ def test_released_store_warnings_terminalize_handle_without_retry(
     _install_failed_open(monkeypatch, store)
 
     with pytest.raises(BaseExceptionGroup) as caught:
-        Runtime.open("ignored")
+        Runtime.open("local")
     handle = _extract_one(caught.value)
     original_release = store.release_admission_guard_and_close
     warning = OSError("released with diagnostic")

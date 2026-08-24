@@ -283,9 +283,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--db",
         help=(
-            "Runtime store target. Paths/local use SQLite; postgresql:// DSNs use PostgreSQL. "
+            "Runtime store target. 'user' uses the persistent per-user SQLite store; "
+            "paths use file SQLite; local/:memory:/sqlite:// use in-memory SQLite; "
+            "postgresql:// DSNs use PostgreSQL. "
             "If omitted, uses the selected config runtime store settings "
-            f"(default '{_RUNTIME_DEFAULTS.local_store_target}' is in-memory SQLite)."
+            f"(default '{_RUNTIME_DEFAULTS.local_store_target}' is persistent SQLite)."
         ),
     )
     parser.add_argument(

@@ -207,7 +207,7 @@ npm --prefix gui install
 Run the Python server directly:
 
 ```bash
-uv run agent-libos-gui-server --db .agent_libos.sqlite --port 0
+uv run agent-libos-gui-server --db user --port 0
 ```
 
 The server options are:
@@ -215,7 +215,7 @@ The server options are:
 | Option | Behavior |
 | --- | --- |
 | `--config <path>` | Load a YAML overlay; otherwise use the project-root `config.yaml` when present. |
-| `--db <target>` | Select the SQLite path, `local`, or configured PostgreSQL target; omission uses the runtime configuration default. |
+| `--db <target>` | Select `user`, a SQLite path outside the workspace, `local`/`:memory:`, or a configured PostgreSQL target; omission uses the runtime configuration default. |
 | `--port <n>` | Bind the fixed loopback host on this port; `0` asks the OS for an available port and is the default. |
 | `--token <value>` | Use an explicit bearer token; omission generates a random token. Treat an explicit value and the startup JSON as Host credentials. |
 | `--llm-profiles-file <path>` | Select the user GUI LLM-profile JSON file; omission uses the documented user-level default. |
@@ -224,9 +224,12 @@ The server options are:
 
 There is no public-bind option: the server rejects non-loopback hosts.
 
-The GUI server accepts the same runtime store targets as the CLI. SQLite paths
-are the default local store; PostgreSQL DSNs require installing the `postgres`
-extra and are redacted in startup and health payloads. Persistent stores use an
+The GUI server accepts the same runtime store targets as the CLI. `user`
+resolves to `~/.agent-libos/runtime/agent-libos.sqlite`; custom persistent
+SQLite paths must remain outside the effective workspace and are rejected
+before database or sidecar creation when they overlap it. PostgreSQL DSNs
+require installing the `postgres` extra and are redacted in startup and health
+payloads. Persistent stores use an
 active-runtime lease, so a GUI server and a writable CLI Runtime cannot open
 the same SQLite target or PostgreSQL database/schema concurrently. On the
 hardened POSIX path, SQLite pairs its canonical target and no-follow sidecar
@@ -244,7 +247,7 @@ The server prints one JSON line containing the selected local URL and bearer
 token:
 
 ```json
-{"url":"http://127.0.0.1:51234","token":"...","db":".agent_libos.sqlite"}
+{"url":"http://127.0.0.1:51234","token":"...","db":"/home/user/.agent-libos/runtime/agent-libos.sqlite"}
 ```
 
 Run the Electron app:
@@ -335,7 +338,7 @@ Agent libOS 1.5.1 also has a manually triggered, internal-only native desktop
 build for macOS arm64, Windows x64, and Ubuntu 24.04/glibc x64. The exact
 runtime closure is Electron 43.2.0, a PyInstaller 6.21.0 one-folder sidecar
 built with CPython 3.11.15, Agent libOS with the complete MCP extra (including
-MCP SDK 2.0.0 and keyring 25.7.0), and the official Deno 2.9.4 platform binary.
+MCP SDK 2.0.0 and keyring 25.7.0), and the official Deno 2.9.5 platform binary.
 Deno downloads are accepted only after the repository-pinned platform SHA-256
 matches; a runner-preinstalled Deno is never staged.
 
@@ -373,12 +376,17 @@ Source-controlled electron-builder inputs such as the application icon live in
 staging and output directories.
 
 The packaged default store is
-`<Electron userData>/runtime/agent-libos.sqlite`. The optional overlay is
-`<Electron userData>/config.yaml`, and GUI-created model profiles remain in
-`<Electron userData>/llm-profiles.json`. These paths are persistent and are
-reopened on the next launch. Git, external MCP Servers, the system keychain (or
-Secret Service), and the system certificate store remain explicit Host/OS
-capabilities rather than bundled substitutes.
+`<Electron userData>/runtime/agent-libos.sqlite`, while the model-visible
+workspace is the separate owner-only `<Electron userData>/workspace` directory.
+The optional overlay is `<Electron userData>/config.yaml`, and GUI-created model
+profiles remain in `<Electron userData>/llm-profiles.json`. These paths are
+persistent and are reopened on the next launch. Development Electron starts the
+server with the explicit `--db user` target. A custom database selected in the
+desktop is Host-canonicalized and rejected before server replacement when it is
+inside the effective workspace, so an already-running server remains available.
+Git, external MCP Servers, the system keychain (or Secret Service), and the
+system certificate store remain explicit Host/OS capabilities rather than
+bundled substitutes.
 
 Artifacts are marked `internal-unsigned`. electron-builder applies an ad-hoc
 signature to the macOS app and the checker verifies every nested Mach-O plus

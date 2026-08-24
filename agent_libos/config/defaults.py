@@ -246,7 +246,7 @@ class ShellCommandRule:
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class RuntimeDefaults:
-    local_store_target: str = "local"
+    local_store_target: str = "user"
     # Compatibility-only 1.x input; the runtime store target is authoritative.
     runtime_db_filename: str = ".agent_libos.sqlite"
     store_backend: Literal["sqlite", "postgres"] = "sqlite"
@@ -1346,7 +1346,8 @@ def _validate_runtime_config(runtime: RuntimeDefaults) -> None:
             )
         if "://" in runtime.local_store_target and local_store_scheme not in {"sqlite"}:
             raise ValueError(
-                "runtime.local_store_target must be a filesystem path, local, :memory:, or sqlite:// URI"
+                "runtime.local_store_target must be user, a filesystem path, "
+                "local, :memory:, or a sqlite:// URI"
             )
     _positive_optional("runtime.run_until_idle_max_quanta", runtime.run_until_idle_max_quanta)
     _positive("runtime.launcher_max_quanta", runtime.launcher_max_quanta)

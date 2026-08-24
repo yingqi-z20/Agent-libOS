@@ -90,6 +90,9 @@ from agent_libos.storage.contracts import (
     OperationEvidenceBackendProtocol,
     ObjectQueryBackendProtocol,
     ObjectRecoveryBackendProtocol,
+    PersistedCapabilityResourceIdentity,
+    PersistedCheckpointCapabilityInventory,
+    PersistedFileLabelPathIdentity,
     ProcessBackendProtocol,
     ProcessScaffoldCleanup,
     ResourceBackendProtocol,
@@ -1240,6 +1243,30 @@ class AuthorityRepository(_RepositoryFacade):
             subject,
             active_only=active_only,
             after_cap_id=after_cap_id,
+            limit=limit,
+        )
+
+    def query_active_capability_resource_identities(
+        self,
+        *,
+        after_cap_id: str | None,
+        limit: int,
+    ) -> list[PersistedCapabilityResourceIdentity]:
+        return (
+            self._authority_recovery_backend.query_active_capability_resource_identities(
+                after_cap_id=after_cap_id,
+                limit=limit,
+            )
+        )
+
+    def query_live_file_label_path_identities(
+        self,
+        *,
+        after_binding_id: str | None,
+        limit: int,
+    ) -> list[PersistedFileLabelPathIdentity]:
+        return self._authority_recovery_backend.query_live_file_label_path_identities(
+            after_binding_id=after_binding_id,
             limit=limit,
         )
 
@@ -2610,6 +2637,56 @@ class SnapshotCheckpointRepository(_RepositoryFacade):
             list[Checkpoint],
             self._snapshot_backend.list_checkpoints(pid=pid, limit=limit),
         )
+
+    def query_checkpoint_capability_inventories(
+        self,
+        *,
+        after_checkpoint_id: str | None,
+        limit: int,
+    ) -> list[PersistedCheckpointCapabilityInventory]:
+        """Return a stable page of canonical checkpoint authority inventories.
+
+        The backend bounds the number and byte size of checkpoint documents.
+        This typed boundary validates each whole document before exposing any
+        capability resource, because only a canonical snapshot is restorable.
+        """
+
+        from agent_libos.models.snapshot import ProcessSnapshot
+
+        found = self._snapshot_backend.query_checkpoint_snapshots(
+            after_checkpoint_id=after_checkpoint_id,
+            limit=limit,
+        )
+        inventories: list[PersistedCheckpointCapabilityInventory] = []
+        for checkpoint, snapshot in found:
+            try:
+                selected_snapshot = ProcessSnapshot.from_mapping(snapshot)
+                selected_snapshot = self._validated_checkpoint_pair(
+                    checkpoint,
+                    selected_snapshot,
+                    expected_checkpoint_id=checkpoint.checkpoint_id,
+                )
+                capabilities = tuple(
+                    PersistedCapabilityResourceIdentity(
+                        capability_id=str(row["cap_id"]),
+                        resource=str(row["resource"]),
+                    )
+                    for row in selected_snapshot.rows.capabilities
+                )
+            except (KeyError, TypeError, ValidationError, ValueError):
+                # Startup callers replace this diagnostic with an opaque
+                # checkpoint-only error. Keep raw snapshot fields out of this
+                # repository boundary as well.
+                raise ValidationError(
+                    "invalid persisted checkpoint capability inventory"
+                ) from None
+            inventories.append(
+                PersistedCheckpointCapabilityInventory(
+                    checkpoint_id=checkpoint.checkpoint_id,
+                    capabilities=capabilities,
+                )
+            )
+        return inventories
 
     def capture_checkpoint_rows(
         self,

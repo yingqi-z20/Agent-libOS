@@ -138,6 +138,10 @@ benchmark_attack_classes:
                 checker.DEFAULT_DETERMINISTIC_MARKER_EXPRESSION
                 + " and platform_linux"
             ),
+            (
+                checker.DEFAULT_DETERMINISTIC_MARKER_EXPRESSION
+                + " and platform_windows"
+            ),
         ]
 
     def test_optional_only_nodes_do_not_satisfy_deterministic_evidence(self) -> None:
@@ -529,7 +533,7 @@ benchmark_attack_classes:
         ("required_platform_nodes", "node_ids", "platform_collected", "expected"),
         [
             pytest.param(
-                {"windows": ["tests/security/test_platform.py::test_default"]},
+                {"solaris": ["tests/security/test_platform.py::test_default"]},
                 ["tests/security/test_platform.py::test_default"],
                 {},
                 "required platform must be one of",
@@ -590,6 +594,26 @@ benchmark_attack_classes:
         )
 
         assert any(expected in error for error in errors)
+
+    @pytest.mark.parametrize(
+        ("host_platform", "expected"),
+        [
+            pytest.param("darwin", "darwin", id="darwin"),
+            pytest.param("linux", "linux", id="linux"),
+            pytest.param("linux2", "linux", id="legacy-linux"),
+            pytest.param("win32", "windows", id="windows"),
+            pytest.param("freebsd14", None, id="unsupported"),
+        ],
+    )
+    def test_current_platform_key_includes_windows(
+        self,
+        monkeypatch: MonkeyPatch,
+        host_platform: str,
+        expected: str | None,
+    ) -> None:
+        monkeypatch.setattr(checker.sys, "platform", host_platform)
+
+        assert checker._current_platform_key() == expected
 
     def test_benchmark_attack_class_mapping_must_match_declarations_and_tasks(self, monkeypatch: MonkeyPatch) -> None:
         manifest = {

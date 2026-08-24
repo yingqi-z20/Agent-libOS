@@ -1256,19 +1256,19 @@ can diagnose the completed operation without persisting live session material.
 ## CLI
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite mcp register server.yaml
-uv run agent-libos --db .agent_libos.sqlite mcp register server.yaml --replace
-uv run agent-libos --db .agent_libos.sqlite mcp list --text demo --limit 20
-uv run agent-libos --db .agent_libos.sqlite mcp inspect demo-mcp
+uv run agent-libos --db user mcp register server.yaml
+uv run agent-libos --db user mcp register server.yaml --replace
+uv run agent-libos --db user mcp list --text demo --limit 20
+uv run agent-libos --db user mcp inspect demo-mcp
 # Manifest v2 with protocol_mode auto or 2026-07-28 only:
-uv run agent-libos --db .agent_libos.sqlite mcp discover demo-mcp
-uv run agent-libos --db .agent_libos.sqlite mcp tools demo-mcp
-uv run agent-libos --db .agent_libos.sqlite mcp tools demo-mcp --refresh
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> process:spawn --rights write
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp_stdio:<sha256-from-inspect> --rights execute
-uv run agent-libos --db .agent_libos.sqlite capabilities grant <pid> mcp:demo-mcp:forecast --rights read
-uv run agent-libos --db .agent_libos.sqlite mcp call <pid> demo-mcp forecast --arguments-json '{"city":"Beijing"}'
-uv run agent-libos --db .agent_libos.sqlite mcp unregister demo-mcp
+uv run agent-libos --db user mcp discover demo-mcp
+uv run agent-libos --db user mcp tools demo-mcp
+uv run agent-libos --db user mcp tools demo-mcp --refresh
+uv run agent-libos --db user capabilities grant <pid> process:spawn --rights write
+uv run agent-libos --db user capabilities grant <pid> mcp_stdio:<sha256-from-inspect> --rights execute
+uv run agent-libos --db user capabilities grant <pid> mcp:demo-mcp:forecast --rights read
+uv run agent-libos --db user mcp call <pid> demo-mcp forecast --arguments-json '{"city":"Beijing"}'
+uv run agent-libos --db user mcp unregister demo-mcp
 ```
 
 `server.yaml` is the user-created, adapted manifest described above; it is not
@@ -1302,7 +1302,7 @@ described above. For `mcp call <pid>`, an explicitly supplied group-level
 `--actor-pid` must equal the target `<pid>` and adds no authority.
 
 ```bash
-uv run agent-libos --db .agent_libos.sqlite mcp --actor-pid <pid> tools demo-mcp --refresh
+uv run agent-libos --db user mcp --actor-pid <pid> tools demo-mcp --refresh
 ```
 
 For stdio actor mode, `mcp inspect` works only after a Host/admin has created the
@@ -1358,12 +1358,14 @@ review workflows without making configuration model-facing:
 uv run python scripts/mcp_dx.py validate examples/mcp/stdio-v3.yaml
 uv run python scripts/mcp_dx.py doctor examples/mcp/http-v3.yaml
 
-# Secret-reference-only registry backup and a no-mutation import plan:
-uv run python scripts/mcp_dx.py export --db .agent_libos.sqlite --server demo-mcp > mcp-export.json
-uv run python scripts/mcp_dx.py import-plan --db target.sqlite mcp-export.json
+# Secret-reference-only registry backup and a no-mutation import plan.
+# Replace this with an absolute persistent target outside the workspace:
+MCP_IMPORT_DB=/absolute/external/store/mcp-import.sqlite
+uv run python scripts/mcp_dx.py export --db user --server demo-mcp > mcp-export.json
+uv run python scripts/mcp_dx.py import-plan --db "$MCP_IMPORT_DB" mcp-export.json
 
 # Apply exactly one reviewed CAS-bound entry:
-uv run python scripts/mcp_dx.py import-one --db target.sqlite mcp-export.json demo-mcp \
+uv run python scripts/mcp_dx.py import-one --db "$MCP_IMPORT_DB" mcp-export.json demo-mcp \
   --confirm-import --reviewer operator@example --reason "reviewed registry migration"
 ```
 
@@ -1386,7 +1388,7 @@ apply when the Store cannot provide one atomic batch transaction.
 A live probe is an external observation and requires an explicit confirmation:
 
 ```bash
-uv run python scripts/mcp_dx.py probe --db .agent_libos.sqlite examples/mcp/stdio-v3.yaml \
+uv run python scripts/mcp_dx.py probe --db user examples/mcp/stdio-v3.yaml \
   --confirm-probe --reviewer operator@example --reason "review unregistered catalogs"
 ```
 
