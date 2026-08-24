@@ -27,6 +27,11 @@ from agent_libos.storage import (
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
 
+def _set_user_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+
 def _sqlite_artifacts(directory: Path) -> tuple[Path, ...]:
     return tuple(
         path
@@ -668,7 +673,7 @@ def test_user_target_display_is_resolved_without_filesystem_mutation(
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    _set_user_home(monkeypatch, home)
     expected = home / ".agent-libos" / "runtime" / "agent-libos.sqlite"
 
     resolved = resolve_store_target("user")
@@ -688,9 +693,9 @@ def test_resolved_user_store_keeps_home_and_secure_directory_frozen(
     changed_home = tmp_path / "changed-home"
     original_home.mkdir()
     changed_home.mkdir()
-    monkeypatch.setenv("HOME", str(original_home))
+    _set_user_home(monkeypatch, original_home)
     resolved = resolve_store_target("user")
-    monkeypatch.setenv("HOME", str(changed_home))
+    _set_user_home(monkeypatch, changed_home)
 
     store = open_store(resolved)
     try:
@@ -711,7 +716,7 @@ def test_runtime_aopen_uses_default_persistent_user_store(
     workspace = tmp_path / "workspace"
     home.mkdir()
     workspace.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    _set_user_home(monkeypatch, home)
     monkeypatch.chdir(workspace)
     expected = home / ".agent-libos" / "runtime" / "agent-libos.sqlite"
 
@@ -749,7 +754,7 @@ def test_user_store_directory_symlink_is_rejected_without_database_creation(
         (home / ".agent-libos").symlink_to(redirected, target_is_directory=True)
     except OSError as exc:
         pytest.skip(f"host cannot create directory symlinks: {exc}")
-    monkeypatch.setenv("HOME", str(home))
+    _set_user_home(monkeypatch, home)
     leases_before = _sqlite_identity_lease_inventory()
 
     with pytest.raises(ValidationError, match="symlink or unsafe component"):
@@ -772,7 +777,7 @@ def test_user_store_symlink_is_rejected_without_o_nofollow_support(
         (home / ".agent-libos").symlink_to(redirected, target_is_directory=True)
     except OSError as exc:
         pytest.skip(f"host cannot create directory symlinks: {exc}")
-    monkeypatch.setenv("HOME", str(home))
+    _set_user_home(monkeypatch, home)
     monkeypatch.delattr("agent_libos.storage.factory.os.O_NOFOLLOW", raising=False)
     leases_before = _sqlite_identity_lease_inventory()
 
@@ -796,7 +801,7 @@ def test_user_store_database_leaf_symlink_is_rejected_without_side_effects(
         alias.symlink_to(redirected)
     except OSError as exc:
         pytest.skip(f"host cannot create file symlinks: {exc}")
-    monkeypatch.setenv("HOME", str(home))
+    _set_user_home(monkeypatch, home)
     leases_before = _sqlite_identity_lease_inventory()
 
     with pytest.raises(ValidationError, match="symlink or unsafe component"):
@@ -813,7 +818,7 @@ def test_default_user_store_inside_workspace_is_rejected_before_directory_creati
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    monkeypatch.setenv("HOME", str(workspace))
+    _set_user_home(monkeypatch, workspace)
     monkeypatch.chdir(workspace)
     leases_before = _sqlite_identity_lease_inventory()
 

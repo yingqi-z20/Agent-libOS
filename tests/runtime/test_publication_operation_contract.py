@@ -1574,8 +1574,13 @@ def test_changed_checkpoint_snapshot_is_rejected_before_recovery_claim(
             "reconcile_checkpoint_object_payloads",
             observe_replay,
         )
+        expected_error = (
+            "cannot validate persisted Windows checkpoint identities"
+            if os.name == "nt"
+            else "snapshot changed"
+        )
         for _attempt in range(2):
-            with pytest.raises(ValidationError, match="snapshot changed"):
+            with pytest.raises(ValidationError, match=expected_error):
                 Runtime.open(target, config=config)
             durable = open_store(target, config=config)
             try:

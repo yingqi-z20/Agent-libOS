@@ -654,6 +654,7 @@ class FilesystemAdapter:
         intent: dict[str, Any] = {}
         mutation_attempted = False
         missing_parent_paths: list[str] = []
+        write_target = plan.target
 
         def prepare() -> None:
             intent["record"] = self._record_mutation_intent(
@@ -669,7 +670,7 @@ class FilesystemAdapter:
         def write_provider() -> None:
             nonlocal mutation_attempted
             mutation_attempted = True
-            self._provider_write_text(plan)
+            self._provider_write_text(plan, write_target)
 
         def settle_ambiguous_write(error: BaseException, _phase: str) -> None:
             if not mutation_attempted or isinstance(error, ProviderEffectNotStarted):
@@ -725,6 +726,17 @@ class FilesystemAdapter:
                 "primitive.filesystem.write_text", invocation, provider=self.provider
             ) as protected,
         ):
+            # Authorization precedes the label lock. Refresh the provider
+            # identity after acquiring it so a serialized delete/create may
+            # safely rebind, without changing the authorized path resource.
+            write_target = self.provider.resolve(plan.relative)
+            if (
+                write_target.relative != plan.relative
+                or self.resource_for(write_target.relative) != plan.resource
+            ):
+                raise CapabilityDenied(
+                    "filesystem write resource changed after authorization"
+                )
             target_state = protected.call(
                 ProviderPhase(
                     "state",
@@ -736,7 +748,7 @@ class FilesystemAdapter:
                     commits_authority=plan.expected_content_sha256 is None,
                 ),
                 self.provider.state,
-                plan.target,
+                write_target,
             )
             created = not target_state.exists
             plan.effect_context.update({"created": created, "state_observed": True})
@@ -829,11 +841,15 @@ class FilesystemAdapter:
             )
             return completed
 
-    def _provider_write_text(self, plan: _TextWritePlan) -> None:
+    def _provider_write_text(
+        self,
+        plan: _TextWritePlan,
+        target: ResolvedPath,
+    ) -> None:
         provider = plan.compare_and_swap_provider
         if provider is None:
             self.provider.write_text(
-                plan.target,
+                target,
                 plan.text,
                 encoding=plan.encoding,
                 newline="\n",
@@ -844,7 +860,7 @@ class FilesystemAdapter:
         if expected_content_sha256 is None:
             raise RuntimeError("filesystem CAS write plan is missing its precondition")
         provider.write_text_compare_and_swap(
-            plan.target,
+            target,
             plan.text,
             encoding=plan.encoding,
             newline="\n",

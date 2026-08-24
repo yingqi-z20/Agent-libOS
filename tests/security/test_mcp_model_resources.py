@@ -836,7 +836,9 @@ def test_runtime_model_resources_enforce_authority_allowlist_and_safe_projection
     secret = "opaque-resource-credential-92f8"
     monkeypatch.setenv("AGENT_LIBOS_MCP_RESOURCE_TOKEN", secret)
     provider = _RuntimeResourceProvider(secret)
-    substrate = LocalResourceProviderSubstrate(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    substrate = LocalResourceProviderSubstrate(workspace)
     substrate.mcp_resource_provider = provider
     database = tmp_path / "mcp-model-resource.sqlite"
     runtime = Runtime.open(database, substrate=substrate)

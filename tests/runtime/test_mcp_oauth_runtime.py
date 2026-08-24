@@ -70,7 +70,9 @@ def _manifest() -> McpServerManifestV3:
 
 
 def _substrate(root: Path, broker: InMemoryMcpCredentialBroker, transport: object):
-    selected = LocalResourceProviderSubstrate(root)
+    workspace = root / "workspace"
+    workspace.mkdir(exist_ok=True)
+    selected = LocalResourceProviderSubstrate(workspace)
     selected.mcp_credential_broker = broker
     selected.mcp_oauth_transport = transport
     return selected

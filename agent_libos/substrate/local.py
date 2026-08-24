@@ -408,7 +408,7 @@ if os.name == "nt":
     _PROCESS_TERMINATE = 0x0001
     _PROCESS_SET_QUOTA = 0x0100
     _DELETE = 0x00010000
-    _FILE_READ_ATTRIBUTES = 0x00000080
+    _GENERIC_READ = 0x80000000
     _FILE_SHARE_READ = 0x00000001
     _OPEN_EXISTING = 3
     _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -514,9 +514,11 @@ class _WindowsDirectoryGuard:
     ) -> "_WindowsDirectoryGuard":
         if os.name != "nt":
             raise OSError("Windows directory guards are only available on Windows")
+        # Attribute-only access is exempt from CreateFile sharing checks and
+        # therefore cannot pin the guarded entry against reparse mutation.
         handle = _kernel32.CreateFileW(
             os.fspath(path),
-            _FILE_READ_ATTRIBUTES if desired_access is None else desired_access,
+            _GENERIC_READ if desired_access is None else desired_access,
             _FILE_SHARE_READ,
             None,
             _OPEN_EXISTING,
@@ -1487,16 +1489,16 @@ class LocalFilesystemProvider:
                     ),
                 )
         except FileExistsError:
-            if windows_identity is not None and not windows_identity.target_exists:
-                raise CapabilityDenied(
-                    "missing Windows filesystem target appeared after authorization"
-                ) from None
             if expected_missing:
                 raise FilesystemContentConflict(
                     "filesystem content changed before compare-and-swap write"
                 ) from None
             if not overwrite:
                 raise
+            if windows_identity is not None and not windows_identity.target_exists:
+                raise CapabilityDenied(
+                    "missing Windows filesystem target appeared after authorization"
+                ) from None
             fd = self._open_under_root(
                 target,
                 os.O_WRONLY,
@@ -1689,7 +1691,7 @@ class LocalFilesystemProvider:
             self._target(path)
             target_guard = _WindowsDirectoryGuard.open(
                 target,
-                desired_access=_FILE_READ_ATTRIBUTES | _DELETE,
+                desired_access=_GENERIC_READ | _DELETE,
             )
             try:
                 self._windows_verify_handle_binding(
@@ -1766,7 +1768,7 @@ class LocalFilesystemProvider:
             self._target(path)
             target_guard = _WindowsDirectoryGuard.open(
                 target,
-                desired_access=_FILE_READ_ATTRIBUTES | _DELETE,
+                desired_access=_GENERIC_READ | _DELETE,
             )
             try:
                 self._windows_verify_handle_binding(
@@ -2570,7 +2572,7 @@ class LocalFilesystemProvider:
         guards = [root_guard]
         try:
             if not relative_parts:
-                if desired_access not in {None, _FILE_READ_ATTRIBUTES}:
+                if desired_access not in {None, _GENERIC_READ}:
                     raise CapabilityDenied(
                         "Windows filesystem adapter root cannot be mutated"
                     )
@@ -2975,7 +2977,7 @@ class LocalFilesystemProvider:
         try:
             guard = _WindowsDirectoryGuard.open(
                 target,
-                desired_access=_FILE_READ_ATTRIBUTES | _DELETE,
+                desired_access=_GENERIC_READ | _DELETE,
             )
         except OSError as exc:
             raise CapabilityDenied(

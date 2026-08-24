@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from agent_libos import Runtime
 from agent_libos.models import CapabilityRight, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus
+from agent_libos.models.exceptions import CapabilityDenied
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import CommandResult, LocalFilesystemProvider, LocalResourceProviderSubstrate
 from tests.support.public_errors import assert_public_error_message
@@ -337,6 +338,27 @@ class TestProcessWorkingDirectory:
                     forbidden=('outside-link', str(outside_target)),
                 )
                 assert provider.state_calls == []
+
+                if os.name == 'nt':
+                    for path, target_name in (
+                        ('inside-link', 'private-target'),
+                        ('outside-link', 'outside-target'),
+                    ):
+                        with pytest.raises(
+                            CapabilityDenied,
+                            match='reparse point',
+                        ) as denied:
+                            runtime.filesystem.grant_directory(
+                                pid,
+                                path,
+                                [CapabilityRight.READ],
+                                issued_by='test',
+                            )
+                        assert target_name not in str(denied.value)
+                    assert provider.state_calls == []
+                    assert runtime.store.list_external_effects(pid=pid) == []
+                    assert runtime.process.working_directory(pid) == '.'
+                    return
 
                 runtime.filesystem.grant_directory(pid, 'inside-link', [CapabilityRight.READ], issued_by='test')
                 runtime.filesystem.grant_directory(pid, 'outside-link', [CapabilityRight.READ], issued_by='test')

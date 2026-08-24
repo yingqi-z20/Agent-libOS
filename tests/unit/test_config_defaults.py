@@ -47,6 +47,12 @@ from agent_libos.models import (
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import SQLiteStore, display_store_target, open_store, redact_store_target
 
+
+def _set_user_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+
 class TestConfigDefaults:
 
     def test_jit_validation_default_allows_cold_deno_startup(self) -> None:
@@ -1658,7 +1664,7 @@ class TestConfigDefaults:
         workspace = tmp_path / "workspace"
         home.mkdir()
         workspace.mkdir()
-        monkeypatch.setenv("HOME", str(home))
+        _set_user_home(monkeypatch, home)
         monkeypatch.chdir(workspace)
         expected = home / ".agent-libos" / "runtime" / "agent-libos.sqlite"
 

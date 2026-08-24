@@ -773,7 +773,9 @@ def _substrate(
     *,
     tool_provider: Any | None = None,
 ) -> LocalResourceProviderSubstrate:
-    selected = LocalResourceProviderSubstrate(root)
+    workspace = root / "workspace"
+    workspace.mkdir(exist_ok=True)
+    selected = LocalResourceProviderSubstrate(workspace)
     selected.mcp_credential_broker = broker
     selected.mcp_continuation_provider = continuation_provider
     selected.mcp_tasks_provider = tasks_provider

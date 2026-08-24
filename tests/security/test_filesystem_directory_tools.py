@@ -1234,7 +1234,7 @@ class TestFilesystemDirectoryTool:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='mkdir reparse race')
                 runtime.filesystem.grant_directory(pid, 'dir/created', [CapabilityRight.WRITE], issued_by='test')
 
-                with pytest.raises(CapabilityDenied, match='symlink|junction|escapes filesystem adapter root'):
+                with pytest.raises(CapabilityDenied, match='symlink|junction|reparse point|escapes filesystem adapter root'):
                     runtime.filesystem.write_directory(pid, 'dir/created', parents=True)
 
                 assert provider.swapped
@@ -1253,7 +1253,7 @@ class TestFilesystemDirectoryTool:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='write parent reparse race')
                 runtime.filesystem.grant_path(pid, 'dir/nested/payload.txt', [CapabilityRight.WRITE], issued_by='test')
 
-                with pytest.raises(CapabilityDenied, match='symlink|junction|escapes filesystem adapter root'):
+                with pytest.raises(CapabilityDenied, match='symlink|junction|reparse point|escapes filesystem adapter root'):
                     runtime.filesystem.write_text(pid, 'dir/nested/payload.txt', 'escaped')
 
                 assert provider.swapped
@@ -1275,7 +1275,7 @@ class TestFilesystemDirectoryTool:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='list reparse race')
                 runtime.filesystem.grant_directory(pid, 'dir', [CapabilityRight.READ], issued_by='test')
 
-                with pytest.raises(CapabilityDenied, match='symlink|junction|escapes filesystem adapter root|path changed'):
+                with pytest.raises(CapabilityDenied, match='symlink|junction|reparse point|escapes filesystem adapter root|path changed'):
                     runtime.filesystem.read_directory(pid, 'dir')
 
                 assert provider.swapped
@@ -1318,7 +1318,7 @@ class TestFilesystemDirectoryTool:
 
                 with pytest.raises(
                     CapabilityDenied,
-                    match='symlink|junction|escapes filesystem adapter root|path changed during delete',
+                    match='symlink|junction|reparse point|escapes filesystem adapter root|path changed during delete',
                 ):
                     runtime.filesystem.delete_file(pid, 'dir/victim.txt')
 
@@ -1344,7 +1344,7 @@ class TestFilesystemDirectoryTool:
 
                 with pytest.raises(
                     CapabilityDenied,
-                    match='symlink|junction|escapes filesystem adapter root|path changed during delete',
+                    match='symlink|junction|reparse point|escapes filesystem adapter root|path changed during delete',
                 ):
                     runtime.filesystem.delete_directory(pid, 'dir/victim', recursive=True)
 
@@ -1369,7 +1369,7 @@ class TestFilesystemDirectoryTool:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='fallback open reparse race')
                 runtime.filesystem.grant_path(pid, 'dir/victim.txt', [CapabilityRight.WRITE], issued_by='test')
 
-                with pytest.raises(CapabilityDenied, match='opened path changed|escapes filesystem adapter root|symlink|junction'):
+                with pytest.raises(CapabilityDenied, match='opened path changed|escapes filesystem adapter root|symlink|junction|reparse point'):
                     runtime.filesystem.write_text(pid, 'dir/victim.txt', 'changed')
 
                 assert provider.swap_attempted

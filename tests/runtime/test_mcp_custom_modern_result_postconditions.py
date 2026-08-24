@@ -48,6 +48,12 @@ from agent_libos.utils.serde import dumps, to_jsonable
 _TASKS_PIN = "9" * 64
 
 
+def _substrate(root: Path) -> LocalResourceProviderSubstrate:
+    workspace = root / "workspace"
+    workspace.mkdir(exist_ok=True)
+    return LocalResourceProviderSubstrate(workspace)
+
+
 class _ResourceProvider:
     mcp_manifest_schema_version = 3
     mcp_protocol_revision = "2026-07-28"
@@ -252,7 +258,7 @@ def test_custom_resource_cannot_publish_unbacked_input_required(
 ) -> None:
     forged_ref = "forged-resource-continuation"
     database = tmp_path / "custom-resource.sqlite"
-    substrate = LocalResourceProviderSubstrate(tmp_path)
+    substrate = _substrate(tmp_path)
     substrate.mcp_resource_provider = _ResourceProvider(
         McpInputRequired(continuation_id=forged_ref)
     )
@@ -280,7 +286,7 @@ def test_custom_tool_cannot_publish_unbacked_input_required(
 ) -> None:
     forged_ref = "forged-tool-continuation"
     database = tmp_path / "custom-tool.sqlite"
-    substrate = LocalResourceProviderSubstrate(tmp_path)
+    substrate = _substrate(tmp_path)
     provider = _ToolProvider(McpInputRequired(continuation_id=forged_ref))
     substrate.mcp_v3_tool_provider = provider
     runtime = Runtime.open(database, substrate=substrate)
@@ -332,7 +338,7 @@ def test_typed_sampling_unsupported_is_public_but_never_durable(
         ),
         respondable=False,
     )
-    substrate = LocalResourceProviderSubstrate(tmp_path)
+    substrate = _substrate(tmp_path)
     provider = _ToolProvider(unsupported)
     substrate.mcp_v3_tool_provider = provider
     runtime = Runtime.open(database, substrate=substrate)
@@ -398,7 +404,7 @@ def test_custom_tool_exception_redacts_active_header_secret_for_runtime_and_cli(
     env_name = "AGENT_LIBOS_MCP_CUSTOM_MODERN_SECRET"
     monkeypatch.setenv(env_name, secret)
     database = tmp_path / "custom-tool-error.sqlite"
-    substrate = LocalResourceProviderSubstrate(tmp_path)
+    substrate = _substrate(tmp_path)
     provider = _RaisingToolProvider()
     substrate.mcp_v3_tool_provider = provider
     runtime = Runtime.open(database, substrate=substrate)
@@ -483,7 +489,7 @@ def test_custom_prompt_cannot_publish_unbacked_remote_task_even_when_pinned(
 ) -> None:
     forged_ref = "forged-prompt-task"
     database = tmp_path / "custom-prompt.sqlite"
-    substrate = LocalResourceProviderSubstrate(tmp_path)
+    substrate = _substrate(tmp_path)
     substrate.mcp_prompt_provider = _PromptProvider(
         prompt_result=McpRemoteTask(task_ref=forged_ref),
         completion_result=McpComplete(value=McpCompletionResult(values=("ok",))),
@@ -513,7 +519,7 @@ def test_custom_completion_cannot_bypass_nonrespondable_surface(
 ) -> None:
     forged_ref = "forged-completion-continuation"
     database = tmp_path / "custom-completion.sqlite"
-    substrate = LocalResourceProviderSubstrate(tmp_path)
+    substrate = _substrate(tmp_path)
     substrate.mcp_prompt_provider = _PromptProvider(
         prompt_result=McpComplete(
             value=McpPromptResult(prompt_id="review", messages=())
@@ -554,7 +560,7 @@ def test_custom_completion_rejects_apps_values_before_public_sinks(
     apps_value: str,
 ) -> None:
     database = tmp_path / "custom-completion-apps.sqlite"
-    substrate = LocalResourceProviderSubstrate(tmp_path)
+    substrate = _substrate(tmp_path)
     substrate.mcp_prompt_provider = _PromptProvider(
         prompt_result=McpComplete(
             value=McpPromptResult(prompt_id="review", messages=())

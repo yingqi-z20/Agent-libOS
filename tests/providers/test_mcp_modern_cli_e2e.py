@@ -305,7 +305,9 @@ def test_oauth_foreground_login_rehydrates_in_fresh_cli_runtime_and_resources(
         **kwargs: Any,
     ) -> Runtime:
         assert substrate is None
-        selected = LocalResourceProviderSubstrate(tmp_path)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir(exist_ok=True)
+        selected = LocalResourceProviderSubstrate(workspace)
         selected.mcp_credential_broker = broker
         selected.mcp_oauth_transport = transport
         return real_open(target, substrate=selected, config=config, **kwargs)

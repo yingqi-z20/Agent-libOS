@@ -117,9 +117,11 @@ def test_gui_mcp_continuation_inspect_survives_runtime_reopen(
 
     database = tmp_path / "gui-mcp-continuation-reopen.sqlite"
     broker = InMemoryMcpCredentialBroker()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
 
     def substrate() -> LocalResourceProviderSubstrate:
-        selected = LocalResourceProviderSubstrate(tmp_path)
+        selected = LocalResourceProviderSubstrate(workspace)
         selected.mcp_credential_broker = broker
         return selected
 
@@ -235,6 +237,8 @@ def test_gui_mcp_task_get_recovers_nonzero_revision_after_runtime_reopen(
     database = tmp_path / "gui-mcp-task-reopen.sqlite"
     broker = InMemoryMcpCredentialBroker()
     provider = TasksProvider()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     config = AgentLibOSConfig(
         mcp=replace(
             DEFAULT_CONFIG.mcp,
@@ -245,7 +249,7 @@ def test_gui_mcp_task_get_recovers_nonzero_revision_after_runtime_reopen(
     )
 
     def substrate() -> LocalResourceProviderSubstrate:
-        selected = LocalResourceProviderSubstrate(tmp_path)
+        selected = LocalResourceProviderSubstrate(workspace)
         selected.mcp_credential_broker = broker
         selected.mcp_tasks_provider = provider
         return selected

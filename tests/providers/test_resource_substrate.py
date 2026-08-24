@@ -34,6 +34,7 @@ class TestResourceProviderSubstrate:
             "utf-8",
             expected_content_sha256="missing",
         )
+        target = provider.resolve("document.txt")
         first_digest = hashlib.sha256(b"first").hexdigest()
         provider.write_text_compare_and_swap(
             target,

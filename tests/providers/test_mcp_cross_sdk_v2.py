@@ -39,6 +39,17 @@ RESOURCE_URI = "fixture://document/current"
 TASKS_SCHEMA = ROOT / "tests" / "fixtures" / "mcp_sdk_v2" / "tasks_extension_schema.json"
 
 
+def _substrate(
+    root: Path,
+    broker: InMemoryMcpCredentialBroker,
+) -> LocalResourceProviderSubstrate:
+    workspace = root / "workspace"
+    workspace.mkdir(exist_ok=True)
+    substrate = LocalResourceProviderSubstrate(workspace)
+    substrate.mcp_credential_broker = broker
+    return substrate
+
+
 @pytest.mark.parametrize("fixture", ("python-sdk-v2", "typescript-sdk-v2"))
 def test_real_sdk_v2_resources_and_prompts_use_runtime_protected_path(
     fixture: str,
@@ -254,8 +265,7 @@ def test_real_sdk_v2_task_subscription_projects_only_local_refs(
         )
     )
     broker = InMemoryMcpCredentialBroker()
-    substrate = LocalResourceProviderSubstrate(tmp_path)
-    substrate.mcp_credential_broker = broker
+    substrate = _substrate(tmp_path, broker)
     runtime = Runtime.open(":memory:", substrate=substrate, config=config)
     subscription_id: str | None = None
     try:
@@ -381,8 +391,7 @@ def test_real_sdk_v2_tasks_use_runtime_store_human_and_reopen_path(
         )
     )
     broker = InMemoryMcpCredentialBroker()
-    substrate = LocalResourceProviderSubstrate(tmp_path)
-    substrate.mcp_credential_broker = broker
+    substrate = _substrate(tmp_path, broker)
     database = tmp_path / f"{fixture}-runtime.sqlite"
     manifest = _runtime_manifest(
         fixture,
@@ -451,8 +460,7 @@ def test_real_sdk_v2_tasks_use_runtime_store_human_and_reopen_path(
     stored = database.read_bytes()
     assert all(remote_id.encode("utf-8") not in stored for remote_id in private_ids)
 
-    reopened_substrate = LocalResourceProviderSubstrate(tmp_path)
-    reopened_substrate.mcp_credential_broker = broker
+    reopened_substrate = _substrate(tmp_path, broker)
     reopened = Runtime.open(database, substrate=reopened_substrate, config=config)
     try:
         awaiting = reopened.mcp.get_remote_task(

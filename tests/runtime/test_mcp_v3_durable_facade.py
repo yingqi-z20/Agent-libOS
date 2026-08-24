@@ -552,7 +552,9 @@ class _ResourcePromptContinuationProvider:
 
 
 def _substrate(root: Path, broker: InMemoryMcpCredentialBroker) -> Any:
-    substrate = LocalResourceProviderSubstrate(root)
+    workspace = root / "workspace"
+    workspace.mkdir(exist_ok=True)
+    substrate = LocalResourceProviderSubstrate(workspace)
     substrate.mcp_credential_broker = broker
     return substrate
 
