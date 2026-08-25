@@ -7,9 +7,13 @@ This is the exhaustive command and argument inventory for the checked-in
 use the [CLI Guide](cli.md). Defaults shown here are parser defaults; effective
 Runtime settings may additionally come from `DEFAULT_CONFIG`, `config.yaml`, or
 an explicit `--config` overlay as described in the
-[Configuration Guide](configuration.md). Usage wrapping and metavars are
-normalized across supported Python versions; every accepted option alias is
-listed in the Arguments tables.
+[Configuration Guide](configuration.md). For flags that store a constant
+(including inverse-named flags such as `--optional` and `--flag/--no-flag`
+pairs sharing one destination), the Default column shows `name=value`: the
+parser destination the flag writes and that destination's effective value when
+the flag is absent; passing the flag stores the flag's constant instead.
+Usage wrapping and metavars are normalized across supported Python versions;
+every accepted option alias is listed in the Arguments tables.
 
 [documentation home](index.md)
 
@@ -62,7 +66,7 @@ usage: agent-libos [-h] [--config CONFIG] [--db DB] [--module-manifest MODULE_MA
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
 | `--config CONFIG` | no | `None` | YAML config overlay. Defaults to the project-root config.yaml when present. |
-| `--db DB` | no | `None` | Runtime store target. 'user' uses the persistent per-user SQLite store; paths use file SQLite; local/:memory:/sqlite:// use in-memory SQLite; postgresql:// DSNs use PostgreSQL. If omitted, uses the selected config runtime store settings (default 'user' is persistent SQLite). |
+| `--db DB` | no | `None` | Runtime store target. 'user' uses the persistent per-user SQLite store; paths use file SQLite; 'local', ':memory:', and a bare 'sqlite://' use in-memory SQLite; a 'sqlite://' URI with a path selects that SQLite file; postgresql:// DSNs use PostgreSQL. If omitted, uses the selected config runtime store settings (default 'user' is persistent SQLite). |
 | `--module-manifest MODULE_MANIFEST` | no | `[]` | Trusted startup module manifest to load before the runtime is used. May be passed multiple times. |
 | `--trusted-module TRUSTED_MODULE` | no | `[]` | Trusted startup module entry in the form '<module_id>:<manifest_sha256>:<source_sha256>'. Use the trust_key from `modules verify`. |
 | `--trusted-module-sha256 TRUSTED_MODULE_SHA256` | no | `[]` | Trusted startup module digest pair in the form '<manifest_sha256>:<source_sha256>', regardless of module id. Intended for local development only. |
@@ -338,13 +342,13 @@ usage: agent-libos payload-retention [-h] {llm_call,external_effect} [--apply]
 | Syntax | Required | Default | Description |
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
-| `{llm_call,external_effect}` | yes | `None` | — |
-| `--apply` | no | `False` | Apply the page; the default is a non-mutating dry run. |
-| `--limit LIMIT` | no | `None` | — |
-| `--after-created-at AFTER_CREATED_AT` | no | `None` | — |
-| `--after-record-id AFTER_RECORD_ID` | no | `None` | — |
-| `--actor ACTOR` | no | `'host.retention'` | — |
-| `--correlation-id CORRELATION_ID` | no | `None` | — |
+| `{llm_call,external_effect}` | yes | `None` | Which bounded payload-retention page kind to preview or apply. |
+| `--apply` | no | `apply=False` | Apply the page; the default is a non-mutating dry run. |
+| `--limit LIMIT` | no | `None` | Maximum rows in the page; bounded by the policy hard limit. |
+| `--after-created-at AFTER_CREATED_AT` | no | `None` | Opaque keyset cursor: created-at timestamp from the preceding page. |
+| `--after-record-id AFTER_RECORD_ID` | no | `None` | Opaque keyset cursor: record id from the preceding page. |
+| `--actor ACTOR` | no | `'host.retention'` | Actor recorded for the retention operation; defaults to host.retention. |
+| `--correlation-id CORRELATION_ID` | no | `None` | Correlation id recorded for the retention operation. |
 
 ## `agent-libos processes`
 
@@ -474,12 +478,12 @@ usage: agent-libos object-task start [-h] --pid PID
 | `--notify-pid NOTIFY_PID` | no | `None` | Process to notify; defaults to --pid. |
 | `--notify-kind {normal,interrupt}` | no | `'normal'` | — |
 | `--notify-channel NOTIFY_CHANNEL` | no | `None` | Process-message channel; defaults to object-task. |
-| `--watch-owner` | no | `False` | Notify the runner process when the owner object is updated or linked. |
+| `--watch-owner` | no | `watch_owner=False` | Notify the runner process when the owner object is updated or linked. |
 | `--watch-events WATCH_EVENTS` | no | `[]` | Owner events to watch, comma-separated or repeated. Defaults to updated,linked when --watch-owner is set. |
 | `--watch-channel WATCH_CHANNEL` | no | `None` | Runner message channel for owner-watch notices; defaults to object-task-owner. |
 | `--watch-kind {normal,interrupt}` | no | `'normal'` | — |
-| `--grant-result-to-notify` | no | `False` | Try to grant result read authority to notify pid; requires object grant authority. |
-| `--wait` | yes | `False` | Required by the one-shot CLI; wait until the task reaches a terminal or explicit waiting state before printing. |
+| `--grant-result-to-notify` | no | `grant_result_to_notify=False` | Try to grant result read authority to notify pid; requires object grant authority. |
+| `--wait` | yes | `wait=False` | Required by the one-shot CLI; wait until the task reaches a terminal or explicit waiting state before printing. |
 | `--timeout TIMEOUT` | no | `None` | Optional wait timeout in seconds. |
 
 ## `agent-libos object-task get`
@@ -510,7 +514,7 @@ usage: agent-libos object-task list [-h] [--pid PID] [--owner-oid OWNER_OID] [--
 | `-h, --help` | no | — | show this help message and exit |
 | `--pid PID` | no | `None` | Actor process id for visibility checks. |
 | `--owner-oid OWNER_OID` | no | `None` | Filter by owner object id. |
-| `--active` | no | `False` | Only include non-terminal tasks. |
+| `--active` | no | `active=False` | Only include non-terminal tasks. |
 | `--limit LIMIT` | no | `None` | — |
 
 ## `agent-libos object-task cancel`
@@ -559,7 +563,7 @@ usage: agent-libos object-task watch-owner [-h] task_id --pid PID [--disable]
 | `-h, --help` | no | — | show this help message and exit |
 | `task_id` | yes | `None` | — |
 | `--pid PID` | yes | `None` | Actor process id. |
-| `--disable` | no | `False` | Disable owner-change notices. |
+| `--disable` | no | `disable=False` | Disable owner-change notices. |
 | `--watch-events WATCH_EVENTS` | no | `[]` | Owner events to watch, comma-separated or repeated. |
 | `--watch-channel WATCH_CHANNEL` | no | `None` | Runner message channel for owner-watch notices. |
 | `--watch-kind {normal,interrupt}` | no | `None` | — |
@@ -621,7 +625,7 @@ usage: agent-libos task-run start [-h] (--goal GOAL | --goal-json GOAL_JSON)
 | `--deadline-at DEADLINE_AT` | no | `None` | Optional absolute wall-clock deadline timestamp. |
 | `--retention {purge_on_terminal,permanent}` | no | `'purge_on_terminal'` | Durable payload retention policy; permanent is Host/admin only. |
 | `--client-request-id CLIENT_REQUEST_ID` | no | `None` | Stable client request id for create idempotency; omitted generates one. |
-| `--run` | no | `False` | After creation, run until the run blocks, finishes, or exhausts --max-quanta. |
+| `--run` | no | `run=False` | After creation, run until the run blocks, finishes, or exhausts --max-quanta. |
 | `--run-command-id RUN_COMMAND_ID` | no | `None` | Stable command id for the separate --run mutation. |
 | `--max-quanta MAX_QUANTA` | no | `None` | Optional scheduler quantum budget used only with --run. |
 
@@ -650,7 +654,7 @@ usage: agent-libos task-run list [-h] [--status STATUSES] [--cursor CURSOR]
 | Syntax | Required | Default | Description |
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
-| `--status STATUSES` | no | `[]` | Filter status, comma-separated or repeated. |
+| `--status STATUSES` | no | `[]` | Filter status, comma-separated or repeated. Valid values: queued, running, waiting_human, waiting_process, waiting_message, waiting_tool, paused, cancelling, finalizing, needs_attention, succeeded, failed, cancelled. |
 | `--cursor CURSOR` | no | `None` | Opaque keyset cursor from the preceding page. |
 | `--limit LIMIT` | no | `100` | Page size from 1 through 500. |
 
@@ -728,7 +732,7 @@ usage: agent-libos task-run cancel [-h] run_id [--reason REASON] --confirm
 | `-h, --help` | no | — | show this help message and exit |
 | `run_id` | yes | `None` | — |
 | `--reason REASON` | no | `None` | — |
-| `--confirm` | yes | `False` | Confirm durable cancellation and descendant termination. |
+| `--confirm` | yes | `confirm=False` | Confirm durable cancellation and descendant termination. |
 | `--expected-revision EXPECTED_REVISION` | yes | `None` | Revision last observed by this client; stale revisions are rejected. |
 | `--command-id COMMAND_ID` | no | `None` | Stable idempotency id; omitted generates one for this invocation. |
 
@@ -750,8 +754,8 @@ usage: agent-libos task-run follow-up [-h] run_id [content] [--content CONTENT_O
 | `[content]` | no | `None` | Follow-up requirement text; alternatively use --content or --content-json. |
 | `--content CONTENT_OPTION` | no | `None` | Follow-up requirement text. |
 | `--content-json CONTENT_JSON` | no | `None` | Follow-up requirement as strict JSON. |
-| `--interrupt` | no | `False` | Also interrupt the active root process after durably recording the requirement. |
-| `--optional` | no | `True` | Record the follow-up without making it a required success condition. |
+| `--interrupt` | no | `interrupt=False` | Also interrupt the active root process after durably recording the requirement. |
+| `--optional` | no | `required=True` | Record the follow-up without making it a required success condition. |
 | `--expected-revision EXPECTED_REVISION` | yes | `None` | Revision last observed by this client; stale revisions are rejected. |
 | `--command-id COMMAND_ID` | no | `None` | Stable idempotency id; omitted generates one for this invocation. |
 
@@ -773,7 +777,7 @@ usage: agent-libos task-run recover [-h] run_id [option] [--option OPTION_FLAG]
 | `[option]` | no | `None` | Exact recovery option returned by the server; alternatively use --option. |
 | `--option OPTION_FLAG` | no | `None` | Exact server-provided recovery option. |
 | `--receipt-json, --evidence-json RECEIPT_JSON` | no | `None` | Optional authoritative receipt as a strict JSON object. |
-| `--confirm` | yes | `False` | Confirm the selected evidence-backed recovery action. |
+| `--confirm` | yes | `confirm=False` | Confirm the selected evidence-backed recovery action. |
 | `--expected-revision EXPECTED_REVISION` | yes | `None` | Revision last observed by this client; stale revisions are rejected. |
 | `--command-id COMMAND_ID` | no | `None` | Stable idempotency id; omitted generates one for this invocation. |
 
@@ -847,12 +851,12 @@ usage: agent-libos exec [-h] image goal --pid PID [--llm-profile LLM_PROFILE]
 | `goal` | yes | `None` | Replacement process goal. |
 | `--pid PID` | yes | `None` | Process id to exec. |
 | `--llm-profile LLM_PROFILE` | no | `None` | Optional host-selected LLM profile id for the existing process. |
-| `--replace-image` | no | `False` | Allow an image package to replace an existing image id. |
+| `--replace-image` | no | `replace_image=False` | Allow an image package to replace an existing image id. |
 | `--args-json ARGS_JSON` | no | `'{}'` | JSON object recorded as structured exec args. |
 | `--preserve-memory, --no-preserve-memory` | no | `True` | Keep the current MemoryView across exec. Use --no-preserve-memory to replace it with the new goal only. |
-| `--preserve-capabilities` | no | `False` | Keep existing external capabilities. Exec never grants target image required_capabilities automatically. |
-| `--run` | no | `False` | Run the scheduler after exec. |
-| `--no-run` | no | `True` | Only apply exec; do not run the scheduler. |
+| `--preserve-capabilities` | no | `preserve_capabilities=False` | Keep existing external capabilities. Exec never grants target image required_capabilities automatically. |
+| `--run` | no | `run=False` | Run the scheduler after exec. |
+| `--no-run` | no | `run=False` | Only apply exec; do not run the scheduler. |
 | `--max-quanta MAX_QUANTA` | no | `None` | Optional quantum budget when --run is set; omitted uses runtime.run_until_idle_max_quanta (which may be unbounded). |
 
 ## `agent-libos exit`
@@ -871,7 +875,7 @@ usage: agent-libos exit [-h] pid [--message MESSAGE] [--payload PAYLOAD]
 | `--message MESSAGE` | no | `None` | Optional final message stored in a label-bearing process-result Object. |
 | `--payload PAYLOAD` | no | `None` | Optional JSON final-result payload. Non-JSON text is wrapped as content. |
 | `--result-oid RESULT_OID` | no | `None` | Existing object id to use as process result. |
-| `--failed` | no | `False` | Mark the process as failed instead of exited. |
+| `--failed` | no | `failed=False` | Mark the process as failed instead of exited. |
 
 ## `agent-libos llm-once`
 
@@ -899,7 +903,7 @@ usage: agent-libos run [-h] [--max-quanta MAX_QUANTA] [--interactive] [--pid PID
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
 | `--max-quanta MAX_QUANTA` | no | `None` | Optional quantum budget; omitted uses runtime.run_until_idle_max_quanta (which may be unbounded). |
-| `--interactive` | no | `False` | Read human input while running and post it as process messages. |
+| `--interactive` | no | `interactive=False` | Read human input while running and post it as process messages. |
 | `--pid PID` | no | `None` | Default target process for interactive human messages. |
 | `--human HUMAN` | no | `None` | Human actor name for interactive messages. |
 | `--message-channel MESSAGE_CHANNEL` | no | `'human'` | Process-message channel for interactive human input. |
@@ -922,14 +926,14 @@ usage: agent-libos message [-h] pid body [--kind {normal,interrupt}] [--interrup
 | `pid` | yes | `None` | Target process id. |
 | `body` | yes | `None` | Message body. Quote it to include spaces. |
 | `--kind {normal,interrupt}` | no | `'normal'` | — |
-| `--interrupt` | no | `False` | Shortcut for --kind interrupt. |
+| `--interrupt` | no | `interrupt=False` | Shortcut for --kind interrupt. |
 | `--human HUMAN` | no | `None` | Human actor name. |
 | `--channel CHANNEL` | no | `'human'` | Process-message channel. |
 | `--subject SUBJECT` | no | `None` | Short message subject. |
 | `--correlation-id CORRELATION_ID` | no | `None` | Optional conversation/request correlation id. |
 | `--reply-to REPLY_TO` | no | `None` | Optional message id this message replies to. |
 | `--payload-json PAYLOAD_JSON` | no | `'{}'` | Structured JSON object to include in the message payload. |
-| `--run` | no | `False` | Run the scheduler after posting the message. |
+| `--run` | no | `run=False` | Run the scheduler after posting the message. |
 | `--max-quanta MAX_QUANTA` | no | `None` | Optional quantum budget when --run is set; omitted uses runtime.run_until_idle_max_quanta (which may be unbounded). |
 
 ## `agent-libos interrupt`
@@ -954,7 +958,7 @@ usage: agent-libos interrupt [-h] pid body [--human HUMAN] [--channel CHANNEL]
 | `--correlation-id CORRELATION_ID` | no | `None` | Optional conversation/request correlation id. |
 | `--reply-to REPLY_TO` | no | `None` | Optional message id this message replies to. |
 | `--payload-json PAYLOAD_JSON` | no | `'{}'` | Structured JSON object to include in the message payload. |
-| `--run` | no | `False` | Run the scheduler after posting the message. |
+| `--run` | no | `run=False` | Run the scheduler after posting the message. |
 | `--max-quanta MAX_QUANTA` | no | `None` | Optional quantum budget when --run is set; omitted uses runtime.run_until_idle_max_quanta (which may be unbounded). |
 
 ## `agent-libos checkpoint`
@@ -1159,7 +1163,7 @@ usage: agent-libos skills register [-h] path [--replace]
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
 | `path` | yes | `None` | — |
-| `--replace` | no | `False` | — |
+| `--replace` | no | `replace=False` | — |
 | `--source-type {workspace,global,runtime}` | no | `None` | — |
 
 ## `agent-libos skills activate`
@@ -1256,7 +1260,7 @@ usage: agent-libos capabilities list [-h] [--subject SUBJECT] [--include-inactiv
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
 | `--subject SUBJECT` | no | `None` | Subject pid/name to list. Defaults to actor pid in process mode; all in admin mode. |
-| `--include-inactive` | no | `False` | — |
+| `--include-inactive` | no | `include_inactive=False` | — |
 | `--limit LIMIT` | no | `None` | — |
 
 ## `agent-libos capabilities inspect`
@@ -1292,9 +1296,9 @@ usage: agent-libos capabilities grant [-h] subject resource
 | `-h, --help` | no | — | show this help message and exit |
 | `subject` | yes | `None` | — |
 | `resource` | yes | `None` | — |
-| `--rights {read,write,execute,link,diff,materialize,delete,grant,revoke,approve,admin} [{read,write,execute,link,diff,materialize,delete,grant,revoke,approve,admin} ...]` | yes | `None` | — |
-| `--effect {allow,deny,ask}` | no | `'allow'` | — |
-| `--delegable` | no | `False` | — |
+| `--rights {read,write,execute,link,diff,materialize,delete,grant,revoke,approve,admin} [{read,write,execute,link,diff,materialize,delete,grant,revoke,approve,admin} ...]` | yes | `None` | One or more CapabilityRight values to grant or delegate. |
+| `--effect {allow,deny,ask}` | no | `'allow'` | Effect of the granted/delegated right; defaults to allow. |
+| `--delegable` | no | `delegable=False` | — |
 | `--revocable, --no-revocable` | no | `True` | — |
 | `--uses-remaining USES_REMAINING` | no | `None` | — |
 | `--expires-at EXPIRES_AT` | no | `None` | — |
@@ -1322,9 +1326,9 @@ usage: agent-libos capabilities delegate [-h] parent child resource
 | `parent` | yes | `None` | — |
 | `child` | yes | `None` | — |
 | `resource` | yes | `None` | — |
-| `--rights {read,write,execute,link,diff,materialize,delete,grant,revoke,approve,admin} [{read,write,execute,link,diff,materialize,delete,grant,revoke,approve,admin} ...]` | yes | `None` | — |
-| `--effect {allow,deny,ask}` | no | `'allow'` | — |
-| `--delegable` | no | `False` | — |
+| `--rights {read,write,execute,link,diff,materialize,delete,grant,revoke,approve,admin} [{read,write,execute,link,diff,materialize,delete,grant,revoke,approve,admin} ...]` | yes | `None` | One or more CapabilityRight values to grant or delegate. |
+| `--effect {allow,deny,ask}` | no | `'allow'` | Effect of the granted/delegated right; defaults to allow. |
+| `--delegable` | no | `delegable=False` | — |
 | `--revocable, --no-revocable` | no | `True` | — |
 | `--uses-remaining USES_REMAINING` | no | `None` | — |
 | `--expires-at EXPIRES_AT` | no | `None` | — |
@@ -1437,7 +1441,7 @@ usage: agent-libos images register [-h] path [--replace]
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
 | `path` | yes | `None` | — |
-| `--replace` | no | `False` | — |
+| `--replace` | no | `replace=False` | — |
 
 ## `agent-libos images commit`
 
@@ -1456,7 +1460,7 @@ usage: agent-libos images commit [-h] checkpoint_id image_id --name NAME
 | `image_id` | yes | `None` | — |
 | `--name NAME` | yes | `None` | — |
 | `--version VERSION` | no | `'v0'` | — |
-| `--replace` | no | `False` | — |
+| `--replace` | no | `replace=False` | — |
 | `--metadata-json METADATA_JSON` | no | `'{}'` | Optional image metadata JSON object. |
 
 ## `agent-libos jsonrpc`
@@ -1495,7 +1499,7 @@ usage: agent-libos jsonrpc register [-h] path [--replace]
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
 | `path` | yes | `None` | — |
-| `--replace` | no | `False` | — |
+| `--replace` | no | `replace=False` | — |
 
 ## `agent-libos jsonrpc list`
 
@@ -1608,7 +1612,7 @@ usage: agent-libos mcp register [-h] path [--replace]
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
 | `path` | yes | `None` | — |
-| `--replace` | no | `False` | — |
+| `--replace` | no | `replace=False` | — |
 
 ## `agent-libos mcp list`
 
@@ -1662,7 +1666,7 @@ usage: agent-libos mcp tools [-h] server_id [--refresh]
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
 | `server_id` | yes | `None` | — |
-| `--refresh` | no | `False` | Query the live MCP server for current tool metadata. |
+| `--refresh` | no | `refresh=False` | Query the live MCP server for current tool metadata. |
 
 ## `agent-libos mcp call`
 
@@ -1877,7 +1881,7 @@ usage: agent-libos mcp auth login [-h] profile_id --profile-file PROFILE_FILE
 | `--profile-file PROFILE_FILE` | yes | `None` | Bounded strict JSON for one pre-registered or CIMD Host profile. |
 | `--scope SCOPE` | no | `[]` | — |
 | `--client-secret-fd CLIENT_SECRET_FD` | no | `None` | Read a bounded client secret from this already-open file descriptor (fd >= 3); never accepts the secret as an argv value. |
-| `--callback-stdin` | no | `False` | Explicitly read one callback URL line from non-interactive stdin; without this flag stdin must be a TTY. |
+| `--callback-stdin` | no | `callback_stdin=False` | Explicitly read one callback URL line from non-interactive stdin; without this flag stdin must be a TTY. |
 
 ## `agent-libos mcp auth logout`
 
@@ -2069,7 +2073,7 @@ usage: agent-libos mcp subscriptions listen [-h] server_id --filter FILTER
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
 | `server_id` | yes | `None` | — |
-| `--filter FILTER` | yes | `None` | — |
+| `--filter FILTER` | yes | `None` | Subscription filter token; repeatable, must be declared in the server manifest. |
 | `--max-events MAX_EVENTS` | no | `None` | Optional positive bound for deterministic foreground completion. |
 | `--max-seconds MAX_SECONDS` | no | `None` | Optional positive foreground lifetime bound. |
 
@@ -2112,7 +2116,7 @@ usage: agent-libos mcp probe [-h] manifest [--confirm-probe] --reviewer REVIEWER
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
 | `manifest` | yes | `None` | — |
-| `--confirm-probe` | no | `False` | Explicitly confirm this Host operation after reviewing its scope. |
+| `--confirm-probe` | no | `mcp_confirmed=False` | Explicitly confirm this Host operation after reviewing its scope. |
 | `--reviewer REVIEWER` | yes | `None` | — |
 | `--reason REASON` | yes | `None` | — |
 
@@ -2150,7 +2154,7 @@ usage: agent-libos mcp scaffold create [-h] base_manifest catalog_json
 | `-h, --help` | no | — | show this help message and exit |
 | `base_manifest` | yes | `None` | — |
 | `catalog_json` | yes | `None` | — |
-| `--confirm-scaffold` | no | `False` | Explicitly confirm this Host operation after reviewing its scope. |
+| `--confirm-scaffold` | no | `mcp_confirmed=False` | Explicitly confirm this Host operation after reviewing its scope. |
 | `--reviewer REVIEWER` | yes | `None` | — |
 | `--reason REASON` | yes | `None` | — |
 
@@ -2167,7 +2171,7 @@ usage: agent-libos mcp scaffold approve [-h] candidate_json [--confirm-review]
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
 | `candidate_json` | yes | `None` | — |
-| `--confirm-review` | no | `False` | Explicitly confirm this Host operation after reviewing its scope. |
+| `--confirm-review` | no | `mcp_confirmed=False` | Explicitly confirm this Host operation after reviewing its scope. |
 | `--reviewer REVIEWER` | yes | `None` | — |
 | `--reason REASON` | yes | `None` | — |
 
@@ -2230,7 +2234,7 @@ usage: agent-libos mcp import apply [-h] bundle_json server_id [--confirm-import
 | `-h, --help` | no | — | show this help message and exit |
 | `bundle_json` | yes | `None` | — |
 | `server_id` | yes | `None` | — |
-| `--confirm-import` | no | `False` | Explicitly confirm this Host operation after reviewing its scope. |
+| `--confirm-import` | no | `mcp_confirmed=False` | Explicitly confirm this Host operation after reviewing its scope. |
 | `--reviewer REVIEWER` | yes | `None` | — |
 | `--reason REASON` | yes | `None` | — |
 
@@ -2684,9 +2688,9 @@ usage: agent-libos store migrate [-h] --to {5,6,7} (--dry-run | --apply)
 | Syntax | Required | Default | Description |
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
-| `--to {5,6,7}` | yes | `None` | — |
-| `--dry-run` | no | `False` | Validate and print the canonical migration plan without writing. |
-| `--apply` | no | `False` | Apply the canonical plan after verifying its digest and backup evidence. |
+| `--to {5,6,7}` | yes | `None` | Target offline Runtime store schema version to plan or apply a migration to. |
+| `--dry-run` | no | `dry_run=False` | Validate and print the canonical migration plan without writing. |
+| `--apply` | no | `apply=False` | Apply the canonical plan after verifying its digest and backup evidence. |
 | `--expected-plan-sha256 EXPECTED_PLAN_SHA256` | no | `None` | Exact plan digest printed by a prior --dry-run; required with --apply. |
 | `--sqlite-backup SQLITE_BACKUP` | no | `None` | Existing verified SQLite backup required before applying a SQLite migration. |
-| `--postgres-snapshot-confirmed` | no | `False` | Confirm an operator snapshot exists before applying a PostgreSQL migration. |
+| `--postgres-snapshot-confirmed` | no | `postgres_snapshot_confirmed=False` | Confirm an operator snapshot exists before applying a PostgreSQL migration. |

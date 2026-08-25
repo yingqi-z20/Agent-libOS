@@ -33,7 +33,7 @@ filesystem bypass for a process or model.
 
 This project is under active development. Current behavior is defined by the
 code and current-contract documents in the same checkout. Start with the
-[documentation home](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/index.md); historical design material is identified
+[documentation home](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/index.md); historical design material is identified
 separately below.
 
 ## 3 to 5 Minute Quick Start
@@ -43,7 +43,7 @@ no API credentials. It needs Python 3.11–3.14,
 [uv](https://docs.astral.sh/uv/), and a source checkout:
 
 ```bash
-git clone https://github.com/yingqi-z20/Agent-libOS.git
+git clone --branch v1.5.2 https://github.com/yingqi-z20/Agent-libOS.git
 cd Agent-libOS
 uv sync --frozen
 uv run agent-libos --db local demo
@@ -75,18 +75,18 @@ uv run python -c 'from pathlib import Path; Path("agent_outputs/demo_patch_previ
 
 The repository-wide `scripts/clean_agent_outputs.py` utility is broader: it
 previews, and with `--yes` removes, all ignored outputs under `agent_outputs/`.
-If setup or the demo fails, use [Troubleshooting](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/troubleshooting.md).
+If setup or the demo fails, use [Troubleshooting](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/troubleshooting.md).
 
 Choose the next path by role:
 
-- user/operator: [CLI guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/cli.md), [Python API](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/python_api.md), or
-  [Electron GUI](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/gui.md);
-- security reviewer: [threat model](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/threat_model.md),
-  [Capabilities](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/capabilities.md), and [data flow](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/data_flow.md);
-- extension author: [AgentImages](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/agent_images.md), [Skills](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/skills.md),
-  [Tools/JIT](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/tools_and_jit.md), or [Runtime Modules](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/modules.md);
-- contributor/maintainer: [development](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/development.md),
-  [benchmarking](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/benchmark.md), and [releasing](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/releasing.md).
+- user/operator: [CLI guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/cli.md), [Python API](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/python_api.md), or
+  [Electron GUI](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/gui.md);
+- security reviewer: [threat model](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/threat_model.md),
+  [Capabilities](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/capabilities.md), and [data flow](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/data_flow.md);
+- extension author: [AgentImages](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/agent_images.md), [Skills](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/skills.md),
+  [Tools/JIT](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/tools_and_jit.md), or [Runtime Modules](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/modules.md);
+- contributor/maintainer: [development](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/development.md),
+  [benchmarking](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/benchmark.md), and [releasing](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/releasing.md).
 
 ## Current System
 
@@ -224,70 +224,70 @@ product categories:
   distribution, not a public signed installer or update channel.
 
 Support and release claims are conditional on the exact version, platform,
-configuration, and required evidence. Consult the [support matrix](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/support_matrix.md)
+configuration, and required evidence. Consult the [support matrix](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/support_matrix.md)
 and maintained contract pages before generalizing from one demo or test run.
 
 ## Documentation
 
-The [documentation home](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/index.md) routes by audience and task and contains
+The [documentation home](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/index.md) routes by audience and task and contains
 the complete current-contract inventory. Direct entry points are grouped here.
 
 ### Use and operate Agent libOS
 
-- [CLI Guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/cli.md) for workflows and security semantics;
-- [machine-generated exhaustive CLI reference](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/cli_reference.md) for the
+- [CLI Guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/cli.md) for workflows and security semantics;
+- [machine-generated exhaustive CLI reference](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/cli_reference.md) for the
   checked-in parser, with the same installed version's `--help` as the live
   source;
-- [Python API](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/python_api.md) and [Electron GUI](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/gui.md);
-- [configuration guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/configuration.md) plus the
-  [machine-generated exhaustive field reference](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/configuration_reference.md);
-- [troubleshooting](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/troubleshooting.md), [storage/migration](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/storage.md),
-  and [support matrix](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/support_matrix.md);
-- [Durable Task Runs](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/durable_task_runs.md),
-  [Object Memory](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/object_memory.md), and [checkpoints](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/checkpoints.md).
+- [Python API](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/python_api.md) and [Electron GUI](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/gui.md);
+- [configuration guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/configuration.md) plus the
+  [machine-generated exhaustive field reference](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/configuration_reference.md);
+- [troubleshooting](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/troubleshooting.md), [storage/migration](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/storage.md),
+  and [support matrix](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/support_matrix.md);
+- [Durable Task Runs](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/durable_task_runs.md),
+  [Object Memory](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/object_memory.md), and [checkpoints](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/checkpoints.md).
 
 ### Understand the runtime and security boundary
 
-- [architecture](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/architecture.md), [runtime model](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/runtime_model.md),
-  [glossary and version map](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/glossary.md), and
-  [threat model](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/threat_model.md);
-- [Capabilities](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/capabilities.md),
-  [Task Authority Manifests](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/task_authority_manifest.md), and
-  [data flow and trusted Sinks](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/data_flow.md);
-- [semantic approval/data identification](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/semantic_shadow.md),
-  [Explainable Operations](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/explainable_operations.md), and
-  [Runtime events](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/events.md);
-- [evidence payload retention](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/evidence_payload_retention.md) and
-  [runtime invariants](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/invariants.md).
+- [architecture](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/architecture.md), [runtime model](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/runtime_model.md),
+  [glossary and version map](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/glossary.md), and
+  [threat model](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/threat_model.md);
+- [Capabilities](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/capabilities.md),
+  [Task Authority Manifests](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/task_authority_manifest.md), and
+  [data flow and trusted Sinks](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/data_flow.md);
+- [semantic approval/data identification](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/semantic_shadow.md),
+  [Explainable Operations](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/explainable_operations.md), and
+  [Runtime events](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/events.md);
+- [evidence payload retention](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/evidence_payload_retention.md) and
+  [runtime invariants](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/invariants.md).
 
 ### Extend and integrate
 
-- [AgentImage authoring](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/agent_images.md) and the specialized
-  [`mini-swe-agent` Image](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/mini_swe_agent_image.md);
-- [Skills](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/skills.md), [Tools and Deno/TypeScript JIT](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/tools_and_jit.md),
-  and [startup Runtime Modules](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/modules.md);
-- [Protected Operation SDK](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/protected_operation_sdk.md) and
-  [provider substrate](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/providers.md);
-- [typed Git](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/git.md), [JSON-RPC](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/jsonrpc.md), and
-  [MCP client](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/mcp.md);
-- [GUI API schema subset](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/gui_api_schema.json).
+- [AgentImage authoring](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/agent_images.md) and the specialized
+  [`mini-swe-agent` Image](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/mini_swe_agent_image.md);
+- [Skills](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/skills.md), [Tools and Deno/TypeScript JIT](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/tools_and_jit.md),
+  and [startup Runtime Modules](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/modules.md);
+- [Protected Operation SDK](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/protected_operation_sdk.md) and
+  [provider substrate](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/providers.md);
+- [typed Git](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/git.md), [JSON-RPC](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/jsonrpc.md), and
+  [MCP client](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/mcp.md);
+- [GUI API schema subset](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/gui_api_schema.json).
 
 ### Evaluate, contribute, and release
 
-- [benchmark contract](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/benchmark.md),
-  [runtime-safety schema](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/benchmarks/runtime_safety/schema.md),
-  [external-effect recovery](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/benchmarks/external_effect_recovery/README.md), and
-  [runtime-publication recovery](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/benchmarks/runtime_publication_recovery/README.md);
-- [practical workflows](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/benchmarks/practical_agent_workflows/README.md),
-  [built-in Tool Skill evaluation](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/benchmarks/builtin_tool_skills/README.md),
-  [long-horizon evaluation](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/benchmarks/long_horizon_agent/README.md), and
-  [AgentDojo](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/experiments/agentdojo/README.md);
-- [development guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/development.md), [release status](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/release_status.md),
-  and [maintainer release runbook](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/releasing.md);
-- [artifact anonymity](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/artifact_anonymity.md),
-  [research thesis](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/paper_thesis.md), [security policy](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/SECURITY.md),
-  [contribution guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/CONTRIBUTING.md), [changelog](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/CHANGELOG.md), and
-  [agent guidance](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/AGENTS.md).
+- [benchmark contract](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/benchmark.md),
+  [runtime-safety schema](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/benchmarks/runtime_safety/schema.md),
+  [external-effect recovery](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/benchmarks/external_effect_recovery/README.md), and
+  [runtime-publication recovery](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/benchmarks/runtime_publication_recovery/README.md);
+- [practical workflows](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/benchmarks/practical_agent_workflows/README.md),
+  [built-in Tool Skill evaluation](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/benchmarks/builtin_tool_skills/README.md),
+  [long-horizon evaluation](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/benchmarks/long_horizon_agent/README.md), and
+  [AgentDojo](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/experiments/agentdojo/README.md);
+- [development guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/development.md), [release status](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/release_status.md),
+  and [maintainer release runbook](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/releasing.md);
+- [artifact anonymity](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/artifact_anonymity.md),
+  [research thesis](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/paper_thesis.md), [security policy](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/SECURITY.md),
+  [contribution guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/CONTRIBUTING.md), [changelog](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/CHANGELOG.md), and
+  [agent guidance](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/AGENTS.md).
 
 Repository README links are checkout-relative so a branch, tag, fork, or source
 archive stays bound to its adjacent documentation. The release build generates
@@ -300,10 +300,10 @@ mutable-`main` contract links.
 These files are retained for traceability. Do not use them to infer current
 commands, interfaces, security guarantees, support, or release evidence:
 
-- [historical design archive notice](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/agent_libos_design_doc.md);
-- [historical paper roadmap notice](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/plan.md);
-- [retired commit-bound prelaunch review](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/prelaunch_hardening_report.md);
-- [commit-bound pre-implementation semantic research](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/semantic_permission_and_dataflow_research.md).
+- [historical design archive notice](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/agent_libos_design_doc.md);
+- [historical paper roadmap notice](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/plan.md);
+- [retired commit-bound prelaunch review](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/prelaunch_hardening_report.md);
+- [commit-bound pre-implementation semantic research](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/semantic_permission_and_dataflow_research.md).
 
 Each file states its baseline or retirement status and points back to maintained
 entry points. Git history, rather than a floating prose claim, is the source for
@@ -322,17 +322,30 @@ Tool Skills, and three console entry points: `agent-libos`,
 optional PTY module, and workspace Image/Skill packages remain checkout/source-
 archive assets rather than core-wheel contents.
 
+A published release version installs from a package index without a checkout:
+
+```bash
+pip install agent-libos
+# Optional integration extras mirror the source extras:
+pip install "agent-libos[mcp]"
+```
+
+A package install provides exactly the wheel contents and console entry points
+above. The repository assets listed above stay in the matching source checkout
+or source archive, and the package-index page's repository links point at that
+version's immutable `v<version>` tag rather than mutable `main`.
+
 Use the canonical page for every workflow beyond onboarding:
 
 | Task | Canonical page |
 | --- | --- |
-| Install, test, or change dependencies | [Development Guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/development.md) |
-| Build, validate, publish, or recover artifacts | [Release Runbook](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/releasing.md) |
-| Migrate, back up, restore, or diagnose a store | [Storage](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/storage.md) |
-| Configure fields, profiles, modules, or providers | [Configuration Guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/configuration.md) |
-| Operate the desktop or GUI server | [GUI Guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/gui.md) |
-| Run or interpret evaluations | [Benchmark Contract](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/benchmark.md) |
-| Find a CLI workflow or every parser option | [CLI Guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/cli.md) / [generated reference](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/cli_reference.md) |
+| Install, test, or change dependencies | [Development Guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/development.md) |
+| Build, validate, publish, or recover artifacts | [Release Runbook](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/releasing.md) |
+| Migrate, back up, restore, or diagnose a store | [Storage](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/storage.md) |
+| Configure fields, profiles, modules, or providers | [Configuration Guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/configuration.md) |
+| Operate the desktop or GUI server | [GUI Guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/gui.md) |
+| Run or interpret evaluations | [Benchmark Contract](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/benchmark.md) |
+| Find a CLI workflow or every parser option | [CLI Guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/cli.md) / [generated reference](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/cli_reference.md) |
 
 Those pages are the single sources for their commands, prerequisites, platform
 differences, safety gates, and expected evidence. Do not copy a release,
@@ -369,14 +382,14 @@ Object payloads do not gain that guarantee.
 
 Store administration is an offline operator workflow. Stop all writers, make
 the documented owner-only backup, preview the exact migration, verify its bound
-digest/state, and only then apply it. See [Storage](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/storage.md) and
-[Troubleshooting](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/troubleshooting.md).
+digest/state, and only then apply it. See [Storage](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/storage.md) and
+[Troubleshooting](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/troubleshooting.md).
 
 ### Upgrading stores that contain Tool Groups
 
 Legacy Tool Group metadata is a separate content migration to immutable built-in
 Tool Skills. Ordinary startup fails closed; use the dry-run-first procedure in
-[Tools and JIT](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/tools_and_jit.md#on-demand-tool-skills) and the offline
+[Tools and JIT](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/tools_and_jit.md#on-demand-tool-skills) and the offline
 storage guidance. Do not infer that a schema migration performs this conversion.
 
 ## Real LLM Configuration
@@ -403,9 +416,9 @@ provider's complete internal state, or permission to repeat an uncertain effect.
 Provider storage, prompt caching, local full-I/O retention, and response chaining
 are independent controls with different privacy and recovery consequences.
 
-Use [Configuration](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/configuration.md) for precedence and security semantics,
-the [generated field reference](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/configuration_reference.md) for exact fields
-and defaults, and [Development](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/development.md#real-llm-smoke) for an
+Use [Configuration](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/configuration.md) for precedence and security semantics,
+the [generated field reference](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/configuration_reference.md) for exact fields
+and defaults, and [Development](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/development.md#real-llm-smoke) for an
 explicit opt-in smoke path.
 
 ## Security Summary
@@ -445,13 +458,13 @@ explicit opt-in smoke path.
 - Remote access is Host-registered and configuration-bound. Models do not choose
   ad hoc URLs, credentials, subprocess transports, or trust roots.
 
-Read the [Threat Model](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/threat_model.md) for assets, adversaries, TCB,
-guarantees, and non-goals; [Runtime Invariants](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/invariants.md) maps current
+Read the [Threat Model](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/threat_model.md) for assets, adversaries, TCB,
+guarantees, and non-goals; [Runtime Invariants](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/invariants.md) maps current
 claims to tests.
 
 ## Contributing, Evaluation, and Releases
 
-Use the [Development Guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/development.md) for environment setup, test
+Use the [Development Guide](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/development.md) for environment setup, test
 lanes, architecture checks, real-provider opt-ins, GUI validation, dependency
 changes, and documentation rules. Generated `agent_outputs/`, benchmark runs,
 credentials, local databases, and GUI build artifacts must not be committed.
@@ -459,13 +472,13 @@ credentials, local databases, and GUI build artifacts must not be committed.
 Evaluation output is source-bound evidence, not a standing performance or safety
 claim for another checkout. Preserve each suite's metadata, results, effects,
 metrics, model/provider identity, and declared evidence level together, and use
-the [Benchmark Contract](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/benchmark.md) to interpret denominators or failure.
+the [Benchmark Contract](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/benchmark.md) to interpret denominators or failure.
 
-The [Release Status](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/release_status.md) describes conditional scope and
+The [Release Status](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/release_status.md) describes conditional scope and
 required gates; it is not a pass receipt. Artifact building, signing, tagging,
 uploading, yanking, or changing external release state requires explicit Human
-authorization and the [Release Runbook](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/docs/releasing.md).
+authorization and the [Release Runbook](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/docs/releasing.md).
 
-See [CONTRIBUTING.md](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/CONTRIBUTING.md) for pull-request expectations and
-[SECURITY.md](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/SECURITY.md) for confidential vulnerability reporting. The project
-is licensed under the terms in [LICENSE](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.1/LICENSE).
+See [CONTRIBUTING.md](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/CONTRIBUTING.md) for pull-request expectations and
+[SECURITY.md](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/SECURITY.md) for confidential vulnerability reporting. The project
+is licensed under the terms in [LICENSE](https://github.com/yingqi-z20/Agent-libOS/blob/v1.5.2/LICENSE).

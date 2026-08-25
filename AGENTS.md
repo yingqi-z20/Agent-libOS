@@ -7,11 +7,13 @@ lives in `agent_libos/`, organized by subsystems including `runtime/`,
 `primitives/`, `capability/`, `memory/`, `skills/`, `modules/`, `tools/`,
 `substrate/`, `config/`, `evidence/`, `human/`, `images/`, `llm/`, `models/`,
 `ports/`, `sdk/`, `semantic/`, `storage/`, `utils/`, and `api/` for CLI/GUI server
-entrypoints. Pytest tests live in `tests/` and map to
+entrypoints. Pytest tests live in `tests/` and map to the six Python
 test matrix lanes: `unit`, `runtime`, `security`, `self-evolution`,
-`providers`, `benchmark`, and `gui`; some lane names differ from directory
+`providers`, and `benchmark`; some lane names differ from directory
 names, for example `self-evolution` maps to `tests/self_evolution` and
-`benchmark` maps to `tests/benchmarks`. Shared helpers live in
+`benchmark` maps to `tests/benchmarks`. The `gui` lane is not a pytest
+lane and has no `tests/` directory; it runs the frontend Vitest,
+typecheck, and build tooling in `gui/`. Shared helpers live in
 `tests/support/`. Runtime-safety task fixtures, runner implementations, oracle,
 and metrics live under `benchmarks/runtime_safety/`; practical evidence-level
 scenarios live under `benchmarks/practical_agent_workflows/`. User-facing

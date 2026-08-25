@@ -138,6 +138,11 @@ data_flow:
       identity_sha256: "<endpoint-and-method-identity-sha256>"
 ```
 
+Configuration validation pins these defaults: `default_trust_level` must remain
+`untrusted` and `default_max_sensitivity` may only be lowered from `normal`;
+any other value fails config load. Additional clearance can come only from
+explicit `sink_rules`.
+
 Patterns are either exact or a single trailing `*`. Longest match wins;
 duplicate and equal-priority overlapping patterns are rejected. Provider-backed
 LLM, JSON-RPC, MCP, Shell, and PTY clearance above `normal` requires an
@@ -500,9 +505,11 @@ declassification authority, endorsement, Sink clearance, or release row.
 Provider-ingress capture binds the committed result/effect/provider/source
 digests so the suggestion can be reviewed later. The result digest is derived
 only from the SDK's bounded Host canonicalization. The normal path is capped at
-4,096 nodes/256 KiB; six built-in provider domains—Filesystem, Shell, Git,
-JSON-RPC, MCP, and LLM—and Host-bound dataclasses may use a 500,000-node/64 MiB
-incremental streaming digest. The descriptor is
+4,096 nodes/256 KiB; the six provider contract namespaces (Filesystem, Shell, Git, JSON-RPC, MCP, and LLM; `primitive.filesystem.*` through `primitive.llm.*`) and Host-bound dataclasses
+may use a 500,000-node/64 MiB incremental streaming digest. These contract
+namespaces are distinct from the semantic assessment `domain` filter, whose
+values are `filesystem`, `shell`, `git`, `jsonrpc`, `mcp`, `runtime`, and
+`unknown`. The descriptor is
 at most 4 KiB and never contains the result text. If the result is opaque,
 cyclic, ambiguous, or over budget, it reports `digest_unavailable` and semantic
 capture fails closed. Safely traversable provider text is also scanned

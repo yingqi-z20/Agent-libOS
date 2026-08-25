@@ -594,12 +594,15 @@ endpoint manifest, then resolves URLs and env-backed headers from the registry
 only for an authorized call.
 
 The same split applies to MCP. `list_mcp_servers`, `inspect_mcp_server`,
-`list_mcp_tools`, and `call_mcp_tool` are stable generic wrappers over a
+`list_mcp_tools`, `call_mcp_tool`, and the Manifest v3 Resource readers
+`list_mcp_resources`/`read_mcp_resource` are stable generic wrappers over a
 registered MCP server registry. Remote MCP tools are not imported into the
 ToolBroker as first-class tools, and a model-projected `call_mcp_tool` entry still
 requires `mcp:<server>:<tool>` authority at primitive use. The call path also
 checks that derived tool resource before loading server metadata or input
 schemas, so missing authority cannot be used to enumerate provider manifests.
+The Resource wrappers stay behind the protected MCP facade and only surface
+model-visible Manifest v3 entries, never a remote URI or provider cursor.
 
 Manifest v1 remains on the initialize-based legacy MCP path. Manifest v2
 explicitly selects `legacy`, `auto`, or `2026-07-28` and requires the optional
@@ -873,6 +876,8 @@ agent_libos/
   human/           HumanObject query, approval, interrupt, and output primitives
   images/          built-in AgentImage definitions
   llm/             prompt, context, OpenAI-compatible client, executor, action parser
+  mcp/             MCP server manifests, OAuth manager, runtime bridge, supervisor,
+                   subscriptions, remote Tasks, and Elicitation continuations
   memory/          typed Object Memory and MemoryView implementation
   models/          dataclass and enum models split by runtime domain
   modules/         trusted startup Runtime Module loader, registry, and core module

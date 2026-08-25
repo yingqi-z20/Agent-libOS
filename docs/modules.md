@@ -610,6 +610,14 @@ module, so list it without repeating the manifest on the command line:
 uv run agent-libos --db local modules list
 ```
 
+Inspect one loaded module's recorded summary, including status,
+manifest/source hashes, entrypoint, registered surfaces, and metadata, by
+exact module id:
+
+```bash
+uv run agent-libos --db local modules inspect example-module:v0
+```
+
 On a Host whose configuration does not already list that manifest, pass
 `--module-manifest modules/pty/module.yaml` together with the exact
 `--trusted-module <trust_key>` returned by `modules verify`. Do not combine a

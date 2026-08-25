@@ -14,6 +14,8 @@ security rules.
 
 - [Load overlays with the documented precedence](#loading-and-precedence)
 - [Apply bounded YAML input rules](#bounded-yaml-input)
+- [Review store persistence and relative path ownership](#store-persistence-and-relative-path-ownership)
+- [Resolve the effective LLM profile](#effective-llm-profile-precedence)
 - [Inspect exact defaults](#inspecting-exact-defaults)
 - [Configure semantic phases](#semantic-phase-24-configuration)
 - [Review security-sensitive settings](#security-sensitive-settings)
@@ -170,6 +172,8 @@ config = load_config_file("host-overrides.yaml", base=base)
 runtime = Runtime.open(config=config)
 ```
 
+### Store persistence and relative path ownership
+
 The checked-in repository `config.yaml` selects the reserved `user` target and
 loads the trusted PTY Runtime Module. `DEFAULT_CONFIG.runtime.local_store_target`
 is also `user`, so the CLI, directly launched development GUI server, and bare
@@ -241,7 +245,7 @@ legacy mappings are
 `OPENAI_REASONING_EFFORT`; `OPENAI_VERBOSITY`; `OPENAI_SAFETY_IDENTIFIER`;
 `OPENAI_PROMPT_CACHE_KEY`; `OPENAI_PROMPT_CACHE_RETENTION`;
 `OPENAI_PROMPT_CACHE_MODE`; `OPENAI_PROMPT_CACHE_TTL`;
-`OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID`; and
+`OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID`;
 `OPENAI_PARALLEL_TOOL_CALLS`; and `OPENAI_FALLBACK_JSON_ACTIONS`. The default profile also snapshots
 `OPENAI_ENABLE_THINKING` and the OpenAI organization/project routing variables
 (`OPENAI_ORGANIZATION`/`OPENAI_ORG_ID` and
@@ -592,6 +596,28 @@ configurable. A runtime release emits only the snapshot version it can decode.
   the process resource ledger, and surfaced as the corresponding safe Runtime
   timeout/resource-limit result. Arbitrary nested provider text is not added to
   the public error allowlist.
+- Shell command authorization is its own policy surface.
+  `shell.default_policy_level` defaults to `allowlist_auto_else_ask`: argv
+  matched by an allow rule run automatically, and every other command asks the
+  Human rather than being denied or silently allowed. The selectable levels are
+  `always_deny`, `allowlist_auto_else_ask`, `blocklist_ask_else_auto`, and
+  `always_allow`; `always_allow` still cannot convert an `ask`/`deny`
+  capability record or the deterministic destructive-command classifications
+  into automatic allows. The built-in `shell.whitelist` holds eight exact-match
+  read-only inspection argv (the `git status`/`git branch --show-current`/
+  `git rev-parse --show-toplevel`/`git diff --stat` forms and
+  `python`/`python3`/`uv --version`), while `shell.blacklist` holds 48
+  prefix-match high-risk argv rules covering shells, script interpreters,
+  package managers, network tools, and file/permission/system-mutation
+  executables. Hosts may replace or extend those argv lists and attach
+  deterministic `AuthorityRule` entries through `shell.rules`; the rule
+  `conditions` mappings are defensively frozen after load. Whole-shell
+  authority is not a bare command grant: `shell.policy_capability_key`
+  (default `shell_policy_level`) and `shell.policy_resource` (default
+  `shell:*`) name the constraint and resource a shell policy capability must
+  carry. See [Capabilities](capabilities.md) for the complete policy-level
+  evaluation rules and [Tools And Deno/TypeScript JIT](tools_and_jit.md) for
+  the tool surfaces that invoke Shell.
 - Filesystem reads default to `tools.filesystem_read_max_bytes=65536` and are
   capped by `tools.filesystem_read_hard_limit_bytes=1048576`. On Darwin,
   existing workspace entries derive capability, lock, and file-label keys from
@@ -608,8 +634,15 @@ configurable. A runtime release emits only the snapshot version it can decode.
   `git.trusted_metadata_roots` is a Host trust decision for linked-worktree
   metadata and should be as narrow as possible. Remote URL schemes, local file
   remotes, credential-helper inheritance, and SSH-agent inheritance are Host
-  policy; model tools cannot override them. Metadata protection is a fixed
-  invariant: `git.protect_git_metadata` must remain `true`. Disabling Git
+  policy; model tools cannot override them. The shipped defaults are
+  inheritance-on: `git.inherit_credential_helpers` and
+  `git.inherit_ssh_agent` both default to `true`, and
+  `git.allow_scp_style_ssh` defaults to `true` so `user@host:path` SSH remote
+  URLs parse. Compensating defaults keep the remote surface narrow:
+  `git.allow_file_remotes` is `false` and `git.allowed_remote_schemes` is
+  `https`/`ssh`, while metadata protection is a fixed invariant that cannot be
+  disabled: `git.protect_git_metadata` must remain `true`. Deployments running
+  untrusted goals should turn both inheritance switches off. Disabling Git
   or failing executable/version validation affects only Git calls, not Runtime
   startup. See [Git Provider and Primitive](git.md).
 - `llm.persist_full_io` defaults to true. Set it to false when the deployment's
@@ -655,6 +688,21 @@ configurable. A runtime release emits only the snapshot version it can decode.
   `purge_on_terminal` policy reduces readable Run-owned payloads
   to hashes before terminalization; `permanent` is a Host/admin-only per-Run
   choice.
+- `object_tasks.max_running_global` (default `16`) bounds concurrently running,
+  non-terminal ObjectTasks across the Runtime, and
+  `object_tasks.max_running_per_object` (default `4`) bounds them per owner
+  Object. Both must be positive and the global ceiling cannot be smaller than
+  the per-object ceiling. The global value sizes the dedicated ObjectTask tool
+  executor and raises the shared blocking-work supervisor to at least that
+  many workers; each running task additionally holds a spawned runner child
+  process charged against its parent's process child budget, so these ceilings
+  cap concurrent runner processes and their resource-ledger charges, not just
+  threads. A submission that would exceed either ceiling fails immediately
+  with a validation error rather than queueing; the caller must retry once
+  active tasks finish. Shutdown drains the executor for
+  `object_tasks.shutdown_join_timeout_s` (default `2.0` seconds). See
+  [Runtime Model](runtime_model.md#scheduler) and the
+  [Object Task entry point](tools_and_jit.md#object-task-entry-point).
 - Provider-side Responses storage policy remains opt-in through `llm.store`.
   `llm.responses_previous_response_id` permits low-level client chaining policy,
   but the current full-snapshot AgentProcess executor records it as configured

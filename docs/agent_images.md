@@ -13,10 +13,17 @@ resource authority. Read [Capabilities](capabilities.md),
 
 ## In this guide
 
-- [Create, validate, register, and boot a minimal package](#minimal-package)
-- [Choose manifest fields and prompt behavior](#manifest-fields)
-- [Control the tool table, authority declarations, and private workspace](#tool-table-and-model-projection)
-- [Package JIT tools and select an LLM profile](#packaged-jit-tools)
+- [Distinguish the Image kinds](#image-kinds)
+- [Create a minimal package](#minimal-package)
+- [Validate, register, and boot the package](#validate-before-registration)
+- [Review the allowed package layout](#package-layout)
+- [Choose manifest fields](#manifest-fields)
+- [Choose a prompt mode](#prompt-modes)
+- [Control the tool table and model projection](#tool-table-and-model-projection)
+- [Declare capabilities and required modules](#capability-and-module-declarations)
+- [Scope the private workspace seed](#private-workspace-seed)
+- [Package JIT tools](#packaged-jit-tools)
+- [Select an LLM profile and keep secrets out](#llm-profile-and-secrets)
 - [Create an Image from a checkpoint](#checkpoint-derived-images)
 - [Review the author checklist](#author-checklist)
 - Return to the [documentation home](index.md).
@@ -86,6 +93,9 @@ uv run agent-libos --db user \
 uv run agent-libos --db user \
   images inspect custom-review-agent:v0
 ```
+
+Like the Skills CLI, these commands accept `--actor-pid`; omitting it runs
+them in admin CLI mode with capability enforcement disabled.
 
 Registration rejects an existing image id unless the Host explicitly supplies
 `--replace`. Validation and registration read the package but do not invoke an

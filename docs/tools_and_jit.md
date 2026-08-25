@@ -16,12 +16,18 @@ but it does not grant permissions or approve execution.
 
 - [Built-in tools](#built-in-tools)
 - [On-demand Tool Skills](#on-demand-tool-skills)
+- [Context compaction](#context-compaction)
+- [Workflow entry point](#workflow-entry-point)
+- [Object Task entry point](#object-task-entry-point)
 - [Writing Python tools](#writing-python-tools)
 - [JIT tool lifecycle](#jit-tool-lifecycle)
 - [LLM exposure strategy](#llm-exposure-strategy)
 - [TypeScript entry point](#typescript-entry-point)
+- [RPC protocol](#rpc-protocol)
 - [Syscall semantics](#syscall-semantics)
 - [Sandbox rules](#sandbox-rules)
+- [Observability limits](#observability-limits)
+- [Deferred lifecycle](#deferred-lifecycle)
 - Return to the [documentation home](index.md).
 
 ## Built-In Tools
@@ -58,9 +64,11 @@ The current built-in tool surface includes tools for:
   worktrees, immutable patch Objects, existing remotes, and repository-local
   simulated pull requests through `Runtime.git`; no arbitrary Git argv or URL.
 - JSON-RPC: list/inspect registered endpoints and call registered methods.
-- MCP: list/inspect registered servers, list manifest-allowed tools, and call
-  registered MCP tools. Modern `server/discover` is intentionally a Host
-  SDK/CLI/GUI operation rather than another model tool or syscall.
+- MCP: list/inspect registered servers, list manifest-allowed tools, call
+  registered MCP tools, and page/read model-visible Manifest v3 Resources
+  through `list_mcp_resources`/`read_mcp_resource`. Modern `server/discover` is
+  intentionally a Host SDK/CLI/GUI operation rather than another model tool or
+  syscall. See [MCP tools and syscalls](mcp.md#tools-and-syscalls).
 - Image registry: load workspace image packages and commit checkpoints into
   checkpoint-derived images.
 - Checkpoint: create, list, inspect, diff, restore, and fork.
@@ -109,9 +117,12 @@ still require `process:<pid>` `admin`.
 
 The catalog gives each of the 101 built-in static tools one intent-focused owner
 across 26 Skills, with at most nine tools per Skill. The owner is available
-through `SkillManager.builtin_skill_for_tool()`. This keeps automatic routing
-deterministic and prevents overlapping Skills from making unload provenance
-ambiguous:
+through `SkillManager.builtin_skill_for_tool()`. These counts are pinned by the
+release install smoke (`len(catalog.list()) == 26`, `len(owned) == 101`) in
+[`test.yml`](../.github/workflows/test.yml); the catalog source is
+[`builtin_catalog.py`](../agent_libos/skills/builtin_catalog.py). This keeps
+automatic routing deterministic and prevents overlapping Skills from making
+unload provenance ambiguous:
 
 | Built-in Skill | Guidance scope |
 | --- | --- |
@@ -626,7 +637,7 @@ The current syscall surface covers existing primitive areas:
 - process cwd/fork/spawn/wait/list/signal/merge/exec/exit/messages,
 - shell run,
 - JSON-RPC list/inspect/call,
-- MCP list/inspect/tools/call,
+- MCP list/inspect/tools/call/resources/resource_read,
 - image list/inspect/load package/commit checkpoint,
 - checkpoint create/list/inspect/diff/restore/fork/replay,
 - Skill discover/inspect/register_path/activate/read_resource/unload.

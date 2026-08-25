@@ -13,6 +13,7 @@ block, not a mechanism for rewinding the outside world.
 - [Restore](#restore)
 - [Commit to Image](#commit-to-image)
 - [Fork from checkpoint](#fork-from-checkpoint)
+- [Replay to Event](#replay-to-event)
 - [Limits](#limits)
 - Return to the [documentation home](index.md).
 
@@ -269,9 +270,17 @@ the five Skill bootstrap tools. Coding additionally binds restore/fork and is
 the only shipped Image whose complete table contains all six tools owned by
 `agent-libos-checkpoints`; activating that exact Skill projects the six together.
 Base and review omit restore/fork, so the immutable built-in Skill is hidden and
-cannot partially project their four static bindings. Toolmaker and
-context-compressor bind no checkpoint tools. Global tool registration alone is
-not model visibility, and every invocation still requires checkpoint authority.
+cannot partially project their four static bindings. The narrow direct
+`maintenance-agent:v0`, `research-agent:v0`, `analysis-agent:v0`, and
+`operator-agent:v0` images set no `tool_projection` and instead project their
+complete default tool tables at boot: research and analysis bind
+`create_checkpoint` only, maintenance binds it with `list_checkpoints`, and
+operator binds `create_checkpoint`, `list_checkpoints`, and
+`inspect_checkpoint`. Their checkpoint schemas are therefore initially
+model-visible because the Host selected the image's workflow domain in advance;
+none of the four binds diff, restore, or fork. Toolmaker and context-compressor
+bind no checkpoint tools. Global tool registration alone is not model
+visibility, and every invocation still requires checkpoint authority.
 
 Checkpoint inspect process rows expose the snapshot's canonical tagged
 `wait_state` and `outcome` mappings together with `state_generation`. The

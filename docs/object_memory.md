@@ -6,11 +6,14 @@ It is not a plain key/value store and object names are not capabilities.
 ## In this guide
 
 - [Objects](#objects)
+- [Namespaces](#namespaces)
 - [Name resolution](#name-resolution)
 - [Query API](#query-api)
 - [Memory Views](#memory-views)
+- [Object Links](#object-links)
 - [Object Tasks](#object-tasks)
 - [File/Object bridge](#fileobject-bridge)
+- [Data labels and provenance](#data-labels-and-provenance)
 - [Context materialization](#context-materialization)
 - [Persistence invariant](#persistence-invariant)
 - Return to the [documentation home](index.md).
@@ -627,6 +630,13 @@ prevents compressor children and their summaries from immediately retriggering
 the maintenance they just completed. The projection is still checked before
 persistence, and a first post-compaction projection that already reaches the
 hard limit fails instead of entering an ineffective retry loop.
+
+Selection order comes from `memory.context_policy`, whose default is
+`plan_first`: goal, task, plan, and step objects are ordered ahead of the rest.
+`evidence_first`, `recency_first`, and `error_debug` are the other supported
+orderings, and an Image may select its own policy. One materialization pass is
+bounded by `memory.materialize_budget_tokens` (8,000 tokens by default), again
+capped by the per-call window and cumulative budget described below.
 
 Materialization budgets use the final rendered object text, not stored
 `metadata.token_estimate`. Object creation, payload updates, file imports, and

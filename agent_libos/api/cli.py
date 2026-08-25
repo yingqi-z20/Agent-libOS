@@ -44,6 +44,7 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import HumanApprovalRequired, LibOSError, NotFound
 from agent_libos.models.exceptions import ValidationError as LibOSValidationError
+from agent_libos.models.task_runs import TaskRunStatus
 from agent_libos.modules import ModuleLoader
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import display_store_target
@@ -69,23 +70,8 @@ from agent_libos.api.semantic_public import (
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _WORKFLOW_HELP = "Run an Image-bound workflow tool directly without an LLM turn"
 _WORKFLOW_RUN_HELP = "Spawn a workflow process and call one tool from its complete process table"
-_TASK_RUN_STATUSES = frozenset(
-    {
-        "queued",
-        "running",
-        "waiting_human",
-        "waiting_process",
-        "waiting_message",
-        "waiting_tool",
-        "paused",
-        "cancelling",
-        "finalizing",
-        "needs_attention",
-        "succeeded",
-        "failed",
-        "cancelled",
-    }
-)
+_TASK_RUN_STATUS_VALUES = tuple(status.value for status in TaskRunStatus)
+_TASK_RUN_STATUSES = frozenset(_TASK_RUN_STATUS_VALUES)
 _TASK_RUN_RETENTIONS = ("purge_on_terminal", "permanent")
 _SEMANTIC_ASSESSMENT_PAGE_DEFAULT = 50
 _SEMANTIC_ASSESSMENT_PAGE_MAX = 100
@@ -219,17 +205,18 @@ def _add_payload_retention_parser_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "kind",
         choices=[item.value for item in PayloadRetentionKind],
+        help="Which bounded payload-retention page kind to preview or apply.",
     )
     parser.add_argument(
         "--apply",
         action="store_true",
         help="Apply the page; the default is a non-mutating dry run.",
     )
-    parser.add_argument("--limit", type=int)
-    parser.add_argument("--after-created-at")
-    parser.add_argument("--after-record-id")
-    parser.add_argument("--actor", default="host.retention")
-    parser.add_argument("--correlation-id")
+    parser.add_argument("--limit", type=int, help="Maximum rows in the page; bounded by the policy hard limit.")
+    parser.add_argument("--after-created-at", help="Opaque keyset cursor: created-at timestamp from the preceding page.")
+    parser.add_argument("--after-record-id", help="Opaque keyset cursor: record id from the preceding page.")
+    parser.add_argument("--actor", default="host.retention", help="Actor recorded for the retention operation; defaults to host.retention.")
+    parser.add_argument("--correlation-id", help="Correlation id recorded for the retention operation.")
 
 
 def _run_compact_command(
@@ -284,7 +271,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         "--db",
         help=(
             "Runtime store target. 'user' uses the persistent per-user SQLite store; "
-            "paths use file SQLite; local/:memory:/sqlite:// use in-memory SQLite; "
+            "paths use file SQLite; 'local', ':memory:', and a bare 'sqlite://' use in-memory SQLite; a 'sqlite://' URI with a path selects that SQLite file; "
             "postgresql:// DSNs use PostgreSQL. "
             "If omitted, uses the selected config runtime store settings "
             f"(default '{_RUNTIME_DEFAULTS.local_store_target}' is persistent SQLite)."
@@ -671,6 +658,7 @@ def _add_store_parser_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         choices=(5, 6, 7),
         required=True,
+        help="Target offline Runtime store schema version to plan or apply a migration to.",
     )
     mode = migrate.add_mutually_exclusive_group(required=True)
     mode.add_argument(
@@ -1572,7 +1560,11 @@ def _add_task_run_parser_args(parser: argparse.ArgumentParser) -> None:
         dest="statuses",
         action="append",
         default=[],
-        help="Filter status, comma-separated or repeated.",
+        help=(
+            "Filter status, comma-separated or repeated. Valid values: "
+            + ", ".join(_TASK_RUN_STATUS_VALUES)
+            + "."
+        ),
     )
     list_parser.add_argument("--cursor", help="Opaque keyset cursor from the preceding page.")
     list_parser.add_argument(
@@ -1913,7 +1905,10 @@ def _task_run_status_filters(values: list[str]) -> tuple[str, ...] | None:
     invalid = sorted(set(selected) - _TASK_RUN_STATUSES)
     if invalid:
         raise LibOSValidationError(
-            "invalid TaskRun status filter(s): " + ", ".join(invalid)
+            "invalid TaskRun status filter(s): "
+            + ", ".join(invalid)
+            + "; valid values: "
+            + ", ".join(_TASK_RUN_STATUS_VALUES)
         )
     return tuple(selected) or None
 
@@ -2708,8 +2703,8 @@ def _add_capabilities_parser_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_capability_spec_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("resource")
-    parser.add_argument("--rights", nargs="+", required=True, choices=[right.value for right in CapabilityRight])
-    parser.add_argument("--effect", choices=[effect.value for effect in CapabilityEffect], default=CapabilityEffect.ALLOW.value)
+    parser.add_argument("--rights", nargs="+", required=True, choices=[right.value for right in CapabilityRight], help="One or more CapabilityRight values to grant or delegate.")
+    parser.add_argument("--effect", choices=[effect.value for effect in CapabilityEffect], default=CapabilityEffect.ALLOW.value, help="Effect of the granted/delegated right; defaults to allow.")
     parser.add_argument("--delegable", action="store_true")
     parser.add_argument("--revocable", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--uses-remaining", type=int)
@@ -3272,7 +3267,7 @@ def _add_mcp_task_subscription_parser_args(sub: Any) -> None:
         ),
     )
     subscription_listen.add_argument("server_id")
-    subscription_listen.add_argument("--filter", action="append", required=True)
+    subscription_listen.add_argument("--filter", action="append", required=True, help="Subscription filter token; repeatable, must be declared in the server manifest.")
     subscription_listen.add_argument(
         "--max-events",
         type=int,

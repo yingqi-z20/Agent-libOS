@@ -48,7 +48,7 @@ skills/review-helper/
 name: review-helper
 description: Focused code-review workflow helpers.
 license: Apache-2.0
-compatibility: agent-libos==1.5.1
+compatibility: agent-libos==1.5.2
 allowed-tools: read_text_file read_directory
 metadata:
   agent-libos.version: v0
@@ -184,7 +184,10 @@ are enforcement details, not different LLM protocols.
 Activation materializes the full body into the process prompt and records the
 exact package snapshot on the process. Bundled resources are read explicitly
 with `read_skill_resource` from that activation snapshot, so later registry
-replacement affects only new registered-Skill activations.
+replacement affects only new registered-Skill activations. Serving resource
+reads from the snapshot rather than the registration path prevents a Skill
+from keeping ambient read authority to the workspace path where it was
+registered.
 
 The model-facing lifecycle tools use distinct outer envelopes: discovery
 returns its `skills` page and paging metadata directly, while successful
@@ -216,9 +219,6 @@ the already loaded immutable snapshot. A path retained from trusted package
 instructions or prior authorized evidence can therefore be read, including an
 otherwise omitted JIT-contract resource. The tool does not list paths, and
 callers must not guess or probe hidden filenames.
-
-This prevents a Skill from keeping ambient read authority to the workspace path
-where it was registered.
 
 ## LibOS Extensions
 
@@ -499,7 +499,7 @@ are rejected before a result set can become unbounded.
 The workspace includes `skills/swe-agent`, named and registerable as
 `swe-agent`. It reproduces the useful SWE-Agent Agent Computer Interface shape
 inside Agent libOS. The shipped package pins `compatibility` to
-`agent-libos==1.5.1`: its JIT manifest uses extension fields from this release,
+`agent-libos==1.5.2`: its JIT manifest uses extension fields from this release,
 so older parsers must not be promised compatibility merely because the
 frontmatter itself can be read. This exact pin is a publisher/Host-facing
 declaration, not a Runtime-enforced version gate.

@@ -17,6 +17,7 @@ _GENERATED_HEADER = (
 )
 _MARKDOWN_LINK = re.compile(r"(?P<prefix>!?\[[^\]]*\]\()(?P<target>[^)]+)(?P<suffix>\))")
 _FINAL_VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
+_PROJECT_CLONE = re.compile(r"git clone " + re.escape(REPOSITORY_URL) + r"(?:\.git)?")
 
 
 def _project_version(root: Path) -> str:
@@ -65,6 +66,15 @@ def render_pypi_readme(source: str, *, version: str) -> str:
         return f'{match.group("prefix")}{rewritten}{title}{match.group("suffix")}'
 
     rendered = _GENERATED_HEADER + _MARKDOWN_LINK.sub(replace, source)
+
+    def pin_clone(match: re.Match[str]) -> str:
+        # The package-index README must reproduce against the immutable release
+        # tag, so a bare `git clone <repo>` is pinned to `--branch v<version>`.
+        return match.group(0).replace("git clone ", f"git clone --branch v{version} ", 1)
+
+    rendered = _PROJECT_CLONE.sub(pin_clone, rendered)
+    if _PROJECT_CLONE.search(rendered):
+        raise ValueError("generated PyPI README contains an unpinned project git clone")
     mutable_prefix = f"{REPOSITORY_URL}/blob/main/"
     if mutable_prefix in rendered:
         raise ValueError("generated PyPI README contains a mutable main-branch link")

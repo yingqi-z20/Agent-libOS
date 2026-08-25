@@ -401,7 +401,7 @@ def test_data_flow_docs_pin_llm_sink_identity_and_host_result_domains() -> None:
         "changing any bound effective policy invalidates a trust rule tied to the old identity hash",
         "`prompt_cache_mode`, `prompt_cache_ttl`, or `fallback_json_actions` changes the profile identity hash",
         "trusted Sink rule bound to the old `identity_sha256` no longer matches",
-        "six built-in provider domains—Filesystem, Shell, Git, JSON-RPC, MCP, and LLM—",
+        "six provider contract namespaces (Filesystem, Shell, Git, JSON-RPC, MCP, and LLM",
     ):
         assert required in documentation
     assert "five built-in provider domains" not in documentation
@@ -411,7 +411,7 @@ def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() 
     documentation = _words(_read("docs/storage.md"))
     readme = _words(_read("README.md"))
 
-    assert "Agent libOS 1.5.1 stores durable runtime state" in documentation
+    assert "Agent libOS 1.5.2 stores durable runtime state" in documentation
     assert "## Strict store schema v7" in documentation
     assert "Product version and store schema version are independent" in documentation
     assert "The only supported migrations are the explicit, offline, operator-invoked canonical v4-to-v5, v5-to-v6, and v6-to-v7 procedures" in documentation

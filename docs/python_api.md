@@ -12,6 +12,7 @@ at the end of this page is part of the API contract.
 - [Use Runtime managers and primitives](#runtime-managers-and-primitives)
 - [Inspect semantic evidence and settlement](#semantic-evidence-control-and-settlement-boundary)
 - [Use JSON-RPC and MCP Host APIs](#json-rpc-and-mcp-host-apis)
+- [Inject provider protocols](#provider-protocols-and-injection)
 - [Handle common exceptions](#common-exceptions)
 - [Apply the compatibility boundary](#compatibility-boundary)
 - Return to the [documentation home](index.md).
@@ -380,11 +381,17 @@ Within the first layer, the complete public Host evidence/review surface is:
 | `runtime.semantic.query_health_events(*, after=None, limit=None, severity=None, code=None, epoch_id=None)` | keyset page `dict[str, Any]` |
 | `runtime.semantic.append_review_label(*, settlement_id, outcome, reviewer_id, evidence_sha256, reviewed_at=None)` | appended review-evidence `dict[str, Any]` |
 
-Paged queries are hard-bounded and keyset-paged. The
-omitted direct-Host limit uses `semantic.assessment_list_limit`; an explicit
-limit cannot exceed the smaller of `semantic.assessment_list_hard_limit` and
-500. The CLI and local HTTP API apply their stricter 50-row default and 100-row
-maximum.
+Paged queries are hard-bounded and keyset-paged, with three limit groups.
+Assessment queries (`query_assessments`) use `semantic.assessment_list_limit`
+as the omitted direct-Host default; flow queries (`query_flow_entities`,
+`query_flow_edges`, `query_flow_lineage`) use `semantic.flow_query_limit`; and
+settlement-family queries (`query_machine_settlements`, `query_policy_epochs`,
+`query_control_history`, `query_health_events`) use
+`semantic.settlement_list_limit`. In each group an explicit limit cannot
+exceed the smaller of the matching hard limit
+(`semantic.assessment_list_hard_limit`, `semantic.flow_query_hard_limit`, or
+`semantic.settlement_list_hard_limit`) and 500. The CLI and local HTTP API
+apply their stricter 50-row default and 100-row maximum.
 The returned mappings are payload-free projections containing typed findings,
 Shadow outcome, normalized Human observation, calibration, reserved nullable
 token/cost fields, and provenance digests. An external classifier may populate
@@ -599,6 +606,7 @@ from agent_libos.models.exceptions import (
 | `HumanApprovalRequired` / `HumanResponseRequired` | The operation is waiting for a durable Human decision or answer; the exception carries `request_id` |
 | `ProcessWaitRequired` / `ProcessMessageWaitRequired` | A resumable operation is waiting for a child process or process message |
 | `ResourceLimitExceeded` | A configured process or hierarchical resource budget would be exceeded |
+| `ProcessRevisionConflict` / `TaskRunRevisionConflict` / `TaskRunCommandConflict` | A compare-and-swap fence rejected the mutation: the expected process or Durable Task Run revision was stale, or a Task Run command id was reused for a different canonical request; retry with the current revision and the same command id under the revision/command-id contract in [Durable Task Runs](durable_task_runs.md) |
 | `GitError` | Stable typed Git failure; inspect `code`, `operation`, `retryable`, and bounded `details` |
 | `ProviderHostError` | Sanitized provider exception with `code`, `error_type`, and `correlation_id`; raw provider text is not part of the public error |
 | `UnsupportedStoreVersion` | The target store is not compatible with the strict current schema |
@@ -622,7 +630,7 @@ cannot silently abandon an owned store or partially assembled component graph.
 
 ## Compatibility boundary
 
-- Agent libOS 1.5.1 is experimental. The top-level `agent_libos.__all__` names
+- Agent libOS 1.5.2 is experimental. The top-level `agent_libos.__all__` names
   and the Runtime entrypoints documented here are the intended application
   import surface for this release. Pin the package version when depending on
   exact signatures or dataclass fields.

@@ -15,13 +15,21 @@ without implicitly changing what resources they can affect.
 ## In this guide
 
 - [Capability record](#capability-record)
+- [Rights](#rights)
 - [Resource matching](#resource-matching)
 - [Authorization API](#authorization-api)
+- [Authority rules and profiles](#authority-rules-and-profiles)
 - [Issue, delegate, and revoke](#issue-delegate-revoke)
 - [Permission policy and Human approval](#permission-policy-and-human-approval)
-- [Data release as separate authority](#data-release-is-separate-authority)
+- [Data release is separate authority](#data-release-is-separate-authority)
 - [Tool, Skill, and JIT boundary](#tool-skill-and-jit-boundary)
+- [Process messages](#process-messages)
+- [CLI and syscalls](#cli-and-syscalls)
+- [JSON-RPC authority](#json-rpc-authority)
+- [MCP authority](#mcp-authority)
 - [Filesystem authority](#filesystem-authority)
+- [Shell authority](#shell-authority)
+- [Git authority](#git-authority)
 - Return to the [documentation home](index.md).
 
 ## Capability Record
@@ -655,9 +663,9 @@ protected external read: a process needs both `read` and `execute` on the exact
 or turn an unsupported server capability into a Runtime capability.
 
 For `stdio` MCP transports, actor-mode server registration, protocol discovery,
-live tool refresh, and tool calls additionally require both `process:spawn`
-`write` and `execute`
-on the exact `mcp_stdio:<sha256>` launch resource. The hash covers the canonical
+live tool refresh, and tool calls additionally require `write` on
+`process:spawn` and `execute` on the exact `mcp_stdio:<sha256>` launch
+resource. The hash covers the canonical
 command, argv, environment mapping, and cwd, so a grant for one launch surface
 cannot authorize another. Registration authorizes persisting that surface;
 refresh and calls are the operations that actually start a local child process.

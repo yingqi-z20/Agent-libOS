@@ -27,6 +27,7 @@ extension without silently reinterpreting v1/v2.
 - Interpret results in [Call And Tool-List Results](#call-and-tool-list-results).
 - Operate and diagnose through the [CLI](#cli) and
   [Host DX workflow](#host-dx-workflow).
+- Review the projected surfaces in [Tools And Syscalls](#tools-and-syscalls).
 - Check lifecycle boundaries in [Persistence And Checkpoints](#persistence-and-checkpoints).
 
 Manifest schema, MCP wire protocol, SDK, product, and Store versions are
@@ -56,7 +57,7 @@ distribution metadata:
 | --- | --- | --- |
 | v1 legacy wire | `mcp` | `0.1.0` |
 | v2 governed Tools compatibility | `agent-libos` | `1.4.2` |
-| v3 exact `2026-07-28` | `agent-libos` | `1.5.1` |
+| v3 exact `2026-07-28` | `agent-libos` | `1.5.2` |
 
 The v1 and v2 values are frozen compatibility identities. Only exact-v3 uses
 the current modern product identity; changing the package version must never
@@ -352,7 +353,12 @@ status/begin/complete/revoke/logout, PKCE/state and token custody, while the
 transport receives only the selected access token through a private broker.
 An `auth_profile_id` cannot coexist with a manifest static `Authorization`
 header; that ambiguous dual-credential configuration is rejected during
-offline validation and registration, before provider work.
+offline validation and registration, before provider work. On dispatch, the
+selected access token reaches the governed transport only as the synthetic
+`AGENT_LIBOS_INTERNAL_MCP_OAUTH_TOKEN` entry inside that operation's
+provider-phase environment snapshot; a value supplied under that name through
+a manifest or the Host environment is rejected by the default env allowlists,
+and the entry is redacted like the underlying lease secrets.
 
 The optional `subscriptions` array is a closed subset of
 `toolsListChanged`, `promptsListChanged`, `resourcesListChanged`,
@@ -841,14 +847,21 @@ register/replace/unregister with the interval from that live compare through
 provider-call return; the runtime's single-writer store lease excludes a second
 supported Runtime writer from bypassing the in-process guard.
 
-Tool binding and model visibility are not authority. Built-in Images that
-support MCP bind the four server/Tool entries plus the two v3 Resource
-list/read entries in their complete process tool tables. Their Skill projection
-keeps those tools out of the model table until the exact
-`agent-libos-mcp` Skill is activated. Toolmaker and context-compressor do not
-bind these tools and cannot activate that immutable built-in Skill. Neither
-static binding nor later projection lets a process inspect or call a registered
-server without the matching capability.
+Tool binding and model visibility are not authority. With `DEFAULT_CONFIG`,
+the complete process tool tables for `base-agent:v0`, `coding-agent:v0`, and
+`review-agent:v0` bind the four server/Tool entries plus the two v3 Resource
+list/read entries. Their initial Skill projection contains only the five
+bootstrap tools, so none of these MCP schemas is initially model-visible;
+activating the exact `agent-libos-mcp` Skill projects them without changing
+Capability authority. The narrow direct `research-agent:v0`,
+`analysis-agent:v0`, and `operator-agent:v0` images expose the same six
+schemas at boot because their workflow domain is Host-selected in advance;
+calls still require the exact server/Tool or Resource Capability and Task
+Authority. `maintenance-agent:v0`, `toolmaker-agent:v0`, and
+`context-compressor:v0` do not bind these tools and cannot activate that
+immutable built-in Skill. Custom or committed Images may choose another
+complete table/projection. Neither static binding nor later projection lets a
+process inspect or call a registered server without the matching capability.
 
 ## Data-flow Sink
 
@@ -1276,6 +1289,16 @@ shipped at the repository root. The placeholder server/module and reserved
 HTTP hostname in the manifest examples will not make these commands a live
 remote demo.
 
+Exit status follows the structured envelope: every `mcp` subcommand prints its
+JSON result and then exits with status 1 when that envelope reports
+`ok: false` — for `mcp call` that includes `mcp_error` and `transport_error`
+results, so the printed JSON names the exact outcome. The parallel
+`jsonrpc call` command deliberately differs: it prints its
+`JsonRpcCallResult` and exits 0 even when the result carries `jsonrpc_error`
+or `transport_error`, because the structured result is the deliverable and
+scripts must inspect its `status`/`ok` fields rather than the exit code. The
+general CLI exit-code contract is described in [CLI](cli.md#mcp-commands).
+
 `mcp list` accepts `--text` and `--limit` and returns an envelope
 `{"servers": [...], "has_more": <bool>}`. `has_more: true` means the bounded
 window is incomplete; this command has no cursor, so narrow `--text` or raise
@@ -1413,6 +1436,15 @@ non-registerable candidate wrapper; an operator must edit/review it and run the
 separate `approve --confirm-review` transition before extracting a registerable
 manifest. Confirmation never bypasses Runtime Capability, data-flow, effect,
 or resource checks.
+
+Each workflow above is also available as a built-in `agent-libos mcp`
+subcommand (see the table earlier in this section): `mcp validate`,
+`mcp doctor`, and `mcp probe` take the manifest path; `mcp scaffold create`
+and `mcp scaffold approve` replace the flat `scaffold` and `approve` script
+modes; and `mcp export`, `mcp import plan`, and `mcp import apply` replace
+`export`, `import-plan`, and `import-one`. Both surfaces share the same
+`agent_libos.mcp.dx` implementation, confirmation flags, and
+reviewer/reason evidence.
 
 ## Tools And Syscalls
 

@@ -19,9 +19,13 @@ This is the exhaustive command and argument inventory for the checked-in
 use the [CLI Guide](cli.md). Defaults shown here are parser defaults; effective
 Runtime settings may additionally come from `DEFAULT_CONFIG`, `config.yaml`, or
 an explicit `--config` overlay as described in the
-[Configuration Guide](configuration.md). Usage wrapping and metavars are
-normalized across supported Python versions; every accepted option alias is
-listed in the Arguments tables.
+[Configuration Guide](configuration.md). For flags that store a constant
+(including inverse-named flags such as `--optional` and `--flag/--no-flag`
+pairs sharing one destination), the Default column shows `name=value`: the
+parser destination the flag writes and that destination's effective value when
+the flag is absent; passing the flag stores the flag's constant instead.
+Usage wrapping and metavars are normalized across supported Python versions;
+every accepted option alias is listed in the Arguments tables.
 """
 
 
@@ -51,9 +55,21 @@ def _required(action: argparse.Action) -> bool:
     return action.nargs not in {"?", "*"}
 
 
-def _default(action: argparse.Action) -> str:
+def _effective_default(parser: argparse.ArgumentParser, dest: str) -> object:
+    # Mirror argparse namespace initialization: the first action registered for
+    # a dest whose default is not SUPPRESS supplies the effective default.
+    for action in parser._actions:
+        if action.dest == dest and action.default is not argparse.SUPPRESS:
+            return action.default
+    return parser._defaults.get(dest)
+
+
+def _default(action: argparse.Action, parser: argparse.ArgumentParser) -> str:
     if action.default is argparse.SUPPRESS:
         return "—"
+    if isinstance(action, argparse._StoreConstAction) and action.option_strings:
+        effective = _effective_default(parser, action.dest)
+        return _code(f"{action.dest}={effective!r}")
     return _code(repr(action.default))
 
 
@@ -225,7 +241,7 @@ def _render_parser(parser: argparse.ArgumentParser) -> list[str]:
                     (
                         _code(syntax),
                         "yes" if _required(action) else "no",
-                        _default(action),
+                        _default(action, parser),
                         _markdown_text(action.help),
                     )
                 )

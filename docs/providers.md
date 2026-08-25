@@ -13,6 +13,15 @@ composition is `LocalResourceProviderSubstrate` from
 provider hooks during startup. Every real provider boundary must use the
 [`ProtectedOperationContract`](protected_operation_sdk.md) lifecycle.
 
+## In this guide
+
+- [Python composition boundary](#python-composition-boundary)
+- [Current provider inventory](#current-provider-inventory)
+- [Failure semantics](#failure-semantics)
+- [Registration and visibility](#registration-and-visibility)
+- [Provider extension checklist](#provider-extension-checklist)
+- Return to the [documentation home](index.md).
+
 ## Python composition boundary
 
 Import the public structural protocols and default composition from
@@ -208,7 +217,11 @@ and the configured privacy domain without a Run or process id. The only v2 TTL
 is `30m`, and it is mutually exclusive with legacy `prompt_cache_retention`.
 See the [OpenAI prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
 
-The maintenance, browser, and knowledge live evaluators accept
+The repository-maintenance
+(`experiments/run_durable_task_run_evaluation.py` and
+`experiments/run_long_horizon_evaluation.py`), browser
+(`experiments/run_browser_customer_flow_evaluation.py`), and knowledge
+(`experiments/run_knowledge_workflow_evaluation.py`) live evaluators accept
 `--prompt-layout`, and their redacted reports aggregate total input/output,
 cache reads, cache writes, uncached input, completion evidence, and forbidden
 Host-identifier counts. Build one arm from two or more provider reports with a

@@ -320,6 +320,19 @@ Tool Skills, and three console entry points: `agent-libos`,
 optional PTY module, and workspace Image/Skill packages remain checkout/source-
 archive assets rather than core-wheel contents.
 
+A published release version installs from a package index without a checkout:
+
+```bash
+pip install agent-libos
+# Optional integration extras mirror the source extras:
+pip install "agent-libos[mcp]"
+```
+
+A package install provides exactly the wheel contents and console entry points
+above. The repository assets listed above stay in the matching source checkout
+or source archive, and the package-index page's repository links point at that
+version's immutable `v<version>` tag rather than mutable `main`.
+
 Use the canonical page for every workflow beyond onboarding:
 
 | Task | Canonical page |

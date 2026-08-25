@@ -14,19 +14,29 @@ Several independent version namespaces coexist. Never infer one from another:
 
 | Namespace | Current value | What it versions |
 | --- | --- | --- |
-| Agent libOS product/package | `1.5.1` | Python package, aligned GUI package, release workflow, and current product contract |
+| Agent libOS product/package | `1.5.2` | Python package, aligned GUI package, release workflow, and current product contract |
 | RuntimeStore schema | `7` | Persisted SQL store shape accepted by ordinary Runtime startup |
 | GUI snapshot envelope | `3` | Same-build `GET /api/snapshot` response consumed by the bundled renderer |
 | GUI JSON Schema registry | `2` | The deliberately partial registry in [`gui_api_schema.json`](gui_api_schema.json); it describes selected v3 snapshot/API shapes and confirmed mutations, not a complete REST API |
 | MCP manifest | `1`, `2`, or `3` | Independent client manifest contracts; v1/v2 preserve governed Tool compatibility and v3 requires the exact `2026-07-28` protocol contract |
+| LLM prompt layout / prompt-cache | `legacy_v1`, `cache_optimized_v2` | `llm.prompt_layout` tokens plus the opt-in v2 prompt-cache transport (`prompt_cache_options`, the `30m` TTL, derived `alibos:v2:` keys); bare prompt-caching v2 in the docs means this namespace, not an MCP manifest version |
 | Runtime-safety benchmark task | `1` | Checked-in benchmark task YAML input |
 | Runtime-safety run output | `2` | One runner's persisted benchmark result/effect artifact |
 
 Checkpoint snapshots, image artifacts, events, semantic records, migration
 plans, and other payloads have additional local schema versions. A field named
 `schema_version` must always be interpreted in the type and subsystem that owns
-it. See [Storage](storage.md), [GUI](gui.md#api-contract-boundary),
-[MCP](mcp.md), and [Benchmark](benchmark.md) for their separate contracts.
+it. Subsystem-local values the Runtime currently declares beyond this map
+include task-run reference payloads (`1`), process tool completion-review and
+acknowledged-message reference payloads (`2`), prompt-cache release-gate
+reports (`1`), LLM provider traces (`1`), GUI-authored LLM user profiles
+(`1`), LLM context-memory snapshot and compaction records (`1`), and the
+public semantic-status projection (`3`). That last value shares its number
+with the unrelated GUI snapshot envelope `3` above; equal numbers across
+namespaces never imply a shared contract, and individual modules may declare
+further private marker versions. See [Storage](storage.md),
+[GUI](gui.md#api-contract-boundary), [MCP](mcp.md), and [Benchmark](benchmark.md)
+for their separate contracts.
 
 ## Runtime and execution
 
@@ -104,12 +114,32 @@ A progressively disclosed instruction/resource package that may change a
 process's prompt context and tool visibility. Activating a Skill is not a
 Capability grant. See [Skills](skills.md).
 
+### Tool Skill
+
+An immutable built-in Skill whose role is on-demand tool projection: it owns a
+fixed group of built-in static tools and supplies intent-focused guidance plus
+only the image-authorized tool schemas needed for the current task. Under an
+image's `tool_projection: skills` contract the model starts from a small
+bootstrap projection and reaches other tools through Tool Skill discovery and
+activation. Legacy Tool Group metadata is converted only by the explicit
+offline `agent-libos-migrate-tool-groups` migration. See
+[Tools and Deno/TypeScript JIT](tools_and_jit.md#on-demand-tool-skills).
+
 ### Tool
 
 A named, schema-validated action exposed through ToolBroker. A complete process
 tool table determines what can be called; the model projection is a potentially
 narrower visible subset. Visibility never substitutes for primitive authority.
 See [Tools and Deno/TypeScript JIT](tools_and_jit.md).
+
+### ToolBroker
+
+The trusted dispatcher for the complete process tool table. It validates every
+call against the exact registered schema and dispatches it to the owning tool
+implementation, while the model-facing projection may be narrower than the
+callable table. Passing broker validation is visibility mediation, not
+resource authority; the owning primitive still authorizes each effect. See
+[Tools and Deno/TypeScript JIT](tools_and_jit.md).
 
 ### JIT tool
 
@@ -194,6 +224,22 @@ activities, edges, monotonic label assertions, source references, and coverage
 without copying the underlying content. It is evidence for assessment and review,
 not an authority graph. See [Semantic Approval and Data Identification](semantic_shadow.md).
 
+### Provider contract namespace
+
+The set of provider primitive prefixes (`primitive.filesystem.`,
+`primitive.shell.`, `primitive.git.`, `primitive.jsonrpc.`,
+`primitive.mcp.`, `primitive.llm.`) whose operations qualify results for the
+digest contract. Six exist; `primitive.llm.` is the only one with no matching
+[semantic assessment domain](#semantic-assessment-domain). The word "domain"
+here is a namespace prefix, not the assessment filter below.
+
+### Semantic assessment domain
+
+The closed enum used by the semantic classifier, the CLI `--domain` filter, and
+the `by_domain` contract: `{filesystem, shell, git, jsonrpc, mcp, runtime,
+unknown}`. It omits `llm` and adds `runtime`/`unknown`, so it is not the same
+set as the provider contract namespaces despite the shared word "domain".
+
 ## Effects and evidence
 
 ### Primitive
@@ -217,6 +263,16 @@ A Host-visible causal record representing one logical Runtime action across its
 LLM, Tool, syscall, primitive, Capability, Human, provider, resource, event, and
 audit stages. An operation tree explains relationships; its existence does not
 authorize a future action. See [Explainable Operations](explainable_operations.md).
+
+### Protected operation
+
+An effectful Runtime action that must enter its owning trusted primitive or
+`agent_libos.sdk` boundary. That boundary enforces process identity, Capability
+reservation, Task Authority ceilings, policy, approval, data flow, budgets,
+provider-effect classification, and event/audit evidence as one fail-closed
+state machine. Tool or model visibility of the action is never a substitute
+for entering this boundary. See
+[Protected Operation SDK](protected_operation_sdk.md).
 
 ### External effect
 
