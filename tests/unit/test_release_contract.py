@@ -1203,15 +1203,19 @@ def test_mcp_durable_artifact_smoke_uses_installed_runtime_store_and_cli() -> No
         "first = Runtime.open(",
         "reopened = Runtime.open(",
         "first.mcp.call_tool(",
+        'prefix="agent-libos-installed-mrtr-workspace-"',
+        'prefix="agent-libos-installed-mrtr-store-"',
+        'database = store_path / "durable.sqlite"',
         '"continuations",',
         '"remote-tasks",',
-        "_assert_private_values_absent(root_path)",
+        "_assert_private_values_absent(store_path)",
         "if len(initial_provider.calls) != 4",
         "if continuation_provider.calls != 1",
         "tasks_provider.get_calls != 3",
         '"runtime-v3-durable-cli": _installed_smoke()',
     ):
         assert required in smoke
+    assert 'database = workspace_path / "durable.sqlite"' not in smoke
     assert "pytest.skip" not in smoke
 
 

@@ -430,10 +430,10 @@ def _grant_initial_authority(runtime: Runtime, pid: str) -> None:
         )
 
 
-def _assert_private_values_absent(root: Path) -> None:
+def _assert_private_values_absent(store_root: Path) -> None:
     store_bytes = b"".join(
         path.read_bytes()
-        for path in root.glob("durable.sqlite*")
+        for path in store_root.glob("durable.sqlite*")
         if path.is_file()
     )
     for value in _PRIVATE_VALUES:
@@ -569,9 +569,17 @@ def _installed_smoke() -> dict[str, Any]:
             f"environment: module={installed_module} prefix={installed_prefix}"
         )
 
-    with tempfile.TemporaryDirectory(prefix="agent-libos-installed-mrtr-") as root:
-        root_path = Path(root)
-        database = root_path / "durable.sqlite"
+    with (
+        tempfile.TemporaryDirectory(
+            prefix="agent-libos-installed-mrtr-workspace-"
+        ) as workspace_root,
+        tempfile.TemporaryDirectory(
+            prefix="agent-libos-installed-mrtr-store-"
+        ) as store_root,
+    ):
+        workspace_path = Path(workspace_root)
+        store_path = Path(store_root)
+        database = store_path / "durable.sqlite"
         broker = InMemoryMcpCredentialBroker()
         task_created_at: dict[str, str] = {}
         initial_provider = _InitialProvider(task_created_at)
@@ -588,7 +596,7 @@ def _installed_smoke() -> dict[str, Any]:
         first = Runtime.open(
             database,
             substrate=_substrate(
-                root_path,
+                workspace_path,
                 broker,
                 initial_provider,
                 continuation_provider,
@@ -655,11 +663,11 @@ def _installed_smoke() -> dict[str, Any]:
         finally:
             first.close()
 
-        _assert_private_values_absent(root_path)
+        _assert_private_values_absent(store_path)
         reopened = Runtime.open(
             database,
             substrate=_substrate(
-                root_path,
+                workspace_path,
                 broker,
                 initial_provider,
                 continuation_provider,
@@ -693,7 +701,7 @@ def _installed_smoke() -> dict[str, Any]:
         finally:
             reopened.close()
             broker.close()
-        _assert_private_values_absent(root_path)
+        _assert_private_values_absent(store_path)
         return {
             "protocol_revision": "2026-07-28",
             "initial_tool_calls": len(initial_provider.calls),
