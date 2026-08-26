@@ -339,9 +339,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.5.1-py3-none-any.whl dist/agent_libos-1.5.1.tar.gz
+  dist/agent_libos-1.5.2-py3-none-any.whl dist/agent_libos-1.5.2.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.5.1-py3-none-any.whl
+  dist/agent_libos-1.5.2-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 ```
 

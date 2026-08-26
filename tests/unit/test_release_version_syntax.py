@@ -114,7 +114,7 @@ def test_release_version_syntax_accepts_final_numeric_ascii_triplet(
 def test_release_version_accepts_only_the_current_target(tmp_path: Path) -> None:
     _write_aligned_release_metadata(tmp_path, RELEASE_TARGET_VERSION)
 
-    assert validate_version_alignment(tmp_path) == "1.5.1"
+    assert validate_version_alignment(tmp_path) == "1.5.2"
 
 
 @pytest.mark.parametrize("version", ["0.0.0", "1.4.2", "2.0.0", "10.20.30"])
@@ -124,7 +124,7 @@ def test_release_version_rejects_aligned_non_target_version(
 ) -> None:
     _write_aligned_release_metadata(tmp_path, version)
 
-    with pytest.raises(ValueError, match="target version must be exactly 1.5.1"):
+    with pytest.raises(ValueError, match="target version must be exactly 1.5.2"):
         validate_version_alignment(tmp_path)
 
 
@@ -157,56 +157,56 @@ def test_release_version_rejects_non_final_or_non_ascii_spelling(
     [
         (
             "experiments/agentdojo/uv.lock",
-            'version = "1.5.1"',
             'version = "1.5.2"',
+            'version = "1.5.3"',
             "experiments/agentdojo/uv.lock",
         ),
         (
             ".github/workflows/test.yml",
-            "agent_libos-1.5.1-py3-none-any.whl",
             "agent_libos-1.5.2-py3-none-any.whl",
+            "agent_libos-1.5.3-py3-none-any.whl",
             "RELEASE_WHEEL",
         ),
         (
             ".github/workflows/test.yml",
-            "agent_libos-1.5.1.tar.gz",
             "agent_libos-1.5.2.tar.gz",
+            "agent_libos-1.5.3.tar.gz",
             "RELEASE_SDIST",
         ),
         (
             "skills/swe-agent/SKILL.md",
-            "agent-libos==1.5.1",
             "agent-libos==1.5.2",
+            "agent-libos==1.5.3",
             "skills/swe-agent/SKILL.md",
         ),
         (
             "agent_libos/substrate/local.py",
-            'version="1.5.1"',
             'version="1.5.2"',
+            'version="1.5.3"',
             "MCP clientInfo",
         ),
         (
             "desktop/runtime-manifest.json",
-            '"version": "1.5.1"',
             '"version": "1.5.2"',
+            '"version": "1.5.3"',
             "desktop/runtime-manifest.json",
         ),
         (
             "scripts/check_desktop_artifacts.py",
-            'VERSION = "1.5.1"',
             'VERSION = "1.5.2"',
+            'VERSION = "1.5.3"',
             "scripts/check_desktop_artifacts.py",
         ),
         (
             "CHANGELOG.md",
-            "## 1.5.1",
             "## 1.5.2",
+            "## 1.5.3",
             "CHANGELOG.md current release",
         ),
         (
             "docs/release_status.md",
-            "Agent libOS 1.5.1 Status",
             "Agent libOS 1.5.2 Status",
+            "Agent libOS 1.5.3 Status",
             "docs/release_status.md",
         ),
     ],
@@ -251,8 +251,8 @@ def test_release_validation_rejects_desktop_artifact_name_drift(
     workflow = tmp_path / ".github" / "workflows" / "desktop-internal.yml"
     workflow.write_text(
         workflow.read_text(encoding="utf-8").replace(
-            "agent-libos-1.5.1-macos-arm64-internal-unsigned",
             "agent-libos-1.5.2-macos-arm64-internal-unsigned",
+            "agent-libos-1.5.3-macos-arm64-internal-unsigned",
         ),
         encoding="utf-8",
     )
@@ -276,7 +276,7 @@ def test_release_runbook_keeps_remote_version_uniqueness_out_of_local_checker() 
     )
     assert "re-check the complete PyPI project history" in normalized
     assert "intended remote's tags" in normalized
-    assert "pins the exact target `1.5.1`" in normalized
+    assert "pins the exact target `1.5.2`" in normalized
 
 
 def test_release_runbook_builds_local_preflight_in_a_fresh_directory() -> None:

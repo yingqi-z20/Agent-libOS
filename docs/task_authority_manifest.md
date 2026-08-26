@@ -5,6 +5,8 @@
 and a real user, workflow controller, or enterprise policy deciding what this
 particular task may receive.
 
+## Launch contract
+
 `runtime.launch_authority_mode` is fixed to `manifest_required`. Image
 `required_capabilities` are copied into the durable manifest as requirements
 for comparison and Explain output, but they are never granted. Only
@@ -44,6 +46,8 @@ ceilings. A fork derived from an implicit source records an empty model-request
 contract, so copied Host authority does not silently become requestable
 authority.
 
+## Implicit, explicit, and derived manifests
+
 Every launch receives a durable manifest record. When the Host does not supply
 an explicit template, the implicit record contains any capability specs the
 Host supplied through the launch `capabilities` argument; it is empty only when
@@ -68,6 +72,8 @@ authorized/requestable space, extend the parent expiry, or widen a concrete or
 deny-all effect ceiling to unrestricted `null` (or to patterns outside the
 parent's ceiling).
 
+## Model permission requests
+
 Model permission requests are checked against the manifest before a Human
 request is created. `approval_policy.requestable_capabilities` declares
 authority that may be requested but is not granted at launch; a Human decision
@@ -81,6 +87,8 @@ permission-request ceiling, never in the active Capability table. This lets the
 model plan one coherent request before an effect instead of learning the scope
 through a denied probe; the runtime remains the authority and rejects every
 out-of-ceiling request regardless of prompt behavior.
+
+## The bundled GUI as Host author
 
 The bundled GUI is one such Host author. Its visible task-access controls create
 an explicit manifest instead of inferring grants from the selected image. Every
@@ -97,6 +105,8 @@ other non-denied commands still require exact per-use Human approval. Both
 opt-ins are disabled by default, and requests outside the selected ceilings are
 rejected before a Human prompt.
 
+## Permitted provider effects
+
 `permitted_effects` is an additional provider-boundary ceiling with exact
 entries or terminal wildcards such as `jsonrpc.*`. Omitting the field or using
 JSON `null` preserves capability-only effect gating for compatibility. An
@@ -109,6 +119,8 @@ That deny-all ceiling also covers runtime-mediated LLM and Human provider
 effects owned by the process. The explicit `"*"` entry permits every current
 and future effect class and should be used only when that deliberately broad
 ceiling is intended.
+
+## Typed Git effects
 
 Typed Git defines five effect families: `git.read`, `git.mutate`, `git.fetch`,
 `git.push`, and `git.pull_request`. When a concrete effect ceiling is used, it
@@ -125,6 +137,8 @@ any filesystem paths, and the selected remote/PR resources. Mandatory
 destructive-operation approval remains necessary even when the effect family is
 within the manifest ceiling.
 
+## Durable effect-policy envelope
+
 The durable effect-policy envelope is schema version 2 so unrestricted `null`
 and deny-all `[]` cannot collapse during persistence. Legacy version 1 rows are
 upcast on read: their empty list retains its historical unrestricted meaning,
@@ -132,6 +146,8 @@ while every newly written manifest uses the tagged version 2 representation.
 Derived manifests inherit an omitted parent value. An unrestricted parent may
 be narrowed to any list, including deny-all; a concrete or deny-all parent
 cannot be widened back to unrestricted.
+
+## Per-use approval binding
 
 Per-use external-operation approval preallocates the eventual external
 `effect_id` and binds it with the canonical argument hash and target state

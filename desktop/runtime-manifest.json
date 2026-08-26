@@ -3,7 +3,7 @@
   "distribution_channel": "internal-unsigned",
   "product": {
     "name": "Agent libOS",
-    "version": "1.5.1",
+    "version": "1.5.2",
     "app_id": "io.agentlibos.desktop"
   },
   "toolchain": {

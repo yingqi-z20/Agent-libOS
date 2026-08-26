@@ -64,6 +64,7 @@ _TENANT = "tenant-canary-security"
 _PROFILE_ID = "semantic-canary-security"
 _MODEL = "semantic-canary-model"
 _RULE_ID = "canary-reports-read"
+_REAL_GIT_ASSESSMENT_TIMEOUT_S = 180.0
 
 
 class _SuccessfulSemanticClient:
@@ -379,6 +380,21 @@ def _git_rule(action_id: str) -> SemanticApprovalRule:
         authority_operation=action_id,
         resource="git:workspace",
         rights=(right,),
+    )
+
+
+def _real_git_canary_config(rule: SemanticApprovalRule) -> AgentLibOSConfig:
+    config = _canary_config(auto_approval_rules=(rule,))
+    # Live Git snapshots can exceed the production 30-second assessment window
+    # under loaded Windows xdist workers. These tests exercise exact Git
+    # binding and drift fences, not the deadline fallback.
+    return replace(
+        config,
+        semantic=replace(
+            config.semantic,
+            assessment_timeout_s=_REAL_GIT_ASSESSMENT_TIMEOUT_S,
+            job_lease_s=_REAL_GIT_ASSESSMENT_TIMEOUT_S,
+        ),
     )
 
 
@@ -808,7 +824,7 @@ def test_real_git_canary_exact_request_issues_consumes_and_succeeds(
     client = _SuccessfulSemanticClient()
     runtime = Runtime.open(
         tmp_path / f"{action_id}.sqlite",
-        config=_canary_config(auto_approval_rules=(rule,)),
+        config=_real_git_canary_config(rule),
         substrate=LocalResourceProviderSubstrate(workspace),
         semantic_tenant_bucketer=_tenant_bucket,
     )
@@ -948,7 +964,7 @@ def test_real_git_canary_drift_blocks_before_protected_provider_dispatch(
     rule = _git_rule("git.read")
     runtime = Runtime.open(
         tmp_path / f"git-drift-{drift}.sqlite",
-        config=_canary_config(auto_approval_rules=(rule,)),
+        config=_real_git_canary_config(rule),
         substrate=LocalResourceProviderSubstrate(workspace),
         semantic_tenant_bucketer=_tenant_bucket,
     )

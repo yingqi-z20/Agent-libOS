@@ -204,7 +204,11 @@ agent-libos --config config.yaml --db user payload-retention external_effect --a
 ```
 
 Use the returned `next_cursor.created_at` and `next_cursor.record_id` as
-`--after-created-at` and `--after-record-id` for the next page. Startup only
+`--after-created-at` and `--after-record-id` for the next page. An optional
+`--limit` bounds the page within the policy hard limit. `--actor` overrides the
+default `host.retention` actor identity, and `--correlation-id` attaches a
+Host-supplied correlation id; both are recorded on the audited maintenance
+summary. Startup only
 constructs the maintenance service; it never invokes a scan or mutation.
 
 Every call is bounded. A page is ordered by `(created_at, record_id)` and may

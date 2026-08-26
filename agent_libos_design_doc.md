@@ -3,7 +3,10 @@
 > **ARCHIVE — NOT A CURRENT CONTRACT.** This historical design archive is not the source of truth
 > for current behavior. Its early planned interfaces were
 > removed because they no longer matched the implementation and could be
-> mistaken for supported APIs.
+> mistaken for supported APIs. The retired archive content was last intact at
+> commit `1a267985c09ce9324747b4e14d8e38265a5f46f4` and was replaced by this
+> notice in commit `76ee42df4124bd491b95d88336335fd6a618c97f`; Git history is
+> the source for the full historical text.
 
 This notice is retained only so old links have an explicit migration path. Use
 the maintained references instead:

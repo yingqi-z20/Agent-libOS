@@ -1,6 +1,6 @@
 # Runtime Events
 
-Agent libOS 1.5.1 persists a closed catalog of `EventType` values. Events
+Agent libOS 1.5.2 persists a closed catalog of `EventType` values. Events
 are durable observations for operators, the GUI, context materialization, and
 Explain evidence. They are not an authority source, a task queue, or a
 replacement for the process, operation, capability, Human-request, or external-
@@ -110,6 +110,47 @@ The public query limit is positive and cannot exceed the import-time
 size. GUI snapshot filtering can hide
 `HUMAN_OUTPUT` events with `purpose=gui_presentation` and matching Human-GUI
 `DATA_FLOW_DECISION` rows; that filter does not delete the durable event.
+
+## Querying events
+
+Events have two supported read surfaces. In Python, `Runtime.events` is the
+`EventBus` facade and `EventBus.list()` is the query API. In the GUI, the SSE
+stream at `GET /api/events/stream` and the workspace views described in the
+[GUI guide](gui.md) consume the same durable rows. There is no `agent-libos
+events` CLI subcommand; the CLI exposes the related evidence surfaces through
+`audit` and `explain` instead.
+
+`EventBus.list()` accepts:
+
+| Parameter | Contract |
+| --- | --- |
+| `target` | Optional string identity filter. A target-filtered query returns exact-target events plus `target=null` broadcasts, as described for the envelope `target` field. |
+| `limit` | Optional positive integer bounded by the fixed query ceiling above. Omitting it returns the complete matching sequence. |
+| `before_event_id` | Opaque cursor selecting the ascending window before this id. Mutually exclusive with `after_event_id`. |
+| `after_event_id` | Opaque cursor selecting the next ascending window after this id. |
+| `include_gui_presentation` | Keyword-only boolean, default `True`. Passing `False` applies the GUI snapshot filter described above to this query result: `HUMAN_OUTPUT` events with `purpose=gui_presentation` and their matching Human-GUI `DATA_FLOW_DECISION` rows are hidden. The durable rows are unaffected. |
+
+A minimal Host polling consumer:
+
+```python
+from agent_libos import Runtime
+
+runtime = Runtime.open("local")
+try:
+    snapshot = runtime.events.list(limit=100)
+    cursor = snapshot[-1].event_id if snapshot else None
+    for event in snapshot:
+        print(event.created_at, event.type, event.source, event.target)
+    # A later poll returns only events persisted after the stored cursor.
+    if cursor is not None:
+        fresh = runtime.events.list(limit=100, after_event_id=cursor)
+        print(len(fresh), "new events")
+finally:
+    runtime.shutdown()
+```
+
+Persist the returned `event_id` as the cursor between invocations; an unknown
+cursor returns an empty page rather than failing.
 
 ## Idempotent publication
 

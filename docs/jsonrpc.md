@@ -435,6 +435,13 @@ any part fails, the old endpoint spec remains active. Unregistering an endpoint
 applies the same endpoint-specific invalidation in the same transaction, so
 reusing the same endpoint id cannot revive stale method authority.
 
+`jsonrpc call` prints the structured `JsonRpcCallResult` and exits with status
+0 even when that result carries `jsonrpc_error` or `transport_error`: the
+structured result is the command's deliverable, so scripts must inspect the
+printed `status`/`ok` fields rather than the exit code. The MCP group
+deliberately differs — `mcp` subcommands exit 1 when their envelope reports
+`ok: false`. See [CLI](cli.md#json-rpc-commands) for the full command contract.
+
 ## Tools And Syscalls
 
 LLM tool interfaces, when bound in the complete process table and projected into

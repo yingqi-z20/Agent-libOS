@@ -364,7 +364,7 @@ longer defines.
   pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
   typed boundaries compute the next state generation, preventing a direct-write
   rewind from reviving a stale token.
-- `v7-persisted-state-is-strict-and-versioned`: ordinary 1.5.1 Runtime startup
+- `v7-persisted-state-is-strict-and-versioned`: ordinary 1.5.2 Runtime startup
   accepts only the frozen version-7 physical schema (including Durable Task
   Run, typed process state, Human revision, semantic job/evidence state,
   FlowGraph, policy epochs, machine-settlement evidence, and sanitized MCP v3
@@ -598,8 +598,9 @@ longer defines.
   visible process; GUI-level omissions detected by lookahead remain explicit in
   `_truncated`, while stricter subsystem list maxima remain authoritative.
   Persisted indexed visibility flags exclude internal presentation evidence
-  before `LIMIT`; missing or malformed required 0.3 visibility state fails
-  closed instead of being repaired during open.
+  before `LIMIT`; missing or malformed required `gui_snapshot_visible` state
+  (the frozen schema-v7 store contract) fails closed instead of being
+  repaired during open.
 - `tool-observability-redacts-sensitive-payloads`: tool audit/event
   observability redacts known structured payload/credential keys plus recognized
   scalar credential forms, URI/DSN userinfo, and HTTP Cookie headers before it

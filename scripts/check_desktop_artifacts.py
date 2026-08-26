@@ -16,7 +16,7 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 CHANNEL = "internal-unsigned"
 APP_ID = "io.agentlibos.desktop"
 MAX_ARCHIVE_FILES = 50_000

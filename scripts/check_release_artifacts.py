@@ -23,7 +23,7 @@ from packaging.utils import canonicalize_name
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT_NAME = "agent-libos"
 ARCHIVE_NAME = "agent_libos"
-RELEASE_TARGET_VERSION = "1.5.1"
+RELEASE_TARGET_VERSION = "1.5.2"
 REPOSITORY_URL = "https://github.com/yingqi-z20/Agent-libOS"
 CORE_REQUIREMENTS = (
     "jsonschema<5,>=4.25.0",

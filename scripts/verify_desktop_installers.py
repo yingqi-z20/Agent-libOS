@@ -19,7 +19,7 @@ except ModuleNotFoundError:  # imported as scripts.verify_desktop_installers
     from scripts.smoke_desktop_bundle import _electron_smoke
 
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 
 def _single(paths: list[Path], label: str) -> Path:

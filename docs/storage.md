@@ -1,6 +1,6 @@
 # Runtime Storage
 
-Agent libOS 1.5.1 stores durable runtime state through a `UnitOfWork` composed of
+Agent libOS 1.5.2 stores durable runtime state through a `UnitOfWork` composed of
 explicit domain boundaries, including `ProcessRepository`,
 `ResourceRepository`, `RuntimePublicationRepository`,
 `SnapshotCheckpointRepository`, `RuntimeModuleRepository`,
@@ -126,11 +126,11 @@ this repository has a connection pool or concurrent per-Runtime transactions.
 
 ## Strict store schema v7
 
-Fresh databases created by Agent libOS 1.5.1 use store schema v7 and create a
+Fresh databases created by Agent libOS 1.5.2 use store schema v7 and create a
 `runtime_schema` table with one marker row; the canonical DDL constrains its
 `singleton` value to `1`. Opening an existing store requires the row selected
 by `singleton = 1` to contain schema version `7`. Product version and store
-schema version are independent identifiers: `1.5.1` is the current product
+schema version are independent identifiers: `1.5.2` is the current product
 release, while `7` is the persisted schema contract. Both backends apply
 the same acceptance rules, with one backend-specific initial probe order:
 
@@ -287,7 +287,7 @@ in order.
 There are no automatic migrations, backfills, read-only compatibility modes,
 or dual runtime schema paths. A v3
 database remains archive-only and must be opened with Agent libOS 1.0.1.
-Agent libOS 1.5.1 raises `UnsupportedStoreVersion` during ordinary Runtime
+Agent libOS 1.5.2 raises `UnsupportedStoreVersion` during ordinary Runtime
 preflight, before initialization, index creation, seed insertion, recovery,
 audit, or any other write. The same zero-write rule applies to v4/v5 before the
 matching offline migrator runs, older/unversioned stores, and malformed v7 stores.
@@ -456,10 +456,15 @@ The v5-to-v6 command is an offline administrative surface and is never imported
 or invoked by ordinary Runtime startup:
 
 ```bash
-uv run agent-libos --db <target> store migrate --to 6 --dry-run
+uv run agent-libos --db <target> store migrate --to 6 --dry-run \
+  --sqlite-backup <verified-v5-backup>
 uv run agent-libos --db <target> store migrate --to 6 --apply \
-  --expected-plan-sha256 <digest> <backup-confirmation-option>
+  --expected-plan-sha256 <digest> \
+  --sqlite-backup <verified-v5-backup>
 ```
+
+For PostgreSQL, omit the SQLite backup option and pass
+`--postgres-snapshot-confirmed` on apply.
 
 It uses the same safety protocol as the legacy migration below: stop all
 writers, establish an independent recovery point, validate the complete
@@ -536,8 +541,8 @@ Planning an already-v5/newer or pre-v4 store is not an idempotent “success”:
 planning accepts only an exact canonical v4 source. The narrower exception is
 an apply retry with the same schema-v2 plan and recovery evidence after an
 uncertain commit; an exact v5 migration result is reported as
-`already_applied=true`. See [CLI Reference](cli.md#offline-store-migration) for
-concrete commands.
+`already_applied=true`. See [the CLI guide](cli.md#offline-store-migration)
+for concrete commands.
 
 On POSIX, SQLite apply additionally requires both source and independent backup
 to be current-user-owned, single-link regular files with exact mode `0600`.
@@ -1036,7 +1041,7 @@ Before either backend is backed up:
    not proceed from a recovery-required or incomplete shutdown result.
 4. Record the Agent libOS product version, backend configuration, and the value
    of `runtime_schema.schema_version`. For this release the expected pair is
-   product `1.5.1`, store schema `7`.
+   product `1.5.2`, store schema `7`.
 5. Prepare an owner-only backup directory and run the dump-producing command
    under `umask 077`. Before accepting either backend's archive, verify it is a
    regular, current-user-owned, single-link file with mode `0600`.
@@ -1219,7 +1224,7 @@ persistent target. Do not edit capability, trust, label, decision, or evidence
 rows directly; supported mutations must publish their coupled generation and
 audit/event evidence.
 
-See [Configuration Reference](configuration.md) for library and product
-configuration precedence, [CLI Reference](cli.md) for backend selection, and
+See [the configuration guide](configuration.md) for library and product
+configuration precedence, [the CLI guide](cli.md) for backend selection, and
 [Architecture](architecture.md) for the authority, evidence, primitive, and
 Runtime dependency boundaries.

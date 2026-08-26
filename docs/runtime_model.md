@@ -485,9 +485,9 @@ The current built-in image contracts are:
 | `base-agent:v0` | General runtime work and coordination | 5 Skill lifecycle/bootstrap schemas | configured Human write |
 | `coding-agent:v0` | Repository inspection, editing, Git, and verification | 5 Skill lifecycle/bootstrap schemas | configured Human write and workspace read |
 | `maintenance-agent:v0` | Durable repository maintenance with a fixed reproduce/edit/test/Git/checkpoint/delivery contract | 13 narrow direct schemas | configured Human write and workspace read |
-| `research-agent:v0` | Source-backed evidence collection and synthesis across local and Host-registered integrations | 30 narrow direct schemas | configured Human write and workspace read |
-| `analysis-agent:v0` | Reproducible data analysis with explicit quality and verification gates | 23 narrow direct schemas | configured Human write and workspace read |
-| `operator-agent:v0` | Transactional customer/enterprise workflows with read-back-before-replay recovery | 23 narrow direct schemas | configured Human write |
+| `research-agent:v0` | Source-backed evidence collection and synthesis across local and Host-registered integrations | 32 narrow direct schemas | configured Human write and workspace read |
+| `analysis-agent:v0` | Reproducible data analysis with explicit quality and verification gates | 25 narrow direct schemas | configured Human write and workspace read |
+| `operator-agent:v0` | Transactional customer/enterprise workflows with read-back-before-replay recovery | 25 narrow direct schemas | configured Human write |
 | `review-agent:v0` | Evidence-first review; read-only unless repair is explicitly requested | 5 Skill lifecycle/bootstrap schemas | configured Human write and workspace read |
 | `toolmaker-agent:v0` | Import-free Deno/TypeScript JIT proposal, validation, and registration | 5 Skill lifecycle/bootstrap schemas | configured Human write |
 | `context-compressor:v0` | Structured context compaction | `process_exit` only | none |

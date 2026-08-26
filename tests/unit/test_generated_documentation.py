@@ -267,13 +267,32 @@ def test_generated_cli_reference_matches_every_parser_command_and_option() -> No
             expected_required = bool(action.required) if action.option_strings else (
                 action.nargs not in {"?", "*"}
             )
-            expected_default = (
-                "—"
-                if action.default is argparse.SUPPRESS
-                else "`"
-                + repr(action.default).replace("|", "\\|").replace("`", "\\`")
-                + "`"
-            )
+            if action.default is argparse.SUPPRESS:
+                expected_default = "—"
+            elif isinstance(
+                action,
+                (argparse._StoreConstAction, argparse.BooleanOptionalAction),
+            ) and action.option_strings:
+                effective = next(
+                    (
+                        candidate.default
+                        for candidate in parser._actions
+                        if candidate.dest == action.dest
+                        and candidate.default is not argparse.SUPPRESS
+                    ),
+                    parser._defaults.get(action.dest),
+                )
+                expected_default = (
+                    "`"
+                    + f"{action.dest}={effective!r}".replace("|", "\\|").replace("`", "\\`")
+                    + "`"
+                )
+            else:
+                expected_default = (
+                    "`"
+                    + repr(action.default).replace("|", "\\|").replace("`", "\\`")
+                    + "`"
+                )
             assert row[1] == ("yes" if expected_required else "no")
             assert row[2] == expected_default
 
@@ -283,6 +302,49 @@ def test_generated_cli_reference_matches_every_parser_command_and_option() -> No
             for command in action.choices:
                 escaped = str(command).replace("|", "\\|").replace("`", "\\`")
                 assert f"| `{escaped}` |" in section
+
+
+def test_generated_cli_reference_reports_effective_defaults_for_inverse_flags() -> None:
+    # Regression: store_false flags such as `task-run follow-up --optional`
+    # and shared-dest mutually exclusive pairs such as `exec --run/--no-run`
+    # and BooleanOptionalAction pairs must report the destination they write
+    # and its effective parser default, not the raw per-action default with
+    # inverted polarity.
+    rendered = render_cli_reference()
+    follow_up = rendered.split("## `agent-libos task-run follow-up`", 1)[1].split(
+        "\n## ", 1
+    )[0]
+    optional_row = next(
+        line for line in follow_up.splitlines() if line.startswith("| `--optional`")
+    )
+    assert "| `required=True` |" in optional_row
+
+    exec_section = rendered.split("## `agent-libos exec`", 1)[1].split("\n## ", 1)[0]
+    run_row = next(
+        line for line in exec_section.splitlines() if line.startswith("| `--run`")
+    )
+    no_run_row = next(
+        line for line in exec_section.splitlines() if line.startswith("| `--no-run`")
+    )
+    assert "| `run=False` |" in run_row
+    assert "| `run=False` |" in no_run_row
+
+    preserve_memory_row = next(
+        line
+        for line in exec_section.splitlines()
+        if line.startswith("| `--preserve-memory, --no-preserve-memory`")
+    )
+    assert "| `preserve_memory=True` |" in preserve_memory_row
+
+    grant_section = rendered.split("## `agent-libos capabilities grant`", 1)[1].split(
+        "\n## ", 1
+    )[0]
+    revocable_row = next(
+        line
+        for line in grant_section.splitlines()
+        if line.startswith("| `--revocable, --no-revocable`")
+    )
+    assert "| `revocable=True` |" in revocable_row
 
 
 def test_generated_cli_index_matches_unique_top_level_sections() -> None:
@@ -528,3 +590,40 @@ def test_pypi_readme_rewrites_only_repository_relative_and_mutable_links() -> No
 def test_pypi_readme_rejects_nonportable_repository_links(target: str) -> None:
     with pytest.raises(ValueError, match="portable|safe"):
         render_pypi_readme(f"[bad]({target})\n", version="1.2.3")
+
+
+def test_pypi_readme_pins_quickstart_clone_to_release_tag() -> None:
+    source = "git clone https://github.com/yingqi-z20/Agent-libOS.git\n"
+    rendered = render_pypi_readme(source, version="1.2.3")
+
+    assert (
+        "git clone --branch v1.2.3 https://github.com/yingqi-z20/Agent-libOS.git"
+        in rendered
+    )
+    assert "git clone https://github.com/yingqi-z20/Agent-libOS.git" not in rendered
+
+
+def test_pypi_readme_pins_clone_with_target_directory() -> None:
+    source = "git clone https://github.com/yingqi-z20/Agent-libOS.git agentlibos\n"
+    rendered = render_pypi_readme(source, version="1.2.3")
+
+    assert (
+        "git clone --branch v1.2.3 https://github.com/yingqi-z20/Agent-libOS.git agentlibos"
+        in rendered
+    )
+
+
+@pytest.mark.parametrize(
+    "repository",
+    (
+        "https://github.com/other/repo.git",
+        "https://github.com/yingqi-z20/Agent-libOS-fork.git",
+        "https://github.com/yingqi-z20/Agent-libOS.git-mirror",
+    ),
+)
+def test_pypi_readme_does_not_pin_foreign_clone(repository: str) -> None:
+    source = f"git clone {repository}\n"
+    rendered = render_pypi_readme(source, version="1.2.3")
+
+    assert f"git clone {repository}" in rendered
+    assert "--branch" not in rendered

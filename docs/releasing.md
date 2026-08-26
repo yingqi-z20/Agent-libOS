@@ -95,7 +95,7 @@ not contact a package index or inspect remote Git references. It also verifies
 that every tracked ordinary source file belongs to the exact sdist
 include/exclude partition; an unclassified top-level file blocks the build
 until a maintainer makes an explicit inclusion decision. For this release
-line it additionally pins the exact target `1.5.1`; a future release must
+line it additionally pins the exact target `1.5.2`; a future release must
 intentionally update that target and its regression contract rather than
 passing merely because stale identifiers agree with one another. Immediately
 before publication authorization, the human owner must re-check the complete
@@ -265,7 +265,7 @@ other cells marked as environment gates are not made true by deterministic CI.
 If a release claim includes one, obtain and bind its documented clean-source
 receipt before authorization.
 
-For the 1.5.1 internal desktop candidate, native packaging is a separate
+For the 1.5.2 internal desktop candidate, native packaging is a separate
 manual workflow (`.github/workflows/desktop-internal.yml`). It builds only on
 the three locked native runners, uploads Actions artifacts for 14 days, and has
 read-only repository permission. Its macOS artifact is ad-hoc signed and not
@@ -312,6 +312,22 @@ git show --no-patch --decorate "v${RELEASE_VERSION}"
 TAG_COMMIT="$(git rev-list -n 1 "v${RELEASE_VERSION}")"
 test "$TAG_COMMIT" = "$RELEASE_COMMIT"
 git push origin "v${RELEASE_VERSION}"
+```
+
+The pushed tag is a hard upload gate, not merely an earlier step. The wheel
+and sdist long description pin every repository link to `/blob/v<version>/`,
+so an index upload before that exact tag exists on the public remote publishes
+a package page whose pinned repository links all fail. Before any TestPyPI or production upload,
+verify that the remote tag resolves to the recorded release commit, and stop
+if it does not:
+
+```bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+REMOTE_TAG_COMMIT="$(git ls-remote --tags origin \
+  "refs/tags/v${RELEASE_VERSION}^{}" | cut -f1)"
+test "$REMOTE_TAG_COMMIT" = "$RELEASE_COMMIT"
 ```
 
 For a first publication or packaging change, the owner may upload the same

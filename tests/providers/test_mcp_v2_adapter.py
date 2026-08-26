@@ -243,7 +243,7 @@ def test_governed_v3_request_ids_do_not_repeat_across_sdk_sessions() -> None:
         metadata = discover.params["_meta"]
         assert metadata["io.modelcontextprotocol/clientInfo"] == {
             "name": "agent-libos",
-            "version": "1.5.1",
+            "version": "1.5.2",
         }
         assert metadata["io.modelcontextprotocol/clientCapabilities"][
             "elicitation"

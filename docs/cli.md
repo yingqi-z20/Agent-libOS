@@ -11,14 +11,24 @@ in sync with the parser.
 ## In this guide
 
 - [Configure the store, models, and startup modules](#configuration-file)
-- [Find a command and understand common output](#top-level-commands)
-- [Operate processes](#persistent-runtime-basics), [workflows](#workflow-run),
-  [TaskRuns](#durable-task-runs), and [ObjectTasks](#object-tasks)
+- [Find a command and understand common output](#top-level-commands) and
+  [exit codes and error envelopes](#exit-codes-and-error-output)
+- [Operate processes](#persistent-runtime-basics), including
+  [interactive run](#interactive-run), [messages](#process-messages),
+  [builtins](#process-builtins), [resources](#process-resources), and
+  [checkpoints](#checkpoint-commands)
+- [Run workflows](#workflow-run), [TaskRuns](#durable-task-runs),
+  [ObjectTasks](#object-tasks), and [Skills](#skill-commands)
 - [Author](#agentimage-packages) and [manage AgentImages](#image-commands)
 - [Inspect or administer Capabilities](#capability-commands)
+- [Inspect evidence](#explainable-operations), [LLM calls](#llm-calls),
+  [payload retention](#payload-retention), and
+  [semantic review data](#semantic-inspection-and-review-evidence)
+- [Bind launch authority manifests](#task-authority-manifest-at-launch)
 - [Use JSON-RPC](#json-rpc-commands), [MCP](#mcp-commands), and
   [startup Runtime Modules](#runtime-module-commands)
-- [Run evaluation and example scripts](#benchmark-scripts)
+- [Migrate legacy stores offline](#offline-store-migration)
+- Run [evaluation](#benchmark-scripts) and [example scripts](#example-scripts)
 - Return to the [documentation home](index.md).
 
 The package installs the `agent-libos` command.
@@ -33,8 +43,10 @@ one-time migration command for legacy stores. It defaults to a rolled-back dry
 run and is not a normal Runtime control surface; see [Tool Skills](tools_and_jit.md).
 
 Use `--db` to select a runtime store. The reserved `user` target resolves to
-the persistent `~/.agent-libos/runtime/agent-libos.sqlite`; it is also the
-default when `--db` is omitted. The `local` and `:memory:` sentinels are
+the persistent `~/.agent-libos/runtime/agent-libos.sqlite`; under the default
+configuration it is also the target used when `--db` is omitted, but a config
+overlay can select another target or a PostgreSQL DSN (see
+[Configuration File](#configuration-file)). The `local` and `:memory:` sentinels are
 in-memory SQLite. Any other filesystem path creates or opens a persistent
 SQLite database, provided it is outside the effective model-visible workspace.
 A `postgresql://` or `postgres://` DSN opens a PostgreSQL runtime store.
@@ -58,7 +70,8 @@ to no scheduler run and to dropping external capabilities, and a bare
 Runtime domain errors are printed as a stable JSON object with
 `schema_version`, `error.type`, and `error.message`, and exit with status 1;
 the installed command does not expose a Python traceback for ordinary user
-errors.
+errors. See [Exit codes and error output](#exit-codes-and-error-output) for the
+complete status contract.
 
 ## Configuration File
 
@@ -80,7 +93,8 @@ JSON-type boundary. In particular, an ordinary integer or float config field
 may coerce YAML `true`/`false` to `1`/`0`; do not use booleans as numeric
 configuration values. Fields declared with `StrictInt` or `StrictFloat` reject
 that coercion, and numeric bounds still receive explicit post-construction
-validation. See [Configuration](configuration.md#loading-and-precedence) for
+validation. See
+[Configuration](configuration.md#loading-and-precedence) for
 the authoritative strict-field groups. For the exhaustive path, input-type,
 default, and unit inventory, use the
 [generated configuration field reference](configuration_reference.md).
@@ -278,6 +292,50 @@ uv run agent-libos --db user capabilities --actor-pid <actor_pid> grant <subject
 uv run agent-libos --db user checkpoint --actor-pid <actor_pid> inspect <checkpoint_id>
 ```
 
+## Exit Codes and Error Output
+
+Successful structured commands print one JSON document and exit with status 0.
+Two command-interface exceptions also exit with status 0 but print plain text:
+`init` prints `initialized <target>`, and any `--help` invocation prints its
+argparse usage/help text. The status contract for everything else is stable:
+
+- Runtime domain errors (`LibOSError` subclasses, including validation and
+  authority failures) are printed as the stable JSON envelope with
+  `schema_version`, `error.type`, and `error.message`, and exit with status 1.
+  A not-found evidence id in `explain` prints the same envelope shape with
+  `error.type: NotFound` and also exits with status 1.
+- Argument-parser usage failures (a missing required argument or an invalid
+  subcommand choice) follow the argparse convention: the usage message goes to
+  stderr and the command exits with status 2.
+- Usage failures detected by the CLI after parsing, such as a malformed
+  `--args-json`/`--arguments-json` object or mutually exclusive options used
+  together, print their plain message without the JSON envelope and exit with
+  status 1.
+- `workflow run` prints the tool result JSON even when it is `ok: false`, then
+  exits with status 1.
+- `mcp` operations print the structured result exactly once; a returned
+  `ok: false` result exits with status 1 and the provider call is not retried.
+- `explain` prints the explicit causal-root candidates for an ambiguous
+  evidence id and exits with status 2, sharing that status with parser usage
+  failures. Its stdout still carries the JSON candidate list, so automation
+  distinguishes the two cases by the printed output.
+- `jsonrpc call` deliberately exits 0 even when the delivered result carries
+  `status: jsonrpc_error`, `http_error`, or `transport_error`: the JSON-RPC
+  response or transport-failure envelope was delivered and printed as the
+  command's output. Callers must inspect the printed `status` and `ok` fields
+  rather than the shell status.
+- `task-run`, `object-task`, and the other structured management commands exit
+  0 for successful structured responses, including waiting states and
+  `needs_attention`; only a runtime domain error moves them to status 1.
+
+Scripts should treat status 1 as "read the printed error envelope or usage
+message", status 2 as "either a parser usage error or, from `explain`, an
+ambiguous id whose candidate list was printed", and status 0 as success. Parse
+the status-0 output as JSON for structured commands; handle the documented
+`init` acknowledgement and `--help` output as plain text. When collecting
+failure evidence, record the exact command, exit status, and the stable error
+`type`; see [Troubleshooting](troubleshooting.md).
+
 ## Persistent Runtime Basics
 
 The current Runtime opens only store schema v7. A canonical schema-v6 database
@@ -336,11 +394,11 @@ resource when that setting changes.
 
 `run` uses the high-level runtime scheduler, so human terminal messages are
 processed as part of runtime execution. Without `--max-quanta`, it uses
-`runtime.run_until_idle_max_quanta`; the checked-in config may bound that value.
-Only a configured `null` value means run until the Runtime becomes idle without
-a quantum limit. Pass `--max-quanta <n>` to set an explicit bound on the total
-number of LLM/tool quanta across all runnable processes. Interactive run,
-`exec --run`, and `message --run` use the same default.
+`runtime.run_until_idle_max_quanta`; the checked-in config leaves that value
+`null`, so a bare run executes until the Runtime becomes idle without a quantum
+limit. Pass `--max-quanta <n>` to set an explicit bound on the total number of
+LLM/tool quanta across all runnable processes and to bound provider token
+spend. Interactive run, `exec --run`, and `message --run` use the same default.
 
 `cd <pid> <path>` requires filesystem `read` authority for the selected
 directory. Explicit working directories for child processes and PTY creation
@@ -654,7 +712,7 @@ Useful leaf options are:
 | Command | Durable controls |
 | --- | --- |
 | `start` | Exactly one of `--goal`/`--goal-json`, required `--title`, optional Image/launch/authority/deadline/retention fields, stable `--client-request-id`, and explicit `--run [--max-quanta N] [--run-command-id ID]`; launch JSON accepts only `capabilities`, `resource_budget`, `working_directory`, and `llm_profile_id` and must not contain credentials |
-| `list` | Repeated or comma-separated `--status`, opaque `--cursor`, and bounded `--limit` |
+| `list` | Repeated or comma-separated `--status` over the closed status set (`queued`, `running`, `waiting_human`, `waiting_process`, `waiting_message`, `waiting_tool`, `paused`, `cancelling`, `finalizing`, `needs_attention`, `succeeded`, `failed`, `cancelled`), opaque `--cursor`, and bounded `--limit`; an unknown status value is rejected with the valid list |
 | `wait` | Optional finite `--timeout`; it has no run command id because it never mutates or dispatches |
 | `recovery-options` | Read-only, server-derived recovery choices for the Run; use the returned opaque `option_id` with `recover` |
 | `pause` / `resume` | Required `--expected-revision`; optional stable `--command-id` is generated for a one-shot invocation when omitted |
@@ -1004,8 +1062,14 @@ replacement goal.
 `cd` checks `read` on the exact canonical directory resource; the first grant
 above covers the checked-in `agent_libos/` directory. An exec that changes the
 image checks `read` on `image:<target_image_id>`, which is why the example grants
-the review image explicitly. Exec preserves Object Memory by default, drops
-external capabilities by default, and does not run unless `--run` is present.
+the review image explicitly: that target names an already-registered image id.
+When the exec target is an image package directory instead, the CLI loads and
+registers it as Host admin (no image capability is required for the load) and
+automatically grants the target pid `read` on the resulting `image:<id>`
+resource, recording `cli` as the issuer; the explicit `capabilities grant` is
+needed only for already-registered image ids. Exec preserves Object Memory by
+default, drops external capabilities by default, and does not run unless `--run`
+is present.
 Here `--no-preserve-memory` replaces any stale prior view with the live goal,
 while `--preserve-capabilities` keeps the Host-issued directory, image, and
 Human grants needed by the new process. Those grants satisfy and narrow the
@@ -1024,8 +1088,10 @@ Useful exec options:
   `runtime.run_until_idle_max_quanta`, whose `null` value means unbounded until
   idle.
 
-Exec never grants target-image `required_capabilities` automatically. If the
-target is an image package, its `workspace/` seed is materialized into a private
+Exec never grants a target image's declared `required_capabilities`
+automatically; the automatic grant described above covers only the image `read`
+authority needed to exec into a freshly loaded package. If the target is an
+image package, its `workspace/` seed is materialized into a private
 per-process directory under `image.materialized_workspace_root` (by default
 `agent_outputs/image_workspaces/`). For any target image, `required_modules` are
 checked before boot; the runtime must already have loaded each declared

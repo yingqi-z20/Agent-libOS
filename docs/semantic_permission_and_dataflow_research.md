@@ -1,5 +1,7 @@
 # 基于语义的自动权限审批与数据流识别：前期调研与落地建议
 
+> **HISTORICAL, COMMIT-PINNED PRE-IMPLEMENTATION RESEARCH** (baseline `dd46f1d5ec439f3539605fd41c7b8938971f45a6`, surveyed 2026-08-03).<br>
+> Not a current contract; see [Semantic Approval and Data Identification](semantic_shadow.md) for current semantic capabilities.<br>
 > 调研日期：2026-08-03<br>
 > 仓库基线：`dd46f1d5ec439f3539605fd41c7b8938971f45a6`（调研时工作区存在其他未提交修改）<br>
 > 适用对象：Agent libOS 的运行时、Capability、Human approval、Protected Operation、Object Memory、provider 与审计子系统<br>

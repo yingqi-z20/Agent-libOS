@@ -24,7 +24,7 @@ def test_desktop_runtime_manifest_locks_exact_internal_toolchain() -> None:
     assert manifest["distribution_channel"] == "internal-unsigned"
     assert manifest["product"] == {
         "name": "Agent libOS",
-        "version": "1.5.1",
+        "version": "1.5.2",
         "app_id": "io.agentlibos.desktop",
     }
     assert manifest["toolchain"] == {
@@ -59,7 +59,7 @@ def test_desktop_build_metadata_and_scripts_use_exact_versions_and_no_publish() 
     config = (ROOT / "gui" / "electron-builder.yml").read_text(encoding="utf-8")
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
-    assert package["version"] == "1.5.1"
+    assert package["version"] == "1.5.2"
     assert package["devDependencies"]["electron"] == "43.2.0"
     assert package["devDependencies"]["electron-builder"] == "26.15.3"
     assert lock["packages"]["node_modules/electron"]["version"] == "43.2.0"
@@ -96,17 +96,17 @@ def test_internal_desktop_workflow_is_manual_native_and_artifact_only() -> None:
 
 
 def test_desktop_release_names_are_exact_for_three_native_targets() -> None:
-    assert finalizer._package_names("1.5.1", "darwin-arm64") == (
-        "Agent-libOS-1.5.1-macos-arm64.dmg",
-        "Agent-libOS-1.5.1-macos-arm64.zip",
+    assert finalizer._package_names("1.5.2", "darwin-arm64") == (
+        "Agent-libOS-1.5.2-macos-arm64.dmg",
+        "Agent-libOS-1.5.2-macos-arm64.zip",
     )
-    assert finalizer._package_names("1.5.1", "win32-x64") == (
-        "Agent-libOS-Setup-1.5.1-windows-x64.exe",
-        "Agent-libOS-1.5.1-windows-x64.zip",
+    assert finalizer._package_names("1.5.2", "win32-x64") == (
+        "Agent-libOS-Setup-1.5.2-windows-x64.exe",
+        "Agent-libOS-1.5.2-windows-x64.zip",
     )
-    assert finalizer._package_names("1.5.1", "linux-x64") == (
-        "Agent-libOS-1.5.1-linux-x64.AppImage",
-        "Agent-libOS-1.5.1-linux-x64.tar.gz",
+    assert finalizer._package_names("1.5.2", "linux-x64") == (
+        "Agent-libOS-1.5.2-linux-x64.AppImage",
+        "Agent-libOS-1.5.2-linux-x64.tar.gz",
     )
 
 
@@ -133,15 +133,15 @@ def test_desktop_helpers_reject_broad_output_and_unsafe_archive_paths(tmp_path: 
 
 
 def test_editable_checkout_receipt_is_removed_from_frozen_metadata(tmp_path: Path) -> None:
-    metadata = tmp_path / "_internal" / "agent_libos-1.5.1.dist-info"
+    metadata = tmp_path / "_internal" / "agent_libos-1.5.2.dist-info"
     metadata.mkdir(parents=True)
     (metadata / "direct_url.json").write_text(
         '{"url":"file:///private/checkout","dir_info":{"editable":true}}',
         encoding="utf-8",
     )
     (metadata / "RECORD").write_text(
-        "agent_libos-1.5.1.dist-info/direct_url.json,sha256=abc,1\n"
-        "agent_libos-1.5.1.dist-info/METADATA,sha256=def,2\n",
+        "agent_libos-1.5.2.dist-info/direct_url.json,sha256=abc,1\n"
+        "agent_libos-1.5.2.dist-info/METADATA,sha256=def,2\n",
         encoding="utf-8",
     )
 
@@ -155,8 +155,8 @@ def test_desktop_finalizer_removes_unpublished_update_and_debug_metadata(
     tmp_path: Path,
 ) -> None:
     for name in (
-        "Agent-libOS-1.5.1-macos-arm64.zip.blockmap",
-        "Agent-libOS-1.5.1-macos-arm64.dmg.blockmap",
+        "Agent-libOS-1.5.2-macos-arm64.zip.blockmap",
+        "Agent-libOS-1.5.2-macos-arm64.dmg.blockmap",
         "builder-debug.yml",
         "builder-effective-config.yaml",
     ):
@@ -176,7 +176,7 @@ def test_desktop_sbom_requires_runtime_mcp_keyring_electron_deno_and_python(
     components = [
         {"name": name, "version": version}
         for name, version in {
-            "agent-libos": "1.5.1",
+            "agent-libos": "1.5.2",
             "CPython": "3.11.15",
             "Deno": "2.9.5",
             "electron": "43.2.0",
@@ -190,7 +190,7 @@ def test_desktop_sbom_requires_runtime_mcp_keyring_electron_deno_and_python(
         "metadata": {
             "component": {
                 "name": "Agent libOS",
-                "version": "1.5.1",
+                "version": "1.5.2",
                 "properties": [
                     {
                         "name": "agent-libos:distribution-channel",

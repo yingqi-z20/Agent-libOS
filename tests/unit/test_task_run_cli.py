@@ -344,6 +344,42 @@ def test_task_run_parser_exposes_the_exact_supported_subcommands() -> None:
     )
 
 
+def test_task_run_list_status_filter_is_bound_to_the_status_enum() -> None:
+    # Regression: the closed status-filter set, the --status help text, and
+    # the rejection message must all be derived from TaskRunStatus so the
+    # valid values are discoverable without reading source code.
+    from agent_libos.api.cli import _TASK_RUN_STATUSES, _task_run_status_filters
+
+    assert _TASK_RUN_STATUSES == {status.value for status in models.TaskRunStatus}
+
+    parser, _args_namespace = _parse_cli_args(["task-run", "list"])
+    task_run_action = next(
+        action
+        for action in parser._actions
+        if getattr(action, "dest", None) == "command"
+    )
+    task_run_parser = task_run_action.choices["task-run"]
+    command_action = next(
+        action
+        for action in task_run_parser._actions
+        if getattr(action, "dest", None) == "task_run_command"
+    )
+    list_parser = command_action.choices["list"]
+    status_action = next(
+        action
+        for action in list_parser._actions
+        if getattr(action, "dest", None) == "statuses"
+    )
+    for status in models.TaskRunStatus:
+        assert status.value in status_action.help
+
+    with pytest.raises(ValidationError) as excinfo:
+        _task_run_status_filters(["queued,not_a_status"])
+    assert "not_a_status" in str(excinfo.value)
+    for status in models.TaskRunStatus:
+        assert status.value in str(excinfo.value)
+
+
 def test_task_run_list_passes_bounded_status_filters_and_cursor() -> None:
     runtime = _runtime()
 

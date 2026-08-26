@@ -427,10 +427,12 @@ and only a bounded canonical Host digest can create ingress evidence. The
 generic digest accepts only exact `None`, `bool`, `int`, finite `float`, `str`,
 `bytes`, and `bytearray` values; `StrEnum`; exact `list`/`tuple`; exact `dict`
 with exact string keys; and allowlisted Host dataclasses under a 4,096-node/256
-KiB ceiling. Filesystem, Shell, Git, JSON-RPC, MCP, and LLM are the six core
-provider domains that may use the 500,000-node/64 MiB incremental path; that
-path accepts only exact built-in values, Host-owned module-bound string-valued
-enums, and Host-bound allowlisted dataclasses. The allowlisted `LLMCompletion`
+KiB ceiling. The six provider contract namespaces (Filesystem, Shell, Git, JSON-RPC, MCP, and LLM; `primitive.filesystem.*` through `primitive.llm.*`) may use the 500,000-node/64 MiB incremental path;
+that path accepts only exact built-in values, Host-owned module-bound
+string-valued enums, and Host-bound allowlisted dataclasses. These contract
+namespaces are distinct from the semantic assessment `domain` filter values
+(`filesystem`, `shell`, `git`, `jsonrpc`, `mcp`, `runtime`, `unknown`). The
+allowlisted `LLMCompletion`
 binds only normalized Runtime-consumed fields; raw provider objects, hidden
 reasoning, provider options/trace, and attempt state are outside this identity
 and local-DLP path.

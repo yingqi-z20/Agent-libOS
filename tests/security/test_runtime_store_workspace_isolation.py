@@ -701,8 +701,14 @@ def test_resolved_user_store_keeps_home_and_secure_directory_frozen(
     try:
         expected_directory = original_home / ".agent-libos" / "runtime"
         assert Path(store.path) == expected_directory / "agent-libos.sqlite"
-        assert stat.S_IMODE(os.stat(original_home / ".agent-libos").st_mode) == 0o700
-        assert stat.S_IMODE(os.stat(expected_directory).st_mode) == 0o700
+        assert (original_home / ".agent-libos").is_dir()
+        assert expected_directory.is_dir()
+        if os.name == "posix":
+            assert (
+                stat.S_IMODE(os.stat(original_home / ".agent-libos").st_mode)
+                == 0o700
+            )
+            assert stat.S_IMODE(os.stat(expected_directory).st_mode) == 0o700
         assert not (changed_home / ".agent-libos").exists()
     finally:
         store.close()

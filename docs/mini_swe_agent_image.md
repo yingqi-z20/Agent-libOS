@@ -1,10 +1,14 @@
 # mini-swe-agent Image
 
+## Package overview
+
 `images/mini-swe-agent/` is a package-only AgentImage inspired by the single
 `bash` tool-call shape historically associated with mini-swe-agent's
 `mini.yaml`. The model sees one `bash` tool with a required `command` string and
 an optional `submit` boolean. This package does not claim drop-in or versioned
 compatibility with an unpinned upstream revision.
+
+## Validate and register
 
 ```bash
 uv run agent-libos --db user images validate images/mini-swe-agent
@@ -19,11 +23,15 @@ silently omitting the `bash` tool. Executing the tool separately requires the
 Host Shell provider to resolve and permit a usable `bash` executable because
 the mediated command is `bash -lc ...`; Deno itself does not supply Bash.
 
+## Prompt mode and transcript persistence
+
 This image uses `prompt_mode: image_only`. Every LLM turn therefore requires
 `llm.persist_full_io: true`, the default, so the Runtime can retain and validate
 the lossless native assistant/tool transcript. With
 `llm.persist_full_io: false`, boot may register the image, but execution fails
 closed before LLM provider dispatch rather than falling back to a lossy prompt.
+
+## CLI store selection
 
 The CLI loads the project-root `config.yaml` when it is present. In this
 checkout that configuration selects `user`, so omitting `--db` persists the
@@ -35,6 +43,8 @@ directory and are rejected inside the effective workspace; use `user` or an
 absolute external path when invocations must select the same store independently
 of local configuration.
 
+## Tool surface
+
 The package uses `prompt_mode: image_only`, `jit_tool_exposure: direct`, and
 `default_tools: []`. At boot, the image package registers one process-local JIT
 tool named `bash`; it does not expose `process_exit`, Object Memory, or other
@@ -42,6 +52,8 @@ builtin tools to the model. If `submit` is `true` and the shell command exits
 successfully, the JIT wrapper calls the internal `process.exit` syscall with
 the same bounded structured observation returned by the tool. It never copies
 an oversized raw shell result into the final process payload.
+
+## Shell mediation boundary
 
 The wrapper runs:
 
@@ -60,6 +72,8 @@ the Bash subprocess. A Host executing untrusted code must put the Shell
 provider or workspace behind an explicit container, WASM, VM, service-provider,
 or comparable filesystem/network isolation boundary.
 
+## Bounds and contract tests
+
 The wrapper uses a 30 second shell timeout, a 32,768-Unicode-code-point command limit, and a
 10,000-code-point observation window. The JSON Schema validator and TypeScript
 wrapper use the same unit, so astral characters such as emoji count once and
@@ -73,6 +87,8 @@ shell syscall, a failed final submission, and propagation of upstream shell
 truncation, plus the rule that a non-zero command cannot submit, before
 registering the tool.
 
+## Required capability declarations
+
 The package declares required capabilities for workspace filesystem read/write
 and shell execute authority. Bootstrap validates and records those declarations
 in the task authority manifest, and exposes any unsatisfied entries through
@@ -81,6 +97,8 @@ not launch gates or grants: missing entries do not prevent spawn/boot, and the
 declarations do not create live authority. A Host or benchmark runner must still
 grant the spawned process the filesystem and shell authority it should have for
 the task.
+
+## Observation and submission semantics
 
 Every command observation propagates `stdout_truncated` and
 `stderr_truncated` from the shell primitive. `output_incomplete` is true when
@@ -104,6 +122,8 @@ the shell command succeeds but the final process-exit syscall fails, the tool
 returns a non-zero observation that retains the same bounded command-output and
 truncation evidence and reports the submission failure; it does not claim
 completion.
+
+## Compatibility scope
 
 The compatibility scope is intentionally only the local single-tool idea. Key
 Agent libOS-specific behavior includes:

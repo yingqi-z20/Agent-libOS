@@ -1,6 +1,6 @@
 {
   "name": "agent-libos-gui",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "Agent libOS self-contained internal desktop distribution",
   "author": "Agent libOS contributors",
   "private": true,

@@ -30,12 +30,14 @@ Deno visible without changing Electron's own environment.
 ## In this guide
 
 - [Complete a first task](#first-task-user-path)
+- [Review the architecture](#architecture)
 - [Develop and test the GUI](#development)
 - [Build the internal desktop distribution](#self-contained-internal-desktop-distribution)
 - [Understand the user and operator workspace](#current-workspace)
 - [Inspect semantic evidence](#semantic-panel)
 - [Review high-risk operations](#high-risk-operations)
 - [Use the API contract boundary and summary](#api-contract-boundary)
+- [Consult the API summary](#api-summary)
 - Return to the [documentation home](index.md).
 
 ## First task: user path
@@ -126,8 +128,12 @@ request and its later approved/rejected/cancelled version each produce a
 The GUI server is not a separate process-effect boundary. It is an
 authenticated local Host/admin authority boundary over the same primitives,
 Capability checks, human approval flow, events, and audit records used by the
-CLI. Possession of its bearer token authorizes the documented Host/admin
-routes; actor-mode routes instead use the selected process's authority. Its
+CLI. Possession of its bearer token authorizes every Host/admin route the
+server dispatches, not only the endpoints enumerated in this guide's API
+Summary. The server dispatch table is the authoritative route inventory; the
+machine-readable [GUI API contract subset](gui_api_schema.json) is a partial
+payload contract and must not be used to infer which routes exist.
+Actor-mode routes instead use the selected process's authority. Its
 Python entrypoint lives under
 `agent_libos.api.gui` with the CLI because both are host-facing API surfaces.
 Only a bearer token holder on the same machine can use it; CORS is limited to
@@ -273,8 +279,9 @@ uv run python scripts/test_matrix.py --lane gui
 ```
 
 The browser end-to-end suite also needs the lock-installed Playwright package
-and its version-matched Chromium binary. `npm ci` above installs the JavaScript
-package; it does not download the browser executable. For CI/Linux parity,
+and its version-matched Chromium binary. The `npm --prefix gui ci` step below
+installs the JavaScript package; it does not download the browser executable.
+For CI/Linux parity,
 install both Chromium and its operating-system dependencies before running the
 suite:
 
@@ -327,14 +334,21 @@ The development Electron smoke path can be run headlessly with
 `AGENT_LIBOS_GUI_SMOKE=1`. By default it verifies the Electron main process,
 Python GUI server startup, authenticated `/api/health`, and graceful shutdown
 against an in-memory `local` store without creating a BrowserWindow. Smoke
-logging redacts the temporary bearer token. Set
+logging redacts the temporary bearer token. `AGENT_LIBOS_GUI_SMOKE_PERSIST=1`
+instead starts the server against the persistent default store target (`user`
+from a checkout, the packaged user-data database in the internal desktop
+smoke). `AGENT_LIBOS_GUI_SMOKE_LOG=<path>` additionally appends every smoke
+JSON log line to that file, and `AGENT_LIBOS_GUI_SMOKE_USER_DATA=<dir>`
+relocates the Electron user-data directory (by default
+`gui/.smoke-user-data` in a checkout, or a per-process temp directory when
+packaged); the native desktop smoke sets all three. Set
 `AGENT_LIBOS_GUI_SMOKE_WINDOW=1` when a machine has a working desktop/GPU stack
 and you specifically want to exercise the production Vite build through the
 custom-protocol BrowserWindow, its API origin, and the preload bridge.
 
 ## Self-contained internal desktop distribution
 
-Agent libOS 1.5.1 also has a manually triggered, internal-only native desktop
+Agent libOS 1.5.2 also has a manually triggered, internal-only native desktop
 build for macOS arm64, Windows x64, and Ubuntu 24.04/glibc x64. The exact
 runtime closure is Electron 43.2.0, a PyInstaller 6.21.0 one-folder sidecar
 built with CPython 3.11.15, Agent libOS with the complete MCP extra (including
@@ -789,8 +803,9 @@ operations before invoking the runtime:
 - JSON-RPC endpoint registration and method calls,
 - MCP server registration, unregistration, and tool calls,
 - accepting an MCP Prompt preview as untrusted user context, OAuth login/logout,
-  Elicitation continuation response/cancellation, remote Task update/cancellation,
-  and subscription start/stop,
+  OAuth profile add/replace/remove, Elicitation continuation
+  response/cancellation, remote Task update/cancellation, and subscription
+  start/stop,
 - Skill registration, activation, and unload,
 - Durable Task Run cancellation and evidence-constrained recovery.
 
@@ -865,8 +880,10 @@ machine-readable [GUI API contract subset v2](gui_api_schema.json)
 deliberately covers the snapshot's required top-level collections, the minimal
 process/scheduler shape and TaskRun launch availability consumed during
 bootstrap, redacted Task Run
-summary/detail state, the JSON error envelope, and payloads for every operation
-that the server gates with explicit confirmation.
+summary/detail state, the JSON error envelope, payloads for every operation
+that the server gates with explicit confirmation, and the Host-only MCP v3
+operation request payloads and result projections (the
+`mcp_v3_host_operations` scope).
 `GET /api/snapshot` emits `schema_version: 3`; this same-build renderer rejects
 older snapshot shapes instead of treating summary-only LLM state or Task Run
 state as an empty collection. Version 3 replaces full LLM rows in snapshot/SSE
@@ -901,6 +918,13 @@ same-build implementation details and must be changed together with their
 server handlers and GUI tests.
 
 ## API Summary
+
+This summary lists important endpoints, but it is deliberately not exhaustive
+and is not the authorization inventory: the bearer token authorizes every
+route the server dispatches. Treat the server dispatch table as the
+authoritative route inventory; the machine-readable [contract
+registry](gui_api_schema.json) validates only the documented subset described
+above.
 
 Important endpoints:
 
@@ -942,7 +966,7 @@ Important endpoints:
   Collection, ledger, and Human pages accept opaque `cursor` values and return
   `next_cursor`; clients must not parse or synthesize them. The embedded
   requirements page also returns `next_cursor`. Requirement changes are linked
-  ledger items, and 1.5.1 has no independent Task Run requirements or wait HTTP
+  ledger items, and 1.5.2 has no independent Task Run requirements or wait HTTP
   route.
 - `POST /api/task-runs/{run_id}/run|pause|resume|cancel|follow-ups|recover|rerun`.
   Every existing-Run mutation carries a command id and expected revision.
