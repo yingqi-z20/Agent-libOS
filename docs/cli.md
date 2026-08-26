@@ -294,8 +294,10 @@ uv run agent-libos --db user checkpoint --actor-pid <actor_pid> inspect <checkpo
 
 ## Exit Codes and Error Output
 
-Successful commands print one JSON document and exit with status 0. The status
-contract for everything else is stable:
+Successful structured commands print one JSON document and exit with status 0.
+Two command-interface exceptions also exit with status 0 but print plain text:
+`init` prints `initialized <target>`, and any `--help` invocation prints its
+argparse usage/help text. The status contract for everything else is stable:
 
 - Runtime domain errors (`LibOSError` subclasses, including validation and
   authority failures) are printed as the stable JSON envelope with
@@ -328,9 +330,11 @@ contract for everything else is stable:
 
 Scripts should treat status 1 as "read the printed error envelope or usage
 message", status 2 as "either a parser usage error or, from `explain`, an
-ambiguous id whose candidate list was printed", and status 0 as "parse the
-printed JSON". When collecting failure evidence, record the exact command, exit
-status, and the stable error `type`; see [Troubleshooting](troubleshooting.md).
+ambiguous id whose candidate list was printed", and status 0 as success. Parse
+the status-0 output as JSON for structured commands; handle the documented
+`init` acknowledgement and `--help` output as plain text. When collecting
+failure evidence, record the exact command, exit status, and the stable error
+`type`; see [Troubleshooting](troubleshooting.md).
 
 ## Persistent Runtime Basics
 

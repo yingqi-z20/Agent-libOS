@@ -853,7 +853,7 @@ usage: agent-libos exec [-h] image goal --pid PID [--llm-profile LLM_PROFILE]
 | `--llm-profile LLM_PROFILE` | no | `None` | Optional host-selected LLM profile id for the existing process. |
 | `--replace-image` | no | `replace_image=False` | Allow an image package to replace an existing image id. |
 | `--args-json ARGS_JSON` | no | `'{}'` | JSON object recorded as structured exec args. |
-| `--preserve-memory, --no-preserve-memory` | no | `True` | Keep the current MemoryView across exec. Use --no-preserve-memory to replace it with the new goal only. |
+| `--preserve-memory, --no-preserve-memory` | no | `preserve_memory=True` | Keep the current MemoryView across exec. Use --no-preserve-memory to replace it with the new goal only. |
 | `--preserve-capabilities` | no | `preserve_capabilities=False` | Keep existing external capabilities. Exec never grants target image required_capabilities automatically. |
 | `--run` | no | `run=False` | Run the scheduler after exec. |
 | `--no-run` | no | `run=False` | Only apply exec; do not run the scheduler. |
@@ -1299,7 +1299,7 @@ usage: agent-libos capabilities grant [-h] subject resource
 | `--rights {read,write,execute,link,diff,materialize,delete,grant,revoke,approve,admin} [{read,write,execute,link,diff,materialize,delete,grant,revoke,approve,admin} ...]` | yes | `None` | One or more CapabilityRight values to grant or delegate. |
 | `--effect {allow,deny,ask}` | no | `'allow'` | Effect of the granted/delegated right; defaults to allow. |
 | `--delegable` | no | `delegable=False` | — |
-| `--revocable, --no-revocable` | no | `True` | — |
+| `--revocable, --no-revocable` | no | `revocable=True` | — |
 | `--uses-remaining USES_REMAINING` | no | `None` | — |
 | `--expires-at EXPIRES_AT` | no | `None` | — |
 | `--constraints-json CONSTRAINTS_JSON` | no | `'{}'` | Capability constraint JSON object. |
@@ -1329,7 +1329,7 @@ usage: agent-libos capabilities delegate [-h] parent child resource
 | `--rights {read,write,execute,link,diff,materialize,delete,grant,revoke,approve,admin} [{read,write,execute,link,diff,materialize,delete,grant,revoke,approve,admin} ...]` | yes | `None` | One or more CapabilityRight values to grant or delegate. |
 | `--effect {allow,deny,ask}` | no | `'allow'` | Effect of the granted/delegated right; defaults to allow. |
 | `--delegable` | no | `delegable=False` | — |
-| `--revocable, --no-revocable` | no | `True` | — |
+| `--revocable, --no-revocable` | no | `revocable=True` | — |
 | `--uses-remaining USES_REMAINING` | no | `None` | — |
 | `--expires-at EXPIRES_AT` | no | `None` | — |
 | `--constraints-json CONSTRAINTS_JSON` | no | `'{}'` | Capability constraint JSON object. |

@@ -48,12 +48,12 @@ gate.
 
 ## 1.5.1
 
-`1.5.1` is the current stabilization release version aligned across the Python
-project, package lockfiles, GUI package, MCP client identity, desktop metadata,
-and release workflows. It preserves the Runtime authority and data-flow
-semantics while hardening first-run behavior, offline migration reconciliation,
-terminal-owner cleanup, live-evaluation evidence recomputation, and release
-artifact validation.
+`1.5.1` was the preceding stabilization release version aligned across the
+Python project, package lockfiles, GUI package, MCP client identity, desktop
+metadata, and release workflows. It preserves the Runtime authority and
+data-flow semantics while hardening first-run behavior, offline migration
+reconciliation, terminal-owner cleanup, live-evaluation evidence recomputation,
+and release artifact validation.
 
 The source distribution now uses an explicit include/exclude partition. Its
 checker rejects ordinary source files outside that partition and validates the

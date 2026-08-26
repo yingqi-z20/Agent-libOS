@@ -130,8 +130,9 @@ authenticated local Host/admin authority boundary over the same primitives,
 Capability checks, human approval flow, events, and audit records used by the
 CLI. Possession of its bearer token authorizes every Host/admin route the
 server dispatches, not only the endpoints enumerated in this guide's API
-Summary; the server dispatch table and the machine-readable [GUI API contract
-subset](gui_api_schema.json) registry are the definitive route inventory.
+Summary. The server dispatch table is the authoritative route inventory; the
+machine-readable [GUI API contract subset](gui_api_schema.json) is a partial
+payload contract and must not be used to infer which routes exist.
 Actor-mode routes instead use the selected process's authority. Its
 Python entrypoint lives under
 `agent_libos.api.gui` with the CLI because both are host-facing API surfaces.
@@ -920,9 +921,10 @@ server handlers and GUI tests.
 
 This summary lists important endpoints, but it is deliberately not exhaustive
 and is not the authorization inventory: the bearer token authorizes every
-route the server dispatches. Treat the server dispatch table and the
-machine-readable [contract registry](gui_api_schema.json) as the definitive
-route inventory.
+route the server dispatches. Treat the server dispatch table as the
+authoritative route inventory; the machine-readable [contract
+registry](gui_api_schema.json) validates only the documented subset described
+above.
 
 Important endpoints:
 

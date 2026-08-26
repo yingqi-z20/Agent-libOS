@@ -269,7 +269,10 @@ def test_generated_cli_reference_matches_every_parser_command_and_option() -> No
             )
             if action.default is argparse.SUPPRESS:
                 expected_default = "—"
-            elif isinstance(action, argparse._StoreConstAction) and action.option_strings:
+            elif isinstance(
+                action,
+                (argparse._StoreConstAction, argparse.BooleanOptionalAction),
+            ) and action.option_strings:
                 effective = next(
                     (
                         candidate.default
@@ -304,8 +307,9 @@ def test_generated_cli_reference_matches_every_parser_command_and_option() -> No
 def test_generated_cli_reference_reports_effective_defaults_for_inverse_flags() -> None:
     # Regression: store_false flags such as `task-run follow-up --optional`
     # and shared-dest mutually exclusive pairs such as `exec --run/--no-run`
-    # must report the destination they write and its effective parser default,
-    # not the raw per-action default with inverted polarity.
+    # and BooleanOptionalAction pairs must report the destination they write
+    # and its effective parser default, not the raw per-action default with
+    # inverted polarity.
     rendered = render_cli_reference()
     follow_up = rendered.split("## `agent-libos task-run follow-up`", 1)[1].split(
         "\n## ", 1
@@ -324,6 +328,23 @@ def test_generated_cli_reference_reports_effective_defaults_for_inverse_flags() 
     )
     assert "| `run=False` |" in run_row
     assert "| `run=False` |" in no_run_row
+
+    preserve_memory_row = next(
+        line
+        for line in exec_section.splitlines()
+        if line.startswith("| `--preserve-memory, --no-preserve-memory`")
+    )
+    assert "| `preserve_memory=True` |" in preserve_memory_row
+
+    grant_section = rendered.split("## `agent-libos capabilities grant`", 1)[1].split(
+        "\n## ", 1
+    )[0]
+    revocable_row = next(
+        line
+        for line in grant_section.splitlines()
+        if line.startswith("| `--revocable, --no-revocable`")
+    )
+    assert "| `revocable=True` |" in revocable_row
 
 
 def test_generated_cli_index_matches_unique_top_level_sections() -> None:
@@ -592,9 +613,17 @@ def test_pypi_readme_pins_clone_with_target_directory() -> None:
     )
 
 
-def test_pypi_readme_does_not_pin_foreign_clone() -> None:
-    source = "git clone https://github.com/other/repo.git\n"
+@pytest.mark.parametrize(
+    "repository",
+    (
+        "https://github.com/other/repo.git",
+        "https://github.com/yingqi-z20/Agent-libOS-fork.git",
+        "https://github.com/yingqi-z20/Agent-libOS.git-mirror",
+    ),
+)
+def test_pypi_readme_does_not_pin_foreign_clone(repository: str) -> None:
+    source = f"git clone {repository}\n"
     rendered = render_pypi_readme(source, version="1.2.3")
 
-    assert "git clone https://github.com/other/repo.git" in rendered
+    assert f"git clone {repository}" in rendered
     assert "--branch" not in rendered

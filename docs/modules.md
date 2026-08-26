@@ -615,7 +615,7 @@ manifest/source hashes, entrypoint, registered surfaces, and metadata, by
 exact module id:
 
 ```bash
-uv run agent-libos --db local modules inspect example-module:v0
+uv run agent-libos --db local modules inspect agent-libos-pty:v0
 ```
 
 On a Host whose configuration does not already list that manifest, pass

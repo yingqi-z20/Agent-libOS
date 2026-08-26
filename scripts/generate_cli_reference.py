@@ -67,7 +67,10 @@ def _effective_default(parser: argparse.ArgumentParser, dest: str) -> object:
 def _default(action: argparse.Action, parser: argparse.ArgumentParser) -> str:
     if action.default is argparse.SUPPRESS:
         return "—"
-    if isinstance(action, argparse._StoreConstAction) and action.option_strings:
+    if isinstance(
+        action,
+        (argparse._StoreConstAction, argparse.BooleanOptionalAction),
+    ) and action.option_strings:
         effective = _effective_default(parser, action.dest)
         return _code(f"{action.dest}={effective!r}")
     return _code(repr(action.default))

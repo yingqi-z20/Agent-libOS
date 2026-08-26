@@ -17,7 +17,9 @@ _GENERATED_HEADER = (
 )
 _MARKDOWN_LINK = re.compile(r"(?P<prefix>!?\[[^\]]*\]\()(?P<target>[^)]+)(?P<suffix>\))")
 _FINAL_VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
-_PROJECT_CLONE = re.compile(r"git clone " + re.escape(REPOSITORY_URL) + r"(?:\.git)?")
+_PROJECT_CLONE = re.compile(
+    r"git clone " + re.escape(REPOSITORY_URL) + r"(?:\.git)?(?=\s|\Z)"
+)
 
 
 def _project_version(root: Path) -> str:
