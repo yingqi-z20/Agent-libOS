@@ -862,11 +862,31 @@ def test_windows_sink_rejects_case_rename_after_authorization(
     authorized = provider.resolve("victim.TXT")
     assert authorized.relative == "Victim.txt"
 
-    with pytest.raises(CapabilityDenied, match="changed during validation"):
+    with pytest.raises(
+        CapabilityDenied,
+        match="changed while its parent was guarded",
+    ):
         provider.read_bytes(authorized)
 
     assert provider.renamed is True
-    assert (root / "VICTIM.TXT").read_text(encoding="utf-8") == "protected"
+    assert [path.name for path in root.iterdir()] == ["Victim.txt"]
+    assert (root / "Victim.txt").read_text(encoding="utf-8") == "protected"
+
+    pre_entry_root = tmp_path / "pre-entry-case-workspace"
+    pre_entry_root.mkdir()
+    pre_entry_target = pre_entry_root / "Victim.txt"
+    pre_entry_target.write_text("protected", encoding="utf-8")
+    pre_entry_provider = LocalFilesystemProvider(pre_entry_root)
+    pre_entry_authorized = pre_entry_provider.resolve("Victim.txt")
+    intermediate = pre_entry_target.with_name("rename-intermediate.tmp")
+    pre_entry_target.rename(intermediate)
+    intermediate.rename(pre_entry_target.with_name("VICTIM.TXT"))
+
+    with pytest.raises(CapabilityDenied, match="changed during validation"):
+        pre_entry_provider.read_bytes(pre_entry_authorized)
+
+    assert [path.name for path in pre_entry_root.iterdir()] == ["VICTIM.TXT"]
+    assert (pre_entry_root / "VICTIM.TXT").read_text(encoding="utf-8") == "protected"
 
 
 @pytest.mark.platform_windows
@@ -896,12 +916,38 @@ def test_windows_read_rejects_same_spelling_file_id_rebind(tmp_path: Path) -> No
     provider = RebindBeforeOpenProvider(root)
     authorized = provider.resolve("Victim.txt")
 
-    with pytest.raises(CapabilityDenied):
+    with pytest.raises(
+        CapabilityDenied,
+        match="changed while its parent was guarded",
+    ):
         provider.read_bytes(authorized)
 
     assert provider.rebound is True
-    assert victim.read_text(encoding="utf-8") == "replacement"
-    assert (root / "original-victim.txt").read_text(encoding="utf-8") == "authorized"
+    assert victim.read_text(encoding="utf-8") == "authorized"
+    assert not (root / "original-victim.txt").exists()
+
+    pre_entry_root = tmp_path / "pre-entry-read-workspace"
+    pre_entry_root.mkdir()
+    pre_entry_victim = pre_entry_root / "Victim.txt"
+    pre_entry_victim.write_text("authorized", encoding="utf-8")
+    pre_entry_provider = LocalFilesystemProvider(pre_entry_root)
+    pre_entry_authorized = pre_entry_provider.resolve("Victim.txt")
+    _windows_replace_file(
+        pre_entry_victim,
+        pre_entry_root / "original-victim.txt",
+        "replacement",
+    )
+
+    with pytest.raises(
+        CapabilityDenied,
+        match="object identity changed after authorization",
+    ):
+        pre_entry_provider.read_bytes(pre_entry_authorized)
+
+    assert pre_entry_victim.read_text(encoding="utf-8") == "replacement"
+    assert (pre_entry_root / "original-victim.txt").read_text(
+        encoding="utf-8"
+    ) == "authorized"
 
 
 @pytest.mark.platform_windows
@@ -931,11 +977,35 @@ def test_windows_state_rejects_same_spelling_file_id_rebind(tmp_path: Path) -> N
     provider = RebindAtStateProvider(root)
     authorized = provider.resolve("state.txt")
 
-    with pytest.raises(CapabilityDenied):
+    with pytest.raises(CapabilityDenied, match="changed before state"):
         provider.state(authorized)
 
-    assert victim.read_text(encoding="utf-8") == "replacement-state"
-    assert (root / "original-state.txt").read_text(encoding="utf-8") == "authorized-state"
+    assert provider.rebound is True
+    assert victim.read_text(encoding="utf-8") == "authorized-state"
+    assert not (root / "original-state.txt").exists()
+
+    pre_entry_root = tmp_path / "pre-entry-state-workspace"
+    pre_entry_root.mkdir()
+    pre_entry_victim = pre_entry_root / "state.txt"
+    pre_entry_victim.write_text("authorized-state", encoding="utf-8")
+    pre_entry_provider = LocalFilesystemProvider(pre_entry_root)
+    pre_entry_authorized = pre_entry_provider.resolve("state.txt")
+    _windows_replace_file(
+        pre_entry_victim,
+        pre_entry_root / "original-state.txt",
+        "replacement-state",
+    )
+
+    with pytest.raises(
+        CapabilityDenied,
+        match="object identity changed after authorization",
+    ):
+        pre_entry_provider.state(pre_entry_authorized)
+
+    assert pre_entry_victim.read_text(encoding="utf-8") == "replacement-state"
+    assert (pre_entry_root / "original-state.txt").read_text(
+        encoding="utf-8"
+    ) == "authorized-state"
 
 
 @pytest.mark.platform_windows
@@ -967,11 +1037,35 @@ def test_windows_delete_file_rejects_same_spelling_file_id_rebind(
     provider = RebindAtDeleteProvider(root)
     authorized = provider.resolve("delete.txt")
 
-    with pytest.raises(CapabilityDenied):
+    with pytest.raises(CapabilityDenied, match="changed before delete_file"):
         provider.delete_file(authorized)
 
-    assert victim.read_text(encoding="utf-8") == "replacement-delete"
-    assert (root / "original-delete.txt").read_text(encoding="utf-8") == "authorized-delete"
+    assert provider.rebound is True
+    assert victim.read_text(encoding="utf-8") == "authorized-delete"
+    assert not (root / "original-delete.txt").exists()
+
+    pre_entry_root = tmp_path / "pre-entry-delete-workspace"
+    pre_entry_root.mkdir()
+    pre_entry_victim = pre_entry_root / "delete.txt"
+    pre_entry_victim.write_text("authorized-delete", encoding="utf-8")
+    pre_entry_provider = LocalFilesystemProvider(pre_entry_root)
+    pre_entry_authorized = pre_entry_provider.resolve("delete.txt")
+    _windows_replace_file(
+        pre_entry_victim,
+        pre_entry_root / "original-delete.txt",
+        "replacement-delete",
+    )
+
+    with pytest.raises(
+        CapabilityDenied,
+        match="object identity changed after authorization",
+    ):
+        pre_entry_provider.delete_file(pre_entry_authorized)
+
+    assert pre_entry_victim.read_text(encoding="utf-8") == "replacement-delete"
+    assert (pre_entry_root / "original-delete.txt").read_text(
+        encoding="utf-8"
+    ) == "authorized-delete"
 
 
 @pytest.mark.platform_windows
@@ -1005,11 +1099,46 @@ def test_windows_recursive_delete_rejects_same_spelling_directory_id_rebind(
     provider = RebindAtRecursiveDeleteProvider(root)
     authorized = provider.resolve("tree")
 
-    with pytest.raises(CapabilityDenied):
+    with pytest.raises(
+        CapabilityDenied,
+        match="changed before delete_directory",
+    ):
         provider.delete_directory(authorized, recursive=True)
 
-    assert (tree / "replacement-marker.txt").read_text(encoding="utf-8") == "replacement"
-    assert (root / "original-tree" / "authorized-marker.txt").read_text(
+    assert provider.rebound is True
+    assert (tree / "authorized-marker.txt").read_text(
+        encoding="utf-8"
+    ) == "authorized"
+    assert not (tree / "replacement-marker.txt").exists()
+    assert not (root / "original-tree").exists()
+
+    pre_entry_root = tmp_path / "pre-entry-tree-workspace"
+    pre_entry_tree = pre_entry_root / "tree"
+    pre_entry_tree.mkdir(parents=True)
+    (pre_entry_tree / "authorized-marker.txt").write_text(
+        "authorized",
+        encoding="utf-8",
+    )
+    pre_entry_provider = LocalFilesystemProvider(pre_entry_root)
+    pre_entry_authorized = pre_entry_provider.resolve("tree")
+    pre_entry_original = pre_entry_root / "original-tree"
+    pre_entry_tree.rename(pre_entry_original)
+    pre_entry_tree.mkdir()
+    (pre_entry_tree / "replacement-marker.txt").write_text(
+        "replacement",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        CapabilityDenied,
+        match="object identity changed after authorization",
+    ):
+        pre_entry_provider.delete_directory(pre_entry_authorized, recursive=True)
+
+    assert (pre_entry_tree / "replacement-marker.txt").read_text(
+        encoding="utf-8"
+    ) == "replacement"
+    assert (pre_entry_original / "authorized-marker.txt").read_text(
         encoding="utf-8"
     ) == "authorized"
 
@@ -1080,11 +1209,35 @@ def test_windows_make_directory_rejects_existing_parent_file_id_rebind(
     provider = RebindParentProvider(root)
     authorized = provider.resolve("parent/child")
 
-    with pytest.raises(CapabilityDenied):
+    with pytest.raises(CapabilityDenied, match="changed before make_directory"):
         provider.make_directory(authorized, parents=True, exist_ok=False)
 
+    assert provider.rebound is True
+    assert parent.is_dir()
     assert not (parent / "child").exists()
-    assert (root / "original-parent").is_dir()
+    assert not (root / "original-parent").exists()
+
+    pre_entry_root = tmp_path / "pre-entry-mkdir-workspace"
+    pre_entry_parent = pre_entry_root / "parent"
+    pre_entry_parent.mkdir(parents=True)
+    pre_entry_provider = LocalFilesystemProvider(pre_entry_root)
+    pre_entry_authorized = pre_entry_provider.resolve("parent/child")
+    pre_entry_original = pre_entry_root / "original-parent"
+    pre_entry_parent.rename(pre_entry_original)
+    pre_entry_parent.mkdir()
+
+    with pytest.raises(
+        CapabilityDenied,
+        match="parent identity changed after authorization",
+    ):
+        pre_entry_provider.make_directory(
+            pre_entry_authorized,
+            parents=True,
+            exist_ok=False,
+        )
+
+    assert not (pre_entry_parent / "child").exists()
+    assert pre_entry_original.is_dir()
 
 
 @pytest.mark.platform_windows
@@ -1113,11 +1266,35 @@ def test_windows_write_rejects_existing_parent_file_id_rebind(
     provider = RebindWriteParentProvider(root)
     authorized = provider.resolve("parent/child.txt")
 
-    with pytest.raises(CapabilityDenied):
+    with pytest.raises(CapabilityDenied, match="changed before write_parent"):
         provider.write_text(authorized, "blocked", "utf-8")
 
+    assert provider.rebound is True
+    assert parent.is_dir()
     assert not (parent / "child.txt").exists()
-    assert (root / "original-write-parent").is_dir()
+    assert not (root / "original-write-parent").exists()
+
+    pre_entry_root = tmp_path / "pre-entry-write-workspace"
+    pre_entry_parent = pre_entry_root / "parent"
+    pre_entry_parent.mkdir(parents=True)
+    pre_entry_provider = LocalFilesystemProvider(pre_entry_root)
+    pre_entry_authorized = pre_entry_provider.resolve("parent/child.txt")
+    pre_entry_original = pre_entry_root / "original-write-parent"
+    pre_entry_parent.rename(pre_entry_original)
+    pre_entry_parent.mkdir()
+
+    with pytest.raises(
+        CapabilityDenied,
+        match="parent identity changed after authorization",
+    ):
+        pre_entry_provider.write_text(
+            pre_entry_authorized,
+            "blocked",
+            "utf-8",
+        )
+
+    assert not (pre_entry_parent / "child.txt").exists()
+    assert pre_entry_original.is_dir()
 
 
 @pytest.mark.platform_windows
