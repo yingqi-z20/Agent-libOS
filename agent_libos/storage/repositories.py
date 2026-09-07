@@ -17,6 +17,7 @@ from agent_libos.evidence.payload_retention import (
 from agent_libos.evidence.initial_goal_recovery import (
     redact_initial_goal_recovery_receipt_projection,
 )
+from agent_libos.models.llm_replay import LLMReplayHead
 from agent_libos.models import (
     AgentObject,
     AgentImage,
@@ -90,6 +91,7 @@ from agent_libos.storage.contracts import (
     OperationEvidenceBackendProtocol,
     ObjectQueryBackendProtocol,
     ObjectRecoveryBackendProtocol,
+    RetainedObjectReadCapabilities,
     PersistedCapabilityResourceIdentity,
     PersistedCheckpointCapabilityInventory,
     PersistedFileLabelPathIdentity,
@@ -416,6 +418,13 @@ class ProcessRepository(_RepositoryFacade):
             "get_latest_successful_llm_call",
             "upsert_llm_tool_output",
             "list_llm_tool_outputs",
+            "insert_llm_replay_turn",
+            "get_llm_replay_turn",
+            "get_llm_replay_head",
+            "list_llm_replay_heads",
+            "list_llm_replay_recovery_pids",
+            "purge_llm_replay",
+            "clear_llm_replay_head",
             "get_llm_context_generation",
             "set_llm_context_generation",
             "get_llm_context_label_history",
@@ -527,6 +536,18 @@ class ProcessRepository(_RepositoryFacade):
             self.transaction,
             lambda: self._process_backend.update_human_request(request),
             operation="update human request",
+        )
+
+    def compare_and_set_llm_replay_head(
+        self, head: LLMReplayHead, *, expected_revision: int | None,
+    ) -> bool:
+        return _transactional_backend_cas_result(
+            self._process_backend,
+            self.transaction,
+            lambda: self._process_backend.compare_and_set_llm_replay_head(
+                head, expected_revision=expected_revision,
+            ),
+            operation="compare and set LLM replay head",
         )
 
     def compare_and_set_human_request(
@@ -1078,10 +1099,12 @@ class ObjectRepository(_RepositoryFacade):
         self,
         *,
         require_recovery_lease: Callable[[], None],
+        retained_read_capabilities: RetainedObjectReadCapabilities | None = None,
     ) -> ObjectPayloadRecoverySummary:
         require_recovery_lease()
         return self._object_recovery_backend.recover_missing_runtime_object_payloads(
             require_recovery_lease=require_recovery_lease,
+            retained_read_capabilities=retained_read_capabilities,
         )
 
     def rehydrate_root_spawn_goal_payload(
@@ -1583,6 +1606,10 @@ class RuntimePublicationRepository(_RepositoryFacade):
                 pid=pid,
             )
         ]
+
+    def get_latest_committed_exec_publication(self, pid: str) -> RuntimePublicationRecord | None:
+        record = self._publication_backend.get_latest_committed_exec_publication(pid)
+        return self._validated_record(record) if record is not None else None
 
     def get_committed_root_spawn_publication(
         self,

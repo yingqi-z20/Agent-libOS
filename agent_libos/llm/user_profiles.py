@@ -33,7 +33,9 @@ _STRING_LIMITS = {
 }
 _API_MODES = {"auto", "responses", "chat"}
 _VERBOSITY = {"low", "medium", "high"}
-_PROMPT_CACHE_MODES = {"provider_default", "implicit", "explicit"}
+_PROMPT_CACHE_MODES = {"auto", "provider_default", "implicit", "explicit"}
+_PROMPT_LAYOUTS = {"auto", "legacy_v1", "cache_optimized_v2"}
+_REASONING_CONTEXTS = {"auto", "current_turn", "all_turns"}
 _USER_PROFILE_FIELDS = (
     "kind",
     "base_url",
@@ -44,6 +46,9 @@ _USER_PROFILE_FIELDS = (
     "max_retries",
     "store",
     "reasoning_effort",
+    "reasoning_context",
+    "responses_replay",
+    "prompt_layout",
     "verbosity",
     "safety_identifier_env",
     "prompt_cache_retention",
@@ -63,6 +68,11 @@ _USER_PROFILE_FIELDS = (
 _CORE_ONLY_PROFILE_FIELDS = (
     "max_input_tokens_per_call",
     "max_total_tokens_per_call",
+    "reasoning_context",
+    "responses_replay",
+    "prompt_layout",
+    "prompt_cache_mode",
+    "prompt_cache_ttl",
 )
 
 
@@ -123,8 +133,8 @@ class UserLLMProfileStore:
         selected_payload = dict(payload)
         existing = profiles.get(selected_id)
         if existing is not None:
-            # The bundled GUI intentionally has no controls for these core-only
-            # limits. Preserve an existing override when an older/editor payload
+            # The bundled GUI has no controls for these Host policy fields.
+            # Preserve an existing override when an older/editor payload
             # omits it; an explicit null still clears the override.
             for field_name in _CORE_ONLY_PROFILE_FIELDS:
                 if field_name not in selected_payload:
@@ -216,6 +226,12 @@ def _normalize_user_llm_profile_fields(raw: dict[str, Any]) -> None:
     raw["api_mode"] = _optional_choice(raw.get("api_mode"), "api_mode", _API_MODES)
     raw["verbosity"] = _optional_choice(raw.get("verbosity"), "verbosity", _VERBOSITY)
     raw["reasoning_effort"] = _optional_string(raw.get("reasoning_effort"), "reasoning_effort")
+    raw["reasoning_context"] = _optional_choice(
+        raw.get("reasoning_context"), "reasoning_context", _REASONING_CONTEXTS,
+    )
+    raw["prompt_layout"] = _optional_choice(
+        raw.get("prompt_layout"), "prompt_layout", _PROMPT_LAYOUTS,
+    )
     raw["safety_identifier_env"] = _optional_env_name(raw.get("safety_identifier_env"), "safety_identifier_env")
     raw["prompt_cache_retention"] = _optional_prompt_cache_retention(
         raw.get("prompt_cache_retention")
@@ -246,6 +262,7 @@ def _normalize_user_llm_profile_fields(raw: dict[str, Any]) -> None:
     raw["temperature"] = _optional_nonnegative_float(raw.get("temperature"), "temperature")
     for key in (
         "store",
+        "responses_replay",
         "responses_previous_response_id",
         "parallel_tool_calls",
         "auto_wait_on_empty_tool_calls",
@@ -309,7 +326,7 @@ def _validate_user_llm_profile_cache(
             "LLM profile prompt_cache_retention and prompt_cache_ttl are mutually exclusive"
         )
     if (
-        effective_cache_mode != "provider_default"
+        effective_cache_mode in {"implicit", "explicit"}
         and not str(config.llm.prompt_cache_key or "").strip()
     ):
         raise ValidationError(
@@ -319,7 +336,7 @@ def _validate_user_llm_profile_cache(
         raise ValidationError(
             "LLM profile prompt_cache_ttl requires implicit or explicit mode"
         )
-    if effective_cache_mode != "provider_default" and effective_cache_retention is not None:
+    if effective_cache_mode in {"implicit", "explicit"} and effective_cache_retention is not None:
         raise ValidationError(
             "LLM profile legacy prompt_cache_retention cannot be combined with implicit/explicit mode"
         )
@@ -364,6 +381,9 @@ def summarize_llm_profile(
         "max_retries": profile.max_retries,
         "store": profile.store,
         "reasoning_effort": profile.reasoning_effort,
+        "reasoning_context": profile.reasoning_context,
+        "responses_replay": profile.responses_replay,
+        "prompt_layout": profile.prompt_layout,
         "verbosity": profile.verbosity,
         "safety_identifier_env": profile.safety_identifier_env,
         "prompt_cache_retention": _optional_prompt_cache_retention(

@@ -194,6 +194,10 @@ PY
 | Path | Type | Default | Unit |
 | --- | --- | --- | --- |
 | `llm.default_profile_id` | `str` | `"default"` | — |
+| `llm.openai_model` | `str` | `"gpt-6-astra"` | — |
+| `llm.openai_reasoning_effort` | `str` | `"medium"` | — |
+| `llm.openai_reasoning_context` | `Literal['current_turn', 'all_turns']` | `"all_turns"` | — |
+| `llm.openai_prompt_cache_ttl` | `Literal['30m']` | `"30m"` | — |
 | `llm.profiles` | `dict[str, LLMProfile]` | `mapping with 1 default key(s): "default"` | — |
 | `llm.profiles.<key>.kind` | `Literal['openai_compatible']` | `"openai_compatible"` | — |
 | `llm.profiles.<key>.base_url` | `str \| None` | `null` | — |
@@ -204,12 +208,15 @@ PY
 | `llm.profiles.<key>.max_retries` | `int \| None` | `null` | — |
 | `llm.profiles.<key>.store` | `bool \| None` | `null` | — |
 | `llm.profiles.<key>.reasoning_effort` | `str \| None` | `null` | — |
+| `llm.profiles.<key>.reasoning_context` | `Literal['auto', 'current_turn', 'all_turns'] \| None` | `null` | — |
+| `llm.profiles.<key>.responses_replay` | `StrictBool \| None` | `null` | — |
 | `llm.profiles.<key>.verbosity` | `Literal['low', 'medium', 'high'] \| None` | `null` | — |
 | `llm.profiles.<key>.safety_identifier` | `str \| None` | `null` | — |
 | `llm.profiles.<key>.safety_identifier_env` | `str \| None` | `null` | — |
 | `llm.profiles.<key>.prompt_cache_key` | `str \| None` | `null` | — |
+| `llm.profiles.<key>.prompt_layout` | `Literal['auto', 'legacy_v1', 'cache_optimized_v2'] \| None` | `null` | — |
 | `llm.profiles.<key>.prompt_cache_retention` | `Literal['in_memory', '24h'] \| None` | `null` | — |
-| `llm.profiles.<key>.prompt_cache_mode` | `Literal['provider_default', 'implicit', 'explicit'] \| None` | `null` | — |
+| `llm.profiles.<key>.prompt_cache_mode` | `Literal['auto', 'provider_default', 'implicit', 'explicit'] \| None` | `null` | — |
 | `llm.profiles.<key>.prompt_cache_ttl` | `Literal['30m'] \| None` | `null` | — |
 | `llm.profiles.<key>.responses_previous_response_id` | `bool \| None` | `null` | — |
 | `llm.profiles.<key>.parallel_tool_calls` | `bool \| None` | `null` | — |
@@ -230,11 +237,15 @@ PY
 | `llm.max_retries` | `int` | `2` | — |
 | `llm.api_mode` | `Literal['auto', 'responses', 'chat']` | `"auto"` | — |
 | `llm.store` | `bool` | `false` | — |
+| `llm.reasoning_context` | `Literal['auto', 'current_turn', 'all_turns']` | `"auto"` | — |
+| `llm.responses_replay` | `StrictBool \| None` | `null` | — |
 | `llm.safety_identifier` | `str \| None` | `null` | — |
-| `llm.prompt_layout` | `Literal['legacy_v1', 'cache_optimized_v2']` | `"legacy_v1"` | — |
+| `llm.responses_replay_max_bytes` | `StrictInt` | `8388608` | bytes |
+| `llm.responses_replay_max_turns` | `StrictInt` | `128` | — |
+| `llm.prompt_layout` | `Literal['auto', 'legacy_v1', 'cache_optimized_v2']` | `"legacy_v1"` | — |
 | `llm.prompt_cache_key` | `str \| None` | `null` | — |
 | `llm.prompt_cache_retention` | `Literal['in_memory', '24h'] \| None` | `null` | — |
-| `llm.prompt_cache_mode` | `Literal['provider_default', 'implicit', 'explicit']` | `"provider_default"` | — |
+| `llm.prompt_cache_mode` | `Literal['auto', 'provider_default', 'implicit', 'explicit']` | `"provider_default"` | — |
 | `llm.prompt_cache_ttl` | `Literal['30m'] \| None` | `null` | — |
 | `llm.responses_previous_response_id` | `bool` | `false` | — |
 | `llm.parallel_tool_calls` | `bool` | `false` | — |
@@ -548,6 +559,7 @@ PY
 | `llm_context.object_name_prefix` | `str` | `"llm_context"` | — |
 | `llm_context.recent_event_limit` | `int` | `20` | — |
 | `llm_context.prompt_event_payload_max_chars` | `int` | `2048` | characters |
+| `llm_context.compaction_chunk_target_tokens` | `StrictInt` | `16384` | tokens |
 | `llm_context.storage_compaction_threshold_bytes` | `int` | `96000` | bytes |
 | `llm_context.storage_compaction_max_chunks` | `int` | `4` | — |
 | `llm_context.storage_compaction_preserve_recent_entries` | `int` | `0` | — |

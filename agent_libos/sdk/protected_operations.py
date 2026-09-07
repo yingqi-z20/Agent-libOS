@@ -363,6 +363,8 @@ _HOST_RESULT_IGNORED_FIELDS = {
         {
             "raw",
             "reasoning",
+            "response_items",
+            "responses_items",
             "provider_request_options",
             "compatibility_removed_options",
             "provider_trace",

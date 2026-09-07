@@ -46,7 +46,8 @@ Legend:
   HTTP-schema, MRTR, and Host-pinned pre-registration/CIMD OAuth conformance on
   Ubuntu Python 3.11 and 3.14; native stdio/HTTP smokes on Windows and macOS;
   and clean-installed wheel/sdist coverage for modern read/call surfaces,
-  subscriptions, OAuth, durable MRTR/Tasks reopen, and Store v6-to-v7 migration
+  subscriptions, OAuth, durable MRTR/Tasks reopen, and ordered Store v6-to-v7 and
+  v7-to-v8 migrations
   on Python 3.11–3.14.
 - **Remaining gates and exclusions:** real remote identity, proxy, TLS, and
   OAuth topology remain deployment-specific. Conformance never enables DCR or

@@ -935,6 +935,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
         *,
         config: AgentLibOSConfig | None = None,
         model_visible: bool = False,
+        prompt_layout: str | None = None,
     ) -> ToolSpec:
         self._validate_contract()
         selected_config = config or DEFAULT_CONFIG
@@ -947,6 +948,7 @@ class BaseAgentTool(ABC, Generic[InputT]):
             input_schema,
             selected_config,
             model_visible=model_visible,
+            prompt_layout=prompt_layout,
         )
         return ToolSpec(
             name=self.name,
@@ -961,8 +963,10 @@ class BaseAgentTool(ABC, Generic[InputT]):
             side_effects=sorted(self.policy.declared_permissions) if self.policy.side_effects else [],
         )
 
-    def to_openai_chat_tool(self, *, config: AgentLibOSConfig | None = None) -> dict[str, Any]:
-        spec = self.spec(config=config, model_visible=True)
+    def to_openai_chat_tool(
+        self, *, config: AgentLibOSConfig | None = None, prompt_layout: str | None = None
+    ) -> dict[str, Any]:
+        spec = self.spec(config=config, model_visible=True, prompt_layout=prompt_layout)
         return openai_chat_tool_schema(spec.name, spec.description, spec.input_schema)
 
     def to_mcp_tool(self, *, config: AgentLibOSConfig | None = None) -> dict[str, Any]:
@@ -1442,6 +1446,7 @@ def _apply_runtime_schema_overrides(
     config: AgentLibOSConfig,
     *,
     model_visible: bool = False,
+    prompt_layout: str | None = None,
 ) -> None:
     properties = schema.get("properties")
     if not isinstance(properties, dict):
@@ -1452,6 +1457,7 @@ def _apply_runtime_schema_overrides(
         properties,
         config,
         model_visible=model_visible,
+        prompt_layout=prompt_layout,
     )
 
     if _apply_checkpoint_schema_overrides(name, properties, config):
@@ -1472,13 +1478,15 @@ def _apply_model_visible_schema_overrides(
     config: AgentLibOSConfig,
     *,
     model_visible: bool,
+    prompt_layout: str | None = None,
 ) -> None:
+    layout = config.llm.prompt_layout if prompt_layout is None else prompt_layout
     if name == "process_exit" and model_visible:
-        _apply_process_exit_schema_projection(schema, properties, config)
+        _apply_process_exit_schema_projection(schema, properties, config, prompt_layout=layout)
     if (
         name != "send_process_message"
         or not model_visible
-        or config.llm.prompt_layout != "cache_optimized_v2"
+        or layout != "cache_optimized_v2"
         or "recipient_pid" not in properties
     ):
         return
@@ -1575,12 +1583,15 @@ def _apply_process_exit_schema_projection(
     schema: dict[str, Any],
     properties: dict[str, Any],
     config: AgentLibOSConfig,
+    *,
+    prompt_layout: str | None = None,
 ) -> None:
     evidence = properties.get("completion_evidence")
     definitions = schema.get("$defs")
     if not isinstance(evidence, dict) or not isinstance(definitions, dict):
         return
-    if config.llm.prompt_layout == "cache_optimized_v2":
+    layout = config.llm.prompt_layout if prompt_layout is None else prompt_layout
+    if layout == "cache_optimized_v2":
         evidence["anyOf"] = [
             {"$ref": "#/$defs/CompactProcessCompletionEvidence"},
             {"type": "null"},

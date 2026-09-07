@@ -961,9 +961,16 @@ Independent version namespaces appear in this document:
 Changing one of these versions does not change or authorize either of the
 others.
 
-Git does not add another checkpoint schema. RuntimeStore uses schema v7 and
+Git does not add another checkpoint schema. RuntimeStore uses schema v8 and
 checkpoint snapshots remain v4. Image packages continue to reject `.git`
 metadata and do not embed managed worktrees or remote state.
+
+Responses replay references are an optional local-only snapshot field. Restore
+and fork validate retained payload integrity, process/TaskRun and provider/model
+scope, and current source authority before effects. The full encrypted history
+remains in Host-private store rows, is excluded from image commits and packages,
+and cannot be resurrected after purge. Old snapshots with no replay reference
+remain readable. Active TaskRun checkpoint restrictions are unchanged.
 
 Checkpoint list callers may request only positive integer limits no larger
 than `CheckpointDefaults.list_limit`; `0`, negative values, booleans, and larger

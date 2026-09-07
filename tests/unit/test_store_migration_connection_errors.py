@@ -9,6 +9,7 @@ import pytest
 
 import agent_libos.api.cli as cli_module
 import agent_libos.storage.mcp_v7_migration as mcp_v7_migration
+import agent_libos.storage.llm_v8_migration as llm_v8_migration
 import agent_libos.storage.semantic_v5_migration as semantic_v5_migration
 import agent_libos.storage.semantic_v6_migration as semantic_v6_migration
 from agent_libos.models.exceptions import ValidationError
@@ -48,6 +49,13 @@ _CASES = (
         plan=semantic_v6_migration.plan_store_v6_migration,
         apply=semantic_v6_migration.apply_store_v6_migration,
         error_type=semantic_v6_migration.StoreV6MigrationError,
+    ),
+    _MigrationCase(
+        version=8,
+        module=llm_v8_migration,
+        plan=llm_v8_migration.plan_store_v8_migration,
+        apply=llm_v8_migration.apply_store_v8_migration,
+        error_type=llm_v8_migration.StoreV8MigrationError,
     ),
     _MigrationCase(
         version=7,

@@ -4534,7 +4534,10 @@ class TestLLMContextMemory:
             runtime.close()
 
     def test_compact_process_context_spawn_failure_marks_job_failed(self) -> None:
-        runtime = Runtime.open('local')
+        config = replace(DEFAULT_CONFIG, process=replace(
+            DEFAULT_CONFIG.process, max_child_processes=0,
+        ))
+        runtime = Runtime.open('local', config=config)
         try:
             runtime.llm.client = RecordingActionClient([
                 {
@@ -4655,7 +4658,7 @@ class TestLLMContextMemory:
                 compaction_method='test_compaction',
                 preserve_recent_entries=1,
                 source_tokens=1000,
-                target_tokens=512,
+                target_tokens=2_000,
                 compressor_pids=[],
             )
 
@@ -4783,7 +4786,10 @@ class TestLLMContextMemory:
             runtime.close()
 
     def test_compact_process_context_uses_multiple_chunks(self) -> None:
-        runtime = Runtime.open('local')
+        config = replace(DEFAULT_CONFIG, llm_context=replace(
+            DEFAULT_CONFIG.llm_context, compaction_chunk_target_tokens=256,
+        ))
+        runtime = Runtime.open('local', config=config)
         try:
             cumulative = _compact_summary('stage one and two')
             cumulative['completed'] = ['stage one']
@@ -4842,7 +4848,7 @@ class TestLLMContextMemory:
                         'action': 'compact_process_context',
                         'force': True,
                         'target_tokens': 512,
-                        'max_chunks': 1,
+                        'max_chunks': 8,
                     }
                 ])
                 pid = runtime.process.spawn(image='base-agent:v0', goal='reopen compaction')
@@ -4854,7 +4860,13 @@ class TestLLMContextMemory:
             finally:
                 close_runtime(runtime)
 
-            reopened = Runtime.open(db)
+            # Recovery must use the persisted plan even if the Host changes
+            # the token target while the first compressor is pending.
+            reopened = Runtime.open(db, config=replace(
+                DEFAULT_CONFIG, llm_context=replace(
+                    DEFAULT_CONFIG.llm_context, compaction_chunk_target_tokens=1,
+                ),
+            ))
             try:
                 reopened.llm.client = RecordingActionClient([
                     {'action': 'process_exit', 'payload': _compact_summary('reopened state')},
@@ -4871,9 +4883,104 @@ class TestLLMContextMemory:
                 context = reopened.store.get_object_by_name(context_object_name(pid), namespace=reopened.memory.resolve_namespace(pid))
                 assert context is not None
                 assert context.payload['entries'][0]['summary']['goal'] == 'reopened state'
+                assert context.payload['entries'][0]['compaction_metadata']['stage_count'] == 1
                 assert reopened.store.get_llm_pending_action(pid)['status'] == 'completed'
             finally:
                 close_runtime(reopened)
+
+    @pytest.mark.parametrize('prompt_layout', ['legacy_v1', 'cache_optimized_v2'])
+    def test_repeated_small_compactions_fit_a_three_child_budget(self, prompt_layout: str) -> None:
+        config = replace(DEFAULT_CONFIG, llm=replace(
+            DEFAULT_CONFIG.llm, prompt_layout=prompt_layout,
+        ))
+        runtime = Runtime.open('local', config=config)
+        try:
+            pid = runtime.process.spawn(
+                image='base-agent:v0', goal='maintain cumulative work across compactions',
+                resource_budget=ResourceBudget(max_child_processes=3),
+            )
+            runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
+            _grant_context_compressor_authority(runtime, pid)
+            _seed_context_entries(runtime, pid, count=40)
+            for index in range(3):
+                summary = _compact_summary('maintain cumulative work across compactions')
+                summary['completed'] = [f'milestone {step}' for step in range(index + 1)]
+                runtime.llm.client = RecordingActionClient([
+                    {'action': 'compact_process_context', 'force': True},
+                    {'action': 'process_exit', 'payload': summary},
+                ])
+                results = runtime.run_until_idle(max_quanta=3)
+                completed = _last_action_result(results, 'compact_process_context')
+                assert completed['result']['ok'] is True, completed
+                assert len(completed['result']['payload']['compressor_pids']) == 1
+                certificate = runtime.llm.context_memory.latest_validated_compaction(pid)
+                assert certificate is not None
+                assert certificate['summary'] == summary
+            assert len(runtime.process.list_children(pid)) == 3
+            assert runtime.process.get(pid).status == ProcessStatus.RUNNABLE
+        finally:
+            runtime.close()
+
+    def test_compaction_tail_fits_rendered_target_and_keeps_latest_entry(self) -> None:
+        from agent_libos.utils.ids import estimate_tokens
+
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='bound verbose history')
+            context = _seed_context_entries(runtime, pid, count=0)
+            payload = json.loads(json.dumps(context.payload))
+            latest = {'kind': 'decision', 'text': 'verify the zero-quantity regression next'}
+            payload['entries'].extend([
+                {'kind': 'old_fact', 'text': 'already summarized'},
+                {'kind': 'tool_output', 'text': 'verbose output ' * 4_000},
+                latest,
+            ])
+            handle = runtime.memory.handle_for_name(
+                pid, context_object_name(pid), rights={'read', 'write'},
+            )
+            updated = runtime.memory.update_object(pid, handle, ObjectPatch(payload=payload))
+            context = runtime.memory.get_object(pid, updated)
+            summary = _compact_summary('bound verbose history')
+            summary['constraints'] = ['zero-quantity lines remain valid', 'keep the public signature']
+            result = runtime.llm.context_memory.replace_with_compacted_summary(
+                pid, context_oid=context.oid, expected_version=context.version,
+                summary=summary, compaction_method='test_compaction',
+                preserve_recent_entries=128, source_tokens=estimate_tokens(payload),
+                target_tokens=2_000, compressor_pids=[],
+            )
+            after = runtime.store.get_object(context.oid)
+            assert after is not None
+            assert after.payload['entries'][1:] == [latest]
+            assert result['preserved_recent_entries'] == 1
+            assert result['compacted_tokens'] == estimate_tokens(runtime.llm.context_memory.render(after.payload))
+            assert result['compacted_tokens'] <= 2_000
+            assert after.payload['entries'][0]['summary'] == summary
+        finally:
+            runtime.close()
+
+    def test_repeated_compaction_does_not_retain_older_summaries(self) -> None:
+        from agent_libos.utils.ids import estimate_tokens
+
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='keep bounded cumulative context')
+            context = _seed_context_entries(runtime, pid, count=0)
+            for index in range(12):
+                summary = _compact_summary(f'cumulative milestone {index}')
+                runtime.llm.context_memory.replace_with_compacted_summary(
+                    pid, context_oid=context.oid, expected_version=context.version,
+                    summary=summary, compaction_method='test_compaction',
+                    preserve_recent_entries=128, source_tokens=estimate_tokens(context.payload),
+                    target_tokens=2_000, compressor_pids=[],
+                )
+                context = runtime.store.get_object(context.oid)
+                assert context is not None
+                entries = context.payload['entries']
+                assert sum(entry.get('kind') == 'context_compacted' for entry in entries) == 1
+                assert entries[0]['summary'] == summary
+                assert estimate_tokens(runtime.llm.context_memory.render(context.payload)) <= 2_000
+        finally:
+            runtime.close()
 
     def test_reopen_after_compressor_exit_reruns_missing_result_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

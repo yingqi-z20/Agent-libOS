@@ -78,6 +78,8 @@ from agent_libos.runtime.boundary_installer import (
     install_explain_boundaries,
 )
 from agent_libos.runtime.checkpoint_manager import CheckpointManager
+from agent_libos.runtime.checkpoint_replay import CheckpointReplayAdapter
+from agent_libos.runtime.replay_source_recovery import LLMReplaySourceRecovery
 from agent_libos.runtime.checkpoint_image import CheckpointImageInstaller
 from agent_libos.runtime.data_flow_manager import DataFlowManager
 from agent_libos.runtime.descriptor_catalog import (
@@ -5597,6 +5599,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 config=host.config,
                 blocking_work=host.blocking_work,
                 task_runs=host.task_runs,
+                file_resource_resolver=host.filesystem.resource_for,
                 host_semantic_result_observer=(
                     host.semantic_runtime_flow.observe_model_output
                 ),
@@ -5798,6 +5801,14 @@ class RuntimeBuilder(Generic[RuntimeT]):
             ),
             transitions=host.process_transitions,
             config=host.config,
+            responses_replay=CheckpointReplayAdapter(
+                host.uow,
+                config=host.config,
+                capabilities=host.capability,
+                data_flow=host.data_flow,
+                filesystem=host.filesystem,
+                profile_snapshot=host.llms.profile_snapshot,
+            ),
         )
 
     @staticmethod
@@ -5876,9 +5887,17 @@ class RuntimeBuilder(Generic[RuntimeT]):
             host.recovered_root_spawn_initial_goal_payloads = (
                 host.process.recover_root_spawn_initial_goal_payloads()
             )
+            replay_sources = LLMReplaySourceRecovery(
+                host.uow,
+                config=host.config,
+                capabilities=host.capability,
+                profile_snapshot=host.llms.profile_snapshot,
+            )
+            replay_sources.preflight()
             host.recovered_missing_object_payloads = (
                 host.uow.objects.recover_missing_runtime_object_payloads(
                     require_recovery_lease=host.lifecycle.require_recovery_lease,
+                    retained_read_capabilities=replay_sources.retained_read_capabilities,
                 )
             )
             host.tools.rehydrate_registered_jit_tools()

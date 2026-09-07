@@ -2677,7 +2677,7 @@ usage: agent-libos store [-h] {migrate} ...
 ## `agent-libos store migrate`
 
 ```text
-usage: agent-libos store migrate [-h] --to {5,6,7} (--dry-run | --apply)
+usage: agent-libos store migrate [-h] --to {5,6,7,8} (--dry-run | --apply)
                                  [--expected-plan-sha256 EXPECTED_PLAN_SHA256]
                                  [--sqlite-backup SQLITE_BACKUP]
                                  [--postgres-snapshot-confirmed]
@@ -2688,7 +2688,7 @@ usage: agent-libos store migrate [-h] --to {5,6,7} (--dry-run | --apply)
 | Syntax | Required | Default | Description |
 | --- | --- | --- | --- |
 | `-h, --help` | no | — | show this help message and exit |
-| `--to {5,6,7}` | yes | `None` | Target offline Runtime store schema version to plan or apply a migration to. |
+| `--to {5,6,7,8}` | yes | `None` | Target offline Runtime store schema version to plan or apply a migration to. |
 | `--dry-run` | no | `dry_run=False` | Validate and print the canonical migration plan without writing. |
 | `--apply` | no | `apply=False` | Apply the canonical plan after verifying its digest and backup evidence. |
 | `--expected-plan-sha256 EXPECTED_PLAN_SHA256` | no | `None` | Exact plan digest printed by a prior --dry-run; required with --apply. |

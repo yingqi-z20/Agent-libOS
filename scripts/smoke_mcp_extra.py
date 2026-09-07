@@ -709,7 +709,7 @@ def _runtime_smoke() -> dict[str, object]:
 
 
 def _migration_smoke() -> dict[str, object]:
-    """Exercise the installed offline v6-to-v7 planner, apply, and reopen."""
+    """Exercise installed offline v6-to-v7-to-v8 migration and current reopen."""
 
     from agent_libos.storage import SQLiteStore
     from agent_libos.storage.mcp_v7_migration import (
@@ -717,6 +717,11 @@ def _migration_smoke() -> dict[str, object]:
         plan_store_v7_migration,
     )
     from agent_libos.storage.v7_schema_contract import V7_TABLES
+    from agent_libos.storage.v8_schema_contract import V8_TABLES
+    from agent_libos.storage.llm_v8_migration import (
+        apply_store_v8_migration,
+        plan_store_v8_migration,
+    )
 
     with tempfile.TemporaryDirectory(
         prefix="agent-libos-installed-mcp-v7-migration-"
@@ -727,14 +732,15 @@ def _migration_smoke() -> dict[str, object]:
         fresh.close()
         connection = sqlite3.connect(source)
         try:
-            for table in sorted(V7_TABLES):
+            connection.execute("DROP INDEX IF EXISTS idx_llm_pending_replay_recovery")
+            for table in sorted(V8_TABLES | V7_TABLES):
                 connection.execute(f'DROP TABLE "{table}"')
             changed = connection.execute(
                 "UPDATE runtime_schema SET schema_version = 6 "
-                "WHERE singleton = 1 AND schema_version = 7"
+                "WHERE singleton = 1 AND schema_version = 8"
             )
             if changed.rowcount != 1:
-                raise RuntimeError("installed MCP migration fixture was not schema v7")
+                raise RuntimeError("installed MCP migration fixture was not schema v8")
             connection.commit()
         finally:
             connection.close()
@@ -752,6 +758,19 @@ def _migration_smoke() -> dict[str, object]:
         )
         if not result.applied or result.already_applied:
             raise RuntimeError("installed MCP v6-to-v7 migration did not apply")
+        v7_backup = Path(root) / "source-v7.backup.sqlite"
+        shutil.copyfile(source, v7_backup)
+        os.chmod(v7_backup, 0o600)
+        v8_plan = plan_store_v8_migration(source, sqlite_backup=v7_backup)
+        if v8_plan.from_schema_version != 7 or v8_plan.to_schema_version != 8:
+            raise RuntimeError("installed replay migration plan version mismatch")
+        v8_result = apply_store_v8_migration(
+            source,
+            expected_plan_sha256=v8_plan.plan_sha256,
+            sqlite_backup=v7_backup,
+        )
+        if not v8_result.applied or v8_result.already_applied:
+            raise RuntimeError("installed MCP v7-to-v8 migration did not apply")
         reopened = SQLiteStore(source)
         try:
             marker = reopened.conn.execute(
@@ -763,8 +782,8 @@ def _migration_smoke() -> dict[str, object]:
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-            if marker is None or int(marker[0]) != 7 or not V7_TABLES <= present:
-                raise RuntimeError("installed MCP migrated Store did not reopen as v7")
+            if marker is None or int(marker[0]) != 8 or not (V7_TABLES | V8_TABLES) <= present:
+                raise RuntimeError("installed MCP migrated Store did not reopen as v8")
         finally:
             reopened.close()
         return {
@@ -772,6 +791,8 @@ def _migration_smoke() -> dict[str, object]:
             "to": plan.to_schema_version,
             "backend": plan.backend,
             "reopened": True,
+            "reopened_schema_version": 8,
+            "v8_plan_sha256": v8_plan.plan_sha256,
         }
 
 

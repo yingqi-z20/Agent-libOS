@@ -888,6 +888,8 @@ class ImageBootService:
                 publication_id=publication_id,
                 expected_revision=current.revision,
             )
+            previous_llm_call = self._processes.get_latest_successful_llm_call(pid=pid, purpose="action_selection")
+            self._processes.clear_llm_replay_head(pid)
             event, audit = self._process.record_exec_evidence(
                 pid,
                 old_image=previous_process.image_id,
@@ -908,6 +910,7 @@ class ImageBootService:
                     "state_generation": current.state_generation,
                     "image_id": current.image_id,
                     "status": current.status.value,
+                    "prior_llm_call_id": previous_llm_call.call_id if previous_llm_call is not None else None,
                     "prior_execution_generation": (
                         prior_execution_token.generation
                         if prior_execution_token is not None

@@ -338,11 +338,11 @@ failure evidence, record the exact command, exit status, and the stable error
 
 ## Persistent Runtime Basics
 
-The current Runtime opens only store schema v7. A canonical schema-v6 database
+The current Runtime opens only store schema v8. A canonical schema-v7 database
 is rejected before `init`, recovery, audit, or any other write until an
-operator uses the explicit offline `store migrate --to 7` workflow below. A v5
-store must first use `store migrate --to 6`, and v4 must first use
-`store migrate --to 5`. Older,
+operator uses the explicit offline `store migrate --to 8` workflow below. A v6
+store must first use `store migrate --to 7`, v5 must first use
+`store migrate --to 6`, and v4 must first use `store migrate --to 5`. Older,
 unversioned, and malformed stores remain unsupported; there is no implicit
 migration or read-only compatibility mode in ordinary Runtime startup.
 
@@ -529,8 +529,8 @@ Identification](semantic_shadow.md).
 ## Offline Store Migration
 
 `store migrate` is handled before `Runtime.open()` and is the only supported
-schema-v4 to v5, v5 to v6, and v6 to v7 path. Migrations are ordered; a v4
-store must independently plan/apply `--to 5`, then `--to 6`, then `--to 7`.
+schema-v4 to v5, v5 to v6, v6 to v7, and v7 to v8 path. Migrations are ordered; a v4
+store must independently plan/apply `--to 5`, then `--to 6`, then `--to 7`, then `--to 8`.
 Stop every CLI/GUI/embedded Runtime using the target first. Dry-run
 validates the complete canonical source shape against a private snapshot,
 performs zero writes beside the source, and returns a deterministic
@@ -558,7 +558,28 @@ catalog, and postcondition return `applied=false` and `already_applied=true`;
 this is uncertain-commit reconciliation, not permission to reuse a plan for
 another, generic same-version, or subsequently modified database.
 
-For the current v6-to-v7 step:
+For the current v7-to-v8 step:
+
+```bash
+# Replace both paths; keep the quiesced source and backup outside the workspace.
+LEGACY_DB=/absolute/external/store/agent-libos.sqlite
+LEGACY_BACKUP=/absolute/external/backup/agent-libos.v7.backup.sqlite
+sqlite3 "$LEGACY_DB" ".backup '$LEGACY_BACKUP'"
+chmod 600 "$LEGACY_BACKUP"
+
+uv run agent-libos --db "$LEGACY_DB" store migrate --to 8 \
+  --dry-run --sqlite-backup "$LEGACY_BACKUP"
+uv run agent-libos --db "$LEGACY_DB" store migrate --to 8 \
+  --apply --expected-plan-sha256 <plan_sha256> \
+  --sqlite-backup "$LEGACY_BACKUP"
+```
+
+For PostgreSQL, use the configured DSN and supply
+`--postgres-snapshot-confirmed` on apply. The
+[v7-to-v8 runbook](storage.md#offline-v7-to-v8-migration) describes the empty
+Host-private replay relations, existing-row preservation, and rollback checks.
+
+For the preceding v6-to-v7 step:
 
 ```bash
 # Replace both paths; keep the quiesced source and backup outside the workspace.
@@ -691,7 +712,7 @@ status code 1.
 `task-run` is the Host CLI for a first-class Durable Task Run. It is separate
 from both the one-tool `workflow run` command and Object-bound background
 tasks. A Run supervises a root AgentProcess tree, persists a versioned goal and
-requirements, and exposes safe restart recovery through store schema v7.
+requirements, and exposes safe restart recovery through store schema v8.
 
 ```text
 task-run start

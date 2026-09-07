@@ -21,7 +21,7 @@ class TestAskFileThenShowScript:
         content = 'human selected this file\n'
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding='utf-8')
-        report = asyncio.run(run_file_viewer(auto_answer=relative, max_bytes=1024, max_quanta=10, echo=False))
+        report = asyncio.run(run_file_viewer(db="local", auto_answer=relative, max_bytes=1024, max_quanta=10, echo=False))
         assert report['process_status'] == 'exited'
         assert report['selected_path'] == relative
         assert report['displayed']
@@ -64,6 +64,7 @@ class TestAskFileThenShowScript:
 
         report = asyncio.run(
             ask_file_then_show.run_file_viewer(
+                db="local",
                 auto_answer=relative,
                 max_bytes=1024,
                 max_quanta=10,

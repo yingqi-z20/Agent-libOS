@@ -27,13 +27,13 @@ normal Capability and Protected Operation path still owns provider dispatch.
 
 ## Release boundary
 
-Agent libOS 1.5.2 implements:
+Agent libOS 1.5.3 implements:
 
 - a strict, Host-authored `semantic_auto_approval` Task Authority ceiling;
 - a deterministic, pure Shadow broker and a closed action/effect ontology;
 - typed semantic assessment and data-finding records;
 - durable, lease/CAS-backed assessment jobs and an append-only assessment
-  ledger in store schema v7;
+  ledger in store schema v8;
 - best-effort capture for eligible external-operation approval requests, root
   goals, and committed provider ingress observations;
 - deterministic/scripted assessment and an optional, explicitly configured
@@ -195,7 +195,7 @@ is evidence for what was shown, not an allow predicate.
 
 ## FlowGraph and monotonic data findings
 
-Store schema v7 records content-free flow entities for root goals,
+Store schema v8 records content-free flow entities for root goals,
 Object/file versions, provider and Tool results, materializations, and model
 outputs, plus activities for Process, provider, Tool, LLM, Object, and file
 operations. Edges use the closed `direct`, `indirect`, or `control` relation.
@@ -439,7 +439,7 @@ prompt or source payload. Checkpoint restore and fork do not copy, rewrite, or
 delete this Host evidence ledger.
 
 See [Runtime Storage](storage.md) for the ordered offline v4-to-v5, v5-to-v6,
-and v6-to-v7 migration workflows. Ordinary `Runtime.open()` never runs a
+v6-to-v7, and v7-to-v8 migration workflows. Ordinary `Runtime.open()` never runs a
 migration.
 
 ## Inspection surfaces
@@ -561,8 +561,8 @@ record.
 
 Before enabling any semantic mode for a tenant-scoped deployment or workload:
 
-1. migrate an offline canonical v4 store to v5, then v5 to v6, then v6 to v7,
-   and verify the complete v7 shape;
+1. migrate an offline canonical v4 store to v5, then v5 to v6, v6 to v7, and v7
+   to v8, and verify the complete v8 shape;
 2. keep `mode: off` while validating configuration and scripted assessment;
 3. if using an external adapter, register a dedicated non-default profile and
    confirm the frozen model/Sink/DataFlow contract;

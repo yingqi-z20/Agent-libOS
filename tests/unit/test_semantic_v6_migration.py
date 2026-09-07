@@ -23,6 +23,11 @@ from agent_libos.storage.mcp_v7_migration import (
 )
 from agent_libos.storage.v6_schema_contract import V6_TABLES
 from agent_libos.storage.v7_schema_contract import V7_TABLES
+from agent_libos.storage.v8_schema_contract import V8_TABLES
+from agent_libos.storage.llm_v8_migration import (
+    apply_store_v8_migration,
+    plan_store_v8_migration,
+)
 
 
 def _v5_store(path: Path) -> None:
@@ -30,11 +35,12 @@ def _v5_store(path: Path) -> None:
     store.close()
     connection = sqlite3.connect(path)
     try:
-        for table in sorted(V7_TABLES | V6_TABLES):
+        connection.execute("DROP INDEX IF EXISTS idx_llm_pending_replay_recovery")
+        for table in sorted(V8_TABLES | V7_TABLES | V6_TABLES):
             connection.execute(f'DROP TABLE "{table}"')
         changed = connection.execute(
             "UPDATE runtime_schema SET schema_version = 5 "
-            "WHERE singleton = 1 AND schema_version = 7"
+            "WHERE singleton = 1 AND schema_version = 8"
         )
         assert changed.rowcount == 1
         connection.commit()
@@ -134,10 +140,17 @@ def test_v5_to_v6_dry_run_is_zero_write_and_apply_requires_digest(
         expected_plan_sha256=v7_plan.plan_sha256,
         sqlite_backup=v6_backup,
     )
+    v7_backup = tmp_path / "backup-v7.sqlite"
+    shutil.copyfile(source, v7_backup)
+    os.chmod(v7_backup, 0o600)
+    v8_plan = plan_store_v8_migration(source, sqlite_backup=v7_backup)
+    apply_store_v8_migration(
+        source, expected_plan_sha256=v8_plan.plan_sha256, sqlite_backup=v7_backup,
+    )
     reopened = SQLiteStore(source)
     assert reopened.conn.execute(
         "SELECT schema_version FROM runtime_schema WHERE singleton = 1"
-    ).fetchone()[0] == 7
+    ).fetchone()[0] == 8
     legacy = reopened.get_semantic_legacy_coverage()
     assert legacy is not None
     assert legacy.source_schema_version == 5

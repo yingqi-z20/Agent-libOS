@@ -9,9 +9,31 @@ Git history remains the record for earlier development snapshots.
 Changes intended for the next published version must be summarized here before
 release. Do not treat an entry in this section as shipped behavior.
 
+## 1.5.3
+
+`1.5.3` is the current release version aligned across the Python project,
+package lockfiles, GUI package, MCP client identity, desktop metadata, and
+release workflows.
+
+- Upgrade the official OpenAI default to `gpt-6-astra` through the Responses
+  API, with bounded encrypted reasoning replay across tool loops, conversation
+  turns, restart, and local checkpoints. Replay state remains Host-private and
+  is excluded from public projections and AgentImages.
+- Introduce RuntimeStore schema v8 and the explicit offline SQLite/PostgreSQL
+  v7-to-v8 migration, with source-authority revalidation, payload purge, and
+  whole-turn context compaction.
+- Normalize reasoning-token accounting and add Host-selectable prompt-cache
+  candidates. The release defaults remain `legacy_v1` and `provider_default`
+  until the existing paired real-LLM release gate passes.
+- Align the minimum OpenAI SDK dependency and release metadata with the
+  validated `2.52.0` version.
+
+Publication still follows the separately authorized, receipt-bound process in
+[docs/releasing.md](docs/releasing.md).
+
 ## 1.5.2
 
-`1.5.2` is the current stabilization release version aligned across the Python
+`1.5.2` was the preceding stabilization release version aligned across the Python
 project, package lockfiles, GUI package, MCP client identity, desktop metadata,
 and release workflows. It builds on the 1.5.1 Runtime authority and data-flow
 semantics with further filesystem-authorization hardening, storage and recovery

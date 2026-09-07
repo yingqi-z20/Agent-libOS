@@ -404,7 +404,12 @@ maintenance uses at most `llm_context.storage_compaction_max_chunks` stages
 tail entries by default via
 `llm_context.storage_compaction_preserve_recent_entries`; the cumulative
 compressor summary remains. This avoids feeding context-maintenance artifacts
-back into an immediate second compaction. After compaction, the first safe
+back into an immediate second compaction. The compactor chooses as few stages
+as the Host's `llm_context.compaction_chunk_target_tokens` permits, balances
+uneven entries by token volume when the stage cap is reached, and saves the
+exact partition for restart. It retains only a recent suffix that fits the
+rendered token target alongside the full cumulative summary. Prior compaction
+envelopes are summarized, not copied into that suffix. After compaction, the first safe
 projected payload becomes a durable baseline and the storage trigger is
 re-armed at one configured waterline of additional growth (capped immediately
 below the hard limit). This hysteresis prevents maintenance events and child
@@ -562,6 +567,16 @@ Trace persistence is terminal-call evidence, not a crash-safe per-attempt
 journal; cancellation or process loss may therefore leave only the protected
 effect and budget evidence.
 
+Official Astra Responses profiles also keep bounded Host-private replay state
+when full-I/O retention is enabled. The Runtime preserves complete ordered
+reasoning/message/tool groups and pairs durable tool outputs without duplicating
+existing TaskRun or `image_only` history. Requests send this local history with
+no `previous_response_id`; public observations omit encrypted reasoning.
+Replay is bound to process, TaskRun, provider/model, source labels, and context
+generation. Checkpoints retain local references, image exports exclude them,
+and purged payloads cannot be recovered through old references. See
+[Responses replay configuration](configuration.md#responses-reasoning-and-local-replay).
+
 Prompt caching has a model-visible layout policy and an independent Provider
 transport policy. The repository default remains
 `llm.prompt_layout=legacy_v1`, `prompt_cache_mode=provider_default`, and no cache
@@ -576,12 +591,21 @@ select the v2 layout.
 explicit breakpoint; separately configured legacy key/retention fields retain
 their legacy Provider behavior. `implicit` sends request-wide implicit cache
 options, while `explicit` also marks one stable text breakpoint. Both opt-in
-modes require a nonempty Host-configured `prompt_cache_key`. The wire key is not
+modes require a nonempty Host-configured `prompt_cache_key` when selected
+directly. The wire key is not
 that plaintext value: the Runtime derives an `alibos:v2:` key from the configured
 privacy/routing domain, Provider endpoint, model, stable prompt projection, and
 normalized tool table, without a Run or process id. The only v2 TTL is `30m`;
 it is mutually exclusive with legacy `prompt_cache_retention`, and opt-in modes
 cannot use that retention field.
+
+The separate `auto` choices for layout and cache mode are Host opt-ins. On the
+official endpoint they select the v2 layout and implicit `30m` candidate;
+custom endpoints keep legacy/provider-default behavior. Auto cache mode
+generates a private per-profile domain when no key is configured, stable within
+the registry lifetime. Explicit keys retain their cross-restart domain. These
+resolved policies participate in the same request, tool-schema, and provider
+identity snapshot.
 
 Cache options are sent to the exact Host-selected OpenAI-compatible endpoint,
 including an explicitly allowed custom base URL. If an endpoint rejects any v2
@@ -1372,7 +1396,7 @@ status, timestamps, and audit linkage.
 
 If a primitive or human tool blocks on human approval, the process enters
 `waiting_human`. Human requests are terminally decided once: only pending
-requests can be approved or rejected. Store schema v7 gives every request a
+requests can be approved or rejected. Store schema v8 gives every request a
 durable non-negative `revision`. Response, cancellation, claim/delivery, and
 retryable delivery-state updates compare the expected revision and status; a
 winner increments the revision, so a stale response cannot exploit a

@@ -687,6 +687,45 @@ class SnapshotRows:
 
 
 @dataclass(frozen=True)
+class LocalReplayReference:
+    """Integrity-bound reference to Host-private, non-exportable LLM state."""
+
+    turn_id: str
+    pid: str
+    run_id: str | None
+    provider_fingerprint: str
+    model: str
+    context_generation: str
+    payload_sha256: str
+
+    FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "turn_id", "pid", "run_id", "provider_fingerprint", "model",
+        "context_generation", "payload_sha256",
+    })
+
+    def __post_init__(self) -> None:
+        for name in self.FIELDS - {"run_id", "payload_sha256"}:
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise ValidationError(f"snapshot replay reference {name} must be canonical text")
+        # Durable TaskRun payloads and execution identity are excluded from
+        # checkpoints. They must never be smuggled back through a sidecar.
+        if self.run_id is not None:
+            raise ValidationError("snapshot replay reference must not belong to a TaskRun")
+        if not isinstance(self.payload_sha256, str) or not _SHA256_PATTERN.fullmatch(self.payload_sha256):
+            raise ValidationError("snapshot replay reference payload_sha256 must be a SHA-256 digest")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "LocalReplayReference":
+        if not isinstance(value, Mapping) or set(value) != cls.FIELDS:
+            raise ValidationError("snapshot replay reference fields are not canonical")
+        return cls(**dict(value))
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in sorted(self.FIELDS)}
+
+
+@dataclass(frozen=True)
 class ProcessSnapshot:
     header: SnapshotHeader
     subtree_pids: tuple[str, ...]
@@ -702,6 +741,9 @@ class ProcessSnapshot:
     image_artifacts: dict[str, Any] = field(default_factory=dict)
     jit_sources: dict[str, str] = field(default_factory=dict)
     modules: tuple[dict[str, Any], ...] = ()
+    responses_replay_refs: dict[str, LocalReplayReference] = field(default_factory=dict)
+
+    OPTIONAL_KEYS: ClassVar[frozenset[str]] = frozenset({"responses_replay_refs"})
 
     TOP_LEVEL_KEYS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -724,6 +766,7 @@ class ProcessSnapshot:
             "image_artifacts",
             "jit_sources",
             "modules",
+            "responses_replay_refs",
         }
     )
 
@@ -744,6 +787,11 @@ class ProcessSnapshot:
             raise ValidationError(
                 "snapshot process rows must exactly match subtree_pids"
             )
+        for pid, reference in self.responses_replay_refs.items():
+            if not isinstance(reference, LocalReplayReference):
+                raise ValidationError("snapshot replay reference must be typed")
+            if pid not in self.subtree_pids or reference.pid != pid:
+                raise ValidationError("snapshot replay reference is outside its process scope")
 
     @staticmethod
     def decode_module_requirements(value: Any) -> tuple[dict[str, Any], ...]:
@@ -756,7 +804,7 @@ class ProcessSnapshot:
         unknown = set(value) - cls.TOP_LEVEL_KEYS
         if unknown:
             raise ValidationError(f"snapshot contains unsupported fields: {sorted(unknown)}")
-        missing = cls.TOP_LEVEL_KEYS - set(value)
+        missing = cls.TOP_LEVEL_KEYS - cls.OPTIONAL_KEYS - set(value)
         if missing:
             raise ValidationError(
                 f"snapshot is not canonical; missing fields: {sorted(missing)}"
@@ -766,6 +814,7 @@ class ProcessSnapshot:
             raise ValidationError("snapshot rows must be an object")
         referenced_types = _mapping(value.get("referenced_object_types", {}), "referenced_object_types")
         jit_sources = _mapping(value.get("jit_sources", {}), "jit_sources")
+        replay_refs = _mapping(value.get("responses_replay_refs", {}), "responses_replay_refs")
         return cls(
             header=SnapshotHeader.from_mapping(value),
             subtree_pids=_string_list(value.get("subtree_pids"), "subtree_pids"),
@@ -784,11 +833,15 @@ class ProcessSnapshot:
             image_artifacts=_mapping(value.get("image_artifacts", {}), "image_artifacts"),
             jit_sources={str(key): _string(item, f"jit_sources.{key}", allow_empty=True) for key, item in jit_sources.items()},
             modules=cls.decode_module_requirements(value.get("modules")),
+            responses_replay_refs={
+                pid: LocalReplayReference.from_mapping(reference)
+                for pid, reference in replay_refs.items()
+            },
         )
 
     def to_mapping(self, *, copy_values: bool = True) -> dict[str, Any]:
         copy_mapping = deepcopy if copy_values else dict
-        return {
+        result = {
             **self.header.to_mapping(),
             "subtree_pids": list(self.subtree_pids),
             "object_oids": list(self.object_oids),
@@ -807,6 +860,12 @@ class ProcessSnapshot:
                 for module in self.modules
             ],
         }
+        if self.responses_replay_refs:
+            result["responses_replay_refs"] = {
+                pid: reference.to_mapping()
+                for pid, reference in self.responses_replay_refs.items()
+            }
+        return result
 
 
 @dataclass(frozen=True)

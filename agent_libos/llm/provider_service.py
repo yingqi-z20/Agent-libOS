@@ -32,6 +32,7 @@ class LLMProviderService:
         temperature: float,
         max_tokens: int,
         previous_response_id: str | None = None,
+        responses_items: list[dict[str, Any]] | None = None,
         parallel_tool_calls: bool,
     ) -> Any:
         try:
@@ -42,6 +43,7 @@ class LLMProviderService:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 previous_response_id=previous_response_id,
+                responses_items=responses_items,
                 parallel_tool_calls=parallel_tool_calls,
             )
         except ProviderEffectNotStarted:
@@ -66,9 +68,16 @@ class LLMProviderService:
         temperature: float,
         max_tokens: int,
         previous_response_id: str | None = None,
+        responses_items: list[dict[str, Any]] | None = None,
         parallel_tool_calls: bool,
     ) -> Any:
         kwargs = {"temperature": temperature, "max_tokens": max_tokens}
+        if responses_items is not None:
+            if not isinstance(client, LLMClient):
+                raise ProviderEffectNotStarted(
+                    "Responses replay requires the built-in LLM client"
+                )
+            kwargs["responses_items"] = responses_items
         if hasattr(client, "acomplete_action"):
             result = (
                 client.acomplete_action(

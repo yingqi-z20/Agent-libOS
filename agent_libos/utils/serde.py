@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, is_dataclass
+from dataclasses import fields, is_dataclass
 from enum import Enum
 from typing import Any
 
@@ -180,9 +180,20 @@ def bounded_json_loads(
     return decoded
 
 
+def _dataclass_to_jsonable(value: Any) -> dict[str, Any]:
+    # Walk each dataclass ourselves: asdict recursively erases metadata before
+    # nested Host-private fields can be excluded. Repr preferences are
+    # independent and must not silently alter existing serialization.
+    return {
+        item.name: to_jsonable(getattr(value, item.name))
+        for item in fields(value)
+        if item.metadata.get("serialize") is not False
+    }
+
+
 def to_jsonable(value: Any) -> Any:
     if is_dataclass(value):
-        return {key: to_jsonable(item) for key, item in asdict(value).items()}
+        return _dataclass_to_jsonable(value)
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, (str, int, float, bool)) or value is None:

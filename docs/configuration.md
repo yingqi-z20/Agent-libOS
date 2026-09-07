@@ -16,6 +16,8 @@ security rules.
 - [Apply bounded YAML input rules](#bounded-yaml-input)
 - [Review store persistence and relative path ownership](#store-persistence-and-relative-path-ownership)
 - [Resolve the effective LLM profile](#effective-llm-profile-precedence)
+- [Configure Responses reasoning and local replay](#responses-reasoning-and-local-replay)
+- [Evaluate the prompt-cache candidate](#prompt-cache-candidate)
 - [Inspect exact defaults](#inspecting-exact-defaults)
 - [Configure semantic phases](#semantic-phase-24-configuration)
 - [Review security-sensitive settings](#security-sensitive-settings)
@@ -58,8 +60,11 @@ Product entrypoints use this order:
      `capability.regex_match_timeout_s`, `scheduler.max_workers`, and
      `process.max_tool_calls`;
    - `llm.max_tokens`, `llm.max_input_tokens_per_call`,
-     `llm.max_total_tokens_per_call`, `llm.temperature`, and each profile's
+     `llm.max_total_tokens_per_call`, `llm.temperature`,
+     `llm.responses_replay_max_bytes`, `llm.responses_replay_max_turns`, and each profile's
      corresponding token limits and temperature;
+   - `llm.responses_replay` and each profile's `responses_replay`, when non-null,
+     use `StrictBool`;
    - every numeric field in `semantic`: `semantic.max_concurrency`,
      `semantic.assessment_timeout_s`, `semantic.job_lease_s`,
      `semantic.shutdown_join_timeout_s`, `semantic.projection_ttl_s`,
@@ -231,6 +236,7 @@ whose id equals `llm.default_profile_id` then inherits the matching legacy
 `OPENAI_*` environment value; other named profiles do not inherit ambient
 endpoint, model, or provider-policy settings. When neither is present,
 `llm.timeout_s`, `llm.max_retries`, `llm.api_mode`, `llm.store`,
+`llm.reasoning_context`, `llm.responses_replay`, `llm.prompt_layout`,
 `llm.safety_identifier`, `llm.prompt_cache_key`,
 `llm.prompt_cache_retention`, `llm.prompt_cache_mode`,
 `llm.prompt_cache_ttl`, `llm.responses_previous_response_id`,
@@ -242,7 +248,9 @@ group defaults. The
 legacy mappings are
 `OPENAI_BASE_URL`; `OPENAI_LANGUAGE_MODEL` then `OPENAI_MODEL`;
 `OPENAI_TIMEOUT`; `OPENAI_MAX_RETRIES`; `OPENAI_API_MODE`; `OPENAI_STORE`;
-`OPENAI_REASONING_EFFORT`; `OPENAI_VERBOSITY`; `OPENAI_SAFETY_IDENTIFIER`;
+`OPENAI_REASONING_EFFORT`; `OPENAI_REASONING_CONTEXT`;
+`OPENAI_RESPONSES_REPLAY`; `OPENAI_PROMPT_LAYOUT`;
+`OPENAI_VERBOSITY`; `OPENAI_SAFETY_IDENTIFIER`;
 `OPENAI_PROMPT_CACHE_KEY`; `OPENAI_PROMPT_CACHE_RETENTION`;
 `OPENAI_PROMPT_CACHE_MODE`; `OPENAI_PROMPT_CACHE_TTL`;
 `OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID`;
@@ -279,6 +287,86 @@ identifier and does not fall back to the default profile's legacy identifier.
 A custom base URL is permitted when either the profile sets
 `allow_custom_base_url: true` or the Host sets
 `AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1`.
+
+### Responses reasoning and local replay
+
+After profile and applicable environment overrides are resolved, an official
+OpenAI endpoint with no model selects `llm.openai_model` (`gpt-6-astra`). The
+default `api_mode: auto` selects Responses there. Official Astra requests use
+`reasoning.effort: medium` and `reasoning.context: all_turns` by default, omit
+unsupported sampling parameters, and keep the default `store: false`. Explicit
+model and policy settings remain authoritative. A custom endpoint receives no
+implicit Astra model, reasoning policy, or replay opt-in.
+
+`reasoning_context` accepts `auto`, `current_turn`, or `all_turns`; `auto`
+chooses the Astra context default only for the official endpoint. A profile's
+`responses_replay` accepts `true`, `false`, or `null`. Null enables replay for
+official Astra Responses requests; true explicitly enables it for a selected
+Responses-compatible provider, and false disables it. Chat cannot replay
+Responses output items. The semantic classifier explicitly disables this
+conversation state and the new cache defaults.
+
+When replay is active, the Runtime sends complete local Responses history with
+no `previous_response_id`. It preserves ordered reasoning, assistant `phase`,
+function calls, and matching tool results. Encrypted reasoning is an opaque
+provider continuation, not a readable reasoning trace. The Runtime retains it
+in a separate Host-private store and never uses a hash or summary as a replay
+substitute. Protocol errors cannot silently discard that state or switch the
+tool loop to Chat. Public LLM records, events, GUI views, and generic completion
+serialization exclude the ciphertext.
+
+`llm.persist_full_io: false` disables durable Responses replay, including when
+the effective provider policy would enable it. Replay payloads are bounded by
+`responses_replay_max_bytes` (8 MiB) and `responses_replay_max_turns` (128).
+Checkpoint snapshots contain local references only; restore and fork validate
+the retained payload, provider/model scope, and current source authority.
+Purging private payloads makes old checkpoint references unusable. Agent images
+and image packages do not carry conversation replay. Active TaskRun checkpoint
+restrictions still apply. Existing schema-v7 stores require the explicit
+[v7-to-v8 migration](storage.md); startup does not migrate them.
+
+Canonical call usage retains `reasoning_tokens` as a subset of output tokens.
+It is not added to completion or total billing. Invalid counters are omitted
+and named in `invalid_usage_fields`; a reported zero remains different from a
+missing counter. Replay input estimates use visible content plus historical
+reasoning token counts, with output usage or the approved output bound as a
+fallback; ciphertext byte length does not estimate reasoning tokens.
+
+### Prompt-cache candidate
+
+The release defaults remain `prompt_layout: legacy_v1` and
+`prompt_cache_mode: provider_default`. The candidate is available through an
+explicit Host overlay:
+
+```yaml
+llm:
+  profiles:
+    default:
+      prompt_layout: auto
+      prompt_cache_mode: auto
+```
+
+For the official endpoint, these `auto` policies select `cache_optimized_v2`,
+implicit caching with a stable-prefix explicit breakpoint, and a `30m` TTL.
+A custom endpoint resolves them to the legacy
+layout and provider-default caching. An explicit legacy retention policy keeps
+its provider-default cache behavior. `auto` is resolved by the Host and is
+never sent to a provider.
+
+With auto caching and no configured `prompt_cache_key`, the Host generates a
+private domain for each profile, stable for the registry lifetime and isolated
+from other profiles and later Runtime instances. An explicit key supplies a
+Host-managed domain for reuse across restarts. Cache domains are routing inputs,
+not authorization credentials. Explicit `implicit` or `explicit` modes still
+require a key; explicit mode adds one stable text breakpoint. Provider
+compatibility retries remove rejected cache options together within the same
+logical call, and records distinguish requested from effective options.
+
+Selecting this candidate does not constitute a successful live evaluation.
+Changing the release defaults requires the existing paired gate, with matching
+models in both arms and at least two provider/model pairs. See
+[provider release evidence](providers.md#prompt-caching-v2-release-evidence)
+for the required success, privacy, token, and cost checks.
 
 ## Inspecting exact defaults
 
@@ -661,7 +749,9 @@ configurable. A runtime release emits only the snapshot version it can decode.
   closed instead of rebuilding or dispatching it. `prompt_mode: image_only`
   cannot use this opt-out: custom Images default to that mode, and it fails
   before provider dispatch unless the lossless native transcript can be written
-  with `persist_full_io=true`. The setting also controls the committed root
+  with `persist_full_io=true`. The setting also controls the private replay
+  store: false disables durable encrypted Responses replay rather than
+  retaining hidden payloads outside the declared policy. It also controls root
   spawn's initial-goal recovery envelope: true retains its bounded exact payload
   while the committed root process remains active, while false writes only
   content-free identity, size, and hash fields and therefore cannot support a
@@ -836,6 +926,17 @@ as equivalent:
   provider-neutral model payload (default `2,048` characters). Oversized
   payloads retain compact actionable fields plus deterministic omission counts
   and SHA-256 digests; original event evidence remains unchanged.
+- `llm_context.compaction_chunk_target_tokens` is the positive integer source
+  token target for each built-in compressor stage (default `16,384`). Small
+  histories use one stage; larger histories are divided by estimated token
+  volume, preserving entry order and complete entries. The tool's `max_chunks`
+  remains a hard stage bound. An indivisible large entry or that bound can
+  require a stage above the soft target; normal provider/context admission
+  still applies. This target excludes system instructions and the rolling
+  summary, so leave headroom when configuring small-context compressor profiles.
+  Stage boundaries are saved before spawning a child and reused after restart,
+  including when the Host changes this target. Existing pending jobs without
+  saved boundaries retain their original entry-count partition.
 - `llm_context.storage_compaction_threshold_bytes` is the persisted-context
   waterline that starts automatic compaction before the generic Object Memory
   payload hard limit. It must be positive and strictly less than
@@ -855,6 +956,12 @@ as equivalent:
   their result objects can otherwise make a newly compacted context cross the
   waterline again. An Image's explicit tool argument still takes precedence;
   values must be between 0 and 128.
+  For all built-in compactions, `preserve_recent_entries` is an upper bound:
+  only the contiguous recent suffix that fits the rendered `target_tokens`
+  target is retained verbatim. Earlier entries are represented by the
+  cumulative summary; older compaction envelopes are never retained as tail
+  entries. The summary itself is kept complete even when it exceeds the soft
+  target, and `compacted_tokens` reports the complete rendered context size.
 - `gui.snapshot_event_limit` bounds snapshot event reads and is also the maximum
   accepted `limit` for the process-events API. Older pages use its `before`
   cursor rather than loading all process events.

@@ -143,6 +143,12 @@ class SnapshotRemapper:
     @classmethod
     def remap(cls, snapshot: ProcessSnapshot, identities: SnapshotIdentityMap) -> ProcessSnapshot:
         cls._validate_identity_collisions(snapshot, identities)
+        if snapshot.responses_replay_refs and any(
+            source != target
+            for mapping in (identities.pids, identities.objects)
+            for source, target in mapping.items()
+        ):
+            raise ValidationError("snapshot private Responses replay requires an authorized local rebind")
         root_pid = identities.pids.get(snapshot.header.root_pid, snapshot.header.root_pid)
         remapped = ProcessSnapshot(
             header=SnapshotHeader(
@@ -179,6 +185,7 @@ class SnapshotRemapper:
                 for tool_id, source in snapshot.jit_sources.items()
             },
             modules=tuple(deepcopy(module) for module in snapshot.modules),
+            responses_replay_refs=dict(snapshot.responses_replay_refs),
         )
         cls._validate_remapped_cardinality(snapshot, remapped)
         cls._validate_remapped_references(snapshot, remapped, identities)

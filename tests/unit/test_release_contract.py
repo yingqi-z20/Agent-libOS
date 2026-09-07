@@ -204,7 +204,7 @@ def _write_test_sdist(
     return target
 
 
-def _write_release_pair(target: Path, *, version: str = "1.5.2") -> tuple[Path, Path]:
+def _write_release_pair(target: Path, *, version: str = "1.5.3") -> tuple[Path, Path]:
     wheel = _write_test_wheel(
         target / f"agent_libos-{version}-py3-none-any.whl",
         version=version,
@@ -217,12 +217,12 @@ def _write_release_pair(target: Path, *, version: str = "1.5.2") -> tuple[Path, 
 
 
 def test_release_version_identifiers_are_aligned() -> None:
-    assert validate_version_alignment(ROOT) == "1.5.2"
+    assert validate_version_alignment(ROOT) == "1.5.3"
 
 
 def test_release_protocol_versions_are_independent_and_default_off() -> None:
-    assert __version__ == "1.5.2"
-    assert STORE_SCHEMA_VERSION == 7
+    assert __version__ == "1.5.3"
+    assert STORE_SCHEMA_VERSION == 8
     assert SEMANTIC_STATUS_SCHEMA_VERSION == 3
     assert DEFAULT_CONFIG.semantic.mode == "off"
     assert DEFAULT_CONFIG.semantic.policy_epoch is None
@@ -235,7 +235,7 @@ def test_agentdojo_lock_tracks_current_editable_agent_libos_metadata() -> None:
         )
     )
     package = next(item for item in lock["package"] if item["name"] == "agent-libos")
-    assert package["version"] == "1.5.2"
+    assert package["version"] == "1.5.3"
     assert package["source"] == {"editable": "../../"}
     assert {
         (item["specifier"], item["marker"])
@@ -248,7 +248,7 @@ def test_root_lock_resolves_the_reviewed_mcp_sdk_v2_graph() -> None:
     lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
     packages = {item["name"]: item for item in lock["package"]}
 
-    assert packages["agent-libos"]["version"] == "1.5.2"
+    assert packages["agent-libos"]["version"] == "1.5.3"
     assert packages["mcp"]["version"] == "2.0.0"
     assert packages["mcp-types"]["version"] == "2.0.0"
     assert {
@@ -334,7 +334,7 @@ def test_build_backend_runtime_dependencies_and_project_urls_are_bounded() -> No
     }
     assert pyproject["project"]["readme"] == "README.pypi.md"
     assert set(pyproject["project"]["dependencies"]) == {
-        "openai>=2.43.0,<3",
+        "openai>=2.52.0,<3",
         "psutil>=7.0.0,<8",
         "pydantic>=2.13.4,<3",
         "jsonschema>=4.25.0,<5",
@@ -828,7 +828,7 @@ def test_release_checksum_manifest_records_and_verifies_exact_artifacts(
 
 def test_release_status_contains_current_version_state_only() -> None:
     text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
-    assert text.startswith("# Agent libOS 1.5.2 Status\n")
+    assert text.startswith("# Agent libOS 1.5.3 Status\n")
     forbidden = {
         "dirty state": r"\bdirty\b",
         "worktree state": r"\bwork(?:ing)?[ -]?tree\b",
@@ -919,7 +919,7 @@ def test_release_status_bounds_unarchived_evidence_and_volatile_counts() -> None
     text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
 
     assert "## Unarchived real-LLM observation" in text
-    assert "not Agent libOS 1.5.2 release evidence" in text
+    assert "not Agent libOS 1.5.3 release evidence" in text
     assert "AgentDojo harness is a required CI matrix" in text
     assert "collected pytest nodes" not in text
     assert not re.search(r"selects [\d,]+ tests", text)
@@ -1091,7 +1091,7 @@ def test_mcp_release_contract_separates_legacy_tools_from_exact_modern_v3() -> N
         "Manifest v1/v2 is the released compatibility contract for governed MCP Tools",
         "Manifest v3 is the exact `2026-07-28` modern Host-client contract",
         "governed Tools with the modern closed result union",
-        "the Store uses schema v7",
+        "the Store uses schema v8",
         "`mcp==2.0.0`",
     ):
         assert required in mcp
@@ -1138,6 +1138,19 @@ def test_mcp_release_contract_separates_legacy_tools_from_exact_modern_v3() -> N
     assert "Ubuntu Python 3.11 and 3.14" in support
 
 
+def test_installed_mcp_migration_smoke_reaches_current_store_schema() -> None:
+    from scripts.smoke_mcp_extra import _migration_smoke
+
+    evidence = _migration_smoke()
+
+    assert evidence["from"] == 6
+    assert evidence["to"] == 7
+    assert evidence["backend"] == "sqlite"
+    assert evidence["reopened"] is True
+    assert evidence["reopened_schema_version"] == STORE_SCHEMA_VERSION
+    assert len(str(evidence["v8_plan_sha256"])) == 64
+
+
 def test_mcp_extra_artifact_smoke_uses_clean_installed_modern_runtime() -> None:
     smoke = (ROOT / "scripts" / "smoke_mcp_extra.py").read_text(encoding="utf-8")
 
@@ -1164,6 +1177,8 @@ def test_mcp_extra_artifact_smoke_uses_clean_installed_modern_runtime() -> None:
         '"streamable-http"',
         'plan_store_v7_migration(',
         'apply_store_v7_migration(',
+        'plan_store_v8_migration(',
+        'apply_store_v8_migration(',
         'PinnedMcpOAuthHttpTransport(',
         '_INSTALLED_OAUTH_TLS_SERVER = r\'\'\'',
         'fixture.write_text(_INSTALLED_OAUTH_TLS_SERVER',
@@ -1363,8 +1378,8 @@ def test_canonical_release_docs_cover_artifacts_and_clean_install_readback() -> 
 
     assert "[Development Guide](docs/development.md)" in readme
     assert "[Release Runbook](docs/releasing.md)" in readme
-    assert "dist/agent_libos-1.5.2-py3-none-any.whl" in development
-    assert "dist/agent_libos-1.5.2.tar.gz" in development
+    assert "dist/agent_libos-1.5.3-py3-none-any.whl" in development
+    assert "dist/agent_libos-1.5.3.tar.gz" in development
     assert '"$RELEASE_WHEEL"' in releasing
     assert '"$RELEASE_SDIST"' in releasing
     assert "set(published) != set(canonical)" in releasing
@@ -1388,7 +1403,7 @@ def test_gui_dependency_baseline_is_current_and_lockfile_aligned() -> None:
         (ROOT / "gui" / "package-lock.json").read_text(encoding="utf-8")
     )
 
-    assert package["version"] == "1.5.2"
+    assert package["version"] == "1.5.3"
     assert package["dependencies"] == {
         "lucide-react": "^1.28.0",
         "react": "^19.2.8",
@@ -1418,7 +1433,7 @@ def test_gui_dependency_baseline_is_current_and_lockfile_aligned() -> None:
     }
     assert "overrides" not in package
     locked_root = lockfile["packages"][""]
-    assert locked_root["version"] == "1.5.2"
+    assert locked_root["version"] == "1.5.3"
     assert locked_root["dependencies"] == package["dependencies"]
     assert locked_root["devDependencies"] == package["devDependencies"]
     assert locked_root["engines"] == package["engines"]
@@ -2503,8 +2518,8 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         "cancel-in-progress": True,
     }
     assert parsed["env"] == {
-        "RELEASE_WHEEL": "dist/agent_libos-1.5.2-py3-none-any.whl",
-        "RELEASE_SDIST": "dist/agent_libos-1.5.2.tar.gz",
+        "RELEASE_WHEEL": "dist/agent_libos-1.5.3-py3-none-any.whl",
+        "RELEASE_SDIST": "dist/agent_libos-1.5.3.tar.gz",
         "RELEASE_CHECKSUMS": "dist/SHA256SUMS",
     }
     release_steps = release_job["steps"]

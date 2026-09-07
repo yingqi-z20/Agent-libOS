@@ -626,28 +626,8 @@ class ExternalLLMSemanticAssessor:
             raise SemanticExternalAssessorConfigurationError(
                 "semantic classifier profile must set store=false"
             )
-        if policy.prompt_cache_retention is not None:
-            raise SemanticExternalAssessorConfigurationError(
-                "semantic classifier profile must disable prompt cache retention"
-            )
-        if policy.responses_previous_response_id is not False:
-            raise SemanticExternalAssessorConfigurationError(
-                "semantic classifier profile must disable response chaining"
-            )
-        if policy.fallback_json_actions is not False:
-            raise SemanticExternalAssessorConfigurationError(
-                "semantic classifier profile must disable JSON action fallback"
-            )
+        self._validate_profile_retention(profile, policy)
         defaults = self._llms.config.llm
-        prompt_cache_key = (
-            profile.prompt_cache_key
-            if profile.prompt_cache_key is not None
-            else defaults.prompt_cache_key
-        )
-        if prompt_cache_key is not None:
-            raise SemanticExternalAssessorConfigurationError(
-                "semantic classifier profile must disable prompt cache keys"
-            )
         max_retries = (
             profile.max_retries
             if profile.max_retries is not None
@@ -682,6 +662,38 @@ class ExternalLLMSemanticAssessor:
                 "semantic classifier timeout exceeds the remaining assessment deadline"
             )
         return selected_timeout
+
+    def _validate_profile_retention(self, profile: Any, policy: Any) -> None:
+        if policy.prompt_cache_retention is not None:
+            raise SemanticExternalAssessorConfigurationError(
+                "semantic classifier profile must disable prompt cache retention"
+            )
+        if policy.prompt_cache_mode != "provider_default" or policy.prompt_cache_ttl is not None:
+            raise SemanticExternalAssessorConfigurationError(
+                "semantic classifier profile must disable prompt cache mode and TTL"
+            )
+        if profile.responses_replay is True or policy.responses_replay is not False:
+            raise SemanticExternalAssessorConfigurationError(
+                "semantic classifier profile must disable Responses replay"
+            )
+        if policy.responses_previous_response_id is not False:
+            raise SemanticExternalAssessorConfigurationError(
+                "semantic classifier profile must disable response chaining"
+            )
+        if policy.fallback_json_actions is not False:
+            raise SemanticExternalAssessorConfigurationError(
+                "semantic classifier profile must disable JSON action fallback"
+            )
+        defaults = self._llms.config.llm
+        prompt_cache_key = (
+            profile.prompt_cache_key
+            if profile.prompt_cache_key is not None
+            else defaults.prompt_cache_key
+        )
+        if prompt_cache_key is not None:
+            raise SemanticExternalAssessorConfigurationError(
+                "semantic classifier profile must disable prompt cache keys"
+            )
 
     @staticmethod
     def _single_attempt_client(client: Any) -> Any:
@@ -720,6 +732,9 @@ class ExternalLLMSemanticAssessor:
             ("store", False),
             ("prompt_cache_key", None),
             ("prompt_cache_retention", None),
+            ("prompt_cache_mode", "provider_default"),
+            ("prompt_cache_ttl", None),
+            ("responses_replay", False),
             ("responses_previous_response_id", False),
             ("max_retries", 0),
         ):

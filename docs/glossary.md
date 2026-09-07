@@ -14,12 +14,12 @@ Several independent version namespaces coexist. Never infer one from another:
 
 | Namespace | Current value | What it versions |
 | --- | --- | --- |
-| Agent libOS product/package | `1.5.2` | Python package, aligned GUI package, release workflow, and current product contract |
-| RuntimeStore schema | `7` | Persisted SQL store shape accepted by ordinary Runtime startup |
+| Agent libOS product/package | `1.5.3` | Python package, aligned GUI package, release workflow, and current product contract |
+| RuntimeStore schema | `8` | Persisted SQL store shape accepted by ordinary Runtime startup |
 | GUI snapshot envelope | `3` | Same-build `GET /api/snapshot` response consumed by the bundled renderer |
 | GUI JSON Schema registry | `2` | The deliberately partial registry in [`gui_api_schema.json`](gui_api_schema.json); it describes selected v3 snapshot/API shapes and confirmed mutations, not a complete REST API |
 | MCP manifest | `1`, `2`, or `3` | Independent client manifest contracts; v1/v2 preserve governed Tool compatibility and v3 requires the exact `2026-07-28` protocol contract |
-| LLM prompt layout / prompt-cache | `legacy_v1`, `cache_optimized_v2` | `llm.prompt_layout` tokens plus the opt-in v2 prompt-cache transport (`prompt_cache_options`, the `30m` TTL, derived `alibos:v2:` keys); bare prompt-caching v2 in the docs means this namespace, not an MCP manifest version |
+| LLM prompt layout / prompt-cache | `auto`, `legacy_v1`, `cache_optimized_v2` | Host-resolved `llm.prompt_layout` tokens plus the opt-in v2 prompt-cache transport (`prompt_cache_options`, the `30m` TTL, derived `alibos:v2:` keys); bare prompt-caching v2 in the docs means this namespace, not an MCP manifest version |
 | Runtime-safety benchmark task | `1` | Checked-in benchmark task YAML input |
 | Runtime-safety run output | `2` | One runner's persisted benchmark result/effect artifact |
 

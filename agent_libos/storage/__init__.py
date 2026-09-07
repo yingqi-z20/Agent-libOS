@@ -1,3 +1,4 @@
+from agent_libos.models.llm_replay import LLMReplayHead, LLMReplayTurn
 from agent_libos.storage.base import (
     RuntimeStore,
     StoreAssemblyReadiness,
@@ -115,6 +116,8 @@ from agent_libos.storage.mcp_v7_migration import (
 from agent_libos.storage.sqlite import SQLiteStore
 
 __all__ = [
+    "LLMReplayHead",
+    "LLMReplayTurn",
     "RuntimeStore",
     "StoreAssemblyReadiness",
     "StoreAssemblyReservation",

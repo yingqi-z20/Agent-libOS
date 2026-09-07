@@ -47,7 +47,7 @@ is not a wire-protocol version: MCP protocol revisions are date strings. Manifes
 requires the exact `2026-07-28` wire contract, while the v1/v2 compatibility
 path also supports the documented legacy initialize-based revisions. Manifest
 schema, SDK major, protocol revision, Agent libOS product version, and
-RuntimeStore schema are independent identifiers; the Store uses schema v7.
+RuntimeStore schema are independent identifiers; the Store uses schema v8.
 
 The outbound `clientInfo` identity is part of the compatibility contract and
 is selected by manifest generation, not copied mechanically from the installed
@@ -57,7 +57,7 @@ distribution metadata:
 | --- | --- | --- |
 | v1 legacy wire | `mcp` | `0.1.0` |
 | v2 governed Tools compatibility | `agent-libos` | `1.4.2` |
-| v3 exact `2026-07-28` | `agent-libos` | `1.5.2` |
+| v3 exact `2026-07-28` | `agent-libos` | `1.5.3` |
 
 The v1 and v2 values are frozen compatibility identities. Only exact-v3 uses
 the current modern product identity; changing the package version must never

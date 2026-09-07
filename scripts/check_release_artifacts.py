@@ -23,11 +23,11 @@ from packaging.utils import canonicalize_name
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT_NAME = "agent-libos"
 ARCHIVE_NAME = "agent_libos"
-RELEASE_TARGET_VERSION = "1.5.2"
+RELEASE_TARGET_VERSION = "1.5.3"
 REPOSITORY_URL = "https://github.com/yingqi-z20/Agent-libOS"
 CORE_REQUIREMENTS = (
     "jsonschema<5,>=4.25.0",
-    "openai<3,>=2.43.0",
+    "openai<3,>=2.52.0",
     "psutil<8,>=7.0.0",
     "pydantic<3,>=2.13.4",
     "pyyaml<7,>=6.0.3",

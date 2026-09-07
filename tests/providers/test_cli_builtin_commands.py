@@ -769,7 +769,7 @@ class TestCLIBuiltinCommand:
     ) -> None:
         message = (
             "Agent libOS store schema v3 is not writable or readable by this runtime; "
-            "expected 7. Use Agent libOS 1.0.1 to view or archive this store. "
+            "expected 8. Use Agent libOS 1.0.1 to view or archive this store. "
             "No migration was attempted."
         )
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -796,7 +796,7 @@ class TestCLIBuiltinCommand:
     def test_python_module_entrypoint_uses_structured_error_boundary(self) -> None:
         message = (
             "Agent libOS store schema v3 is not writable or readable by this runtime; "
-            "expected 7. Use Agent libOS 1.0.1 to view or archive this store. "
+            "expected 8. Use Agent libOS 1.0.1 to view or archive this store. "
             "No migration was attempted."
         )
         with tempfile.TemporaryDirectory() as temp_dir:

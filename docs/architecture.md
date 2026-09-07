@@ -469,16 +469,29 @@ The assembled graph includes:
   fingerprints; its narrower dispatch gate is an explicit id, an official
   stored Responses request, and representable tool history.
 
+For official Astra Responses profiles, a separate Host-private replay service
+preserves ordered encrypted reasoning and paired tool turns across durable
+waits and local recovery. It binds state to process, TaskRun, provider/model,
+source labels, and context generation; public call records retain safe
+observations. Checkpoints contain local references and image packages omit the
+conversation state. Full-I/O retention opt-out disables durable replay.
+
 Prompt caching separates a model-visible layout from provider transport policy.
 The defaults, `legacy_v1` and `provider_default`, preserve the legacy prompt and
 send no v2 cache options. Opt-in `cache_optimized_v2` keeps stable instructions
 and append-only TaskRun requirements ahead of volatile state and minimizes
-libOS-owned metadata. `implicit` and `explicit` cache modes require a
+libOS-owned metadata. Selecting `implicit` or `explicit` directly requires a
 Host-configured `prompt_cache_key`; Runtime derives the wire key from that
 privacy domain plus provider, model, stable prefix, and tool fingerprint rather
 than a Run or process id. Explicit mode also marks one stable text breakpoint.
 The only v2 TTL is `30m`, mutually exclusive with legacy
 `prompt_cache_retention`.
+
+An explicit Host `auto` selection exposes the official-endpoint v2/implicit
+`30m` candidate and generates a private profile domain when no key is supplied.
+It falls back to legacy/provider-default policy for custom endpoints. Auto
+domains last for one registry lifetime; they do not grant authority or alter
+the release defaults.
 
 If an endpoint rejects a cache field, the bounded compatibility retry removes
 the entire v2 cache-option group. That retry remains inside the same logical
@@ -681,7 +694,7 @@ never automatically replayed. The general LLM process executor is not reused,
 so its full-I/O persistence path cannot capture the semantic prompt or
 response.
 
-Store schema v7 keeps mutable queue/control/rate state separate from append-only
+Store schema v8 keeps mutable queue/control/rate state separate from append-only
 assessment, FlowGraph, policy epoch, machine-settlement, health, and review
 evidence. Temporary safe projections are bounded and reduced to
 hash-only at terminalization, expiry, cancellation, failure, or kill-switch

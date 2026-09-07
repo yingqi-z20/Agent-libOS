@@ -1376,6 +1376,10 @@ export type ToolSummary = {
   ephemeral: boolean;
 };
 
+export type LLMReasoningContext = "auto" | "current_turn" | "all_turns";
+export type LLMPromptLayout = "auto" | "legacy_v1" | "cache_optimized_v2";
+export type LLMPromptCacheMode = "auto" | "provider_default" | "implicit" | "explicit";
+
 export type LLMProfileSummary = {
   profile_id: string;
   model: string | null;
@@ -1387,9 +1391,14 @@ export type LLMProfileSummary = {
   max_retries: number | null;
   store: boolean | null;
   reasoning_effort: string | null;
+  reasoning_context: LLMReasoningContext | null;
+  responses_replay: boolean | null;
+  prompt_layout: LLMPromptLayout | null;
   verbosity: "low" | "medium" | "high" | null;
   safety_identifier_env: string | null;
   prompt_cache_retention: "in_memory" | "24h" | null;
+  prompt_cache_mode: LLMPromptCacheMode | null;
+  prompt_cache_ttl: "30m" | null;
   responses_previous_response_id: boolean | null;
   parallel_tool_calls: boolean | null;
   auto_wait_on_empty_tool_calls: boolean | null;
@@ -1413,9 +1422,14 @@ export type LLMProfileInput = {
   max_retries?: number | null;
   store?: boolean | null;
   reasoning_effort?: string | null;
+  reasoning_context?: LLMReasoningContext | null;
+  responses_replay?: boolean | null;
+  prompt_layout?: LLMPromptLayout | null;
   verbosity?: "low" | "medium" | "high" | null;
   safety_identifier_env?: string | null;
   prompt_cache_retention?: "in_memory" | "24h" | null;
+  prompt_cache_mode?: LLMPromptCacheMode | null;
+  prompt_cache_ttl?: "30m" | null;
   responses_previous_response_id?: boolean | null;
   parallel_tool_calls?: boolean | null;
   auto_wait_on_empty_tool_calls?: boolean | null;

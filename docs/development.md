@@ -162,8 +162,8 @@ stdio plus loopback Streamable HTTP server through the installed Runtime
 Resource, Resource Template, Prompt, Completion, bounded resource-subscription,
 and Tool protected paths. The same installed-package smoke writes its OAuth server fixture into
 that temporary directory, performs a Host-pinned loopback-TLS OAuth
-authorization-code, PKCE, and Bearer exchange, and runs an offline Store v6-to-v7
-migration followed by a schema-v7 reopen. A second installed-package smoke
+authorization-code, PKCE, and Bearer exchange, and runs ordered offline Store
+v6-to-v7 and v7-to-v8 migrations followed by a schema-v8 reopen. A second installed-package smoke
 captures MRTR and remote-Task results through the protected Runtime, closes and
 reopens the SQLite Store, then drives continuation inspect/respond/cancel and
 Task get/update/cancel/re-observe through the installed CLI. It requires each
@@ -339,9 +339,9 @@ uv sync --frozen --no-dev --group release
 uv build --no-build-isolation --clear --out-dir dist --python .venv/bin/python --no-create-gitignore
 .venv/bin/python scripts/check_release_artifacts.py dist --write-checksums
 uv run --frozen --no-dev --group release twine check \
-  dist/agent_libos-1.5.2-py3-none-any.whl dist/agent_libos-1.5.2.tar.gz
+  dist/agent_libos-1.5.3-py3-none-any.whl dist/agent_libos-1.5.3.tar.gz
 uv run --frozen --no-dev --group release check-wheel-contents \
-  dist/agent_libos-1.5.2-py3-none-any.whl
+  dist/agent_libos-1.5.3-py3-none-any.whl
 .venv/bin/python scripts/check_release_artifacts.py dist --verify-checksums
 ```
 
@@ -431,10 +431,15 @@ Useful optional variables:
 - `OPENAI_MAX_RETRIES`
 - `OPENAI_STORE`
 - `OPENAI_REASONING_EFFORT`
+- `OPENAI_REASONING_CONTEXT=auto|current_turn|all_turns`
+- `OPENAI_RESPONSES_REPLAY=true|false`
+- `OPENAI_PROMPT_LAYOUT=auto|legacy_v1|cache_optimized_v2`
 - `OPENAI_VERBOSITY`
 - `OPENAI_SAFETY_IDENTIFIER`
 - `OPENAI_PROMPT_CACHE_KEY`
 - `OPENAI_PROMPT_CACHE_RETENTION=in_memory|24h`
+- `OPENAI_PROMPT_CACHE_MODE=auto|provider_default|implicit|explicit`
+- `OPENAI_PROMPT_CACHE_TTL=30m`
 - `OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID=true|false`
 - `OPENAI_PARALLEL_TOOL_CALLS=true|false`
 - `OPENAI_FALLBACK_JSON_ACTIONS=true|false`
@@ -443,6 +448,9 @@ Useful optional variables:
 `OPENAI_BASE_URL` is optional for the OpenAI API. Custom OpenAI-compatible
 endpoints require `AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1` or an explicit
 `allow_custom_base_url=True` client construction.
+With the official endpoint and no explicit model, the Host selects
+`gpt-6-astra` and the Responses reasoning defaults. The cache candidate remains
+an explicit Host opt-in; see [LLM configuration](configuration.md#responses-reasoning-and-local-replay).
 
 To exercise the original five general/specialized image contracts against one
 configured real model, run the scoped opt-in suite:
@@ -475,7 +483,7 @@ not trusted to receive. `previous_response_id` is narrower: the low-level
 client sends it only for the official Responses endpoint, with `store=true`,
 and only when the caller explicitly supplies an eligible id.
 
-The AgentProcess executor is stateless even if a profile configures
+The AgentProcess executor does not use provider-side response chaining even if a profile configures
 `store=true` and `responses_previous_response_id=true`. It rebuilds the complete
 local snapshot, records the configured-but-disabled reason in `llm_calls`, and
 never combines that snapshot with `previous_response_id`. For ordinary Runtime
@@ -484,6 +492,13 @@ context. An `image_only` Image instead replays its paired tool transcript in the
 provider's native form without provider-side chaining: Responses receives
 `function_call`/`function_call_output` input items, while Chat receives
 assistant/tool messages.
+
+When Responses replay is enabled, the executor instead assembles the complete
+ordered private history, retaining encrypted reasoning and assistant `phase`
+alongside paired tool output. It avoids adding the existing TaskRun or
+`image_only` transcript twice. Durable replay requires `persist_full_io=true`,
+and replay-bearing protocol errors cannot silently switch to Chat. Local
+checkpoint references do not export conversation state with an agent image.
 
 Real asynchronous SDK transports are request-scoped. Scheduler quanta and
 parallel process workers may use different short-lived event loops, so a cached

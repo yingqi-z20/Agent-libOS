@@ -798,7 +798,7 @@ def test_publication_scale_rejects_same_name_weak_reconciliation_index(
     # assertion can run.
     with pytest.raises(
         UnsupportedStoreVersion,
-        match="schema v7 full catalog",
+        match="schema v8 full catalog",
     ):
         run_publication_scale_benchmark(
             total_records=40,

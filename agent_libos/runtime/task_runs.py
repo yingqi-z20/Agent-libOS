@@ -7164,6 +7164,81 @@ class TaskRunManager:
         DataLabels.from_dict(decoded["data_labels"])
         self._prevalidate_recoverable_requirements(record)
         self._prevalidate_recoverable_resume_points(record)
+        self._prevalidate_recoverable_llm_replay(record)
+
+    def _prevalidate_recoverable_llm_replay(self, record: TaskRunRecord) -> None:
+        """Validate private replay before recovery performs durable effects."""
+        from agent_libos.llm.replay import LLMReplayService
+
+        replay = LLMReplayService(
+            self._store,
+            max_bytes=self.config.llm.responses_replay_max_bytes,
+            max_turns=self.config.llm.responses_replay_max_turns,
+        )
+        for pid in self._member_pids(record.run_id):
+            current = replay.load_current(pid)
+            self._prevalidate_replay_release(replay, run_id=record.run_id, pid=pid)
+            self._prevalidate_replay_call(replay, run_id=record.run_id, pid=pid, current=current)
+
+    def _prevalidate_replay_release(self, replay: Any, *, run_id: str, pid: str) -> None:
+        pending = self._store.get_llm_pending_action(pid)
+        prepared = pending.get("action") if isinstance(pending, Mapping) else None
+        reference = (
+            prepared.get("responses_replay_request")
+            if isinstance(prepared, Mapping) else None
+        )
+        if reference is None:
+            return
+        if not isinstance(reference, Mapping):
+            raise ValidationError("TaskRun replay release reference is invalid")
+        frozen = self._store.get_llm_replay_turn(reference.get("turn_id"))
+        if frozen is None or frozen.pid != pid or frozen.run_id != run_id:
+            raise ValidationError("TaskRun replay release payload is missing")
+        replay.load_request(
+            reference,
+            pid=pid,
+            provider_fingerprint=frozen.provider_fingerprint,
+            model=frozen.model,
+            context_generation=frozen.context_generation,
+            run_id=run_id,
+        )
+
+    def _prevalidate_replay_call(
+        self, replay: Any, *, run_id: str, pid: str, current: Any,
+    ) -> None:
+        latest = self._store.get_latest_successful_llm_call(pid=pid, purpose="action_selection")
+        marker = latest.request_options.get("responses_replay") if latest is not None else None
+        if current is not None and current[1].run_id != run_id:
+            raise ValidationError("TaskRun replay head has a different owner")
+        if not isinstance(marker, Mapping) or marker.get("enabled") is not True:
+            return
+        if (
+            marker.get("schema_version") != 1
+            or not isinstance(marker.get("turn_id"), str)
+            or not isinstance(marker.get("payload_sha256"), str)
+        ):
+            raise ValidationError("TaskRun replay continuation is missing")
+        staged = self._store.get_llm_replay_turn(marker["turn_id"])
+        if (
+            staged is None
+            or staged.pid != pid
+            or staged.run_id != run_id
+            or staged.payload_sha256 != marker["payload_sha256"]
+        ):
+            raise ValidationError("TaskRun replay staged response binding is invalid")
+        replay.validate_turn(staged)
+        if current is None:
+            if replay.superseded_by_exec(pid=pid, call_id=latest.call_id, publications=self._store):
+                return
+            raise ValidationError("TaskRun replay continuation is missing")
+        if latest.status == "ok" and not any(
+            group["call_id"] == latest.call_id for group in current[2]["groups"]
+        ):
+            # Replacing history is allowed only by a certified context
+            # generation transition; a disappearing current call otherwise
+            # means the local safe point cannot be trusted.
+            if staged.context_generation == current[1].context_generation:
+                raise ValidationError("TaskRun replay head lost its completed provider turn")
 
     def _prevalidate_recoverable_requirements(
         self,
@@ -9663,6 +9738,10 @@ class TaskRunManager:
         if not callable(purge_messages):
             raise RuntimeError("Store lacks TaskRun message purge support")
         purge_messages(run_id, pids)
+        # Provider-encrypted reasoning is private replay payload, even though
+        # its plaintext is unreadable to this Host. It follows the same Run
+        # purge boundary and must not remain recoverable from old references.
+        self._store.purge_llm_replay(run_id=run_id, purged_at=purged_at)
         self._store.purge_task_run_payloads(run_id, purged_at=purged_at)
 
     def _status_from_processes(

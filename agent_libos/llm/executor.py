@@ -6,7 +6,7 @@ import hmac
 import json
 import os
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, TYPE_CHECKING
 
@@ -85,6 +85,7 @@ from agent_libos.llm.pending import (
 )
 from agent_libos.llm.actions import LLMActionService, auto_wait_message_action
 from agent_libos.llm.provider_service import LLMProviderService
+from agent_libos.llm.replay import LLMReplayService, ReplayStateError
 from agent_libos.process_transition import ProcessTransitionService
 from agent_libos.ports import (
     AuditPort,
@@ -240,6 +241,8 @@ class _LLMCallState:
     egress_payload: dict[str, Any] = field(default_factory=dict)
     canonical_args: dict[str, Any] = field(default_factory=dict)
     resumed_release: bool = False
+    replay_request: Any | None = field(default=None, repr=False, metadata={"serialize": False})
+    responses_items: list[dict[str, Any]] | None = field(default=None, repr=False, metadata={"serialize": False})
 
     @property
     def prepared(self) -> bool:
@@ -398,8 +401,11 @@ class LLMProcessExecutor:
         blocking_work: Any | None = None,
         task_runs: TaskRunLLMHook | None = None,
         host_semantic_result_observer: Callable[..., None] | None = None,
+        file_resource_resolver: Callable[[str], str] | None = None,
     ) -> None:
         self.config = config or DEFAULT_CONFIG
+        self._file_resource_resolver = file_resource_resolver
+        self._unit_of_work = unit_of_work
         self._processes = unit_of_work.processes
         self._objects = unit_of_work.objects
         self._authority = unit_of_work.authority
@@ -439,6 +445,12 @@ class LLMProcessExecutor:
             restore_child_goal=self._restore_pending_compaction_child_goal,
         )
         self.provider = LLMProviderService(blocking_work)
+        self.replay = LLMReplayService(
+            self._processes,
+            max_bytes=self.config.llm.responses_replay_max_bytes,
+            max_turns=self.config.llm.responses_replay_max_turns,
+            publications=unit_of_work.publications,
+        )
         self.actions = LLMActionService(
             processes=self._processes,
             tools=self._tools,
@@ -569,7 +581,7 @@ class LLMProcessExecutor:
 
         if (
             not self.config.llm.persist_full_io
-            or self.config.llm.prompt_layout != PROMPT_LAYOUT_CACHE_OPTIMIZED_V2
+            or self._effective_prompt_layout(process.pid) != PROMPT_LAYOUT_CACHE_OPTIMIZED_V2
         ):
             return None
         image = self._images.get(process.image_id)
@@ -601,6 +613,147 @@ class LLMProcessExecutor:
             },
         )
 
+    def _effective_prompt_layout(self, pid: str) -> str:
+        process = self._process.get(pid)
+        profile_id = process.llm_profile_id or self.config.llm.default_profile_id
+        try:
+            snapshot = self._llms.profile_snapshot(profile_id)
+        except (ValidationError, LLMError):
+            # The protected call boundary owns invalid-profile reporting.
+            layout = self.config.llm.prompt_layout
+            return "legacy_v1" if layout == "auto" else layout
+        return str(snapshot.policy.prompt_layout)
+
+    def _responses_replay_enabled(self, pid: str) -> bool:
+        if not self.config.llm.persist_full_io:
+            return False
+        try:
+            resolved = self._llms.resolve_for_process(pid)
+        except (ValidationError, LLMError):
+            return False
+        return bool(
+            isinstance(resolved.client, LLMClient)
+            and resolved.client.responses_replay
+            and resolved.client._use_responses_api()
+        )
+
+    def _prepare_responses_replay(self, state: _LLMCallState) -> None:
+        if not (
+            self.config.llm.persist_full_io
+            and isinstance(state.client, LLMClient)
+            and state.client.responses_replay
+            and state.client._use_responses_api()
+        ):
+            return
+        assert state.resolved is not None
+        with self._unit_of_work.transaction():
+            generation = self._processes.get_llm_context_generation(state.pid)
+            self._compact_responses_replay_if_certified(state, generation)
+            state.replay_request = self.replay.prepare(
+                pid=state.pid,
+                provider_fingerprint=state.resolved.identity_sha256,
+                model=str(state.client.model),
+                context_generation=generation,
+                messages=state.request_messages,
+                tools=state.tools,
+                flow_context=state.flow_context,
+                run_id=getattr(state.process, "task_run_id", None),
+            )
+            state.responses_items = state.replay_request.response_items
+            state.flow_context = state.replay_request.flow_context
+            self._validate_replay_request_sources(state)
+            self._set_llm_provider_scope(state)
+
+    def _compact_responses_replay_if_certified(
+        self, state: _LLMCallState, generation: str,
+    ) -> None:
+        current = self.replay.load_current(state.pid)
+        if current is None or current[1].context_generation == generation:
+            return
+        certificate = self.context_memory.latest_validated_compaction(state.pid)
+        if certificate is None or certificate["context_generation"] != generation:
+            raise ReplayStateError("Responses replay generation changed without validated compaction")
+        summary = certificate["summary"]
+        summary_flow = self._data_flow.context_from_source_oids(
+            state.pid, [certificate["context_oid"]], include_current=False,
+        )
+        self._validate_compaction_source_versions(certificate, current[2], summary_flow)
+        state.flow_context = DataFlowContext.aggregate((
+            state.flow_context, summary_flow,
+            DataFlowContext(labels=DataLabels.from_dict(certificate["data_labels"])),
+        ))
+        if not self._request_contains_compaction_summary(state.request_messages, summary):
+            # image_only has no ordinary materialized-context message after
+            # its first turn. Carry the certified summary exactly once there,
+            # and when a bounded ordinary snapshot omitted that context.
+            state.request_messages = [*state.request_messages, {
+                "role": "user",
+                "content": json.dumps({"kind": "context_compacted", "summary": summary},
+                                      ensure_ascii=False, sort_keys=True),
+            }]
+        prefix: list[dict[str, Any]] = []
+        for message in state.request_messages:
+            if message.get("role") not in {"system", "developer"}:
+                break
+            prefix.append(message)
+        # The certified current snapshot already contains the summary. Reset
+        # only whole historical groups here; prepare appends the snapshot once.
+        # Its source validation shares this transaction, so failed preparation
+        # cannot retire the previous private head.
+        self.replay.compact(
+            pid=state.pid, context_generation=generation, messages=prefix,
+            flow_context=state.flow_context, retain_groups=0,
+            replaced_context_oid=certificate["context_oid"],
+        )
+
+    @staticmethod
+    def _validate_compaction_source_versions(
+        certificate: Mapping[str, Any], payload: Mapping[str, Any],
+        summary_flow: DataFlowContext,
+    ) -> None:
+        oid = certificate["context_oid"]
+        current = [ref for ref in summary_flow.source_refs if ref.oid == oid]
+        if len(current) != 1 or current[0].version != certificate["context_version"]:
+            raise ReplayStateError("Responses compaction source changed after certification")
+        old_context = DataFlowContext.from_dict(payload["flow_context"])
+        if any(ref.oid == oid and ref.version > certificate["source_version"]
+               for ref in old_context.source_refs):
+            raise ReplayStateError("Responses compaction does not cover retained context source")
+
+    @staticmethod
+    def _request_contains_compaction_summary(
+        messages: list[dict[str, Any]], summary: dict[str, Any],
+    ) -> bool:
+        decoder = json.JSONDecoder()
+        for message in messages:
+            content = message.get("content")
+            if message.get("role") != "user" or not isinstance(content, str):
+                continue
+            for candidate in content.split('"summary":')[1:]:
+                try:
+                    value, _end = decoder.raw_decode(candidate.lstrip())
+                except ValueError:
+                    continue
+                if value == summary:
+                    return True
+        return False
+
+    def _validate_replay_request_sources(self, state: _LLMCallState) -> None:
+        if state.replay_request is None:
+            return
+        def resolve_file(path: str) -> str:
+            if self._file_resource_resolver is None:
+                raise ReplayStateError("Responses replay file authority resolver is unavailable")
+            return self._file_resource_resolver(path)
+        self._data_flow.validate_replay_sources(
+            state.pid,
+            state.replay_request.flow_context,
+            file_resource_resolver=resolve_file,
+            allow_recovered_source_snapshots=(
+                state.resumed_release or state.replay_request.expected_head is not None
+            ),
+        )
+
     def _include_retained_goal_labels(
         self,
         flow_context: DataFlowContext,
@@ -628,6 +781,19 @@ class LLMProcessExecutor:
             return normalize_task_run_prompt_context(selected)
         except (TypeError, ValueError) as exc:
             raise ValidationError("durable TaskRun prompt context is invalid") from exc
+
+    def _task_run_replay_input_context(
+        self, pid: str, context: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if (
+            context is None
+            or not self._responses_replay_enabled(pid)
+            or self._processes.get_llm_replay_head(pid) is None
+        ):
+            return context
+        # Seed visible legacy history once; subsequent native history belongs
+        # exclusively to the private assembler.
+        return {**context, "transcript_messages": []}
 
     def _task_run_requirement_binding(
         self,
@@ -800,31 +966,7 @@ class LLMProcessExecutor:
             self._preflight_parallel_tool_batch(pid, actions)
 
         call_id = str(manifest["call_id"])
-        tool_call_count = int(manifest["tool_call_count"])
-        tool_calls: list[dict[str, Any]] = []
-        if tool_call_count:
-            selected_actions = actions if parallel_tool_calls else [actions[-1]]
-            padding = max(0, tool_call_count - len(selected_actions))
-            tool_calls.extend({} for _ in range(padding))
-            for index, action in enumerate(selected_actions, start=padding):
-                digest = hashlib.sha256(
-                    f"{call_id}:{index}".encode("utf-8")
-                ).hexdigest()[:24]
-                tool_calls.append(
-                    {
-                        "id": f"taskrun_call_{digest}",
-                        "name": str(action.get("action") or ""),
-                        "arguments": "{}",
-                    }
-                )
-        completion = LLMCompletion(
-            content="",
-            tool_calls=tool_calls,
-            api="local_task_run_resume",
-            response_id=call_id,
-            request_id=None,
-            usage={},
-        )
+        completion = self._task_run_resume_completion(pid, manifest, actions)
         labels = DataLabels.from_dict(dict(manifest["data_labels"]))
         flow_token = self._data_flow.push(DataFlowContext(labels=labels))
         try:
@@ -849,6 +991,102 @@ class LLMProcessExecutor:
             )
         finally:
             self._data_flow.reset(flow_token)
+
+    def _task_run_resume_completion(
+        self, pid: str, manifest: Mapping[str, Any], actions: list[dict[str, Any]],
+    ) -> LLMCompletion:
+        call_id = str(manifest["call_id"])
+        record = self._processes.get_llm_call(call_id)
+        if record is not None and record.request_options.get("responses_replay"):
+            return self._task_run_replay_completion(pid, manifest, actions, record)
+        tool_call_count = int(manifest["tool_call_count"])
+        tool_calls: list[dict[str, Any]] = []
+        if tool_call_count:
+            selected_actions = actions if manifest["parallel_tool_calls"] else [actions[-1]]
+            padding = max(0, tool_call_count - len(selected_actions))
+            tool_calls.extend({} for _ in range(padding))
+            for index, action in enumerate(selected_actions, start=padding):
+                digest = hashlib.sha256(
+                    f"{call_id}:{index}".encode("utf-8")
+                ).hexdigest()[:24]
+                tool_calls.append(
+                    {
+                        "id": f"taskrun_call_{digest}",
+                        "name": str(action.get("action") or ""),
+                        "arguments": "{}",
+                    }
+                )
+        return LLMCompletion(
+            content="",
+            tool_calls=tool_calls,
+            api="local_task_run_resume",
+            response_id=call_id,
+            request_id=None,
+            usage={},
+        )
+
+    def _task_run_replay_completion(
+        self, pid: str, manifest: Mapping[str, Any], actions: list[dict[str, Any]],
+        record: LLMCallRecord,
+    ) -> LLMCompletion:
+        group = self._task_run_replay_group(pid, manifest, record)
+        tool_calls = [
+            dict(item) for item in group["output_items"]
+            if item.get("type") == "function_call"
+        ]
+        if len(tool_calls) != manifest["tool_call_count"]:
+            raise ReplayStateError("TaskRun replay native tool-call count changed")
+        replay_actions, auto_wait = self._completion_to_actions(
+            record.response_content,
+            tool_calls,
+            parallel_tool_calls=bool(manifest["parallel_tool_calls"]),
+            auto_wait_on_empty_tool_calls=bool(manifest["host_auto_wait"]),
+            fallback_json_actions=False,
+        )
+        normalized = (
+            replay_actions if auto_wait else
+            [self._tools.normalize_model_action(pid, action) for action in replay_actions]
+        )
+        if auto_wait != manifest["host_auto_wait"] or dumps(normalized) != dumps(actions):
+            raise ReplayStateError("TaskRun replay native function arguments changed")
+        completion = LLMCompletion(
+            content=record.response_content,
+            tool_calls=tool_calls,
+            api="responses",
+            response_id=record.response_id,
+            request_id=record.request_id,
+            model=record.model,
+        )
+        setattr(completion, "_agent_libos_transcript_output_key", record.call_id)
+        return completion
+
+    def _task_run_replay_group(
+        self, pid: str, manifest: Mapping[str, Any], record: LLMCallRecord,
+    ) -> dict[str, Any]:
+        marker = record.request_options["responses_replay"]
+        if not isinstance(marker, Mapping) or marker.get("enabled") is not True:
+            raise ReplayStateError("TaskRun replay call marker is invalid")
+        staged = self._processes.get_llm_replay_turn(marker.get("turn_id"))
+        if (
+            record.pid != pid or record.call_id != manifest["call_id"]
+            or record.status != "ok" or record.api != "responses"
+            or staged is None or staged.pid != pid
+            or staged.payload_sha256 != marker.get("payload_sha256")
+        ):
+            raise ReplayStateError("TaskRun replay committed provider binding changed")
+        staged_payload = self.replay.validate_turn(staged)
+        current = self.replay.load_current(pid)
+        if current is None or not current[2]["groups"]:
+            raise ReplayStateError("TaskRun replay committed continuation is missing")
+        group = current[2]["groups"][-1]
+        staged_group = staged_payload["groups"][-1]
+        if (
+            group["call_id"] != record.call_id or not group["validated"]
+            or staged_group["call_id"] != record.call_id
+            or group["output_items"] != staged_group["output_items"]
+        ):
+            raise ReplayStateError("TaskRun replay current provider turn changed")
+        return group
 
     @staticmethod
     def _include_task_run_labels(
@@ -1106,6 +1344,8 @@ class LLMProcessExecutor:
         )
         if latest is None:
             return None, None
+        if self.replay.superseded_by_exec(pid=pid, call_id=latest.call_id, publications=self._unit_of_work.publications):
+            return latest, None
         marker = self._image_only_marker_for_anchor(latest, anchor)
         if marker is not None:
             self._assert_image_only_transcript_complete(
@@ -1584,7 +1824,7 @@ class LLMProcessExecutor:
             ),
             original_goal_context=original_goal_context,
             fallback_json_actions=fallback_json_actions,
-            prompt_layout=self.config.llm.prompt_layout,
+            prompt_layout=self._effective_prompt_layout(pid),
         )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": build_system_prompt(image)},
@@ -1593,7 +1833,7 @@ class LLMProcessExecutor:
             "role": "user",
             "content": user_prompt,
         }
-        if self.config.llm.prompt_layout == "cache_optimized_v2":
+        if self._effective_prompt_layout(pid) == "cache_optimized_v2":
             stable, dynamic = split_cache_optimized_user_prompt(user_prompt)
             if stable and dynamic:
                 user_message["_agent_libos_cache_stable_prefix_chars"] = len(
@@ -1624,6 +1864,7 @@ class LLMProcessExecutor:
     ]:
         task_context = self._task_run_prompt_context(pid)
         requirement_binding = self._task_run_requirement_binding(pid, task_context)
+        task_context = self._task_run_replay_input_context(pid, task_context)
         if image.prompt_mode == PROMPT_MODE_IMAGE_ONLY:
             return self._assemble_image_only_llm_request(
                 pid=pid,
@@ -1712,7 +1953,7 @@ class LLMProcessExecutor:
                 system_message=messages[0],
                 task_context=task_context,
                 current_user_messages=messages[1:],
-                prompt_layout=self.config.llm.prompt_layout,
+                prompt_layout=self._effective_prompt_layout(pid),
             )
         input_refs = list(context.object_refs)
         if (
@@ -1774,13 +2015,21 @@ class LLMProcessExecutor:
         anchor = self._image_only_transcript_anchor(image, process)
         task_run_projection: dict[str, Any] | None = None
         if task_context is None:
-            messages, flow_context, input_refs = self._image_only_messages_and_flow(
-                pid=pid,
-                image=image,
-                process=process,
-                context=context,
-                anchor=anchor,
-            )
+            if self._responses_replay_enabled(pid) and self._processes.get_llm_replay_head(pid) is not None:
+                messages, flow_context, input_refs = self._new_image_only_transcript(
+                    pid=pid, image=image, process=process, context=context,
+                )
+                messages = messages[:1]
+            else:
+                # Seed the first private turn from the validated visible
+                # transcript when replay is enabled on an existing process.
+                messages, flow_context, input_refs = self._image_only_messages_and_flow(
+                    pid=pid,
+                    image=image,
+                    process=process,
+                    context=context,
+                    anchor=anchor,
+                )
         else:
             messages = self._task_run_messages(
                 system_message={
@@ -1788,7 +2037,7 @@ class LLMProcessExecutor:
                     "content": build_system_prompt(image),
                 },
                 task_context=task_context,
-                prompt_layout=self.config.llm.prompt_layout,
+                prompt_layout=self._effective_prompt_layout(pid),
             )
             flow_context = self._include_task_run_labels(
                 self._data_flow.context_from_materialization(pid, context),
@@ -2103,22 +2352,25 @@ class LLMProcessExecutor:
         tools: list[dict[str, Any]],
     ) -> MaterializedContext | dict[str, Any]:
         try:
-            return self.context_memory.prepare(
-                pid=pid,
-                image=image,
-                process=process,
-                source_context=source_context,
-                events=events,
-                label_events=label_events,
-                capabilities=capabilities,
-                tools=tools,
-            )
+            with self._context_replay_update_scope(pid):
+                return self.context_memory.prepare(
+                    pid=pid,
+                    image=image,
+                    process=process,
+                    source_context=source_context,
+                    events=events,
+                    label_events=label_events,
+                    capabilities=capabilities,
+                    tools=tools,
+                )
         except LLMContextStoragePressure as pressure:
             return await self._handle_context_storage_pressure(
                 pid,
                 image=image,
                 pressure=pressure,
             )
+        except (ReplayStateError, CapabilityDenied) as exc:
+            return self._fail_llm_quantum(pid, exc)
         except ResourceLimitExceeded as exc:
             self._resources.kill_if_exceeded(pid, reason=str(exc))
             self._audit.record(
@@ -2132,6 +2384,29 @@ class LLMProcessExecutor:
                 "resource_limit_exceeded": True,
                 "error": str(exc),
             }
+
+    @contextmanager
+    def _context_replay_update_scope(self, pid: str):
+        if self.config.llm_context.policy != "llm_context_object" or self._processes.get_llm_replay_head(pid) is None:
+            yield
+            return
+        # The Host append and its private source reference commit together.
+        # Capture the digest before prepare mutates the context payload, and
+        # retain normal READ checks on both sides of this exact update.
+        with self._unit_of_work.transaction(include_object_payloads=True):
+            oid = self.context_memory.context_oid(pid)
+            previous = (
+                self._data_flow.context_from_source_oids(pid, [oid], include_current=False)
+                if oid is not None else None
+            )
+            generation = self._processes.get_llm_context_generation(pid)
+            yield
+            if previous is not None:
+                current = self._data_flow.context_from_source_oids(pid, [oid], include_current=False)
+                self.replay.advance_context_source(
+                    pid=pid, context_generation=generation,
+                    previous=previous.source_refs[0], current=current,
+                )
 
     def _ensure_process_memory_view(self, pid: str, process: Any) -> Any:
         if process.memory_view is not None:
@@ -4222,6 +4497,42 @@ class LLMProcessExecutor:
             )
         return True
 
+    def _persist_replay_tool_output(
+        self, *, pid: str, call: Any, result: dict[str, Any],
+        response_id: str, tool_call_id: str, tool_name: str | None,
+    ) -> bool:
+        if call is None or not call.request_options.get("responses_replay"):
+            return False
+        if call.pid != pid:
+            raise ReplayStateError("Responses replay tool result owner changed")
+        payload = result.get("payload")
+        if payload is None:
+            payload = {"ok": bool(result.get("ok")), "error": result.get("error")}
+        content = payload if isinstance(payload, str) else dumps(to_jsonable(payload))
+        result_oid = result.get("result_oid")
+        result_flow = (
+            self._data_flow.context_from_source_oids(pid, [result_oid], include_current=False)
+            if isinstance(result_oid, str) and result_oid
+            else self._data_flow.current_context()
+        )
+        with self._unit_of_work.transaction():
+            self._processes.upsert_llm_tool_output(
+                pid=pid, response_id=response_id, call_id=tool_call_id,
+                tool_name=tool_name, output=dumps(result),
+            )
+            # exec commits before its tool result is persisted. Keep that
+            # result as evidence without reviving the retired conversation.
+            if not self.replay.superseded_by_exec(
+                pid=pid, call_id=call.call_id,
+                publications=self._unit_of_work.publications,
+            ):
+                self.replay.settle(
+                    pid=pid, call_id=call.call_id,
+                    outputs=[{"type": "function_call_output", "call_id": tool_call_id, "output": content}],
+                    flow_context=result_flow,
+                )
+        return True
+
     def _persist_response_tool_output(
         self,
         *,
@@ -4232,9 +4543,17 @@ class LLMProcessExecutor:
         tool_name: str | None,
         synthetic: bool = False,
     ) -> None:
-        if not response_id or not tool_call_id or not self.config.llm.persist_full_io:
+        if not response_id or not self.config.llm.persist_full_io:
             return
         call = self._processes.get_llm_call(response_id)
+        if not tool_call_id:
+            self._persist_replay_host_output(pid=pid, call=call, result=result)
+            return
+        if self._persist_replay_tool_output(
+            pid=pid, call=call, result=result, response_id=response_id,
+            tool_call_id=tool_call_id, tool_name=tool_name,
+        ):
+            return
         if self._persist_image_only_tool_output(
             pid=pid,
             call=call,
@@ -4278,6 +4597,36 @@ class LLMProcessExecutor:
             tool_name=tool_name,
             output=dumps(result),
         )
+
+    def _persist_replay_host_output(
+        self, *, pid: str, call: LLMCallRecord | None, result: dict[str, Any],
+    ) -> None:
+        """Keep a Host action result when the model made no native call.
+
+        Empty-response auto-wait is an authorized Host action. Its consumed
+        messages must become input even though no provider call_id exists to
+        pair with a function_call_output.
+        """
+        if call is None or not call.request_options.get("responses_replay"):
+            return
+        if call.pid != pid or call.status != "ok" or call.tool_calls:
+            raise ReplayStateError("Responses replay Host result lacks its empty-call binding")
+        payload = result.get("payload")
+        if payload is None:
+            payload = {"ok": bool(result.get("ok")), "error": result.get("error")}
+        content = payload if isinstance(payload, str) else dumps(to_jsonable(payload))
+        result_oid = result.get("result_oid")
+        flow_context = (
+            self._data_flow.context_from_source_oids(pid, [result_oid], include_current=False)
+            if isinstance(result_oid, str) and result_oid
+            else self._data_flow.current_context()
+        )
+        with self._unit_of_work.transaction():
+            self.replay.append_host_input(
+                pid=pid, call_id=call.call_id,
+                input_items=[{"role": "user", "content": content}],
+                flow_context=flow_context,
+            )
 
     def _persist_unexecuted_parallel_tool_outputs(
         self,
@@ -4595,6 +4944,37 @@ class LLMProcessExecutor:
     def _auto_wait_message_action() -> dict[str, Any]:
         return auto_wait_message_action()
 
+    def _is_replay_call(self, call_id: str) -> bool:
+        record = self._processes.get_llm_call(call_id)
+        return bool(record is not None and record.request_options.get("responses_replay"))
+
+    def _validate_replay_action_shape(self, call_id: str, completion: Any, parallel: bool) -> None:
+        if self._is_replay_call(call_id) and not parallel and len(completion.tool_calls) > 1:
+            raise ValueError("Sequential Responses replay requires exactly one tool call")
+
+    def _commit_validated_action(
+        self, *, pid: str, call_id: str, completion: Any, actions: list[dict[str, Any]],
+        parallel_tool_calls: bool, auto_wait_used: bool,
+    ) -> None:
+        replay_enabled = self._is_replay_call(call_id)
+        with self._unit_of_work.transaction() if replay_enabled else nullcontext():
+            if replay_enabled:
+                self.replay.mark_validated(pid=pid, call_id=call_id)
+            self._supersede_validated_image_only_empty_head(pid=pid, completion=completion)
+            expected = self._record_task_run_validated_transcript(
+                pid=pid, call_id=call_id, actions=actions,
+                parallel_tool_calls=parallel_tool_calls, host_auto_wait=auto_wait_used,
+                tool_call_count=len(completion.tool_calls),
+            )
+        # A concurrent pause/cancel can refuse the claim. The admitted Provider
+        # result and its validated local safe point must remain committed even
+        # when that control fence prevents the following tool dispatch.
+        self._claim_task_run_validated_action(pid, expected)
+
+    def _discard_invalid_replay_action(self, pid: str, call_id: str) -> None:
+        if self._is_replay_call(call_id):
+            self.replay.discard_staged(pid=pid, call_id=call_id)
+
     async def _complete_valid_action(
         self,
         pid: str,
@@ -4677,17 +5057,10 @@ class LLMProcessExecutor:
                         self._validate_dispatchable_action(pid, action)
                 if parallel_tool_calls and len(actions) > 1:
                     self._preflight_parallel_tool_batch(pid, actions)
-                self._supersede_validated_image_only_empty_head(
-                    pid=pid,
-                    completion=completion,
-                )
-                self._publish_and_claim_task_run_validated_action(
-                    pid=pid,
-                    call_id=call_id,
-                    actions=actions,
-                    parallel_tool_calls=parallel_tool_calls,
-                    host_auto_wait=auto_wait_used,
-                    tool_call_count=len(completion.tool_calls),
+                self._validate_replay_action_shape(call_id, completion, parallel_tool_calls)
+                self._commit_validated_action(
+                    pid=pid, call_id=call_id, completion=completion, actions=actions,
+                    parallel_tool_calls=parallel_tool_calls, auto_wait_used=auto_wait_used,
                 )
                 return (
                     completion,
@@ -4697,6 +5070,7 @@ class LLMProcessExecutor:
                     call_id,
                 )
             except ValueError as exc:
+                self._discard_invalid_replay_action(pid, call_id)
                 last_error = exc
                 self._audit.record(
                     actor=pid,
@@ -4813,24 +5187,9 @@ class LLMProcessExecutor:
             ) from exc
         return manifest
 
-    def _publish_and_claim_task_run_validated_action(
-        self,
-        *,
-        pid: str,
-        call_id: str,
-        actions: list[dict[str, Any]],
-        parallel_tool_calls: bool,
-        host_auto_wait: bool,
-        tool_call_count: int,
+    def _claim_task_run_validated_action(
+        self, pid: str, expected: Mapping[str, Any] | None,
     ) -> None:
-        expected = self._record_task_run_validated_transcript(
-            pid=pid,
-            call_id=call_id,
-            actions=actions,
-            parallel_tool_calls=parallel_tool_calls,
-            host_auto_wait=host_auto_wait,
-            tool_call_count=tool_call_count,
-        )
         process = self._processes.get_process(pid)
         is_durable_run = (
             process is not None
@@ -5307,7 +5666,12 @@ class LLMProcessExecutor:
             response_scope_fingerprint=response_scope_fingerprint,
             previous_output_count=len(previous_outputs),
         )
+        self._prepare_responses_replay(state)
         await self._apply_context_management(state, image=image)
+        # Context-pressure notices are new input too. Reassemble from the
+        # unchanged committed head after the notice has been materialized.
+        if state.replay_request is not None:
+            self._prepare_responses_replay(state)
         self._prepare_image_only_request_record(state, image=image)
         state.egress_payload = {
             "messages": state.request_messages,
@@ -5316,6 +5680,8 @@ class LLMProcessExecutor:
             "previous_response_id": state.previous_response_id,
             "parallel_tool_calls": state.parallel_tool_calls,
         }
+        if state.responses_items is not None:
+            state.egress_payload["responses_items"] = state.responses_items
         # Context pressure and the hard per-call envelope are evaluated only
         # after the complete request has been assembled. Prompt-mode notices
         # therefore participate in the exact payload admitted for dispatch.
@@ -5325,6 +5691,10 @@ class LLMProcessExecutor:
             sink=precheck_sink,
             context=state.flow_context,
             payload=state.egress_payload,
+            **({"allow_recovered_source_snapshots": True} if (
+                state.replay_request is not None
+                and state.replay_request.expected_head is not None
+            ) else {}),
         )
         state.canonical_args = {
             "call_id": state.call_id,
@@ -5404,16 +5774,21 @@ class LLMProcessExecutor:
                 "data_flow_provider_chain_fingerprint": state.data_flow_chain_fingerprint,
                 "data_flow_provider_source_refs_sha256": state.source_refs_fingerprint,
                 "openai_prompt_cache_key_configured": bool(
-                    isinstance(client, LLMClient) and client.prompt_cache_key
+                    isinstance(client, LLMClient)
+                    and client.prompt_cache_key_source == "configured"
+                    and client.prompt_cache_key
+                ),
+                "openai_prompt_cache_key_source": (
+                    client.prompt_cache_key_source if isinstance(client, LLMClient) else "none"
                 ),
                 "openai_prompt_cache_retention_configured": (
                     client.prompt_cache_retention
                     if isinstance(client, LLMClient)
                     else None
                 ),
-                "prompt_layout": self.config.llm.prompt_layout,
+                "prompt_layout": resolved.prompt_layout,
                 "openai_prompt_cache_mode_configured": (
-                    client.prompt_cache_mode
+                    client.prompt_cache_mode_configured
                     if isinstance(client, LLMClient)
                     else "provider_default"
                 ),
@@ -5458,6 +5833,12 @@ class LLMProcessExecutor:
             context_generation=generation,
             previous_response_id=state.previous_response_id,
         )
+        if state.replay_request is not None:
+            lower_bound = max(
+                0,
+                state.replay_request.estimated_input_tokens
+                - estimate_request_input_tokens(state.request_messages, state.tools),
+            )
         assessment = assess_context_pressure(
             messages=state.request_messages,
             tools=state.tools,
@@ -6149,6 +6530,22 @@ class LLMProcessExecutor:
         state.temperature = float(prepared_request["temperature"])
         state.max_tokens = int(prepared_request["max_tokens"])
         state.egress_payload = dict(prepared_request.get("egress_payload") or {})
+        replay_reference = prepared_request.get("responses_replay_request")
+        if replay_reference is not None:
+            if not self.config.llm.persist_full_io or not state.client.responses_replay:
+                raise ReplayStateError("Prepared Responses replay retention is disabled")
+            state.replay_request = self.replay.load_request(
+                replay_reference,
+                pid=state.pid,
+                provider_fingerprint=resolved.identity_sha256,
+                model=str(state.client.model),
+                context_generation=self._processes.get_llm_context_generation(state.pid),
+                run_id=getattr(state.process, "task_run_id", None),
+            )
+            state.responses_items = state.replay_request.response_items
+            state.flow_context = state.replay_request.flow_context
+            self._validate_replay_request_sources(state)
+            state.egress_payload["responses_items"] = state.responses_items
         state.canonical_args = dict(
             prepared_request.get("canonical_args") or {}
         )
@@ -6243,7 +6640,12 @@ class LLMProcessExecutor:
             ),
             data_flow_payload=state.egress_payload,
             data_flow_operation="llm.complete",
-            data_flow_allow_recovered_source_snapshots=state.resumed_release,
+            data_flow_allow_recovered_source_snapshots=(
+                state.resumed_release or (
+                    state.replay_request is not None
+                    and state.replay_request.expected_head is not None
+                )
+            ),
             reservation_usage=state.resource_envelope,
             resource_source="llm.request",
             resource_context=self._llm_resource_context(state),
@@ -6277,6 +6679,7 @@ class LLMProcessExecutor:
                     temperature=state.temperature,
                     max_tokens=state.max_tokens,
                     previous_response_id=state.previous_response_id,
+                    responses_items=state.responses_items,
                     parallel_tool_calls=state.parallel_tool_calls,
                 )
 
@@ -6335,6 +6738,7 @@ class LLMProcessExecutor:
 
     def _assert_llm_call_scope(self, state: _LLMCallState) -> None:
         assert state.resolved is not None and state.sink is not None
+        self._validate_replay_request_sources(state)
         if state.previous_response_id is not None:
             raise _LLMProviderChainScopeChanged(
                 "provider-side Responses state is disabled for full-snapshot "
@@ -6457,6 +6861,14 @@ class LLMProcessExecutor:
                 "response_scope_fingerprint": response_scope_fingerprint,
             }
         )
+        if state.replay_request is not None:
+            prepared["responses_replay_request"] = self.replay.freeze_request(state.replay_request)
+            # Public pending-action records retain only the local reference.
+            # The exact request is rehydrated before release/hash validation.
+            prepared["egress_payload"] = {
+                key: value for key, value in state.egress_payload.items()
+                if key != "responses_items"
+            }
         return prepared
 
     def _record_llm_call_error(
@@ -6607,7 +7019,30 @@ class LLMProcessExecutor:
             created_at=state.created_at,
             completed_at=utc_now(),
         )
-        self._processes.insert_llm_call(success_record)
+        with self._unit_of_work.transaction():
+            if state.replay_request is not None:
+                head = self.replay.stage(
+                    state.replay_request,
+                    call_id=state.call_id,
+                    response_items=getattr(completion, "response_items", []),
+                    usage=usage,
+                    max_output_tokens=state.max_tokens,
+                    response_id=getattr(completion, "response_id", None),
+                    flow_context=self._data_flow.unclassified_ingress_context(
+                        state.flow_context, origin="external:llm",
+                    ),
+                )
+                turn = self._processes.get_llm_replay_turn(head.turn_id)
+                assert turn is not None
+                state.request_options["responses_replay"] = {
+                    "schema_version": 1,
+                    "enabled": True,
+                    "turn_id": head.turn_id,
+                    "payload_sha256": turn.payload_sha256,
+                    "item_count": len(getattr(completion, "response_items", [])),
+                }
+                setattr(completion, "_agent_libos_transcript_output_key", state.call_id)
+            self._processes.insert_llm_call(success_record)
         self._operations.link_evidence(
             "llm_call",
             state.call_id,
@@ -6789,7 +7224,7 @@ class LLMProcessExecutor:
         *,
         image: Any,
     ) -> None:
-        if image.prompt_mode != PROMPT_MODE_IMAGE_ONLY:
+        if state.replay_request is not None or image.prompt_mode != PROMPT_MODE_IMAGE_ONLY:
             return
         if not self.config.llm.persist_full_io:
             raise ValidationError(
@@ -6837,7 +7272,7 @@ class LLMProcessExecutor:
         completion: Any,
     ) -> None:
         image = self._images.get(state.process.image_id)
-        if image is None or image.prompt_mode != PROMPT_MODE_IMAGE_ONLY:
+        if state.replay_request is not None or image is None or image.prompt_mode != PROMPT_MODE_IMAGE_ONLY:
             return
         if not self.config.llm.persist_full_io:
             raise ValidationError(
@@ -6977,13 +7412,15 @@ class LLMProcessExecutor:
             self._prompt_projection_observation(
                 state.request_messages,
                 state.tools,
-                layout=self.config.llm.prompt_layout,
+                layout=resolved.prompt_layout,
             )
         )
         state.estimated_input_tokens = estimate_request_input_tokens(
             state.request_messages,
             state.tools,
         )
+        if state.replay_request is not None:
+            state.estimated_input_tokens = state.replay_request.estimated_input_tokens
         reserved_total_tokens = min(
             state.max_total_tokens_per_call,
             state.max_input_tokens_per_call + state.max_tokens,
@@ -7668,6 +8105,7 @@ class LLMProcessExecutor:
         temperature: float,
         max_tokens: int,
         previous_response_id: str | None = None,
+        responses_items: list[dict[str, Any]] | None = None,
         parallel_tool_calls: bool,
     ) -> Any:
         return await self.provider.complete_action(
@@ -7677,6 +8115,7 @@ class LLMProcessExecutor:
             temperature=temperature,
             max_tokens=max_tokens,
             previous_response_id=previous_response_id,
+            responses_items=responses_items,
             parallel_tool_calls=parallel_tool_calls,
         )
 

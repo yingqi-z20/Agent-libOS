@@ -5,7 +5,6 @@ from contextvars import ContextVar, Token
 from dataclasses import asdict, dataclass, field
 import hashlib
 import hmac
-import math
 import threading
 from typing import Any, Callable, Iterable, Iterator, Mapping, TypeVar
 
@@ -39,6 +38,7 @@ from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequire
 from agent_libos.ports import DataReleaseApprovalPort
 from agent_libos.ports.blocking_work import run_blocking_once
 from agent_libos.utils.ids import new_id, utc_now
+from agent_libos.utils.object_payload import object_payload_sha256
 from agent_libos.utils.serde import dumps, to_jsonable
 
 
@@ -405,6 +405,52 @@ class DataFlowManager:
             contexts.append(self._context_for_object(pid, oid))
         return DataFlowContext.aggregate(contexts)
 
+    def validate_replay_sources(
+        self,
+        pid: str,
+        context: DataFlowContext,
+        *,
+        file_resource_resolver: Callable[[str], str],
+        captured_objects: Mapping[str, tuple[int, Any]] | None = None,
+        allow_recovered_source_snapshots: bool = False,
+    ) -> None:
+        """Reauthorize historical bytes held in Host-private LLM state.
+
+        Captured Objects are accepted only from the Host checkpoint publication
+        path, whose canonical artifact binds their payload/version. Ordinary
+        dispatch validates live source state; the existing recovery exception
+        requires an explicit Host opt-in. Neither retained bytes nor an LLM
+        profile grant substitute for current source READ authority.
+        """
+
+        if not isinstance(context, DataFlowContext):
+            raise ValidationError("private replay sources require a typed data-flow context")
+        selected_snapshots = captured_objects or {}
+        for reference in context.source_refs:
+            if reference.oid.startswith(self.FILE_BINDING_SOURCE_REF_PREFIX):
+                binding_id = reference.oid.removeprefix(self.FILE_BINDING_SOURCE_REF_PREFIX)
+                binding = self.store.get_file_label_binding_by_id(binding_id)
+                if binding is None or not binding.active:
+                    raise ValidationError("private replay source file binding is unavailable")
+                resource = file_resource_resolver(binding.normalized_path)
+            else:
+                resource = f"object:{reference.oid}"
+            self.capabilities.require(pid, resource, CapabilityRight.READ, consume=False)
+            captured = selected_snapshots.get(reference.oid)
+            if captured is not None and not reference.oid.startswith(self.FILE_BINDING_SOURCE_REF_PREFIX):
+                version, payload = captured
+                if version != reference.version or not hmac.compare_digest(
+                    object_payload_sha256(payload), reference.content_sha256,
+                ):
+                    raise ValidationError("private replay source Object does not match its snapshot")
+                continue
+            error = self._validate_source_refs(
+                (reference,),
+                allow_recovered_source_snapshots=allow_recovered_source_snapshots,
+            )
+            if error is not None:
+                raise ValidationError("private replay source is unavailable or changed")
+
     def context_from_trusted_source_oids(
         self,
         source_oids: Iterable[str] | None,
@@ -643,6 +689,7 @@ class DataFlowManager:
         context: DataFlowContext | None,
         payload: Any,
         minimum_integrity: DataIntegrity | str = DataIntegrity.UNTRUSTED,
+        allow_recovered_source_snapshots: bool = False,
     ) -> DataFlowDecision:
         """Reject impossible egress before provider/profile resolution.
 
@@ -654,7 +701,10 @@ class DataFlowManager:
         selected_context = context or self.current_context()
         payload_hash, _ = self._payload_digest(payload)
         generation = int(self.store.get_sink_trust_generation())
-        source_error = self._validate_source_refs(selected_context.source_refs)
+        source_error = self._validate_source_refs(
+            selected_context.source_refs,
+            allow_recovered_source_snapshots=allow_recovered_source_snapshots,
+        )
         if source_error is not None:
             self._deny(
                 pid,
@@ -1450,25 +1500,7 @@ class DataFlowManager:
     def _object_payload_sha256(cls, payload: Any) -> str:
         """Hash a stable finite JSON projection, including legacy NaN rows."""
 
-        projected = cls._finite_json_projection(to_jsonable(payload))
-        return hashlib.sha256(dumps(projected).encode("utf-8")).hexdigest()
-
-    @classmethod
-    def _finite_json_projection(cls, value: Any) -> Any:
-        if type(value) is float and not math.isfinite(value):
-            if math.isnan(value):
-                label = "NaN"
-            else:
-                label = "Infinity" if value > 0 else "-Infinity"
-            return {"_non_finite_number": label}
-        if isinstance(value, dict):
-            return {
-                key: cls._finite_json_projection(item)
-                for key, item in value.items()
-            }
-        if isinstance(value, list):
-            return [cls._finite_json_projection(item) for item in value]
-        return value
+        return object_payload_sha256(payload)
 
     def _clearance_error(
         self,

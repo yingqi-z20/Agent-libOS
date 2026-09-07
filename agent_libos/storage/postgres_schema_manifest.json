@@ -2301,6 +2301,170 @@
           "type": "text"
         }
       ],
+      "llm_replay_heads": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "pid",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "turn_id",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "revision",
+          "nullable": false,
+          "ordinal": 3,
+          "type": "bigint"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "updated_at",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        }
+      ],
+      "llm_replay_turns": [
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "turn_id",
+          "nullable": false,
+          "ordinal": 1,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "pid",
+          "nullable": false,
+          "ordinal": 2,
+          "type": "text"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "run_id",
+          "nullable": true,
+          "ordinal": 3,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "provider_fingerprint",
+          "nullable": false,
+          "ordinal": 4,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "model",
+          "nullable": false,
+          "ordinal": 5,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "context_generation",
+          "nullable": false,
+          "ordinal": 6,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "payload_json",
+          "nullable": true,
+          "ordinal": 7,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "source_labels_json",
+          "nullable": false,
+          "ordinal": 8,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "payload_sha256",
+          "nullable": false,
+          "ordinal": 9,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "payload_bytes",
+          "nullable": false,
+          "ordinal": 10,
+          "type": "bigint"
+        },
+        {
+          "collation": "pg_catalog.C",
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "created_at",
+          "nullable": false,
+          "ordinal": 11,
+          "type": "text"
+        },
+        {
+          "collation": null,
+          "default": null,
+          "generated": "",
+          "identity": "",
+          "name": "purged_at",
+          "nullable": true,
+          "ordinal": 12,
+          "type": "text"
+        }
+      ],
       "llm_tool_outputs": [
         {
           "collation": null,
@@ -9365,6 +9529,133 @@
         "referenced_schema": null,
         "referenced_table": null,
         "table": "llm_pending_actions",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "pid"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (pid)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "llm_replay_heads_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "llm_replay_heads",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "revision"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (revision > 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "llm_replay_heads_revision_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "llm_replay_heads",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "payload_json",
+          "purged_at"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((payload_json IS NULL) = (purged_at IS NOT NULL))",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "llm_replay_turns_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "llm_replay_turns",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "payload_bytes"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (payload_bytes >= 0)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "llm_replay_turns_payload_bytes_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "llm_replay_turns",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "payload_sha256"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (length(payload_sha256) = 64)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "c",
+        "match_type": " ",
+        "name": "llm_replay_turns_payload_sha256_check",
+        "no_inherit": false,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "llm_replay_turns",
+        "update_action": " ",
+        "validated": true
+      },
+      {
+        "columns": [
+          "turn_id"
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (turn_id)",
+        "delete_action": " ",
+        "inheritance_count": 0,
+        "is_local": true,
+        "kind": "p",
+        "match_type": " ",
+        "name": "llm_replay_turns_pkey",
+        "no_inherit": true,
+        "referenced_columns": [],
+        "referenced_schema": null,
+        "referenced_table": null,
+        "table": "llm_replay_turns",
         "update_action": " ",
         "validated": true
       },
@@ -17216,6 +17507,41 @@
       },
       {
         "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "status",
+          "pid"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.default",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_llm_pending_replay_recovery ON llm_pending_actions USING btree (status, pid)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_llm_pending_replay_recovery",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "llm_pending_actions",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
         "attribute_count": 1,
         "attributes": [
           "pid"
@@ -17242,6 +17568,142 @@
         "ready": true,
         "replica_identity": false,
         "table": "llm_pending_actions",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "pid"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX llm_replay_heads_pkey ON llm_replay_heads USING btree (pid)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "llm_replay_heads_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "llm_replay_heads",
+        "unique": true,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 3,
+        "attributes": [
+          "pid",
+          "created_at",
+          "turn_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_llm_replay_turns_pid ON llm_replay_turns USING btree (pid, created_at, turn_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 3,
+        "live": true,
+        "name": "idx_llm_replay_turns_pid",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "llm_replay_turns",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 2,
+        "attributes": [
+          "run_id",
+          "turn_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C",
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE INDEX idx_llm_replay_turns_run ON llm_replay_turns USING btree (run_id, turn_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 2,
+        "live": true,
+        "name": "idx_llm_replay_turns_run",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops",
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0,
+          0
+        ],
+        "predicate": null,
+        "primary": false,
+        "ready": true,
+        "replica_identity": false,
+        "table": "llm_replay_turns",
+        "unique": false,
+        "valid": true
+      },
+      {
+        "access_method": "btree",
+        "attribute_count": 1,
+        "attributes": [
+          "turn_id"
+        ],
+        "clustered": false,
+        "collations": [
+          "pg_catalog.C"
+        ],
+        "definition": "CREATE UNIQUE INDEX llm_replay_turns_pkey ON llm_replay_turns USING btree (turn_id)",
+        "exclusion": false,
+        "immediate": true,
+        "key_count": 1,
+        "live": true,
+        "name": "llm_replay_turns_pkey",
+        "nulls_not_distinct": false,
+        "operator_classes": [
+          "pg_catalog.text_ops"
+        ],
+        "options": [
+          0
+        ],
+        "predicate": null,
+        "primary": true,
+        "ready": true,
+        "replica_identity": false,
+        "table": "llm_replay_turns",
         "unique": true,
         "valid": true
       },
@@ -24431,6 +24893,30 @@
         "force_row_security": false,
         "is_partition": false,
         "kind": "r",
+        "name": "llm_replay_heads",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
+        "name": "llm_replay_turns",
+        "options": [],
+        "persistence": "p",
+        "replica_identity": "d",
+        "row_security": false,
+        "tablespace": null
+      },
+      {
+        "access_method": "heap",
+        "force_row_security": false,
+        "is_partition": false,
+        "kind": "r",
         "name": "llm_tool_outputs",
         "options": [],
         "persistence": "p",
@@ -25054,7 +25540,7 @@
     "rewrite_rules": [],
     "triggers": []
   },
-  "catalog_sha256": "41a8a0e3c02edb9fa7dd30918f6f6cc46787ae1936b5b561e3ff5298b3090927",
+  "catalog_sha256": "b2b627cf5a174dc5e1d80be9239186331277e86c84aa769d6e72c9519b727c09",
   "format_version": 1,
   "generated_postgres_version_num": 170010
 }

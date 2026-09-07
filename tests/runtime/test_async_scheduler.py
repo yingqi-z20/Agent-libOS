@@ -66,7 +66,7 @@ class TestAsyncScheduler:
         asyncio.run(scenario())
 
     def test_two_processes_alternate_time_output_via_async_sleep(self) -> None:
-        report = asyncio.run(run_interleaved_clock_demo(iterations=2, interval_s=0.04, offset_s=0.02, echo=False))
+        report = asyncio.run(run_interleaved_clock_demo(db='local', iterations=2, interval_s=0.04, offset_s=0.02, echo=False))
         assert report['interleaved']
         assert report['actual_order'] == ['A', 'B', 'A', 'B']
         assert all((status == 'exited' for status in report['process_statuses'].values()))

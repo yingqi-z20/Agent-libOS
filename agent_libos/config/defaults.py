@@ -56,9 +56,10 @@ PromptCacheRetention = Annotated[
     Literal["in_memory", "24h"] | None,
     BeforeValidator(_normalize_prompt_cache_retention),
 ]
-PromptLayout = Literal["legacy_v1", "cache_optimized_v2"]
-PromptCacheMode = Literal["provider_default", "implicit", "explicit"]
+PromptLayout = Literal["auto", "legacy_v1", "cache_optimized_v2"]
+PromptCacheMode = Literal["auto", "provider_default", "implicit", "explicit"]
 PromptCacheTTL = Literal["30m"] | None
+ReasoningContext = Literal["auto", "current_turn", "all_turns"]
 
 _SENSITIVE_LLM_URL_QUERY_KEY_NAMES = frozenset(
     {
@@ -514,10 +515,13 @@ class LLMProfile:
     max_retries: int | None = None
     store: bool | None = None
     reasoning_effort: str | None = None
+    reasoning_context: ReasoningContext | None = None
+    responses_replay: StrictBool | None = None
     verbosity: Literal["low", "medium", "high"] | None = None
     safety_identifier: str | None = None
     safety_identifier_env: str | None = None
     prompt_cache_key: str | None = None
+    prompt_layout: PromptLayout | None = None
     prompt_cache_retention: PromptCacheRetention = None
     prompt_cache_mode: PromptCacheMode | None = None
     prompt_cache_ttl: PromptCacheTTL = None
@@ -536,6 +540,10 @@ class LLMProfile:
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class LLMDefaults:
     default_profile_id: str = "default"
+    openai_model: str = "gpt-6-astra"
+    openai_reasoning_effort: str = "medium"
+    openai_reasoning_context: Literal["current_turn", "all_turns"] = "all_turns"
+    openai_prompt_cache_ttl: Literal["30m"] = "30m"
     profiles: dict[str, LLMProfile] = field(default_factory=lambda: {"default": LLMProfile()})
     temperature: StrictFloat = 0.2
     max_tokens: StrictInt = 16_384
@@ -549,7 +557,11 @@ class LLMDefaults:
     max_retries: int = 2
     api_mode: Literal["auto", "responses", "chat"] = "auto"
     store: bool = False
+    reasoning_context: ReasoningContext = "auto"
+    responses_replay: StrictBool | None = None
     safety_identifier: str | None = None
+    responses_replay_max_bytes: StrictInt = 8 * 1024 * 1024
+    responses_replay_max_turns: StrictInt = 128
     prompt_layout: PromptLayout = "legacy_v1"
     prompt_cache_key: str | None = None
     prompt_cache_retention: PromptCacheRetention = None
@@ -994,6 +1006,7 @@ class LLMContextDefaults:
     object_name_prefix: str = "llm_context"
     recent_event_limit: int = 20
     prompt_event_payload_max_chars: int = 2_048
+    compaction_chunk_target_tokens: StrictInt = 16_384
     storage_compaction_threshold_bytes: int = 96_000
     storage_compaction_max_chunks: int = 4
     storage_compaction_preserve_recent_entries: int = 0
@@ -1234,6 +1247,10 @@ def _validate_llm_context_config(
     llm_context: LLMContextDefaults,
     tools: ToolDefaults,
 ) -> None:
+    _positive(
+        "llm_context.compaction_chunk_target_tokens",
+        llm_context.compaction_chunk_target_tokens,
+    )
     if llm_context.policy not in {"source_only", "llm_context_object"}:
         raise ValueError(
             "llm_context.policy must be source_only or llm_context_object"
@@ -1836,6 +1853,8 @@ def _validate_llm_config(
     semantic: SemanticDefaults | None = None,
 ) -> None:
     _require_non_empty("llm.default_profile_id", llm.default_profile_id)
+    _require_non_empty("llm.openai_model", llm.openai_model)
+    _require_non_empty("llm.openai_reasoning_effort", llm.openai_reasoning_effort)
     if llm.default_profile_id not in llm.profiles:
         raise ValueError(
             "llm.default_profile_id does not reference a configured profile: "
@@ -1855,6 +1874,8 @@ def _validate_llm_config(
         ttl=llm.prompt_cache_ttl,
     )
     _nonnegative("llm.temperature", llm.temperature)
+    _positive("llm.responses_replay_max_bytes", llm.responses_replay_max_bytes)
+    _positive("llm.responses_replay_max_turns", llm.responses_replay_max_turns)
     _positive("llm.max_tokens", llm.max_tokens)
     _positive("llm.max_input_tokens_per_call", llm.max_input_tokens_per_call)
     _positive("llm.max_total_tokens_per_call", llm.max_total_tokens_per_call)
@@ -2153,12 +2174,14 @@ def _validate_semantic_external_profile(
         or profile.prompt_cache_ttl is not None
         or llm.prompt_cache_key is not None
         or llm.prompt_cache_retention is not None
-        or llm.prompt_cache_mode != "provider_default"
+        or llm.prompt_cache_mode not in {"auto", "provider_default"}
         or llm.prompt_cache_ttl is not None
     ):
         raise ValueError("semantic external LLM profile must disable prompt caching")
     if profile.responses_previous_response_id is not False:
         raise ValueError("semantic external LLM profile must disable response chaining")
+    if profile.responses_replay is True:
+        raise ValueError("semantic external LLM profile must disable Responses replay")
     if profile.fallback_json_actions is not False:
         raise ValueError("semantic external LLM profile must disable JSON action fallback")
 
@@ -2178,7 +2201,7 @@ def _validate_prompt_cache_policy(
     retention: str | None,
     ttl: str | None,
 ) -> None:
-    if mode not in {"provider_default", "implicit", "explicit"}:
+    if mode not in {"auto", "provider_default", "implicit", "explicit"}:
         raise ValueError(f"{prefix}.prompt_cache_mode is not supported: {mode}")
     if ttl is not None and ttl != "30m":
         raise ValueError(f"{prefix}.prompt_cache_ttl must be 30m or null")
@@ -2186,7 +2209,7 @@ def _validate_prompt_cache_policy(
         raise ValueError(
             f"{prefix}.prompt_cache_retention and prompt_cache_ttl are mutually exclusive"
         )
-    if mode != "provider_default" and not str(key or "").strip():
+    if mode in {"implicit", "explicit"} and not str(key or "").strip():
         raise ValueError(
             f"{prefix}.prompt_cache_key is required when prompt_cache_mode is {mode}"
         )
@@ -2194,7 +2217,7 @@ def _validate_prompt_cache_policy(
         raise ValueError(
             f"{prefix}.prompt_cache_ttl requires implicit or explicit prompt_cache_mode"
         )
-    if mode != "provider_default" and retention is not None:
+    if mode in {"implicit", "explicit"} and retention is not None:
         raise ValueError(
             f"{prefix}.prompt_cache_retention cannot be combined with prompt_cache_mode {mode}"
         )

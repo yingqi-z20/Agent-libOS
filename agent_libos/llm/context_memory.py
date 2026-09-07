@@ -582,7 +582,7 @@ class LLMContextMemory:
         return handle
 
     def view_without_context(self, pid: str, view: MemoryView) -> MemoryView:
-        context_oid = self._context_oid(pid)
+        context_oid = self.context_oid(pid)
         if context_oid is None:
             roots = list(view.roots)
         else:
@@ -616,7 +616,7 @@ class LLMContextMemory:
         Object payload after validation.
         """
 
-        context_oid = self._context_oid(pid)
+        context_oid = self.context_oid(pid)
         if context_oid is None:
             return None
         context = self._objects.get_object(context_oid)
@@ -847,9 +847,12 @@ class LLMContextMemory:
         selected_method = self._validate_compaction_method(compaction_method)
         selected_metadata = self._validate_compaction_metadata(compaction_metadata)
         entries = list(payload.get("entries", []))
-        preserved_count = max(0, min(int(preserve_recent_entries), len(entries)))
-        preserved_entries = deepcopy(entries[-preserved_count:]) if preserved_count else []
-        compacted_payload = deepcopy(payload)
+        recent_limit = max(0, min(int(preserve_recent_entries), len(entries)))
+        # Do not clone the full history only to discard it. Copy retained
+        # entries after fitting them within the rendered context target.
+        compacted_payload = {
+            key: deepcopy(value) for key, value in payload.items() if key != "entries"
+        }
         compact_entry = {
             "kind": "context_compacted",
             "at": utc_now(),
@@ -862,9 +865,10 @@ class LLMContextMemory:
             "compaction_metadata": selected_metadata,
             "compressor_pids": list(compressor_pids),
             "summary": compact_summary,
-            "preserved_recent_entries": preserved_count,
+            "preserved_recent_entries": 0,
+            "compacted_tokens": 0,
         }
-        compacted_payload["entries"] = [compact_entry, *preserved_entries]
+        compacted_payload["entries"] = [compact_entry]
         captured = dict(compacted_payload.get("captured") or {})
         captured["process_signature"] = None
         captured["capability_signature"] = None
@@ -882,10 +886,36 @@ class LLMContextMemory:
             "storage_compaction_baseline_bytes": None,
             "storage_compaction_rearm_at_bytes": None,
         }
-        rendered = self.render(compacted_payload)
-        compacted_tokens = estimate_tokens(rendered)
-        compact_entry["compacted_tokens"] = compacted_tokens
+        # The cumulative summary is mandatory even when it exceeds the soft
+        # target. Verbatim history is optional: keep only a fitting, contiguous
+        # recent suffix. Older compaction envelopes have already been merged
+        # into the new summary and must never accumulate as nested history.
+        preserved_entries: list[Any] = []
+        candidates = entries[-recent_limit:] if recent_limit else []
+        for entry in reversed(candidates):
+            if isinstance(entry, Mapping) and entry.get("kind") == "context_compacted":
+                break
+            compacted_payload["entries"] = [compact_entry, entry, *preserved_entries]
+            compact_entry["preserved_recent_entries"] = len(preserved_entries) + 1
+            if self._measure_compacted_payload(compacted_payload) > target_tokens:
+                break
+            preserved_entries.insert(0, deepcopy(entry))
+        preserved_count = len(preserved_entries)
+        compacted_payload["entries"] = [compact_entry, *preserved_entries]
+        compact_entry["preserved_recent_entries"] = preserved_count
+        compacted_tokens = self._measure_compacted_payload(compacted_payload)
         return compacted_payload, compacted_tokens, preserved_count
+
+    def _measure_compacted_payload(self, payload: dict[str, Any]) -> int:
+        entry = payload["entries"][0]
+        # The reported count itself occupies prompt space. Start at zero to
+        # reach the same fixed point after either growing or shrinking a tail.
+        entry["compacted_tokens"] = 0
+        while True:
+            measured = estimate_tokens(self.render(payload))
+            if measured == entry["compacted_tokens"]:
+                return measured
+            entry["compacted_tokens"] = measured
 
     def _validate_compaction_method(self, method: str) -> str:
         if not isinstance(method, str) or not method.strip():
@@ -1356,7 +1386,8 @@ class LLMContextMemory:
             )
         return payload
 
-    def _context_oid(self, pid: str) -> str | None:
+    def context_oid(self, pid: str) -> str | None:
+        """Locate the Host-maintained context without creating it or granting access."""
         obj = self._objects.get_object_by_name(
             self.object_name(pid),
             namespace=self._memory.resolve_namespace(pid),

@@ -4,6 +4,8 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from agent_libos import AgentImage, Runtime
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import (
@@ -11,9 +13,11 @@ from agent_libos.models import (
     ObjectType,
     PROMPT_MODE_IMAGE_ONLY,
 )
+from tests.runtime.test_responses_replay_executor import ReplayClient
 
 
-def test_historical_sensitive_tool_output_denies_next_image_only_egress() -> None:
+@pytest.mark.parametrize("enable_replay", [False, True], ids=["legacy", "first-native-replay"])
+def test_historical_sensitive_tool_output_denies_next_image_only_egress(enable_replay: bool) -> None:
     runtime = Runtime.open("local")
     try:
         runtime.register_image(
@@ -42,12 +46,18 @@ def test_historical_sensitive_tool_output_denies_next_image_only_egress() -> Non
         )
 
         first = runtime.run_process_once(pid)
+        replay_client = ReplayClient([]) if enable_replay else None
+        if replay_client is not None:
+            runtime.llm.client = replay_client
         second = runtime.run_process_once(pid)
 
         assert first["ok"], first
         assert not second["ok"]
         assert "data-flow denied egress" in second["error"]
         assert client.call_count == 1
+        if replay_client is not None:
+            assert not replay_client.inputs
+            assert runtime.store.get_llm_replay_head(pid) is None
         result_oid = first["result"]["result_oid"]
         request = [
             record

@@ -18,6 +18,7 @@ from agent_libos.storage.semantic_v5_migration import (
 )
 from agent_libos.storage.v6_schema_contract import V6_TABLES
 from agent_libos.storage.v7_schema_contract import V7_TABLES
+from agent_libos.storage.v8_schema_contract import V8_TABLES
 
 
 def _make_v4_store(path: Path) -> None:
@@ -31,7 +32,8 @@ def _make_v4_store(path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        for table in sorted((V7_TABLES | V6_TABLES) & tables):
+        connection.execute("DROP INDEX IF EXISTS idx_llm_pending_replay_recovery")
+        for table in sorted((V8_TABLES | V7_TABLES | V6_TABLES) & tables):
             connection.execute(f'DROP TABLE "{table}"')
         if "semantic_assessments" in tables:
             connection.execute("DROP TABLE semantic_assessments")

@@ -13,6 +13,7 @@ from typing import Any
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.human.manager import HumanObjectManager
+from agent_libos.llm.client import LLMError
 from agent_libos.utils.openai_schema import openai_chat_tool_schema
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
@@ -1002,7 +1003,7 @@ class ToolBroker:
             for row in self.extensions.list_tools()
             if row["tool_id"] in visible_ids
         ]
-        rows = self._model_projected_tool_rows(rows)
+        rows = self._model_projected_tool_rows(rows, prompt_layout=self._model_prompt_layout(pid))
         if self._jit_exposure_for_process(pid) != JIT_TOOL_EXPOSURE_MULTIPLEXED:
             return rows
         static_rows = [
@@ -1016,6 +1017,8 @@ class ToolBroker:
     def _model_projected_tool_rows(
         self,
         rows: builtins.list[dict[str, Any]],
+        *,
+        prompt_layout: str | None = None,
     ) -> builtins.list[dict[str, Any]]:
         projected: builtins.list[dict[str, Any]] = []
         for row in rows:
@@ -1026,10 +1029,32 @@ class ToolBroker:
                     implementation.spec(
                         config=self.config,
                         model_visible=True,
+                        prompt_layout=prompt_layout,
                     )
                 )
             projected.append(selected)
         return projected
+
+    def _model_prompt_layout(self, pid: str | None) -> str:
+        """Resolve model schema layout without constructing a Provider client."""
+
+        registry = getattr(self._tool_context_host, "llms", None)
+        if registry is None:
+            return self.config.llm.prompt_layout
+        process = self.processes.get_process(pid) if pid is not None else None
+        profile_id = (
+            process.llm_profile_id if process is not None else None
+        ) or self.config.llm.default_profile_id
+        try:
+            return registry.profile_snapshot(profile_id).policy.prompt_layout
+        except (ValidationError, LLMError):
+            # The executor records unknown profiles through its protected LLM
+            # failure path. Schema construction must not bypass that boundary.
+            return (
+                "legacy_v1"
+                if self.config.llm.prompt_layout == "auto"
+                else self.config.llm.prompt_layout
+            )
 
     def initial_tool_projection(self, image: Any) -> list[str]:
         metadata = getattr(image, "metadata", {})
@@ -1161,6 +1186,7 @@ class ToolBroker:
         return self._redact_hidden_jit_names(value, hidden)
 
     def openai_tool_schemas(self, pid: str | None = None) -> builtins.list[dict[str, Any]]:
+        prompt_layout = self._model_prompt_layout(pid)
         tool_ids = (
             self._model_visible_tool_ids(pid)
             if pid is not None
@@ -1172,7 +1198,9 @@ class ToolBroker:
         for tool_id in sorted(tool_ids, key=self._tool_sort_key):
             implementation = self.registry.implementation(tool_id)
             if implementation is not None:
-                schemas.append(implementation.to_openai_chat_tool(config=self.config))
+                schemas.append(implementation.to_openai_chat_tool(
+                    config=self.config, prompt_layout=prompt_layout
+                ))
                 continue
             if not self.registry.is_jit(tool_id):
                 continue

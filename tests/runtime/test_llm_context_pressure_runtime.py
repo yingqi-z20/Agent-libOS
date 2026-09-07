@@ -1043,9 +1043,13 @@ def test_storage_pressure_builtin_compactor_resumes_without_reconsuming_finite_a
         name="storage-pressure-builtin",
         default_tools=["compact_process_context", "process_exit"],
     )
+    config = _storage_pressure_config(30_000)
     runtime = Runtime(
         SQLiteStore(":memory:"),
-        config=_storage_pressure_config(30_000),
+        config=replace(config, llm_context=replace(
+            config.llm_context, compaction_chunk_target_tokens=1,
+            storage_compaction_max_chunks=3,
+        )),
     )
     runtime.register_image(image, actor="test")
     summary_action = {

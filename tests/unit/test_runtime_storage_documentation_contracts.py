@@ -411,15 +411,19 @@ def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() 
     documentation = _words(_read("docs/storage.md"))
     readme = _words(_read("README.md"))
 
-    assert "Agent libOS 1.5.2 stores durable runtime state" in documentation
-    assert "## Strict store schema v7" in documentation
+    assert "Agent libOS 1.5.3 stores durable runtime state" in documentation
+    assert "## Strict store schema v8" in documentation
     assert "Product version and store schema version are independent" in documentation
-    assert "The only supported migrations are the explicit, offline, operator-invoked canonical v4-to-v5, v5-to-v6, and v6-to-v7 procedures" in documentation
+    assert "The only supported migrations are the explicit, offline, operator-invoked canonical v4-to-v5, v5-to-v6, v6-to-v7, and v7-to-v8 procedures" in documentation
     assert "There are no automatic migrations, backfills, read-only compatibility modes, or dual runtime schema paths" in documentation
     assert "must be opened with Agent libOS 1.0.1" in documentation
-    assert "creates and opens only RuntimeStore schema v7" in readme
-    assert "offline, digest-bound v6-to-v7 migration" in readme
+    assert "creates and opens only RuntimeStore schema v8" in readme
+    assert "offline, digest-bound v7-to-v8 migration" in readme
     for required in (
+        "## Offline v7 to v8 migration",
+        "`llm_replay_turns` and `llm_replay_heads` tables",
+        "checks that all existing rows are unchanged",
+        "atomically advances the marker from 7 to 8",
         "## Offline v6 to v7 migration",
         "creates the five MCP v7 tables",
         "compare-and-swaps the singleton marker `6 -> 7`",
@@ -462,8 +466,8 @@ def test_storage_docs_distinguish_product_and_schema_and_bound_backup_support() 
         "`--no-privileges`",
         "do not pre-create it",
         "Restore into the new target in one",
-        "The expected output includes `ok` and `7`",
-        "store schema version to equal `7` before opening the Runtime",
+        "The expected output includes `ok` and `8`",
+        "store schema version to equal `8` before opening the Runtime",
         "restored `server_version_num` to have major version 17",
         "server must be major version 17",
         "`SHOW server_version_num`",

@@ -364,15 +364,16 @@ longer defines.
   pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
   typed boundaries compute the next state generation, preventing a direct-write
   rewind from reviving a stale token.
-- `v7-persisted-state-is-strict-and-versioned`: ordinary 1.5.2 Runtime startup
-  accepts only the frozen version-7 physical schema (including Durable Task
+- `v8-persisted-state-is-strict-and-versioned`: ordinary 1.5.3 Runtime startup
+  accepts only the frozen version-8 physical schema (including Durable Task
   Run, typed process state, Human revision, semantic job/evidence state,
   FlowGraph, policy epochs, machine-settlement evidence, and sanitized MCP v3
   continuation/Task/subscription/auth projections) plus canonical security
-  carriers. Canonical v4-to-v5, v5-to-v6, and v6-to-v7 upgrades are explicit,
+  carriers and private Responses replay rows. Canonical v4-to-v5, v5-to-v6,
+  v6-to-v7, and v7-to-v8 upgrades are explicit,
   offline, digest-bound migration steps; Runtime startup never migrates a
   store. Older, incomplete, or malformed state is rejected before Runtime
-  mutation. Recovery operates only on valid schema-v7 state, and remote MCP
+  mutation. Recovery operates only on valid schema-v8 state, and remote MCP
   request state, input payloads, task ids, and OAuth secrets never become Store
   columns. Every persisted input-required Task remains bound to a durable Human
   request that is unique across continuations and Tasks, and each multi-round
@@ -599,7 +600,7 @@ longer defines.
   `_truncated`, while stricter subsystem list maxima remain authoritative.
   Persisted indexed visibility flags exclude internal presentation evidence
   before `LIMIT`; missing or malformed required `gui_snapshot_visible` state
-  (the frozen schema-v7 store contract) fails closed instead of being
+  (the frozen schema-v8 store contract) fails closed instead of being
   repaired during open.
 - `tool-observability-redacts-sensitive-payloads`: tool audit/event
   observability redacts known structured payload/credential keys plus recognized
@@ -915,8 +916,8 @@ longer defines.
 - `llm-async-clients-are-event-loop-scoped`: real async SDK clients and their
   keep-alive pools are request-scoped and cannot cross scheduler event loops.
 - `llm-provider-state-is-scope-bound-and-nonreplayable`: the Runtime records
-  scope-sensitive provider fingerprints while the AgentProcess executor remains
-  stateless even when provider continuation policy is configured. The low-level
+  scope-sensitive provider fingerprints while the AgentProcess executor sends
+  locally assembled full snapshots without server-side response chaining. The low-level
   client does not enforce those Runtime fingerprints. Durable waits use
   token-scoped pending/resuming/completed CAS and
   synchronize restored generations; an ABA
@@ -956,12 +957,48 @@ longer defines.
   charge one call and the aggregate maximum during failure or startup recovery.
 - `llm-token-usage-is-charged-before-tool-dispatch`: provider-reported LLM token
   usage is validated against the reserved envelope and settled exactly or
-  conservatively before any model-selected tool call is dispatched.
+  conservatively before any model-selected tool call is dispatched. Canonical
+  `reasoning_tokens` remains an output-token subset and is never added to output
+  or total charges; zero, missing, and invalid counters remain distinguishable
+  in retained evidence.
 - `llm-provider-attempt-traces-are-bounded-redacted-and-logically-accounted`:
   built-in-client attempts are explicit, bounded, and stripped of credentials,
   opaque Provider blobs, and raw failure bodies; all attempts remain inside one
   logical-call reservation and intermediate diagnostic usage is not charged
   again.
+- `llm-responses-replay-is-private-scoped-and-lossless`: native Responses
+  reasoning, assistant phase, calls, and paired results preserve their order in
+  bounded Host-private state. Generic completion serialization, observability,
+  and protected semantic result traversal exclude ciphertext. Invalid replay
+  protocols fail instead of dropping state or switching to Chat; immutable
+  retained payloads and compare-and-swap heads reject corruption, cross-process
+  rebinding, and resurrection after purge. Checkpoint restore and fork recheck
+  source authority and provider scope before effects; image commits exclude
+  replay and full-I/O opt-out prevents snapshot capture. Executor replay keeps
+  each tool result once across process quanta and reopen, including native
+  `image_only` history, and repairs invalid actions without orphan calls.
+  Compaction requires the committed current-generation certificate, preserves
+  complete pending groups, and replaces covered historical context references
+  only after current READ authorization. Labels and other source references
+  survive, the certified summary appears once, and failed preparation restores
+  the previous replay head.
+  Ordinary Host context appends atomically advance only an exactly matched
+  predecessor reference; arbitrary context writes cannot bypass source checks.
+  Committed exec retires the old private head using an exact provider-call
+  receipt without changing TaskRun context generations. Failed exec preserves
+  the old head, and retained checkpoint bodies remain available.
+  Historical sources require current READ and exact source identity. Startup
+  narrows existing source grants and restrictions to READ for validated retained
+  history; user revocation and explicit source deletion remain final, and the
+  full-I/O opt-out prevents authority preservation. Pending waits with no private
+  replay state do not require a replay profile during startup.
+- `llm-auto-provider-policy-is-host-scoped-and-cache-defaults-stay-gated`:
+  one Host profile snapshot resolves explicit settings and eligible environment
+  values before endpoint defaults. Auto cache domains are profile-isolated and
+  stable within a registry lifetime; custom endpoints and the semantic
+  classifier retain their separate policies. The candidate marks the stable
+  instruction prefix while release defaults remain legacy until paired live
+  qualification succeeds.
 - `gui-llm-reasoning-content-is-on-demand-retention-aware-and-inert`: GUI
   snapshot/SSE projections contain no LLM body content; authenticated
   process-bound detail reads honor retention and content-version cursors, and

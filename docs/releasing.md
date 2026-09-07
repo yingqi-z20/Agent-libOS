@@ -95,7 +95,7 @@ not contact a package index or inspect remote Git references. It also verifies
 that every tracked ordinary source file belongs to the exact sdist
 include/exclude partition; an unclassified top-level file blocks the build
 until a maintainer makes an explicit inclusion decision. For this release
-line it additionally pins the exact target `1.5.2`; a future release must
+line it additionally pins the exact target `1.5.3`; a future release must
 intentionally update that target and its regression contract rather than
 passing merely because stale identifiers agree with one another. Immediately
 before publication authorization, the human owner must re-check the complete
@@ -265,7 +265,7 @@ other cells marked as environment gates are not made true by deterministic CI.
 If a release claim includes one, obtain and bind its documented clean-source
 receipt before authorization.
 
-For the 1.5.2 internal desktop candidate, native packaging is a separate
+For the 1.5.3 internal desktop candidate, native packaging is a separate
 manual workflow (`.github/workflows/desktop-internal.yml`). It builds only on
 the three locked native runners, uploads Actions artifacts for 14 days, and has
 read-only repository permission. Its macOS artifact is ad-hoc signed and not

@@ -254,5 +254,5 @@ leaves the original audit and external-effect records unchanged; it does not
 rewrite their source fields while producing a redacted projection.
 
 Unlinked rows are not backfilled or heuristically reconstructed. The frozen
-schema-v7 RuntimeStore contract requires the explanation tables and explicit
+schema-v8 RuntimeStore contract requires the explanation tables and explicit
 links; an older or incomplete store is rejected before mutation.
