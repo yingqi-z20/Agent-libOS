@@ -163,6 +163,21 @@ def _with_registry_lifecycle_lock(method: Callable[..., Any]) -> Callable[..., A
     return guarded
 
 
+def _summary_tool_names(summary: Mapping[str, Any]) -> list[str]:
+    """Return the declared tool names a discovery summary exposes for search."""
+
+    names: list[str] = []
+    for key in ("allowed_tools", "jit_tools"):
+        values = summary.get(key)
+        if not isinstance(values, (list, tuple)):
+            continue
+        for value in values:
+            name = value.get("name") if isinstance(value, Mapping) else value
+            if isinstance(name, str) and name.strip():
+                names.append(name)
+    return names
+
+
 class SkillManager:
     """Capability-controlled primitive for standard Agent Skill packages.
 
@@ -781,6 +796,7 @@ class SkillManager:
                 skill_id=str(item.get("skill_id") or ""),
                 name=str(item.get("name") or ""),
                 text=text,
+                tool_names=_summary_tool_names(item),
             )
         ]
         return (exact, True) if exact else (ranked, False)
@@ -819,6 +835,7 @@ class SkillManager:
             name=str(summary.get("name") or ""),
             description=str(summary.get("description") or ""),
             text=text,
+            tool_names=_summary_tool_names(summary),
         )
 
     def _loaded_skill_is_trusted(self, process: Any | None, skill_id: str) -> bool:

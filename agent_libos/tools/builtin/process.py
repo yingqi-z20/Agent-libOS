@@ -608,7 +608,8 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
         "item, then retry with its fresh review_token and structured "
         "completion_evidence. "
         "This does not present the result to the human; interactive images "
-        "should call human_output in a prior quantum. "
+        "should call human_output first, either in a prior quantum or in the same "
+        "response immediately before process_exit, which must be the last call. "
         "This is a Skills/Tools Layer wrapper over process lifecycle primitives."
     )
     args_schema = ProcessExitArgs

@@ -5,9 +5,10 @@ allowed-tools: process_exit compact_process_context get_current_time sleep
 ---
 # Manage time, context, and process completion
 
-Activating this Skill exposes schemas but grants no underlying authority. Make a
-wait, compaction, or exit the only call in its turn because it can stop later
-calls in a parallel batch.
+Activating this Skill exposes schemas but grants no underlying authority. A
+wait, compaction, or exit stops later calls in the same response, so make it
+the last call of its turn: a response may end with `human_output` followed by
+`process_exit`, but nothing may follow the exit.
 
 ## Tool guide
 
@@ -125,8 +126,9 @@ those Host-managed runners.
 4. Before exit re-read the cumulative goal/ledger and queued messages. A notice
    pauses exit: follow source-neutral Skill discovery, activate a result that
    declares a message-read tool, read/ACK input, and merge cumulative follow-ups.
-   Send required `human_output` in a prior turn, then call `process_exit` alone
-   and follow Completion evidence on review.
+   Send required `human_output` in a prior turn or immediately before
+   `process_exit` in the same response (exit last), and follow Completion
+   evidence on review.
 
 ## Failure and recovery
 
@@ -212,10 +214,11 @@ nonempty `final_verification` list likewise contains only observed successful
 tool names.
 
 There is no separate “clear review” call. After the post-ACK review, complete
-missing tools, prepare evidence, and send required Human output in its own turn.
-Successful tools/Human output do not change the token; a goal version change,
-new Human message, or message ACK does. Then call `process_exit` alone with the
-latest token, evidence, and the same desired result. Validation rebuilds the
+missing tools and prepare evidence. Successful tools/Human output do not change
+the token; a goal version change, new Human message, or message ACK does. Then
+send any required final Human output and `process_exit` with the latest token,
+evidence, and the same desired result in one response, with `process_exit` as
+the last call. Validation rebuilds the
 current successful-tool list. If another review returns, resolve its newest
 errors and input, refresh after any ACK, and retry. Stop only on
 `status="exited"`.

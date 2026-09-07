@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import tempfile
 from dataclasses import replace
 from pathlib import Path
 
 from agent_libos.config import DEFAULT_CONFIG
 from benchmarks.long_horizon_agent import report_all_successful, run_evaluation
-from benchmarks.long_horizon_agent.runner import (
-    DEFAULT_MAX_QUANTA,
-    DEFAULT_PHASE_ONE_QUANTA,
-)
+from benchmarks.long_horizon_agent.runner import SCENARIO_ID, SCENARIOS
 from experiments.evaluation_cli import (
     has_real_llm_environment,
     paths_overlap,
@@ -26,17 +24,47 @@ def main(argv: list[str] | None = None) -> None:
             "follow-up and durable Runtime restart."
         )
     )
-    parser.add_argument("--output", required=True, help="JSON report path.")
+    parser.add_argument(
+        "--output",
+        help="JSON report path (required unless --list-scenarios is given).",
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=sorted(SCENARIOS),
+        default=SCENARIO_ID,
+        help="Registered long-horizon scenario to run.",
+    )
+    parser.add_argument(
+        "--list-scenarios",
+        action="store_true",
+        help="Print the registered scenario ids, one per line, and exit.",
+    )
     parser.add_argument("--repetitions", type=positive_int, default=1)
     parser.add_argument(
         "--phase-one-quanta",
         type=positive_int,
-        default=DEFAULT_PHASE_ONE_QUANTA,
+        default=None,
+        help=(
+            "Scheduler quanta before the follow-up message and Runtime restart "
+            "(default: the selected scenario's value)."
+        ),
     )
     parser.add_argument(
         "--max-quanta",
         type=positive_int,
-        default=DEFAULT_MAX_QUANTA,
+        default=None,
+        help=(
+            "Total scheduler quanta per run; must exceed --phase-one-quanta "
+            "(default: the selected scenario's value)."
+        ),
+    )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help=(
+            "Print one stderr summary line per completed phase (quanta, tool "
+            "names, status, and seconds only)."
+        ),
     )
     parser.add_argument(
         "--artifacts-root",
@@ -62,6 +90,12 @@ def main(argv: list[str] | None = None) -> None:
         help="Model prompt layout used for this paired evaluation arm.",
     )
     args = parser.parse_args(argv)
+    if args.list_scenarios:
+        for scenario_id in sorted(SCENARIOS):
+            print(scenario_id)
+        return
+    if not args.output:
+        parser.error("--output is required")
     if not args.confirm_real_llm:
         parser.error("--confirm-real-llm is required to spend real LLM tokens")
     if not has_real_llm_environment():
@@ -69,6 +103,18 @@ def main(argv: list[str] | None = None) -> None:
             "OPENAI_API_KEY and OPENAI_LANGUAGE_MODEL or OPENAI_MODEL are required"
         )
     output = Path(args.output).resolve()
+    scenario = SCENARIOS[args.scenario]
+    phase_one_quanta = (
+        scenario.default_phase_one_quanta
+        if args.phase_one_quanta is None
+        else args.phase_one_quanta
+    )
+    max_quanta = (
+        scenario.default_max_quanta if args.max_quanta is None else args.max_quanta
+    )
+    if max_quanta <= phase_one_quanta:
+        parser.error("--max-quanta must be greater than --phase-one-quanta")
+    progress = _stderr_progress if args.progress else None
     config = replace(
         DEFAULT_CONFIG,
         llm=replace(DEFAULT_CONFIG.llm, prompt_layout=args.prompt_layout),
@@ -89,9 +135,11 @@ def main(argv: list[str] | None = None) -> None:
             report = run_evaluation(
                 artifacts_root,
                 repetitions=args.repetitions,
-                phase_one_quanta=args.phase_one_quanta,
-                max_quanta=args.max_quanta,
+                phase_one_quanta=phase_one_quanta,
+                max_quanta=max_quanta,
                 config=config,
+                scenario_id=scenario.scenario_id,
+                progress=progress,
             )
             report["artifacts_root"] = str(artifacts_root)
         else:
@@ -101,14 +149,20 @@ def main(argv: list[str] | None = None) -> None:
                 report = run_evaluation(
                     root,
                     repetitions=args.repetitions,
-                    phase_one_quanta=args.phase_one_quanta,
-                    max_quanta=args.max_quanta,
+                    phase_one_quanta=phase_one_quanta,
+                    max_quanta=max_quanta,
                     config=config,
+                    scenario_id=scenario.scenario_id,
+                    progress=progress,
                 )
         rendered = artifact.commit(report)
     print(rendered, end="")
     if args.require_all_successful and not report_all_successful(report):
         raise SystemExit(1)
+
+
+def _stderr_progress(line: str) -> None:
+    print(line, file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

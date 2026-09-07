@@ -562,7 +562,10 @@ See [data_flow.md](data_flow.md).
 Set `llm.parallel_tool_calls` or `OPENAI_PARALLEL_TOOL_CALLS=true` to let the
 provider return multiple tool calls in one action-selection response. Agent
 libOS dispatches that batch sequentially in one quantum; it does not run tools
-concurrently.
+concurrently. When the option is off but a provider still returns several
+calls, the executor dispatches them as the same ordered batch instead of
+keeping only one; the validated TaskRun manifest records the dispatched batch
+shape, and a Durable TaskRun asks the model to send `activate_skill` alone.
 Set `llm.auto_wait_on_empty_tool_calls: true` globally or on a specific LLM
 profile only for providers that sometimes answer action-selection requests
 without tool calls. When enabled, Agent libOS synthesizes a

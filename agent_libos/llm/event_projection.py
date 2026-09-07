@@ -112,6 +112,7 @@ def project_prompt_events(
     *,
     context_object_name: str | None = None,
     payload_max_chars: int = DEFAULT_CONFIG.llm_context.prompt_event_payload_max_chars,
+    max_visible: int | None = None,
 ) -> ProjectedEventBatch:
     """Project audit events into deterministic, bounded prompt data.
 
@@ -119,13 +120,20 @@ def project_prompt_events(
     Repetitive bookkeeping is summarized by type/reason and a digest instead
     of being copied into the prompt.  Process-message metadata is deliberately
     delegated to the mediated message-read directive and never projected.
+    ``max_visible`` keeps only the newest visible records; older ones are
+    accounted as ``recent_window`` omissions so the cursor can still advance
+    through a long backlog without hiding the newest actionable events behind
+    bookkeeping rows.
     """
 
     if payload_max_chars < 512:
         raise ValueError("payload_max_chars must be at least 512")
+    if max_visible is not None and max_visible < 1:
+        raise ValueError("max_visible must be at least 1")
 
     selected_events = list(events)
     projected: list[dict[str, Any]] = []
+    projected_sources: list[Event] = []
     omitted_counts: dict[str, int] = {}
     omitted_descriptors: list[dict[str, Any]] = []
     resource_usage_delta: dict[str, int | float] = {}
@@ -153,9 +161,19 @@ def project_prompt_events(
         )
         if was_truncated:
             payload_truncated_count += 1
+        projected.append(record)
+        projected_sources.append(event)
+
+    if max_visible is not None and len(projected) > max_visible:
+        dropped = len(projected) - max_visible
+        for event in projected_sources[:dropped]:
+            omitted_descriptors.append(_event_digest_descriptor(event))
+        omitted_counts["recent_window"] = omitted_counts.get("recent_window", 0) + dropped
+        projected = projected[dropped:]
+        projected_sources = projected_sources[dropped:]
+    for event in projected_sources:
         event_type = event.type.value
         represented_type_counts[event_type] = represented_type_counts.get(event_type, 0) + 1
-        projected.append(record)
 
     represented_through_event_id = selected_events[-1].event_id if selected_events else None
     summary = _projection_summary(
@@ -197,6 +215,21 @@ def _prompt_event_omission_reason(
     if event.type == EventType.TOOL_COMPLETED:
         # Tool output is already present through the memory/result channel.
         return event.type.value
+    if (
+        event.type == EventType.OBJECT_CREATED
+        and event.payload.get("type") == "tool_result"
+    ):
+        # The result Object itself is materialized into the prompt; its
+        # creation row is bookkeeping that would otherwise crowd out the few
+        # actionable events of a busy multi-call quantum.
+        return "tool_result_object_created"
+    if (
+        event.type == EventType.CAPABILITY_GRANTED
+        and str(event.payload.get("resource") or "").startswith("object:")
+    ):
+        # Per-Object read grants mirror Object creation; the Capabilities
+        # section already summarizes them.
+        return "object_capability_granted"
     if (
         event.type == EventType.DATA_FLOW_DECISION
         and event.payload.get("outcome") == "allow"

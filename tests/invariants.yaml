@@ -583,6 +583,7 @@
       "title": "Object Memory materialization is bounded by rendered object text.",
       "lane": "runtime",
       "node_ids": [
+        "tests/runtime/test_long_horizon_context.py::test_working_set_keeps_goal_plan_and_latest_feedback_under_pressure",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_mutable_payload_update_refreshes_token_estimate_for_materialization_budget",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_append_refreshes_token_estimate_for_materialization_budget",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_materialization_budget_uses_rendered_text_not_stale_metadata_estimate",
@@ -5529,6 +5530,48 @@
       "lane": "runtime",
       "node_ids": [
         "tests/runtime/test_runtime_infra_release_repairs.py::test_rating_update_and_audit_failure_share_one_transaction"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "working-set-feedback-window-is-a-prompt-projection",
+      "title": "Older or superseded working_set feedback renders as content-free stubs while Human input stays verbatim and durable Objects are unchanged.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_long_horizon_working_set.py::test_working_set_supersedes_repeated_observations_and_stubs_older_feedback",
+        "tests/runtime/test_long_horizon_working_set.py::test_working_set_stubs_apply_only_to_that_policy_and_keep_stable_prefix",
+        "tests/runtime/test_long_horizon_working_set.py::test_supersession_keys_cover_observations_but_never_actions_or_failures",
+        "tests/runtime/test_long_horizon_working_set.py::test_feedback_stub_summary_describes_without_copying_content",
+        "tests/unit/test_prompt_projection_compaction.py::test_v2_compaction_strips_object_ids_from_feedback_stubs"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "source-materialization-stays-within-admission-headroom",
+      "title": "The per-quantum materialization budget never exceeds the process window or the resolved per-call input headroom.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_long_horizon_working_set.py::test_materialization_budget_follows_per_call_admission_headroom",
+        "tests/runtime/test_long_horizon_working_set.py::test_materialization_budget_never_exceeds_the_process_window"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "unexecuted-batch-calls-are-reported-not-assumed",
+      "title": "Calls of a multi-call response that never ran are reported to the model as an event, and queued normal input is noticed before tool selection without copying its body.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_long_horizon_working_set.py::test_truncated_batch_reports_unexecuted_calls_to_the_model",
+        "tests/runtime/test_long_horizon_working_set.py::test_queued_normal_message_directive_appears_before_first_tool_selection"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "container-argument-repair-is-schema-guided",
+      "title": "A JSON-encoded container argument is decoded only when every schema variant forbids strings, and the repair is audited.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_long_horizon_working_set.py::test_json_string_container_arguments_are_decoded_only_when_schema_forbids_strings"
       ],
       "benchmark_attack_classes": []
     }

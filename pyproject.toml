@@ -97,6 +97,7 @@ include = [
     "/tests",
 ]
 exclude = [
+    "/.env.example",
     "/.gitattributes",
     "/.github",
     "/AGENTS.md",

@@ -26,6 +26,7 @@ SUPPORTED_BUILTIN_CONTEXT_POLICIES = {
     "recency_first",
     "evidence_first",
     "error_debug",
+    "working_set",
 }
 SKILL_PROJECTION_BOOTSTRAP = {
     "activate_skill",

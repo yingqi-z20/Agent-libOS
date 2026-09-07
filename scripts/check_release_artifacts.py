@@ -70,6 +70,7 @@ SDIST_INCLUDE = (
     "/tests",
 )
 SDIST_EXCLUDE = (
+    "/.env.example",
     "/.gitattributes",
     "/.github",
     "/AGENTS.md",

@@ -259,7 +259,7 @@ Tool binding or model visibility does not grant remote authority. With
 `DEFAULT_CONFIG`, the complete process tool tables for `base-agent:v0`,
 `coding-agent:v0`, and `review-agent:v0` bind `list_jsonrpc_endpoints`,
 `inspect_jsonrpc_endpoint`, and `call_jsonrpc_method`. Their initial Skill
-projection contains only the five bootstrap tools, so none of these JSON-RPC
+projection contains only the bootstrap and message-read tools, so none of these JSON-RPC
 schemas is initially model-visible. Activating the exact
 `agent-libos-jsonrpc` Skill projects all three without changing Capability
 authority. The narrow direct `research-agent:v0`, `analysis-agent:v0`, and

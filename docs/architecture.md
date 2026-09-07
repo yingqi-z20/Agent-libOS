@@ -110,7 +110,10 @@ Skill-authority checks.
 Images may opt into `metadata.tool_projection: skills`. The complete image tool
 table stays callable and capability-enforced, while a separate durable model
 projection initially contains exactly `discover_skills`, `activate_skill`,
-`read_skill_resource`, `unload_skill`, and `process_exit`. This is the shipped
+`read_skill_resource`, `unload_skill`, and `process_exit`, plus
+`read_process_messages` and `receive_process_messages` when the image table
+binds them, so queued Human or process input can be acknowledged without a
+discovery round trip. This is the shipped
 base, coding, review, and toolmaker contract. Static bindings for filesystem,
 Git, checkpoint, Capability, JSON-RPC, MCP, and other domains are not thereby
 initially model-visible. Activating an applicable built-in Skill projects its

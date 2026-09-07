@@ -356,7 +356,11 @@ class TestLLMContextMemory:
     def test_llm_quantum_reads_a_store_bounded_event_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
         config = replace(
             DEFAULT_CONFIG,
-            llm_context=replace(DEFAULT_CONFIG.llm_context, recent_event_limit=3),
+            llm_context=replace(
+                DEFAULT_CONFIG.llm_context,
+                recent_event_limit=3,
+                recent_event_scan_limit=3,
+            ),
         )
         runtime = Runtime.open('local', config=config)
         try:
@@ -2155,7 +2159,28 @@ class TestLLMContextMemory:
         finally:
             runtime.close()
 
-    def test_parallel_tool_calls_disabled_uses_existing_single_action_path(self) -> None:
+    def test_parallel_tool_calls_disabled_single_call_uses_single_action_path(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            runtime.llm.client = MultiToolActionClient([
+                [{'action': 'process_exit', 'payload': {'done': True}}],
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='parallel disabled')
+
+            result = runtime.run_next_process_once()
+
+            assert result['ok']
+            assert result['action']['action'] == 'process_exit'
+            assert 'parallel_tool_calls' not in result
+            assert runtime.process.get(pid).status == ProcessStatus.EXITED
+            assert not any(record.action == 'llm.action_batch' for record in runtime.audit.trace())
+        finally:
+            runtime.close()
+
+    def test_parallel_tool_calls_disabled_still_dispatches_every_returned_call_in_order(self) -> None:
+        # Some providers ignore ``parallel_tool_calls=false``. A model-selected
+        # call must never be silently discarded: the response is dispatched as
+        # one ordered batch through the governed sequential path.
         runtime = Runtime.open('local')
         try:
             runtime.llm.client = MultiToolActionClient([
@@ -2165,16 +2190,57 @@ class TestLLMContextMemory:
                 ]
             ])
             pid = runtime.process.spawn(image='base-agent:v0', goal='parallel disabled')
+            runtime.skills.activate_skill(pid, OBJECT_MEMORY_SKILL, actor=pid)
+
+            result = runtime.run_next_process_once()
+
+            assert result['ok']
+            assert result['parallel_tool_calls'] is True
+            assert result['executed_count'] == 2
+            assert [action['action'] for action in result['actions']] == ['create_memory_object', 'process_exit']
+            assert runtime.process.get(pid).status == ProcessStatus.EXITED
+            tool_calls = [
+                record.decision.get('tool')
+                for record in runtime.audit.trace()
+                if record.action == 'tool.call'
+            ]
+            assert tool_calls[:2] == ['create_memory_object', 'process_exit']
+            llm_call = runtime.store.list_llm_calls(pid)[0]
+            assert llm_call.request_options['openai_parallel_tool_calls_enabled'] is False
+            batches = [record for record in runtime.audit.trace() if record.action == 'llm.action_batch']
+            assert len(batches) == 1
+            assert batches[0].decision['requested_count'] == 2
+            assert batches[0].decision['executed_count'] == 2
+        finally:
+            runtime.close()
+
+    def test_parallel_tool_calls_disabled_invalid_extra_call_repairs_before_dispatch(self) -> None:
+        config = replace(DEFAULT_CONFIG, llm=replace(DEFAULT_CONFIG.llm, action_repair_attempts=2))
+        runtime = Runtime.open('local', config=config)
+        try:
+            runtime.llm.client = MultiToolActionClient([
+                [
+                    {'action': 'process_exit', 'payload': {'should_not_run': True}},
+                    {'action': 'create_memory_object', 'type': 'observation', 'payload': {'hidden': True}},
+                ],
+                [{'action': 'process_exit', 'payload': {'done': True}}],
+            ])
+            pid = runtime.process.spawn(image='base-agent:v0', goal='repair hidden batch member')
 
             result = runtime.run_next_process_once()
 
             assert result['ok']
             assert result['action']['action'] == 'process_exit'
-            assert runtime.process.get(pid).status == ProcessStatus.EXITED
-            assert not any(
-                record.action == 'tool.call' and record.decision.get('tool') == 'create_memory_object'
-                for record in runtime.audit.trace()
-            )
+            assert len(runtime.llm.client.user_prompts) == 2
+            repairs = [record for record in runtime.audit.trace() if record.action == 'llm.action_repair_requested']
+            assert len(repairs) == 1
+            assert 'create_memory_object' in repairs[0].decision['error']
+            assert 'one or more' in runtime.llm.client.user_prompts[1]
+            exits = [
+                record for record in runtime.audit.trace()
+                if record.action == 'tool.call' and record.decision.get('tool') == 'process_exit'
+            ]
+            assert len(exits) == 1
         finally:
             runtime.close()
 
@@ -3860,7 +3926,6 @@ class TestLLMContextMemory:
                 if not capability.resource.startswith('object:')
             }
             assert 'receive_process_messages' in full_tool_table_before
-            assert 'receive_process_messages' not in model_tool_table_before
 
             result = runtime.run_next_process_once()
 
@@ -3965,15 +4030,15 @@ class TestLLMContextMemory:
         runtime = Runtime.open('local', config=config)
         try:
             runtime.llm.client = TextOnlyActionClient([
-                '{"action":"receive_process_messages"}',
+                '{"action":"sleep","seconds":1}',
             ])
             pid = runtime.process.spawn(
                 image='base-agent:v0',
                 goal='reject a model-selected hidden wait tool',
             )
             process = runtime.process.get(pid)
-            assert 'receive_process_messages' in process.tool_table
-            assert 'receive_process_messages' not in process.model_tool_table
+            assert 'sleep' in process.tool_table
+            assert 'sleep' not in process.model_tool_table
 
             result = runtime.run_next_process_once()
 
@@ -3986,7 +4051,7 @@ class TestLLMContextMemory:
             )
             assert not any(
                 record.action == 'tool.call'
-                and record.decision.get('tool') == 'receive_process_messages'
+                and record.decision.get('tool') == 'sleep'
                 for record in runtime.audit.trace(actor=pid)
             )
         finally:
@@ -4037,7 +4102,6 @@ class TestLLMContextMemory:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='persist auto wait')
                 process = runtime.process.get(pid)
                 assert 'receive_process_messages' in process.tool_table
-                assert 'receive_process_messages' not in process.model_tool_table
                 waiting = runtime.run_next_process_once()
                 assert waiting['waiting_message']
                 durable_pending = runtime.store.get_llm_pending_action(pid)
@@ -4053,10 +4117,6 @@ class TestLLMContextMemory:
                 reopened.llm.client = ExplodingClient()
                 reopened_process = reopened.process.get(pid)
                 assert 'receive_process_messages' in reopened_process.tool_table
-                assert (
-                    'receive_process_messages'
-                    not in reopened_process.model_tool_table
-                )
                 message = reopened.human.send_process_message(pid, 'resume now', subject='resume')
                 resumed = reopened.run_next_process_once()
 
@@ -4064,10 +4124,6 @@ class TestLLMContextMemory:
                 assert resumed['action']['action'] == 'receive_process_messages'
                 assert resumed['result']['payload']['messages'][0]['message_id'] == message.message_id
                 assert reopened.store.get_llm_pending_action(pid)['status'] == 'completed'
-                assert (
-                    'receive_process_messages'
-                    not in reopened.process.get(pid).model_tool_table
-                )
                 completed_action = next(
                     record
                     for record in reversed(reopened.audit.trace(actor=pid))

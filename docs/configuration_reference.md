@@ -171,7 +171,7 @@ PY
 | `process.max_tool_calls` | `StrictInt` | `256` | — |
 | `process.max_child_processes` | `int` | `16` | — |
 | `process.max_runtime_seconds` | `float \| None` | `null` | seconds |
-| `process.max_context_materialization_tokens` | `int` | `65536` | tokens |
+| `process.max_context_materialization_tokens` | `int` | `262144` | tokens |
 | `process.max_context_materialization_total_tokens` | `int \| None` | `null` | tokens |
 | `process.max_llm_calls` | `int \| None` | `null` | — |
 | `process.max_llm_total_tokens` | `int \| None` | `null` | tokens |
@@ -230,9 +230,9 @@ PY
 | `llm.profiles.<key>.allow_custom_base_url` | `bool` | `false` | — |
 | `llm.temperature` | `StrictFloat` | `0.2` | — |
 | `llm.max_tokens` | `StrictInt` | `16384` | tokens |
-| `llm.max_input_tokens_per_call` | `StrictInt` | `114688` | tokens |
-| `llm.max_total_tokens_per_call` | `StrictInt` | `131072` | tokens |
-| `llm.context_window_tokens` | `int` | `131072` | tokens |
+| `llm.max_input_tokens_per_call` | `StrictInt` | `245760` | tokens |
+| `llm.max_total_tokens_per_call` | `StrictInt` | `262144` | tokens |
+| `llm.context_window_tokens` | `int` | `262144` | tokens |
 | `llm.timeout_s` | `float` | `180.0` | seconds |
 | `llm.max_retries` | `int` | `2` | — |
 | `llm.api_mode` | `Literal['auto', 'responses', 'chat']` | `"auto"` | — |
@@ -510,7 +510,7 @@ PY
 | Path | Type | Default | Unit |
 | --- | --- | --- | --- |
 | `memory.object_schema_version` | `str` | `"1"` | — |
-| `memory.materialize_budget_tokens` | `int` | `8000` | tokens |
+| `memory.materialize_budget_tokens` | `int` | `262144` | tokens |
 | `memory.query_limit` | `int` | `50` | — |
 | `memory.context_policy` | `str` | `"plan_first"` | — |
 | `memory.metadata_sensitivity` | `str` | `"normal"` | — |
@@ -522,6 +522,9 @@ PY
 | `memory.metadata_collection_max_items` | `StrictInt` | `128` | — |
 | `memory.metadata_collection_item_max_chars` | `StrictInt` | `2048` | characters |
 | `memory.metadata_max_bytes` | `StrictInt` | `131072` | bytes |
+| `memory.working_set_recent_feedback` | `StrictInt` | `8` | — |
+| `memory.working_set_supersede_observations` | `bool` | `true` | — |
+| `memory.working_set_verbatim_feedback_tokens` | `StrictInt` | `48000` | tokens |
 
 ## `object_tasks`
 
@@ -563,6 +566,9 @@ PY
 | `llm_context.storage_compaction_threshold_bytes` | `int` | `96000` | bytes |
 | `llm_context.storage_compaction_max_chunks` | `int` | `4` | — |
 | `llm_context.storage_compaction_preserve_recent_entries` | `int` | `0` | — |
+| `llm_context.materialization_headroom_tokens` | `StrictInt` | `12288` | tokens |
+| `llm_context.materialization_budget_floor_tokens` | `StrictInt` | `16384` | tokens |
+| `llm_context.recent_event_scan_limit` | `StrictInt` | `200` | — |
 
 ## `checkpoint`
 
@@ -604,6 +610,7 @@ PY
 | `skills.max_package_directories` | `StrictInt` | `256` | — |
 | `skills.max_package_depth` | `StrictInt` | `32` | — |
 | `skills.catalog_scan_limit` | `StrictInt` | `1000` | — |
+| `skills.compact_tool_guides_after_use` | `bool` | `false` | — |
 
 ## `modules`
 

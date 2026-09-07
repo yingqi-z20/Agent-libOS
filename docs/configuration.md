@@ -564,15 +564,15 @@ configurable. A runtime release emits only the snapshot version it can decode.
   environment-specific untracked overlay; never commit a real DSN.
 - LLM profiles store an `api_key_env` variable name, never the API-key value.
   Only the selected host process reads the named environment variable.
-- `llm.context_window_tokens` defaults to `131072` and `llm.max_tokens`
+- `llm.context_window_tokens` defaults to `262144` and `llm.max_tokens`
   defaults to `16384`; a profile may override either value. Effective
   `max_tokens` must be smaller than the effective model window. The
   lower default output reservation leaves room for multi-quantum task context;
   increase it per profile only when a task genuinely needs longer single-call
   output. The window controls local pressure management only and is deliberately
   excluded from the Provider/Sink identity hash.
-- `llm.max_input_tokens_per_call` defaults to `114688` and
-  `llm.max_total_tokens_per_call` defaults to `131072`. Profiles may override
+- `llm.max_input_tokens_per_call` defaults to `245760` and
+  `llm.max_total_tokens_per_call` defaults to `262144`. Profiles may override
   either positive integer. The effective input ceiling and `max_tokens` must
   each be no greater than the effective total ceiling. After assembling the
   exact request, Runtime rejects a local estimate above the input ceiling or an
@@ -918,10 +918,16 @@ as equivalent:
   unchanged and creates no persistent delta Object. A Host may opt in globally
   with `llm_context_object`, or opt in one process with explicit
   `context:enrichment/execute` authority.
-- `llm_context.recent_event_limit` bounds the earliest next post-cursor event
-  rows loaded from SQL for an explicitly enabled persistent-context
-  preparation. This oldest-first page preserves a gap-free advancing cursor; it
-  does not activate delta capture by itself.
+- `llm_context.recent_event_limit` bounds how many visible post-cursor events
+  render in one prompt, newest first, while `llm_context.recent_event_scan_limit`
+  (default `200`, never below the render limit) bounds the earliest next
+  post-cursor event rows loaded from SQL each quantum. Bookkeeping rows that
+  mirror materialized results (tool-result Object creation, per-Object read
+  grants, resource charges) and visible rows older than the render window are
+  counted in the projection summary rather than rendered, so a busy multi-call
+  quantum cannot leave actionable events stuck behind a backlog for several
+  quanta. The oldest-first scan preserves a gap-free advancing cursor; it does
+  not activate delta capture by itself.
 - `llm_context.prompt_event_payload_max_chars` bounds each represented event's
   provider-neutral model payload (default `2,048` characters). Oversized
   payloads retain compact actionable fields plus deterministic omission counts

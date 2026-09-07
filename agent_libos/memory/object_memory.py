@@ -2365,41 +2365,13 @@ class ObjectMemoryManager:
                     "rendered_sha256": None,
                     "labels": None,
                 }
-        rendered_by_oid: dict[str, str] = {}
-        selected_oids: set[str] = set()
-        total = 0
-        for obj in self._sort_for_policy(objects, selected_policy):
-            rendered = self._render_object(obj)
-            rendered_by_oid[obj.oid] = rendered
-            transform = self.prompt_transform(obj)
-            tokens = estimate_tokens(rendered)
-            if total + tokens > selected_budget:
-                omitted.append(obj.oid)
-                manifest_by_oid[obj.oid] = {
-                    "oid": obj.oid,
-                    "version": obj.version,
-                    "type": obj.type.value,
-                    "disposition": "omitted",
-                    "reason": "token_budget",
-                    "transform": transform,
-                    "tokens": tokens,
-                    "rendered_sha256": hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
-                    "labels": labels_for_explain(obj.metadata),
-                }
-                continue
-            selected_oids.add(obj.oid)
-            total += tokens
-            manifest_by_oid[obj.oid] = {
-                "oid": obj.oid,
-                "version": obj.version,
-                "type": obj.type.value,
-                "disposition": "included",
-                "reason": "selected",
-                "transform": transform,
-                "tokens": tokens,
-                "rendered_sha256": hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
-                "labels": labels_for_explain(obj.metadata),
-            }
+        rendered_by_oid, selected_oids, total = self._select_context_objects(
+            objects,
+            selected_policy,
+            selected_budget,
+            omitted=omitted,
+            manifest_by_oid=manifest_by_oid,
+        )
         chunks, refs = self._render_selected_context_objects(objects, selected_oids, rendered_by_oid)
         context = MaterializedContext(
             text="\n\n".join(chunks),
@@ -2446,6 +2418,85 @@ class ObjectMemoryManager:
         )
         return context
 
+    def _select_context_objects(
+        self,
+        objects: list[AgentObject],
+        policy: str,
+        budget_tokens: int,
+        *,
+        omitted: list[str],
+        manifest_by_oid: dict[str, dict[str, Any]],
+    ) -> tuple[dict[str, str], set[str], int]:
+        """Render and first-fit select Objects under the budget in policy order.
+
+        Appends omitted ids to ``omitted`` and records every decision in
+        ``manifest_by_oid``; returns the renders, the selected ids, and the
+        selected token total.
+        """
+
+        rendered_by_oid: dict[str, str] = {}
+        selected_oids: set[str] = set()
+        total = 0
+        stub_plan, priority_feedback, prerendered = self._working_set_stub_plan(objects, policy)
+        for obj in self._sort_for_policy(objects, policy, priority_feedback=priority_feedback):
+            stub_reason = stub_plan.get(obj.oid)
+            if stub_reason == "superseded":
+                # A fresher observation of the same target is already rendered;
+                # the stale copy would only contradict the current workspace.
+                omitted.append(obj.oid)
+                manifest_by_oid[obj.oid] = self._manifest_entry(
+                    obj, disposition="omitted", reason="superseded",
+                    transform=self.prompt_transform(obj), rendered=None,
+                )
+                continue
+            if stub_reason is None:
+                rendered = prerendered.get(obj.oid) or self._render_object(obj)
+                transform = self.prompt_transform(obj)
+            else:
+                rendered = self._render_feedback_stub(obj, stub_reason)
+                transform = "compacted"
+            rendered_by_oid[obj.oid] = rendered
+            tokens = estimate_tokens(rendered)
+            if total + tokens > budget_tokens:
+                omitted.append(obj.oid)
+                manifest_by_oid[obj.oid] = self._manifest_entry(
+                    obj, disposition="omitted", reason="token_budget",
+                    transform=transform, rendered=rendered,
+                )
+                continue
+            selected_oids.add(obj.oid)
+            total += tokens
+            manifest_by_oid[obj.oid] = self._manifest_entry(
+                obj, disposition="included", reason="selected",
+                transform=transform, rendered=rendered,
+            )
+        return rendered_by_oid, selected_oids, total
+
+    @staticmethod
+    def _manifest_entry(
+        obj: AgentObject,
+        *,
+        disposition: str,
+        reason: str,
+        transform: str,
+        rendered: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "oid": obj.oid,
+            "version": obj.version,
+            "type": obj.type.value,
+            "disposition": disposition,
+            "reason": reason,
+            "transform": transform,
+            "tokens": estimate_tokens(rendered) if rendered is not None else 0,
+            "rendered_sha256": (
+                hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+                if rendered is not None
+                else None
+            ),
+            "labels": labels_for_explain(obj.metadata),
+        }
+
     @staticmethod
     def _render_selected_context_objects(
         objects: list[AgentObject],
@@ -2457,6 +2508,92 @@ class ObjectMemoryManager:
         chunks = [rendered_by_oid[obj.oid] for obj in selected_objects]
         refs = [obj.oid for obj in selected_objects]
         return chunks, refs
+
+    def _working_set_stub_plan(
+        self,
+        objects: list[AgentObject],
+        policy: str,
+    ) -> tuple[dict[str, str], set[str], dict[str, str]]:
+        """Decide how each feedback Object renders under ``working_set``.
+
+        Returns ``(plan, priority_feedback, prerendered)``.  ``plan`` maps an
+        Object id to ``"superseded"`` (a fresher observation of the same target
+        exists: the stale copy is omitted) or ``"older_feedback"`` (rendered as
+        a bounded stub).  Feedback newer than the window renders verbatim: the
+        newest ``memory.working_set_recent_feedback`` Objects always do, and
+        older ones keep rendering verbatim while their estimated rendered
+        tokens fit ``memory.working_set_verbatim_feedback_tokens``.  A file
+        read or command output a maintainer still needs therefore stays in
+        view for a whole multi-file task; only genuinely old feedback of a very
+        long task is compacted.  ``priority_feedback`` names the newest few
+        verbatim Objects that selection ranks with the latest result.
+        ``prerendered`` caches the verbatim renders computed while planning.
+        Human input results (message reads, answers) are never compacted.
+        The durable Objects are unchanged; this is a prompt projection.
+        """
+
+        if policy != "working_set":
+            return {}, set(), {}
+        min_verbatim = max(int(self.config.memory.working_set_recent_feedback), 1)
+        token_window = max(int(self.config.memory.working_set_verbatim_feedback_tokens), 0)
+        supersede = bool(self.config.memory.working_set_supersede_observations)
+        plan: dict[str, str] = {}
+        priority_feedback: set[str] = set()
+        prerendered: dict[str, str] = {}
+        seen_keys: set[tuple[Any, ...]] = set()
+        verbatim_count = 0
+        verbatim_tokens = 0
+        newest_first = [
+            obj
+            for _, obj in sorted(
+                enumerate(objects),
+                key=lambda item: (item[1].updated_at, item[0]),
+                reverse=True,
+            )
+        ]
+        for obj in newest_first:
+            if obj.type not in _WORKING_SET_FEEDBACK_TYPES:
+                continue
+            payload = self.prompt_payload(obj)
+            if _feedback_is_pinned(payload):
+                continue
+            key = _observation_supersession_key(payload) if supersede else None
+            if key is not None:
+                if key in seen_keys:
+                    plan[obj.oid] = "superseded"
+                    continue
+                seen_keys.add(key)
+            rendered = self._render_object(obj)
+            tokens = estimate_tokens(rendered)
+            if verbatim_count < min_verbatim or verbatim_tokens + tokens <= token_window:
+                prerendered[obj.oid] = rendered
+                if verbatim_count < min_verbatim:
+                    priority_feedback.add(obj.oid)
+                verbatim_count += 1
+                verbatim_tokens += tokens
+                continue
+            plan[obj.oid] = "older_feedback"
+        return plan, priority_feedback, prerendered
+
+    def _render_feedback_stub(self, obj: AgentObject, reason: str) -> str:
+        """Render one older or superseded feedback Object as a compact record.
+
+        The stub keeps the identity of the action (tool, target, outcome and
+        sizes) so the model knows what it already did without replaying the
+        payload.  It never copies result content.
+        """
+
+        payload = self.prompt_payload(obj)
+        record: dict[str, Any] = {
+            "content_trust": "untrusted_data",
+            "name": obj.name,
+            "object_oid": obj.oid,
+            "record_type": FEEDBACK_STUB_RECORD_TYPE,
+            "stub_reason": reason,
+            "summary": _feedback_stub_summary(payload),
+            "type": obj.type.value,
+        }
+        return _canonical_prompt_json(record)
 
     def _matches_view_filters(self, obj: AgentObject, filters: list[ObjectFilter]) -> bool:
         if not filters:
@@ -2497,17 +2634,59 @@ class ObjectMemoryManager:
         render = renderer.repr(payload)
         return render[: self.config.tools.memory_payload_chars]
 
-    def _sort_for_policy(self, objects: list[AgentObject], policy: str) -> list[AgentObject]:
+    def _sort_for_policy(
+        self,
+        objects: list[AgentObject],
+        policy: str,
+        *,
+        priority_feedback: set[str] | None = None,
+    ) -> list[AgentObject]:
+        # Selection and rendering have different jobs. Prefer fresh facts when
+        # the budget forces a choice, but render the selected set in MemoryView
+        # root order so an unconstrained append keeps its stable cache prefix.
+        recent = [
+            obj for _, obj in sorted(
+                enumerate(objects),
+                key=lambda item: (item[1].updated_at, item[0]),
+                reverse=True,
+            )
+        ]
         if policy == "recency_first":
-            return sorted(objects, key=lambda obj: obj.updated_at, reverse=True)
+            return recent
+        if policy == "working_set":
+            # Current feedback must compete ahead of accumulated plans and
+            # evidence, or a long task can no longer observe its own actions.
+            # The newest few feedback Objects rank together: a multi-call batch
+            # produces several current results in one quantum and all of them
+            # inform the next decision.
+            windowed_feedback = set(priority_feedback or ())
+            if not windowed_feedback:
+                latest_feedback = next(
+                    (obj.oid for obj in recent if obj.type in _WORKING_SET_FEEDBACK_TYPES),
+                    None,
+                )
+                if latest_feedback is not None:
+                    windowed_feedback.add(latest_feedback)
+            priority = {
+                ObjectType.GOAL: 0,
+                ObjectType.CONSTRAINT: 2,
+                ObjectType.HUMAN_DECISION: 2,
+                ObjectType.TASK: 3,
+                ObjectType.PLAN: 3,
+                ObjectType.SUMMARY: 3,
+            }
+            return sorted(
+                recent,
+                key=lambda obj: 1 if obj.oid in windowed_feedback else priority.get(obj.type, 4),
+            )
         if policy == "evidence_first":
-            return sorted(objects, key=lambda obj: obj.type != ObjectType.EVIDENCE)
+            return sorted(recent, key=lambda obj: obj.type != ObjectType.EVIDENCE)
         if policy == "plan_first":
             priority = {ObjectType.GOAL: 0, ObjectType.TASK: 1, ObjectType.PLAN: 2, ObjectType.STEP: 3}
-            return sorted(objects, key=lambda obj: priority.get(obj.type, 10))
+            return sorted(recent, key=lambda obj: priority.get(obj.type, 10))
         if policy == "error_debug":
             priority = {ObjectType.ERROR_TRACE: 0, ObjectType.TEST_RESULT: 1, ObjectType.CODE_PATCH: 2}
-            return sorted(objects, key=lambda obj: priority.get(obj.type, 10))
+            return sorted(recent, key=lambda obj: priority.get(obj.type, 10))
         return objects
 
     def _issue_handle_with_selected_authority(
@@ -3063,6 +3242,163 @@ _TOOL_RESULT_WRAPPER_TELEMETRY_FIELDS = frozenset(
         "trace_id",
     }
 )
+_WORKING_SET_FEEDBACK_TYPES = frozenset(
+    {ObjectType.TOOL_RESULT, ObjectType.ERROR_TRACE, ObjectType.TEST_RESULT}
+)
+FEEDBACK_STUB_RECORD_TYPE = "object_memory_feedback_stub"
+# Results that carry Human or process input.  A queued follow-up constraint or
+# an answer must stay verbatim for the rest of the task.
+_PINNED_FEEDBACK_TOOLS = frozenset(
+    {"read_process_messages", "receive_process_messages", "ask_human"}
+)
+# Observations whose newest instance supersedes earlier ones.  The value names
+# the result fields that identify the observed target; an empty tuple means
+# the tool observes one global target (for example Git status).
+_OBSERVATION_KEY_FIELDS: dict[str, tuple[str, ...]] = {
+    "read_text_file": ("path",),
+    "read_directory": ("path",),
+    "get_working_directory": (),
+    "git_status": (),
+    "git_diff": (),
+    "git_log": (),
+    "git_repository_info": (),
+    "run_shell_command": ("argv",),
+    "discover_skills": (),
+    "list_memory_namespace": ("namespace",),
+    "read_memory_object": ("namespace", "name"),
+    "list_checkpoints": (),
+    "list_capabilities": (),
+    "list_child_processes": (),
+    "list_object_tasks": (),
+    "list_jsonrpc_endpoints": (),
+    "list_mcp_servers": (),
+    "list_mcp_tools": ("server_id",),
+    "list_mcp_resources": ("server_id",),
+    "get_current_time": (),
+}
+_STUB_SUMMARY_RESULT_FIELDS = (
+    "path",
+    "argv",
+    "returncode",
+    "namespace",
+    "name",
+    "skill_id",
+    "status",
+    "changed_paths",
+    "bytes_written",
+    "created",
+    "deleted",
+    "checkpoint_id",
+    "delivered",
+    "kind",
+)
+_STUB_SUMMARY_SIZE_FIELDS = (
+    "content",
+    "stdout",
+    "stderr",
+    "patch",
+    "preview",
+)
+_STUB_VALUE_MAX_CHARS = 120
+_STUB_LIST_MAX_ITEMS = 6
+
+
+def _feedback_is_pinned(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return str(payload.get("tool_name") or "") in _PINNED_FEEDBACK_TOOLS
+
+
+def _observation_supersession_key(payload: Any) -> tuple[Any, ...] | None:
+    """Return the identity of an observed target, or ``None`` for actions.
+
+    Only successful observation results carry a key; failures and mutations
+    (writes, checkpoints, activations, Human output) are actions whose record
+    must not be folded into a later one.
+    """
+
+    if not isinstance(payload, dict):
+        return None
+    tool_name = str(payload.get("tool_name") or "")
+    result = payload.get("result")
+    if payload.get("ok") is False or not isinstance(result, dict):
+        return None
+    if tool_name == "process_exit":
+        if result.get("status") == "completion_review_required":
+            return ("process_exit", "completion_review")
+        return None
+    fields = _OBSERVATION_KEY_FIELDS.get(tool_name)
+    if fields is None:
+        return None
+    return (tool_name, *(_canonical_prompt_json(result.get(field)) for field in fields))
+
+
+def _feedback_stub_summary(payload: Any) -> dict[str, Any]:
+    """Describe a feedback payload by tool, target, outcome, and sizes only."""
+
+    if not isinstance(payload, dict):
+        return {"payload_type": type(payload).__name__}
+    summary: dict[str, Any] = {}
+    tool_name = payload.get("tool_name")
+    if isinstance(tool_name, str) and tool_name:
+        summary["tool_name"] = tool_name
+    if payload.get("ok") is False:
+        summary["ok"] = False
+        error = _stub_error_message(payload.get("error"))
+        if error:
+            summary["error"] = error
+    if "result" in payload:
+        summary.update(_stub_result_summary(payload.get("result")))
+    elif not tool_name:
+        summary["payload_keys"] = sorted(str(key) for key in payload)[:_STUB_LIST_MAX_ITEMS * 2]
+    return summary
+
+
+def _stub_error_message(error: Any) -> str | None:
+    if isinstance(error, dict):
+        message = error.get("safe_message") or error.get("message") or error.get("type")
+    else:
+        message = error
+    if isinstance(message, str) and message:
+        return message[:_STUB_VALUE_MAX_CHARS]
+    return None
+
+
+def _stub_result_summary(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {"result_type": type(result).__name__}
+    summary: dict[str, Any] = {}
+    for field in _STUB_SUMMARY_RESULT_FIELDS:
+        if field in result:
+            summary[field] = _bounded_stub_value(result[field])
+    for field in _STUB_SUMMARY_SIZE_FIELDS:
+        value = result.get(field)
+        if isinstance(value, str):
+            summary[f"{field}_chars"] = len(value)
+    for field in ("entries", "messages", "skills", "capabilities", "checkpoints"):
+        value = result.get(field)
+        if isinstance(value, list):
+            summary[f"{field}_count"] = len(value)
+    if not summary:
+        summary["result_keys"] = sorted(str(key) for key in result)[:_STUB_LIST_MAX_ITEMS * 2]
+    return summary
+
+
+def _bounded_stub_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return value if len(value) <= _STUB_VALUE_MAX_CHARS else value[:_STUB_VALUE_MAX_CHARS] + "..."
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, list):
+        bounded = [_bounded_stub_value(item) for item in value[:_STUB_LIST_MAX_ITEMS]]
+        if len(value) > _STUB_LIST_MAX_ITEMS:
+            bounded.append(f"... {len(value) - _STUB_LIST_MAX_ITEMS} more")
+        return bounded
+    if isinstance(value, dict):
+        return {"keys": sorted(str(key) for key in value)[:_STUB_LIST_MAX_ITEMS * 2]}
+    return type(value).__name__
 _TOOL_RESULT_METADATA_TELEMETRY_FIELDS = frozenset(
     {
         "call_id",

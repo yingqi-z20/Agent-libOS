@@ -82,6 +82,9 @@ _CANONICAL_JSON_NUMBER = re.compile(
     r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z"
 )
 _MODEL_SCALAR_STRING_MAX_CHARS = 128
+# A JSON-encoded object/array argument may legitimately be as large as a
+# tool-call argument; keep the decode bounded below the argument hard limit.
+_MODEL_CONTAINER_STRING_MAX_CHARS = 262_144
 _MODEL_ARGUMENT_NORMALIZATION_MAX_DEPTH = 32
 _MODEL_ARGUMENT_NORMALIZATION_MAX_FIELDS = 64
 
@@ -91,6 +94,15 @@ _SKILL_TOOL_BOOTSTRAP = (
     "read_skill_resource",
     "unload_skill",
     "process_exit",
+)
+# Queued Human or process input is a mandatory control action.  An image that
+# owns the message-read tools projects them from the start so acknowledging a
+# follow-up costs one call instead of a discover/activate/read round trip.
+# Visibility is not authority: the message primitives keep enforcing their
+# own Capability, data-flow, budget, and audit rules.
+_SKILL_TOOL_BOOTSTRAP_OPTIONAL = (
+    "read_process_messages",
+    "receive_process_messages",
 )
 
 _JIT_MULTIPLEXER_INPUT_SCHEMA = {
@@ -330,8 +342,10 @@ def _normalize_scalar_string(value: str, allowed_types: set[str]) -> Any:
     if not allowed_types or "string" in allowed_types:
         return value
     stripped = value.strip()
-    if not stripped or len(stripped) > _MODEL_SCALAR_STRING_MAX_CHARS:
+    if not stripped:
         return value
+    if len(stripped) > _MODEL_SCALAR_STRING_MAX_CHARS:
+        return _normalize_container_string(stripped, allowed_types)
     lowered = stripped.casefold()
     if "null" in allowed_types and lowered == "null":
         return None
@@ -353,7 +367,36 @@ def _normalize_scalar_string(value: str, allowed_types: set[str]) -> Any:
             and (not isinstance(normalized, float) or math.isfinite(normalized))
         ):
             return normalized
-    return value
+    return _normalize_container_string(stripped, allowed_types)
+
+
+def _normalize_container_string(stripped: str, allowed_types: set[str]) -> Any:
+    """Decode a JSON-encoded object/array where the schema forbids strings.
+
+    Some providers hand structured arguments back as one JSON string (for
+    example ``completion_evidence`` or a ``payload`` declared as an object).
+    Only an argument whose every schema variant excludes ``string`` and admits
+    the decoded container type is repaired, so a legitimately string-typed
+    field is never reinterpreted.  The decoded value is bounded by the same
+    argument-size limits as any other argument.
+    """
+
+    if not (
+        ("object" in allowed_types and stripped.startswith("{"))
+        or ("array" in allowed_types and stripped.startswith("["))
+    ):
+        return stripped
+    if len(stripped) > _MODEL_CONTAINER_STRING_MAX_CHARS:
+        return stripped
+    try:
+        decoded = json.loads(stripped)
+    except (TypeError, ValueError):
+        return stripped
+    if isinstance(decoded, dict) and "object" in allowed_types:
+        return decoded
+    if isinstance(decoded, list) and "array" in allowed_types:
+        return decoded
+    return stripped
 
 
 def _normalization_path(path: tuple[str, ...]) -> str:
@@ -1078,7 +1121,10 @@ class ToolBroker:
                 "image metadata tool_projection='skills' requires all bootstrap "
                 f"tools; missing: {', '.join(missing)}"
             )
-        return list(_SKILL_TOOL_BOOTSTRAP)
+        return [
+            *_SKILL_TOOL_BOOTSTRAP,
+            *(name for name in _SKILL_TOOL_BOOTSTRAP_OPTIONAL if name in allowed),
+        ]
 
     def configure_model_tool_projection(
         self,

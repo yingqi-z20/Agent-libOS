@@ -51,7 +51,14 @@ JSONRPC_TOOLS = {
     "list_jsonrpc_endpoints",
 }
 
-INITIAL_TOOLS = SKILL_BOOTSTRAP_TOOLS
+# Images that own the message-read tools project them from the start so queued
+# Human or process input can be acknowledged without a discovery round trip.
+MESSAGE_BOOTSTRAP_TOOLS = {
+    "read_process_messages",
+    "receive_process_messages",
+}
+
+INITIAL_TOOLS = SKILL_BOOTSTRAP_TOOLS | MESSAGE_BOOTSTRAP_TOOLS
 
 
 def test_review_image_projects_small_model_schema_without_removing_callable_tools(tmp_path: Path) -> None:
@@ -161,17 +168,17 @@ def test_all_skill_projected_builtin_images_start_small_without_changing_authori
             "base-agent:v0": (
                 INITIAL_TOOLS,
                 "agent-libos-child-processes",
-                12_000,
+                16_000,
             ),
             "coding-agent:v0": (
                 INITIAL_TOOLS,
                 "agent-libos-command-execution",
-                12_000,
+                16_000,
             ),
             "review-agent:v0": (
                 INITIAL_TOOLS,
                 "agent-libos-git-inspection",
-                12_000,
+                16_000,
             ),
         }
         for image_id, (expected_tools, activation_skill, schema_limit) in expectations.items():

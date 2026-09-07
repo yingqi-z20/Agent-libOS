@@ -146,9 +146,15 @@ needed. `text` and `limit` apply to every visible Skill in one uniformly bounded
 page. Discovery case-folds and de-duplicates Unicode word terms from the query,
 and drops one-character and common low-information terms when at least one
 informative term remains. A one-term query requires that term to match Skill
-id, name, or description. A query with two or more selected terms requires at
-least two distinct term matches; it does not require every term to match.
-An exact full id or name match returns only exact matches. Otherwise results
+id, name, description, or the terms of a declared tool name. A query with two
+or more selected terms requires at least two distinct term matches; it does not
+require every term to match. Declared tool names are first-class keys: a
+whitespace-delimited query token equal to a tool the Skill declares
+(`human_output`, `create_checkpoint`) always matches and outranks description
+mentions, so a goal that names its required tools can list them all in one
+query and receive every owning Skill.
+An exact full id or name match, or a single-token query equal to a declared
+tool name, returns only exact matches. Otherwise results
 combine a normalized-phrase bonus with the number and location of matched
 terms; id/name hits weigh more than description-only hits. The combined score
 sorts descending, with deterministic case-folded name and id tie-breaking.

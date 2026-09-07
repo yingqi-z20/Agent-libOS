@@ -149,10 +149,14 @@ class UnloadSkillOutput(BaseModel):
 class DiscoverSkillsTool(SyncAgentTool[DiscoverSkillsArgs]):
     name = "discover_skills"
     description = (
-        "Search visible Agent Skills by task intent and return one relevance-ranked metadata "
-        "page. Start with two to four concrete domain/action terms and omit limit or use at "
-        "least 5 as an unquoted JSON integer. A multi-capability query can return separate narrowly owned Skills; activate "
-        "each relevant exact id with that row's package hash instead of repeating discovery. "
+        "Search visible Agent Skills by task intent or by exact tool name and return one "
+        "relevance-ranked metadata page. When the goal names the tools it requires, list "
+        "every needed tool name in one query (for example `run_shell_command git_status "
+        "create_checkpoint human_output`) to find all owning Skills at once; otherwise start "
+        "with two to four concrete domain/action terms. Omit limit or use at least 5 as an "
+        "unquoted JSON integer. A multi-capability query can return separate narrowly owned "
+        "Skills; activate each relevant exact id with that row's package hash instead of "
+        "repeating discovery. "
         "visibility_limited does not "
         "invalidate returned matches. Discovery does not load instructions, expose domain "
         "tools, or grant authority."

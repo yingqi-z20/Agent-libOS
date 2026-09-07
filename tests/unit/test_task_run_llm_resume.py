@@ -1043,7 +1043,10 @@ def test_task_run_semantic_compaction_cannot_drop_later_turns_twice(
         task_runs=replace(
             DEFAULT_CONFIG.task_runs,
             plaintext_payloads_enabled=True,
-            payload_max_bytes=4_096,
+            # Tight enough to keep the compaction payloads small, but the
+            # validated-action payload also carries the pre-action binding
+            # (including the bootstrap model tool projection), so leave room.
+            payload_max_bytes=6_144,
         ),
     )
     runtime = Runtime.open(tmp_path / "single-use-compaction.sqlite", config=config)

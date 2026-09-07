@@ -92,7 +92,7 @@ def build_research_agent_image(
             "wait_child_process",
             "write_text_file",
         ],
-        context_policy="evidence_first",
+        context_policy="working_set",
         safety_profile="research",
         required_capabilities=[
             {

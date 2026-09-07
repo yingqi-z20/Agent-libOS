@@ -1185,9 +1185,13 @@ def test_builtin_images_start_with_only_the_source_neutral_skill_lifecycle(
             "process_exit",
             "read_skill_resource",
             "unload_skill",
+            # Mandatory input handling is projected without discovery for
+            # images that own the message-read tools.
+            "read_process_messages",
+            "receive_process_messages",
         }
         assert process.loaded_skills == {}
-        assert len(runtime.tools.openai_tool_schemas(pid)) == 5
+        assert len(runtime.tools.openai_tool_schemas(pid)) == 7
         assert len(process.tool_table) > len(process.model_tool_table)
     finally:
         runtime.close()

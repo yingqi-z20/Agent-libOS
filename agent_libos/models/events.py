@@ -42,6 +42,7 @@ class EventType(StrEnum):
     TOOL_CALLED = "tool_called"
     TOOL_COMPLETED = "tool_completed"
     TOOL_FAILED = "tool_failed"
+    TOOL_BATCH_TRUNCATED = "tool_batch_truncated"
     CAPABILITY_GRANTED = "capability_granted"
     CAPABILITY_REVOKED = "capability_revoked"
     CHECKPOINT_CREATED = "checkpoint_created"

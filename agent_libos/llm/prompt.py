@@ -21,6 +21,12 @@ from agent_libos.models import (
 from agent_libos.utils.openai_schema import compact_model_json_schema
 from agent_libos.utils.serde import loads
 
+# Record type of the compact stand-in that Object Memory renders for older or
+# superseded feedback under the ``working_set`` policy.  Kept in sync with
+# ``agent_libos.memory.object_memory.FEEDBACK_STUB_RECORD_TYPE`` (the memory
+# package must not import the LLM package).
+FEEDBACK_STUB_RECORD_TYPE = "object_memory_feedback_stub"
+
 
 PromptEvent = Event | Mapping[str, Any]
 
@@ -43,6 +49,11 @@ The runtime will only execute a valid native model tool call into the Skills/Too
 These tool calls are library/runtime wrapper calls, like libc or a language standard library.
 They are not kernel syscalls; the runtime may validate, attenuate, checkpoint, ask a human, sandbox, audit, or decompose them into lower-level libOS primitives.
 Use a native tool call for the final action. Ordinary assistant text has no side effect.
+When one response contains several tool calls, the runtime dispatches them in
+order within this quantum and stops at the first failure, wait, or exit; no
+call is silently dropped, and every result is visible in the next quantum. Batch
+only independent steps whose arguments do not depend on an earlier result in
+the same batch (for example activating several Skills or reading several files).
 The available library calls and their input schemas are supplied through the model tool schema for this turn.
 Match those JSON types exactly: integers, numbers, and booleans are unquoted
 JSON scalars (for example `{"limit":5}`, never `{"limit":"5"}`). If a call
@@ -179,6 +190,7 @@ def build_user_prompt(
     original_goal_context: str | None = None,
     fallback_json_actions: bool = False,
     prompt_layout: str = PROMPT_LAYOUT_LEGACY_V1,
+    pending_message_notice: Mapping[str, Any] | None = None,
 ) -> str:
     mode = prompt_mode if prompt_mode in PROMPT_MODES else PROMPT_MODE_LIBOS_DEFAULT
     layout = (
@@ -211,7 +223,7 @@ def build_user_prompt(
                     tools=tools,
                     prompt_layout=layout,
                 ),
-                _process_message_directive(process, events),
+                _process_message_directive(process, events, pending_message_notice),
             ]
             if part.strip()
         )
@@ -245,6 +257,7 @@ def build_user_prompt(
         original_goal_context=original_goal_context,
         fallback_json_actions=fallback_json_actions,
         prompt_layout=layout,
+        pending_message_notice=pending_message_notice,
     )
 
 
@@ -266,6 +279,7 @@ def _runtime_user_prompt(
     original_goal_context: str | None,
     fallback_json_actions: bool,
     prompt_layout: str,
+    pending_message_notice: Mapping[str, Any] | None = None,
 ) -> str:
     parts = [
         _available_skill_section(available_skills),
@@ -285,6 +299,7 @@ def _runtime_user_prompt(
             requestable_capabilities=requestable_capabilities,
             tools=tools,
             prompt_layout=prompt_layout,
+            pending_message_notice=pending_message_notice,
         ),
     ]
     return "\n\n".join(part for part in parts if part.strip())
@@ -543,15 +558,22 @@ def _original_goal_section(original_goal_context: str | None) -> str:
 def _process_message_directive(
     process: AgentProcess,
     events: list[PromptEvent],
+    pending_notice: Mapping[str, Any] | None = None,
 ) -> str:
-    """Keep explicit queued input actionable without copying its body into context."""
+    """Keep explicit queued input actionable without copying its body into context.
+
+    ``pending_notice`` is the notice the executor raised for unread input at the
+    start of this quantum.  It is authoritative even when the bounded recent
+    event window is still draining older bookkeeping events, so a queued Human
+    follow-up can never hide behind an event backlog.
+    """
 
     notices = [
         event
         for event in events
         if _event_type_value(event) == EventType.PROCESS_MESSAGE_NOTICE.value
     ]
-    if not notices:
+    if not notices and pending_notice is None:
         return ""
     message_tools = {"read_process_messages", "receive_process_messages"}
     visible_tools = set(process.model_tool_table)
@@ -663,7 +685,66 @@ def _capability_section(
         if cap.active
     ]
     visible.sort(key=_prompt_json)
-    return f"Capabilities:\n{_prompt_json(visible)}"
+    return f"Capabilities:\n{_prompt_json(_slim_legacy_capability_rows(visible, tools=tools))}"
+
+
+def _slim_legacy_capability_rows(
+    rows: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop constant or null legacy fields and fold per-Object read grants.
+
+    Every materialized Object mints one ``object:<oid>`` capability row, so the
+    legacy table grows by ~300 chars per tool result for the whole task while
+    no visible tool consumes those ids.  Fold identical Object rows into one
+    ``object:materialized`` summary unless a visible tool accepts
+    ``object_oid``, and omit fields that are always the same after the
+    ``active`` filter (status), always null for ordinary grants (parent,
+    expiry), or only meaningful for delegation tools (depth, issuer).  The
+    Capability records themselves are unchanged; this is a prompt projection.
+    """
+
+    include_object_id = _visible_tools_accept_field(tools, "object_oid")
+    include_cap_id = _visible_tools_accept_field(tools, "cap_id")
+    include_delegation = bool(
+        {"delegate_capability", "revoke_capability", "inspect_capability"}
+        & _visible_tool_names(tools)
+    )
+    slim_by_fingerprint: dict[str, dict[str, Any]] = {}
+    object_counts: dict[str, int] = {}
+    for row in rows:
+        resource = str(row.get("resource") or "")
+        folded_object = not include_object_id and resource.startswith("object:obj_")
+        slim: dict[str, Any] = {
+            "resource": "object:materialized" if folded_object else resource,
+            "rights": row.get("rights"),
+            "effect": row.get("effect"),
+            "policy": row.get("policy"),
+        }
+        if include_cap_id and not folded_object:
+            slim["cap_id"] = row.get("cap_id")
+        if row.get("uses_remaining") is not None:
+            slim["uses_remaining"] = row["uses_remaining"]
+        if row.get("expires_at") is not None:
+            slim["expires_at"] = row["expires_at"]
+        if row.get("delegable"):
+            slim["delegable"] = True
+        if include_delegation:
+            if row.get("delegation_depth"):
+                slim["delegation_depth"] = row["delegation_depth"]
+            if row.get("parent_cap_id") is not None:
+                slim["parent_cap_id"] = row["parent_cap_id"]
+            if row.get("issuer") is not None:
+                slim["issuer"] = row["issuer"]
+        fingerprint = _prompt_json(slim)
+        if folded_object:
+            object_counts[fingerprint] = object_counts.get(fingerprint, 0) + 1
+        slim_by_fingerprint.setdefault(fingerprint, slim)
+    for fingerprint, count in object_counts.items():
+        if count > 1:
+            slim_by_fingerprint[fingerprint]["object_count"] = count
+    return sorted(slim_by_fingerprint.values(), key=_prompt_json)
 
 
 def _capability_policy(cap: Capability) -> str:
@@ -722,6 +803,72 @@ def _requestable_capability_section(
         "an effect still requires the resulting Human decision. Plan coherent "
         "requests from this list instead of probing an effect for denial."
     )
+
+
+_TOOL_GUIDE_HEADING = "## Tool guide"
+
+
+def compact_skill_tool_guide(instructions: str, exercised_tools: list[str]) -> str:
+    """Drop ``### `tool``` subsections of a Skill's Tool guide for used tools.
+
+    Built-in Skill bodies share one heading convention: a ``## Tool guide``
+    section with one ``### `name``` subsection per owned tool, followed by
+    workflow, recovery, and completion-evidence sections.  Once a process has
+    used a tool successfully, its schema and the observed result already carry
+    the parameter semantics, so the subsection is replaced by a one-line note.
+    Bodies without that convention are returned unchanged.
+    """
+
+    lines = instructions.split("\n")
+    start = next(
+        (index for index, line in enumerate(lines) if line.strip() == _TOOL_GUIDE_HEADING),
+        None,
+    )
+    if start is None:
+        return instructions
+    end = next(
+        (
+            index
+            for index in range(start + 1, len(lines))
+            if lines[index].startswith("## ")
+        ),
+        len(lines),
+    )
+    section = lines[start + 1 : end]
+    subsection_starts = [
+        index for index, line in enumerate(section) if line.startswith("### ")
+    ]
+    if not subsection_starts:
+        return instructions
+    exercised = {name for name in exercised_tools if name}
+    kept: list[str] = section[: subsection_starts[0]]
+    removed: list[str] = []
+    for position, sub_start in enumerate(subsection_starts):
+        sub_end = (
+            subsection_starts[position + 1]
+            if position + 1 < len(subsection_starts)
+            else len(section)
+        )
+        heading = section[sub_start].strip()
+        tool_name = heading.removeprefix("###").strip().strip("`").strip()
+        if tool_name in exercised:
+            removed.append(tool_name)
+            continue
+        kept.extend(section[sub_start:sub_end])
+    if not removed:
+        return instructions
+    note = (
+        "Guides for "
+        + ", ".join(f"`{name}`" for name in sorted(removed))
+        + " are omitted because this process already used them successfully; their "
+        "parameter semantics remain in the tool schemas, and a guide returns if "
+        "that tool fails."
+    )
+    while kept and not kept[-1].strip():
+        kept.pop()
+    rebuilt = [*lines[:start], _TOOL_GUIDE_HEADING, "", *([*kept, ""] if kept else []), note, ""]
+    rebuilt.extend(lines[end:])
+    return "\n".join(rebuilt)
 
 
 def _skill_section(skills: list[dict[str, Any]]) -> str:
@@ -944,6 +1091,80 @@ def _context_metadata_section(
         f"- token_estimate: {context.token_count}\n"
         f"- object_refs: {_prompt_json(context.object_refs)}\n"
         f"- omitted_objects: {_prompt_json(context.omitted_objects)}"
+        f"{_compacted_feedback_guidance(context)}"
+        f"{_omitted_object_guidance(context)}"
+    )
+
+
+def _compacted_feedback_guidance(context: MaterializedContext) -> str:
+    """Tell the model that stub records stand for earlier feedback, not lost work."""
+
+    stubs = sum(
+        1
+        for entry in context.object_manifest
+        if isinstance(entry, dict)
+        and entry.get("disposition") == "included"
+        and entry.get("transform") == "compacted"
+    )
+    if not stubs:
+        return ""
+    return (
+        f"\n- compacted_feedback_stubs: {stubs} (records of type "
+        f"`{FEEDBACK_STUB_RECORD_TYPE}` stand for the oldest tool results of this "
+        "long task; their payloads were already shown in earlier quanta and every "
+        "newer result is still verbatim. They are a record that the action "
+        "happened, not a request to redo it: do not re-read files merely to "
+        "re-establish context, and re-read a stubbed file only when you need its "
+        "exact current content for an edit you are about to make.)"
+    )
+
+
+_OMITTED_REASON_NOTES = {
+    "capability_denied": (
+        "no longer readable by this process (typically an earlier Object whose "
+        "payload or handle was released after a Runtime reopen)"
+    ),
+    "missing": "payload unavailable after a Runtime reopen",
+    "token_budget": "dropped to stay within the materialization budget",
+    "filter_mismatch": "excluded by the MemoryView filter",
+    "superseded": (
+        "an older observation of a target whose fresher read is already shown; "
+        "nothing to re-read"
+    ),
+}
+
+
+def _omitted_object_guidance(context: MaterializedContext) -> str:
+    """Explain omissions semantically so the model re-derives, not assumes.
+
+    After a Runtime reopen or under budget pressure, earlier tool results may
+    be absent from the materialized context.  A bare identifier list invites
+    the model either to guess what those results said or to assume prior
+    actions never happened.  Name the reason and tell it to re-observe.
+    """
+
+    if not context.omitted_objects:
+        return ""
+    counts: dict[str, int] = {}
+    for entry in context.object_manifest:
+        if not isinstance(entry, dict) or entry.get("disposition") != "omitted":
+            continue
+        reason = str(entry.get("reason") or "unknown")
+        counts[reason] = counts.get(reason, 0) + 1
+    if counts:
+        reasons = ", ".join(
+            f"{reason}={count} ({_OMITTED_REASON_NOTES.get(reason, 'not materialized')})"
+            for reason, count in sorted(counts.items())
+        )
+    else:
+        reasons = "not materialized in this quantum"
+    return (
+        f"\n- omitted_object_reasons: {reasons}"
+        "\n- omitted_object_guidance: omitted Objects are not visible this "
+        "quantum; their earlier effects (edits, activations, ledger entries) "
+        "may still exist in the workspace or Object Memory. Re-observe with a "
+        "fresh read before relying on or repeating that work; do not treat an "
+        "omission as proof that the work was never done or as a reason to redo it blindly."
     )
 
 
@@ -956,6 +1177,7 @@ def _volatile_runtime_section(
     requestable_capabilities: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     prompt_layout: str,
+    pending_message_notice: Mapping[str, Any] | None = None,
 ) -> str:
     include_event_id = (
         prompt_layout == PROMPT_LAYOUT_LEGACY_V1
@@ -986,7 +1208,7 @@ def _volatile_runtime_section(
             include_event_id=include_event_id,
             prompt_layout=prompt_layout,
         ),
-        _process_message_directive(process, events),
+        _process_message_directive(process, events, pending_message_notice),
     ]
     return "\n\n".join(part for part in parts if part.strip())
 
@@ -1317,6 +1539,11 @@ def _compact_materialized_context_record(
             record,
             include_object_ids=include_object_ids,
         )
+    if record.get("record_type") == FEEDBACK_STUB_RECORD_TYPE:
+        compact = dict(record)
+        if not include_object_ids:
+            compact.pop("object_oid", None)
+        return compact
     return None
 
 

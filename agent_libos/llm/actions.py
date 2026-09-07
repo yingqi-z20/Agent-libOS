@@ -34,6 +34,7 @@ class LLMActionService:
         ],
         post_tool_notice: Callable[[str], dict[str, Any] | None],
         publish_result: Callable[[str, Any], None],
+        note_tool_result: Callable[[str, str, bool], None] | None = None,
     ) -> None:
         self._processes = processes
         self._tools = tools
@@ -43,6 +44,7 @@ class LLMActionService:
         self._pre_tool_notice = pre_tool_notice
         self._post_tool_notice = post_tool_notice
         self._publish_result = publish_result
+        self._note_tool_result = note_tool_result
 
     def completion_to_actions(
         self,
@@ -62,6 +64,13 @@ class LLMActionService:
                         pass
                 if auto_wait_on_empty_tool_calls:
                     return [auto_wait_message_action()], True
+            if len(tool_calls) > 1:
+                # The Host asked the provider for one call per response, but
+                # some providers ignore that request option.  A model-selected
+                # tool call is never silently discarded: every call becomes an
+                # ordered action and the executor dispatches the batch through
+                # the same governed sequential path used for parallel mode.
+                return self._parallel_actions(tool_calls), False
             return [
                 self._single_action(
                     content,
@@ -198,6 +207,7 @@ class LLMActionService:
             return notice
         tool = self._exact_tool_binding(pid, name, expected_tool_id)
         result = self._tools.call(pid, tool, args, context_metadata=context_metadata)
+        self._observe_tool_result(pid, name, result)
         return self._result(
             pid,
             result,
@@ -225,6 +235,7 @@ class LLMActionService:
             args,
             context_metadata=context_metadata,
         )
+        self._observe_tool_result(pid, name, result)
         return self._result(
             pid,
             result,
@@ -233,6 +244,23 @@ class LLMActionService:
                 or _is_completion_review_result(name, result)
             ),
         )
+
+    def _observe_tool_result(self, pid: str, name: str, result: ToolCallResult) -> None:
+        """Let the executor remember prompt-ergonomic facts about a dispatch.
+
+        This carries no authority and no durable state: it only informs prompt
+        composition (for example which Skill tool guides have already been
+        exercised successfully by this process).
+        """
+
+        if self._note_tool_result is None:
+            return
+        try:
+            self._note_tool_result(pid, name, bool(result.ok))
+        except Exception:
+            # Prompt ergonomics must never turn a completed dispatch into a
+            # failure; the result below is the authoritative record.
+            pass
 
     async def adispatch_host_auto_wait(
         self,

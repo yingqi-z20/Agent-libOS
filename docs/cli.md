@@ -170,7 +170,11 @@ different launch directories.
 `llm.parallel_tool_calls` is opt-in and can be overridden per profile. When it
 is enabled, OpenAI may return multiple tool calls in one action-selection
 response; Agent libOS dispatches them sequentially in the same quantum rather
-than running tools concurrently.
+than running tools concurrently. A provider that returns several tool calls
+even though the option is off gets the same ordered batch dispatch: a
+model-selected call is never silently discarded. Only sequential Responses
+replay keeps requiring exactly one call per response and asks the model to
+repair a multi-call response.
 `llm.auto_wait_on_empty_tool_calls` is also opt-in and can be overridden per
 profile. It helps weaker tool-calling models by synthesizing
 `receive_process_messages` when a response has no provider tool calls. The

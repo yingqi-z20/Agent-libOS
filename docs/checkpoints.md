@@ -266,7 +266,7 @@ complete process table and projected into the model table):
 
 The built-in base, coding, and review static tables bind the low-risk
 create/list/inspect/diff tools, but their initial model projections contain only
-the five Skill bootstrap tools. Coding additionally binds restore/fork and is
+the Skill bootstrap tools plus the message-read tools. Coding additionally binds restore/fork and is
 the only shipped Image whose complete table contains all six tools owned by
 `agent-libos-checkpoints`; activating that exact Skill projects the six together.
 Base and review omit restore/fork, so the immutable built-in Skill is hidden and

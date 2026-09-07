@@ -1462,6 +1462,23 @@ longer defines.
 - `skill-discovery-catalogs-are-bounded-and-source-consistent`: Host and persisted Skill catalogs share Unicode matching and fail closed at the configured scan ceiling.
 - `runtime-registration-mutations-are-audit-atomic`: Tool and syscall route bindings roll back atomically when required audit recording fails.
 - `rating-mutations-are-audit-atomic`: rating updates and required audit records commit or roll back in one transaction.
+- `working-set-feedback-window-is-a-prompt-projection`: under the `working_set`
+  policy, feedback older than the recent window or superseded by a fresher
+  observation of the same target renders as a content-free stub; Human and
+  process input results stay verbatim, the durable Objects are unchanged, and
+  the cache-optimized layout strips stub Object ids like any other envelope.
+- `source-materialization-stays-within-admission-headroom`: the per-quantum
+  source materialization budget never exceeds the process window or the
+  resolved per-call input limit minus the fixed prompt overhead and headroom,
+  so selection omits stale feedback before budget admission could deny the
+  request.
+- `unexecuted-batch-calls-are-reported-not-assumed`: calls of a multi-call
+  response that never ran are surfaced to the model as a `tool_batch_truncated`
+  event, and unread normal process input is noticed before tool selection
+  without copying its body into the prompt.
+- `container-argument-repair-is-schema-guided`: a JSON-encoded object or array
+  tool argument is decoded only when every schema variant forbids strings, and
+  the repair is recorded as `llm.tool_arguments_normalized`.
 
 ## Known Test Gaps
 

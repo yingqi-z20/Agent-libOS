@@ -485,7 +485,7 @@ class ProcessDefaults:
     max_tool_calls: StrictInt = 256
     max_child_processes: int = 16
     max_runtime_seconds: float | None = None
-    max_context_materialization_tokens: int = 65_536
+    max_context_materialization_tokens: int = 262_144
     max_context_materialization_total_tokens: int | None = None
     max_llm_calls: int | None = None
     max_llm_total_tokens: int | None = None
@@ -547,9 +547,9 @@ class LLMDefaults:
     profiles: dict[str, LLMProfile] = field(default_factory=lambda: {"default": LLMProfile()})
     temperature: StrictFloat = 0.2
     max_tokens: StrictInt = 16_384
-    max_input_tokens_per_call: StrictInt = 114_688
-    max_total_tokens_per_call: StrictInt = 131_072
-    context_window_tokens: int = 131_072
+    max_input_tokens_per_call: StrictInt = 245_760
+    max_total_tokens_per_call: StrictInt = 262_144
+    context_window_tokens: int = 262_144
     # Long-context completion and final evidence synthesis can legitimately
     # exceed one minute. A longer first attempt avoids three ambiguous,
     # potentially billable retries against a still-working provider.
@@ -931,7 +931,7 @@ class ImageCommitDefaults:
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ObjectMemoryDefaults:
     object_schema_version: str = "1"
-    materialize_budget_tokens: int = 8_000
+    materialize_budget_tokens: int = 262_144
     query_limit: int = 50
     context_policy: str = "plan_first"
     metadata_sensitivity: str = "normal"
@@ -943,6 +943,18 @@ class ObjectMemoryDefaults:
     metadata_collection_max_items: StrictInt = 128
     metadata_collection_item_max_chars: StrictInt = 2_048
     metadata_max_bytes: StrictInt = 131_072
+    # ``working_set`` rendering window.  The newest N feedback Objects (tool
+    # results, error traces, test results) always render verbatim, and older
+    # feedback keeps rendering verbatim while its estimated rendered tokens fit
+    # the verbatim token window; feedback beyond that renders as a bounded stub
+    # that names the tool and its target, and an observation superseded by a
+    # fresher read of the same target is omitted.  A long task therefore keeps a
+    # record of what it already did without replaying every payload on every
+    # quantum, while a multi-file orientation stays fully in view.  Human input
+    # results (message reads, answers) are never compacted.
+    working_set_recent_feedback: StrictInt = 8
+    working_set_supersede_observations: bool = True
+    working_set_verbatim_feedback_tokens: StrictInt = 48_000
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -1010,6 +1022,19 @@ class LLMContextDefaults:
     storage_compaction_threshold_bytes: int = 96_000
     storage_compaction_max_chunks: int = 4
     storage_compaction_preserve_recent_entries: int = 0
+    # Source materialization budget headroom.  The executor derives the
+    # per-quantum materialization budget from the resolved per-call input limit
+    # minus the fixed prompt overhead (system prompt, loaded Skill bodies, tool
+    # schemas) and this reserve for the volatile sections, so ``working_set``
+    # omits stale feedback before provider admission would reject the request.
+    # The floor keeps a minimum context even when the fixed overhead is large.
+    materialization_headroom_tokens: StrictInt = 12_288
+    materialization_budget_floor_tokens: StrictInt = 16_384
+    # Events scanned past the process cursor each quantum.  Only the newest
+    # ``recent_event_limit`` visible events render; the rest are counted, so a
+    # busy multi-call quantum cannot leave actionable events stuck behind a
+    # backlog of bookkeeping rows for several quanta.
+    recent_event_scan_limit: StrictInt = 200
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -1059,6 +1084,14 @@ class SkillDefaults:
     max_package_directories: StrictInt = 256
     max_package_depth: StrictInt = 32
     catalog_scan_limit: StrictInt = 1_000
+    # Prompt ergonomics only: once a loaded Skill's tool has succeeded for this
+    # process, that tool's ``### `name``` subsection of the ``## Tool guide``
+    # is left out of later prompts (the tool schema still carries parameter
+    # semantics).  The subsection returns after a failure of that tool or a
+    # Runtime reopen.  Activation, authority, and the package hash are
+    # unaffected.  Off by default: each compaction changes the stable prompt
+    # prefix once, so the provider-cache trade-off depends on task length.
+    compact_tool_guides_after_use: bool = False
 
     @property
     def manifest_max_bytes(self) -> int:
@@ -1259,6 +1292,21 @@ def _validate_llm_context_config(
         "llm_context.prompt_event_payload_max_chars",
         llm_context.prompt_event_payload_max_chars,
     )
+    _positive(
+        "llm_context.materialization_headroom_tokens",
+        llm_context.materialization_headroom_tokens,
+    )
+    _positive(
+        "llm_context.materialization_budget_floor_tokens",
+        llm_context.materialization_budget_floor_tokens,
+    )
+    _positive("llm_context.recent_event_limit", llm_context.recent_event_limit)
+    _require_at_least(
+        "llm_context.recent_event_scan_limit",
+        llm_context.recent_event_scan_limit,
+        "llm_context.recent_event_limit",
+        llm_context.recent_event_limit,
+    )
     if llm_context.prompt_event_payload_max_chars < 512:
         raise ValueError(
             "llm_context.prompt_event_payload_max_chars must be at least 512"
@@ -1306,6 +1354,17 @@ def _validate_object_memory_config(memory: ObjectMemoryDefaults) -> None:
         "metadata_max_bytes",
     ):
         _positive(f"memory.{name}", getattr(memory, name))
+    _positive(
+        "memory.working_set_recent_feedback",
+        memory.working_set_recent_feedback,
+    )
+    if (
+        isinstance(memory.working_set_verbatim_feedback_tokens, bool)
+        or memory.working_set_verbatim_feedback_tokens < 0
+    ):
+        raise ValueError("memory.working_set_verbatim_feedback_tokens must be non-negative")
+    if type(memory.working_set_supersede_observations) is not bool:
+        raise ValueError("memory.working_set_supersede_observations must be a boolean")
     _require_at_least(
         "memory.query_scan_ceiling",
         memory.query_scan_ceiling,

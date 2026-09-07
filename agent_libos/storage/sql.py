@@ -21093,6 +21093,10 @@ class SQLRuntimeStore:
                 name=package.name,
                 description=package.description,
                 text=query,
+                tool_names=[
+                    *package.allowed_tools,
+                    *(tool.name for tool in package.jit_tools),
+                ],
             )
             if score is not None:
                 scored.append((score, package, self._skill_row_metadata(row)))

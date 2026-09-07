@@ -86,17 +86,25 @@ An image with `metadata.tool_projection: skills` starts with a small
 model-facing projection instead of exposing every image tool schema at once.
 The fixed bootstrap requires the complete image-authorized set of
 `discover_skills`, `activate_skill`, `read_skill_resource`, `unload_skill`, and
-`process_exit`; a Skills-projection image missing any member is rejected. The
+`process_exit`; a Skills-projection image missing any member is rejected. When
+the image table also binds `read_process_messages` and
+`receive_process_messages`, the initial projection includes them so mandatory
+queued-input handling never needs a discovery round trip. The
 image's full process tool table is unchanged.
 
 Fresh shipped images contain neither Skill catalog metadata nor Skill bodies in
 the prompt. `discover_skills` searches every source visible under current
 catalog authority using one common, `text`/`limit`-bounded result schema.
-Concrete query terms are matched independently against id, name, and
-description metadata and results are relevance-ranked. A one-term query must
-match that term; a longer query requires at least two matching terms, allowing
-one task intent to surface separate narrowly owned Skills without admitting a
-result on one generic word alone. `next_step` tells the model to activate an
+Concrete query terms are matched independently against id, name,
+description, and declared tool-name metadata and results are relevance-ranked.
+A one-term query must match that term; a longer query requires at least two
+matching terms, allowing one task intent to surface separate narrowly owned
+Skills without admitting a result on one generic word alone. A query token that
+equals a declared tool name always matches its owning Skill, so listing the
+exact tools a goal requires resolves every owning Skill in one call. When the
+model selects a tool the image binds but no active Skill projects, the action
+repair names the owning built-in Skill and its package hash so the next
+response can activate it directly. `next_step` tells the model to activate an
 inactive plausible exact id, use a current loaded snapshot, or refine a
 zero-result query. `active` is true only when loaded and catalog package hashes
 match. `activate_skill` passes the discovered hash as

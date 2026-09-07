@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, TYPE_CHECKING
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.skills import get_builtin_skill_catalog
 from agent_libos.models.exceptions import (
     CapabilityDenied,
     HumanApprovalRequired,
@@ -51,6 +52,7 @@ from agent_libos.llm.prompt import (
     RETAINED_GOAL_CONTEXT_BINDING_KEY,
     build_system_prompt,
     build_user_prompt,
+    compact_skill_tool_guide,
     recover_initial_goal_context,
     retained_goal_context_binding,
     split_cache_optimized_user_prompt,
@@ -104,6 +106,7 @@ from agent_libos.models import (
     DataFlowContext,
     DataLabels,
     DataSink,
+    EventPriority,
     EventType,
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
@@ -451,6 +454,10 @@ class LLMProcessExecutor:
             max_turns=self.config.llm.responses_replay_max_turns,
             publications=unit_of_work.publications,
         )
+        # Prompt ergonomics only: tool names this process has used successfully
+        # since this Runtime opened.  Loaded Skill tool guides for these names
+        # are compacted in later prompts; a failure re-expands them.
+        self._used_tool_names: dict[str, set[str]] = {}
         self.actions = LLMActionService(
             processes=self._processes,
             tools=self._tools,
@@ -462,6 +469,7 @@ class LLMProcessExecutor:
             pre_tool_notice=self._pre_tool_interrupt_notice,
             post_tool_notice=self._notify_normal_messages,
             publish_result=self._add_to_view,
+            note_tool_result=self._note_tool_result,
         )
         self.context_memory = LLMContextMemory(
             self._processes,
@@ -1801,6 +1809,7 @@ class LLMProcessExecutor:
         skills: list[dict[str, Any]],
         available_skills: list[dict[str, Any]] | None = None,
         original_goal_context: str | None = None,
+        pending_message_notice: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         try:
             fallback_json_actions = (
@@ -1825,6 +1834,7 @@ class LLMProcessExecutor:
             original_goal_context=original_goal_context,
             fallback_json_actions=fallback_json_actions,
             prompt_layout=self._effective_prompt_layout(pid),
+            pending_message_notice=pending_message_notice,
         )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": build_system_prompt(image)},
@@ -1855,6 +1865,7 @@ class LLMProcessExecutor:
         tools: list[dict[str, Any]],
         skills: list[dict[str, Any]],
         available_skills: list[dict[str, Any]],
+        pending_message_notice: dict[str, Any] | None = None,
     ) -> tuple[
         list[dict[str, Any]],
         DataFlowContext,
@@ -1927,6 +1938,7 @@ class LLMProcessExecutor:
             events,
             context_object_name=self.context_memory.object_name(pid),
             payload_max_chars=self.config.llm_context.prompt_event_payload_max_chars,
+            max_visible=self.config.llm_context.recent_event_limit,
         )
         # Event projection is prompt content independently of the configured
         # context-memory policy. Merge its trusted labels directly into the
@@ -1947,6 +1959,7 @@ class LLMProcessExecutor:
             skills=skills,
             available_skills=available_skills,
             original_goal_context=original_goal_context,
+            pending_message_notice=pending_message_notice,
         )
         if task_context is not None:
             messages = self._task_run_messages(
@@ -2162,17 +2175,15 @@ class LLMProcessExecutor:
         process = self._ensure_process_memory_view(pid, process)
 
         self._notify_interrupt_messages(pid)
-        source_view = self.context_memory.view_without_context(pid, process.memory_view)
-        source_context = self._memory.materialize_context(
+        pending_message_notice = self._pending_message_notice(pid)
+        tools, skills, openai_tools, source_context = self._prepare_quantum_prompt_inputs(
             pid,
-            source_view,
-            policy=image.context_policy,
-            budget_tokens=process.resource_budget.max_context_materialization_tokens,
-            charge_resources=False,
+            image=image,
+            process=process,
         )
         label_events = self._events.list(
             target=pid,
-            limit=self.config.llm_context.recent_event_limit,
+            limit=self.config.llm_context.recent_event_scan_limit,
             after_event_id=process.event_cursor,
         )
         events = [
@@ -2186,16 +2197,11 @@ class LLMProcessExecutor:
             for event in label_events
         ]
         capabilities = self._capabilities.capabilities_for(pid)
-        # The prompt-visible tool list must match the process tool table. The
-        # broker still owns the real execute check, but showing extra tools
-        # teaches the model to choose actions the process cannot call.
-        tools = self._tools.model_visible_tools(pid)
         prompt_process = replace(
             process,
             tool_table=self._tools.model_tool_table(pid),
             loaded_skills=self._tools.model_loaded_skills(pid),
         )
-        skills = self._skills.prompt_context(pid)
         # Skill metadata is discovered through the same on-demand tool path as
         # every other Skill.  Only activated bodies belong in the prompt.
         available_skills: list[dict[str, Any]] = []
@@ -2231,6 +2237,7 @@ class LLMProcessExecutor:
                     tools=tools,
                     skills=skills,
                     available_skills=available_skills,
+                    pending_message_notice=pending_message_notice,
                 )
             )
         except Exception as exc:
@@ -2239,7 +2246,6 @@ class LLMProcessExecutor:
             return self._fail_llm_quantum(pid, exc)
         flow_token = self._data_flow.push(flow_context)
         try:
-            openai_tools = self._tools.openai_tool_schemas(pid)
             response_scope_fingerprint = (
                 self._current_responses_state_scope_fingerprint(pid)
             )
@@ -2896,7 +2902,7 @@ class LLMProcessExecutor:
         resumed_after_human: bool = False,
         call_id: str,
     ) -> dict[str, Any]:
-        if parallel_tool_calls and len(actions) > 1:
+        if len(actions) > 1:
             return await self._dispatch_action_batch(
                 pid=pid,
                 completion=completion,
@@ -3190,6 +3196,12 @@ class LLMProcessExecutor:
             start_index=action_index + 1,
             reason=stop_reason,
         )
+        self._emit_batch_truncation_event(
+            pid=pid,
+            actions=actions,
+            executed_count=action_index + 1,
+            stop_reason=stop_reason,
+        )
         wait_result = self._parallel_batch_wait_result(
             completed_actions,
             completed_results,
@@ -3269,6 +3281,13 @@ class LLMProcessExecutor:
                 completion=completion,
                 start_index=len(completed_actions),
                 reason=stop_reason,
+            )
+        if stop_reason not in {"completed", "process_terminal"}:
+            self._emit_batch_truncation_event(
+                pid=pid,
+                actions=actions,
+                executed_count=len(completed_actions),
+                stop_reason=stop_reason,
             )
 
         self._record_action_batch(
@@ -5055,17 +5074,23 @@ class LLMProcessExecutor:
                     ]
                     for action in actions:
                         self._validate_dispatchable_action(pid, action)
-                if parallel_tool_calls and len(actions) > 1:
+                # A response with several tool calls is dispatched as one
+                # ordered batch whether or not the provider was asked for
+                # parallel calls; the durable manifest records the batch shape
+                # that will actually be dispatched.
+                batch_dispatch = parallel_tool_calls or len(actions) > 1
+                if len(actions) > 1:
+                    self._validate_multi_action_batch(pid, actions)
                     self._preflight_parallel_tool_batch(pid, actions)
                 self._validate_replay_action_shape(call_id, completion, parallel_tool_calls)
                 self._commit_validated_action(
                     pid=pid, call_id=call_id, completion=completion, actions=actions,
-                    parallel_tool_calls=parallel_tool_calls, auto_wait_used=auto_wait_used,
+                    parallel_tool_calls=batch_dispatch, auto_wait_used=auto_wait_used,
                 )
                 return (
                     completion,
                     actions,
-                    parallel_tool_calls,
+                    batch_dispatch,
                     auto_wait_used,
                     call_id,
                 )
@@ -5094,6 +5119,9 @@ class LLMProcessExecutor:
                     if fallback_json_actions
                     else ""
                 )
+                single_call_required = (
+                    not parallel_tool_calls and self._is_replay_call(call_id)
+                )
                 attempt_messages = [
                     *messages,
                     {
@@ -5101,7 +5129,7 @@ class LLMProcessExecutor:
                         "content": (
                             "The previous model response could not be dispatched: "
                             f"{exc}. Choose "
-                            f"{'one or more' if parallel_tool_calls else 'exactly one'} "
+                            f"{'exactly one' if single_call_required else 'one or more'} "
                             "available OpenAI tool call by its function name. "
                             f"Available tool names: {self._tools.model_tool_names(pid)}"
                             f"{compatibility_hint}"
@@ -5143,6 +5171,37 @@ class LLMProcessExecutor:
 
     def _preflight_parallel_tool_batch(self, pid: str, actions: list[dict[str, Any]]) -> None:
         self.actions.preflight_parallel(pid, actions)
+
+    def _validate_multi_action_batch(self, pid: str, actions: list[dict[str, Any]]) -> None:
+        """Reject batch shapes the durable TaskRun contract cannot record.
+
+        A Durable TaskRun records ``activate_skill`` only as a singleton
+        non-parallel action because it rebinds the process tool table.  Ask
+        the model to send that call alone instead of failing the quantum after
+        the provider completion has already been admitted.  A terminal call
+        (``process_exit``/``exec_process``) placed before the end of a batch is
+        not rejected: the dispatcher stops after it, which is the documented
+        contract, and the prompts teach the model to put it last.
+        """
+
+        if self._task_runs is None:
+            return
+        process = self._processes.get_process(pid)
+        if process is None or getattr(process, "task_run_id", None) is None:
+            return
+        binding_actions = sorted(
+            {
+                str(action.get("action") or "")
+                for action in actions
+                if action.get("action") == "activate_skill"
+            }
+        )
+        if binding_actions:
+            raise ValueError(
+                "a Durable TaskRun dispatches activate_skill only as the single "
+                "tool call of a response; send it alone, then continue with the "
+                "remaining calls after its result is visible"
+            )
 
     def _record_task_run_validated_transcript(
         self,
@@ -5340,7 +5399,52 @@ class LLMProcessExecutor:
         return tuple(sorted(selected))
 
     def _validate_dispatchable_action(self, pid: str, action: dict[str, Any]) -> None:
-        self.actions.validate(pid, action)
+        try:
+            self.actions.validate(pid, action)
+        except ValueError as exc:
+            hint = self._hidden_tool_activation_hint(pid, action)
+            if hint is None:
+                raise
+            raise ValueError(f"{exc}; {hint}") from exc
+
+    def _hidden_tool_activation_hint(
+        self,
+        pid: str,
+        action: dict[str, Any],
+    ) -> str | None:
+        """Name the built-in Skill that projects a callable-but-hidden tool.
+
+        Skill projection is progressive disclosure over the process tool
+        table, not authority.  When the model selects a tool the image already
+        owns but no activated Skill has projected yet, telling it the exact
+        owning Skill and package hash turns a discovery round trip into one
+        activation call.  Nothing here grants or widens authority: the model
+        still has to activate the Skill and pass every primitive check.
+        """
+
+        name = str(action.get("action") or "").strip()
+        if not name:
+            return None
+        process = self._processes.get_process(pid)
+        if process is None or name in process.model_tool_table:
+            return None
+        if name not in process.tool_table:
+            return None
+        try:
+            skill_id = self._skills.builtin_skill_for_tool(name)
+        except Exception:
+            return None
+        if not skill_id:
+            return None
+        package = get_builtin_skill_catalog().get(skill_id)
+        if package is None or not package.package_sha256:
+            return None
+        return (
+            f"{name} is projected by the built-in Skill {skill_id!r}; call "
+            f"activate_skill with skill_id {skill_id!r} and "
+            f"expected_package_sha256 {package.package_sha256!r} (no discovery "
+            f"is needed), then call {name} in a later response"
+        )
 
     def _supersede_validated_image_only_empty_head(
         self,
@@ -8172,13 +8276,46 @@ class LLMProcessExecutor:
         )
 
     def _notify_interrupt_messages(self, pid: str) -> dict[str, Any] | None:
-        return self._messages.notice(
+        notice = self._messages.notice(
             pid,
             kind=ProcessMessageKind.INTERRUPT,
             phase="before_llm_tool_selection",
             source="llm.executor",
             instruction=self._process_message_instruction(pid),
         )
+        # Ordinary queued input (for example a Human follow-up posted while the
+        # Runtime was closed) also surfaces before tool selection so the very
+        # next prompt carries the mandatory read directive.  Waiting for the
+        # after-tool-call notice instead costs one quantum of stale planning
+        # and truncates that quantum's batch.  NORMAL input still does not
+        # pre-empt an admitted tool call; only the prompt learns about it
+        # earlier.
+        self._messages.notice(
+            pid,
+            kind=ProcessMessageKind.NORMAL,
+            phase="before_llm_tool_selection",
+            source="llm.executor",
+            instruction=self._process_message_instruction(pid),
+        )
+        return notice
+
+    def _pending_message_notice(self, pid: str) -> dict[str, Any] | None:
+        """Return the unread-input notice that must drive this quantum's prompt.
+
+        Computed from the mailbox, not from the bounded recent-event window, so
+        a backlog of bookkeeping events can never hide a queued Human message
+        from the directive that tells the model to read it.
+        """
+
+        for kind in (ProcessMessageKind.INTERRUPT, ProcessMessageKind.NORMAL):
+            unread = self._messages.unread(pid, kind=kind)
+            if unread:
+                return {
+                    "kind": kind.value,
+                    "count": len(unread),
+                    "phase": "before_llm_tool_selection",
+                }
+        return None
 
     def _pre_tool_interrupt_notice(
         self,
@@ -8328,6 +8465,184 @@ class LLMProcessExecutor:
             )
         elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
             self._processes.append_process_memory_roots(pid, [handle])
+
+    def _prepare_quantum_prompt_inputs(
+        self,
+        pid: str,
+        *,
+        image: Any,
+        process: Any,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], MaterializedContext]:
+        """Collect the model-visible tools, Skill bodies, schemas, and source context.
+
+        The prompt-visible tool list must match the process tool table: the
+        broker still owns the real execute check, but showing extra tools
+        teaches the model to choose actions the process cannot call.  The fixed
+        prompt parts are gathered first because the source-context budget is
+        derived from the headroom they leave.
+        """
+
+        tools = self._tools.model_visible_tools(pid)
+        skills = self._compact_used_skill_guides(
+            pid,
+            self._skills.prompt_context(pid),
+        )
+        openai_tools = self._tools.openai_tool_schemas(pid)
+        source_view = self.context_memory.view_without_context(pid, process.memory_view)
+        source_context = self._memory.materialize_context(
+            pid,
+            source_view,
+            policy=image.context_policy,
+            budget_tokens=self._materialization_budget_tokens(
+                pid,
+                image=image,
+                process=process,
+                skills=skills,
+                openai_tools=openai_tools,
+            ),
+            charge_resources=False,
+        )
+        return tools, skills, openai_tools, source_context
+
+    def _materialization_budget_tokens(
+        self,
+        pid: str,
+        *,
+        image: Any,
+        process: Any,
+        skills: list[dict[str, Any]],
+        openai_tools: list[dict[str, Any]],
+    ) -> int:
+        """Derive the source-context budget from the real per-call headroom.
+
+        ``max_context_materialization_tokens`` is a ceiling, not a promise that
+        the rendered context fits the provider request.  The request also
+        carries the system prompt, every loaded Skill body, and the tool
+        schemas; when their sum plus the context exceeds the resolved
+        ``max_input_tokens_per_call`` the quantum is denied before the provider
+        call and the process tree is killed without the model ever seeing a
+        warning.  Bounding the context by the remaining headroom lets the
+        selection policy omit stale feedback instead.  The floor keeps a
+        minimum working context even when the fixed overhead is large.
+        """
+
+        window = int(process.resource_budget.max_context_materialization_tokens)
+        try:
+            max_input = int(self._llms.resolve_for_process(pid).max_input_tokens_per_call)
+        except Exception:
+            max_input = int(self.config.llm.max_input_tokens_per_call)
+        overhead_messages = [
+            {"role": "system", "content": build_system_prompt(image)},
+            {
+                "role": "user",
+                "content": "\n\n".join(
+                    str(skill.get("instructions") or "")
+                    for skill in skills
+                    if isinstance(skill, dict)
+                ),
+            },
+        ]
+        overhead = estimate_request_input_tokens(overhead_messages, openai_tools)
+        headroom = (
+            max_input
+            - overhead
+            - int(self.config.llm_context.materialization_headroom_tokens)
+        )
+        floor = int(self.config.llm_context.materialization_budget_floor_tokens)
+        return max(floor, min(window, headroom))
+
+    def _note_tool_result(self, pid: str, name: str, ok: bool) -> None:
+        used = self._used_tool_names.setdefault(pid, set())
+        if ok:
+            used.add(name)
+        else:
+            used.discard(name)
+
+    def _compact_used_skill_guides(
+        self,
+        pid: str,
+        skills: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Leave out Skill tool-guide subsections for tools already exercised.
+
+        Loaded built-in Skill bodies are the largest fixed prompt cost of a long
+        task.  Once this process has used a tool successfully, the tool schema
+        and the observed result carry its parameter semantics; the recovery,
+        workflow, and completion-evidence sections stay.  This is visibility,
+        not authority, and the durable activation record is unchanged.
+        """
+
+        if not self.config.skills.compact_tool_guides_after_use:
+            return skills
+        used = self._used_tool_names.get(pid)
+        if not used:
+            return skills
+        compacted: list[dict[str, Any]] = []
+        for entry in skills:
+            if not isinstance(entry, dict):
+                compacted.append(entry)
+                continue
+            instructions = entry.get("instructions")
+            allowed = entry.get("allowed_tools") or []
+            exercised = sorted(
+                str(name) for name in allowed if isinstance(name, str) and name in used
+            )
+            if not isinstance(instructions, str) or not exercised:
+                compacted.append(entry)
+                continue
+            rewritten = compact_skill_tool_guide(instructions, exercised)
+            if rewritten == instructions:
+                compacted.append(entry)
+                continue
+            compacted.append(
+                {**entry, "instructions": rewritten, "compacted_tool_guides": exercised}
+            )
+        return compacted
+
+    def _emit_batch_truncation_event(
+        self,
+        *,
+        pid: str,
+        actions: list[dict[str, Any]],
+        executed_count: int,
+        stop_reason: str,
+    ) -> None:
+        """Tell the model which calls of its last response never ran.
+
+        Without this the next prompt shows results for the executed prefix
+        only, and a model tends to assume the remaining calls also happened.
+        """
+
+        unexecuted = [
+            str(action.get("action") or "")
+            for action in actions[executed_count:]
+            if isinstance(action, dict)
+        ]
+        if not unexecuted:
+            return
+        try:
+            self._events.emit(
+                EventType.TOOL_BATCH_TRUNCATED,
+                source="llm.executor",
+                target=pid,
+                payload={
+                    "stop_reason": stop_reason,
+                    "requested_count": len(actions),
+                    "executed_count": executed_count,
+                    "unexecuted_actions": unexecuted,
+                    "instruction": (
+                        "These tool calls from the previous response did not run. "
+                        "Handle the stop reason first (a failed call, queued "
+                        "process input, or a wait), then re-issue them only if "
+                        "they are still needed."
+                    ),
+                },
+                priority=EventPriority.HIGH,
+            )
+        except Exception:
+            # The audit record of the batch remains authoritative; a failed
+            # advisory event must not undo the settled dispatch.
+            pass
 
     def _persist_pending_action(
         self,

@@ -110,8 +110,9 @@ not change Object labels or replace Human write authority.
    promising acknowledgement or transport.
 3. Call once. Stop on `delivered=true`, expected normalized channel, and
    matching `chars`.
-4. For an ordinary interactive image, call `process_exit` only later; never
-   batch it with output because exit may win.
+4. For an ordinary interactive image, `process_exit` may follow the output in
+   the same response only as the last call; the runtime dispatches calls in
+   order and nothing after an exit runs.
 5. For cumulative review, follow `agent-libos-runtime-session`: obtain and
    resolve the review, prepare fresh `review_token`/`completion_evidence`, send
    the final report, then retry exit. Output does not refresh the token, but new

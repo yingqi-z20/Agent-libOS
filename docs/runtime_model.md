@@ -350,8 +350,9 @@ through Host configuration `llm_context.policy: llm_context_object` or a
 Host-issued `context:enrichment/execute` capability for that process.
 
 When explicitly enabled, the context helper uses the active Runtime's
-`llm_context.schema_version`, `llm_context.object_name_prefix`, and
-`llm_context.recent_event_limit`; these are not import-time constants. New
+`llm_context.schema_version`, `llm_context.object_name_prefix`,
+`llm_context.recent_event_limit`, and `llm_context.recent_event_scan_limit`;
+these are not import-time constants. New
 context Objects carry the active schema version, and an existing context Object
 with a different schema fails closed before reuse. Event capture consumes the
 same configured, store-bounded window. In Runtime-owned prompt modes, the
@@ -524,6 +525,14 @@ operations do not acquire Provider or external-effect semantics merely because
 their tools are model-visible. The broader general-purpose images retain
 source-neutral on-demand Skill projection for tasks whose tool domain is not
 known at launch.
+
+These four Images and the coding Image select the `working_set` memory policy:
+the goal and newest action feedback precede accumulated historical evidence,
+alongside current constraints, plans, and summaries. This prevents older tool
+results from starving the next observation when a long task reaches its
+materialization budget. It changes selection, not the permission checks or
+the chronological rendering of the selected context; see
+[Context Materialization](object_memory.md#context-materialization).
 
 LLM selection is host-controlled and process-local. A process stores only an
 `llm_profile_id`; the host Runtime resolves that id to a configured
@@ -1049,7 +1058,8 @@ quantum limit and no bounded-run drain deadline. In all cases, a run:
 
 1. runs runnable processes,
 2. processes pending human terminal messages when work is blocked on human I/O,
-3. delivers process-message notices at tool boundaries,
+3. delivers process-message notices before model tool selection and at tool
+   boundaries,
 4. observes processes that condition-owning managers have returned to
    `runnable`,
 5. stops when no runnable or human-resumable work remains, or when the quantum
@@ -1493,7 +1503,12 @@ guidance exceptions are restricted `discover_skills` queries for message/mailbox
 help and activation of a Skill that exposes the required message tools, so a
 process can reach a reader without bypassing the mailbox gate. A read with
 `ack=false` leaves the interrupt unread and therefore still preempting. Normal
-messages notify after a tool call and do not block the current action.
+messages do not block the current action: an unread normal message is noticed
+before each quantum's tool selection, so the mandatory read directive appears
+in the very next prompt (including the first quantum after a Runtime reopen),
+and again after each tool call while it stays unread. A notice that arrives
+mid-batch still stops the remaining calls of that response; the runtime then
+emits `tool_batch_truncated` naming the calls that did not run.
 
 ObjectTask completion and waiting notices use the same queue. By default they
 arrive on channel `object-task` from sender `object_task:<task_id>`. A process
@@ -1629,7 +1644,10 @@ The built-in `process_exit` tool requests the `exited` state and can attach a
 final Object Memory result. For an image with cumulative completion review, an
 attempt can instead return `status="completion_review_required"` without making
 the process terminal; the caller must address the review and retry with its
-fresh token and evidence. The trusted Host API
+fresh token and evidence. Because a multi-call response is dispatched in order
+and stops after a terminal call, the final `human_output` and the confirmed
+`process_exit` may be sent in the same response with `process_exit` last; a
+call placed after an exit never runs. The trusted Host API
 `ProcessManager.exit(..., failed=True)` is the separate path that can mark a
 process `failed`; the model-facing tool has no failure-state argument. Callers
 should omit `result_oid` and `review_token` until they have real values;
