@@ -39,6 +39,12 @@ and process-tree termination. Provider/API credentials, `PYTHONPATH`, and
 startup variables are not inherited. Truncated, limit-killed, incomplete, or
 unparseable oracle output fails closed.
 
+Before starting a Runtime or making any paid LLM call, each run executes a
+fixed Host-only probe through that same bounded runner. An environment that
+blocks governed subprocess execution or process-tree monitoring fails this
+preflight immediately, instead of spending tokens on a task whose final oracle
+cannot run.
+
 The JSON report contract is `schema_version: 1`. CLI defaults for the default
 scenario are one repetition, six phase-one scheduler quanta, and 96 total
 scheduler quanta per run (`--repetitions 1 --phase-one-quanta 6 --max-quanta
@@ -76,9 +82,10 @@ consumer, an AST check that every consumer routes through `round_amount` and
 no longer calls `quantize`/`round`, `inspect.signature` and `LedgerConfig` field
 stability, SHA-256 identity for `ledgerctl/config.py`, `tests/test_config.py`,
 and both Tokyo fixtures, CHANGELOG structure with byte-identical released
-history, AST-parsed whole-unit regressions per consumer plus a negative-half
-literal, the documented CLI smoke receipt after the last edit, and the absence
-of any successful delete receipt. Changed files must include the changelog and
+history, AST-parsed whole-unit and negative-half regressions for each consumer
+(including tests in unittest subpackages), the documented CLI smoke receipt
+after the last edit, and the absence of any successful delete receipt.
+Changed files must include the changelog and
 all three consumers and may add test modules other than `tests/test_config.py`.
 
 Check identifiers derive from the scenario: each regression-coverage key
@@ -113,6 +120,17 @@ reads drop below 2,048 tokens after a nonzero read). The evaluation metrics add
 `mean_wall_seconds`, `mean_llm_latency_seconds`, `mean_max_llm_call_seconds`,
 and `mean_overhead_llm_calls`. `--progress` prints one stderr summary line per
 completed phase (quanta, tool names, status, and seconds).
+
+`prompt_tokens` and `completion_tokens` are compatibility names for the shared
+`total_input_tokens` and `total_output_tokens` counters. Reports and the retained
+database inspector normalize Chat and Responses usage with API-specific alias
+precedence, preserving explicitly reported zeros. Reasoning tokens are a subset
+of output tokens and are not added again.
+
+The retained-database inspector uses SQLite's backup API for a consistent
+snapshot, including committed WAL transactions. Close the owning Runtime
+before inspection: its exclusive SQLite lock prevents a concurrent snapshot,
+and the inspector reports the lock instead of reading separately copied files.
 
 This is environment and resource isolation, not an operating-system sandbox.
 The oracle executes Python from the candidate workspace with the evaluator
@@ -162,8 +180,20 @@ successful evaluation.
 Custom endpoints whose bounded requests can legitimately exceed the default
 provider timeout should set `OPENAI_TIMEOUT` in the Host environment. Keep it
 finite: `OPENAI_MAX_RETRIES` configures Agent libOS's explicit, attempt-traced
-transport retry loop; provider-SDK internal retries are disabled. Exhausting
-those attempts pauses the process for Host recovery. A benchmark repetition
+transport retry loop; provider-SDK internal retries are disabled.
+`OPENAI_TIMEOUT` is not an end-to-end deadline: it configures the
+SDK's connect/read/write/pool timeouts, and successive response-body reads can
+each complete within that limit while the total request takes much longer.
+Transport retries and their delays add further elapsed time. `--max-quanta`
+bounds scheduler admissions, not wall-clock time; this CLI currently has no
+whole-run wall-clock deadline. Hosts can opt in to `OPENAI_LOGICAL_CALL_TIMEOUT`
+(or `LLMProfile.logical_call_timeout_s`) to bound one complete logical LLM call,
+including transport retries, backoff, and API compatibility fallback. It is
+disabled by default and does not replace the HTTP I/O timeout. Its cancellation
+runs on the provider event loop, records the interrupted attempt, and pauses
+the process for Host recovery; it does not prove that remote processing or
+billing stopped. Exhausting transport attempts also pauses the process
+for Host recovery. A benchmark repetition
 does not auto-resume that process, so the repetition remains unsuccessful and
 reports only the sanitized `timeout` category (the runner and
 `experiments/inspect_long_horizon_run.py` classify the retained provider SDK

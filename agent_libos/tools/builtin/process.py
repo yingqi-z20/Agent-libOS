@@ -10,6 +10,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.tools.contracts import OPTIONAL_RESULT_OBJECT
 from agent_libos.llm.prompt import recover_initial_goal_context
 from agent_libos.memory.data_labels import flow_context_parts, flow_context_value
 from agent_libos.models.exceptions import (
@@ -221,15 +222,7 @@ class ProcessExitArgs(BaseModel):
             "this restriction does not alter user-supplied business data."
         ),
     )
-    result_oid: str | None = Field(
-        default=None,
-        min_length=1,
-        description=(
-            "Existing non-empty object id to use as process result. Omit this "
-            "field when there is no existing result Object; do not pass the "
-            "text 'None' or 'null'."
-        ),
-    )
+    result_oid: str | None = OPTIONAL_RESULT_OBJECT.field()
     message: str | None = Field(
         default=None,
         description=(

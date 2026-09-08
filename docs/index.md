@@ -142,6 +142,7 @@ between visibility, authority, effect, operation, and evidence are unclear.
 - [`mini-swe-agent` image](mini_swe_agent_image.md)
 - [Skills](skills.md)
 - [Tools and Deno/TypeScript JIT](tools_and_jit.md)
+- [Generated tool contracts and consistency checks](tool_contracts.md)
 - [Runtime Modules](modules.md)
 - [Protected Operation SDK](protected_operation_sdk.md)
 - [Provider substrate](providers.md)

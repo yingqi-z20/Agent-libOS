@@ -94,10 +94,33 @@ characters), so free text cannot ride along; the exception text itself is
 hashed, never copied. Without such a code a model that sent one malformed
 argument tends to retry the same call. Before dispatch the broker repairs the
 provider quirks that the declared schema makes unambiguous: a JSON-encoded
-container for an object- or array-only field, canonical scalars for non-string
-fields, and the literal text `null` or `None` for a string-or-null field.
-String-only fields and enum literals are never reinterpreted, and every repair
-is audited as `llm.tool_arguments_normalized`.
+container for an object- or array-only field and canonical scalars for
+non-string fields. When the schema accepts strings, text such as `"null"` or
+`"None"` stays literal, including in string-or-null and JSON-value fields;
+callers must send JSON `null` to select the null value. Enum literals are never
+reinterpreted, and every repair is audited as `llm.tool_arguments_normalized`.
+
+### Shared contract definitions and drift checks
+
+Canonical field semantics live in `agent_libos/tools/contracts.py`. Pydantic
+fields reuse the declarations to generate descriptions, defaults, and lexical
+constraints; the owning Skill embeds generated guidance from the same source.
+Result declarations also select specialized replay handling. Local contract
+metadata is not sent as provider schema extensions and grants no authority.
+
+`uv run python scripts/check_tool_contracts.py` inventories every core tool and
+checks native/transport schemas, accepted and rejected canonical arguments,
+Skill blocks, and result replay. CI runs the check without LLM calls. Independent
+coverage fixtures prevent a removed declaration from silently reducing coverage;
+mutation tests verify that the check detects drift. Runtime workflow tests then
+execute serialized wire-valid calls through the broker and primitives, including
+denials and non-mutating CAS conflicts. These tests complement domain tests;
+they do not prove every business effect or remote provider's schema support.
+
+See the [generated contract reference](tool_contracts.md) for exact coverage,
+regeneration, and extension instructions. Existing compatibility validators
+remain unchanged; declaring a canonical value does not introduce an alias or a
+new coercion. Prompt-cache v2 remains a Host opt-in with its own release gate.
 
 ## On-Demand Tool Skills
 

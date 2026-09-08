@@ -269,3 +269,31 @@ def test_runtime_preserves_configured_auto_cache_and_private_domain_evidence() -
         assert "PRIVATE_HOST_CACHE_DOMAIN" not in dumps(record)
     finally:
         runtime.close()
+
+
+def test_terminal_replay_owner_does_not_require_retired_profile(tmp_path: Path) -> None:
+    from agent_libos.models import ProcessStatus
+
+    target = tmp_path / "retired-profile.sqlite"
+    config = replace(CONFIG, llm=replace(CONFIG.llm, profiles={
+        **CONFIG.llm.profiles, "retired": CONFIG.llm.profiles["default"],
+    }))
+    runtime = Runtime.open(target, config=config)
+    try:
+        runtime.register_image(AgentImage(
+            image_id=IMAGE, name="terminal replay", system_prompt="Exit.",
+            default_tools=["process_exit"],
+        ), actor="test")
+        pid = runtime.process.spawn(image=IMAGE, goal="finish", llm_profile_id="retired")
+        runtime.llms.set_test_client("retired", ReplayClient([completion(1, name="process_exit", arguments={"payload": {"done": True}})]))
+        assert runtime.run_process_once(pid)["ok"]
+        assert runtime.process.get(pid).status is ProcessStatus.EXITED
+        assert runtime.store.get_llm_replay_head(pid) is not None
+    finally:
+        runtime.close()
+    reopened = Runtime.open(target, config=CONFIG)
+    try:
+        assert reopened.process.get(pid).status is ProcessStatus.EXITED
+        assert reopened.store.get_llm_replay_head(pid) is not None
+    finally:
+        reopened.close()

@@ -5830,7 +5830,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             # TaskRun plaintext and integrity bindings are validated first and
             # without dispatch.  Durable recovery effects run only after this
             # read-only preflight has classified missing/corrupt payloads.
-            host.task_runs.validate_recoverable_payloads()
+            blocked_recovery_run_ids = host.task_runs.validate_recoverable_payloads()
             # MCP continuations, remote Tasks, and subscriptions interrupted by
             # a crash reach their durable restart state exactly once.
             # Constructors are read-only; these CAS transitions occur only
@@ -5892,6 +5892,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 config=host.config,
                 capabilities=host.capability,
                 profile_snapshot=host.llms.profile_snapshot,
+                excluded_run_ids=blocked_recovery_run_ids or frozenset(),
             )
             replay_sources.preflight()
             host.recovered_missing_object_payloads = (

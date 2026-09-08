@@ -5,7 +5,8 @@ This inspector reads that database read-only and reports, per LLM call, the
 timing, provider token usage, the character size of each top-level prompt
 section, the tool schema size, and the tool calls the model returned.  It
 prints sizes, counts, names, and categories only; prompt text, tool arguments,
-model text, and provider payloads are never echoed.
+model text, and provider payloads are never echoed. Close the owning Runtime
+first; its exclusive SQLite lock prevents a concurrent consistent snapshot.
 
 Example:
 
@@ -17,14 +18,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sqlite3
 import sys
 import tempfile
 from collections import Counter
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
+
+from agent_libos.llm.usage import canonicalize_llm_usage
 
 # Top-level user-prompt headings emitted by ``agent_libos.llm.prompt``.  Text
 # before the first heading is attributed to ``preamble``; unknown paragraph
@@ -128,19 +131,23 @@ def inspect_database(path: Path, *, pid: str | None = None) -> dict[str, Any]:
     if not source.is_file():
         raise FileNotFoundError(f"database not found: {source}")
     with tempfile.TemporaryDirectory(prefix="agent-libos-inspect-") as scratch:
-        # Copy the main file and any WAL/SHM sidecars so a live or
-        # incompletely checkpointed database is read consistently.
+        # SQLite backup coordinates with WAL checkpoints and concurrent writers;
+        # copying the main file and sidecars separately cannot preserve a snapshot.
         copied = Path(scratch) / source.name
-        shutil.copy2(source, copied)
-        for suffix in ("-wal", "-shm"):
-            sidecar = source.with_name(source.name + suffix)
-            if sidecar.is_file():
-                shutil.copy2(sidecar, copied.with_name(copied.name + suffix))
-        connection = sqlite3.connect(f"file:{copied}?mode=ro", uri=True)
-        try:
-            return _inspect_connection(connection, pid=pid, source=str(source))
-        finally:
-            connection.close()
+        with (
+            closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=0)) as live,
+            closing(sqlite3.connect(copied)) as snapshot,
+        ):
+            # Runtime stores hold an exclusive SQLite lock. Refuse a locked
+            # source instead of waiting forever inside backup's busy retry loop.
+            def backup_progress(status: int, _remaining: int, _total: int) -> None:
+                if status in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                    raise sqlite3.OperationalError(
+                        "database is locked; close the owning Runtime before inspection"
+                    )
+
+            live.backup(snapshot, progress=backup_progress)
+            return _inspect_connection(snapshot, pid=pid, source=str(source))
 
 
 def _inspect_connection(
@@ -173,7 +180,19 @@ def _inspect_connection(
 
 def _call_row(index: int, row: sqlite3.Row) -> dict[str, Any]:
     messages = _load_json(row["messages_json"], default=[])
-    usage = _load_json(row["usage_json"], default={})
+    usage, _invalid_usage = canonicalize_llm_usage(
+        _load_json(row["usage_json"], default={}), api=row["api"]
+    )
+    input_keys = (
+        ("input_tokens", "prompt_tokens")
+        if row["api"] == "responses"
+        else ("prompt_tokens", "input_tokens")
+    )
+    output_keys = (
+        ("output_tokens", "completion_tokens")
+        if row["api"] == "responses"
+        else ("completion_tokens", "output_tokens")
+    )
     tool_calls = _load_json(row["tool_calls_json"], default=[])
     tools = row["tools_json"]
     created = _parse_time(row["created_at"])
@@ -206,11 +225,9 @@ def _call_row(index: int, row: sqlite3.Row) -> dict[str, Any]:
             else None
         ),
         "gap_s": None,
-        "input_tokens": _usage_int(usage, "input_tokens", "prompt_tokens"),
-        "cached_tokens": _usage_int(
-            usage, "cache_read_tokens", "cached_tokens", "cache_read_input_tokens"
-        ),
-        "output_tokens": _usage_int(usage, "output_tokens", "completion_tokens"),
+        "input_tokens": _usage_int(usage, *input_keys),
+        "cached_tokens": _usage_int(usage, "cache_read_tokens"),
+        "output_tokens": _usage_int(usage, *output_keys),
         "reasoning_tokens": _usage_int(usage, "reasoning_tokens"),
         "role_chars": role_chars,
         "sections": sections,

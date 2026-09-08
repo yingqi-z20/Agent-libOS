@@ -66,6 +66,9 @@ jobs:
       - name: Check generated configuration reference
         run: uv run python scripts/generate_config_reference.py --check
 
+      - name: Check builtin tool contracts
+        run: uv run python scripts/check_tool_contracts.py
+
       - name: Check documentation navigation and workflow contracts
         run: >-
           uv run python -m pytest -q

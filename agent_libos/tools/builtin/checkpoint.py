@@ -18,6 +18,11 @@ from agent_libos.tools.base import (
     ToolPolicy,
     ToolResult,
 )
+from agent_libos.tools.contracts import (
+    CURRENT_PROCESS,
+    DETACHED_PARENT,
+    compact_checkpoint_created,
+)
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _CANCELLED_HUMAN_REQS_KEY = "cancelled_human_re" "quests"
@@ -135,13 +140,7 @@ class CreateCheckpointArgs(BaseModel):
             f"{_CHECKPOINT_REASON_MAX_BYTES} bytes of UTF-8 text."
         ),
     )
-    pid: str | None = Field(
-        default=None,
-        description=(
-            "Target process id. Omit this field to checkpoint the caller; do "
-            "not pass null, the text 'None', or the caller pid."
-        ),
-    )
+    pid: str | None = CURRENT_PROCESS.field()
 
     @field_validator("reason")
     @classmethod
@@ -172,7 +171,7 @@ class CreateCheckpointOutput(BaseModel):
 
 
 class ListCheckpointsArgs(BaseModel):
-    pid: str | None = Field(default=None, description="Process id to list. Defaults to the caller.")
+    pid: str | None = CURRENT_PROCESS.field()
     limit: int | None = Field(
         default=None,
         ge=1,
@@ -394,13 +393,7 @@ class ForkCheckpointArgs(BaseModel):
             "checkpoint id to copy without changing the source subtree."
         )
     )
-    parent_pid: str | None = Field(
-        default=None,
-        description=(
-            "Optional existing process that will own the new fork root. "
-            "Omit for a detached root; pass the caller pid explicitly to create a direct child."
-        ),
-    )
+    parent_pid: str | None = DETACHED_PARENT.field()
 
 
 class ForkCheckpointOutput(BaseModel):
@@ -458,10 +451,7 @@ class CreateCheckpointTool(SyncAgentTool[CreateCheckpointArgs]):
         return ToolResult.success(
             data=output.model_dump(),
             model_data=(
-                {
-                    "created": True,
-                    "reason": output.reason,
-                }
+                compact_checkpoint_created(output.reason)
                 if _cache_optimized_v2(runtime)
                 else output.model_dump()
             ),

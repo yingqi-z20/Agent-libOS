@@ -1326,8 +1326,9 @@ def test_corrupt_non_run_pending_action_remains_startup_fatal(
         Runtime.open(target)
 
 
+@pytest.mark.parametrize("action_json", ["[]", "[1]"])
 def test_corrupt_task_run_pending_action_isolated_to_needs_attention(
-    tmp_path: Path,
+    tmp_path: Path, action_json: str,
 ) -> None:
     config = replace(
         DEFAULT_CONFIG,
@@ -1365,7 +1366,7 @@ def test_corrupt_task_run_pending_action_isolated_to_needs_attention(
     with sqlite3.connect(target) as connection:
         connection.execute(
             "UPDATE llm_pending_actions SET action_json = ? WHERE pid = ?",
-            ("[]", created.root_pid),
+            (action_json, created.root_pid),
         )
         connection.commit()
 

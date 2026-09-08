@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
     AgentImage,
     AgentProcess,
@@ -18,6 +19,11 @@ from agent_libos.models import (
     PROMPT_MODE_MINIMAL_RUNTIME,
     PROMPT_MODES,
 )
+from agent_libos.tools.base import (
+    bounded_failure_model_projection,
+    public_identifier_details,
+)
+from agent_libos.tools.contracts import RESULT_CONTRACTS
 from agent_libos.utils.openai_schema import compact_model_json_schema
 from agent_libos.utils.serde import loads
 
@@ -41,6 +47,11 @@ _RETAINED_GOAL_CONTEXT_BINDING_SCHEMA_VERSION = 1
 _DYNAMIC_RUNTIME_HEADING = (
     "Current runtime state (volatile; applies only to this quantum):"
 )
+_MEMORY_NAMESPACE_GUIDANCE = (
+    "Object Memory namespace targets are literal strings. For tools with a "
+    "nullable namespace argument, JSON null (or omitting that argument) selects "
+    "this process namespace."
+)
 
 
 ACTION_PROTOCOL = """
@@ -62,8 +73,10 @@ Represent an absent nullable value as JSON `null`, never as the strings `"None"`
 or `"null"`; represent arrays and objects as JSON arrays and objects, not strings.
 Do not copy Host identifiers, hashes, timestamps, or protocol bookkeeping from
 tool results into human-facing text or completion payloads. The only exceptions
-are an explicit user request for the value, or the exact argument position of
-a visible tool that requires it as its target. An identifier used by an earlier
+are an explicit user request for the value, or a visible tool's schema-defined
+operational target or precondition field (including optional
+expected_content_sha256 and expected_package_sha256). Copy confirmed identifiers
+and digests exactly into those fields. An identifier used by an earlier
 tool call is never evidence by itself: do not repeat it in human_output,
 process_exit payload/message, or completion evidence; describe the semantic
 outcome instead.
@@ -192,6 +205,7 @@ def build_user_prompt(
     prompt_layout: str = PROMPT_LAYOUT_LEGACY_V1,
     pending_message_notice: Mapping[str, Any] | None = None,
     reopen_digest: str | None = None,
+    current_namespace: str | None = None,
 ) -> str:
     mode = prompt_mode if prompt_mode in PROMPT_MODES else PROMPT_MODE_LIBOS_DEFAULT
     layout = (
@@ -199,6 +213,7 @@ def build_user_prompt(
         if prompt_layout in PROMPT_LAYOUTS
         else PROMPT_LAYOUT_LEGACY_V1
     )
+    current_namespace = current_namespace or f"process:{process.pid}"
     if mode == PROMPT_MODE_IMAGE_ONLY:
         raise ValueError(
             "image_only user messages are built from the process goal and durable native transcript"
@@ -211,28 +226,22 @@ def build_user_prompt(
                     tools,
                     "object_oid",
                 ),
+                current_namespace=current_namespace,
             )
             if layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2
             else context.text
         )
-        dynamic_runtime = "\n\n".join(
-            part
-            for part in [
-                _requestable_capability_section(
-                    requestable_capabilities or [],
-                    process=process,
-                    tools=tools,
-                    prompt_layout=layout,
-                ),
-                reopen_digest or "",
-                _process_message_directive(process, events, pending_message_notice),
-            ]
-            if part.strip()
+        dynamic_runtime = _llm_context_dynamic_runtime_section(
+            process=process,
+            events=events,
+            capabilities=capabilities,
+            tools=tools,
+            requestable_capabilities=requestable_capabilities,
+            prompt_layout=layout,
+            current_namespace=current_namespace,
+            pending_message_notice=pending_message_notice,
+            reopen_digest=reopen_digest,
         )
-        if dynamic_runtime and layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
-            dynamic_runtime = (
-                f"{_DYNAMIC_RUNTIME_HEADING}\n\n{dynamic_runtime}"
-            )
         return "\n\n".join(
             part
             for part in [
@@ -242,6 +251,7 @@ def build_user_prompt(
                 _original_goal_section(original_goal_context),
                 _skill_section(skills or []),
                 _fallback_tool_section(tools) if fallback_json_actions else "",
+                _MEMORY_NAMESPACE_GUIDANCE if layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2 else "",
                 context_text,
                 dynamic_runtime,
             ]
@@ -261,7 +271,49 @@ def build_user_prompt(
         prompt_layout=layout,
         pending_message_notice=pending_message_notice,
         reopen_digest=reopen_digest,
+        current_namespace=current_namespace,
     )
+
+
+def _llm_context_dynamic_runtime_section(
+    *,
+    process: AgentProcess,
+    events: list[PromptEvent],
+    capabilities: list[Capability],
+    tools: list[dict[str, Any]],
+    requestable_capabilities: list[dict[str, Any]] | None,
+    prompt_layout: str,
+    current_namespace: str | None,
+    pending_message_notice: Mapping[str, Any] | None,
+    reopen_digest: str | None,
+) -> str:
+    dynamic_runtime = "\n\n".join(
+        part
+        for part in [
+            _capability_section(
+                capabilities,
+                process=process,
+                tools=tools,
+                prompt_layout=prompt_layout,
+                current_namespace=current_namespace,
+            )
+            if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2
+            and "delegate_capability" in _visible_tool_names(tools)
+            else "",
+            _requestable_capability_section(
+                requestable_capabilities or [],
+                process=process,
+                tools=tools,
+                prompt_layout=prompt_layout,
+            ),
+            reopen_digest or "",
+            _process_message_directive(process, events, pending_message_notice),
+        ]
+        if part.strip()
+    )
+    if dynamic_runtime and prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
+        dynamic_runtime = f"{_DYNAMIC_RUNTIME_HEADING}\n\n{dynamic_runtime}"
+    return dynamic_runtime
 
 
 def _prompt_mode(image: AgentImage) -> str:
@@ -284,16 +336,19 @@ def _runtime_user_prompt(
     prompt_layout: str,
     pending_message_notice: Mapping[str, Any] | None = None,
     reopen_digest: str | None = None,
+    current_namespace: str | None = None,
 ) -> str:
     parts = [
         _available_skill_section(available_skills),
         _original_goal_section(original_goal_context),
         _skill_section(skills),
         _fallback_tool_section(tools) if fallback_json_actions else "",
+        _MEMORY_NAMESPACE_GUIDANCE if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2 else "",
         _context_body_section(
             context,
             tools=tools,
             prompt_layout=prompt_layout,
+            current_namespace=current_namespace,
         ),
         _volatile_runtime_section(
             process=process,
@@ -305,6 +360,7 @@ def _runtime_user_prompt(
             prompt_layout=prompt_layout,
             pending_message_notice=pending_message_notice,
             reopen_digest=reopen_digest,
+            current_namespace=current_namespace,
         ),
     ]
     return "\n\n".join(part for part in parts if part.strip())
@@ -457,6 +513,8 @@ def _decode_json_object(
 def retained_goal_context_binding(
     goal_oid: str,
     object_record: Mapping[str, Any],
+    *,
+    current_namespace: str | None = None,
 ) -> dict[str, Any]:
     """Bind an id-free v2 goal projection to one Host-owned goal Object."""
 
@@ -467,6 +525,7 @@ def retained_goal_context_binding(
     projected_record = _compact_materialized_context_record(
         dict(object_record),
         include_object_ids=False,
+        current_namespace=current_namespace,
     )
     if (
         projected_record is None
@@ -637,6 +696,7 @@ def _capability_section(
     process: AgentProcess,
     tools: list[dict[str, Any]],
     prompt_layout: str,
+    current_namespace: str | None = None,
 ) -> str:
     if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
         include_cap_id = _visible_tools_accept_field(tools, "cap_id")
@@ -650,10 +710,17 @@ def _capability_section(
             if not cap.active:
                 continue
             row: dict[str, Any] = {
-                "resource": _semantic_capability_resource(
-                    cap.resource,
-                    process=process,
-                    include_object_id=include_object_id,
+                **_namespace_capability_fields(
+                    _semantic_capability_resource(
+                        cap.resource,
+                        process=process,
+                        include_object_id=include_object_id,
+                    ),
+                    current_namespace=(
+                        None
+                        if "delegate_capability" in _visible_tool_names(tools)
+                        else current_namespace
+                    ),
                 ),
                 "rights": sorted(cap.rights),
                 "effect": cap.effect.value,
@@ -1027,6 +1094,7 @@ def _event_section(
     *,
     include_event_id: bool = True,
     prompt_layout: str = PROMPT_LAYOUT_LEGACY_V1,
+    current_namespace: str | None = None,
 ) -> str:
     if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
         actionable = [
@@ -1050,6 +1118,7 @@ def _event_section(
             event,
             include_event_id=include_event_id,
             prompt_layout=prompt_layout,
+            current_namespace=current_namespace,
         )
         for event in events
     ]
@@ -1063,6 +1132,7 @@ def _context_body_section(
     *,
     tools: list[dict[str, Any]],
     prompt_layout: str,
+    current_namespace: str | None = None,
 ) -> str:
     text = context.text
     if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
@@ -1072,6 +1142,7 @@ def _context_body_section(
                 tools,
                 "object_oid",
             ),
+            current_namespace=current_namespace,
         )
     else:
         text = _strip_persisted_model_projections(text)
@@ -1191,6 +1262,7 @@ def _volatile_runtime_section(
     prompt_layout: str,
     pending_message_notice: Mapping[str, Any] | None = None,
     reopen_digest: str | None = None,
+    current_namespace: str | None = None,
 ) -> str:
     include_event_id = (
         prompt_layout == PROMPT_LAYOUT_LEGACY_V1
@@ -1210,6 +1282,7 @@ def _volatile_runtime_section(
             process=process,
             tools=tools,
             prompt_layout=prompt_layout,
+            current_namespace=current_namespace,
         ),
         _requestable_capability_section(
             requestable_capabilities,
@@ -1221,6 +1294,7 @@ def _volatile_runtime_section(
             events,
             include_event_id=include_event_id,
             prompt_layout=prompt_layout,
+            current_namespace=current_namespace,
         ),
         _process_message_directive(process, events, pending_message_notice),
     ]
@@ -1282,6 +1356,7 @@ def _event_prompt_record(
     *,
     include_event_id: bool = True,
     prompt_layout: str = PROMPT_LAYOUT_LEGACY_V1,
+    current_namespace: str | None = None,
 ) -> dict[str, Any]:
     if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
         if isinstance(event, Mapping):
@@ -1294,7 +1369,7 @@ def _event_prompt_record(
             payload = event.payload
         selected = {
             "type": event_type,
-            "payload": _compact_host_event_payload(payload),
+            "payload": _compact_host_event_payload(payload, current_namespace=current_namespace),
         }
         if include_event_id and event_id:
             selected["event_id"] = event_id
@@ -1321,7 +1396,7 @@ def _event_prompt_record(
     return selected
 
 
-def _compact_host_event_payload(value: Any) -> Any:
+def _compact_host_event_payload(value: Any, *, current_namespace: str | None = None) -> Any:
     if not isinstance(value, dict):
         return value
     blocked = {
@@ -1358,39 +1433,47 @@ def _compact_host_event_payload(value: Any) -> Any:
     for key, item in value.items():
         if key in blocked or key.endswith("_sha256"):
             continue
-        if key == "pids" or key.endswith("_pids"):
-            if isinstance(item, (list, tuple, set)):
-                semantic_key = (
-                    "process_count"
-                    if key == "pids"
-                    else f"{key[:-5]}_process_count"
-                )
-                selected[semantic_key] = len(item)
-            continue
-        if key == "oids" or key.endswith("_oids"):
-            if isinstance(item, (list, tuple, set)):
-                semantic_key = (
-                    "object_count"
-                    if key == "oids"
-                    else f"{key[:-5]}_object_count"
-                )
-                selected[semantic_key] = len(item)
-            continue
-        if key == "ids" or key.endswith("_ids"):
-            if isinstance(item, (list, tuple, set)):
-                semantic_key = (
-                    "item_count"
-                    if key == "ids"
-                    else f"{key[:-4]}_count"
-                )
-                selected[semantic_key] = len(item)
+        collection_projection = _host_identifier_collection_projection(key, item)
+        if collection_projection is not None:
+            selected.update(collection_projection)
             continue
         if key.endswith(("_pid", "_oid", "_id")):
             continue
-        if key in {"resource", "namespace", "name", "target"}:
+        if key in {"resource", "namespace"} and (
+            key == "namespace"
+            or (isinstance(item, str) and item.startswith("object_namespace:"))
+        ):
+            # These are literal namespace addresses, never process aliases.
+            if key == "namespace":
+                selected[key] = _semantic_memory_namespace(item, current_namespace=current_namespace)
+            else:
+                selected.update(_namespace_capability_fields(item, current_namespace=current_namespace))
+            continue
+        if key in {"resource", "name", "target"}:
             item = _semantic_host_identifier_text(item)
         selected[key] = item
     return selected
+
+
+def _host_identifier_collection_projection(
+    key: str,
+    value: Any,
+) -> dict[str, int] | None:
+    for plural, count_name, named_count_suffix in (
+        ("pids", "process_count", "process_count"),
+        ("oids", "object_count", "object_count"),
+        ("ids", "item_count", "count"),
+    ):
+        if key == plural or key.endswith(f"_{plural}"):
+            if not isinstance(value, (list, tuple, set)):
+                return {}
+            semantic_key = (
+                count_name
+                if key == plural
+                else f"{key[:-(len(plural) + 1)]}_{named_count_suffix}"
+            )
+            return {semantic_key: len(value)}
+    return None
 
 
 def _semantic_capability_resource(
@@ -1400,6 +1483,11 @@ def _semantic_capability_resource(
     include_object_id: bool,
 ) -> str:
     selected = str(resource)
+    # Namespace resources are literal authority targets, including strings
+    # containing process ids or the word "self". Permission requests need the
+    # exact resource; current grants get a separate nullable target projection.
+    if selected.startswith("object_namespace:"):
+        return selected
     selected = selected.replace(process.pid, "self")
     if process.goal_oid:
         selected = selected.replace(process.goal_oid, "goal")
@@ -1411,6 +1499,16 @@ def _semantic_capability_resource(
     if not include_object_id and selected.startswith("object:obj_"):
         return "object:materialized"
     return _semantic_host_identifier_text(selected)
+
+
+def _namespace_capability_fields(
+    resource: str,
+    *,
+    current_namespace: str | None,
+) -> dict[str, Any]:
+    if current_namespace is not None and resource == f"object_namespace:{current_namespace}":
+        return {"resource_type": "object_namespace", "namespace": None}
+    return {"resource": resource}
 
 
 def _semantic_host_identifier_text(value: Any) -> Any:
@@ -1477,6 +1575,7 @@ def _compact_materialized_context_text(
     text: str,
     *,
     include_object_ids: bool,
+    current_namespace: str | None = None,
 ) -> str:
     """Compact only libOS-owned Object envelopes, never nested user payloads."""
 
@@ -1497,6 +1596,7 @@ def _compact_materialized_context_text(
         compact = _compact_materialized_context_record(
             record,
             include_object_ids=include_object_ids,
+            current_namespace=current_namespace,
         )
         if compact is not None:
             rendered.append(_prompt_json(compact))
@@ -1542,16 +1642,19 @@ def _compact_materialized_context_record(
     record: dict[str, Any],
     *,
     include_object_ids: bool,
+    current_namespace: str | None = None,
 ) -> dict[str, Any] | None:
     if record.get("record_type") == "object_memory_object":
         return _compact_materialized_object_record(
             record,
             include_object_ids=include_object_ids,
+            current_namespace=current_namespace,
         )
     if record.get("record_type") == "object_memory_payload_entry":
         return _compact_materialized_payload_entry_record(
             record,
             include_object_ids=include_object_ids,
+            current_namespace=current_namespace,
         )
     if record.get("record_type") == FEEDBACK_STUB_RECORD_TYPE:
         compact = dict(record)
@@ -1565,12 +1668,15 @@ def _compact_materialized_object_record(
     record: dict[str, Any],
     *,
     include_object_ids: bool,
+    current_namespace: str | None = None,
 ) -> dict[str, Any]:
     payload = record.get("payload")
     if isinstance(payload, dict) and payload.get("kind") == "llm_context":
-        payload = _compact_llm_context_payload(payload)
+        payload = _compact_llm_context_payload(
+            payload, current_namespace=current_namespace,
+        )
     if record.get("type") == "tool_result" and isinstance(payload, dict):
-        payload = _compact_tool_result_payload(payload)
+        payload = _compact_tool_result_payload(payload, current_namespace=current_namespace)
     semantic_name = _semantic_object_name(record.get("name"))
     if record.get("type") == "tool_result":
         tool_name = payload.get("tool_name") if isinstance(payload, dict) else None
@@ -1578,7 +1684,7 @@ def _compact_materialized_object_record(
     compact: dict[str, Any] = {
         "content_trust": record.get("content_trust", "untrusted_data"),
         "name": semantic_name,
-        "namespace": _semantic_object_namespace(record.get("namespace")),
+        "namespace": _semantic_memory_namespace(record.get("namespace"), current_namespace=current_namespace),
         "type": record.get("type"),
         "immutable": record.get("immutable"),
         "payload": payload,
@@ -1595,7 +1701,9 @@ def _compact_materialized_object_record(
     return compact
 
 
-def _compact_tool_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _compact_tool_result_payload(
+    payload: dict[str, Any], *, current_namespace: str | None = None,
+) -> dict[str, Any]:
     """Project a Host-owned ToolResult wrapper without filtering tool data.
 
     The nested result can be a user document or an external provider payload,
@@ -1605,26 +1713,28 @@ def _compact_tool_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """
 
     tool_name = payload.get("tool_name")
+    contract = RESULT_CONTRACTS.get(tool_name) if isinstance(tool_name, str) else None
     selected: dict[str, Any] = {}
     if isinstance(tool_name, str) and tool_name:
         selected["tool_name"] = tool_name
 
     if "model_projection" in payload:
         selected["result"] = payload["model_projection"]
-    elif tool_name == "process_exit":
+    elif payload.get("ok") is False and contract is not None and contract.preserve_public_failure:
+        # Failure carriers have no success `result`. Their durable `failure`
+        # may also contain raw exception evidence, so neither the success
+        # projector nor a wholesale replay of that carrier is appropriate.
+        selected["result"] = _compact_specialized_tool_failure(payload)
+        return selected
+    elif contract is not None and contract.family == "process_exit":
         selected["result"] = _process_exit_model_projection(
             payload.get("result")
         )
-    elif tool_name in {
-        "create_memory_object",
-        "create_memory_namespace",
-        "list_memory_namespace",
-        "read_memory_object",
-        "append_memory_object",
-    }:
+    elif contract is not None and contract.family == "memory":
         selected["result"] = _memory_tool_result_projection(
             tool_name,
             payload.get("result"),
+            current_namespace=current_namespace,
         )
     elif "result" in payload:
         selected["result"] = payload["result"]
@@ -1647,6 +1757,45 @@ def _compact_tool_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(artifacts, list) and artifacts:
         selected["artifacts"] = artifacts
     return selected
+
+
+def _compact_specialized_tool_failure(payload: dict[str, Any]) -> dict[str, Any]:
+    failure = payload.get("failure")
+    failure = failure if isinstance(failure, dict) else payload
+    error = failure.get("error")
+    error = error if isinstance(error, dict) else {}
+    details = error.get("details")
+    details = details if isinstance(details, dict) else {}
+    public_details = public_identifier_details(details)
+    hint = public_details.get("hint")
+    code = error.get("code", details.get("code"))
+    error_type = error.get(
+        "type", error.get("error_type", details.get("error_type"))
+    )
+    projection = bounded_failure_model_projection(
+        code=code if isinstance(code, str) else "execution_error",
+        error_type=error_type if isinstance(error_type, str) else "ToolError",
+        message="Tool execution failed.",
+        retryable=error.get("retryable") is True,
+        details={"hint": hint} if hint is not None else {},
+        metadata=None,
+        limit_bytes=min(
+            DEFAULT_CONFIG.tools.tool_result_payload_hard_limit_bytes,
+            DEFAULT_CONFIG.tools.memory_payload_hard_limit_bytes,
+        ),
+    )
+    # Reuse the broker's bounded diagnostic projection while leaving raw
+    # messages, correlation ids, error hashes, payloads and telemetry private.
+    if not isinstance(projection, dict) or not isinstance(projection.get("error"), dict):
+        return {"ok": False}
+    return {
+        "ok": False,
+        "error": {
+            key: value
+            for key, value in projection["error"].items()
+            if key in {"code", "type", "retryable", "safe_message", "details"}
+        },
+    }
 
 
 def _process_exit_model_projection(value: Any) -> Any:
@@ -1719,7 +1868,9 @@ def _process_exit_model_projection(value: Any) -> Any:
     }
 
 
-def _memory_tool_result_projection(tool_name: str, value: Any) -> Any:
+def _memory_tool_result_projection(
+    tool_name: str, value: Any, *, current_namespace: str | None = None,
+) -> Any:
     """Project Host-owned Object Memory identity without touching user data."""
 
     if not isinstance(value, dict):
@@ -1731,43 +1882,47 @@ def _memory_tool_result_projection(tool_name: str, value: Any) -> Any:
         "read_memory_object": _read_memory_object_projection,
         "append_memory_object": _appended_memory_object_projection,
     }.get(tool_name)
-    return projector(value) if projector is not None else value
+    return projector(value, current_namespace=current_namespace) if projector is not None else value
 
 
-def _created_memory_object_projection(value: dict[str, Any]) -> dict[str, Any]:
-    projected = _memory_object_identity_projection(value)
+def _created_memory_object_projection(
+    value: dict[str, Any], *, current_namespace: str | None = None,
+) -> dict[str, Any]:
+    projected = _memory_object_identity_projection(value, current_namespace=current_namespace)
     default_name = f"{value.get('type')}:{value.get('oid')}"
     if projected.get("name") == default_name:
         projected.pop("name", None)
     return projected
 
 
-def _created_memory_namespace_projection(value: dict[str, Any]) -> dict[str, Any]:
+def _created_memory_namespace_projection(
+    value: dict[str, Any], *, current_namespace: str | None = None,
+) -> dict[str, Any]:
+    # Creating a namespace requires a literal namespace, and a null parent
+    # means inferred path parent rather than the current process namespace.
     return {
-        key: (
-            _semantic_memory_namespace(item)
-            if key in {"namespace", "parent_namespace"}
-            else item
-        )
+        key: item
         for key, item in value.items()
         if key in {"namespace", "parent_namespace", "created"}
         and item is not None
     }
 
 
-def _listed_memory_namespace_projection(value: dict[str, Any]) -> dict[str, Any]:
+def _listed_memory_namespace_projection(
+    value: dict[str, Any], *, current_namespace: str | None = None,
+) -> dict[str, Any]:
     objects = value.get("objects")
     namespaces = value.get("namespaces")
     return {
-        "namespace": _semantic_memory_namespace(value.get("namespace")),
+        "namespace": _semantic_memory_namespace(value.get("namespace"), current_namespace=current_namespace),
         "objects": [
-            _memory_object_identity_projection(item)
+            _memory_object_identity_projection(item, current_namespace=current_namespace)
             for item in (objects if isinstance(objects, list) else [])
             if isinstance(item, dict)
         ],
         "namespaces": [
             {
-                key: _semantic_memory_namespace(item.get(key))
+                key: item[key]
                 for key in ("namespace", "parent_namespace")
                 if item.get(key) is not None
             }
@@ -1777,10 +1932,12 @@ def _listed_memory_namespace_projection(value: dict[str, Any]) -> dict[str, Any]
     }
 
 
-def _read_memory_object_projection(value: dict[str, Any]) -> dict[str, Any]:
+def _read_memory_object_projection(
+    value: dict[str, Any], *, current_namespace: str | None = None,
+) -> dict[str, Any]:
     # payload and preview are user-owned Object data. Preserve them
     # recursively, including business fields named run_id or similar.
-    return _selected_memory_result_fields(
+    projected = _selected_memory_result_fields(
         value,
         (
             "oid",
@@ -1801,19 +1958,30 @@ def _read_memory_object_projection(value: dict[str, Any]) -> dict[str, Any]:
             "omitted_bytes",
             "next_cursor",
         ),
+        current_namespace=current_namespace,
     )
+    # A complete JSON null is business data, unlike the empty payload
+    # placeholder on a canonical_json_page. Keep that distinction on replay.
+    if value.get("representation") == "json_value" and "payload" in value:
+        projected["payload"] = value["payload"]
+    return projected
 
 
-def _appended_memory_object_projection(value: dict[str, Any]) -> dict[str, Any]:
+def _appended_memory_object_projection(
+    value: dict[str, Any], *, current_namespace: str | None = None,
+) -> dict[str, Any]:
     return _selected_memory_result_fields(
         value,
         ("oid", "name", "appended", "list_field", "length"),
+        current_namespace=current_namespace,
     )
 
 
 def _selected_memory_result_fields(
     value: dict[str, Any],
     fields: tuple[str, ...],
+    *,
+    current_namespace: str | None = None,
 ) -> dict[str, Any]:
     projected = {
         key: value[key]
@@ -1821,31 +1989,35 @@ def _selected_memory_result_fields(
         if key in value and value[key] is not None
     }
     if "namespace" in value:
-        projected["namespace"] = _semantic_memory_namespace(value["namespace"])
+        projected["namespace"] = _semantic_memory_namespace(value["namespace"], current_namespace=current_namespace)
     return projected
 
 
-def _memory_object_identity_projection(value: dict[str, Any]) -> dict[str, Any]:
+def _memory_object_identity_projection(
+    value: dict[str, Any], *, current_namespace: str | None = None,
+) -> dict[str, Any]:
     projected = {
         key: value[key]
         for key in ("oid", "name", "type")
         if key in value and value[key] is not None
     }
     if "namespace" in value:
-        projected["namespace"] = _semantic_memory_namespace(value["namespace"])
+        projected["namespace"] = _semantic_memory_namespace(value["namespace"], current_namespace=current_namespace)
     return projected
 
 
-def _semantic_memory_namespace(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-    return re.sub(r"(?<=process:)pid_[A-Za-z0-9]+", "self", value)
+def _semantic_memory_namespace(value: Any, *, current_namespace: str | None) -> Any:
+    # Only an exact Host-provided namespace can be replaced with the API's
+    # current-namespace selector. Foreign, child, and literal "process:self"
+    # namespace strings keep their original identity and authority boundary.
+    return None if current_namespace is not None and value == current_namespace else value
 
 
 def _compact_materialized_payload_entry_record(
     record: dict[str, Any],
     *,
     include_object_ids: bool,
+    current_namespace: str | None = None,
 ) -> dict[str, Any]:
     entry = record.get("entry")
     if isinstance(entry, dict) and entry.get("kind") in {
@@ -1861,7 +2033,9 @@ def _compact_materialized_payload_entry_record(
         "context_omissions",
         "context_compacted",
     }:
-        entry = _compact_llm_context_entry(entry)
+        entry = _compact_llm_context_entry(
+            entry, current_namespace=current_namespace,
+        )
     compact = {
         "entry_index": record.get("entry_index"),
         "entry": entry,
@@ -1871,12 +2045,16 @@ def _compact_materialized_payload_entry_record(
     return compact
 
 
-def _compact_llm_context_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _compact_llm_context_payload(
+    payload: dict[str, Any], *, current_namespace: str | None = None,
+) -> dict[str, Any]:
     entries = payload.get("entries")
     compact: dict[str, Any] = {}
     if isinstance(entries, list):
         compact["entries"] = [
-            _compact_llm_context_entry(entry)
+            _compact_llm_context_entry(
+                entry, current_namespace=current_namespace,
+            )
             if isinstance(entry, dict)
             else entry
             for entry in entries
@@ -1893,14 +2071,9 @@ def _semantic_object_name(value: Any) -> Any:
     return selected
 
 
-def _semantic_object_namespace(value: Any) -> Any:
-    selected = str(value) if value is not None else value
-    if isinstance(selected, str) and selected.startswith("process:pid_"):
-        return "process:self"
-    return selected
-
-
-def _compact_llm_context_entry(entry: dict[str, Any]) -> dict[str, Any]:
+def _compact_llm_context_entry(
+    entry: dict[str, Any], *, current_namespace: str | None = None,
+) -> dict[str, Any]:
     kind = str(entry.get("kind") or "runtime_update")
     if kind == "process_started":
         return {
@@ -1923,11 +2096,13 @@ def _compact_llm_context_entry(entry: dict[str, Any]) -> dict[str, Any]:
         }
         return {"kind": kind, "state": actionable}
     if kind in {"capabilities_delta", "capabilities_snapshot"}:
-        return _compact_capabilities_context_entry(entry, kind=kind)
+        return _compact_capabilities_context_entry(
+            entry, kind=kind, current_namespace=current_namespace,
+        )
     if kind in {"tool_table_delta", "tool_table_snapshot"}:
         return _compact_tool_table_context_entry(entry, kind=kind)
     if kind == "events_delta":
-        return _compact_events_context_entry(entry, kind=kind)
+        return _compact_events_context_entry(entry, kind=kind, current_namespace=current_namespace)
     if kind == "memory_delta":
         return _compact_memory_context_entry(entry, kind=kind)
     if kind == "context_omissions":
@@ -1960,11 +2135,12 @@ def _compact_capabilities_context_entry(
     entry: dict[str, Any],
     *,
     kind: str,
+    current_namespace: str | None = None,
 ) -> dict[str, Any]:
     raw_caps = entry.get("upserted", entry.get("capabilities", []))
     capabilities = (
         [
-            _compact_llm_context_capability(cap)
+            _compact_llm_context_capability(cap, current_namespace=current_namespace)
             for cap in raw_caps
             if isinstance(cap, dict)
         ]
@@ -2006,6 +2182,7 @@ def _compact_events_context_entry(
     entry: dict[str, Any],
     *,
     kind: str,
+    current_namespace: str | None = None,
 ) -> dict[str, Any]:
     raw_events = entry.get("events")
     events = []
@@ -2016,7 +2193,7 @@ def _compact_events_context_entry(
             events.append(
                 {
                     "type": event.get("type"),
-                    "payload": _compact_host_event_payload(event.get("payload")),
+                    "payload": _compact_host_event_payload(event.get("payload"), current_namespace=current_namespace),
                 }
             )
     return {"kind": kind, "events": events}
@@ -2047,7 +2224,9 @@ def _compact_memory_context_entry(
     return selected
 
 
-def _compact_llm_context_capability(value: dict[str, Any]) -> dict[str, Any]:
+def _compact_llm_context_capability(
+    value: dict[str, Any], *, current_namespace: str | None = None,
+) -> dict[str, Any]:
     selected = {
         key: value[key]
         for key in (
@@ -2062,7 +2241,9 @@ def _compact_llm_context_capability(value: dict[str, Any]) -> dict[str, Any]:
         if value.get(key) not in (None, "", [], {}, False)
     }
     if "resource" in selected:
-        selected["resource"] = _semantic_host_identifier_text(
-            selected["resource"]
-        )
+        resource = selected.pop("resource")
+        if isinstance(resource, str) and resource.startswith("object_namespace:"):
+            selected.update(_namespace_capability_fields(resource, current_namespace=current_namespace))
+        else:
+            selected["resource"] = _semantic_host_identifier_text(resource)
     return selected

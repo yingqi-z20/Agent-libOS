@@ -535,6 +535,7 @@ class LLMProfile:
     max_total_tokens_per_call: StrictInt | None = None
     context_window_tokens: int | None = None
     allow_custom_base_url: bool = False
+    logical_call_timeout_s: StrictFloat | None = None
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -582,6 +583,9 @@ class LLMDefaults:
     persist_full_io: bool = True
     json_instruction: str = "You must respond with a valid JSON object."
     fallback_status_codes: tuple[int, ...] = (404, 405)
+    # Explicit Host opt-in: one deadline across every physical attempt in a
+    # logical call. timeout_s remains the SDK's independent I/O timeout.
+    logical_call_timeout_s: StrictFloat | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "profiles", _ImmutableDict(self.profiles))
@@ -1960,6 +1964,7 @@ def _validate_llm_config(
             "llm.max_tokens must not exceed llm.max_total_tokens_per_call"
         )
     _positive("llm.timeout_s", llm.timeout_s)
+    _positive_optional("llm.logical_call_timeout_s", llm.logical_call_timeout_s)
     _nonnegative("llm.max_retries", llm.max_retries)
     _positive("llm.compatibility_retry_attempts", llm.compatibility_retry_attempts)
     _positive("llm.action_repair_attempts", llm.action_repair_attempts)
@@ -2014,6 +2019,7 @@ def _validate_llm_profile(
     _optional_non_empty(f"{prefix}.prompt_cache_key", profile.prompt_cache_key)
     _validate_llm_profile_cache(profile, llm, prefix=prefix)
     _positive_optional(f"{prefix}.timeout_s", profile.timeout_s)
+    _positive_optional(f"{prefix}.logical_call_timeout_s", profile.logical_call_timeout_s)
     _nonnegative_optional(f"{prefix}.max_retries", profile.max_retries)
     _nonnegative_optional(f"{prefix}.temperature", profile.temperature)
     for field in (

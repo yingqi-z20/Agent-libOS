@@ -196,7 +196,7 @@ class TestToolProtocol:
             "array",
         }
         assert "JSON strings are stored literally" in payload["description"]
-        assert "JSON strings are appended literally" in entry["description"]
+        assert entry["description"] == payload["description"]
 
         created = CreateMemoryObjectArgs(
             type="plan",
@@ -234,7 +234,7 @@ class TestToolProtocol:
             "namespace"
         ]
         assert "runtime-only goal object may be unavailable" in read_name["description"]
-        assert "Do not broaden to the parent `process` namespace" in list_namespace[
+        assert "Do not broaden to a parent namespace after denial" in list_namespace[
             "description"
         ]
 

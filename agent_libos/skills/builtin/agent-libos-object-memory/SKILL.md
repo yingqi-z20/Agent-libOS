@@ -11,7 +11,11 @@ reopen; export or explicitly capture required payloads. The Host's narrow
 committed-root initial-GOAL recovery path does not make these ordinary Objects
 durable.
 
-Names are namespace-local lookup, not authority: trimmed, nonempty, not `.`/`..`, with no `/` or `\`. Omitted namespace means process scope.
+Names are namespace-local lookup, not authority: trimmed, nonempty, not `.`/`..`, with no `/` or `\`.
+
+<!-- tool-contract: field:current_namespace -->
+Object Memory namespace. Pass JSON null to select this process namespace; omission is also valid when allowed by the call schema. Explicit strings name exact namespaces, including literal 'process:self'; they are not aliases. Do not broaden to a parent namespace after denial.
+<!-- /tool-contract -->
 
 Tool schema visibility comes from Skill projection. Within these tools,
 namespace/Object capabilities govern discovery and operations; prompt visibility
@@ -22,7 +26,11 @@ is not a view query. Only `create_memory_object` auto-adds its handle as a root.
 
 ### `create_memory_namespace`
 
-Creates one slash-delimited `namespace`; `parent_namespace` defaults to its path parent. Create parents first. Top-level needs no parent right; child needs existing parent write. Duplicate fails, not ensure/upsert. `metadata` grants nothing. Output is `namespace`, `parent_namespace`, `created=true`.
+<!-- tool-contract: field:path_parent_namespace -->
+Parent namespace. JSON null selects the path parent; top-level namespaces have no parent. Omission is also valid when allowed by the call schema. An explicit string names the exact parent namespace.
+<!-- /tool-contract -->
+
+Creates one slash-delimited `namespace`. Create parents first. Top-level needs no parent right; child needs existing parent write. Duplicate fails, not ensure/upsert. `metadata` grants nothing. Output is `namespace`, `parent_namespace`, `created=true`.
 
 ### `list_memory_namespace`
 
@@ -36,10 +44,12 @@ Objects expose OID/namespace/name/type/version; children expose namespace/parent
 
 Creates typed JSON and attaches its handle to the caller's MemoryView. Required: `type`, direct JSON `payload`. Optional: name, namespace, metadata, parents, `immutable` (true).
 
+<!-- tool-contract: field:direct_json -->
+Direct JSON value. JSON strings are stored literally; pass an object or array value, not a JSON-encoded string, when a container is intended.
+<!-- /tool-contract -->
+
 - Valid types are `task`, `goal`, `plan`, `step`, `constraint`, `message`, `human_decision`, `human_request`, `tool_result`, `observation`, `error_trace`, `code_patch`, `test_result`, `evidence`, `claim`, `summary`, `skill`, `tool_spec`, `tool_candidate`, `tool_artifact`, `checkpoint`, `process_state`, `external_ref`, and `artifact`. Type classifies; it does not impose a payload schema.
-- Pass containers directly, not encoded strings. A JSON-looking string is still
-  a string and is stored literally; use an actual object/array value when a
-  container is intended. Payload is bounded. Choose a stable name for later
+- Payload is bounded. Choose a stable name for later
   read/append/transfer/task use.
 - Set `immutable=false` at creation when append/writable ownership is needed. Use a `plan` with `{"entries":[]}` as a ledger.
 - `metadata` accepts only `title`, `summary`, `tags`, `mime_type`, `sensitivity`, `retention_policy`, `trust_level`, `integrity`, `tenant`, and `principal`. Fields and collection items are strictly typed and bounded by configured character, item-count, and canonical-byte limits. Origin/token estimate are derived; models cannot declassify or elevate trust/integrity.
@@ -76,6 +86,10 @@ Needs namespace read and Object read/write; inherits flow labels/provenance and 
 6. Before exit, re-read ledgers and map every requirement to evidence/blocker; arrange reopen durability separately.
 
 ## Failure and recovery
+
+<!-- tool-contract: result:memory -->
+A failed call remains ok=false with a safe error type and recovery hint when available; a missing result is not success. A complete json_value read preserves payload even when it is JSON null; a canonical_json_page read carries a preview instead.
+<!-- /tool-contract -->
 
 - Namespace/Object duplicate: list and read the exact existing name. Reuse only after verification; otherwise choose a deliberate new name. Blind retry cannot upsert.
 - Missing/unreadable parent: correct the OID or authority. Never drop true provenance merely to make creation pass.

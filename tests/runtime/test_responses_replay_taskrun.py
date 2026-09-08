@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -194,3 +195,30 @@ def test_first_taskrun_replay_request_seeds_existing_visible_transcript() -> Non
         assert legacy_result["result"]["payload"]["message"] == "VISIBLE_TASKRUN_ECHO_1"
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize("corruption", ["missing", "changed-payload"])
+def test_corrupt_replay_run_is_isolated_during_startup(tmp_path: Path, corruption: str) -> None:
+    target = tmp_path / "corrupt-replay.sqlite"
+    runtime = Runtime.open(target, config=CONFIG)
+    try:
+        created, _ = seed_validated_wait(runtime)
+        head = runtime.store.get_llm_replay_head(created.root_pid)
+        unaffected_pid = runtime.process.spawn(goal="unaffected process")
+    finally:
+        runtime.close()
+    with sqlite3.connect(target) as connection:
+        if corruption == "missing":
+            connection.execute("DELETE FROM llm_replay_turns WHERE turn_id = ?", (head.turn_id,))
+        else:
+            connection.execute("UPDATE llm_replay_turns SET payload_json = '{}' WHERE turn_id = ?", (head.turn_id,))
+    reopened = Runtime.open(target, config=CONFIG)
+    try:
+        summary = reopened.task_runs.get(created.run_id)
+        assert summary.status is TaskRunStatus.NEEDS_ATTENTION
+        assert any(blocker["kind"] == "payload_corrupt" for blocker in summary.blockers)
+        assert reopened.process.get(unaffected_pid) is not None
+        assert not reopened.store.list_llm_calls(pid=unaffected_pid)
+        assert len(reopened.store.list_llm_calls(pid=created.root_pid)) == 1
+    finally:
+        reopened.close()

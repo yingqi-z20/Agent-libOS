@@ -3279,7 +3279,11 @@ _OBSERVATION_KEY_FIELDS: dict[str, tuple[str, ...]] = {
     # reverted its fix to reproduce the failure again, in a loop.  Older runs
     # fall back to stubs that keep argv and returncode.
     "list_memory_namespace": ("namespace",),
-    "read_memory_object": ("namespace", "name"),
+    # A subtree or byte page is an independent observation. Replacing it
+    # requires the same selection, including the extent of the returned page.
+    "read_memory_object": (
+        "namespace", "name", "json_pointer", "page_offset_bytes", "page_bytes",
+    ),
     "list_checkpoints": (),
     "list_capabilities": (),
     "list_child_processes": (),

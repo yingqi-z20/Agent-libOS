@@ -7132,8 +7132,8 @@ class TaskRunManager:
     # ------------------------------------------------------------------
     # Startup recovery and evidence-based manual recovery
 
-    def validate_recoverable_payloads(self) -> None:
-        """Integrity-check recoverable Run payloads without writing or dispatching."""
+    def validate_recoverable_payloads(self) -> frozenset[str]:
+        """Validate without effects; return Runs excluded from source retention."""
 
         cursor: TaskRunCursor | None = None
         while True:
@@ -7154,7 +7154,7 @@ class TaskRunManager:
                     )
             cursor = page.next_cursor
             if cursor is None:
-                return
+                return frozenset(self._prevalidated_blockers)
 
     def _prevalidate_recoverable_record(self, record: TaskRunRecord) -> None:
         goal = self._payload_by_role(record.run_id, "goal")

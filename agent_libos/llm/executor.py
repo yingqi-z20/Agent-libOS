@@ -111,6 +111,7 @@ from agent_libos.models import (
     DataFlowContext,
     DataLabels,
     DataSink,
+    Event,
     EventPriority,
     EventType,
     ExternalEffectClassification,
@@ -624,6 +625,7 @@ class LLMProcessExecutor:
                 "title": goal.metadata.title,
                 "type": goal.type.value,
             },
+            current_namespace=self._memory.resolve_namespace(process.pid),
         )
 
     def _effective_prompt_layout(self, pid: str) -> str:
@@ -1840,6 +1842,7 @@ class LLMProcessExecutor:
             original_goal_context=original_goal_context,
             fallback_json_actions=fallback_json_actions,
             prompt_layout=self._effective_prompt_layout(pid),
+            current_namespace=self._memory.resolve_namespace(pid),
             pending_message_notice=pending_message_notice,
             reopen_digest=reopen_digest,
         )
@@ -1955,6 +1958,7 @@ class LLMProcessExecutor:
             flow_context,
             label_events,
         )
+        reopen_digest, flow_context = self._reopen_activity_digest(pid, context, flow_context)
         messages = self._build_model_messages(
             pid=pid,
             image=image,
@@ -1967,7 +1971,7 @@ class LLMProcessExecutor:
             available_skills=available_skills,
             original_goal_context=original_goal_context,
             pending_message_notice=pending_message_notice,
-            reopen_digest=self._reopen_activity_digest(pid, context),
+            reopen_digest=reopen_digest,
         )
         if task_context is not None:
             messages = self._task_run_messages(
@@ -8307,7 +8311,9 @@ class LLMProcessExecutor:
         )
         return notice
 
-    def _reopen_activity_digest(self, pid: str, context: Any) -> str | None:
+    def _reopen_activity_digest(
+        self, pid: str, context: Any, flow_context: DataFlowContext,
+    ) -> tuple[str | None, DataFlowContext]:
         """Describe pre-reopen effects when their result Objects are gone.
 
         Only a context that omits earlier results for ``capability_denied`` or
@@ -8317,7 +8323,7 @@ class LLMProcessExecutor:
         """
 
         if not context_lost_earlier_results(getattr(context, "object_manifest", None)):
-            return None
+            return None, flow_context
         scan_limit = self.config.llm_context.reopen_digest_event_scan_limit
         try:
             events = collect_pre_reopen_events(
@@ -8327,12 +8333,24 @@ class LLMProcessExecutor:
                 page_size=min(scan_limit, DEFAULT_CONFIG.gui.event_buffer_limit),
             )
         except ValidationError:
-            return None
+            return None, flow_context
+        # Old events have no immutable label provenance. Their free-form
+        # metadata cannot be reclassified from today's possibly deleted or
+        # changed resources. Only already-visible Skill IDs are safe to reuse.
+        visible_skills = self._tools.model_loaded_skills(pid)
+        events = [event for event in events if (
+            "data_labels" in event.payload
+            or (event.type == EventType.SKILL_LOADED
+                and event.payload.get("skill_id") in visible_skills)
+        )]
+        included_events: list[Event] = []
         digest = render_reopen_activity_digest(
             events,
             redact=lambda payload: self._tools.redact_model_context(pid, payload),
+            on_included_event=included_events.append,
         )
-        return digest or None
+        flow_context = self.context_memory.include_event_labels(flow_context, included_events)
+        return digest or None, flow_context
 
     def _pending_message_notice(self, pid: str) -> dict[str, Any] | None:
         """Return the unread-input notice that must drive this quantum's prompt.

@@ -235,3 +235,38 @@ def test_private_replay_recovery_never_invents_delegation_ancestor_authority(tmp
                 _validate(reopened, child, context, allow_recovered_source_snapshots=True)
     finally:
         reopened.close()
+
+
+def test_startup_retains_valid_read_grants_across_capability_pages(tmp_path: Path) -> None:
+    config = replace(
+        DEFAULT_CONFIG,
+        capability=replace(DEFAULT_CONFIG.capability, list_limit=1),
+        runtime=replace(DEFAULT_CONFIG.runtime, object_payload_recovery_page_size=1),
+    )
+    target = tmp_path / "multi-page-grants.sqlite"
+    runtime = Runtime.open(target, config=config)
+    try:
+        pid = runtime.process.spawn(goal="preserve paginated grants")
+        handle = runtime.memory.create_object(pid, ObjectType.ARTIFACT, {"value": "private"})
+        extra = runtime.capability.issue_trusted(
+            pid, f"object:{handle.oid}", [CapabilityRight.READ, CapabilityRight.WRITE], issued_by="test",
+        )
+        context = runtime.data_flow.context_from_source_oids(pid, [handle.oid], include_current=False)
+        _retain_history(runtime, pid, context)
+    finally:
+        runtime.close()
+    reopened = Runtime.open(target, config=config)
+    try:
+        for cap_id in (handle.capability_id, extra.cap_id):
+            cap = reopened.store.get_capability(cap_id)
+            assert cap.active and cap.rights == {CapabilityRight.READ.value}
+        _validate(reopened, pid, context, allow_recovered_source_snapshots=True)
+        reopened.capability.issue_trusted(
+            pid, f"object:{handle.oid}", [CapabilityRight.READ], issued_by="test", effect=CapabilityEffect.DENY,
+        )
+        with pytest.raises(CapabilityDenied):
+            _validate(reopened, pid, context, allow_recovered_source_snapshots=True)
+        assert any(row.action == "capability.authorize" and row.decision.get("allowed") is False
+                   for row in reopened.audit.trace(actor=pid))
+    finally:
+        reopened.close()

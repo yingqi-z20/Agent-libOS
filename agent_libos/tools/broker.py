@@ -171,7 +171,6 @@ def _normalize_schema_scalar_strings(
         normalized = _normalize_scalar_string(
             value,
             allowed_types,
-            enum_values=_schema_variant_enum_values(variants),
         )
         if normalized is value:
             return value
@@ -342,55 +341,16 @@ def _schema_variant_types(variants: list[dict[str, Any]]) -> set[str]:
     return selected
 
 
-def _schema_variant_enum_values(variants: list[dict[str, Any]]) -> frozenset[str]:
-    selected: set[str] = set()
-    for variant in variants:
-        enum = variant.get("enum")
-        if isinstance(enum, list):
-            selected.update(item for item in enum if isinstance(item, str))
-        const = variant.get("const")
-        if isinstance(const, str):
-            selected.add(const)
-    return frozenset(selected)
-
-
-# Text some providers emit for an intended JSON ``null`` in a nullable string
-# field.  Matched exactly (no case folding) so ordinary words are never touched.
-_NULL_STRING_LITERALS = frozenset({"null", "None"})
-
-
-def _normalize_nullable_string_literal(
-    value: str,
-    allowed_types: set[str],
-    enum_values: frozenset[str],
-) -> Any:
-    """Repair the literal text ``null``/``None`` sent for a nullable string field.
-
-    Some providers serialize an intended JSON null as the string ``"null"``
-    (observed for ``namespace``, ``base``, and ``head``), which then fails as a
-    literal namespace or Git ref with an error the model cannot decode.  Only a
-    field whose schema admits both string and null, and whose enum does not
-    list that literal, is repaired; string-only fields are never reinterpreted.
-    """
-
-    if "null" not in allowed_types:
-        return value
-    stripped = value.strip()
-    if stripped not in _NULL_STRING_LITERALS or stripped in enum_values:
-        return value
-    return None
-
-
 def _normalize_scalar_string(
     value: str,
     allowed_types: set[str],
-    *,
-    enum_values: frozenset[str] = frozenset(),
 ) -> Any:
     if not allowed_types:
         return value
     if "string" in allowed_types:
-        return _normalize_nullable_string_literal(value, allowed_types, enum_values)
+        # A string already accepted by the schema is literal data, including
+        # "null" and "None". Intent cannot be inferred from its spelling.
+        return value
     stripped = value.strip()
     if not stripped:
         return value

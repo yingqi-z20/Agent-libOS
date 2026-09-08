@@ -2,6 +2,23 @@
   "schema_version": 2,
   "invariants": [
     {
+      "id": "declared-tool-contracts-preserve-canonical-semantics",
+      "title": "Declared tool semantics agree across native/transport schemas, parser, generated Skill guidance, and result replay; wire-valid Runtime workflows preserve authority and state boundaries.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/unit/test_tool_contract_consistency.py::test_all_builtin_contracts_pass_without_rewriting_files",
+        "tests/unit/test_tool_contract_consistency.py::test_removing_one_contract_from_a_multi_contract_tool_cannot_reduce_coverage",
+        "tests/unit/test_tool_contract_consistency.py::test_failure_checks_cannot_be_disabled_by_changing_the_registry",
+        "tests/runtime/test_tool_contract_workflows.py::test_wire_valid_contract_workflow_preserves_state_and_authority[chat-legacy_v1]",
+        "tests/runtime/test_tool_contract_workflows.py::test_wire_valid_contract_workflow_preserves_state_and_authority[chat-cache_optimized_v2]",
+        "tests/runtime/test_tool_contract_workflows.py::test_wire_valid_contract_workflow_preserves_state_and_authority[responses-legacy_v1]",
+        "tests/runtime/test_tool_contract_workflows.py::test_wire_valid_contract_workflow_preserves_state_and_authority[responses-cache_optimized_v2]",
+        "tests/runtime/test_checkpoint_target_contract.py::test_literal_self_and_foreign_checkpoint_targets_remain_unauthorized",
+        "tests/runtime/test_prompt_namespace_targets.py::test_foreign_and_literal_self_namespaces_remain_literal_and_enforced"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "tool-visibility-is-not-authority",
       "title": "Tool visibility does not grant protected resource authority.",
       "lane": "security",
@@ -3746,7 +3763,8 @@
         "tests/security/test_replay_source_authority.py::test_startup_private_replay_retains_only_existing_read_authority[user-revoked]",
         "tests/security/test_replay_source_authority.py::test_startup_does_not_retain_replay_source_authority_when_full_io_is_disabled",
         "tests/security/test_replay_source_authority.py::test_private_replay_recovery_decodes_history_once_across_object_pages",
-        "tests/security/test_replay_source_authority.py::test_private_replay_recovery_never_invents_delegation_ancestor_authority[False]"
+        "tests/security/test_replay_source_authority.py::test_private_replay_recovery_never_invents_delegation_ancestor_authority[False]",
+        "tests/security/test_replay_source_authority.py::test_startup_retains_valid_read_grants_across_capability_pages"
       ],
       "benchmark_attack_classes": []
     },
@@ -4279,6 +4297,17 @@
       "title": "Runtime-mediated payload egress is bound to trusted source labels, Host Sink clearance, ordinary authority, and exact one-shot release.",
       "lane": "security",
       "node_ids": [
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-read_text]",
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-read_directory]",
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-write_text]",
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-write_directory]",
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-read_then_delete]",
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-write_text_source]",
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-write_directory_source]",
+        "tests/security/test_reopen_digest_data_flow.py::test_shell_event_retains_explicit_source_labels_after_reopen",
+        "tests/security/test_reopen_digest_data_flow.py::test_digest_rejects_incomplete_trusted_labels",
+        "tests/security/test_reopen_digest_data_flow.py::test_directory_state_event_keeps_labels_when_binding_is_deleted",
+        "tests/security/test_reopen_digest_data_flow.py::test_digest_ignores_labels_of_events_without_rendered_activity[True-payload2]",
         "tests/unit/test_data_flow_models.py::test_authority_data_flow_schema_versions_reject_non_integer_aliases[True]",
         "tests/unit/test_data_flow_models.py::test_authority_data_flow_schema_versions_reject_non_integer_aliases[1.0]",
         "tests/unit/test_data_flow_models.py::test_authority_data_flow_schema_versions_reject_non_integer_aliases[1]",
@@ -5543,6 +5572,8 @@
         "tests/runtime/test_long_horizon_working_set.py::test_supersession_keys_cover_observations_but_never_actions_or_failures",
         "tests/runtime/test_long_horizon_working_set.py::test_feedback_stub_summary_describes_without_copying_content",
         "tests/runtime/test_long_horizon_working_set.py::test_discovery_supersession_keys_follow_the_surfaced_skills",
+        "tests/runtime/test_long_horizon_working_set.py::test_working_set_keeps_independent_memory_selections[subtrees]",
+        "tests/runtime/test_long_horizon_working_set.py::test_working_set_keeps_independent_memory_selections[byte-pages]",
         "tests/unit/test_prompt_omitted_object_guidance.py::test_superseded_only_omissions_do_not_ask_for_re_observation",
         "tests/unit/test_prompt_projection_compaction.py::test_v2_compaction_strips_object_ids_from_feedback_stubs"
       ],
@@ -5578,11 +5609,12 @@
       "benchmark_attack_classes": []
     },
     {
-      "id": "nullable-string-literal-repair-is-schema-guided",
-      "title": "The literal text null or None for a string-or-null argument is repaired to JSON null and audited; string-only fields and enum literals are never reinterpreted.",
+      "id": "schema-accepted-tool-strings-remain-literal",
+      "title": "Tool argument normalization preserves schema-accepted strings, including null and None spellings in nullable fields and direct JSON memory values; only unambiguous non-string repairs are allowed.",
       "lane": "runtime",
       "node_ids": [
-        "tests/runtime/test_long_horizon_working_set.py::test_null_string_literals_are_repaired_only_for_nullable_string_fields"
+        "tests/runtime/test_long_horizon_working_set.py::test_schema_accepted_strings_remain_literal_memory_values[null]",
+        "tests/runtime/test_long_horizon_working_set.py::test_schema_accepted_strings_remain_literal_memory_values[None]"
       ],
       "benchmark_attack_classes": []
     },

@@ -12,6 +12,7 @@ import pytest
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
+from agent_libos.models import LLMCallRecord
 from agent_libos.skills import get_builtin_skill_catalog
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from agent_libos.tools.builtin.process import _build_cumulative_exit_review
@@ -1107,3 +1108,102 @@ class _SingleActionClient:
             model="fake",
             usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         )
+
+
+@pytest.mark.parametrize(
+    ("call_usages", "expected_input", "expected_output"),
+    [
+        (
+            [("responses", {
+                "input_tokens": 1200, "output_tokens": 42, "reasoning_tokens": 30,
+            })],
+            1200, 42,
+        ),
+        (
+            [
+                ("chat", {"prompt_tokens": 100, "completion_tokens": 10}),
+                ("responses", {"input_tokens": 200, "output_tokens": 20}),
+            ],
+            300, 30,
+        ),
+        (
+            [
+                ("chat", {
+                    "prompt_tokens": 7, "input_tokens": 999,
+                    "completion_tokens": 3, "output_tokens": 888,
+                }),
+                ("responses", {
+                    "input_tokens": 11, "prompt_tokens": 999,
+                    "output_tokens": 5, "completion_tokens": 888,
+                }),
+            ],
+            18, 8,
+        ),
+        (
+            [
+                ("chat", {
+                    "prompt_tokens": 0, "input_tokens": 999,
+                    "completion_tokens": 0, "output_tokens": 888,
+                }),
+                ("responses", {
+                    "input_tokens": 0, "prompt_tokens": 999,
+                    "output_tokens": 0, "completion_tokens": 888,
+                }),
+            ],
+            0, 0,
+        ),
+    ],
+    ids=["responses", "mixed-apis", "conflicting-aliases", "reported-zero"],
+)
+def test_report_token_totals_match_persisted_provider_usage_across_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    call_usages: list[tuple[str, dict[str, int]]],
+    expected_input: int,
+    expected_output: int,
+) -> None:
+    from benchmarks.long_horizon_agent import runner
+    from experiments.inspect_long_horizon_run import inspect_database
+
+    pending_calls = iter(enumerate(call_usages))
+
+    def retain_next_call(
+        runtime: Runtime, pid: str, *, max_quanta: int,
+    ) -> list[Any]:
+        # Exercise both report aggregation and SQLite reopen without a provider.
+        selected = next(pending_calls, None)
+        if selected is not None:
+            index, (api, usage) = selected
+            runtime.store.insert_llm_call(LLMCallRecord(
+                call_id=f"token-call-{index}", pid=pid, image_id=None,
+                purpose="action_selection", status="ok", api=api,
+                messages=[], tools=[], tool_calls=[], usage=usage,
+                created_at=f"2026-09-08T00:00:0{index}+00:00",
+            ))
+        return []
+
+    monkeypatch.setattr(Runtime, "run_process_until_idle", retain_next_call)
+    # This test covers persisted usage across reopen; Host limit support has
+    # separate preflight coverage and must not make token reporting OS-dependent.
+    monkeypatch.setattr(
+        runner, "_preflight_host_oracle", lambda *_args, **_kwargs: None,
+        raising=False,
+    )
+    monkeypatch.setattr(runner, "evaluate_run", lambda *_args, **_kwargs: {
+        "passed": False, "checks": {}, "changed_files": [],
+        "test_returncode": None, "test_output_tail": "", "behavior_probe": {},
+        "host_oracle": {}, "workflow_evidence": [],
+    })
+    root = tmp_path / "evaluation"
+    report = run_evaluation(root, phase_one_quanta=1, max_quanta=2)
+    run = report["runs"][0]
+    inspected = inspect_database(root / "run-1/state/runtime.sqlite")
+
+    assert run["llm_calls"] == len(call_usages)
+    assert run["prompt_tokens"] == run["total_input_tokens"] == expected_input
+    assert run["completion_tokens"] == run["total_output_tokens"] == expected_output
+    assert report["metrics"]["mean_prompt_tokens"] == expected_input
+    assert report["metrics"]["total_input_tokens"] == expected_input
+    assert report["metrics"]["total_output_tokens"] == expected_output
+    assert inspected["totals"]["input_tokens"] == expected_input
+    assert inspected["totals"]["output_tokens"] == expected_output

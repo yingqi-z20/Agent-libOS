@@ -704,6 +704,9 @@ def behavior_probe_source() -> str:
             "        out['validator'] = (",
             "            balanced(check_balance(rows('2.5', '-2'), jpy_even))",
             "            and balanced(check_balance(rows('2.5', '-3'), jpy_up))",
+            "            and balanced(check_balance(rows('-2.5', '3'), jpy_up))",
+            "            and balanced(check_balance(rows('-2.5', '2'), jpy_even))",
+            "            and not balanced(check_balance(rows('-2.5', '2'), jpy_up))",
             "            and balanced(check_balance(rows('1.0005', '-1.001'), kwd_3))",
             "            and not balanced(check_balance(rows('2.5', '-2'), jpy_up)))",
             "    except Exception:",
@@ -798,8 +801,8 @@ def regression_coverage(workspace: str | Path) -> dict[str, bool]:
 
     root = Path(workspace).resolve()
     per_consumer = {name: False for name in sorted(CONSUMER_FUNCTIONS)}
-    negative_half = False
-    for path in sorted(root.glob("tests/*.py")):
+    negative_half = dict.fromkeys(per_consumer, False)
+    for path in sorted(root.glob("tests/**/test*.py")):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except (OSError, SyntaxError, UnicodeDecodeError):
@@ -829,10 +832,11 @@ def regression_coverage(workspace: str | Path) -> dict[str, bool]:
                 and (value * 2) == (value * 2).to_integral_value()
                 for value in literals
             ):
-                negative_half = True
+                for call in consumer_calls:
+                    negative_half[_callee_name(call)] = True
     return {
         "whole_unit_per_consumer": all(per_consumer.values()),
-        "negative_half_unit": negative_half,
+        "negative_half_unit": all(negative_half.values()),
     }
 
 

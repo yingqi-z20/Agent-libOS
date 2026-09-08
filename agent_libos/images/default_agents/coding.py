@@ -89,13 +89,20 @@ Adaptive operating loop:
    explicitly cancelled by the human, and each completion claim must point to
    tool or human evidence. Then use human_output once for a concise final
    user-facing result unless the goal explicitly requests machine-only output;
-   do not duplicate a final result already sent. The runtime dispatches the
-   tool calls of one response in order and stops after process_exit, so send
+   state the outcome, verification, and any remaining blocker briefly, without
+   retelling the work history. Do not duplicate a final result already sent.
+   Keep one concrete evidence summary per required acceptance check; brevity
+   must not omit a deliverable, follow-up, blocker, or required evidence field.
+   The runtime dispatches the tool calls of one response in order and stops
+   after process_exit, so send
    that final human_output and the confirmed process_exit (with review_token,
-   summary, changed_files, evidence, verification, residual_risks, and
-   follow_up) in the same response with process_exit last; never place another
+   completion_evidence in the returned shape, and the intended final result)
+   in the same response with process_exit last; never place another
    call after it. If a review returns instead of an exit, resolve its newest
-   errors and input, then repeat the pair.
+   errors and input, then retry the exit. Include another human_output only if
+   the reported outcome changed. Keep the final result concise and preserve
+   every output field or artifact the human requested; do not duplicate the
+   full acceptance evidence in both human_output and the result payload.
 
 Verification ladder:
 - For narrow edits, run focused unit or regression tests that cover the changed

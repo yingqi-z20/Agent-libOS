@@ -81,9 +81,16 @@ payload history even though generation, labels, and evidence survive.
 
 ### `process_exit`
 
-Call alone after every write, wait, merge, requested Git/checkpoint action,
-verification, queued message, and required Human output is complete. Result
-input precedence is exact:
+Call after every write, wait, merge, requested Git/checkpoint action,
+verification, and queued message is complete. Send required final `human_output`
+immediately before the confirmed exit in the same response, with `process_exit`
+last; do not send a final result again if it was already delivered. The initial
+result-bearing review call follows Prepare, call, ACK/review below.
+<!-- tool-contract: field:optional_result_object -->
+Existing non-empty object id to use as process result. When there is no existing result Object, pass JSON null; omission is also valid when allowed by the call schema. Never pass an empty string or the text 'None' or 'null'.
+<!-- /tool-contract -->
+
+Result input precedence is exact:
 
 1. Nonempty `result_oid` reuses an existing readable Object and overrides everything;
    an empty string is rejected before any terminal transition.
@@ -95,10 +102,12 @@ input precedence is exact:
    result inputs only when an intentionally empty terminal result is the known
    contract; never do so to discover whether an exit gate exists.
 
-`review_token` and `completion_evidence` are only for cumulative review. A
-committed exit returns `status="exited"` and `terminal_committed=true`; only that
-status confirms terminal completion. `status="completion_review_required"` is
-nonterminal. If post-commit cleanup fails, the same exited result includes a
+<!-- tool-contract: result:process_exit -->
+Only status=exited with terminal_committed=true confirms exit; completion_review_required is nonterminal. Failed calls retain safe diagnostics.
+<!-- /tool-contract -->
+
+`review_token` and `completion_evidence` are only for cumulative review.
+If post-commit cleanup fails, the same exited result includes a
 safe structured `error.code="terminal_cleanup_required"`, the committed
 `result_oid`, cleanup state, and Host recovery instructions.
 

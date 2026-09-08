@@ -33,6 +33,14 @@ longer defines.
 
 ## Current Invariant Groups
 
+- `declared-tool-contracts-preserve-canonical-semantics`: shared field/result
+  declarations agree with native/transport schemas, canonical parser cases,
+  generated Skill guidance, and result replay. Independent coverage fixtures and
+  mutation tests detect drift; wire-valid Runtime workflows verify nullable
+  targets, literal JSON, CAS conflicts, checkpoint authority, and committed exit.
+  This covers the declarations listed in [Tool contracts](tool_contracts.md),
+  not every business effect or remote provider's schema support. Contracts
+  introduce no aliases or authority and retain primitive denial paths.
 - `tool-visibility-is-not-authority`: visible tools and endpoints do not grant
   protected resource authority.
 - `primitive-checks-before-effects`: primitives enforce capability, policy,
@@ -1467,6 +1475,8 @@ longer defines.
   observation of the same target renders as a content-free stub; Human and
   process input results stay verbatim, the durable Objects are unchanged, and
   the cache-optimized layout strips stub Object ids like any other envelope.
+  Different JSON subtrees and byte pages of one memory Object are independent
+  observations; only the same selection supersedes an earlier result.
 - `source-materialization-stays-within-admission-headroom`: the per-quantum
   source materialization budget never exceeds the process window or the
   resolved per-call input limit minus the fixed prompt overhead and headroom,
@@ -1479,17 +1489,21 @@ longer defines.
 - `container-argument-repair-is-schema-guided`: a JSON-encoded object or array
   tool argument is decoded only when every schema variant forbids strings, and
   the repair is recorded as `llm.tool_arguments_normalized`.
-- `nullable-string-literal-repair-is-schema-guided`: the literal text `null` or
-  `None` sent for an argument whose schema admits both string and null is
-  repaired to JSON null and audited; string-only fields and enum literals are
-  never reinterpreted.
+- `schema-accepted-tool-strings-remain-literal`: text such as `"null"` or
+  `"None"` stays literal when the tool argument schema accepts strings,
+  including nullable fields and direct JSON memory values. Only unambiguous
+  non-string repairs are allowed and audited.
 - `tool-failures-expose-identifier-codes-not-text`: a model-facing tool failure
   carries only identifier-shaped diagnostic codes attached by the tool boundary
   (for example `git_error_code`, `hint`); exception text stays hashed.
 - `reopen-digest-is-payload-free`: after a Runtime reopen released earlier tool
   results, the prompt digest of prior activity is rebuilt from durable events
   older than the last shutdown and carries paths, argv, identifiers, and counts
-  only; without lost results no digest renders.
+  only; without lost results no digest renders. External-effect metadata keeps
+  its historical source labels, which contribute to LLM egress authorization
+  when the event contributes a fact to the digest.
+  Legacy metadata without label provenance is omitted, except for Skill IDs
+  already visible to the process.
 
 ## Known Test Gaps
 

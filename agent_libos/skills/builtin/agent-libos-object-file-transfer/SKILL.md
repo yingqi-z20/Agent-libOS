@@ -14,6 +14,10 @@ apply. Exported files are workspace effects that restore does not undo.
 
 ## Tool guide
 
+<!-- tool-contract: field:current_namespace -->
+Object Memory namespace. Pass JSON null to select this process namespace; omission is also valid when allowed by the call schema. Explicit strings name exact namespaces, including literal 'process:self'; they are not aliases. Do not broaden to a parent namespace after denial.
+<!-- /tool-contract -->
+
 ### `create_object_from_file`
 
 Creates one named immutable Object from a governed text file. Required inputs are `name` and cwd-relative `path`; optional inputs are `namespace`, `encoding`, `max_bytes`, `allow_truncated`, and `object_type`.

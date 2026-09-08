@@ -101,6 +101,10 @@ class RoundingConsumerTests(unittest.TestCase):
     def test_exporter_negative_half(self) -> None:
         self.assertEqual(export_rows(rows("-40961.5"), JPY_UP)[0]["amount"], "-40962")
 
+    def test_validator_negative_half_rounds_away_from_zero(self) -> None:
+        problems = check_balance(rows("-2.5", "3"), JPY_UP)
+        self.assertEqual([p for p in problems if "balance" in p], [])
+
     def test_validator_uses_configured_mode(self) -> None:
         problems = check_balance(rows("2.5", "-2"), JPY_EVEN)
         self.assertEqual([p for p in problems if "balance" in p], [])
@@ -403,11 +407,11 @@ class WholeUnitStyleTests(unittest.TestCase):
 
     def test_exporter_via_fixture_config(self) -> None:
         config = load_config("fixtures/tokyo.ini")
-        self.assertEqual(export_rows(rows("2.5"), config)[0]["amount"], "3")
+        self.assertEqual(export_rows(rows("-2.5"), config)[0]["amount"], "-3")
 
     def test_reporter_via_env_override(self) -> None:
         config = load_config(env={"LEDGERCTL_PRECISION": "0", "LEDGERCTL_ROUNDING": "ROUND_HALF_UP"})
-        self.assertEqual(summarize(rows("2.5"), config).total, Decimal("3"))
+        self.assertEqual(summarize(rows("-2.5"), config).total, Decimal("-3"))
 
 
 if __name__ == "__main__":
@@ -430,3 +434,50 @@ def test_regression_detector_accepts_ordinary_precision_zero_spellings(tmp_path:
         "whole_unit_per_consumer": True,
         "negative_half_unit": True,
     }
+
+
+@pytest.mark.parametrize("consumer", ["exporter", "reporter", "validator"])
+def test_negative_half_coverage_is_required_for_each_consumer(tmp_path: Path, consumer: str) -> None:
+    root = tmp_path / "workspace"
+    prepare_workspace(root)
+    _apply_reference_fix(root)
+    import ast
+    tree = ast.parse(_REGRESSION_TESTS)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            node.body = [
+                fn for fn in node.body
+                if not (isinstance(fn, ast.FunctionDef)
+                        and fn.name.startswith(f"test_{consumer}_negative_half"))
+            ]
+    root.joinpath("tests/test_rounding_consumers.py").write_text(ast.unparse(tree), encoding="utf-8")
+    assert regression_coverage(root)["negative_half_unit"] is False
+
+
+def test_hidden_probe_rejects_validator_with_wrong_negative_rounding(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    prepare_workspace(root)
+    _apply_reference_fix(root)
+    mutant = _FIXED_VALIDATOR.replace(
+        "round_amount(amount, config.precision, config.rounding)",
+        'round_amount(amount, config.precision, config.rounding if amount >= 0 else "ROUND_HALF_EVEN")',
+    )
+    root.joinpath("ledgerctl/validator.py").write_text(mutant, encoding="utf-8")
+    # Direct execution verifies the probe logic without requiring platform
+    # subprocess-containment metrics used by the full Host oracle.
+    probe = _run(root, "-c", LEDGERCTL_SCENARIO.behavior_probe_source())
+    assert probe.returncode == 0, probe.stderr
+    assert json.loads(probe.stdout)["validator"] is False
+
+
+def test_regression_detector_discovers_test_subpackages(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    prepare_workspace(root)
+    _apply_reference_fix(root)
+    package = root / "tests" / "rounding"
+    package.mkdir()
+    (package / "__init__.py").touch()
+    root.joinpath("tests/test_rounding_consumers.py").rename(package / "test_rounding_consumers.py")
+    suite = _run(root, "-m", "unittest", "discover", "-s", "tests", "-q")
+    assert suite.returncode == 0, suite.stderr
+    assert regression_coverage(root) == {"whole_unit_per_consumer": True, "negative_half_unit": True}

@@ -9,6 +9,30 @@ Git history remains the record for earlier development snapshots.
 Changes intended for the next published version must be summarized here before
 release. Do not treat an entry in this section as shipped behavior.
 
+- Define shared field and result contracts for model-facing tool semantics,
+  generate matching Skill guidance, and gate schema/argument/result drift in CI.
+  All core tools receive Chat/Responses and MCP schema checks; explicit semantic
+  coverage includes nullable targets, literal JSON, exit results, and file CAS.
+  Contracts add no authority or aliases and retain existing Skill size limits.
+- Preserve `payload: null` for complete Object Memory reads in v2 result replay,
+  while omitting the empty payload placeholder on paginated reads.
+- Render v2 Object Memory targets with the API's nullable current-namespace
+  selector, preserving literal foreign namespaces and permission/delegation
+  resources. Retained goal bindings use the same Host namespace as the prompt.
+- Add an optional Host logical LLM-call deadline across transport retries,
+  compatibility fallback, and SDK cleanup, with terminal attempt evidence and
+  recoverable timeout handling. Existing I/O timeouts and disabled defaults
+  remain compatible; evaluation provenance binds an enabled deadline.
+- Align coding and Skill guidance on conditional file writes and concise
+  same-response final reporting and confirmed exit, preserving cumulative
+  review and fresh Human-input checks.
+- Keep the original schema's optional fields and open-object constraints when
+  OpenAI strict conversion cannot complete. Discard partial conversion edits,
+  and make the nullable process-result identifier explicit in its tool guide.
+- Explain nullable checkpoint caller selection consistently with strict tool
+  schemas, and accept the compact creation receipt without requiring a Host id.
+- Preserve safe failure codes, types, and recovery hints for v2 Memory and
+  process-exit results that previously disappeared behind success projections.
 - Dispatch every tool call in a multi-call model response as one ordered batch
   even when `llm.parallel_tool_calls` is off. Providers that ignore the request
   option previously had all but one call silently discarded, which cost a
@@ -76,12 +100,10 @@ release. Do not treat an entry in this section as shipped behavior.
   receipt-order oracles), a `--scenario` CLI selector, per-run wall-clock,
   latency, prompt-section, batch, and stop-reason diagnostics, and the
   payload-free `experiments/inspect_long_horizon_run.py` inspector.
-- Repair the literal text `"null"`/`"None"` sent for a tool argument whose
-  schema admits both string and null (for example `namespace`, `base`, `head`)
-  to JSON null, audited as `llm.tool_arguments_normalized`; string-only and
-  enum fields are never reinterpreted. One provider sent these on every call,
-  which failed as a literal namespace or Git ref and cancelled the rest of each
-  batch.
+- Preserve the literal text `"null"`/`"None"` when a tool argument's schema
+  accepts strings, including nullable fields and direct JSON values. Callers
+  must send JSON `null` for a null value; unambiguous non-string repairs remain
+  audited as `llm.tool_arguments_normalized`.
 - Let model-facing tool failures carry identifier-shaped diagnostic codes from
   the tool boundary (`git_error_code`, `hint`, `current_package_sha256`) while
   exception text stays hashed; `git_diff` now names
@@ -103,6 +125,9 @@ release. Do not treat an entry in this section as shipped behavior.
   digest (files read and written, commands with return codes, Git inspections,
   Skills, checkpoints) rebuilt from durable events when a reopen released the
   earlier tool results, bounded by `llm_context.reopen_digest_event_scan_limit`.
+  External-effect metadata retains its observation-time data labels, and the
+  digest contributes those labels to LLM egress authorization. Legacy metadata
+  without label provenance is omitted, except for already-visible Skill IDs.
 
 ## 1.5.3
 

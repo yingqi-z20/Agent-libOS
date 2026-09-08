@@ -7,7 +7,7 @@ from typing import Any
 
 from agent_libos.config import AgentLibOSConfig
 from agent_libos.llm.replay import LLMReplayService
-from agent_libos.models import CapabilityRight, DataFlowContext, ObjectLifecycleState
+from agent_libos.models import CapabilityRight, DataFlowContext, ObjectLifecycleState, ProcessStatus
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.utils.object_payload import object_payload_sha256
 
@@ -27,6 +27,7 @@ class LLMReplaySourceRecovery:
         config: AgentLibOSConfig,
         capabilities: Any,
         profile_snapshot: Callable[[str], Any],
+        excluded_run_ids: frozenset[str] = frozenset(),
     ) -> None:
         self.processes = unit_of_work.processes
         self.objects = unit_of_work.objects
@@ -34,6 +35,7 @@ class LLMReplaySourceRecovery:
         self.config = config
         self.capabilities = capabilities
         self.profile_snapshot = profile_snapshot
+        self.excluded_run_ids = excluded_run_ids
         self.service = LLMReplayService(self.processes, max_bytes=config.llm.responses_replay_max_bytes, max_turns=config.llm.responses_replay_max_turns)
         self._retained: dict[str, dict[str, frozenset[str]]] | None = None
 
@@ -53,13 +55,23 @@ class LLMReplaySourceRecovery:
 
     def _owner_contexts(self, pid: str) -> Iterator[tuple[str, DataFlowContext]]:
         process = self.processes.get_process(pid)
-        if process is None:
+        if (
+            process is None
+            or process.status in {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
+            or process.task_run_id in self.excluded_run_ids
+        ):
+            # Terminal owners need no volatile read grants. TaskRun preflight
+            # already classified invalid Runs; recovery must isolate them.
             return
         head = self.processes.get_llm_replay_head(pid)
         pending = self.processes.get_llm_pending_action(pid)
         prepared = {}
         if pending is not None and pending["status"] == "pending":
             prepared = pending.get("action") or {}
+        if not isinstance(prepared, dict):
+            # The pending-action validator owns malformed action isolation.
+            # It cannot establish authority for any retained replay sources.
+            return
         reference = prepared.get("responses_replay_request")
         if head is None and reference is None:
             return

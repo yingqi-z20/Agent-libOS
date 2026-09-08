@@ -5,6 +5,7 @@ import os
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.tools.contracts import CONTENT_PRECONDITION
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -55,14 +56,7 @@ class WriteTextFileArgs(_WorkspaceFilesystemArgs):
     content: str = Field(description="Exact text content to encode and write using `encoding`.")
     encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
     overwrite: bool = Field(default=True, description="Whether to overwrite an existing file.")
-    expected_content_sha256: str | None = Field(
-        default=None,
-        pattern=r"^(?:missing|[0-9a-f]{64})$",
-        description=(
-            "Optional compare-and-swap precondition: 'missing' requires creation, "
-            "or provide the full-content SHA-256 returned by read_text_file."
-        ),
-    )
+    expected_content_sha256: str | None = CONTENT_PRECONDITION.field()
 
 
 class WriteTextFileOutput(BaseModel):

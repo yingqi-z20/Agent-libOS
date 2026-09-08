@@ -108,10 +108,11 @@ def render_reopen_activity_digest(
     events: Sequence[Event],
     *,
     redact: Callable[[Any], Any] | None = None,
+    on_included_event: Callable[[Event], None] | None = None,
 ) -> str:
-    """Render a bounded, payload-free digest; empty when nothing durable happened."""
+    """Render activity and report only events that contribute digest facts."""
 
-    activity = _summarize(events, redact=redact)
+    activity = _summarize(events, redact=redact, on_included_event=on_included_event)
     text = _render(activity, items_per_line=_DEFAULT_ITEMS_PER_LINE)
     if len(text) > _MAX_DIGEST_CHARS:
         text = _render(activity, items_per_line=_COMPACT_ITEMS_PER_LINE)
@@ -146,6 +147,7 @@ def _summarize(
     events: Sequence[Event],
     *,
     redact: Callable[[Any], Any] | None,
+    on_included_event: Callable[[Event], None] | None,
 ) -> dict[str, Any]:
     activity = _Activity()
     for event in events:
@@ -153,22 +155,23 @@ def _summarize(
         if not isinstance(payload, Mapping):
             continue
         handler = _EVENT_HANDLERS.get(_event_type(event))
-        if handler is not None:
-            handler(activity, payload)
+        if handler is not None and handler(activity, payload):
+            if on_included_event is not None:
+                on_included_event(event)
     return activity.as_dict()
 
 
-def _note_read(activity: _Activity, payload: Mapping[str, Any]) -> None:
+def _note_read(activity: _Activity, payload: Mapping[str, Any]) -> bool:
     adapter = payload.get("adapter")
     if adapter == "git":
         operation = str(payload.get("operation") or "inspect")
         activity.git_operations[operation] = activity.git_operations.get(operation, 0) + 1
-        return
+        return True
     if adapter != "filesystem":
-        return
+        return False
     path = payload.get("path")
     if not isinstance(path, str) or not path:
-        return
+        return False
     target = (
         activity.directories
         if payload.get("operation") == "read_directory"
@@ -176,9 +179,10 @@ def _note_read(activity: _Activity, payload: Mapping[str, Any]) -> None:
     )
     if path not in target:
         target.append(path)
+    return True
 
 
-def _note_write(activity: _Activity, payload: Mapping[str, Any]) -> None:
+def _note_write(activity: _Activity, payload: Mapping[str, Any]) -> bool:
     adapter = payload.get("adapter")
     if adapter == "filesystem":
         path = payload.get("path")
@@ -186,10 +190,13 @@ def _note_write(activity: _Activity, payload: Mapping[str, Any]) -> None:
             count, _ = activity.writes.get(path, (0, 0))
             written = payload.get("bytes_written")
             activity.writes[path] = (count + 1, written if isinstance(written, int) else 0)
+            return True
     elif adapter == "shell":
         argv = payload.get("argv")
         if isinstance(argv, list):
             _note_command(activity, argv, payload.get("returncode"))
+            return True
+    return False
 
 
 def _note_command(activity: _Activity, argv: list[Any], returncode: Any) -> None:
@@ -203,21 +210,26 @@ def _note_command(activity: _Activity, argv: list[Any], returncode: Any) -> None
         activity.commands.append((command, returncode, 1))
 
 
-def _note_skill(activity: _Activity, payload: Mapping[str, Any]) -> None:
+def _note_skill(activity: _Activity, payload: Mapping[str, Any]) -> bool:
     skill_id = payload.get("skill_id")
-    if isinstance(skill_id, str) and skill_id and skill_id not in activity.skills:
+    if not isinstance(skill_id, str) or not skill_id:
+        return False
+    if skill_id not in activity.skills:
         activity.skills.append(skill_id)
+    return True
 
 
-def _note_checkpoint(activity: _Activity, payload: Mapping[str, Any]) -> None:
+def _note_checkpoint(activity: _Activity, payload: Mapping[str, Any]) -> bool:
     activity.checkpoints += 1
+    return True
 
 
-def _note_human_output(activity: _Activity, payload: Mapping[str, Any]) -> None:
+def _note_human_output(activity: _Activity, payload: Mapping[str, Any]) -> bool:
     activity.human_outputs += 1
+    return True
 
 
-_EVENT_HANDLERS: dict[str, Callable[[_Activity, Mapping[str, Any]], None]] = {
+_EVENT_HANDLERS: dict[str, Callable[[_Activity, Mapping[str, Any]], bool]] = {
     EventType.EXTERNAL_READ.value: _note_read,
     EventType.EXTERNAL_WRITE.value: _note_write,
     EventType.SKILL_LOADED.value: _note_skill,

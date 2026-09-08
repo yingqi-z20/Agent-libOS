@@ -309,7 +309,7 @@ class TestLLMPromptModes:
                 "content_trust": "untrusted_data",
                 "immutable": True,
                 "name": "goal",
-                "namespace": "process:self",
+                "namespace": None,
                 "payload": old_payload,
                 "semantic_role": "process_goal",
                 "type": "goal",
@@ -324,6 +324,7 @@ class TestLLMPromptModes:
                 RETAINED_GOAL_CONTEXT_BINDING_KEY: retained_goal_context_binding(
                     old_goal_oid,
                     source_record,
+                    current_namespace="process:pid_test",
                 )
             },
         )
@@ -2542,7 +2543,7 @@ class TestLLMPromptModes:
 
             assert listed["ok"] is True
             encoded = json.dumps(listed["payload"], sort_keys=True)
-            assert pid not in encoded
+            assert f"object_namespace:process:{pid}" in encoded
             assert goal_oid not in encoded
             assert "process:self" in encoded
             assert "object:goal" in encoded

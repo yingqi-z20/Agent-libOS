@@ -5,6 +5,7 @@ import os
 import stat
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,7 +25,23 @@ from agent_libos.storage import (
     open_store,
     resolve_store_target,
 )
+from agent_libos.storage import sqlite as sqlite_storage
 from agent_libos.substrate import LocalResourceProviderSubstrate
+
+
+@pytest.fixture(autouse=True)
+def _isolate_sqlite_identity_lease_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Preserve real lease creation and validation while keeping this test's
+    # complete inventory independent of other workers and live Runtime hosts.
+    # Replace only SQLite's module binding, not the shared tempfile module.
+    lease_root = tmp_path / "identity-lease-temp"
+    lease_root.mkdir()
+    isolated_tempfile = SimpleNamespace(**vars(tempfile))
+    isolated_tempfile.gettempdir = lambda: str(lease_root)
+    monkeypatch.setattr(sqlite_storage, "tempfile", isolated_tempfile)
 
 
 def _set_user_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
@@ -43,7 +60,7 @@ def _sqlite_artifacts(directory: Path) -> tuple[Path, ...]:
 def _sqlite_identity_lease_inventory() -> tuple[bool, tuple[str, ...]]:
     uid = os.getuid() if hasattr(os, "getuid") else 0
     directory = (
-        Path(tempfile.gettempdir()).resolve()
+        Path(sqlite_storage.tempfile.gettempdir()).resolve()
         / f"agent-libos-sqlite-leases-{uid}"
     )
     if not directory.exists():

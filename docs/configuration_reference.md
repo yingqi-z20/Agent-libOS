@@ -228,6 +228,7 @@ PY
 | `llm.profiles.<key>.max_total_tokens_per_call` | `StrictInt \| None` | `null` | tokens |
 | `llm.profiles.<key>.context_window_tokens` | `int \| None` | `null` | tokens |
 | `llm.profiles.<key>.allow_custom_base_url` | `bool` | `false` | — |
+| `llm.profiles.<key>.logical_call_timeout_s` | `StrictFloat \| None` | `null` | seconds |
 | `llm.temperature` | `StrictFloat` | `0.2` | — |
 | `llm.max_tokens` | `StrictInt` | `16384` | tokens |
 | `llm.max_input_tokens_per_call` | `StrictInt` | `245760` | tokens |
@@ -262,6 +263,7 @@ PY
 | `llm.persist_full_io` | `bool` | `true` | — |
 | `llm.json_instruction` | `str` | `"You must respond with a valid JSON object."` | — |
 | `llm.fallback_status_codes` | `tuple[int, ...]` | `[404, 405]` | — |
+| `llm.logical_call_timeout_s` | `StrictFloat \| None` | `null` | seconds |
 
 ## `tools`
 

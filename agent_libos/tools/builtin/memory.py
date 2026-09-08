@@ -8,6 +8,7 @@ from typing import Annotated, Any
 from pydantic import BaseModel, Field, WithJsonSchema, field_validator, model_validator
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.tools.contracts import CURRENT_NAMESPACE, DIRECT_JSON, PATH_PARENT_NAMESPACE
 from agent_libos.memory.data_labels import propagate_object_labels
 from agent_libos.models import ObjectMetadata, ObjectType, Provenance, ViewMode
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
@@ -56,14 +57,9 @@ def _empty_optional_text_is_none(value: Any) -> Any:
 
 class CreateMemoryObjectArgs(BaseModel):
     name: str | None = Field(default=None, description="Optional namespace-local object name.")
-    namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
+    namespace: str | None = CURRENT_NAMESPACE.field()
     type: str = Field(description="Agent libOS object type, for example summary, plan, observation, or artifact.")
-    payload: DirectJsonValue = Field(
-        description=(
-            "Direct JSON value to store. JSON strings are stored literally; pass an "
-            "object/array value, not a JSON-encoded string, when a container is intended."
-        )
-    )
+    payload: DirectJsonValue = DIRECT_JSON.field()
     metadata: dict[str, Any] = Field(default_factory=dict)
     parent_oids: list[str] = Field(
         default_factory=list,
@@ -95,7 +91,7 @@ class ReadMemoryObjectArgs(BaseModel):
             "be unavailable after reopen; use cumulative process_exit review then."
         )
     )
-    namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
+    namespace: str | None = CURRENT_NAMESPACE.field()
     max_payload_chars: int = Field(
         default=_TOOL_DEFAULTS.memory_payload_chars,
         ge=1,
@@ -179,13 +175,8 @@ class ReadMemoryObjectOutput(BaseModel):
 
 class AppendMemoryObjectArgs(BaseModel):
     name: str = Field(description="Namespace-local mutable Object Memory name to append to.")
-    namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
-    entry: DirectJsonValue = Field(
-        description=(
-            "Direct JSON entry to append. JSON strings are appended literally; pass an "
-            "object/array value, not a JSON-encoded string, when a container is intended."
-        )
-    )
+    namespace: str | None = CURRENT_NAMESPACE.field()
+    entry: DirectJsonValue = DIRECT_JSON.field()
     list_field: str = Field(
         default="entries",
         description="Payload list field to append into when the object payload is a JSON object.",
@@ -209,10 +200,7 @@ class AppendMemoryObjectOutput(BaseModel):
 
 class CreateMemoryNamespaceArgs(BaseModel):
     namespace: str = Field(description="Namespace path to create, for example project/research or child-results.")
-    parent_namespace: str | None = Field(
-        default=None,
-        description="Parent namespace. Defaults to the path parent; top-level namespaces have no parent.",
-    )
+    parent_namespace: str | None = PATH_PARENT_NAMESPACE.field()
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("parent_namespace", mode="before")
@@ -228,13 +216,7 @@ class CreateMemoryNamespaceOutput(BaseModel):
 
 
 class ListMemoryNamespaceArgs(BaseModel):
-    namespace: str | None = Field(
-        default=None,
-        description=(
-            "Exact namespace to list; null defaults to this process namespace. "
-            "Do not broaden to the parent `process` namespace as a fallback."
-        ),
-    )
+    namespace: str | None = CURRENT_NAMESPACE.field()
     limit: int | None = Field(
         default=None,
         ge=1,

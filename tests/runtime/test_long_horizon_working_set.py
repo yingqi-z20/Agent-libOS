@@ -12,6 +12,8 @@ import json
 from dataclasses import replace
 from typing import Any
 
+import pytest
+
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
@@ -583,48 +585,75 @@ def test_discovery_supersession_keys_follow_the_surfaced_skills() -> None:
     ) is None
 
 
-def test_null_string_literals_are_repaired_only_for_nullable_string_fields() -> None:
-    """A provider that writes the text ``"null"`` for a nullable string means null.
-
-    glm-5.3 sent ``namespace: "null"`` and ``base/head: "null"`` on every call,
-    which failed as a literal namespace or Git ref and cancelled the rest of
-    each batch.  String-only fields and enum literals are never reinterpreted.
-    """
-
-    assert _normalize_scalar_string("null", {"string"}) == "null"
-    assert _normalize_scalar_string("NULL", {"string", "null"}) == "NULL"
-    assert (
-        _normalize_scalar_string(
-            "null", {"string", "null"}, enum_values=frozenset({"null"})
-        )
-        == "null"
-    )
-    assert _normalize_scalar_string("null", {"string", "null"}) is None
-    assert _normalize_scalar_string("None", {"string", "null"}) is None
-
+@pytest.mark.parametrize("value", ["null", "None", " null ", "NULL"])
+def test_schema_accepted_strings_remain_literal_memory_values(value: str) -> None:
+    assert _normalize_scalar_string(value, {"string", "null"}) == value
+    assert _normalize_scalar_string(value, {"string"}) == value
+    assert _normalize_scalar_string("null", {"integer", "null"}) is None
     runtime = Runtime.open("local")
     try:
-        pid = runtime.process.spawn(image="base-agent:v0", goal="argument repair")
+        pid = runtime.process.spawn(image="base-agent:v0", goal="preserve literal data")
+        runtime.activate_skill(pid, "agent-libos-object-memory")
+        action = runtime.tools.normalize_model_action(pid, {
+            "action": "create_memory_object", "name": "literal", "type": "artifact",
+            "payload": value,
+        })
+        assert runtime.llm.dispatch(pid, action)["ok"]
+        result = runtime.llm.dispatch(pid, {"action": "read_memory_object", "name": "literal"})
+        assert result["payload"]["payload"] == value
+        assert result["payload"]["payload_type"] == "string"
+        assert runtime.llm.dispatch(pid, {
+            "action": "create_memory_object", "name": "entries", "type": "artifact",
+            "payload": [], "immutable": False,
+        })["ok"]
+        append = runtime.tools.normalize_model_action(pid, {
+            "action": "append_memory_object", "name": "entries", "entry": value,
+        })
+        assert runtime.llm.dispatch(pid, append)["ok"]
+        result = runtime.llm.dispatch(pid, {"action": "read_memory_object", "name": "entries"})
+        assert result["payload"]["payload"] == [value]
+        nullable = runtime.tools.normalize_model_action(pid, {
+            "action": "process_exit", "message": value,
+        })
+        assert nullable["message"] == value
+    finally:
+        runtime.close()
 
-        normalized = runtime.tools.normalize_model_action(
-            pid,
-            {"action": "process_exit", "message": "null", "review_token": "None"},
+
+@pytest.mark.parametrize("paged", [False, True], ids=["subtrees", "byte-pages"])
+def test_working_set_keeps_independent_memory_selections(paged: bool) -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="read both selections")
+        runtime.activate_skill(pid, "agent-libos-object-memory")
+        assert runtime.llm.dispatch(pid, {
+            "action": "create_memory_object", "name": "document", "type": "artifact",
+            "payload": {"a": "FIRST_SUBTREE_PAYLOAD", "b": "SECOND_SUBTREE_PAYLOAD"},
+        })["ok"]
+        first_action = {"action": "read_memory_object", "name": "document"}
+        first_action.update({"max_payload_chars": 30} if paged else {"json_pointer": "/a"})
+        first = runtime.llm.dispatch(pid, first_action)
+        assert first["ok"]
+        second_action = {"action": "read_memory_object", "name": "document"}
+        second_action.update({
+            "cursor": first["payload"]["next_cursor"],
+            "expected_sha256": first["payload"]["sha256"], "max_payload_chars": 30,
+        } if paged else {"json_pointer": "/b"})
+        second = runtime.llm.dispatch(pid, second_action)
+        assert second["ok"]
+        context = runtime.memory.materialize_context(
+            pid, runtime.process.get(pid).memory_view, policy="working_set",
+            budget_tokens=100_000, charge_resources=False,
         )
-
-        assert normalized["message"] is None
-        assert normalized["review_token"] is None
-        records = [
-            record
-            for record in runtime.audit.trace(actor=pid)
-            if record.action == "llm.tool_arguments_normalized"
-        ]
-        assert records
-        assert {"message", "review_token"} <= set(records[-1].decision["normalized_fields"])
-
-        literal = runtime.tools.normalize_model_action(
-            pid,
-            {"action": "process_exit", "message": "nullable summary"},
+        assert {first["result_oid"], second["result_oid"]} <= set(context.object_refs)
+        assert not any(entry["reason"] == "superseded" for entry in context.object_manifest)
+        repeated = runtime.llm.dispatch(pid, second_action)
+        context = runtime.memory.materialize_context(
+            pid, runtime.process.get(pid).memory_view, policy="working_set",
+            budget_tokens=100_000, charge_resources=False,
         )
-        assert literal["message"] == "nullable summary"
+        assert first["result_oid"] in context.object_refs
+        assert repeated["result_oid"] in context.object_refs
+        assert second["result_oid"] in context.omitted_objects
     finally:
         runtime.close()

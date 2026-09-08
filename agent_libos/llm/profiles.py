@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import math
 import os
 import secrets
 import threading
@@ -26,6 +27,7 @@ _LEGACY_PROFILE_ENV_KEYS = {
     "OPENAI_ENABLE_THINKING",
     "OPENAI_FALLBACK_JSON_ACTIONS",
     "OPENAI_LANGUAGE_MODEL",
+    "OPENAI_LOGICAL_CALL_TIMEOUT",
     "OPENAI_MAX_RETRIES",
     "OPENAI_MODEL",
     "OPENAI_ORGANIZATION",
@@ -300,6 +302,7 @@ class LLMProfileRegistry:
         # and must not invalidate existing trust rules when hosts change them.
         for local_policy_field in (
             "context_window_tokens",
+            "logical_call_timeout_s",
             "max_input_tokens_per_call",
             "max_total_tokens_per_call",
         ):
@@ -473,6 +476,13 @@ class LLMProfileRegistry:
                 profile.timeout_s
                 if profile.timeout_s is not None
                 else _float_env(legacy_env, "OPENAI_TIMEOUT", self.config.llm.timeout_s)
+            ),
+            "logical_call_timeout_s": (
+                profile.logical_call_timeout_s
+                if profile.logical_call_timeout_s is not None
+                else _float_env(legacy_env, "OPENAI_LOGICAL_CALL_TIMEOUT", 0.0)
+                if _optional_env(legacy_env, "OPENAI_LOGICAL_CALL_TIMEOUT") is not None
+                else self.config.llm.logical_call_timeout_s
             ),
             "max_retries": (
                 profile.max_retries
@@ -687,6 +697,13 @@ class LLMProfileRegistry:
             raise ValidationError(f"unsupported LLM profile kind for {profile_id}: {profile.kind}")
         if not profile.api_key_env.strip():
             raise ValidationError(f"LLM profile api_key_env must be non-empty: {profile_id}")
+        if profile.logical_call_timeout_s is not None and (
+            not math.isfinite(profile.logical_call_timeout_s)
+            or profile.logical_call_timeout_s <= 0
+        ):
+            raise ValidationError(
+                f"LLM profile logical_call_timeout_s must be finite and positive: {profile_id}"
+            )
         for field_name in (
             "max_tokens",
             "max_input_tokens_per_call",

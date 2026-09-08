@@ -256,6 +256,20 @@ def _capture_safe_llm_config(config: AgentLibOSConfig) -> dict[str, Any]:
             if profile.timeout_s is not None
             else _float_env(environment, "OPENAI_TIMEOUT", config.llm.timeout_s)
         )
+        logical_call_timeout_s = profile.logical_call_timeout_s
+        if logical_call_timeout_s is None:
+            logical_call_timeout_env = _optional_env(
+                environment, "OPENAI_LOGICAL_CALL_TIMEOUT"
+            )
+            logical_call_timeout_s = (
+                config.llm.logical_call_timeout_s
+                if logical_call_timeout_env is None
+                else float(logical_call_timeout_env)
+            )
+        if logical_call_timeout_s is not None and not _is_positive_number(
+            logical_call_timeout_s
+        ):
+            raise ValueError("invalid logical call timeout")
         max_retries = (
             profile.max_retries
             if profile.max_retries is not None
@@ -323,6 +337,14 @@ def _capture_safe_llm_config(config: AgentLibOSConfig) -> dict[str, Any]:
                     "context_window_tokens",
                 ),
                 "timeout_s": timeout_s,
+                # An omitted deadline is the historical, disabled behavior.
+                # Preserve existing report identities while binding any Host
+                # opt-in to the evaluation configuration and its digest.
+                **(
+                    {"logical_call_timeout_s": logical_call_timeout_s}
+                    if logical_call_timeout_s is not None
+                    else {}
+                ),
                 "max_retries": max_retries,
                 "compatibility_retry_attempts": (
                     config.llm.compatibility_retry_attempts
@@ -486,7 +508,7 @@ def _valid_safe_llm_config(value: Any) -> bool:
         "custom_endpoint_allowed",
     }:
         return False
-    if not isinstance(request, dict) or set(request) != {
+    required_request_fields = {
         "temperature",
         "max_tokens",
         "max_input_tokens_per_call",
@@ -499,7 +521,11 @@ def _valid_safe_llm_config(value: Any) -> bool:
         "parallel_tool_calls",
         "auto_wait_on_empty_tool_calls",
         "enable_thinking",
-    }:
+    }
+    if not isinstance(request, dict) or set(request) not in (
+        required_request_fields,
+        required_request_fields | {"logical_call_timeout_s"},
+    ):
         return False
     if not isinstance(prompt, dict) or set(prompt) != {
         "layout",
@@ -542,6 +568,10 @@ def _valid_safe_llm_config(value: Any) -> bool:
         and _is_positive_int(request.get("max_total_tokens_per_call"))
         and _is_positive_int(request.get("context_window_tokens"))
         and _is_positive_number(request.get("timeout_s"))
+        and (
+            "logical_call_timeout_s" not in request
+            or _is_positive_number(request["logical_call_timeout_s"])
+        )
         and _is_nonnegative_int(request.get("max_retries"))
         and _is_positive_int(request.get("compatibility_retry_attempts"))
         and _is_positive_int(request.get("action_repair_attempts"))

@@ -22308,11 +22308,9 @@ class SQLRuntimeStore:
         selected = resolver(oids)
         if not isinstance(selected, Mapping):
             raise ValidationError("retained Object capability resolver must return a mapping")
-        max_count = len(oids) * self.config.capability.list_limit
-        if len(selected) > max_count:
-            raise ValidationError("retained Object capability page exceeds configured bounds")
+        # The Host retention preflight bounds the total selection. Query page
+        # size does not limit how many existing grants one Object can have.
         result: dict[str, dict[str, str]] = {}
-        count = 0
         for key, cap_ids in selected.items():
             if (
                 not isinstance(key, tuple) or len(key) != 2
@@ -22321,9 +22319,6 @@ class SQLRuntimeStore:
                 or not isinstance(cap_ids, (set, frozenset))
             ):
                 raise ValidationError("retained Object capability entry is outside the recovery page")
-            count += len(cap_ids)
-            if count > max_count:
-                raise ValidationError("retained Object capability page exceeds configured bounds")
             pid, oid = key
             for cap_id in cap_ids:
                 if not isinstance(cap_id, str) or not cap_id:

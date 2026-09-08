@@ -6,6 +6,7 @@ import email.utils
 import hashlib
 import inspect
 import json
+import math
 import os
 import random
 import secrets
@@ -53,6 +54,9 @@ _ACTIVE_PROVIDER_TRACE: contextvars.ContextVar[ProviderTraceBuilder | None] = (
 _ACTIVE_PROVIDER_ATTEMPT_KIND: contextvars.ContextVar[ProviderAttemptKind] = (
     contextvars.ContextVar("agent_libos_provider_attempt_kind", default="initial")
 )
+_ACTIVE_LOGICAL_CALL_TIMEOUT: contextvars.ContextVar[asyncio.Timeout | None] = (
+    contextvars.ContextVar("agent_libos_logical_call_timeout", default=None)
+)
 
 # These are inbound trust-boundary limits, not generation preferences. They
 # cap provider-authored material before it is joined or copied into durable
@@ -73,6 +77,10 @@ class LLMError(LibOSError):
 
 class LLMTransientError(LLMError):
     """Provider failure that is safe to retry in a later process quantum."""
+
+
+class _LogicalCallTimeoutError(TimeoutError):
+    """Host deadline expired; never eligible for another client attempt."""
 
 
 _PROVIDER_FAILURE_MARKER = object()
@@ -147,11 +155,15 @@ class LLMClient:
     inherit_ambient_openai_sdk_config: bool = True
     allow_custom_base_url: bool = False
     defaults: LLMDefaults = field(default_factory=lambda: DEFAULT_CONFIG.llm, repr=False)
+    logical_call_timeout_s: float | None = None
     _client: Any | None = field(default=None, init=False, repr=False)
     _async_client: Any | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.timeout = self.defaults.timeout_s if self.timeout is None else self.timeout
+        self.logical_call_timeout_s = _resolve_logical_call_timeout(
+            self.logical_call_timeout_s, self.defaults.logical_call_timeout_s,
+        )
         self.max_retries = self.defaults.max_retries if self.max_retries is None else self.max_retries
         self.store = self.defaults.store if self.store is None else self.store
         self.safety_identifier = self.defaults.safety_identifier if self.safety_identifier is None else self.safety_identifier
@@ -242,6 +254,11 @@ class LLMClient:
             api_key=env.get("OPENAI_API_KEY"),
             api_key_env="OPENAI_API_KEY",
             timeout=_float_env_from(env, "OPENAI_TIMEOUT", default=defaults.timeout_s),
+            logical_call_timeout_s=_optional_float_env_from(
+                env,
+                "OPENAI_LOGICAL_CALL_TIMEOUT",
+                default=defaults.logical_call_timeout_s,
+            ),
             max_retries=_int_env_from(env, "OPENAI_MAX_RETRIES", default=defaults.max_retries),
             api_mode=api_mode,  # type: ignore[arg-type]
             store=_bool_env_from(env, "OPENAI_STORE", default=defaults.store),
@@ -415,30 +432,31 @@ class LLMClient:
         trace_token = _ACTIVE_PROVIDER_TRACE.set(trace)
         kind_token = _ACTIVE_PROVIDER_ATTEMPT_KIND.set("initial")
         try:
-            selected_messages = (
-                self._messages_with_json_instruction(messages)
-                if json_mode and json_schema is None
-                else messages
-            )
-            completion = await self._complete_without_tools(
-                messages=selected_messages,
-                temperature=self._temperature(temperature),
-                max_tokens=self._max_tokens(max_tokens),
-                json_mode=json_mode,
-                json_schema=json_schema,
-                schema_name=schema_name,
-                responses_items=responses_items,
-            )
-            if not completion.content:
-                error = llm_provider_failure_error(
-                    "empty content",
-                    diagnostic_type="ProviderEmptyResponse",
+            async with self._logical_call_scope():
+                selected_messages = (
+                    self._messages_with_json_instruction(messages)
+                    if json_mode and json_schema is None
+                    else messages
                 )
-                _reject_active_provider_sequence(
-                    completion._provider_attempt_sequence,
-                    error,
+                completion = await self._complete_without_tools(
+                    messages=selected_messages,
+                    temperature=self._temperature(temperature),
+                    max_tokens=self._max_tokens(max_tokens),
+                    json_mode=json_mode,
+                    json_schema=json_schema,
+                    schema_name=schema_name,
+                    responses_items=responses_items,
                 )
-                raise error
+                if not completion.content:
+                    error = llm_provider_failure_error(
+                        "empty content",
+                        diagnostic_type="ProviderEmptyResponse",
+                    )
+                    _reject_active_provider_sequence(
+                        completion._provider_attempt_sequence,
+                        error,
+                    )
+                    raise error
             trace.mark_selected(completion._provider_attempt_sequence)
             completion.provider_trace = trace.to_dict()
             return completion
@@ -487,15 +505,16 @@ class LLMClient:
         trace_token = _ACTIVE_PROVIDER_TRACE.set(trace)
         kind_token = _ACTIVE_PROVIDER_ATTEMPT_KIND.set("initial")
         try:
-            completion = await self._acomplete_action_untraced(
-                messages=messages,
-                tools=tools,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                previous_response_id=previous_response_id,
-                parallel_tool_calls=parallel_tool_calls,
-                responses_items=responses_items,
-            )
+            async with self._logical_call_scope():
+                completion = await self._acomplete_action_untraced(
+                    messages=messages,
+                    tools=tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    previous_response_id=previous_response_id,
+                    parallel_tool_calls=parallel_tool_calls,
+                    responses_items=responses_items,
+                )
             trace.mark_selected(completion._provider_attempt_sequence)
             completion.provider_trace = trace.to_dict()
             return completion
@@ -505,6 +524,28 @@ class LLMClient:
         finally:
             _ACTIVE_PROVIDER_ATTEMPT_KIND.reset(kind_token)
             _ACTIVE_PROVIDER_TRACE.reset(trace_token)
+
+    @asynccontextmanager
+    async def _logical_call_scope(self) -> Any:
+        if self.logical_call_timeout_s is None:
+            yield
+            return
+        # Enter in the same event loop that owns the SDK coroutine. Cancelling
+        # a caller-side thread Future cannot reliably stop provider work.
+        timeout = asyncio.timeout(self.logical_call_timeout_s)
+        token = _ACTIVE_LOGICAL_CALL_TIMEOUT.set(timeout)
+        try:
+            try:
+                async with timeout:
+                    yield
+                    _check_logical_call_deadline()
+            except TimeoutError as exc:
+                if not timeout.expired() and not isinstance(exc, _LogicalCallTimeoutError):
+                    raise
+                deadline_error = _LogicalCallTimeoutError("LLM logical call deadline exceeded")
+                raise llm_provider_failure_error(deadline_error, transient=True) from deadline_error
+        finally:
+            _ACTIVE_LOGICAL_CALL_TIMEOUT.reset(token)
 
     async def _acomplete_action_untraced(
         self,
@@ -854,15 +895,32 @@ class LLMClient:
     async def _async_client_scope(self) -> Any:
         client = self._async_client_or_raise()
         owned = self._async_client is None
+        primary_error: BaseException | None = None
         try:
             yield client
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
             if owned:
                 close = getattr(client, "aclose", None) or getattr(client, "close", None)
                 if callable(close):
-                    result = close()
-                    if inspect.isawaitable(result):
-                        await result
+                    try:
+                        timeout = _ACTIVE_LOGICAL_CALL_TIMEOUT.get()
+                        # Cancellation has already been delivered to the
+                        # request. Reuse its absolute deadline for cleanup so
+                        # a slow close cannot restart the logical-call budget.
+                        async with asyncio.timeout_at(timeout.when() if timeout else None):
+                            result = close()
+                            if inspect.isawaitable(result):
+                                await result
+                    except BaseException as cleanup_error:
+                        if isinstance(primary_error, asyncio.CancelledError):
+                            pass
+                        elif primary_error is not None and isinstance(cleanup_error, Exception):
+                            pass
+                        else:
+                            raise
 
     def _client_kwargs(self) -> dict[str, Any]:
         self._validate_base_url_policy()
@@ -1106,6 +1164,7 @@ class LLMClient:
     ) -> tuple[Any, int | None]:
         max_retries = max(0, int(self.max_retries or 0))
         for retry_index in range(max_retries + 1):
+            _check_logical_call_deadline()
             trace = _ACTIVE_PROVIDER_TRACE.get()
             sequence = (
                 trace.start_attempt(
@@ -1117,9 +1176,21 @@ class LLMClient:
             )
             try:
                 response = await create(**request)
-            except Exception as exc:
+            except BaseException as exc:
                 if trace is not None and sequence is not None:
-                    trace.finish_error(sequence, exc)
+                    timeout = _ACTIVE_LOGICAL_CALL_TIMEOUT.get()
+                    trace.finish_error(
+                        sequence,
+                        _LogicalCallTimeoutError("LLM logical call deadline exceeded")
+                        if isinstance(exc, asyncio.CancelledError)
+                        and timeout is not None and timeout.expired()
+                        else exc,
+                    )
+                if not isinstance(exc, Exception):
+                    raise
+                # A transport can translate cancellation to its own exception.
+                # Do not enter a fresh backoff after the Host budget is spent.
+                _check_logical_call_deadline()
                 if (
                     not _is_openai_sdk_error(exc)
                     or not _should_retry_openai_sdk_error(exc)
@@ -1130,6 +1201,9 @@ class LLMClient:
                 continue
             if trace is not None and sequence is not None:
                 trace.finish_response(sequence, response)
+            # A custom transport may suppress cancellation. Keep any returned
+            # usage evidence, but never select a response past the Host deadline.
+            _check_logical_call_deadline()
             return response, sequence
         raise AssertionError("unreachable Provider retry loop")
 
@@ -2706,6 +2780,40 @@ def _bool_env_from(env: dict[str, str], name: str, default: bool) -> bool:
     if value is None or not value.strip():
         return default
     return _bool_env_value(value)
+
+
+def _resolve_logical_call_timeout(
+    value: float | None, default: float | None,
+) -> float | None:
+    selected = default if value is None else value
+    if selected is not None and (
+        isinstance(selected, bool)
+        or not isinstance(selected, (int, float))
+        or not math.isfinite(selected)
+        or selected <= 0
+    ):
+        raise LLMError("logical_call_timeout_s must be a finite positive number or None")
+    return selected
+
+
+def _check_logical_call_deadline() -> None:
+    timeout = _ACTIVE_LOGICAL_CALL_TIMEOUT.get()
+    if timeout is None:
+        return
+    deadline = timeout.when()
+    if timeout.expired() or (
+        deadline is not None and asyncio.get_running_loop().time() >= deadline
+    ):
+        raise _LogicalCallTimeoutError("LLM logical call deadline exceeded")
+
+
+def _optional_float_env_from(
+    env: dict[str, str], name: str, default: float | None
+) -> float | None:
+    value = _optional_env_from(env, name)
+    if value is None:
+        return default
+    return _float_env_from(env, name, default=0.0)
 
 
 def _float_env(name: str, default: float) -> float:
