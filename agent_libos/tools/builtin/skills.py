@@ -232,7 +232,8 @@ class ActivateSkillTool(SyncAgentTool[ActivateSkillArgs]):
             )
         except SkillPackageChanged as exc:
             raise SkillPackageChanged(
-                _source_neutral_error_message(str(exc))
+                _source_neutral_error_message(str(exc)),
+                current_package_sha256=exc.current_package_sha256,
             ) from exc
         except ValidationError as exc:
             raise ValidationError(_source_neutral_error_message(str(exc))) from exc

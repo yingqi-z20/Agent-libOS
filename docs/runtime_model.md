@@ -312,6 +312,20 @@ breaking replacement of the former Object-Memory-snapshot behavior: existing
 Images selecting `image_only` adopt these semantics after upgrade; there is no
 legacy compatibility mode.
 
+After a Runtime reopen, tool-result payloads held in runtime memory are gone
+and the `working_set` materialization omits them with reason
+`capability_denied` or `missing`. When that happens the volatile prompt section
+adds a payload-free digest, `Durable activity before the last Runtime reopen`,
+rebuilt from durable events older than the most recent `runtime_shutdown`:
+files read and directories listed, files written with byte counts, shell
+commands with return codes, Git inspections, Skills activated, checkpoints, and
+Human deliveries. It carries paths, argv, identifiers, and counts only, never
+tool output; it walks at most `llm_context.reopen_digest_event_scan_limit`
+event rows (4,000 by default), so a very long history yields a partial digest,
+never a wrong one. Without a recorded shutdown nothing is rendered. The digest
+lets the model re-read only what it must edit or verify instead of every file
+it had already inspected.
+
 A persistent Runtime reopen has one separate, narrow initial-goal recovery path.
 A committed root `ProcessManager.spawn` publication records a size-bounded,
 integrity-bound JSON recovery envelope for its immutable initial GOAL when

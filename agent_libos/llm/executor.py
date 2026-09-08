@@ -47,6 +47,11 @@ from agent_libos.llm.context_management import (
     provider_usage_lower_bound,
 )
 from agent_libos.llm.event_projection import project_prompt_events
+from agent_libos.llm.reopen_digest import (
+    collect_pre_reopen_events,
+    context_lost_earlier_results,
+    render_reopen_activity_digest,
+)
 from agent_libos.llm.prompt import (
     PROMPT_LAYOUT_CACHE_OPTIMIZED_V2,
     RETAINED_GOAL_CONTEXT_BINDING_KEY,
@@ -1810,6 +1815,7 @@ class LLMProcessExecutor:
         available_skills: list[dict[str, Any]] | None = None,
         original_goal_context: str | None = None,
         pending_message_notice: dict[str, Any] | None = None,
+        reopen_digest: str | None = None,
     ) -> list[dict[str, Any]]:
         try:
             fallback_json_actions = (
@@ -1835,6 +1841,7 @@ class LLMProcessExecutor:
             fallback_json_actions=fallback_json_actions,
             prompt_layout=self._effective_prompt_layout(pid),
             pending_message_notice=pending_message_notice,
+            reopen_digest=reopen_digest,
         )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": build_system_prompt(image)},
@@ -1960,6 +1967,7 @@ class LLMProcessExecutor:
             available_skills=available_skills,
             original_goal_context=original_goal_context,
             pending_message_notice=pending_message_notice,
+            reopen_digest=self._reopen_activity_digest(pid, context),
         )
         if task_context is not None:
             messages = self._task_run_messages(
@@ -8298,6 +8306,33 @@ class LLMProcessExecutor:
             instruction=self._process_message_instruction(pid),
         )
         return notice
+
+    def _reopen_activity_digest(self, pid: str, context: Any) -> str | None:
+        """Describe pre-reopen effects when their result Objects are gone.
+
+        Only a context that omits earlier results for ``capability_denied`` or
+        ``missing`` reasons (the post-reopen signature) pays for the event
+        walk; the digest carries paths, argv, return codes, Skill ids, and
+        counts, never tool output.
+        """
+
+        if not context_lost_earlier_results(getattr(context, "object_manifest", None)):
+            return None
+        scan_limit = self.config.llm_context.reopen_digest_event_scan_limit
+        try:
+            events = collect_pre_reopen_events(
+                self._events.list,
+                pid,
+                scan_limit=scan_limit,
+                page_size=min(scan_limit, DEFAULT_CONFIG.gui.event_buffer_limit),
+            )
+        except ValidationError:
+            return None
+        digest = render_reopen_activity_digest(
+            events,
+            redact=lambda payload: self._tools.redact_model_context(pid, payload),
+        )
+        return digest or None
 
     def _pending_message_notice(self, pid: str) -> dict[str, Any] | None:
         """Return the unread-input notice that must drive this quantum's prompt.

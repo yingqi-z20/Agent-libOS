@@ -569,6 +569,7 @@ PY
 | `llm_context.materialization_headroom_tokens` | `StrictInt` | `12288` | tokens |
 | `llm_context.materialization_budget_floor_tokens` | `StrictInt` | `16384` | tokens |
 | `llm_context.recent_event_scan_limit` | `StrictInt` | `200` | — |
+| `llm_context.reopen_digest_event_scan_limit` | `StrictInt` | `4000` | — |
 
 ## `checkpoint`
 

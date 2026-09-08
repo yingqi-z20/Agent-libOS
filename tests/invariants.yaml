@@ -5542,6 +5542,8 @@
         "tests/runtime/test_long_horizon_working_set.py::test_working_set_stubs_apply_only_to_that_policy_and_keep_stable_prefix",
         "tests/runtime/test_long_horizon_working_set.py::test_supersession_keys_cover_observations_but_never_actions_or_failures",
         "tests/runtime/test_long_horizon_working_set.py::test_feedback_stub_summary_describes_without_copying_content",
+        "tests/runtime/test_long_horizon_working_set.py::test_discovery_supersession_keys_follow_the_surfaced_skills",
+        "tests/unit/test_prompt_omitted_object_guidance.py::test_superseded_only_omissions_do_not_ask_for_re_observation",
         "tests/unit/test_prompt_projection_compaction.py::test_v2_compaction_strips_object_ids_from_feedback_stubs"
       ],
       "benchmark_attack_classes": []
@@ -5572,6 +5574,37 @@
       "lane": "runtime",
       "node_ids": [
         "tests/runtime/test_long_horizon_working_set.py::test_json_string_container_arguments_are_decoded_only_when_schema_forbids_strings"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "nullable-string-literal-repair-is-schema-guided",
+      "title": "The literal text null or None for a string-or-null argument is repaired to JSON null and audited; string-only fields and enum literals are never reinterpreted.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_long_horizon_working_set.py::test_null_string_literals_are_repaired_only_for_nullable_string_fields"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "tool-failures-expose-identifier-codes-not-text",
+      "title": "Model-facing tool failures carry only identifier-shaped diagnostic codes from the tool boundary while exception text stays hashed.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_tool_failure_public_details.py::test_public_identifier_details_keep_codes_and_drop_text",
+        "tests/runtime/test_tool_failure_public_details.py::test_git_diff_scope_failure_tells_the_model_why"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "reopen-digest-is-payload-free",
+      "title": "After a reopen released earlier tool results, the prompt digest of prior activity is rebuilt from durable pre-shutdown events and carries paths, argv, identifiers, and counts only.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_reopen_activity_digest.py::test_collection_pages_backwards_and_keeps_only_pre_shutdown_process_events",
+        "tests/runtime/test_reopen_activity_digest.py::test_rendering_is_bounded_and_payload_free",
+        "tests/runtime/test_reopen_activity_digest.py::test_prompt_after_reopen_names_earlier_reads_writes_and_commands",
+        "tests/runtime/test_reopen_activity_digest.py::test_prompt_without_lost_results_has_no_digest"
       ],
       "benchmark_attack_classes": []
     }

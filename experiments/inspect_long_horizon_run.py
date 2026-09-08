@@ -40,6 +40,7 @@ PROMPT_SECTION_HEADINGS: tuple[tuple[str, str], ...] = (
     ("Process facts:", "process_facts"),
     ("Materialized context metadata (volatile):", "context_metadata"),
     ("Materialized context warning:", "context_warning"),
+    ("Durable activity before the last Runtime reopen", "reopen_digest"),
     ("Capabilities:", "capabilities"),
     ("Permission-request ceilings", "requestable_capabilities"),
     ("Recent events:", "recent_events"),

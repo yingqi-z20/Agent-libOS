@@ -1,8 +1,33 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 
 class LibOSError(Exception):
-    """Base exception for Agent libOS runtime errors."""
+    """Base exception for Agent libOS runtime errors.
+
+    ``details`` is an optional bag of identifier-shaped diagnostic codes (for
+    example ``{"hint": "list_field_is_not_a_list"}``).  The tool boundary
+    projects only entries whose key and value satisfy the closed identifier
+    grammar to the model; the message text itself stays hashed.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(*args)
+        # Only materialize the attribute when there is something to carry, so
+        # exceptions that never declare codes keep their minimal attribute set.
+        # Subclasses such as ``GitError`` assign ``details`` before delegating
+        # here; merge instead of clobbering so their codes survive.
+        existing = vars(self).get("details")
+        if details or existing is not None:
+            merged: dict[str, Any] = dict(existing or {})
+            merged.update(details or {})
+            self.details = merged
 
 
 class NotFound(LibOSError):
@@ -203,9 +228,28 @@ class TaskRunCompletionContractError(ValidationError):
 
 
 class SkillPackageChanged(ValidationError):
-    """A hash-pinned Skill activation no longer matches visible content."""
+    """A hash-pinned Skill activation no longer matches visible content.
 
-    pass
+    ``details`` carries identifier-shaped codes only: the current package hash
+    lets the model re-pin in one retry instead of re-running discovery, which
+    is exactly what a fresh discovery would return.  A model copying a
+    64-character hash by hand mistypes one digit surprisingly often.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        current_package_sha256: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.current_package_sha256 = current_package_sha256
+        self.details: dict[str, str] = {}
+        if current_package_sha256:
+            self.details = {
+                "hint": "retry_activation_with_current_package_sha256",
+                "current_package_sha256": current_package_sha256,
+            }
 
 
 class GitError(LibOSError):

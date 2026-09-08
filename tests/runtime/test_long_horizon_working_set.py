@@ -22,6 +22,7 @@ from agent_libos.memory.object_memory import (
     _observation_supersession_key,
 )
 from agent_libos.models import CapabilityRight, EventType, ObjectType, ProcessMessageKind
+from agent_libos.tools.broker import _normalize_scalar_string
 from tests.support.fakes import RecordingActionClient
 
 
@@ -255,11 +256,11 @@ def test_supersession_keys_cover_observations_but_never_actions_or_failures() ->
     ) != _observation_supersession_key(
         {"tool_name": "read_text_file", "result": {"path": "src/b.py"}}
     )
+    # A shell run is evidence, never superseded: a passing suite must not hide
+    # the earlier failing run that proves the defect was reproduced first.
     assert _observation_supersession_key(
-        {"tool_name": "run_shell_command", "result": {"argv": ["python", "-m", "unittest"]}}
-    ) == _observation_supersession_key(
-        {"tool_name": "run_shell_command", "result": {"argv": ["python", "-m", "unittest"]}}
-    )
+        {"tool_name": "run_shell_command", "result": {"argv": ["python", "-m", "unittest"], "returncode": 0}}
+    ) is None
     assert _observation_supersession_key(
         {"tool_name": "write_text_file", "result": {"path": "src/a.py"}}
     ) is None
@@ -540,3 +541,90 @@ def test_event_projection_keeps_newest_visible_events_and_counts_bookkeeping() -
     assert batch.summary["input_event_count"] == len(events)
     assert batch.summary["represented_event_count"] == 3
     assert batch.summary["omitted_event_count"] == len(events) - 3
+
+
+def test_discovery_supersession_keys_follow_the_surfaced_skills() -> None:
+    """Two discovery queries issued in one response must both stay visible.
+
+    Keying every ``discover_skills`` result on the bare tool name let the
+    second query's result hide the first, so the model repeated the query and
+    read the omission as evidence of unfinished earlier work.
+    """
+
+    tool_query = {
+        "tool_name": "discover_skills",
+        "result": {
+            "skills": [
+                {"skill_id": "agent-libos-git-inspection"},
+                {"skill_id": "agent-libos-workspace-editing"},
+            ],
+            "has_more": True,
+        },
+    }
+    memory_query = {
+        "tool_name": "discover_skills",
+        "result": {"skills": [{"skill_id": "agent-libos-object-memory"}], "has_more": False},
+    }
+    repeat = {
+        "tool_name": "discover_skills",
+        "result": {
+            "skills": [
+                {"skill_id": "agent-libos-workspace-editing"},
+                {"skill_id": "agent-libos-git-inspection"},
+            ],
+            "has_more": True,
+        },
+    }
+
+    assert _observation_supersession_key(tool_query) != _observation_supersession_key(memory_query)
+    assert _observation_supersession_key(tool_query) == _observation_supersession_key(repeat)
+    assert _observation_supersession_key(
+        {"tool_name": "discover_skills", "result": {"skills": "not-a-list"}}
+    ) is None
+
+
+def test_null_string_literals_are_repaired_only_for_nullable_string_fields() -> None:
+    """A provider that writes the text ``"null"`` for a nullable string means null.
+
+    glm-5.3 sent ``namespace: "null"`` and ``base/head: "null"`` on every call,
+    which failed as a literal namespace or Git ref and cancelled the rest of
+    each batch.  String-only fields and enum literals are never reinterpreted.
+    """
+
+    assert _normalize_scalar_string("null", {"string"}) == "null"
+    assert _normalize_scalar_string("NULL", {"string", "null"}) == "NULL"
+    assert (
+        _normalize_scalar_string(
+            "null", {"string", "null"}, enum_values=frozenset({"null"})
+        )
+        == "null"
+    )
+    assert _normalize_scalar_string("null", {"string", "null"}) is None
+    assert _normalize_scalar_string("None", {"string", "null"}) is None
+
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="argument repair")
+
+        normalized = runtime.tools.normalize_model_action(
+            pid,
+            {"action": "process_exit", "message": "null", "review_token": "None"},
+        )
+
+        assert normalized["message"] is None
+        assert normalized["review_token"] is None
+        records = [
+            record
+            for record in runtime.audit.trace(actor=pid)
+            if record.action == "llm.tool_arguments_normalized"
+        ]
+        assert records
+        assert {"message", "review_token"} <= set(records[-1].decision["normalized_fields"])
+
+        literal = runtime.tools.normalize_model_action(
+            pid,
+            {"action": "process_exit", "message": "nullable summary"},
+        )
+        assert literal["message"] == "nullable summary"
+    finally:
+        runtime.close()

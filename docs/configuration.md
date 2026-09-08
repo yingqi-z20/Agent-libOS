@@ -928,6 +928,12 @@ as equivalent:
   quantum cannot leave actionable events stuck behind a backlog for several
   quanta. The oldest-first scan preserves a gap-free advancing cursor; it does
   not activate delta capture by itself.
+- `llm_context.reopen_digest_event_scan_limit` (default `4000`) bounds how many
+  global event-log rows the executor walks backwards to rebuild the payload-free
+  `Durable activity before the last Runtime reopen` digest when a materialized
+  context omits earlier results whose payloads were released by a reopen. A
+  smaller value yields a partial digest for long histories; the digest never
+  includes tool output.
 - `llm_context.prompt_event_payload_max_chars` bounds each represented event's
   provider-neutral model payload (default `2,048` characters). Oversized
   payloads retain compact actionable fields plus deterministic omission counts

@@ -764,10 +764,65 @@ def _project_checkpoint_restore_receipt(value: Any) -> dict[str, Any] | None:
     return projected
 
 
+_PUBLIC_DETAIL_IDENTIFIER_MAX_CHARS = 64
+_PUBLIC_DETAIL_MAX_ITEMS = 4
+_RESERVED_DETAIL_KEYS = frozenset(
+    {
+        "code",
+        "error_type",
+        "correlation_id",
+        "checkpoint_fork_receipt",
+        "checkpoint_restore_receipt",
+        "errors",
+        "message",
+        "safe_message",
+        "policy_decision",
+    }
+)
+
+
+def _is_identifier_detail(value: Any) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _PUBLIC_DETAIL_IDENTIFIER_MAX_CHARS
+    ):
+        return False
+    return all(
+        character.isascii() and (character.isalnum() or character in "._:-")
+        for character in value
+    )
+
+
+def public_identifier_details(details: Mapping[str, Any]) -> dict[str, str]:
+    """Project value-free, identifier-shaped diagnostic codes for the model.
+
+    Tools may attach short machine codes (for example ``git_error_code`` or a
+    ``hint``) that say *why* a call failed without echoing arguments, paths,
+    or output.  Only entries whose key and value both satisfy the closed
+    identifier grammar survive, so free text can never ride along; without
+    them a failure reads as an opaque correlation id and the model retries the
+    same malformed call.
+    """
+
+    selected: dict[str, str] = {}
+    for raw_key in sorted(details, key=str):
+        key = str(raw_key)
+        if key in _RESERVED_DETAIL_KEYS or not _is_identifier_detail(key):
+            continue
+        value = details[raw_key]
+        if not _is_identifier_detail(value):
+            continue
+        selected[key] = value
+        if len(selected) >= _PUBLIC_DETAIL_MAX_ITEMS:
+            break
+    return selected
+
+
 def _safe_caught_exception_details(
     details: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Retain only explicitly projected retry-safety facts from exceptions."""
+    """Retain explicitly projected retry-safety facts and identifier codes."""
 
     safe: dict[str, Any] = {}
     receipt = _project_checkpoint_fork_receipt(
@@ -780,6 +835,7 @@ def _safe_caught_exception_details(
     )
     if restore_receipt is not None:
         safe["checkpoint_restore_receipt"] = restore_receipt
+    safe.update(public_identifier_details(details))
     return safe
 
 
@@ -1186,6 +1242,16 @@ class BaseAgentTool(ABC, Generic[InputT]):
         safe_details: Mapping[str, Any] | None = None,
     ) -> ToolResult:
         public_error = public_error_envelope(exc, code=code.value)
+        if safe_details is None:
+            # Domain exceptions (for example ``SkillPackageChanged``) may carry
+            # identifier-shaped codes of their own; the same closed filter
+            # applies, so exception text still never reaches the model.
+            declared = getattr(exc, "details", None)
+            safe_details = (
+                _safe_caught_exception_details(declared)
+                if isinstance(declared, Mapping)
+                else None
+            )
         result = ToolResult.failure(
             code=code,
             message=public_error["message"],

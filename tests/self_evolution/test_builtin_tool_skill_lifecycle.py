@@ -379,6 +379,16 @@ def test_reopen_reproduces_old_builtin_snapshot_after_catalog_upgrade(
         )
         assert not stale.ok
         assert stale.payload["error"]["details"]["error_type"] == "SkillPackageChanged"
+        # The failure names the current hash so one retry can re-pin without a
+        # second discovery; a mistyped 64-character hash otherwise costs two calls.
+        assert (
+            stale.payload["error"]["details"]["current_package_sha256"]
+            == upgraded.package_sha256
+        )
+        assert (
+            stale.payload["error"]["details"]["hint"]
+            == "retry_activation_with_current_package_sha256"
+        )
         assert (
             reopened.process.get(pid).loaded_skills[WORKSPACE_EDITING_SKILL]
             == loaded_snapshot

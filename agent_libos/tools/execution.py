@@ -65,6 +65,7 @@ from agent_libos.tools.base import (
     bounded_failure_model_projection,
     exception_failure_provenance,
     model_safe_tool_error_message,
+    public_identifier_details,
     tool_result_content_duplicates_data,
     wait_data_flow_context,
 )
@@ -777,6 +778,13 @@ class ToolExecutionService:
             receipt = tool_result.error.details.get("checkpoint_fork_receipt")
             if isinstance(receipt, dict):
                 public_details["checkpoint_fork_receipt"] = dict(receipt)
+            # Identifier-shaped codes retained by the tool boundary (for
+            # example ``git_error_code`` or ``hint``) tell the model why the
+            # call failed; the exception text itself stays hashed.
+            for key, value in public_identifier_details(
+                tool_result.error.details
+            ).items():
+                public_details.setdefault(key, value)
         durable_payload = {
             "ok": False,
             "error": {

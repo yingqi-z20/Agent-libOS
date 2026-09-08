@@ -658,10 +658,16 @@ tool, its target (path, argv, namespace, changed paths), the outcome, and
 result sizes, never result content. With
 `memory.working_set_supersede_observations` (default on), a repeated
 observation of the same target (the same file path read again, the same
-directory listed, the same argv run, the newest Git status/diff, discovery, or
-completion review) supersedes the earlier copy, which is omitted with manifest
+directory listed, the newest Git status, a Git diff of the same scope and
+refs, discovery, or completion review) supersedes the earlier copy, which is omitted with manifest
 reason `superseded`, so stale file contents cannot contradict the current
-workspace after an edit. Results that carry Human or process input
+workspace after an edit. A Skill discovery supersedes only an earlier discovery
+that surfaced the same Skill set, so two different queries issued in one
+response both stay visible. When every omission is `superseded`, the legacy
+prompt names the reason without a re-observation cue; that cue is reserved for
+results whose payloads are actually gone. Shell command results are never
+superseded: a failing run followed by a passing run is exactly the evidence a
+task needs, so older runs fall back to stubs that keep argv and return code. Results that carry Human or process input
 (`read_process_messages`, `receive_process_messages`, `ask_human`) are never
 compacted. Stubs are `included` manifest entries with transform `compacted`,
 keep their root position, and are counted in the legacy prompt metadata as

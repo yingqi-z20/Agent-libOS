@@ -68,3 +68,39 @@ def test_cache_optimized_layout_keeps_its_compact_count_only_warning() -> None:
     section = _context_metadata_section(context, prompt_layout=PROMPT_LAYOUT_CACHE_OPTIMIZED_V2)
 
     assert section == "Materialized context warning:\n- omitted_object_count: 1"
+
+
+def test_superseded_only_omissions_do_not_ask_for_re_observation() -> None:
+    """A superseded copy was replaced by a fresher read that is rendered.
+
+    The re-observation cue made models infer unfinished earlier work at the
+    very start of a task and spend a quantum re-orienting.
+    """
+
+    context = _context(
+        omitted=["obj-stale"],
+        manifest=[{"oid": "obj-stale", "disposition": "omitted", "reason": "superseded"}],
+    )
+
+    section = _context_metadata_section(context, prompt_layout=PROMPT_LAYOUT_LEGACY_V1)
+
+    assert "superseded=1" in section
+    assert "nothing to re-read" in section
+    assert "omitted_object_guidance" not in section
+    assert "Re-observe" not in section
+
+
+def test_mixed_omissions_keep_the_re_observation_guidance() -> None:
+    context = _context(
+        omitted=["obj-stale", "obj-lost"],
+        manifest=[
+            {"oid": "obj-stale", "disposition": "omitted", "reason": "superseded"},
+            {"oid": "obj-lost", "disposition": "omitted", "reason": "capability_denied"},
+        ],
+    )
+
+    section = _context_metadata_section(context, prompt_layout=PROMPT_LAYOUT_LEGACY_V1)
+
+    assert "omitted_object_guidance" in section
+    assert "this same process" in section
+    assert "Re-observe with a fresh read" in section

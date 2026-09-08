@@ -1035,6 +1035,11 @@ class LLMContextDefaults:
     # busy multi-call quantum cannot leave actionable events stuck behind a
     # backlog of bookkeeping rows for several quanta.
     recent_event_scan_limit: StrictInt = 200
+    # Global event-log rows walked backwards (newest first) to rebuild the
+    # payload-free digest of what a process did before the last Runtime
+    # reopen.  Tool results are released on reopen; without this digest the
+    # model re-reads every file it had already read or written.
+    reopen_digest_event_scan_limit: StrictInt = 4_000
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -1306,6 +1311,10 @@ def _validate_llm_context_config(
         llm_context.recent_event_scan_limit,
         "llm_context.recent_event_limit",
         llm_context.recent_event_limit,
+    )
+    _positive(
+        "llm_context.reopen_digest_event_scan_limit",
+        llm_context.reopen_digest_event_scan_limit,
     )
     if llm_context.prompt_event_payload_max_chars < 512:
         raise ValueError(

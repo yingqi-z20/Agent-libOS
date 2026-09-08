@@ -1412,7 +1412,10 @@ class ObjectMemoryManager:
         if isinstance(payload, dict):
             values = payload.setdefault(list_field, [])
             if not isinstance(values, list):
-                raise ValidationError("target object list_field is not a list")
+                raise ValidationError(
+                    "target object list_field is not a list",
+                    details={"hint": "list_field_is_not_a_list"},
+                )
             values.append(entry)
             output_list_field: str | None = list_field
             length = len(values)
@@ -1421,7 +1424,12 @@ class ObjectMemoryManager:
             output_list_field = None
             length = len(payload)
         else:
-            raise ValidationError("target object payload is not appendable")
+            raise ValidationError(
+                "target object payload is not appendable",
+                details={
+                    "hint": "target_payload_is_not_a_container_recreate_with_object_or_array"
+                },
+            )
         self._validate_payload_size(payload, "memory payload")
         return payload, output_list_field, length
 
@@ -3259,11 +3267,17 @@ _OBSERVATION_KEY_FIELDS: dict[str, tuple[str, ...]] = {
     "read_directory": ("path",),
     "get_working_directory": (),
     "git_status": (),
-    "git_diff": (),
+    # A staged-scope diff must not hide the worktree-scope diff issued in the
+    # same response; only a diff of the same scope and refs is stale.
+    "git_diff": ("scope", "base_oid", "head_oid", "worktree_id"),
     "git_log": (),
     "git_repository_info": (),
-    "run_shell_command": ("argv",),
-    "discover_skills": (),
+    # ``run_shell_command`` is deliberately absent: a command's outcome is
+    # evidence with temporal meaning, not an observation of a stable target.
+    # Letting a passing test run supersede the earlier failing run erased the
+    # "reproduced the failure first" evidence, and a literal-minded model then
+    # reverted its fix to reproduce the failure again, in a loop.  Older runs
+    # fall back to stubs that keep argv and returncode.
     "list_memory_namespace": ("namespace",),
     "read_memory_object": ("namespace", "name"),
     "list_checkpoints": (),
@@ -3327,10 +3341,34 @@ def _observation_supersession_key(payload: Any) -> tuple[Any, ...] | None:
         if result.get("status") == "completion_review_required":
             return ("process_exit", "completion_review")
         return None
+    if tool_name == "discover_skills":
+        return _discovery_supersession_key(result)
     fields = _OBSERVATION_KEY_FIELDS.get(tool_name)
     if fields is None:
         return None
     return (tool_name, *(_canonical_prompt_json(result.get(field)) for field in fields))
+
+
+def _discovery_supersession_key(result: dict[str, Any]) -> tuple[Any, ...] | None:
+    """Key a Skill discovery by the Skills it surfaced, not by the tool alone.
+
+    Two discovery queries issued in one response usually target different
+    Skills; a later result must not hide the earlier one, or the model repeats
+    the query.  Only a repeat that surfaces the same Skill set supersedes the
+    older copy.
+    """
+
+    skills = result.get("skills")
+    if not isinstance(skills, list):
+        return None
+    skill_ids = tuple(
+        sorted(
+            str(entry.get("skill_id"))
+            for entry in skills
+            if isinstance(entry, dict) and entry.get("skill_id")
+        )
+    )
+    return ("discover_skills", skill_ids, bool(result.get("has_more")))
 
 
 def _feedback_stub_summary(payload: Any) -> dict[str, Any]:

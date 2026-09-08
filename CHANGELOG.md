@@ -76,6 +76,33 @@ release. Do not treat an entry in this section as shipped behavior.
   receipt-order oracles), a `--scenario` CLI selector, per-run wall-clock,
   latency, prompt-section, batch, and stop-reason diagnostics, and the
   payload-free `experiments/inspect_long_horizon_run.py` inspector.
+- Repair the literal text `"null"`/`"None"` sent for a tool argument whose
+  schema admits both string and null (for example `namespace`, `base`, `head`)
+  to JSON null, audited as `llm.tool_arguments_normalized`; string-only and
+  enum fields are never reinterpreted. One provider sent these on every call,
+  which failed as a literal namespace or Git ref and cancelled the rest of each
+  batch.
+- Let model-facing tool failures carry identifier-shaped diagnostic codes from
+  the tool boundary (`git_error_code`, `hint`, `current_package_sha256`) while
+  exception text stays hashed; `git_diff` now names
+  `worktree_scope_requires_null_base_and_head` and its siblings instead of an
+  opaque correlation id the model retried seven times, a stale Skill hash
+  reports the current hash for a one-call re-pin, a compare-and-swap write
+  conflict and an unappendable Object payload name their cause, and every
+  `LibOSError` accepts an optional identifier `details` bag.
+- Accept the main worktree's reported identity digest wherever a Git tool takes
+  `worktree_id`; `git_status` returns that digest, and a model that copied it
+  into `git_diff` was rejected with `invalid_path` twice per run.
+- Key `discover_skills` supersession on the surfaced Skill set so two different
+  discovery queries in one response both stay visible, never supersede
+  `run_shell_command` results (a passing test run hid the earlier failing run
+  and one model reverted its fix to reproduce the failure again), and drop the
+  re-observation cue when every omitted Object is merely `superseded`; that cue
+  made models infer unfinished earlier work at the start of a task.
+- Add a payload-free `Durable activity before the last Runtime reopen` prompt
+  digest (files read and written, commands with return codes, Git inspections,
+  Skills, checkpoints) rebuilt from durable events when a reopen released the
+  earlier tool results, bounded by `llm_context.reopen_digest_event_scan_limit`.
 
 ## 1.5.3
 

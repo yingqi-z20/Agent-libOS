@@ -1479,6 +1479,17 @@ longer defines.
 - `container-argument-repair-is-schema-guided`: a JSON-encoded object or array
   tool argument is decoded only when every schema variant forbids strings, and
   the repair is recorded as `llm.tool_arguments_normalized`.
+- `nullable-string-literal-repair-is-schema-guided`: the literal text `null` or
+  `None` sent for an argument whose schema admits both string and null is
+  repaired to JSON null and audited; string-only fields and enum literals are
+  never reinterpreted.
+- `tool-failures-expose-identifier-codes-not-text`: a model-facing tool failure
+  carries only identifier-shaped diagnostic codes attached by the tool boundary
+  (for example `git_error_code`, `hint`); exception text stays hashed.
+- `reopen-digest-is-payload-free`: after a Runtime reopen released earlier tool
+  results, the prompt digest of prior activity is rebuilt from durable events
+  older than the last shutdown and carries paths, argv, identifiers, and counts
+  only; without lost results no digest renders.
 
 ## Known Test Gaps
 

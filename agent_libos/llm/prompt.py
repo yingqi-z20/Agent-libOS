@@ -191,6 +191,7 @@ def build_user_prompt(
     fallback_json_actions: bool = False,
     prompt_layout: str = PROMPT_LAYOUT_LEGACY_V1,
     pending_message_notice: Mapping[str, Any] | None = None,
+    reopen_digest: str | None = None,
 ) -> str:
     mode = prompt_mode if prompt_mode in PROMPT_MODES else PROMPT_MODE_LIBOS_DEFAULT
     layout = (
@@ -223,6 +224,7 @@ def build_user_prompt(
                     tools=tools,
                     prompt_layout=layout,
                 ),
+                reopen_digest or "",
                 _process_message_directive(process, events, pending_message_notice),
             ]
             if part.strip()
@@ -258,6 +260,7 @@ def build_user_prompt(
         fallback_json_actions=fallback_json_actions,
         prompt_layout=layout,
         pending_message_notice=pending_message_notice,
+        reopen_digest=reopen_digest,
     )
 
 
@@ -280,6 +283,7 @@ def _runtime_user_prompt(
     fallback_json_actions: bool,
     prompt_layout: str,
     pending_message_notice: Mapping[str, Any] | None = None,
+    reopen_digest: str | None = None,
 ) -> str:
     parts = [
         _available_skill_section(available_skills),
@@ -300,6 +304,7 @@ def _runtime_user_prompt(
             tools=tools,
             prompt_layout=prompt_layout,
             pending_message_notice=pending_message_notice,
+            reopen_digest=reopen_digest,
         ),
     ]
     return "\n\n".join(part for part in parts if part.strip())
@@ -1158,13 +1163,20 @@ def _omitted_object_guidance(context: MaterializedContext) -> str:
         )
     else:
         reasons = "not materialized in this quantum"
+    reasons_line = f"\n- omitted_object_reasons: {reasons}"
+    if counts and set(counts) <= {"superseded"}:
+        # A superseded copy was replaced by a fresher read of the same target
+        # that is rendered above.  Nothing was lost, so no re-observation cue:
+        # that cue made models infer unfinished earlier work and re-orient.
+        return reasons_line
     return (
-        f"\n- omitted_object_reasons: {reasons}"
-        "\n- omitted_object_guidance: omitted Objects are not visible this "
-        "quantum; their earlier effects (edits, activations, ledger entries) "
-        "may still exist in the workspace or Object Memory. Re-observe with a "
-        "fresh read before relying on or repeating that work; do not treat an "
-        "omission as proof that the work was never done or as a reason to redo it blindly."
+        reasons_line
+        + "\n- omitted_object_guidance: omitted Objects are earlier results of "
+        "this same process that are not visible this quantum; their effects "
+        "(edits, activations, ledger entries) may still exist in the workspace "
+        "or Object Memory. Re-observe with a fresh read before relying on or "
+        "repeating that work; do not treat an omission as proof that the work "
+        "was never done or as a reason to redo it blindly."
     )
 
 
@@ -1178,6 +1190,7 @@ def _volatile_runtime_section(
     tools: list[dict[str, Any]],
     prompt_layout: str,
     pending_message_notice: Mapping[str, Any] | None = None,
+    reopen_digest: str | None = None,
 ) -> str:
     include_event_id = (
         prompt_layout == PROMPT_LAYOUT_LEGACY_V1
@@ -1191,6 +1204,7 @@ def _volatile_runtime_section(
             prompt_layout=prompt_layout,
         ),
         _context_metadata_section(context, prompt_layout=prompt_layout),
+        reopen_digest or "",
         _capability_section(
             capabilities,
             process=process,

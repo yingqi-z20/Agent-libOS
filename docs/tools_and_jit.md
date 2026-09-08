@@ -63,6 +63,9 @@ The current built-in tool surface includes tools for:
 - Git: 32 strict tools for bounded inspection, local mutation, managed
   worktrees, immutable patch Objects, existing remotes, and repository-local
   simulated pull requests through `Runtime.git`; no arbitrary Git argv or URL.
+  Results report the main worktree as its identity digest, and every Git tool
+  accepts that digest in `worktree_id` as an alias for `main` once a read has
+  reported it.
 - JSON-RPC: list/inspect registered endpoints and call registered methods.
 - MCP: list/inspect registered servers, list manifest-allowed tools, call
   registered MCP tools, and page/read model-visible Manifest v3 Resources
@@ -79,6 +82,22 @@ The current built-in tool surface includes tools for:
 - Utility actions such as `echo` and `parse_pytest_log`.
 
 Use `uv run agent-libos tools` to inspect registered tools in a runtime.
+
+### Model-facing failure codes and argument repair
+
+A failed tool call reaches the model as a bounded envelope: the error code, the
+exception class name, a correlation id, and any identifier-shaped diagnostic
+codes the tool boundary attached, for example `git_error_code: invalid_ref`
+with `hint: worktree_scope_requires_null_base_and_head`. Codes must satisfy the
+closed identifier grammar (ASCII letters, digits, `._:-`, at most 64
+characters), so free text cannot ride along; the exception text itself is
+hashed, never copied. Without such a code a model that sent one malformed
+argument tends to retry the same call. Before dispatch the broker repairs the
+provider quirks that the declared schema makes unambiguous: a JSON-encoded
+container for an object- or array-only field, canonical scalars for non-string
+fields, and the literal text `null` or `None` for a string-or-null field.
+String-only fields and enum literals are never reinterpreted, and every repair
+is audited as `llm.tool_arguments_normalized`.
 
 ## On-Demand Tool Skills
 

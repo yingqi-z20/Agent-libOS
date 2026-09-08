@@ -3658,7 +3658,8 @@ class SkillManager:
             return
         if expected_package_sha256 != skill.package_sha256:
             raise SkillPackageChanged(
-                f"Skill package changed since discovery: {skill.skill_id}"
+                f"Skill package changed since discovery: {skill.skill_id}",
+                current_package_sha256=skill.package_sha256,
             )
 
     def _skill_snapshot(self, skill: SkillPackage) -> dict[str, Any]:

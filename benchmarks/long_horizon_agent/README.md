@@ -173,3 +173,12 @@ over three minutes for that single completion; on the multi-module scenario a
 180-second per-attempt timeout ended three consecutive real runs during such a
 step, so budget the timeout for the longest expected write step rather than
 for an average call.
+
+Read a retained run's trajectory before changing the harness. Provider quirks
+that look like model failures are often harness-absorbable: one model wrote the
+text `"null"` for every nullable argument and mistyped one digit of a Skill
+hash on roughly one activation in seven, and because the failure envelope hid
+the reason it retried the same rejected `git_diff` until the quantum budget
+would have run out. `action_batches.stop_reasons`, `tool_calls_by_category`,
+and the per-call table from `experiments/inspect_long_horizon_run.py --calls`
+expose such loops without copying any prompt text.
