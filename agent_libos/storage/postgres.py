@@ -120,6 +120,8 @@ class _PostgresDialect:
             "(package_json::jsonb ->> 'description')",
             transformed,
         )
+        for sqlite_expression, postgres_expression in _PROVIDER_CONTINUATION_JSON_EXPRESSIONS.items():
+            transformed = transformed.replace(sqlite_expression, postgres_expression)
         transformed = re.sub(
             r"\s+INDEXED\s+BY\s+[A-Za-z_][A-Za-z0-9_]*",
             "",
@@ -1199,6 +1201,18 @@ _SQLITE_SKILL_DESCRIPTION_JSON_EXTRACT = re.compile(
     r"json_extract\(\s*package_json\s*,\s*'\$\.description'\s*\)",
     re.IGNORECASE,
 )
+_PROVIDER_CONTINUATION_JSON_EXPRESSIONS = {
+    "json_extract(checkpoint.snapshot_json, '$.provider_continuation_refs')":
+        "(checkpoint.snapshot_json::json -> 'provider_continuation_refs')",
+    "json_extract(continuation_ref.value, '$.marker_call_id')":
+        "(continuation_ref.value ->> 'marker_call_id')",
+    "json_extract(continuation_ref.value, '$.source_call_id')":
+        "(continuation_ref.value ->> 'source_call_id')",
+    "json_extract(marker.request_options_json, '$.provider_continuation.state')":
+        "(marker.request_options_json::json -> 'provider_continuation' ->> 'state')",
+    "json_extract(marker.request_options_json, '$.provider_continuation.call_id')":
+        "(marker.request_options_json::json -> 'provider_continuation' ->> 'call_id')",
+}
 
 
 def _prepare_parameterized_sql(sql: str) -> str:

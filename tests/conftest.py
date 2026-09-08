@@ -117,9 +117,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             elif shutil.which("deno") is None:
                 item.add_marker(pytest.mark.skip(reason="deno not installed"))
         if "real_llm" in item.keywords:
+            real_llm_marker = item.get_closest_marker("real_llm")
+            host_env_prefix = real_llm_marker.kwargs.get("host_env_prefix") if real_llm_marker else None
             if not run_real_llm:
                 item.add_marker(pytest.mark.skip(reason="real LLM tests require --run-real-llm"))
-            elif not _has_real_llm_environment():
+            elif not _has_real_llm_environment(host_env_prefix):
                 item.add_marker(pytest.mark.skip(reason="real LLM environment is not configured"))
         if "postgres" in item.keywords:
             if not run_postgres:
@@ -187,7 +189,11 @@ def _is_mcp_test_item(root: Path, item: pytest.Item) -> bool:
     return "mcp" in source.lower()
 
 
-def _has_real_llm_environment() -> bool:
+def _has_real_llm_environment(host_env_prefix: str | None = None) -> bool:
+    if host_env_prefix is not None:
+        if not isinstance(host_env_prefix, str) or not host_env_prefix or not host_env_prefix.replace("_", "").isalnum():
+            raise pytest.UsageError("real_llm host_env_prefix must name an explicit Host environment prefix")
+        return bool(os.getenv(f"{host_env_prefix}_API_KEY") and os.getenv(f"{host_env_prefix}_MODEL"))
     return bool(
         os.getenv("OPENAI_API_KEY")
         and (os.getenv("OPENAI_LANGUAGE_MODEL") or os.getenv("OPENAI_MODEL"))

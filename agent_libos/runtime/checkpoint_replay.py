@@ -11,6 +11,7 @@ from agent_libos.models import Capability, CapabilityEffect, CapabilityRight, Ca
 from agent_libos.models.data_flow import DataFlowContext, DataSourceRef
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.models.snapshot import LocalReplayReference
+from agent_libos.runtime.checkpoint_continuation import CheckpointContinuationAdapter
 from agent_libos.utils.object_payload import object_payload_sha256
 from agent_libos.utils.serde import loads
 
@@ -44,6 +45,14 @@ class CheckpointReplayAdapter:
             max_bytes=config.llm.responses_replay_max_bytes,
             max_turns=config.llm.responses_replay_max_turns,
         )
+        self.continuations = CheckpointContinuationAdapter(
+            processes=self.processes, config=config, profile_scope=self._scope,
+            validate_sources=self._validate_sources, fork_context=self._fork_context,
+            validate_fork_sources=self._validate_fork_sources,
+        )
+
+    def capture_provider_continuations(self, pids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        return self.continuations.capture(pids)
 
     def capture(self, pids: Sequence[str]) -> dict[str, dict[str, Any]]:
         if not self.config.llm.persist_full_io:
@@ -74,6 +83,7 @@ class CheckpointReplayAdapter:
         return snapshot.identity_sha256, snapshot.policy.model
 
     def validate(self, snapshot: Mapping[str, Any], *, remapped: Mapping[str, Any] | None = None) -> None:
+        self.continuations.validate(snapshot, remapped=remapped)
         rows = {str(row["pid"]): row for row in snapshot["rows"]["processes"]}
         for pid, reference in self._entries(snapshot).items():
             if pid not in rows or reference.pid != pid:
@@ -165,6 +175,7 @@ class CheckpointReplayAdapter:
                 provider_fingerprint=reference.provider_fingerprint, model=reference.model,
                 flow_context=DataFlowContext.from_dict(payload["flow_context"]),
             )
+        self.continuations.publish_restore(snapshot)
 
     def publish_fork(self, snapshot: Mapping[str, Any], *, remapped: Mapping[str, Any]) -> None:
         for pid, reference in self._entries(snapshot).items():
@@ -176,3 +187,4 @@ class CheckpointReplayAdapter:
                 provider_fingerprint=reference.provider_fingerprint, model=reference.model,
                 flow_context=self._fork_context(DataFlowContext.from_dict(payload["flow_context"]), remapped),
             )
+        self.continuations.publish_fork(snapshot, remapped=remapped)

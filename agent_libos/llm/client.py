@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMDefaults
+from agent_libos.config import (
+    DEFAULT_CONFIG, AgentLibOSConfig, LLMDefaults, ProviderToolsConfig, normalize_provider_tools,
+)
 from agent_libos.utils.openai_schema import (
     normalize_openai_chat_tool_schema,
     normalize_openai_structured_output_schema,
@@ -26,6 +28,10 @@ from agent_libos.utils.openai_schema import (
 )
 from agent_libos.models.exceptions import LibOSError
 from agent_libos.ports.blocking_work import run_blocking_once
+from agent_libos.llm.provider_tools import (
+    ProviderToolsResponseError, apply_provider_tools, project_provider_tool_results,
+    provider_tool_request_observation,
+)
 from agent_libos.llm.provider_policy import is_astra_model, resolve_provider_policy
 from agent_libos.llm.response_items import ResponseItemsError, validate_response_items
 from agent_libos.llm.provider_trace import (
@@ -106,6 +112,9 @@ class LLMCompletion:
     # identifiers are intentionally represented as booleans rather than copied
     # into durable call records by downstream consumers.
     provider_request_options: dict[str, Any] = field(default_factory=dict)
+    provider_tool_activities: list[dict[str, Any]] = field(default_factory=list)
+    citations: list[dict[str, Any]] = field(default_factory=list)
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
     compatibility_removed_options: list[str] = field(default_factory=list)
     provider_trace: dict[str, Any] | None = None
     _provider_attempt_sequence: int | None = field(default=None, repr=False)
@@ -150,6 +159,7 @@ class LLMClient:
     parallel_tool_calls: bool | None = None
     fallback_json_actions: bool | None = None
     enable_thinking: bool | None = None
+    provider_tools: ProviderToolsConfig | None = None
     organization: str | None = None
     project: str | None = None
     inherit_ambient_openai_sdk_config: bool = True
@@ -178,6 +188,7 @@ class LLMClient:
             self.base_url = os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
         self._validate_base_url_policy()
         try:
+            self.provider_tools = normalize_provider_tools(self.provider_tools)
             policy = resolve_provider_policy(
                 defaults=self.defaults,
                 base_url=self.base_url,
@@ -190,9 +201,11 @@ class LLMClient:
                 prompt_cache_mode=self.prompt_cache_mode,
                 prompt_cache_ttl=self.prompt_cache_ttl,
                 prompt_cache_retention=self.prompt_cache_retention,
+                provider_tools=self.provider_tools,
             )
         except ValueError as exc:
             raise LLMError(str(exc)) from exc
+        self.provider_tools = policy.provider_tools
         self.model = policy.model
         self.api_mode = policy.api_mode  # type: ignore[assignment]
         self.reasoning_effort = policy.reasoning_effort
@@ -213,11 +226,16 @@ class LLMClient:
             retention=self.prompt_cache_retention,
             ttl=self.prompt_cache_ttl,
         )
+        self._initialize_action_defaults()
+
+    def _initialize_action_defaults(self) -> None:
         self.responses_previous_response_id = (
             self.defaults.responses_previous_response_id
             if self.responses_previous_response_id is None
             else self.responses_previous_response_id
         )
+        if self.provider_tools is not None and self.provider_tools.code_interpreter:
+            self.responses_previous_response_id = False
         self.parallel_tool_calls = (
             self.defaults.parallel_tool_calls if self.parallel_tool_calls is None else self.parallel_tool_calls
         )
@@ -477,6 +495,7 @@ class LLMClient:
         parallel_tool_calls: bool | None = None,
         *,
         responses_items: list[dict[str, Any]] | None = None,
+        provider_tools_enabled: bool = True,
     ) -> LLMCompletion:
         return _run_sync(
             self.acomplete_action(
@@ -487,6 +506,7 @@ class LLMClient:
                 previous_response_id=previous_response_id,
                 parallel_tool_calls=parallel_tool_calls,
                 responses_items=responses_items,
+                provider_tools_enabled=provider_tools_enabled,
             )
         )
 
@@ -500,6 +520,7 @@ class LLMClient:
         parallel_tool_calls: bool | None = None,
         *,
         responses_items: list[dict[str, Any]] | None = None,
+        provider_tools_enabled: bool = True,
     ) -> LLMCompletion:
         trace = ProviderTraceBuilder()
         trace_token = _ACTIVE_PROVIDER_TRACE.set(trace)
@@ -514,6 +535,7 @@ class LLMClient:
                     previous_response_id=previous_response_id,
                     parallel_tool_calls=parallel_tool_calls,
                     responses_items=responses_items,
+                    provider_tools_enabled=provider_tools_enabled,
                 )
             trace.mark_selected(completion._provider_attempt_sequence)
             completion.provider_trace = trace.to_dict()
@@ -557,7 +579,10 @@ class LLMClient:
         parallel_tool_calls: bool | None = None,
         *,
         responses_items: list[dict[str, Any]] | None = None,
+        provider_tools_enabled: bool = True,
     ) -> LLMCompletion:
+        if type(provider_tools_enabled) is not bool:
+            raise LLMError("provider_tools_enabled must be a Host boolean")
         if responses_items is not None and not self._use_responses_api():
             raise LLMError("Responses replay requires the Responses API")
         if responses_items is not None and previous_response_id is not None:
@@ -575,9 +600,10 @@ class LLMClient:
                     previous_response_id=previous_response_id,
                     parallel_tool_calls=selected_parallel_tool_calls,
                     responses_items=responses_items,
+                    provider_tools_enabled=provider_tools_enabled,
                 )
             except LLMError as exc:
-                if responses_items is not None or self.responses_replay or (self._use_openai_request_options() and is_astra_model(self.model)):
+                if (self.provider_tools is not None and provider_tools_enabled) or responses_items is not None or self.responses_replay or (self._use_openai_request_options() and is_astra_model(self.model)):
                     # A fallback cannot preserve native ordered reasoning/tool
                     # state. The caller must resolve this protocol failure.
                     raise
@@ -602,6 +628,7 @@ class LLMClient:
                     selected_temperature,
                     selected_max_tokens,
                     parallel_tool_calls=selected_parallel_tool_calls,
+                    provider_tools_enabled=provider_tools_enabled,
                 )
         return await self._chat_complete_action(
             messages,
@@ -609,6 +636,7 @@ class LLMClient:
             selected_temperature,
             selected_max_tokens,
             parallel_tool_calls=selected_parallel_tool_calls,
+            provider_tools_enabled=provider_tools_enabled,
         )
 
     async def _complete_without_tools(
@@ -678,6 +706,7 @@ class LLMClient:
         previous_response_id: str | None = None,
         parallel_tool_calls: bool,
         responses_items: list[dict[str, Any]] | None = None,
+        provider_tools_enabled: bool = True,
     ) -> LLMCompletion:
         payload = self._responses_payload(
             messages,
@@ -693,6 +722,7 @@ class LLMClient:
                 "parallel_tool_calls": parallel_tool_calls,
             }
         )
+        apply_provider_tools(payload, self.provider_tools, api="responses", enabled=provider_tools_enabled)
         provider_call = await self._create_response(payload)
         try:
             return self._completion_from_response(provider_call, capture_replay=responses_items is not None)
@@ -756,13 +786,15 @@ class LLMClient:
         max_tokens: int,
         *,
         parallel_tool_calls: bool,
+        provider_tools_enabled: bool = True,
     ) -> LLMCompletion:
         payload = self._chat_payload(messages=messages, temperature=temperature, max_tokens=max_tokens)
         payload.update({"tools": _chat_tools(tools), "tool_choice": "auto", "parallel_tool_calls": parallel_tool_calls})
+        apply_provider_tools(payload, self.provider_tools, api="chat", enabled=provider_tools_enabled)
         try:
             provider_call = await self._create_chat_completion(payload)
         except LLMError as exc:
-            if self.fallback_json_actions and self._is_tool_protocol_rejection(
+            if not (self.provider_tools is not None and provider_tools_enabled) and self.fallback_json_actions and self._is_tool_protocol_rejection(
                 exc.__cause__ or exc
             ):
                 with _provider_attempt_kind("json_action_fallback"):
@@ -977,6 +1009,9 @@ class LLMClient:
     ) -> dict[str, Any]:
         if not self.model:
             raise LLMError("OPENAI_LANGUAGE_MODEL or OPENAI_MODEL is not configured")
+        messages = self._responses_history_messages(
+            messages, responses_items=responses_items, previous_response_id=previous_response_id,
+        )
         will_use_previous_response_id = self._can_use_previous_response_id(
             previous_response_id, messages=messages, responses_items=responses_items
         )
@@ -1029,6 +1064,24 @@ class LLMClient:
             payload["extra_body"] = extra_body
         return payload
 
+    def _responses_history_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        responses_items: list[dict[str, Any]] | None,
+        previous_response_id: str | None,
+    ) -> list[dict[str, Any]]:
+        if self.provider_tools is not None and self.provider_tools.code_interpreter:
+            if responses_items is not None or previous_response_id is not None:
+                raise LLMError("Code interpreter requires stateless history; start a new process or task")
+            # Strip structured provider annotations even on Host cache-marked
+            # messages. Only plain content and Runtime function history survive.
+            messages = [
+                {**message, "content": _message_content_for_search(message)}
+                for message in messages
+            ]
+        return messages
+
     def _can_use_previous_response_id(
         self,
         response_id: str | None,
@@ -1040,6 +1093,7 @@ class LLMClient:
             response_id
             and responses_items is None
             and not self.responses_replay
+            and not (self.provider_tools is not None and self.provider_tools.code_interpreter)
             and self.store
             and self._use_openai_request_options()
             and not _messages_have_unrepresentable_tool_output(messages)
@@ -1047,7 +1101,7 @@ class LLMClient:
 
     def _native_replay_input(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         try:
-            selected = validate_response_items(items)
+            selected = validate_response_items(items, provider=self.provider_tools.provider if self.provider_tools else None)
         except ResponseItemsError as exc:
             raise LLMError(str(exc)) from exc
         if not self._uses_prompt_cache_breakpoint():
@@ -1170,6 +1224,9 @@ class LLMClient:
                 trace.start_attempt(
                     api="responses" if api == "responses" else "chat",
                     kind=kind if retry_index == 0 else "transport_retry",
+                    provider_tools=provider_tool_request_observation(
+                        self.provider_tools, request, replay=bool(self.responses_replay),
+                    ),
                 )
                 if trace is not None
                 else None
@@ -1222,8 +1279,7 @@ class LLMClient:
             return None
 
         if "enable_thinking" in message and "extra_body" in retry:
-            retry.pop("extra_body", None)
-            return retry
+            return self._without_optional_thinking(retry)
         if "max_completion_tokens" in message and "max_completion_tokens" in retry:
             retry["max_tokens"] = retry.pop("max_completion_tokens")
             return retry
@@ -1243,6 +1299,24 @@ class LLMClient:
         if cache_retry is not None:
             return cache_retry
         return _generic_compatibility_retry(retry, message)
+
+    def _without_optional_thinking(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """Compatibility may remove optional thinking but never hosted-tool policy."""
+        retry = dict(payload)
+        observation = provider_tool_request_observation(self.provider_tools, payload, replay=False)
+        if (self.provider_tools is not None and self.provider_tools.provider == "aliyun"
+                and observation is not None
+                and any(name in observation["effective"] for name in ("code_interpreter", "web_extractor"))):
+            return None
+        extra_body = dict(retry["extra_body"])
+        if "enable_thinking" not in extra_body:
+            return None
+        extra_body.pop("enable_thinking")
+        if extra_body:
+            retry["extra_body"] = extra_body
+        else:
+            retry.pop("extra_body")
+        return retry
 
     def _completion_from_response(
         self,
@@ -1312,10 +1386,16 @@ class LLMClient:
         response_items: list[dict[str, Any]] = []
         if self.responses_replay or capture_replay:
             try:
-                response_items = validate_response_items(output, output=True)
+                response_items = validate_response_items(
+                    output, output=True, provider=self.provider_tools.provider if self.provider_tools else None,
+                )
             except ResponseItemsError as exc:
                 raise LLMError(str(exc)) from exc
+        managed = self._managed_response_projection(output, provider_call)
         completion = LLMCompletion(
+            provider_tool_activities=managed.activities,
+            citations=managed.citations,
+            artifacts=managed.artifacts,
             content=self._response_text(response, output=output),
             tool_calls=tool_calls,
             raw=project_provider_raw_response(response),
@@ -1336,6 +1416,7 @@ class LLMClient:
             ),
             _provider_attempt_sequence=provider_call.attempt_sequence,
         )
+        self._add_provider_tools_observation(completion, provider_call, managed)
         _enrich_active_provider_trace(completion)
         return completion
 
@@ -1399,7 +1480,14 @@ class LLMClient:
                 diagnostic_type="ProviderFinishReason",
             )
 
+        managed = self._managed_response_projection(
+            [{"type": "message", "content": [{"annotations": _get_attr_or_key(message, "annotations")}]}],
+            provider_call,
+        )
         result = LLMCompletion(
+            provider_tool_activities=managed.activities,
+            citations=managed.citations,
+            artifacts=managed.artifacts,
             content=content,
             tool_calls=tool_calls,
             raw=completion,
@@ -1419,8 +1507,29 @@ class LLMClient:
             ),
             _provider_attempt_sequence=provider_call.attempt_sequence,
         )
+        self._add_provider_tools_observation(result, provider_call, managed)
         _enrich_active_provider_trace(result)
         return result
+
+    def _managed_response_projection(self, output: list[Any], provider_call: _ProviderCallResult) -> Any:
+        try:
+            return project_provider_tool_results(
+                output, self.provider_tools, provider_call.request, response=provider_call.response,
+            )
+        except ProviderToolsResponseError as exc:
+            raise LLMError(str(exc)) from exc
+
+    def _add_provider_tools_observation(
+        self, completion: LLMCompletion, provider_call: _ProviderCallResult, managed: Any,
+    ) -> None:
+        observation = provider_tool_request_observation(
+            self.provider_tools, provider_call.request, replay=bool(self.responses_replay),
+        )
+        if observation is not None:
+            if managed.activities or managed.citations or managed.artifacts or managed.usage:
+                observation["observed"] = "returned"
+            observation["usage"] = managed.usage
+            completion.provider_request_options["provider_tools"] = observation
 
     def _use_responses_api(self) -> bool:
         if self.api_mode == "responses":
@@ -1550,6 +1659,11 @@ class LLMClient:
                     "model": payload.get("model"),
                     "stable_prefix": stable,
                     "tools": payload.get("tools", []),
+                    **({"provider_tools": {
+                        "provider": self.provider_tools.provider,
+                        "effective": provider_tool_request_observation(self.provider_tools, payload, replay=bool(self.responses_replay)),
+                        "extra_body": payload.get("extra_body", {}),
+                    }} if self.provider_tools is not None else {}),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -1794,6 +1908,12 @@ def _enrich_active_provider_trace(completion: LLMCompletion) -> None:
             model=completion.model,
             request_id=completion.request_id,
             response_id=completion.response_id,
+            provider_tools=(
+                {**completion.provider_request_options["provider_tools"],
+                 "activities": completion.provider_tool_activities,
+                 "citations": completion.citations, "artifacts": completion.artifacts}
+                if "provider_tools" in completion.provider_request_options else None
+            ),
         )
     except Exception:
         # Trace construction is diagnostic and must never turn a valid Provider

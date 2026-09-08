@@ -6,7 +6,7 @@ import json
 import math
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -64,6 +64,7 @@ from agent_libos.llm.pending import (
 )
 from agent_libos.llm.task_runs import (
     TaskRunDispatchDeferred,
+    normalize_provider_continuation_manifest,
     normalize_validated_action_manifest,
 )
 from agent_libos.runtime.task_run_reference import (
@@ -169,6 +170,13 @@ _COMPLETED_OUTCOME_KEYS = frozenset(
         "result",
         "durable_wait",
         "previous_response_id_used",
+    }
+)
+_PROVIDER_CONTINUATION_WRAPPER_KEYS = frozenset(
+    {
+        "schema_version", "kind", "state", "call_id", "context_generation",
+        "manifest", "manifest_sha256", "llm_call_sha256", "message_sha256",
+        "pre_action_binding", "requirement_binding",
     }
 )
 _TASK_RUN_REQUIREMENT_BINDING_KEY = "task_run_requirement_binding_v1"
@@ -1858,6 +1866,288 @@ class TaskRunManager:
         canonical_task_run_json(binding)
         return binding
 
+    @contextmanager
+    def transcript_settlement_scope_for_pid(self, pid: str) -> Iterator[None]:
+        """Order the Run control lock before a transcript store transaction.
+
+        This scope grants no new dispatch and performs no status admission;
+        already-admitted calls must settle even after a Host pause or cancel.
+        Callers enter it before starting their shared transcript transaction.
+        """
+
+        del pid
+        with self._condition:
+            yield
+
+    def record_provider_continuation(
+        self,
+        *,
+        pid: str,
+        call_id: str,
+        continuation_manifest: Mapping[str, Any],
+        context_generation: str | int,
+    ) -> None:
+        """Atomically settle hosted work and retain a local-only next-call marker.
+
+        The existing pending payload slot holds a distinct versioned kind,
+        never an empty validated action. Its transcript is already committed;
+        recovery only validates it and cannot dispatch the hosted work again.
+        """
+
+        with self._condition, self._uow.transaction():
+            process, record = self._bound_process_run(pid)
+            if record is None:
+                return
+            self._require_settlement_epoch(process, record, "provider continuation")
+            selected_call_id = self._identifier(call_id, "LLM call_id")
+            generation = str(context_generation)
+            if generation != self._store.get_llm_context_generation(pid):
+                raise ValidationError("TaskRun provider continuation context changed")
+            try:
+                manifest = normalize_provider_continuation_manifest(
+                    continuation_manifest
+                )
+                labels = DataLabels.from_dict(manifest["data_labels"])
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("TaskRun provider continuation is invalid") from exc
+            if manifest["call_id"] != selected_call_id:
+                raise ValidationError("TaskRun provider continuation call_id changed")
+            message = self._provider_continuation_message(
+                process, selected_call_id, generation
+            )
+            call_sha256 = self._local_llm_call_sha256(process, selected_call_id)
+            manifest_sha256 = self._sha256(manifest)
+            requirement_binding = self._llm_prompt_requirement_binding(
+                process, record, call_id=selected_call_id,
+                context_generation=generation,
+            )
+            prior = self._store.get_task_run_resume_point(pid, complete_only=True)
+            prior_transcript = self._provider_continuation_replay_base(
+                process, record, prior, generation=generation, manifest=manifest,
+            )
+            if prior_transcript is None:
+                return
+            if self._unsettled_effects(record.run_id):
+                raise ValidationError("TaskRun provider continuation has unsettled effects")
+            prior_messages = prior_transcript.get("transcript_messages", [])
+            if not isinstance(prior_messages, list) or any(
+                not self._valid_replay_message(item) for item in prior_messages
+            ):
+                raise ValidationError("TaskRun continuation transcript is invalid")
+            now = utc_now()
+            bounded = self._bounded_transcript_projection(
+                record.run_id, pid, [*prior_messages, message], prior=prior,
+                created_at=now, context_generation=generation, new_message_count=1,
+            )
+            if bounded is None:
+                self._mark_attention(
+                    record,
+                    self._blocker(
+                        "pending_action_unreplayable",
+                        "provider continuation exceeds the durable transcript bound",
+                        pid=pid,
+                    ),
+                )
+                raise ValidationError("TaskRun provider continuation exceeds payload bound")
+            messages, summary_payload = bounded
+            if prior_transcript.get("data_labels") is not None:
+                labels = DataLabels.aggregate(
+                    [labels, DataLabels.from_dict(prior_transcript["data_labels"])]
+                )
+            transcript = TaskRunPayload.plaintext(
+                payload_id=new_id("trp"), run_id=record.run_id, role="transcript",
+                label="Committed provider continuation transcript",
+                value={
+                    "schema_version": 1, "call_id": selected_call_id,
+                    "transcript_messages": messages, "data_labels": labels.to_dict(),
+                    "provider_continuation_manifest_sha256": manifest_sha256,
+                }, created_at=now,
+            )
+            image_hash, _tool_hash, provider_hash = self._process_binding_hashes(process)
+            wrapper = {
+                "schema_version": 1, "kind": "provider_continuation", "state": "ready",
+                "call_id": selected_call_id, "context_generation": generation,
+                "manifest": manifest, "manifest_sha256": manifest_sha256,
+                "llm_call_sha256": call_sha256, "message_sha256": self._sha256(message),
+                "pre_action_binding": pre_action_binding(
+                    process, image_binding_hash=image_hash, provider_binding_hash=provider_hash,
+                ),
+                "requirement_binding": requirement_binding,
+            }
+            pending = TaskRunPayload.plaintext(
+                payload_id=new_id("trp"), run_id=record.run_id, role="pending_action",
+                label="Provider continuation awaiting local action selection",
+                value=wrapper, created_at=now,
+            )
+            effective_summary = summary_payload or (
+                self._optional_resume_payload(prior.summary_payload_id)
+                if prior is not None else None
+            )
+            point = self._make_resume_point(
+                process=process, record=record, context_generation=generation,
+                safe_point_seq=prior.safe_point_seq + 1 if prior is not None else 1,
+                transcript_payload=transcript, summary_payload=effective_summary,
+                pending_payload=pending, last_effect_seq=self._current_effect_seq(),
+                created_at=prior.created_at if prior is not None else now, updated_at=now,
+            )
+            if summary_payload is not None:
+                self._store.insert_task_run_payload(summary_payload)
+            self._store.insert_task_run_payload(transcript)
+            self._store.insert_task_run_payload(pending)
+            self._store.upsert_task_run_resume_point(point)
+            updated = self._store.update_task_run_cas(
+                record.run_id, record.revision,
+                updates={
+                    "step_count": record.step_count + 1,
+                    "completed_step_count": record.completed_step_count + 1,
+                    "active_pid": pid, "updated_at": now,
+                }, expected_runtime_epoch=self._runtime_epoch,
+            )
+            ledger = self._append_ledger(
+                record.run_id, kind=TaskRunLedgerKind.LLM_TURN,
+                status="provider_continuation", label="Provider result committed for local action selection",
+                pid=pid, llm_call_id=selected_call_id, payload_id=pending.payload_id,
+                metadata={
+                    "context_generation": generation,
+                    "continuation_manifest_sha256": manifest_sha256,
+                    "llm_call_sha256": call_sha256, "safe_point_seq": point.safe_point_seq,
+                    "provider_tools_disabled_on_resume": True,
+                },
+            )
+            self._store.insert_task_run_link(
+                TaskRunLink(
+                    link_id=new_id("trlink"), run_id=record.run_id, ledger_seq=ledger.seq,
+                    evidence_type="llm_call", evidence_id=selected_call_id,
+                    role="provider_continuation", created_at=now,
+                    metadata={"revision": updated.revision},
+                )
+            )
+        with self._condition:
+            self._prompt_requirement_bindings.pop((pid, generation), None)
+        self._notify_updated()
+
+    def _provider_continuation_replay_base(
+        self, process: Any, record: TaskRunRecord, prior: TaskRunResumePoint | None,
+        *, generation: str, manifest: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Return the exact replay base, or None for an idempotent settlement."""
+
+        if prior is None:
+            return {}
+        self._require_prompt_resume_integrity(record, process, prior)
+        if prior.context_generation != generation:
+            raise ValidationError("TaskRun continuation context changed")
+        if prior.pending_action_payload_id is not None:
+            existing = self._decode_pending_resume_payload(prior)
+            if existing.get("kind") == "provider_continuation":
+                current = self._validate_provider_continuation(process, prior, existing)
+                if current == manifest:
+                    return None
+            raise TaskRunRevisionConflict(
+                "TaskRun already has another pending continuation or action"
+            )
+        return self._decode_payload(
+            self._store.get_task_run_payload(prior.transcript_payload_id),
+            role="transcript",
+        )
+
+    def _provider_continuation_message(
+        self, process: Any, call_id: str, generation: str,
+        *, check_current_binding: bool = True,
+    ) -> dict[str, Any]:
+        from agent_libos.llm.provider_continuation import continuation_message
+
+        self._local_llm_call_sha256(process, call_id)
+        call = self._store.get_llm_call(call_id)
+        options = call.request_options
+        configured = options.get("provider_tools_configured")
+        if (
+            options.get("provider_tools_enabled") is not True
+            or not isinstance(configured, Mapping) or not configured
+            or call.tool_calls
+            or options.get("llm_context_generation") != generation
+            or options.get("llm_profile_id") != process.llm_profile_id
+            or not _is_lower_sha256(options.get("llm_profile_identity_sha256"))
+            or (
+                check_current_binding
+                and options.get("llm_profile_identity_sha256")
+                != self._host.llms.profile_identity_sha256(process.llm_profile_id)
+            )
+        ):
+            raise ValidationError("TaskRun provider continuation lost its request binding")
+        try:
+            message = continuation_message(call)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("TaskRun provider continuation has no retained result") from exc
+        if (
+            not isinstance(message, dict) or not self._valid_replay_message(message)
+            or message.get("role") != "assistant"
+            or not isinstance(message.get("content"), str)
+            or not message["content"].strip()
+        ):
+            raise ValidationError("TaskRun provider continuation has no retained result")
+        return message
+
+    def _validate_provider_continuation(
+        self, process: Any, point: TaskRunResumePoint, wrapper: Mapping[str, Any],
+        *, check_current_binding: bool = True,
+    ) -> dict[str, Any]:
+        if (
+            set(wrapper) != _PROVIDER_CONTINUATION_WRAPPER_KEYS
+            or type(wrapper.get("schema_version")) is not int
+            or wrapper.get("schema_version") != 1
+            or wrapper.get("kind") != "provider_continuation"
+            or wrapper.get("state") != "ready"
+            or wrapper.get("context_generation") != point.context_generation
+        ):
+            raise ValidationError("TaskRun provider continuation payload is invalid")
+        try:
+            manifest = normalize_provider_continuation_manifest(wrapper["manifest"])
+            DataLabels.from_dict(manifest["data_labels"])
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("TaskRun provider continuation manifest is invalid") from exc
+        call_id = str(manifest["call_id"])
+        message = self._provider_continuation_message(
+            process, call_id, point.context_generation,
+            check_current_binding=check_current_binding,
+        )
+        transcript = self._decode_payload(
+            self._store.get_task_run_payload(point.transcript_payload_id), role="transcript",
+        )
+        messages = transcript.get("transcript_messages")
+        if (
+            wrapper.get("call_id") != call_id
+            or wrapper.get("manifest_sha256") != self._sha256(manifest)
+            or wrapper.get("llm_call_sha256") != self._local_llm_call_sha256(process, call_id)
+            or wrapper.get("message_sha256") != self._sha256(message)
+            or not isinstance(messages, list) or not messages or messages[-1] != message
+            or transcript.get("provider_continuation_manifest_sha256") != self._sha256(manifest)
+            or wrapper.get("requirement_binding")
+            != self._store.get_llm_call(call_id).request_options.get(
+                _TASK_RUN_REQUIREMENT_BINDING_KEY
+            )
+        ):
+            raise ValidationError("TaskRun provider continuation source evidence changed")
+        self._validated_action_pre_binding(wrapper, point)
+        return manifest
+
+    def pending_provider_continuation_for_pid(
+        self, pid: str,
+    ) -> Mapping[str, Any] | None:
+        """Read, without consuming, the integrity-bound hosted-tool suppression."""
+
+        process, record = self._bound_process_run(pid)
+        if record is None:
+            return None
+        point = self._store.get_task_run_resume_point(pid, complete_only=True)
+        if point is None or point.pending_action_payload_id is None:
+            return None
+        self._require_prompt_resume_integrity(record, process, point)
+        wrapper = self._decode_pending_resume_payload(point)
+        if wrapper.get("kind") != "provider_continuation":
+            return None
+        return self._validate_provider_continuation(process, point, wrapper)
+
     def record_validated_transcript(
         self,
         *,
@@ -1915,8 +2205,8 @@ class TaskRunManager:
                 and existing.get("state") in {"validated", "dispatching"}
             ):
                 return
-            raise TaskRunRevisionConflict(
-                "TaskRun already has another pending local action"
+            self._require_provider_continuation_successor(
+                process, prior, existing, call_id=selected_call_id,
             )
 
         transcript_payload: TaskRunPayload
@@ -1992,6 +2282,17 @@ class TaskRunManager:
         with self._condition:
             self._prompt_requirement_bindings.pop((pid, generation), None)
         self._notify_updated()
+
+    def _require_provider_continuation_successor(
+        self, process: Any, point: TaskRunResumePoint, existing: Mapping[str, Any],
+        *, call_id: str,
+    ) -> None:
+        if existing.get("kind") != "provider_continuation":
+            raise TaskRunRevisionConflict("TaskRun already has another pending local action")
+        self._validate_provider_continuation(process, point, existing)
+        call = self._store.get_llm_call(call_id)
+        if call.request_options.get("provider_tools_enabled") is not False:
+            raise ValidationError("TaskRun continuation re-enabled hosted tools")
 
     def _require_supported_binding_action_manifest(
         self,
@@ -2152,6 +2453,9 @@ class TaskRunManager:
             raise ValidationError("TaskRun pending local action is corrupt")
         wrapper = self._decode_pending_resume_payload(point)
         if wrapper.get("kind") != "validated_action":
+            if wrapper.get("kind") == "provider_continuation":
+                self._validate_provider_continuation(process, point, wrapper)
+                return None
             if wrapper.get("kind") in {"completed_outcome", "durable_wait_action"}:
                 return None
             raise ValidationError("TaskRun pending action kind is invalid")
@@ -7350,6 +7654,15 @@ class TaskRunManager:
                 raise ValidationError(
                     "TaskRun resume bundle payload role is invalid"
                 )
+        if point.pending_action_payload_id is not None:
+            wrapper = self._decode_pending_resume_payload(point)
+            if wrapper.get("kind") == "provider_continuation":
+                # Before publication/reconciliation, trust only persisted
+                # identities and bytes. Compare live registries in the later
+                # ordinary resume-integrity phase.
+                self._validate_provider_continuation(
+                    process, point, wrapper, check_current_binding=False,
+                )
 
     def recover_startup(self) -> tuple[TaskRunSummary, ...]:
         if self._recovered:
@@ -9660,6 +9973,15 @@ class TaskRunManager:
                     pid=process.pid,
                     transient_local_settlement=True,
                 )
+            if kind == "provider_continuation" and state == "ready":
+                try:
+                    self._validate_provider_continuation(process, point, wrapper)
+                except (KeyError, NotFound, TypeError, ValueError, ValidationError):
+                    return self._blocker(
+                        "payload_corrupt", "terminal provider continuation is invalid",
+                        pid=process.pid,
+                    )
+                continue
             if not (
                 (kind == "validated_action" and state == "validated")
                 or (kind == "durable_wait_action" and state == "waiting")
@@ -12356,6 +12678,9 @@ class TaskRunManager:
         try:
             wrapper = self._decode_pending_resume_payload(point)
             kind = wrapper.get("kind")
+            if kind == "provider_continuation":
+                self._validate_provider_continuation(process, point, wrapper)
+                return None
             if kind == "completed_outcome":
                 self._recover_staged_completed_outcome(process, wrapper)
                 return None

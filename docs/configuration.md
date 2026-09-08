@@ -17,6 +17,7 @@ security rules.
 - [Review store persistence and relative path ownership](#store-persistence-and-relative-path-ownership)
 - [Resolve the effective LLM profile](#effective-llm-profile-precedence)
 - [Configure Responses reasoning and local replay](#responses-reasoning-and-local-replay)
+- [Enable provider-hosted tools](#provider-hosted-tools)
 - [Evaluate the prompt-cache candidate](#prompt-cache-candidate)
 - [Inspect exact defaults](#inspecting-exact-defaults)
 - [Configure semantic phases](#semantic-phase-24-configuration)
@@ -332,6 +333,101 @@ missing counter. Replay input estimates use visible content plus historical
 reasoning token counts, with output usage or the approved output bound as a
 fallback; ciphertext byte length does not estimate reasoning tokens.
 
+### Provider-hosted tools
+
+Provider-hosted tools are an explicit per-profile Host setting. An omitted or
+null `provider_tools` leaves them disabled; there is no ambient environment
+opt-in. The GUI profile editor exposes the same setting. Choose the provider
+explicitly and enable only the capabilities that profile should use:
+
+```yaml
+llm:
+  profiles:
+    research:
+      model: gpt-6-astra
+      api_mode: responses
+      provider_tools:
+        provider: openai
+        web_search: true
+        web_extractor: false
+        code_interpreter: false
+        file_ids: []
+```
+
+OpenAI Responses supports `web_search` and `code_interpreter`. Its search tool
+may open and inspect pages as part of a search; `web_extractor` is not a separate
+OpenAI tool. Aliyun Responses supports `web_search`, `web_extractor`, and
+`code_interpreter`. Aliyun Chat supports its search option, not the Responses
+extractor or code interpreter. Unsupported combinations and unknown fields
+fail validation instead of becoming arbitrary provider request parameters.
+Aliyun `web_extractor` requires `web_search` to be enabled as well. `api_mode:
+auto` selects Responses when provider tools are enabled; choose `chat`
+explicitly for Aliyun's Chat search option.
+Aliyun Responses extraction and code execution explicitly send
+`enable_thinking: true`; a profile combining either tool with
+`reasoning_effort: none` is invalid. Search alone does not impose this
+requirement.
+
+`file_ids` accepts only Host-configured, already-uploaded OpenAI file IDs for
+code interpreter. Aliyun file-ID passthrough, file search, uploads, downloads,
+existing container IDs, and model-supplied endpoints are outside this interface.
+Changing provider tools changes the profile's Sink identity, so an existing
+identity-bound trust rule does not silently authorize the new behavior.
+
+Search, page extraction, and code execution run inside the LLM provider call.
+They share that call's data-flow admission, resource reservation, effect, and
+audit boundary. The Runtime does not separately approve provider-generated
+queries or code, and provider tool activity is distinct from local function
+calls. Local functions still pass through their normal primitive permissions.
+Provider tools are unavailable to the context compressor, semantic classifier,
+and internal structured/text completions. Action-format repair also disables
+them while using the preceding result as context.
+
+A successful hosted result without a local function call becomes a local
+continuation. The next quantum receives that result with provider tools
+disabled, and selects a normal Runtime action. TaskRuns persist this as a
+separate completed safe point. Recovery validates the result, profile binding,
+and continuation instead of repeating the hosted work. Pending result evidence
+and continuation records remain retention dependencies while an active
+continuation or checkpoint refers to them. With `persist_full_io: false`, an
+ordinary process can continue from its in-memory result, but a restart with that
+result unavailable fails closed instead of executing the hosted tool again.
+
+Checkpoints can preserve a pending local result through private, integrity-bound
+references to its retained call evidence. Restore and fork validate those
+references and rebind the local continuation to the restored process context;
+the next call consumes the saved result with provider tools disabled. A
+checkpoint predating the result does not acquire a later continuation.
+Checkpoint capture explicitly rejects a pending result whose payload was not
+retained, including with `persist_full_io: false`.
+
+Certified context compaction can preserve a retained pending result in an
+ordinary process. It atomically updates the local continuation's context and
+source bindings while keeping the result for the next tools-disabled call.
+Compaction is rejected while a TaskRun has a pending provider result, or while
+a pending result lacks retained payload. Consume the next local action before
+compacting in those cases; rejection leaves the context generation and TaskRun
+safe point unchanged.
+
+Code interpreter uses independent execution for every request. Enabling it
+selects ordinary stateless message/function history and disables effective
+Responses replay and response chaining, including when replay was configured.
+The call record preserves the configured and effective modes. Raw code-tool
+items, opaque reasoning, and container continuations are not replayed into the
+next request. Processes with an existing native replay head cannot silently
+switch to this mode; use the updated profile for a new process or task.
+Search/extractor profiles retain the normal Responses replay policy.
+
+Provider tool results expose bounded text, source citations, and artifact
+references in the call trace. Artifact references do not imply a local file or
+continued remote availability. Checkpoint restore and image commit do not copy,
+restore, or roll back provider containers or files. The current interface does
+not keep containers alive or promise cross-request variables or temporary files.
+Aliyun isolation remains the provider's documented behavior; the Runtime never
+requests continuation of an earlier sandbox session. Provider-reported tool
+usage is diagnostic and does not extend the local function-call budget or
+guarantee a hard cap on separate provider tool charges.
+
 ### Prompt-cache candidate
 
 The release defaults remain `prompt_layout: legacy_v1` and
@@ -510,7 +606,8 @@ An external adapter can be staged while mode is off without resolving a
 profile. Enabling any external semantic mode requires a configured named
 profile other than `llm.default_profile_id`, with an explicit model; explicit
 `api_mode: chat` or `api_mode: responses`; `store: false`; `max_retries: 0`;
-`responses_previous_response_id: false`; `fallback_json_actions: false`; and a
+`responses_previous_response_id: false`; `fallback_json_actions: false`;
+`provider_tools: null`; and a
 finite timeout compatible with `semantic.assessment_timeout_s`. Prompt caching
 must be disabled both on that profile and in the global `llm` defaults: neither
 level may set a cache key, retention, or TTL; the profile cache mode may only be

@@ -6,6 +6,7 @@ import type {
   LlmCallSummary,
   LlmPayloadRetentionTier,
   LlmProviderAttempt,
+  LlmProviderToolsSummary,
   LlmTraceContentDescriptor,
   LlmTraceContentField
 } from "../api/types";
@@ -20,10 +21,11 @@ export type LlmTraceFocus = { callId: string; nonce: number };
 
 const userContentFields = new Set<LlmTraceContentField>([
   "attempt_reasoning",
-  "attempt_output"
+  "attempt_output",
+  "attempt_provider_tools"
 ]);
 const operatorCallFields = ["messages", "tools", "request_options", "raw_response", "response_content"] as const;
-const attemptFields = ["attempt_reasoning", "attempt_output", "attempt_tool_calls"] as const;
+const attemptFields = ["attempt_reasoning", "attempt_output", "attempt_tool_calls", "attempt_provider_tools"] as const;
 const maxClientContentChars = 4 * 1024 * 1024;
 
 export function ProviderTracePanel({
@@ -328,11 +330,13 @@ function TraceAttempt({
           </>
         ) : null}
         {attempt.tool_names.length ? <p className="traceToolNames"><strong>{t("trace.tools")}</strong> {attempt.tool_names.map((name) => <bdi key={name}>{name}</bdi>)}</p> : null}
+        {attempt.provider_tools ? <ProviderToolsSummary summary={attempt.provider_tools} /> : null}
         {mode === "operator" && attempt.reasoning_blocks.length ? (
           <details className="traceBlockMetadata"><summary>{t("trace.blockMetadata")}</summary><InertJson value={attempt.reasoning_blocks} /></details>
         ) : null}
         <div className="traceContentGrid">
-          {attemptFields.filter((field) => mode === "operator" || userContentFields.has(field)).map((field) => (
+          {attemptFields.filter((field) => (mode === "operator" || userContentFields.has(field))
+            && (field !== "attempt_provider_tools" || attempt.provider_tools || descriptorFor(descriptors, field, attempt.sequence))).map((field) => (
             <TraceContent
               key={field}
               descriptor={descriptorFor(descriptors, field, attempt.sequence)}
@@ -452,12 +456,97 @@ export function TraceContent({
       {!loaded && !invalidated && (availability === "available" || availability === "limited") ? (
         <button type="button" disabled={busy || !descriptor?.cursor} onClick={() => descriptor?.cursor && void load(descriptor.cursor, false)}>{busy ? <LoaderCircle className="spin" size={14} /> : null}{t("trace.reveal")}</button>
       ) : null}
-      {loaded ? <pre className="traceInertText" dir="auto"><bdi>{content || t("trace.emptyContent")}</bdi></pre> : null}
+      {loaded ? field === "attempt_provider_tools" && !cursor
+        ? <ProviderToolsContent content={content} />
+        : <pre className="traceInertText" dir="auto"><bdi>{content || t("trace.emptyContent")}</bdi></pre> : null}
       {loaded && availability === "limited" ? <p className="inlineWarning">{t("trace.limited")}</p> : null}
       {error ? <p className="inlineError" role="alert">{error}</p> : null}
       {cursor ? <button type="button" disabled={busy} onClick={() => void load(cursor, true)}>{busy ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}{t("trace.loadMoreContent")}</button> : null}
     </section>
   );
+}
+
+function ProviderToolsSummary({ summary }: { summary: LlmProviderToolsSummary }) {
+  const { t } = useI18n();
+  return <section className="traceProviderTools" aria-label={t("trace.providerTools")}>
+    <strong>{t("trace.providerTools")}</strong>
+    <dl className="traceFacts compact">
+      <div><dt>{t("trace.providerTools.configured")}</dt><dd>{summary.configured.join(", ") || t("trace.providerTools.none")}</dd></div>
+      <div><dt>{t("trace.providerTools.effective")}</dt><dd>{summary.effective.join(", ") || t("trace.providerTools.none")}</dd></div>
+      <div><dt>{t("trace.providerTools.execution")}</dt><dd>{t(`trace.providerTools.${summary.observed}`)}</dd></div>
+      <div><dt>{t("trace.providerTools.activities")}</dt><dd>{summary.activity_count}</dd></div>
+      {summary.replay ? <div><dt>{t("trace.providerTools.replay")}</dt><dd>{summary.replay}</dd></div> : null}
+      <div><dt>{t("trace.providerTools.usage")}</dt><dd>{summary.usage === null ? t("trace.notAvailable") : <InertJson value={summary.usage} />}</dd></div>
+    </dl>
+    {summary.limited ? <p className="inlineWarning">{t("trace.limited")}</p> : null}
+  </section>;
+}
+
+function ProviderToolsContent({ content }: { content: string }) {
+  const { t } = useI18n();
+  let payload: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(content);
+    if (!isContentRecord(parsed) || !Array.isArray(parsed.activities)
+      || !Array.isArray(parsed.citations) || !Array.isArray(parsed.artifacts)) throw new Error("incomplete");
+    payload = parsed;
+  } catch {
+    return <pre className="traceInertText" dir="auto"><bdi>{content || t("trace.emptyContent")}</bdi></pre>;
+  }
+  const activities = (payload.activities as unknown[]).filter(isContentRecord);
+  const citations = (payload.citations as unknown[]).filter(isContentRecord);
+  const artifacts = (payload.artifacts as unknown[]).filter(isContentRecord);
+  return <div className="traceProviderToolsContent">
+    {activities.map((activity, index) => <article className="traceProviderActivity" key={index}>
+      <header><strong><bdi>{contentString(activity.type) || t("trace.providerTools.activity")}</bdi></strong><span><bdi>{contentString(activity.status)}</bdi></span></header>
+      {activity.id ? <small><bdi>{contentString(activity.id)}</bdi></small> : null}
+      {["goal", "text", "code", "action", "urls", "output", "outputs"].filter((field) => activity[field] !== undefined).map((field) =>
+        typeof activity[field] === "string"
+          ? <pre key={field} className="traceInertText" dir="auto"><bdi>{contentString(activity[field])}</bdi></pre>
+          : <InertJson key={field} value={activity[field]} />)}
+    </article>)}
+    {citations.length ? <section className="traceProviderCitations" aria-label={t("trace.providerTools.citations")}>
+      <strong>{t("trace.providerTools.citations")}</strong>
+      <ul>{citations.map((citation, index) => {
+        const url = contentString(citation.url);
+        const title = contentString(citation.title) || url;
+        return <li key={index}>{isSafeCitationUrl(url)
+          ? <a href={url} target="_blank" rel="noreferrer noopener" onClick={(event) => {
+            if (window.libosApi) {
+              event.preventDefault();
+              void window.libosApi.openExternal(url);
+            }
+          }}><bdi>{title}</bdi></a>
+          : <span><bdi>{title || t("trace.providerTools.citation")}</bdi></span>}</li>;
+      })}</ul>
+    </section> : null}
+    {artifacts.length ? <section className="traceProviderArtifacts" aria-label={t("trace.providerTools.artifacts")}>
+      <strong>{t("trace.providerTools.artifacts")}</strong>
+      <ul>{artifacts.map((artifact, index) => <li key={index}>
+        {artifact.filename ? <strong><bdi>{contentString(artifact.filename)}</bdi></strong> : null}
+        <code><bdi>{contentString(artifact.file_id)}</bdi></code>
+        {artifact.container_id ? <small><bdi>{contentString(artifact.container_id)}</bdi></small> : null}
+      </li>)}</ul>
+    </section> : null}
+    {!activities.length && !citations.length && !artifacts.length ? <p className="traceUnavailable">{t("trace.providerTools.empty")}</p> : null}
+  </div>;
+}
+
+function isContentRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function contentString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function isSafeCitationUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password;
+  } catch {
+    return false;
+  }
 }
 
 function descriptorFor(

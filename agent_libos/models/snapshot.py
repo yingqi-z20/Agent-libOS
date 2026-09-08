@@ -726,6 +726,48 @@ class LocalReplayReference:
 
 
 @dataclass(frozen=True)
+class LocalProviderContinuationReference:
+    """Integrity-bound local result reference, without provider session state."""
+
+    pid: str
+    marker_call_id: str
+    marker_sha256: str
+    source_call_id: str
+    source_sha256: str
+    source_pid: str
+    profile_identity_sha256: str
+    context_generation: str
+    payload_sha256: str
+
+    FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "pid", "marker_call_id", "marker_sha256", "source_call_id",
+        "source_sha256", "source_pid", "profile_identity_sha256",
+        "context_generation", "payload_sha256",
+    })
+
+    def __post_init__(self) -> None:
+        for name in self.FIELDS:
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise ValidationError(
+                    f"snapshot provider continuation reference {name} must be canonical text"
+                )
+            if name.endswith("_sha256") and not _SHA256_PATTERN.fullmatch(value):
+                raise ValidationError(
+                    f"snapshot provider continuation reference {name} must be a SHA-256 digest"
+                )
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "LocalProviderContinuationReference":
+        if not isinstance(value, Mapping) or set(value) != cls.FIELDS:
+            raise ValidationError("snapshot provider continuation reference fields are not canonical")
+        return cls(**dict(value))
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in sorted(self.FIELDS)}
+
+
+@dataclass(frozen=True)
 class ProcessSnapshot:
     header: SnapshotHeader
     subtree_pids: tuple[str, ...]
@@ -742,8 +784,11 @@ class ProcessSnapshot:
     jit_sources: dict[str, str] = field(default_factory=dict)
     modules: tuple[dict[str, Any], ...] = ()
     responses_replay_refs: dict[str, LocalReplayReference] = field(default_factory=dict)
+    provider_continuation_refs: dict[str, LocalProviderContinuationReference] = field(default_factory=dict)
 
-    OPTIONAL_KEYS: ClassVar[frozenset[str]] = frozenset({"responses_replay_refs"})
+    OPTIONAL_KEYS: ClassVar[frozenset[str]] = frozenset({
+        "responses_replay_refs", "provider_continuation_refs",
+    })
 
     TOP_LEVEL_KEYS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -767,6 +812,7 @@ class ProcessSnapshot:
             "jit_sources",
             "modules",
             "responses_replay_refs",
+            "provider_continuation_refs",
         }
     )
 
@@ -792,6 +838,14 @@ class ProcessSnapshot:
                 raise ValidationError("snapshot replay reference must be typed")
             if pid not in self.subtree_pids or reference.pid != pid:
                 raise ValidationError("snapshot replay reference is outside its process scope")
+        process_rows = {row["pid"]: row for row in self.rows.processes}
+        for pid, reference in self.provider_continuation_refs.items():
+            if not isinstance(reference, LocalProviderContinuationReference):
+                raise ValidationError("snapshot provider continuation reference must be typed")
+            if pid not in self.subtree_pids or reference.pid != pid:
+                raise ValidationError("snapshot provider continuation reference is outside its process scope")
+            if process_rows[pid].get("task_run_id") is not None:
+                raise ValidationError("snapshot provider continuation reference must not belong to a TaskRun")
 
     @staticmethod
     def decode_module_requirements(value: Any) -> tuple[dict[str, Any], ...]:
@@ -815,6 +869,7 @@ class ProcessSnapshot:
         referenced_types = _mapping(value.get("referenced_object_types", {}), "referenced_object_types")
         jit_sources = _mapping(value.get("jit_sources", {}), "jit_sources")
         replay_refs = _mapping(value.get("responses_replay_refs", {}), "responses_replay_refs")
+        continuation_refs = _mapping(value.get("provider_continuation_refs", {}), "provider_continuation_refs")
         return cls(
             header=SnapshotHeader.from_mapping(value),
             subtree_pids=_string_list(value.get("subtree_pids"), "subtree_pids"),
@@ -836,6 +891,10 @@ class ProcessSnapshot:
             responses_replay_refs={
                 pid: LocalReplayReference.from_mapping(reference)
                 for pid, reference in replay_refs.items()
+            },
+            provider_continuation_refs={
+                pid: LocalProviderContinuationReference.from_mapping(reference)
+                for pid, reference in continuation_refs.items()
             },
         )
 
@@ -864,6 +923,11 @@ class ProcessSnapshot:
             result["responses_replay_refs"] = {
                 pid: reference.to_mapping()
                 for pid, reference in self.responses_replay_refs.items()
+            }
+        if self.provider_continuation_refs:
+            result["provider_continuation_refs"] = {
+                pid: reference.to_mapping()
+                for pid, reference in self.provider_continuation_refs.items()
             }
         return result
 

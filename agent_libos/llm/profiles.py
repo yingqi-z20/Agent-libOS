@@ -11,7 +11,8 @@ from dataclasses import asdict, dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMProfile
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMProfile, ProviderToolsConfig
+from agent_libos.config.defaults import validate_provider_tools_api_mode
 from agent_libos.llm.client import LLMClient, LLMError
 from agent_libos.llm.provider_policy import ProviderPolicy, resolve_provider_policy
 from agent_libos.models.exceptions import NotFound, ValidationError
@@ -66,12 +67,16 @@ class ResolvedLLMProfile:
     auto_wait_on_empty_tool_calls: bool
     fallback_json_actions: bool
     prompt_layout: str = "legacy_v1"
+    provider_tools: ProviderToolsConfig | None = None
+    responses_replay_configured: bool | None = None
+    responses_previous_response_id_configured: bool = False
 
 
 @dataclass(frozen=True)
 class _ResolvedLLMPolicy(ProviderPolicy):
     store: bool
     responses_previous_response_id: bool
+    responses_previous_response_id_configured: bool
     fallback_json_actions: bool
     prompt_cache_mode_configured: str
 
@@ -222,6 +227,11 @@ class LLMProfileRegistry:
                 auto_wait_on_empty_tool_calls=self._resolved_auto_wait_on_empty_tool_calls(profile),
                 fallback_json_actions=snapshot.policy.fallback_json_actions,
                 prompt_layout=snapshot.policy.prompt_layout,
+                provider_tools=snapshot.policy.provider_tools,
+                responses_replay_configured=snapshot.policy.responses_replay_configured,
+                responses_previous_response_id_configured=(
+                    snapshot.policy.responses_previous_response_id_configured
+                ),
             )
 
     @property
@@ -290,7 +300,7 @@ class LLMProfileRegistry:
         identity_profile = asdict(profile)
         # Additive optional controls must not invalidate trust for existing
         # profiles whose effective Provider behavior remains unchanged.
-        for optional_field in ("reasoning_context", "responses_replay", "prompt_layout"):
+        for optional_field in ("reasoning_context", "responses_replay", "prompt_layout", "provider_tools"):
             if identity_profile.get(optional_field) is None:
                 identity_profile.pop(optional_field, None)
         identity_profile["prompt_cache_retention"] = _normalize_prompt_cache_retention(
@@ -320,6 +330,10 @@ class LLMProfileRegistry:
                 "prompt_cache_mode": policy.prompt_cache_mode,
                 "prompt_cache_ttl": policy.prompt_cache_ttl,
                 "responses_previous_response_id": policy.responses_previous_response_id,
+                **(
+                    {"provider_tools": asdict(policy.provider_tools)}
+                    if policy.provider_tools is not None else {}
+                ),
                 **({"responses_replay": True} if policy.responses_replay else {}),
                 **(
                     {"reasoning_context": policy.reasoning_context}
@@ -494,6 +508,7 @@ class LLMProfileRegistry:
             "reasoning_effort": policy.reasoning_effort,
             "reasoning_context": policy.reasoning_context,
             "responses_replay": policy.responses_replay,
+            "provider_tools": policy.provider_tools,
             "prompt_layout": policy.prompt_layout,
             "verbosity": (
                 profile.verbosity
@@ -566,6 +581,8 @@ class LLMProfileRegistry:
     ) -> _ResolvedLLMPolicy:
         defaults = self.config.llm
         classifier = profile_id == self.config.semantic.external_profile_id
+        if classifier and profile.provider_tools is not None:
+            raise ValidationError("semantic classifier profile must disable provider tools")
         mode = _normalize_prompt_cache_mode(
             profile.prompt_cache_mode
             if profile.prompt_cache_mode is not None
@@ -583,8 +600,16 @@ class LLMProfileRegistry:
                 else defaults.responses_replay
             )
         provider = self._provider_policy(profile, legacy_env, mode=mode, replay=replay)
+        previous_response_id_configured = (
+            profile.responses_previous_response_id
+            if profile.responses_previous_response_id is not None
+            else _bool_env(
+                legacy_env, "OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID",
+                defaults.responses_previous_response_id,
+            )
+        )
         return _ResolvedLLMPolicy(
-            **asdict(provider),
+            **{**asdict(provider), "provider_tools": provider.provider_tools},
             prompt_cache_mode_configured=mode,
             store=(
                 profile.store
@@ -592,13 +617,10 @@ class LLMProfileRegistry:
                 else _bool_env(legacy_env, "OPENAI_STORE", defaults.store)
             ),
             responses_previous_response_id=(
-                profile.responses_previous_response_id
-                if profile.responses_previous_response_id is not None
-                else _bool_env(
-                    legacy_env, "OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID",
-                    defaults.responses_previous_response_id,
-                )
+                False if provider.provider_tools is not None and provider.provider_tools.code_interpreter
+                else previous_response_id_configured
             ),
+            responses_previous_response_id_configured=previous_response_id_configured,
             fallback_json_actions=(
                 profile.fallback_json_actions
                 if profile.fallback_json_actions is not None
@@ -643,6 +665,7 @@ class LLMProfileRegistry:
                     or defaults.reasoning_context
                 ),
                 responses_replay=replay,
+                provider_tools=profile.provider_tools,
                 prompt_layout=(
                     profile.prompt_layout
                     if profile.prompt_layout is not None
@@ -697,6 +720,12 @@ class LLMProfileRegistry:
             raise ValidationError(f"unsupported LLM profile kind for {profile_id}: {profile.kind}")
         if not profile.api_key_env.strip():
             raise ValidationError(f"LLM profile api_key_env must be non-empty: {profile_id}")
+        if profile_id == self.config.semantic.external_profile_id and profile.provider_tools is not None:
+            raise ValidationError("semantic classifier profile must disable provider tools")
+        try:
+            validate_provider_tools_api_mode(profile.provider_tools, profile.api_mode or self.config.llm.api_mode)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
         if profile.logical_call_timeout_s is not None and (
             not math.isfinite(profile.logical_call_timeout_s)
             or profile.logical_call_timeout_s <= 0

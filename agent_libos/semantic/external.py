@@ -616,6 +616,10 @@ class ExternalLLMSemanticAssessor:
                 "semantic classifier must use an explicit non-default LLM profile"
             )
         profile = snapshot.profile
+        if getattr(profile, "provider_tools", None) is not None or getattr(snapshot.policy, "provider_tools", None) is not None:
+            raise SemanticExternalAssessorConfigurationError(
+                "semantic classifier profile must disable provider tools"
+            )
         model = profile.model
         if not isinstance(model, str) or not model.strip():
             raise SemanticExternalAssessorConfigurationError(
@@ -736,6 +740,7 @@ class ExternalLLMSemanticAssessor:
             ("prompt_cache_ttl", None),
             ("responses_replay", False),
             ("responses_previous_response_id", False),
+            ("provider_tools", None),
             ("max_retries", 0),
         ):
             if hasattr(client, name) and getattr(client, name) != expected:

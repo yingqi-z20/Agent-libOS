@@ -8,7 +8,7 @@ from typing import Annotated, Final, Literal
 from urllib.parse import SplitResult, unquote_plus, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BeforeValidator, ConfigDict, StrictBool, StrictFloat, StrictInt
+from pydantic import BeforeValidator, ConfigDict, StrictBool, StrictFloat, StrictInt, StrictStr
 from pydantic.dataclasses import dataclass
 
 from agent_libos.models.capability import AuthorityRule
@@ -505,6 +505,68 @@ class ProcessDefaults:
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
+class ProviderToolsConfig:
+    """Host-owned, provider-specific hosted tools; no transport escape hatch."""
+
+    provider: Literal["openai", "aliyun"]
+    web_search: StrictBool = False
+    web_extractor: StrictBool = False
+    code_interpreter: StrictBool = False
+    file_ids: tuple[StrictStr, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.provider == "openai" and self.web_extractor:
+            raise ValueError("OpenAI provider tools do not support web_extractor")
+        if self.web_extractor and not self.web_search:
+            raise ValueError("provider web_extractor requires web_search")
+        if self.file_ids and self.provider != "openai":
+            raise ValueError("provider file_ids are supported only for OpenAI")
+        if self.file_ids and not self.code_interpreter:
+            raise ValueError("provider file_ids require code_interpreter")
+        if len(self.file_ids) > 100:
+            raise ValueError("provider file_ids must contain at most 100 identifiers")
+        if len(set(self.file_ids)) != len(self.file_ids):
+            raise ValueError("provider file_ids must not contain duplicates")
+        if any(
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", value) is None
+            for value in self.file_ids
+        ):
+            raise ValueError("provider file_ids must be bounded remote identifiers, not paths or URLs")
+
+    @property
+    def enabled(self) -> bool:
+        return self.web_search or self.web_extractor or self.code_interpreter
+
+
+def normalize_provider_tools(
+    value: ProviderToolsConfig | dict[str, object] | None,
+) -> ProviderToolsConfig | None:
+    """Validate an optional tools configuration and canonicalize disabled tools."""
+
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = ProviderToolsConfig(**value)
+    if not isinstance(value, ProviderToolsConfig):
+        raise ValueError("provider_tools must be a ProviderToolsConfig object or null")
+    return value if value.enabled else None
+
+
+def validate_provider_tools_api_mode(
+    tools: ProviderToolsConfig | None, api_mode: str | None,
+    reasoning_effort: str | None = None,
+) -> None:
+    if (tools is not None and tools.provider == "aliyun"
+            and (tools.code_interpreter or tools.web_extractor)
+            and isinstance(reasoning_effort, str) and reasoning_effort.strip().lower() == "none"):
+        raise ValueError("Aliyun code_interpreter and web_extractor require thinking; reasoning_effort cannot be none")
+    if tools is None or api_mode != "chat":
+        return
+    if tools.provider != "aliyun" or tools.code_interpreter or tools.web_extractor:
+        raise ValueError("Chat provider tools support only Aliyun web_search; select Responses")
+
+
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class LLMProfile:
     kind: Literal["openai_compatible"] = "openai_compatible"
     base_url: str | None = None
@@ -517,6 +579,7 @@ class LLMProfile:
     reasoning_effort: str | None = None
     reasoning_context: ReasoningContext | None = None
     responses_replay: StrictBool | None = None
+    provider_tools: ProviderToolsConfig | None = None
     verbosity: Literal["low", "medium", "high"] | None = None
     safety_identifier: str | None = None
     safety_identifier_env: str | None = None
@@ -536,6 +599,11 @@ class LLMProfile:
     context_window_tokens: int | None = None
     allow_custom_base_url: bool = False
     logical_call_timeout_s: StrictFloat | None = None
+
+    def __post_init__(self) -> None:
+        tools = normalize_provider_tools(self.provider_tools)
+        object.__setattr__(self, "provider_tools", tools)
+        validate_provider_tools_api_mode(tools, self.api_mode, self.reasoning_effort)
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -2010,6 +2078,7 @@ def _validate_llm_profile(
         "chat",
     }:
         raise ValueError(f"{prefix}.api_mode is not supported: {profile.api_mode}")
+    validate_provider_tools_api_mode(profile.provider_tools, profile.api_mode or llm.api_mode, profile.reasoning_effort)
     _optional_non_empty(f"{prefix}.safety_identifier", profile.safety_identifier)
     _optional_max_chars(f"{prefix}.safety_identifier", profile.safety_identifier, 64)
     _optional_non_empty(
@@ -2233,6 +2302,8 @@ def _validate_semantic_external_profile(
         raise ValueError("semantic.external_profile_id does not reference an LLM profile")
     if profile.model is None or not profile.model.strip():
         raise ValueError("semantic external LLM profile must set model explicitly")
+    if profile.provider_tools is not None:
+        raise ValueError("semantic external LLM profile must disable provider tools")
     if profile.store is not False:
         raise ValueError("semantic external LLM profile must set store=false")
     if profile.max_retries != 0:
@@ -2241,6 +2312,13 @@ def _validate_semantic_external_profile(
         raise ValueError("semantic external LLM profile must set a finite timeout_s")
     if profile.api_mode not in {"chat", "responses"}:
         raise ValueError("semantic external LLM profile must set api_mode explicitly")
+    _validate_semantic_external_retention(profile, llm)
+
+
+def _validate_semantic_external_retention(
+    profile: LLMProfile,
+    llm: LLMDefaults,
+) -> None:
     if (
         profile.prompt_cache_key is not None
         or profile.prompt_cache_retention is not None

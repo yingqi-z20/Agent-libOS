@@ -499,6 +499,58 @@ describe("MCP v3 GUI projection", () => {
 });
 
 describe("LLM Provider trace API projection", () => {
+  it("accepts bounded built-in tool evidence without requiring it on old attempts", () => {
+    const detail = llmDetail();
+    const provider_tools = providerToolsSummary();
+    expect(() => assertLlmCallDetail(detail)).not.toThrow();
+    expect(() => assertLlmCallDetail({
+      ...detail,
+      attempts: [{ ...detail.attempts[0], provider_tools }],
+      content: [{ ...detail.content[0], field: "attempt_provider_tools", content_type: "json" }]
+    })).not.toThrow();
+    const { replay: _replay, file_count: _fileCount, ...withoutOptionalFields } = provider_tools;
+    expect(() => assertLlmCallDetail({
+      ...detail,
+      attempts: [{ ...detail.attempts[0], provider_tools: withoutOptionalFields }]
+    })).not.toThrow();
+    expect(() => assertLlmTraceContentChunk({
+      schema_version: 1,
+      pid: "pid_1",
+      call_id: "call_1",
+      field: "attempt_provider_tools",
+      attempt_sequence: 1,
+      content: JSON.stringify({ ...provider_tools, activities: [], citations: [], artifacts: [] }),
+      next_cursor: null,
+      has_more: false,
+      content_hash: "a".repeat(64),
+      retention_tier: "full"
+    })).not.toThrow();
+  });
+
+  it("rejects unbounded counts and content in the built-in tool summary", () => {
+    const detail = llmDetail();
+    for (const invalid of [
+      { query: "must remain behind retention controls" },
+      { activities: [{ code: "private code" }] },
+      { provider: "unregistered" },
+      { observed: "enabled" },
+      { configured: ["web_search", "web_search"] },
+      { effective: "web_search" },
+      { activity_count: -1 },
+      { citation_count: 1.5 },
+      { artifact_count: Number.MAX_SAFE_INTEGER + 1 },
+      { file_count: -1 },
+      { replay: "stateful" },
+      { usage: [] },
+      { limited: "false" }
+    ]) {
+      expect(() => assertLlmCallDetail({
+        ...detail,
+        attempts: [{ ...detail.attempts[0], provider_tools: { ...providerToolsSummary(), ...invalid } }]
+      })).toThrow(/attempt/);
+    }
+  });
+
   it("accepts the content-free list and bounded detail contract", () => {
     const detail = llmDetail();
     expect(() => assertLlmCallPage({ schema_version: 1, items: [detail.call], next_cursor: null, has_more: false })).not.toThrow();
@@ -1007,6 +1059,22 @@ function mcpServer() {
     max_request_bytes: 65_536,
     max_response_bytes: 1_048_576,
     metadata: {}
+  };
+}
+
+function providerToolsSummary() {
+  return {
+    provider: "aliyun",
+    configured: ["web_search"],
+    effective: ["web_search"],
+    observed: "unknown",
+    activity_count: 0,
+    citation_count: 0,
+    artifact_count: 0,
+    usage: null,
+    limited: false,
+    replay: "stateless",
+    file_count: 0
   };
 }
 

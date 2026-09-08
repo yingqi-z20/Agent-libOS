@@ -34,6 +34,7 @@ class LLMProviderService:
         previous_response_id: str | None = None,
         responses_items: list[dict[str, Any]] | None = None,
         parallel_tool_calls: bool,
+        provider_tools_enabled: bool = True,
     ) -> Any:
         try:
             return await self._complete_action_unwrapped(
@@ -45,6 +46,7 @@ class LLMProviderService:
                 previous_response_id=previous_response_id,
                 responses_items=responses_items,
                 parallel_tool_calls=parallel_tool_calls,
+                provider_tools_enabled=provider_tools_enabled,
             )
         except ProviderEffectNotStarted:
             # Preserve the Host/Provider certificate so the protected
@@ -70,8 +72,11 @@ class LLMProviderService:
         previous_response_id: str | None = None,
         responses_items: list[dict[str, Any]] | None = None,
         parallel_tool_calls: bool,
+        provider_tools_enabled: bool = True,
     ) -> Any:
         kwargs = {"temperature": temperature, "max_tokens": max_tokens}
+        if isinstance(client, LLMClient) and getattr(client, "provider_tools", None) is not None:
+            kwargs["provider_tools_enabled"] = provider_tools_enabled
         if responses_items is not None:
             if not isinstance(client, LLMClient):
                 raise ProviderEffectNotStarted(

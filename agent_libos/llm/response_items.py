@@ -9,6 +9,8 @@ import json
 import math
 from typing import Any
 
+from agent_libos.llm.sdk_fields import omit_unset_sdk_defaults
+
 
 RESPONSE_ITEMS_MAX_BYTES = 4 * 1024 * 1024
 RESPONSE_ITEMS_MAX_ITEMS = 2_048
@@ -20,6 +22,14 @@ _ITEM_FIELDS = {
     "message": {"type", "id", "role", "content", "phase", "status"},
     "function_call": {"type", "id", "call_id", "name", "arguments", "status"},
     "function_call_output": {"type", "id", "call_id", "output", "status"},
+}
+_PROVIDER_ITEM_FIELDS = {
+    "web_search_call": {"type", "id", "status", "action"},
+    "web_extractor_call": {"type", "id", "status", "goal", "urls", "output"},
+}
+_PROVIDER_ITEM_TYPES = {
+    "openai": {"web_search_call"},
+    "aliyun": {"web_search_call", "web_extractor_call"},
 }
 
 
@@ -90,29 +100,37 @@ class _BoundedWireCopy:
         extras = getattr(value, "__pydantic_extra__", None)
         if len(fields) > _MAX_NODES or (isinstance(extras, dict) and len(extras) > _MAX_NODES):
             raise ResponseItemsError("Responses replay structure exceeds the supported bound")
+        fields = omit_unset_sdk_defaults(value, fields, _PROVIDER_ITEM_FIELDS["web_extractor_call"])
         copied = {key: child for key, child in fields.items() if isinstance(key, str) and not key.startswith("_")}
         if isinstance(extras, dict):
             copied.update(extras)
         return copied
 
 
-def validate_response_items(items: Any, *, output: bool = False) -> list[dict[str, Any]]:
+def validate_response_items(items: Any, *, output: bool = False, provider: str | None = None) -> list[dict[str, Any]]:
     """Validate and copy complete ordered wire items without lossy projection.
 
     Input requires every tool output to match an earlier call exactly once,
-    and every call to have its result. Errors never quote provider values.
+    and every call to have its result. Hosted search observations never enter
+    that pairing. They require an explicit Host-configured provider; code
+    interpreter items are never valid replay input or output because they
+    could resume a remote container. Errors never quote provider values.
     """
+    if provider is not None and (not isinstance(provider, str) or provider not in _PROVIDER_ITEM_TYPES):
+        raise ResponseItemsError("Responses replay provider is unsupported")
     if not isinstance(items, (list, tuple)) or len(items) > RESPONSE_ITEMS_MAX_ITEMS:
         raise ResponseItemsError("Responses replay item count exceeds the supported bound")
     selected = _BoundedWireCopy().copy(items)
     calls: set[str] = set()
     completed: set[str] = set()
     for item in selected:
-        kind = _validate_item_shape(item, output=output)
+        kind = _validate_item_shape(item, output=output, provider=provider)
         if kind == "reasoning":
             _validate_reasoning(item)
         elif kind == "message":
             _validate_message(item, output=output)
+        elif kind in _PROVIDER_ITEM_FIELDS:
+            _validate_provider_item(item, kind=kind, provider=provider)
         else:
             _validate_tool_item(item, kind=kind, calls=calls, completed=completed)
     if not output and calls != completed:
@@ -122,13 +140,15 @@ def validate_response_items(items: Any, *, output: bool = False) -> list[dict[st
     return selected
 
 
-def _validate_item_shape(item: Any, *, output: bool) -> str:
+def _validate_item_shape(item: Any, *, output: bool, provider: str | None) -> str:
     if not isinstance(item, dict):
         raise ResponseItemsError("Responses replay items must be objects")
     kind = item.get("type", "message" if "role" in item else None)
     if not isinstance(kind, str):
         raise ResponseItemsError("Responses replay contains an invalid item type")
     allowed = _ITEM_FIELDS.get(kind)
+    if kind in _PROVIDER_ITEM_TYPES.get(provider, ()):
+        allowed = _PROVIDER_ITEM_FIELDS[kind]
     if allowed is None or (output and kind == "function_call_output"):
         raise ResponseItemsError("Responses replay contains an unsupported item type")
     if kind == "function_call":
@@ -139,11 +159,57 @@ def _validate_item_shape(item: Any, *, output: bool) -> str:
                 item.pop(key, None)
     if set(item) - allowed:
         raise ResponseItemsError("Responses replay contains unsupported item fields")
-    if item.get("status") is not None and item["status"] != "completed":
+    statuses = ("completed", "failed") if kind == "web_search_call" else ("completed",)
+    if item.get("status") is not None and item["status"] not in statuses:
         raise ResponseItemsError("Responses replay contains an incomplete item")
     if item.get("id") is not None and not isinstance(item["id"], str):
         raise ResponseItemsError("Responses replay contains an invalid item identifier")
     return kind
+
+
+def _validate_provider_item(item: dict[str, Any], *, kind: str, provider: str | None) -> None:
+    if not isinstance(item.get("id"), str) or not item["id"] or item.get("status") is None:
+        raise ResponseItemsError("Responses replay contains invalid hosted tool identity or status")
+    if kind == "web_extractor_call":
+        if not isinstance(item.get("goal"), str) or not isinstance(item.get("output"), str):
+            raise ResponseItemsError("Responses replay contains invalid web extraction text")
+        _validate_string_list(item.get("urls"))
+        return
+    action = item.get("action")
+    if not isinstance(action, dict):
+        raise ResponseItemsError("Responses replay contains an invalid search action")
+    action_type = action.get("type")
+    if action_type == "search":
+        _validate_search_action(action)
+    elif action_type == "open_page" and provider == "openai":
+        if set(action) - {"type", "url"} or (action.get("url") is not None and not isinstance(action["url"], str)):
+            raise ResponseItemsError("Responses replay contains invalid open-page fields")
+    elif action_type == "find_in_page" and provider == "openai":
+        if set(action) != {"type", "url", "pattern"} or not isinstance(action.get("url"), str) or not isinstance(action.get("pattern"), str):
+            raise ResponseItemsError("Responses replay contains invalid find-in-page fields")
+    else:
+        raise ResponseItemsError("Responses replay contains an unsupported search action")
+
+
+def _validate_search_action(action: dict[str, Any]) -> None:
+    if set(action) - {"type", "query", "queries", "sources"}:
+        raise ResponseItemsError("Responses replay contains unsupported search action fields")
+    if action.get("query") is not None and not isinstance(action["query"], str):
+        raise ResponseItemsError("Responses replay contains an invalid search query")
+    if action.get("queries") is not None:
+        _validate_string_list(action["queries"])
+    sources = action.get("sources")
+    if sources is not None:
+        if not isinstance(sources, list):
+            raise ResponseItemsError("Responses replay contains invalid search sources")
+        for source in sources:
+            if not isinstance(source, dict) or set(source) != {"type", "url"} or source.get("type") != "url" or not isinstance(source.get("url"), str):
+                raise ResponseItemsError("Responses replay contains an invalid search source")
+
+
+def _validate_string_list(value: Any) -> None:
+    if not isinstance(value, list) or any(not isinstance(entry, str) for entry in value):
+        raise ResponseItemsError("Responses replay contains an invalid hosted tool text list")
 
 
 def _validate_reasoning(item: dict[str, Any]) -> None:

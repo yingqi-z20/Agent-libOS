@@ -1362,6 +1362,88 @@ class TestGuiServer:
         assert headers["x-content-type-options"] == "nosniff"
         assert headers["referrer-policy"] == "no-referrer"
 
+    def test_provider_tools_trace_exposes_only_summary_until_requested(self) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image="base-agent:v0", goal="managed tool trace")
+        record = _gui_provider_trace_record(pid, "llm-managed-trace")
+        managed = {
+            "provider": "openai",
+            "configured": ["web_search", "code_interpreter"],
+            "effective": ["web_search", "code_interpreter"],
+            "observed": "returned", "replay": "stateless", "file_count": 1,
+            "activities": [{
+                "id": "managed-1", "type": "code_interpreter_call", "status": "completed",
+                "code": "PRIVATE_CODE", "outputs": [{"type": "logs", "text": "PRIVATE_LOG"}],
+                "action": {"authorization": "PRIVATE_MANAGED_CREDENTIAL"},
+            }],
+            "citations": [{"type": "url_citation", "url": "https://example.com/PRIVATE_SEARCH", "title": "PRIVATE_TITLE"}],
+            "artifacts": [{"type": "file", "file_id": "PRIVATE_FILE", "filename": "PRIVATE_FILENAME"}],
+            "usage": {"code_interpreter": {"calls": 1}, "PRIVATE_USAGE_KEY": 1},
+        }
+        record.reasoning["attempts"][0]["provider_tools"] = managed
+        runtime.store.insert_llm_call(record)
+        status, detail = self.request("GET", f"/api/processes/{pid}/llm-calls/{record.call_id}")
+        assert status == 200
+        summary = detail["attempts"][0]["provider_tools"]
+        assert summary["observed"] == "returned"
+        assert summary["activity_count"] == summary["citation_count"] == summary["artifact_count"] == 1
+        assert summary["usage"] == {"code_interpreter": {"calls": 1}}
+        assert "PRIVATE" not in dumps(summary)
+        assert "PRIVATE_CODE" not in dumps(detail)
+        assert "PRIVATE_FILE" not in dumps(detail)
+        descriptor = next(item for item in detail["content"] if item["field"] == "attempt_provider_tools")
+        assert descriptor["availability"] == "available"
+        cursor = descriptor["cursor"]
+        assembled = ""
+        while cursor is not None:
+            status, chunk = self.request(
+                "GET", f"/api/processes/{pid}/llm-calls/{record.call_id}/content"
+                f"?field=attempt_provider_tools&attempt_sequence=1&limit=256&cursor={cursor}",
+            )
+            assert status == 200
+            assembled += chunk["content"]
+            cursor = chunk["next_cursor"]
+        content = json.loads(assembled)
+        assert content["activities"][0]["code"] == "PRIVATE_CODE"
+        assert content["artifacts"][0]["file_id"] == "PRIVATE_FILE"
+        assert "PRIVATE_MANAGED_CREDENTIAL" not in assembled
+        schema = json.loads((Path(__file__).resolve().parents[2] / "docs" / "gui_api_schema.json").read_text())
+        for reference, value in (("llmProviderToolsSummary", summary), ("llmProviderToolsContent", content)):
+            Draft202012Validator({"$schema": schema["$schema"], "$defs": schema["$defs"], "$ref": f"#/$defs/{reference}"}).validate(value)
+
+    @pytest.mark.parametrize("tier", [PayloadRetentionTier.SUMMARY, PayloadRetentionTier.HASH_ONLY])
+    def test_provider_tools_trace_retention_blocks_old_cursor(self, tier: PayloadRetentionTier) -> None:
+        runtime = self.server.service.runtime
+        pid = runtime.process.spawn(image="base-agent:v0", goal="managed tool retention")
+        record = _gui_provider_trace_record(pid, "llm-managed-retention")
+        record.reasoning["attempts"][0]["provider_tools"] = {
+            "provider": "aliyun", "configured": ["web_search"], "effective": ["web_search"],
+            "observed": "unknown", "activities": [], "citations": [], "artifacts": [], "usage": None,
+        }
+        runtime.store.insert_llm_call(record)
+        status, detail = self.request("GET", f"/api/processes/{pid}/llm-calls/{record.call_id}")
+        assert status == 200
+        assert detail["attempts"][0]["provider_tools"]["observed"] == "unknown"
+        descriptor = next(item for item in detail["content"] if item["field"] == "attempt_provider_tools")
+        retained = retain_llm_call_payload(record, PayloadRetentionTier.SUMMARY, provider_chain_head=False)
+        assert runtime.store.update_llm_call_payload_retention(
+            retained, expected_payload_sha256=llm_call_payload_sha256(record), expected_tier=PayloadRetentionTier.FULL,
+        )
+        if tier is PayloadRetentionTier.HASH_ONLY:
+            hashed = retain_llm_call_payload(retained, tier, provider_chain_head=False)
+            assert runtime.store.update_llm_call_payload_retention(
+                hashed, expected_payload_sha256=llm_call_payload_sha256(retained), expected_tier=PayloadRetentionTier.SUMMARY,
+            )
+        status, response = self.request(
+            "GET", f"/api/processes/{pid}/llm-calls/{record.call_id}/content"
+            f"?field=attempt_provider_tools&attempt_sequence=1&cursor={descriptor['cursor']}",
+        )
+        assert status == 409
+        assert response["error"]["code"] == "content_changed"
+        status, refreshed = self.request("GET", f"/api/processes/{pid}/llm-calls/{record.call_id}")
+        assert status == 200
+        assert refreshed["attempts"] == []
+
     @pytest.mark.parametrize(
         ("provider_status", "expected_status"),
         [

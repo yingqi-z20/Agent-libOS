@@ -262,7 +262,7 @@ class CheckpointManager:
         *,
         remapped: dict[str, Any] | None = None,
     ) -> None:
-        if not snapshot.get("responses_replay_refs"):
+        if not snapshot.get("responses_replay_refs") and not snapshot.get("provider_continuation_refs"):
             return
         if self._responses_replay is None:
             raise ValidationError("checkpoint requires unavailable private Responses replay storage")
@@ -2144,6 +2144,9 @@ class CheckpointManager:
             references = self._responses_replay.capture(subtree_pids)
             if references:
                 snapshot["responses_replay_refs"] = references
+            continuations = self._responses_replay.capture_provider_continuations(subtree_pids)
+            if continuations:
+                snapshot["provider_continuation_refs"] = continuations
         return self.snapshots.normalize(snapshot)
 
     def _module_snapshot(self) -> list[dict[str, Any]]:

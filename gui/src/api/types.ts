@@ -1298,6 +1298,22 @@ export type LlmProviderAttempt = {
   completed_at: string | null;
   duration_ms: number | null;
   error: LlmAttemptError | null;
+  provider_tools?: LlmProviderToolsSummary;
+};
+
+/** Content-free evidence: configured or sent tools do not imply execution. */
+export type LlmProviderToolsSummary = {
+  provider: "openai" | "aliyun" | null;
+  configured: string[];
+  effective: string[];
+  observed: "returned" | "unknown" | "not_returned";
+  activity_count: number;
+  citation_count: number;
+  artifact_count: number;
+  usage: Record<string, unknown> | null;
+  limited: boolean;
+  replay?: "native" | "stateless";
+  file_count?: number;
 };
 
 export type LlmReasoningBlock = {
@@ -1324,7 +1340,8 @@ export type LlmTraceContentField =
   | "response_content"
   | "attempt_reasoning"
   | "attempt_output"
-  | "attempt_tool_calls";
+  | "attempt_tool_calls"
+  | "attempt_provider_tools";
 
 export type LlmTraceContentAvailability = "available" | "not_returned" | "not_persisted" | "purged" | "limited";
 
@@ -1380,6 +1397,14 @@ export type LLMReasoningContext = "auto" | "current_turn" | "all_turns";
 export type LLMPromptLayout = "auto" | "legacy_v1" | "cache_optimized_v2";
 export type LLMPromptCacheMode = "auto" | "provider_default" | "implicit" | "explicit";
 
+export type LLMProviderTools = {
+  provider: "openai" | "aliyun";
+  web_search: boolean;
+  web_extractor: boolean;
+  code_interpreter: boolean;
+  file_ids: string[];
+};
+
 export type LLMProfileSummary = {
   profile_id: string;
   model: string | null;
@@ -1387,6 +1412,7 @@ export type LLMProfileSummary = {
   api_key_env: string;
   api_key_env_present: boolean;
   api_mode: "auto" | "responses" | "chat" | null;
+  provider_tools?: LLMProviderTools | null;
   timeout_s: number | null;
   max_retries: number | null;
   store: boolean | null;
@@ -1418,6 +1444,7 @@ export type LLMProfileInput = {
   base_url?: string | null;
   api_key_env: string;
   api_mode?: "auto" | "responses" | "chat" | null;
+  provider_tools?: LLMProviderTools | null;
   timeout_s?: number | null;
   max_retries?: number | null;
   store?: boolean | null;
@@ -2836,7 +2863,8 @@ const llmTraceContentFields = [
   "response_content",
   "attempt_reasoning",
   "attempt_output",
-  "attempt_tool_calls"
+  "attempt_tool_calls",
+  "attempt_provider_tools"
 ] as const satisfies readonly LlmTraceContentField[];
 const llmCallSummaryKeys = new Set([
   "schema_version", "call_id", "pid", "image_id", "purpose", "status", "api", "model", "usage", "error",
@@ -2846,7 +2874,11 @@ const llmCallSummaryKeys = new Set([
 const llmAttemptKeys = new Set([
   "sequence", "kind", "api", "status", "model", "request_id", "response_id", "reasoning_availability",
   "reasoning_blocks", "output_availability", "tool_names", "tool_call_count", "usage", "started_at",
-  "completed_at", "duration_ms", "error"
+  "completed_at", "duration_ms", "error", "provider_tools"
+]);
+const llmProviderToolsSummaryKeys = new Set([
+  "provider", "configured", "effective", "observed", "activity_count", "citation_count", "artifact_count",
+  "usage", "limited", "replay", "file_count"
 ]);
 const llmReasoningBlockKeys = new Set(["type", "source", "reason", "chars", "bytes", "sha256"]);
 const llmAttemptErrorKeys = new Set(["error_type", "status_code", "message_bytes", "message_sha256"]);
@@ -2926,7 +2958,7 @@ export function assertLlmTraceContentChunk(value: unknown): asserts value is Llm
 }
 
 function assertLlmProviderAttempt(value: unknown): asserts value is LlmProviderAttempt {
-  if (!isRecord(value) || !hasOnlyKeys(value, llmAttemptKeys)
+  if (!isRecord(value) || !hasKeysWithOptional(value, llmAttemptKeys, ["provider_tools"])
       || !Number.isSafeInteger(value.sequence) || Number(value.sequence) <= 0
       || !isNonEmptyString(value.kind) || !isOptionalNullableString(value.api) || !isNonEmptyString(value.status)
       || !isOptionalNullableString(value.model) || !isOptionalNullableString(value.request_id)
@@ -2938,7 +2970,8 @@ function assertLlmProviderAttempt(value: unknown): asserts value is LlmProviderA
       || !isCanonicalLlmUsage(value.usage)
       || !isOptionalNullableString(value.started_at) || !isOptionalNullableString(value.completed_at)
       || !(value.duration_ms === null || isNonNegativeFiniteNumber(value.duration_ms))
-      || !(value.error === null || isLlmAttemptError(value.error))) {
+      || !(value.error === null || isLlmAttemptError(value.error))
+      || !(value.provider_tools === undefined || isLlmProviderToolsSummary(value.provider_tools))) {
     throw new Error("GUI LLM provider attempt is malformed.");
   }
   for (const block of value.reasoning_blocks) {
@@ -2952,6 +2985,23 @@ function assertLlmProviderAttempt(value: unknown): asserts value is LlmProviderA
       throw new Error("GUI LLM reasoning block metadata is malformed.");
     }
   }
+}
+
+function isLlmProviderToolsSummary(value: unknown): value is LlmProviderToolsSummary {
+  return isRecord(value) && hasKeysWithOptional(value, llmProviderToolsSummaryKeys, ["replay", "file_count"])
+    && (value.provider === null || value.provider === "openai" || value.provider === "aliyun")
+    && isUniqueStringArray(value.configured) && isUniqueStringArray(value.effective)
+    && ["returned", "unknown", "not_returned"].includes(String(value.observed))
+    && isNonNegativeSafeInteger(value.activity_count) && isNonNegativeSafeInteger(value.citation_count)
+    && isNonNegativeSafeInteger(value.artifact_count)
+    && (value.usage === null || isRecord(value.usage)) && typeof value.limited === "boolean"
+    && (value.replay === undefined || value.replay === "native" || value.replay === "stateless")
+    && (value.file_count === undefined || isNonNegativeSafeInteger(value.file_count));
+}
+
+function hasKeysWithOptional(value: Record<string, unknown>, allowed: ReadonlySet<string>, optional: readonly string[]): boolean {
+  return Object.keys(value).every((key) => allowed.has(key))
+    && Array.from(allowed).every((key) => optional.includes(key) || Object.hasOwn(value, key));
 }
 
 function assertLlmContentDescriptor(value: unknown): asserts value is LlmTraceContentDescriptor {

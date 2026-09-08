@@ -125,8 +125,7 @@ class LLMReplayService:
         encoded = canonical_replay_payload(payload).encode("utf-8")
         if hashlib.sha256(encoded).hexdigest() != turn.payload_sha256 or len(encoded) != turn.payload_bytes:
             raise ReplayStateError("Responses replay payload integrity check failed")
-        if set(payload) != {"schema_version", "prefix", "groups", "flow_context"} or payload["schema_version"] != 1:
-            raise ReplayStateError("Responses replay payload schema is invalid")
+        provider = self._payload_provider(payload)
         groups = payload["groups"]
         if not isinstance(groups, list) or len(groups) > self.max_turns:
             raise ReplayStateError("Responses replay turn bound is invalid")
@@ -135,16 +134,27 @@ class LLMReplayService:
         context = DataFlowContext.from_dict(payload["flow_context"])
         if context.labels.to_dict() != turn.source_labels:
             raise ReplayStateError("Responses replay source labels do not match its payload")
-        self._validate_groups(groups)
+        self._validate_groups(groups, provider=provider)
         # Validation permits only the last group to be pending; every prior
         # complete request remains independently representable.
         if not groups or not self._pending_calls(groups[-1]):
-            validate_response_items(self._flatten(payload))
+            validate_response_items(self._flatten(payload), provider=provider)
         else:
-            validate_response_items(self._flatten({**payload, "groups": groups[:-1]}) + groups[-1]["input_items"])
+            validate_response_items(self._flatten({**payload, "groups": groups[:-1]}) + groups[-1]["input_items"], provider=provider)
         return payload
 
-    def _validate_groups(self, groups: list[Any]) -> None:
+    @staticmethod
+    def _payload_provider(payload: Mapping[str, Any]) -> str | None:
+        legacy_fields = {"schema_version", "prefix", "groups", "flow_context"}
+        if set(payload) == legacy_fields and payload["schema_version"] == 1:
+            return None
+        if set(payload) == legacy_fields | {"provider"} and payload["schema_version"] == 2:
+            provider = payload["provider"]
+            if isinstance(provider, str) and provider in {"openai", "aliyun"}:
+                return provider
+        raise ReplayStateError("Responses replay payload schema is invalid")
+
+    def _validate_groups(self, groups: list[Any], *, provider: str | None = None) -> None:
         seen: set[str] = set()
         for index, group in enumerate(groups):
             self._validate_group_shape(group)
@@ -152,7 +162,7 @@ class LLMReplayService:
             if not isinstance(call_id, str) or not call_id or call_id in seen:
                 raise ReplayStateError("Responses replay has duplicate or invalid local call identities")
             seen.add(call_id)
-            validate_response_items(group["output_items"], output=True)
+            validate_response_items(group["output_items"], output=True, provider=provider)
             self._validate_outputs(group)
             if index < len(groups) - 1 and (self._pending_calls(group) or not group["validated"]):
                 raise ReplayStateError("Responses replay contains an unresolved historical tool call")
@@ -239,7 +249,7 @@ class LLMReplayService:
         self.store.insert_llm_replay_turn(turn)
         return {"turn_id": turn.turn_id, "payload_sha256": turn.payload_sha256}
 
-    def load_request(self, reference: Mapping[str, Any], *, pid: str, provider_fingerprint: str, model: str, context_generation: str, run_id: str | None = None) -> ReplayRequest:
+    def load_request(self, reference: Mapping[str, Any], *, pid: str, provider_fingerprint: str, model: str, context_generation: str, run_id: str | None = None, provider: str | None = None) -> ReplayRequest:
         if set(reference) != {"turn_id", "payload_sha256"}:
             raise ReplayStateError("Responses replay request reference shape is invalid")
         turn = self.store.get_llm_replay_turn(reference["turn_id"])
@@ -262,12 +272,16 @@ class LLMReplayService:
         flow = DataFlowContext.from_dict(request["flow_context"])
         if flow.labels.to_dict() != turn.source_labels or _counter(request["estimated_input_tokens"]) is None:
             raise ReplayStateError("Responses replay frozen request evidence is invalid")
-        items = validate_response_items(request["response_items"])
+        if not isinstance(request["payload"], dict) or self._payload_provider(request["payload"]) != provider:
+            raise ReplayStateError("Responses replay frozen request provider changed")
+        items = validate_response_items(request["response_items"], provider=provider)
         if items != [*self._flatten(request["payload"]), *request["input_items"]]:
             raise ReplayStateError("Responses replay frozen request wire input changed")
         return ReplayRequest(pid=pid, run_id=run_id, provider_fingerprint=provider_fingerprint, model=model, context_generation=context_generation, expected_head=expected, response_items=items, payload=request["payload"], input_items=request["input_items"], flow_context=flow, estimated_input_tokens=request["estimated_input_tokens"])
 
-    def prepare(self, *, pid: str, provider_fingerprint: str, model: str, context_generation: str, messages: Sequence[Mapping[str, Any]], flow_context: DataFlowContext, run_id: str | None = None, tools: Sequence[Mapping[str, Any]] = ()) -> ReplayRequest:
+    def prepare(self, *, pid: str, provider_fingerprint: str, model: str, context_generation: str, messages: Sequence[Mapping[str, Any]], flow_context: DataFlowContext, run_id: str | None = None, tools: Sequence[Mapping[str, Any]] = (), provider: str | None = None) -> ReplayRequest:
+        # Validate the Host-supplied selection even before any history exists.
+        validate_response_items([], provider=provider)
         current_items = messages_to_response_items(messages)
         prefix: list[dict[str, Any]] = []
         while current_items and current_items[0].get("role") in {"system", "developer"}:
@@ -276,10 +290,14 @@ class LLMReplayService:
         head = None
         if current is None:
             payload = {"schema_version": 1, "prefix": prefix, "groups": [], "flow_context": flow_context.to_dict()}
+            if provider is not None:
+                payload.update(schema_version=2, provider=provider)
         else:
             head, turn, payload = current
             if (turn.provider_fingerprint, turn.model, turn.context_generation, turn.run_id) != (provider_fingerprint, model, context_generation, run_id):
                 raise ReplayStateError("Responses replay provider, owner, or context scope changed")
+            if self._payload_provider(payload) != provider:
+                raise ReplayStateError("Responses replay hosted tool provider changed")
             if payload["prefix"] != prefix:
                 raise ReplayStateError("Responses replay instruction prefix changed")
             if payload["groups"] and (self._pending_calls(payload["groups"][-1]) or not payload["groups"][-1]["validated"]):
@@ -288,7 +306,7 @@ class LLMReplayService:
             payload["flow_context"] = flow_context.to_dict()
         self._require_continuity(pid, context_generation, None if current is None else payload)
         self._admit_request_payload(payload, current_items)
-        items = validate_response_items([*self._flatten(payload), *current_items])
+        items = validate_response_items([*self._flatten(payload), *current_items], provider=provider)
         opaque_tokens = sum(group["reasoning_tokens"] for group in payload["groups"])
         self._copy_payload(payload)
         return ReplayRequest(pid=pid, run_id=run_id, provider_fingerprint=provider_fingerprint, model=model, context_generation=context_generation, expected_head=head, response_items=items, payload=payload, input_items=current_items, flow_context=flow_context, estimated_input_tokens=estimate_replay_input_tokens(items, opaque_tokens=opaque_tokens, tools=tools))
@@ -333,7 +351,7 @@ class LLMReplayService:
             raise ReplayStateError("Responses replay head is missing for an existing conversation")
 
     def stage(self, request: ReplayRequest, *, call_id: str, response_items: Sequence[Mapping[str, Any]], usage: Mapping[str, Any], max_output_tokens: int, response_id: str | None = None, flow_context: DataFlowContext | None = None) -> LLMReplayHead:
-        items = validate_response_items(list(response_items), output=True)
+        items = validate_response_items(list(response_items), output=True, provider=self._payload_provider(request.payload))
         payload = deepcopy(request.payload)
         if flow_context is not None:
             payload["flow_context"] = DataFlowContext.aggregate([request.flow_context, flow_context]).to_dict()
@@ -460,7 +478,7 @@ class LLMReplayService:
             DataFlowContext.from_dict(payload["flow_context"]), flow_context,
             replaced_context_oid=replaced_context_oid, retain_groups=retain_groups,
         )
-        compacted = {"schema_version": 1, "prefix": prefix, "groups": retained, "flow_context": context.to_dict()}
+        compacted = {**payload, "prefix": prefix, "groups": retained, "flow_context": context.to_dict()}
         return self._publish(pid=pid, run_id=turn.run_id, provider_fingerprint=turn.provider_fingerprint, model=turn.model, context_generation=context_generation, payload=compacted, expected=head)
 
     @staticmethod

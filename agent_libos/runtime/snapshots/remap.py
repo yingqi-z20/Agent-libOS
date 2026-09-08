@@ -143,12 +143,15 @@ class SnapshotRemapper:
     @classmethod
     def remap(cls, snapshot: ProcessSnapshot, identities: SnapshotIdentityMap) -> ProcessSnapshot:
         cls._validate_identity_collisions(snapshot, identities)
-        if snapshot.responses_replay_refs and any(
+        changes_private_identity = any(
             source != target
             for mapping in (identities.pids, identities.objects)
             for source, target in mapping.items()
-        ):
+        )
+        if snapshot.responses_replay_refs and changes_private_identity:
             raise ValidationError("snapshot private Responses replay requires an authorized local rebind")
+        if snapshot.provider_continuation_refs and changes_private_identity:
+            raise ValidationError("snapshot private provider continuation requires an authorized local rebind")
         root_pid = identities.pids.get(snapshot.header.root_pid, snapshot.header.root_pid)
         remapped = ProcessSnapshot(
             header=SnapshotHeader(
@@ -186,6 +189,7 @@ class SnapshotRemapper:
             },
             modules=tuple(deepcopy(module) for module in snapshot.modules),
             responses_replay_refs=dict(snapshot.responses_replay_refs),
+            provider_continuation_refs=dict(snapshot.provider_continuation_refs),
         )
         cls._validate_remapped_cardinality(snapshot, remapped)
         cls._validate_remapped_references(snapshot, remapped, identities)

@@ -500,6 +500,119 @@ alongside paired tool output. It avoids adding the existing TaskRun or
 and replay-bearing protocol errors cannot silently switch to Chat. Local
 checkpoint references do not export conversation state with an agent image.
 
+Provider-hosted tools are configured per LLM profile; see
+[provider-hosted tools](configuration.md#provider-hosted-tools) for the supported
+provider/API combinations. Keep provider activity separate from
+`LLMCompletion.tool_calls`: that list contains only local functions which the
+Runtime will dispatch. Hosted search, page extraction, and code execution have
+already occurred inside the admitted provider call. Their bounded observations
+and citations belong to provider trace evidence, and must follow full, summary,
+and purged payload-retention rules.
+
+Code-interpreter profiles use stateless message/function history. OpenAI's
+automatic container selection can reuse a container referenced by a historical
+`code_interpreter_call`, so omitting `previous_response_id` alone does not make
+code execution independent. Keep raw native code items, item references, and
+opaque reasoning out of subsequent request input. Store them only where private
+provider evidence is permitted, and record the configured/effective replay
+distinction. Do not migrate an existing native replay head by silently dropping
+its history. Never store mutable per-process container state on a shared
+profile client.
+
+Tool suppression must use the Host call's effective policy, not prompt text.
+The context compressor is a `context-compressor:v0` child process that also
+uses action selection; an LLM purpose-string check alone will not isolate it.
+Structured/text completions, the semantic classifier, and action-format repair
+do not invoke provider tools. A completed hosted-tool result followed by an
+invalid local function action must survive every repair attempt as result
+context, without executing the hosted tool again.
+
+A successful hosted-only response has a separate local continuation contract;
+do not manufacture an empty validated-action manifest or a local tool receipt.
+Its source call, source digest, profile identity, context generation, and
+tools-disabled successor policy are checked before continuation. TaskRuns
+publish an idempotent completed safe point and preserve normal pause/cancel
+fences. A successful source awaiting marker settlement blocks new provider
+dispatch, including after restart and after subsequent error records. The
+source call is a retention dependency even before its continuation marker is
+committed. Keep that call and the active marker protected across
+failed repairs, and recheck live dependencies inside the retention update after
+page selection. Consuming a continuation releases its own dependency;
+checkpoint references and pending forks keep the original evidence protected.
+Content-free integrity envelopes remain protected while they are referenced.
+
+Checkpoint snapshots carry typed, integrity-bound references to pending local
+provider results; they do not contain a provider container session. Restore and
+fork validate source/marker digests, source process, profile identity, and
+payload before publication, then rebind only the local target process and
+context generation. A fork can reference its original process's source call.
+Only these formal snapshot fields participate in retention, not matching IDs
+inside arbitrary snapshot data. Capturing a pending result without retained
+payload explicitly fails, including under `persist_full_io=false`.
+
+Certified ordinary-process compaction atomically replaces the context payload
+and publishes a continuation bound to the new generation. Preserve its hosted
+result and original source call; revalidate source authority and bind the
+updated source context to the certified summary. Missing or mismatched
+certification rolls back the context payload, generation, and continuation
+marker together. A pending TaskRun or a pending result without retained payload
+must select its local action before compaction: reject before changing context
+generation or TaskRun safe points, without relaxing the existing TaskRun
+continuation bindings.
+
+An authenticated Host context append can advance the pending result's exact
+source version by one while preserving its context generation. This update
+keeps the result and its data-flow labels, revalidates source access, and
+publishes the replacement binding atomically with the context write. It does
+not accept arbitrary source edits or replace revoked source authority. Under
+full-I/O opt-out, the result remains in memory and the durable marker retains
+only its integrity-bound envelope.
+
+Host exec can clear the native replay head while preserving a pending local
+result. Construct its next tools-disabled request from the actual available
+history and include the retained result when no head remains; a profile's replay
+setting alone does not establish that its provider history is still present.
+
+Validate these boundaries with deterministic captured provider requests:
+
+```bash
+uv run python -m pytest tests/security/test_provider_tools_governance.py \
+  tests/security/test_provider_continuation_retention.py \
+  tests/runtime/test_task_run_provider_continuation.py \
+  tests/runtime/test_provider_tools_executor.py \
+  tests/runtime/test_provider_tools_repairs.py \
+  tests/runtime/test_provider_continuation_compaction.py \
+  tests/runtime/test_provider_continuation_exec.py \
+  tests/self_evolution/test_checkpoint_provider_continuation.py
+uv run python scripts/check_test_invariants.py
+```
+
+Cover changed profile identity before dispatch, same-profile process isolation,
+ordinary and image-only histories, restart/restore, repair, certified
+compaction, internal calls, and retention. Real-provider support checks remain
+opt-in; deterministic test results do not establish provider model availability,
+sandbox isolation beyond the documented API contract, or artifact lifetime.
+
+The [real-provider smoke cases](../tests/providers/test_provider_tools_real.py)
+require `--run-real-llm`, an exact comma-separated selection in
+`AGENT_LIBOS_REAL_PROVIDER_TOOLS_CASES`, and dedicated Host environment variables
+`AGENT_LIBOS_REAL_PROVIDER_TOOLS_OPENAI_API_KEY` and
+`AGENT_LIBOS_REAL_PROVIDER_TOOLS_OPENAI_MODEL`, or their `ALIYUN` equivalents.
+Aliyun also requires `AGENT_LIBOS_REAL_PROVIDER_TOOLS_ALIYUN_BASE_URL` for the
+selected API. These tests do not inherit `.env` or ambient SDK configuration.
+After configuring those variables, run one paid case explicitly:
+
+```bash
+AGENT_LIBOS_REAL_PROVIDER_TOOLS_CASES=openai-search uv run python -m pytest \
+  'tests/providers/test_provider_tools_real.py::test_provider_tools_real[openai-search]' \
+  --run-real-llm
+```
+
+Available cases are `openai-search`, `openai-code`, `aliyun-search`,
+`aliyun-extractor`, `aliyun-code`, and `aliyun-chat-search`. Responses cases
+require returned tool activity. Aliyun Chat may leave execution evidence
+unknown even when the search request option was enabled.
+
 Real asynchronous SDK transports are request-scoped. Scheduler quanta and
 parallel process workers may use different short-lived event loops, so a cached
 `AsyncOpenAI`/httpx keep-alive pool must never be reused across quanta. Explicit

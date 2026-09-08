@@ -31,6 +31,7 @@ from agent_libos.evidence.payload_retention import (
     PayloadRetentionTier,
     external_effect_payload_retention_tier,
     llm_call_payload_can_be_image_only_transcript_head,
+    llm_call_payload_can_be_provider_continuation,
     llm_call_payload_sha256,
     llm_call_payload_requires_latest_guard,
     llm_call_payload_retention_tier,
@@ -19382,6 +19383,137 @@ class SQLRuntimeStore:
             return selected
         return owned
 
+    def _provider_continuation_retention_ids(
+        self, records: tuple[LLMCallRecord, ...], *, cursor: Any = None,
+    ) -> frozenset[str]:
+        """Classify pending hosted evidence in one bounded query per page.
+
+        The write path calls this again inside its transaction. A page selected
+        before a continuation was committed therefore cannot erase its source.
+        """
+
+        candidates = tuple(
+            record for record in records
+            if llm_call_payload_can_be_provider_continuation(record)
+        )
+        if not candidates:
+            return frozenset()
+        placeholders = ",".join("?" for _ in candidates)
+        query = f"""
+            SELECT candidate.pid, marker.call_id AS marker_id,
+                   marker.created_at AS marker_created_at,
+                   marker.request_options_json AS marker_options,
+                   latest.call_id AS latest_success_id,
+                   point.pending_action_payload_id,
+                   pending.canonical_json AS pending_json
+              FROM (
+                SELECT DISTINCT pid FROM llm_calls WHERE call_id IN ({placeholders})
+              ) AS candidate
+              LEFT JOIN llm_calls AS marker ON marker.call_id = (
+                SELECT call_id FROM llm_calls
+                 WHERE pid = candidate.pid AND purpose = 'provider_continuation'
+                 ORDER BY created_at COLLATE BINARY DESC, call_id COLLATE BINARY DESC
+                 LIMIT 1
+              )
+              LEFT JOIN llm_calls AS latest ON latest.call_id = (
+                SELECT call_id FROM llm_calls
+                 WHERE pid = candidate.pid AND purpose = 'action_selection' AND status = 'ok'
+                 ORDER BY created_at COLLATE BINARY DESC, call_id COLLATE BINARY DESC
+                 LIMIT 1
+              )
+              LEFT JOIN task_run_resume_points AS point
+                ON point.pid = candidate.pid AND point.complete = 1
+              LEFT JOIN task_run_payloads AS pending
+                ON pending.payload_id = point.pending_action_payload_id
+        """
+        parameters = tuple(record.call_id for record in candidates)
+        rows = list(cursor.execute(query, parameters)) if cursor is not None else self._query(query, parameters)
+        by_pid = {row["pid"]: row for row in rows}
+        local_refs = frozenset(
+            record.call_id for record in candidates
+            if self._provider_continuation_reference_protects(record, by_pid.get(record.pid))
+        )
+        external_candidates = tuple(record for record in candidates if record.call_id not in local_refs)
+        return local_refs | self._external_provider_continuation_retention_ids(external_candidates, cursor=cursor)
+
+    def _external_provider_continuation_retention_ids(
+        self, candidates: tuple[LLMCallRecord, ...], *, cursor: Any = None,
+    ) -> frozenset[str]:
+        """Protect exact checkpoint refs and pending forks without copying bodies.
+
+        Fixed JSON paths are Host schema fields; PostgreSQL's dialect translates
+        only these reviewed expressions. Query results remain page-bounded IDs.
+        """
+
+        if not candidates:
+            return frozenset()
+        placeholders = ",".join("?" for _ in candidates)
+        query = f"""
+            SELECT candidate.call_id FROM llm_calls AS candidate
+             WHERE candidate.call_id IN ({placeholders}) AND (
+               EXISTS (
+                 SELECT 1 FROM checkpoints AS checkpoint,
+                   json_each(json_extract(checkpoint.snapshot_json, '$.provider_continuation_refs')) AS continuation_ref
+                  WHERE json_extract(continuation_ref.value, '$.marker_call_id') = candidate.call_id
+                     OR json_extract(continuation_ref.value, '$.source_call_id') = candidate.call_id
+               ) OR EXISTS (
+                 SELECT 1 FROM llm_calls AS marker
+                  WHERE marker.purpose = 'provider_continuation'
+                    AND json_extract(marker.request_options_json, '$.provider_continuation.state') = 'pending'
+                    AND json_extract(marker.request_options_json, '$.provider_continuation.call_id') = candidate.call_id
+                    AND NOT EXISTS (
+                      SELECT 1 FROM llm_calls AS newer
+                       WHERE newer.pid = marker.pid AND newer.purpose = marker.purpose
+                         AND (newer.created_at COLLATE BINARY, newer.call_id COLLATE BINARY)
+                             > (marker.created_at COLLATE BINARY, marker.call_id COLLATE BINARY)
+                    )
+               )
+             )
+        """
+        parameters = tuple(record.call_id for record in candidates)
+        rows = list(cursor.execute(query, parameters)) if cursor is not None else self._query(query, parameters)
+        return frozenset(row["call_id"] for row in rows)
+
+    @staticmethod
+    def _provider_continuation_reference_state(row: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        options = loads(row["marker_options"], {})
+        marker = options.get("provider_continuation", {})
+        pending = loads(row["pending_json"], {})
+        if not isinstance(marker, dict) or not isinstance(pending, dict):
+            raise ValueError("invalid continuation projection")
+        if row["marker_id"] is not None and (
+            type(marker.get("schema_version")) is not int
+            or marker.get("schema_version") not in {1, 2}
+            or marker.get("state") not in {"pending", "consumed"}
+            or not isinstance(marker.get("call_id"), str)
+        ):
+            raise ValueError("invalid continuation marker")
+        return marker, pending
+
+    def _provider_continuation_reference_protects(self, record: LLMCallRecord, row: Any) -> bool:
+        if row is None:
+            return True
+        try:
+            marker, pending = self._provider_continuation_reference_state(row)
+        except (AttributeError, TypeError, ValueError):
+            return True
+        if row["pending_action_payload_id"] is not None and row["pending_json"] is None:
+            # Diagnose a missing active resume payload before erasing evidence.
+            return True
+        if pending.get("kind") == "provider_continuation" and pending.get("call_id") == record.call_id:
+            return True
+        if record.purpose == "provider_continuation":
+            return row["marker_id"] == record.call_id
+        if marker.get("call_id") == record.call_id:
+            return marker.get("state") != "consumed"
+        # Protect the success-to-commit interval, including when the last
+        # continuation belongs to an older turn. Errors cannot supersede it.
+        return row["latest_success_id"] == record.call_id and (
+            row["marker_id"] is None
+            or (record.created_at, record.call_id)
+            > (row["marker_created_at"], row["marker_id"])
+        )
+
     def scan_llm_call_payloads_for_retention(
         self,
         *,
@@ -19483,6 +19615,7 @@ class SQLRuntimeStore:
             records=records,
             next_cursor=next_cursor,
             latest_llm_call_ids=latest_llm_call_ids,
+            provider_continuation_call_ids=self._provider_continuation_retention_ids(records),
         )
 
     def update_llm_call_payload_retention(
@@ -19504,6 +19637,9 @@ class SQLRuntimeStore:
             if len(rows) != 1:
                 return False
             current = self._row_to_llm_call(rows[0])
+            continuation_pending = current.call_id in self._provider_continuation_retention_ids(
+                (current,), cursor=cur,
+            )
             latest_guard_kind = (
                 2
                 if llm_call_payload_can_be_image_only_transcript_head(current)
@@ -19516,6 +19652,7 @@ class SQLRuntimeStore:
                     expected_payload_sha256=expected_payload_sha256,
                     expected_tier=expected_tier,
                     provider_chain_head=False,
+                    provider_continuation_pending=continuation_pending,
                 )
             except (TypeError, ValueError):
                 return False

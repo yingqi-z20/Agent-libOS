@@ -63,6 +63,18 @@ from agent_libos.llm.prompt import (
     split_cache_optimized_user_prompt,
 )
 from agent_libos.llm.records import observable_llm_call_fields
+from agent_libos.llm.provider_continuation import (
+    continuation_source_sha256,
+    has_provider_continuation_result,
+    is_provider_continuation_completion,
+    provider_repair_messages,
+    validated_continuation_marker,
+)
+from agent_libos.llm.provider_tools import provider_tool_result_text
+from agent_libos.llm.continuation_compaction import (
+    provider_continuation_compaction_scope,
+    provider_continuation_context_update_scope,
+)
 from agent_libos.llm.provider_trace import (
     custom_provider_trace,
     is_provider_trace,
@@ -81,6 +93,7 @@ from agent_libos.llm.task_runs import (
     task_run_contract_message,
     task_run_dynamic_state_message,
     validated_action_manifest,
+    provider_continuation_manifest,
 )
 from agent_libos.llm.pending import (
     LLMPendingActionService,
@@ -170,6 +183,7 @@ _IMAGE_ONLY_EMPTY_HEAD_VALIDATION_KEY = "image_only_empty_head_validation"
 _IMAGE_ONLY_EMPTY_HEAD_VALIDATION_PURPOSE_PREFIX = "image_only_empty_validation"
 _IMAGE_ONLY_EMPTY_HEAD_VALIDATION_SCHEMA_VERSION = 1
 _IMAGE_ONLY_TOOL_OUTPUT_SCHEMA_VERSION = 1
+_PROVIDER_CONTINUATION_PURPOSE = "provider_continuation"
 
 
 class _LLMProviderChainScopeChanged(ProviderEffectNotStarted):
@@ -227,6 +241,7 @@ class _LLMCallState:
     parallel_tool_calls: bool = False
     auto_wait_on_empty_tool_calls: bool = False
     fallback_json_actions: bool = False
+    provider_tools_enabled: bool = True
     temperature: float = 0.0
     max_tokens: int = 0
     max_input_tokens_per_call: int = 0
@@ -464,6 +479,9 @@ class LLMProcessExecutor:
         # since this Runtime opened.  Loaded Skill tool guides for these names
         # are compacted in later prompts; a failure re-expands them.
         self._used_tool_names: dict[str, set[str]] = {}
+        # Content-free evidence cannot retain the operational continuation
+        # body. Keep it only for this Runtime lifetime, as for pending release.
+        self._provider_continuation_payloads: dict[str, dict[str, Any]] = {}
         self.actions = LLMActionService(
             processes=self._processes,
             tools=self._tools,
@@ -486,6 +504,13 @@ class LLMProcessExecutor:
             self._operations,
             self._resources,
             config=self.config,
+            provider_continuation_compaction_scope=lambda pid: provider_continuation_compaction_scope(
+                pid, processes=self._processes, unit_of_work=self._unit_of_work,
+                pending_data=self._provider_continuation_data,
+                context_memory=self.context_memory, data_flow=self._data_flow,
+                file_resource_resolver=self._file_resource_resolver,
+                persist_full_io=self.config.llm.persist_full_io,
+            ),
         )
         self._load_pending_actions()
 
@@ -652,6 +677,199 @@ class LLMProcessExecutor:
             and resolved.client._use_responses_api()
         )
 
+    @staticmethod
+    def _provider_tools_provider(client: Any) -> str | None:
+        configured = getattr(client, "provider_tools", None)
+        return configured.provider if configured is not None else None
+
+    def _provider_continuation_data(self, pid: str) -> dict[str, Any] | None:
+        marker = self._processes.get_latest_llm_call(
+            pid=pid, purpose=_PROVIDER_CONTINUATION_PURPOSE,
+        )
+        self._require_provider_continuation_settlement(pid, marker)
+        if marker is None:
+            return None
+        manifest = validated_continuation_marker(marker)
+        if manifest.get("state") == "consumed":
+            return None
+        generation = self._processes.get_llm_context_generation(pid)
+        if manifest.get("context_generation") != generation:
+            # Checkpoint restore starts a new local context generation. A
+            # marker from the discarded generation cannot select new work.
+            return None
+        source = self._processes.get_llm_call(str(manifest.get("call_id") or ""))
+        if (
+            source is None or source.pid != manifest.get("source_pid", pid)
+            or source.status != "ok" or not source.completed_at
+            or (source.tool_calls != [] and source.request_options.get("provider_tools_function_call_count") != 0)
+            or continuation_source_sha256(source) != manifest.get("source_sha256")
+        ):
+            raise ValidationError("provider continuation source is unavailable or changed")
+        resolved = self._llms.resolve_for_process(pid)
+        if manifest.get("profile_identity_sha256") != resolved.identity_sha256:
+            raise ValidationError("provider continuation profile changed; start a new task")
+        payload = self._provider_continuation_payloads.get(marker.call_id)
+        if payload is None:
+            payload = {"message": marker.messages, "flow_context": marker.raw_response}
+        if hashlib.sha256(dumps(to_jsonable(payload)).encode()).hexdigest() != manifest.get("payload_sha256"):
+            raise ValidationError("provider continuation content is unavailable under the retention policy")
+        return {"marker": marker, "manifest": manifest, **payload}
+
+    def _require_provider_continuation_settlement(
+        self, pid: str, marker: LLMCallRecord | None,
+    ) -> None:
+        source = self._processes.get_latest_successful_llm_call(
+            pid=pid, purpose="action_selection",
+        )
+        if source is None or source.request_options.get("provider_continuation_required") is not True:
+            return
+        if source.request_options.get("llm_context_generation") != self._processes.get_llm_context_generation(pid):
+            return
+        manifest = marker.request_options.get("provider_continuation") if marker is not None else None
+        if isinstance(manifest, dict) and manifest.get("call_id") == source.call_id:
+            return
+        # The external call has already completed. A crash or failed local
+        # transaction before the continuation safe point must not repeat it.
+        raise ValidationError(
+            "successful provider result is awaiting continuation settlement; "
+            "start a new task or restore a completed checkpoint"
+        )
+
+    def _prepare_provider_tools_request(self, state: _LLMCallState) -> None:
+        pending = self._provider_continuation_data(state.pid)
+        task_run_pending = None
+        pending_getter = getattr(self._task_runs, "pending_provider_continuation_for_pid", None)
+        if callable(pending_getter):
+            task_run_pending = pending_getter(state.pid)
+        configured = getattr(state.client, "provider_tools", None)
+        if configured is None:
+            return
+        if configured.code_interpreter and self._processes.get_llm_replay_head(state.pid) is not None:
+            raise ValidationError(
+                "cannot enable independent provider code execution on an existing native replay history; start a new process or task"
+            )
+        image = self._images.get(state.process.image_id)
+        compressor = bool(image is not None and (
+            image.image_id == "context-compressor:v0"
+            or image.metadata.get("role") == "llm_context_compressor"
+        ))
+        state.provider_tools_enabled = bool(
+            state.provider_tools_enabled and state.attempt == 1 and not compressor
+        )
+        if task_run_pending is not None:
+            state.provider_tools_enabled = False
+            state.request_options["provider_continuation_source_call_id"] = task_run_pending["call_id"]
+        if pending is not None:
+            state.provider_tools_enabled = False
+            state.request_options["provider_continuation_source_call_id"] = pending["manifest"]["call_id"]
+            previous_flow = DataFlowContext.from_dict(pending["flow_context"])
+            state.flow_context = DataFlowContext.aggregate((state.flow_context, previous_flow))
+            # Native replay and image-only/TaskRun transcripts already contain
+            # the same result. A certified compaction replaces old replay
+            # groups, so its rebound result must enter the current snapshot.
+            if (self._provider_result_needs_prompt_injection(state.pid, pending, image)
+                    and getattr(state.process, "task_run_id", None) is None):
+                state.request_messages = [*state.request_messages, pending["message"]]
+        safe_config = to_jsonable(configured)
+        safe_config["file_count"] = len(safe_config.pop("file_ids", []))
+        state.request_options.update({
+            "provider_tools_configured": safe_config,
+            "provider_tools_enabled": state.provider_tools_enabled,
+            "llm_profile_identity_sha256": state.resolved.identity_sha256,
+            "responses_replay_configured": getattr(state.resolved, "responses_replay_configured", None),
+            "responses_replay_effective": bool(state.client.responses_replay),
+            "responses_replay_disabled_reason": "independent_code_execution" if configured.code_interpreter else None,
+        })
+
+    def _provider_result_needs_prompt_injection(
+        self, pid: str, pending: Mapping[str, Any], image: Any,
+    ) -> bool:
+        replay_enabled = self._responses_replay_enabled(pid)
+        replay_head = self._processes.get_llm_replay_head(pid) if replay_enabled else None
+        compacted = "provider_continuation_compaction" in pending["marker"].request_options
+        if image is None or (replay_head is not None and not compacted):
+            return False
+        return bool(
+            image.prompt_mode != PROMPT_MODE_IMAGE_ONLY
+            or pending["manifest"]["schema_version"] == 2
+            or replay_enabled
+        )
+
+    def _commit_provider_continuation(self, pid: str, call_id: str, completion: Any) -> None:
+        source = self._processes.get_llm_call(call_id)
+        if source is None or source.status != "ok" or completion.tool_calls:
+            raise RuntimeError("provider continuation requires a successful local call without function calls")
+        text = provider_tool_result_text(
+            completion.content,
+            getattr(completion, "provider_tool_activities", []),
+            getattr(completion, "citations", []),
+            getattr(completion, "artifacts", []),
+        )
+        if not text.strip():
+            raise RuntimeError("provider continuation has no readable result")
+        payload = {
+            "message": {"role": "assistant", "content": text},
+            "flow_context": self._data_flow.unclassified_ingress_context(
+                self._data_flow.current_context(), origin="external:llm",
+            ).to_dict(),
+        }
+        marker_id = new_id("llmcontinuation")
+        now = utc_now()
+        manifest = {
+            "schema_version": 1, "state": "pending", "call_id": call_id,
+            "source_sha256": continuation_source_sha256(source),
+            "profile_identity_sha256": source.request_options["llm_profile_identity_sha256"],
+            "context_generation": self._processes.get_llm_context_generation(pid),
+            "payload_sha256": hashlib.sha256(dumps(to_jsonable(payload)).encode()).hexdigest(),
+        }
+        observation = observable_llm_call_fields(
+            messages=payload["message"], tools=[], raw_response=payload["flow_context"], config=self.config,
+        )
+        with self._transcript_settlement_scope(pid), self._unit_of_work.transaction():
+            if self._is_replay_call(call_id):
+                self.replay.mark_validated(pid=pid, call_id=call_id)
+            self._supersede_validated_image_only_empty_head(pid=pid, completion=completion)
+            hook = getattr(self._task_runs, "record_provider_continuation", None)
+            if callable(hook):
+                hook(
+                    pid=pid, call_id=call_id,
+                    continuation_manifest=provider_continuation_manifest(
+                        call_id=call_id, data_labels=self._data_flow.current_context().labels.to_dict(),
+                    ),
+                    context_generation=manifest["context_generation"],
+                )
+            self._processes.insert_llm_call(LLMCallRecord(
+                call_id=marker_id, pid=pid, image_id=source.image_id,
+                purpose=_PROVIDER_CONTINUATION_PURPOSE, status="ok",
+                request_options={"provider_continuation": manifest},
+                created_at=now, completed_at=now, **observation,
+            ))
+            self._audit.record(
+                actor=pid, action="llm.provider_continuation", target=f"llm_call:{call_id}",
+                decision={"call_id": call_id, "provider_tools_disabled_on_resume": True},
+            )
+        if not self.config.llm.persist_full_io:
+            self._provider_continuation_payloads[marker_id] = payload
+        setattr(completion, "_agent_libos_provider_continuation", call_id)
+
+    def _consume_provider_continuation(self, pid: str) -> None:
+        pending = self._provider_continuation_data(pid)
+        if pending is None:
+            return
+        now = utc_now()
+        self._processes.insert_llm_call(LLMCallRecord(
+            call_id=new_id("llmcontinuation"), pid=pid,
+            image_id=pending["marker"].image_id,
+            purpose=_PROVIDER_CONTINUATION_PURPOSE, status="ok", messages=[], tools=[], tool_calls=[],
+            request_options={"provider_continuation": {**pending["manifest"], "state": "consumed"}},
+            created_at=now, completed_at=now,
+        ))
+        self._provider_continuation_payloads.pop(pending["marker"].call_id, None)
+
+    def _transcript_settlement_scope(self, pid: str) -> Any:
+        scope = getattr(self._task_runs, "transcript_settlement_scope_for_pid", None)
+        return scope(pid) if callable(scope) else nullcontext()
+
     def _prepare_responses_replay(self, state: _LLMCallState) -> None:
         if not (
             self.config.llm.persist_full_io
@@ -673,6 +891,7 @@ class LLMProcessExecutor:
                 tools=state.tools,
                 flow_context=state.flow_context,
                 run_id=getattr(state.process, "task_run_id", None),
+                provider=self._provider_tools_provider(state.client),
             )
             state.responses_items = state.replay_request.response_items
             state.flow_context = state.replay_request.flow_context
@@ -2370,7 +2589,7 @@ class LLMProcessExecutor:
         tools: list[dict[str, Any]],
     ) -> MaterializedContext | dict[str, Any]:
         try:
-            with self._context_replay_update_scope(pid):
+            with self._provider_context_update_scope(pid), self._context_replay_update_scope(pid):
                 return self.context_memory.prepare(
                     pid=pid,
                     image=image,
@@ -2387,7 +2606,7 @@ class LLMProcessExecutor:
                 image=image,
                 pressure=pressure,
             )
-        except (ReplayStateError, CapabilityDenied) as exc:
+        except (ReplayStateError, CapabilityDenied, ValidationError) as exc:
             return self._fail_llm_quantum(pid, exc)
         except ResourceLimitExceeded as exc:
             self._resources.kill_if_exceeded(pid, reason=str(exc))
@@ -2425,6 +2644,18 @@ class LLMProcessExecutor:
                     pid=pid, context_generation=generation,
                     previous=previous.source_refs[0], current=current,
                 )
+
+    def _provider_context_update_scope(self, pid: str) -> Any:
+        if self.config.llm_context.policy != "llm_context_object":
+            return nullcontext()
+        return provider_continuation_context_update_scope(
+            pid, processes=self._processes, unit_of_work=self._unit_of_work,
+            pending_data=self._provider_continuation_data,
+            context_memory=self.context_memory, data_flow=self._data_flow,
+            file_resource_resolver=self._file_resource_resolver,
+            persist_full_io=self.config.llm.persist_full_io,
+            volatile_payloads=self._provider_continuation_payloads,
+        )
 
     def _ensure_process_memory_view(self, pid: str, process: Any) -> Any:
         if process.memory_view is not None:
@@ -2914,6 +3145,10 @@ class LLMProcessExecutor:
         resumed_after_human: bool = False,
         call_id: str,
     ) -> dict[str, Any]:
+        if getattr(completion, "_agent_libos_provider_continuation", None) == call_id:
+            if actions:
+                raise RuntimeError("provider continuation cannot contain local actions")
+            return {"ok": True, "provider_continuation": True, "call_id": call_id}
         if len(actions) > 1:
             return await self._dispatch_action_batch(
                 pid=pid,
@@ -4988,7 +5223,7 @@ class LLMProcessExecutor:
         parallel_tool_calls: bool, auto_wait_used: bool,
     ) -> None:
         replay_enabled = self._is_replay_call(call_id)
-        with self._unit_of_work.transaction() if replay_enabled else nullcontext():
+        with self._transcript_settlement_scope(pid), self._unit_of_work.transaction():
             if replay_enabled:
                 self.replay.mark_validated(pid=pid, call_id=call_id)
             self._supersede_validated_image_only_empty_head(pid=pid, completion=completion)
@@ -4997,6 +5232,7 @@ class LLMProcessExecutor:
                 parallel_tool_calls=parallel_tool_calls, host_auto_wait=auto_wait_used,
                 tool_call_count=len(completion.tool_calls),
             )
+            self._consume_provider_continuation(pid)
         # A concurrent pause/cancel can refuse the claim. The admitted Provider
         # result and its validated local safe point must remain committed even
         # when that control fence prevents the following tool dispatch.
@@ -5005,6 +5241,41 @@ class LLMProcessExecutor:
     def _discard_invalid_replay_action(self, pid: str, call_id: str) -> None:
         if self._is_replay_call(call_id):
             self.replay.discard_staged(pid=pid, call_id=call_id)
+
+    def _action_repair_messages(
+        self, *, pid: str, messages: list[dict[str, Any]], record: Any,
+        previous_messages: list[dict[str, Any]],
+        completion: Any, call_id: str, error: ValueError,
+        parallel_tool_calls: bool, fallback_json_actions: bool,
+    ) -> list[dict[str, Any]]:
+        # Hosted work can precede more than one malformed local action. Keep
+        # that result through every repair while the hosted tools stay off.
+        base_messages = (
+            previous_messages
+            if record is not None and record.request_options.get("provider_tools_configured")
+            else messages
+        )
+        compatibility_hint = (
+            " If native tool calls are unavailable, you may instead use the "
+            "enabled compatibility JSON action protocol."
+            if fallback_json_actions else ""
+        )
+        single_call_required = not parallel_tool_calls and self._is_replay_call(call_id)
+        return [
+            *base_messages,
+            *provider_repair_messages(record, completion),
+            {
+                "role": "user",
+                "content": (
+                    "The previous model response could not be dispatched: "
+                    f"{error}. Choose "
+                    f"{'exactly one' if single_call_required else 'one or more'} "
+                    "available OpenAI tool call by its function name. "
+                    f"Available tool names: {self._tools.model_tool_names(pid)}"
+                    f"{compatibility_hint}"
+                ),
+            },
+        ]
 
     async def _complete_valid_action(
         self,
@@ -5043,12 +5314,17 @@ class LLMProcessExecutor:
                     image_only_anchor=image_only_anchor,
                     task_run_requirement_binding=task_run_requirement_binding,
                     _prepared_request=prepared_request,
+                    provider_tools_enabled=attempt_number == 1,
                 )
             except _LLMReleaseApprovalRequired as exc:
                 exc.prepared_request["base_messages"] = list(messages)
                 exc.prepared_request["attempt_messages"] = list(attempt_messages)
                 raise
             prepared_request = None
+            record = self._processes.get_llm_call(call_id)
+            if is_provider_continuation_completion(record, completion):
+                self._commit_provider_continuation(pid, call_id, completion)
+                return completion, [], False, False, call_id
             try:
                 raw_actions, auto_wait_used = self._completion_to_actions(
                     completion.content,
@@ -5125,29 +5401,12 @@ class LLMProcessExecutor:
                 )
                 if attempt_number >= selected_max_attempts:
                     break
-                compatibility_hint = (
-                    " If native tool calls are unavailable, you may instead use the "
-                    "enabled compatibility JSON action protocol."
-                    if fallback_json_actions
-                    else ""
+                attempt_messages = self._action_repair_messages(
+                    pid=pid, messages=messages, record=record, completion=completion,
+                    previous_messages=attempt_messages,
+                    call_id=call_id, error=exc, parallel_tool_calls=parallel_tool_calls,
+                    fallback_json_actions=fallback_json_actions,
                 )
-                single_call_required = (
-                    not parallel_tool_calls and self._is_replay_call(call_id)
-                )
-                attempt_messages = [
-                    *messages,
-                    {
-                        "role": "user",
-                        "content": (
-                            "The previous model response could not be dispatched: "
-                            f"{exc}. Choose "
-                            f"{'exactly one' if single_call_required else 'one or more'} "
-                            "available OpenAI tool call by its function name. "
-                            f"Available tool names: {self._tools.model_tool_names(pid)}"
-                            f"{compatibility_hint}"
-                        ),
-                    },
-                ]
         assert last_error is not None
         raise last_error
 
@@ -5565,6 +5824,7 @@ class LLMProcessExecutor:
         _force_stateless: bool = False,
         _chain_scope_retry: int = 0,
         _prepared_request: dict[str, Any] | None = None,
+        provider_tools_enabled: bool = True,
     ) -> tuple[Any, bool, bool, bool, str, str]:
         state = self._initialize_llm_call_state(
             pid=pid,
@@ -5576,6 +5836,7 @@ class LLMProcessExecutor:
             image_only_anchor=image_only_anchor,
             task_run_requirement_binding=task_run_requirement_binding,
         )
+        state.provider_tools_enabled = provider_tools_enabled
         # Admission is serialized with persisted pause/interrupt generation.
         # Once admitted, the scope stays active through local LLM-call
         # persistence so a concurrent controller can drain it without taking
@@ -5627,6 +5888,7 @@ class LLMProcessExecutor:
                     task_run_requirement_binding=task_run_requirement_binding,
                     _force_stateless=True,
                     _chain_scope_retry=_chain_scope_retry + 1,
+                    provider_tools_enabled=provider_tools_enabled,
                 )
             except Exception as exc:
                 # Host-side admission failures occur before the protected
@@ -5739,6 +6001,7 @@ class LLMProcessExecutor:
         )
         state.resolved = resolved
         state.client = resolved.client
+        self._prepare_provider_tools_request(state)
         state.sink = DataSink(
             f"llm:{resolved.profile_id}",
             resolved.identity_sha256,
@@ -5796,6 +6059,10 @@ class LLMProcessExecutor:
             "previous_response_id": state.previous_response_id,
             "parallel_tool_calls": state.parallel_tool_calls,
         }
+        provider_tools = getattr(state.client, "provider_tools", None)
+        if provider_tools is not None:
+            state.egress_payload["provider_tools"] = to_jsonable(provider_tools)
+            state.egress_payload["provider_tools_enabled"] = state.provider_tools_enabled
         if state.responses_items is not None:
             state.egress_payload["responses_items"] = state.responses_items
         # Context pressure and the hard per-call envelope are evaluated only
@@ -5861,7 +6128,7 @@ class LLMProcessExecutor:
         )
         response_chain_configured = bool(
             isinstance(client, LLMClient)
-            and client.responses_previous_response_id
+            and getattr(resolved, "responses_previous_response_id_configured", client.responses_previous_response_id)
         )
         state.request_options.update(
             {
@@ -5877,7 +6144,9 @@ class LLMProcessExecutor:
                 ),
                 "openai_responses_previous_response_id_enabled": False,
                 "openai_responses_previous_response_id_disabled_reason": (
-                    _FULL_SNAPSHOT_RESPONSE_CHAIN_DISABLED_REASON
+                    ("independent_code_execution"
+                     if getattr(client, "provider_tools", None) is not None and client.provider_tools.code_interpreter
+                     else _FULL_SNAPSHOT_RESPONSE_CHAIN_DISABLED_REASON)
                     if response_chain_configured
                     else None
                 ),
@@ -6636,6 +6905,10 @@ class LLMProcessExecutor:
                 "full-snapshot executor"
             )
         state.previous_response_id = None
+        selected_tools_enabled = prepared_request.get("provider_tools_enabled", True)
+        if type(selected_tools_enabled) is not bool:
+            raise ValidationError("prepared provider tool policy is invalid")
+        state.provider_tools_enabled = selected_tools_enabled
         state.parallel_tool_calls = bool(prepared_request["parallel_tool_calls"])
         state.auto_wait_on_empty_tool_calls = bool(
             prepared_request["auto_wait_on_empty_tool_calls"]
@@ -6646,6 +6919,13 @@ class LLMProcessExecutor:
         state.temperature = float(prepared_request["temperature"])
         state.max_tokens = int(prepared_request["max_tokens"])
         state.egress_payload = dict(prepared_request.get("egress_payload") or {})
+        if getattr(state.client, "provider_tools", None) is not None:
+            if (
+                state.egress_payload.get("provider_tools") != to_jsonable(state.client.provider_tools)
+                or state.egress_payload.get("provider_tools_enabled") is not state.provider_tools_enabled
+                or state.request_options.get("provider_tools_enabled") is not state.provider_tools_enabled
+            ):
+                raise ValidationError("prepared provider tools do not match the frozen request")
         replay_reference = prepared_request.get("responses_replay_request")
         if replay_reference is not None:
             if not self.config.llm.persist_full_io or not state.client.responses_replay:
@@ -6657,6 +6937,7 @@ class LLMProcessExecutor:
                 model=str(state.client.model),
                 context_generation=self._processes.get_llm_context_generation(state.pid),
                 run_id=getattr(state.process, "task_run_id", None),
+                provider=self._provider_tools_provider(state.client),
             )
             state.responses_items = state.replay_request.response_items
             state.flow_context = state.replay_request.flow_context
@@ -6797,6 +7078,7 @@ class LLMProcessExecutor:
                     previous_response_id=state.previous_response_id,
                     responses_items=state.responses_items,
                     parallel_tool_calls=state.parallel_tool_calls,
+                    provider_tools_enabled=state.provider_tools_enabled,
                 )
 
             completion = await protected.acall(
@@ -6968,6 +7250,7 @@ class LLMProcessExecutor:
                 "parallel_tool_calls": state.parallel_tool_calls,
                 "auto_wait_on_empty_tool_calls": state.auto_wait_on_empty_tool_calls,
                 "fallback_json_actions": state.fallback_json_actions,
+                "provider_tools_enabled": state.provider_tools_enabled,
                 "temperature": state.temperature,
                 "max_tokens": state.max_tokens,
                 "egress_payload": state.egress_payload,
@@ -7082,6 +7365,11 @@ class LLMProcessExecutor:
         usage = dict(state.completion_usage)
         invalid_usage_fields = set(state.invalid_completion_usage_fields)
         self._record_effective_provider_request_options(state, completion)
+        if "provider_tools_configured" in state.request_options:
+            state.request_options["provider_tools_function_call_count"] = len(completion.tool_calls)
+            state.request_options["provider_continuation_required"] = bool(
+                state.provider_tools_enabled and has_provider_continuation_result(completion)
+            )
         if invalid_usage_fields:
             state.request_options["invalid_usage_fields"] = sorted(
                 invalid_usage_fields
@@ -8223,6 +8511,7 @@ class LLMProcessExecutor:
         previous_response_id: str | None = None,
         responses_items: list[dict[str, Any]] | None = None,
         parallel_tool_calls: bool,
+        provider_tools_enabled: bool = True,
     ) -> Any:
         return await self.provider.complete_action(
             client,
@@ -8233,6 +8522,7 @@ class LLMProcessExecutor:
             previous_response_id=previous_response_id,
             responses_items=responses_items,
             parallel_tool_calls=parallel_tool_calls,
+            provider_tools_enabled=provider_tools_enabled,
         )
 
     def dispatch(

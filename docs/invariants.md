@@ -935,6 +935,53 @@ longer defines.
   stored as process-local ids, resolved at LLM-call time, inherited by child
   processes, preserved by image-package defaults, isolated from non-default
   ambient provider environment, and fail closed when the id is unknown.
+- `llm-provider-tools-remain-host-scoped-and-content-retained`: provider-hosted
+  tools require explicit typed profile configuration and change its Sink
+  identity. Existing identity-bound clearance cannot authorize expanded tools.
+  A pending hosted result remains bound to the exact profile policy, including
+  when tools are removed before its successor dispatch.
+  Hosted activities remain provider evidence rather than dispatchable local
+  function calls. Internal text completions, the semantic classifier, context
+  compression, and every action-repair attempt cannot inherit these tools.
+  Full-I/O opt-out removes hosted query and code payloads from durable call
+  records, audit, and events; checkpoint capture rejects a pending result
+  without retained payload.
+- `llm-provider-code-execution-does-not-reuse-containers`: code execution uses
+  stateless ordinary message/function history without native code-tool items,
+  item references, opaque reasoning, or provider-side continuation. Processes
+  sharing a profile and requests after reopen, checkpoint restore, or fork do
+  not reuse provider container state through the Runtime. A checkpoint's
+  pending local-result reference can resume the saved result with tools
+  disabled without restoring a remote code session. This bounds the Runtime's
+  request protocol; it
+  does not assert undocumented provider isolation or persistence guarantees.
+- `llm-provider-continuations-resume-without-repeating-hosted-work`: a
+  successful hosted result without local function calls uses a separate,
+  idempotent completed safe point. Recovery preserves its source/profile/context
+  bindings and selects the next local action with hosted tools disabled.
+  Source changes, duplicate hosted work, or attempts to re-enable hosted tools
+  fail closed. Success awaiting marker settlement blocks repeated dispatch
+  through restart and later error records. Checkpoint restore/fork validate and
+  rebind the saved local result before publication; older checkpoints cannot
+  acquire later continuations. Certified ordinary-process compaction atomically
+  rebinds the retained result and its sources to the new context generation;
+  failed certification rolls back payload, generation, and marker. Pending
+  TaskRuns and unretained results reject compaction before changing generation
+  or safe points. Authenticated Host appends can atomically advance an exact
+  source version within the same generation; arbitrary source edits and revoked
+  source access still fail closed. Clearing a replay head through Host exec
+  preserves the pending result in the next local-only request. Pause/cancel
+  fences and strict nonempty action manifests remain intact; missing
+  content-free result state cannot trigger hosted reexecution.
+- `llm-provider-continuation-evidence-is-a-retention-dependency`: successful
+  hosted-only calls are protected before continuation publication. The source
+  call, active marker, and integrity-bound content-free envelopes remain
+  protected through failed repairs and TaskRun recovery. Retention updates
+  recheck current references after selecting a page, so stale dependency views
+  cannot erase pending evidence. Consuming a continuation releases its own
+  dependency; checkpoint references and cross-process pending forks still
+  protect the original evidence. Arbitrary snapshot body IDs create no such
+  dependency, and malformed markers preserve remaining evidence.
 - `automatic-context-management-does-not-grant-authority`: context pressure
   may select an Image-configured tool, but never inserts it into the process
   tool table or bypasses argument validation, Capability, resource, approval,

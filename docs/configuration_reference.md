@@ -210,6 +210,12 @@ PY
 | `llm.profiles.<key>.reasoning_effort` | `str \| None` | `null` | — |
 | `llm.profiles.<key>.reasoning_context` | `Literal['auto', 'current_turn', 'all_turns'] \| None` | `null` | — |
 | `llm.profiles.<key>.responses_replay` | `StrictBool \| None` | `null` | — |
+| `llm.profiles.<key>.provider_tools` | `ProviderToolsConfig \| None` | `null` | — |
+| `llm.profiles.<key>.provider_tools.provider` | `Literal['openai', 'aliyun']` | `required` | — |
+| `llm.profiles.<key>.provider_tools.web_search` | `StrictBool` | `false` | — |
+| `llm.profiles.<key>.provider_tools.web_extractor` | `StrictBool` | `false` | — |
+| `llm.profiles.<key>.provider_tools.code_interpreter` | `StrictBool` | `false` | — |
+| `llm.profiles.<key>.provider_tools.file_ids` | `tuple[str, ...]` | `[]` | — |
 | `llm.profiles.<key>.verbosity` | `Literal['low', 'medium', 'high'] \| None` | `null` | — |
 | `llm.profiles.<key>.safety_identifier` | `str \| None` | `null` | — |
 | `llm.profiles.<key>.safety_identifier_env` | `str \| None` | `null` | — |

@@ -12,10 +12,11 @@ from typing import Any
 
 from pydantic import ValidationError as PydanticValidationError
 
-from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMProfile
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMProfile, normalize_provider_tools
 from agent_libos.config.defaults import (
     sanitize_llm_base_url_for_summary,
     validate_llm_base_url,
+    validate_provider_tools_api_mode,
 )
 from agent_libos.models.exceptions import NotFound, ValidationError
 
@@ -48,6 +49,7 @@ _USER_PROFILE_FIELDS = (
     "reasoning_effort",
     "reasoning_context",
     "responses_replay",
+    "provider_tools",
     "prompt_layout",
     "verbosity",
     "safety_identifier_env",
@@ -211,7 +213,9 @@ def validate_user_llm_profile_payload(
     _validate_user_llm_profile_token_bounds(raw, selected_config)
     _validate_user_llm_profile_cache(raw, selected_config)
     try:
-        return LLMProfile(**cleaned)
+        profile = LLMProfile(**cleaned)
+        validate_provider_tools_api_mode(profile.provider_tools, profile.api_mode or selected_config.llm.api_mode)
+        return profile
     except (TypeError, ValueError, PydanticValidationError) as exc:
         raise ValidationError(f"invalid LLM profile {profile_id}: {exc}") from exc
 
@@ -229,6 +233,10 @@ def _normalize_user_llm_profile_fields(raw: dict[str, Any]) -> None:
     raw["reasoning_context"] = _optional_choice(
         raw.get("reasoning_context"), "reasoning_context", _REASONING_CONTEXTS,
     )
+    try:
+        raw["provider_tools"] = normalize_provider_tools(raw.get("provider_tools"))
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"invalid provider_tools: {exc}") from exc
     raw["prompt_layout"] = _optional_choice(
         raw.get("prompt_layout"), "prompt_layout", _PROMPT_LAYOUTS,
     )
@@ -355,6 +363,8 @@ def serialize_user_llm_profile(profile: LLMProfile) -> dict[str, Any]:
             value = _optional_prompt_cache_retention(value)
         if key == "prompt_cache_ttl":
             value = _optional_prompt_cache_ttl(value)
+        if key == "provider_tools":
+            value = {**value, "file_ids": list(value["file_ids"])}
         serialized[key] = value
     return serialized
 
@@ -383,6 +393,10 @@ def summarize_llm_profile(
         "reasoning_effort": profile.reasoning_effort,
         "reasoning_context": profile.reasoning_context,
         "responses_replay": profile.responses_replay,
+        "provider_tools": (
+            {**asdict(profile.provider_tools), "file_ids": list(profile.provider_tools.file_ids)}
+            if profile.provider_tools is not None else None
+        ),
         "prompt_layout": profile.prompt_layout,
         "verbosity": profile.verbosity,
         "safety_identifier_env": profile.safety_identifier_env,

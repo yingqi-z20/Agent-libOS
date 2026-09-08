@@ -107,6 +107,7 @@ class ProviderTraceBuilder:
         *,
         api: Literal["responses", "chat", "custom"],
         kind: ProviderAttemptKind,
+        provider_tools: Any = None,
     ) -> int:
         if len(self.attempts) >= PROVIDER_TRACE_MAX_ATTEMPTS:
             self.limited = True
@@ -137,6 +138,10 @@ class ProviderTraceBuilder:
                 monotonic_started=time.monotonic(),
             )
         )
+        projected_tools = project_provider_tools(provider_tools)
+        if projected_tools is not None:
+            self.attempts[-1].value["provider_tools"] = projected_tools
+            self.limited = self.limited or projected_tools["limited"]
         return sequence
 
     def finish_response(self, sequence: int, response: Any) -> None:
@@ -173,6 +178,14 @@ class ProviderTraceBuilder:
         attempt["output"] = ""
         attempt.pop("output_limited", None)
         attempt["tool_calls"] = []
+        tools = attempt.get("provider_tools")
+        if isinstance(tools, dict):
+            # Rejected payloads must not remain an alternate body reveal path.
+            tools["activities"] = []
+            tools["citations"] = []
+            tools["artifacts"] = []
+            tools["observed"] = "unknown" if tools.get("effective") else "not_returned"
+            tools["usage"] = None
         attempt["error"] = safe_provider_error(error)
 
     def enrich_response(
@@ -186,6 +199,7 @@ class ProviderTraceBuilder:
         model: Any = None,
         request_id: Any = None,
         response_id: Any = None,
+        provider_tools: Any = None,
     ) -> None:
         attempt = self._attempt(sequence)
         attempt["reasoning"] = provider_reasoning_view(reasoning)
@@ -197,6 +211,10 @@ class ProviderTraceBuilder:
             attempt["output_limited"] = limited_output
             self.limited = True
         attempt["tool_calls"] = project_provider_tool_calls(tool_calls)
+        projected_tools = project_provider_tools(provider_tools)
+        if projected_tools is not None:
+            attempt["provider_tools"] = projected_tools
+            self.limited = self.limited or projected_tools["limited"]
         attempt["usage"] = project_provider_usage(usage)
         attempt["model"] = _bounded_identifier(model) or attempt.get("model")
         attempt["request_id"] = _bounded_identifier(request_id) or attempt.get(
@@ -317,6 +335,15 @@ def custom_provider_trace(
     builder = ProviderTraceBuilder(coverage="custom_client_incomplete")
     if completion is None:
         return builder.to_dict()
+    options = getattr(completion, "provider_request_options", None)
+    provider_tools = options.get("provider_tools") if isinstance(options, dict) else None
+    if isinstance(provider_tools, dict):
+        provider_tools = {
+            **provider_tools,
+            "activities": getattr(completion, "provider_tool_activities", []),
+            "citations": getattr(completion, "citations", []),
+            "artifacts": getattr(completion, "artifacts", []),
+        }
     sequence = builder.start_attempt(api="custom", kind="initial")
     builder.finish_response(sequence, completion)
     builder.enrich_response(
@@ -328,6 +355,7 @@ def custom_provider_trace(
         model=getattr(completion, "model", None),
         request_id=getattr(completion, "request_id", None),
         response_id=getattr(completion, "response_id", None),
+        provider_tools=provider_tools,
     )
     if error is not None:
         builder.finish_error(sequence, error)
@@ -812,6 +840,144 @@ def project_provider_tool_calls(value: Any) -> list[dict[str, Any]]:
     return projected
 
 
+_PROVIDER_TOOL_NAMES = frozenset({"web_search", "web_extractor", "code_interpreter"})
+_PROVIDER_TOOL_EVIDENCE_FIELDS = {
+    "activities": frozenset({
+        "id", "type", "status", "text", "action", "code", "outputs",
+        "goal", "urls", "output", "container_id",
+    }),
+    "citations": frozenset({"type", "url", "title", "start_index", "end_index", "index"}),
+    "artifacts": frozenset({
+        "type", "file_id", "container_id", "filename", "start_index", "end_index", "index",
+    }),
+}
+_PROVIDER_TOOL_USAGE_FIELDS = frozenset({
+    *_PROVIDER_TOOL_NAMES, "requests", "request_count", "calls", "call_count",
+    "count", "seconds", "execution_time", "input_tokens", "output_tokens",
+    "total_tokens", "tokens", "search_count", "num_calls", "tool_calls",
+})
+
+
+def project_provider_tools(value: Any) -> dict[str, Any] | None:
+    """Project managed execution evidence separately from local function calls.
+
+    This is retained payload, not a replay format. Only bounded known fields are
+    accepted, and the ordinary raw projection removes credential/opaque values.
+    Configuration contains tool names and file counts, never configured file IDs.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    provider = value.get("provider")
+    projected: dict[str, Any] = {
+        "provider": provider if isinstance(provider, str) and provider in {"openai", "aliyun"} else None,
+        "configured": [],
+        "effective": [],
+        "observed": "not_returned",
+        "usage": None,
+        "limited": value.get("limited") is True,
+    }
+    for key in ("configured", "effective"):
+        names = value.get(key)
+        if isinstance(names, (list, tuple)):
+            projected[key] = sorted({
+                name for name in names[:256]
+                if isinstance(name, str) and name in _PROVIDER_TOOL_NAMES
+            })
+            projected["limited"] = projected["limited"] or len(names) > 256
+    if isinstance(value.get("replay"), str) and value["replay"] in {"native", "stateless"}:
+        projected["replay"] = value["replay"]
+    file_count = value.get("file_count")
+    if type(file_count) is int and 0 <= file_count <= PROVIDER_TRACE_SAFE_INTEGER_MAX:
+        projected["file_count"] = file_count
+    usage = value.get("usage")
+    if isinstance(usage, dict):
+        projected["usage"] = project_provider_usage(usage)
+    _project_provider_tools_evidence(value, projected)
+    projected["observed"] = _provider_tools_observed(value, projected)
+    if _json_bytes(projected) > PROVIDER_TRACE_MAX_BYTES:
+        _limit_provider_tools_content(projected)
+    return projected
+
+
+def _provider_tools_observed(value: dict[str, Any], projected: dict[str, Any]) -> str:
+    observed = value.get("observed")
+    if projected["activities"] or projected["citations"] or projected["artifacts"]:
+        return "returned"
+    if isinstance(observed, str) and observed in {"returned", "unknown", "not_returned"}:
+        return observed
+    return "unknown" if projected["effective"] else "not_returned"
+
+
+def _project_provider_tools_evidence(value: dict[str, Any], projected: dict[str, Any]) -> None:
+    state = _RawProjectionState()
+    for key, fields in _PROVIDER_TOOL_EVIDENCE_FIELDS.items():
+        result: list[dict[str, Any]] = []
+        raw_items = value.get(key)
+        if isinstance(raw_items, (list, tuple)):
+            projected["limited"] = projected["limited"] or len(raw_items) > 256
+            for item in raw_items[:256]:
+                if not isinstance(item, dict):
+                    projected["limited"] = True
+                    continue
+                # Use the same node/text budget across all managed evidence.
+                selected = _project_provider_value(
+                    {field: item[field] for field in fields if field in item},
+                    key=key,
+                    depth=0,
+                    state=state,
+                )
+                if isinstance(selected, dict):
+                    result.append(selected)
+                if state.nodes >= PROVIDER_TRACE_MAX_NODES:
+                    projected["limited"] = True
+                    break
+        projected[key] = result
+    projected["limited"] = projected["limited"] or state.limited
+
+
+def provider_tools_summary(value: Any) -> dict[str, Any] | None:
+    """Return content-free managed tool metadata safe for list/detail views."""
+
+    selected = project_provider_tools(value)
+    if selected is None:
+        return None
+
+    def safe_usage(item: Any, depth: int = 0) -> Any:
+        if type(item) in {int, float} and math.isfinite(item) and item >= 0:
+            return item
+        if not isinstance(item, dict) or depth > 4:
+            return None
+        return {
+            key: safe_usage(child, depth + 1)
+            for key, child in item.items()
+            if key in _PROVIDER_TOOL_USAGE_FIELDS
+        }
+
+    return {
+        key: item
+        for key, item in selected.items()
+        if key not in {"activities", "citations", "artifacts", "usage"}
+    } | {
+        "activity_count": len(selected["activities"]),
+        "citation_count": len(selected["citations"]),
+        "artifact_count": len(selected["artifacts"]),
+        "usage": safe_usage(selected["usage"]),
+    }
+
+
+def _limit_provider_tools_content(value: dict[str, Any]) -> None:
+    value["limited"] = True
+    for key in _PROVIDER_TOOL_EVIDENCE_FIELDS:
+        items = value.get(key)
+        if isinstance(items, list) and items:
+            value[key] = []
+            value[f"{key}_limited"] = {
+                "count": len(items),
+                **_omitted_value(items, reason="aggregate_limit"),
+            }
+
+
 def safe_provider_error(error: BaseException) -> dict[str, Any]:
     try:
         message = str(error)
@@ -862,6 +1028,9 @@ def _fit_trace_aggregate(trace: dict[str, Any]) -> dict[str, Any]:
 
 
 def _limit_attempt_readable_content(attempt: dict[str, Any]) -> None:
+    provider_tools = attempt.get("provider_tools")
+    if isinstance(provider_tools, dict):
+        _limit_provider_tools_content(provider_tools)
     reasoning = attempt.get("reasoning")
     if isinstance(reasoning, dict):
         reasoning["availability"] = "limited"

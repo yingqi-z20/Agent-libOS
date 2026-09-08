@@ -1,7 +1,7 @@
 import { Plus, Save, Settings, Trash2 } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import type { LLMProfileInput, LLMProfileSummary } from "../api/types";
-import { useI18n } from "../i18n";
+import type { LLMProfileInput, LLMProfileSummary, LLMProviderTools } from "../api/types";
+import { useI18n, type TranslationKey } from "../i18n";
 import { Modal } from "./Modal";
 
 export type LLMProfileSelectProps = {
@@ -32,6 +32,11 @@ type ProfileFormState = {
   base_url: string;
   api_key_env: string;
   api_mode: "" | "auto" | "responses" | "chat";
+  provider_tools_provider: "" | "openai" | "aliyun";
+  provider_tools_web_search: boolean;
+  provider_tools_web_extractor: boolean;
+  provider_tools_code_interpreter: boolean;
+  provider_tools_file_ids: string;
   temperature: string;
   max_tokens: string;
   context_window_tokens: string;
@@ -55,6 +60,11 @@ const emptyForm: ProfileFormState = {
   base_url: "",
   api_key_env: "OPENAI_API_KEY",
   api_mode: "",
+  provider_tools_provider: "",
+  provider_tools_web_search: false,
+  provider_tools_web_extractor: false,
+  provider_tools_code_interpreter: false,
+  provider_tools_file_ids: "",
   temperature: "",
   max_tokens: "",
   context_window_tokens: "",
@@ -152,7 +162,8 @@ export function LLMProfileManagerDialog({
   const deleteCancelRef = useRef<HTMLButtonElement>(null);
   const deleteButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const editing = useMemo(() => profiles.find((profile) => profile.profile_id === editingId) ?? null, [editingId, profiles]);
-  const canSave = Boolean(form.profile_id.trim() && form.model.trim() && form.api_key_env.trim() && !busy && (!editing || editing.editable));
+  const providerToolsError = validateProviderTools(form);
+  const canSave = Boolean(form.profile_id.trim() && form.model.trim() && form.api_key_env.trim() && !providerToolsError && !busy && (!editing || editing.editable));
 
   useEffect(() => {
     if (pendingDeleteId) deleteCancelRef.current?.focus();
@@ -307,6 +318,46 @@ export function LLMProfileManagerDialog({
                   <option value="chat">chat</option>
                 </select>
               </label>
+              <fieldset className="llmProviderTools">
+                <legend>{t("llmProfile.providerTools")}</legend>
+                <label>
+                  {t("llmProfile.providerToolsProvider")}
+                  <select value={form.provider_tools_provider} onChange={(event) => {
+                    const provider = event.currentTarget.value as ProfileFormState["provider_tools_provider"];
+                    setForm({ ...form, provider_tools_provider: provider,
+                      api_mode: provider && !form.api_mode ? "auto" : form.api_mode,
+                      provider_tools_web_extractor: provider === "aliyun" && form.provider_tools_web_extractor,
+                      provider_tools_file_ids: provider === "openai" ? form.provider_tools_file_ids : ""
+                    });
+                  }}>
+                    <option value="">{t("llmProfile.disabled")}</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="aliyun">{t("llmProfile.aliyun")}</option>
+                  </select>
+                </label>
+                {form.provider_tools_provider ? <>
+                  <label className="toggle">
+                    <input type="checkbox" checked={form.provider_tools_web_search} onChange={(event) => setForm({ ...form, provider_tools_web_search: event.currentTarget.checked })} />
+                    {t("llmProfile.webSearch")}
+                  </label>
+                  {form.provider_tools_provider === "aliyun" ? <label className="toggle">
+                    <input type="checkbox" checked={form.provider_tools_web_extractor} onChange={(event) => setForm({ ...form, provider_tools_web_extractor: event.currentTarget.checked })} />
+                    {t("llmProfile.webExtractor")}
+                  </label> : null}
+                  <label className="toggle">
+                    <input type="checkbox" checked={form.provider_tools_code_interpreter} onChange={(event) => setForm({ ...form, provider_tools_code_interpreter: event.currentTarget.checked,
+                      provider_tools_file_ids: event.currentTarget.checked ? form.provider_tools_file_ids : "" })} />
+                    {t("llmProfile.codeInterpreter")}
+                  </label>
+                  {form.provider_tools_provider === "openai" && form.provider_tools_code_interpreter ? <label>
+                    {t("llmProfile.fileIds")}
+                    <textarea rows={3} value={form.provider_tools_file_ids} placeholder="file-..." onChange={(event) => setForm({ ...form, provider_tools_file_ids: event.currentTarget.value })} />
+                    <small>{t("llmProfile.fileIdsHint")}</small>
+                  </label> : null}
+                  <p className="llmProviderToolsHint">{t(form.provider_tools_code_interpreter ? "llmProfile.codeIsolationHint" : "llmProfile.providerToolsHint")}</p>
+                  {providerToolsError ? <p className="llmProfileWarning" role="alert">{t(providerToolsError)}</p> : null}
+                </> : null}
+              </fieldset>
               <div className="llmProfileFormGrid">
                 <label>
                   {t("llmProfile.reasoningEffort")}
@@ -402,6 +453,11 @@ function formFromProfile(profile: LLMProfileSummary): ProfileFormState {
     base_url: profile.base_url ?? "",
     api_key_env: profile.api_key_env,
     api_mode: profile.api_mode ?? "",
+    provider_tools_provider: profile.provider_tools?.provider ?? "",
+    provider_tools_web_search: profile.provider_tools?.web_search ?? false,
+    provider_tools_web_extractor: profile.provider_tools?.web_extractor ?? false,
+    provider_tools_code_interpreter: profile.provider_tools?.code_interpreter ?? false,
+    provider_tools_file_ids: profile.provider_tools?.file_ids.join("\n") ?? "",
     temperature: stringifyNumber(profile.temperature),
     max_tokens: stringifyNumber(profile.max_tokens),
     context_window_tokens: stringifyNumber(profile.context_window_tokens),
@@ -427,6 +483,7 @@ function formToInput(form: ProfileFormState): LLMProfileInput {
     base_url: trimOrNull(form.base_url),
     api_key_env: form.api_key_env.trim(),
     api_mode: form.api_mode || null,
+    provider_tools: providerToolsFromForm(form),
     temperature: parseProfileNumber(form.temperature, { minimum: 0 }),
     max_tokens: parseProfileNumber(form.max_tokens, { integer: true, minimum: 0, exclusiveMinimum: true }),
     context_window_tokens: parseProfileNumber(form.context_window_tokens, { integer: true, minimum: 0, exclusiveMinimum: true }),
@@ -443,6 +500,30 @@ function formToInput(form: ProfileFormState): LLMProfileInput {
     fallback_json_actions: formBoolToValue(form.fallback_json_actions),
     allow_custom_base_url: form.allow_custom_base_url
   };
+}
+
+function providerToolsFromForm(form: ProfileFormState): LLMProviderTools | null {
+  if (!form.provider_tools_provider) return null;
+  return {
+    provider: form.provider_tools_provider,
+    web_search: form.provider_tools_web_search,
+    web_extractor: form.provider_tools_provider === "aliyun" && form.provider_tools_web_extractor,
+    code_interpreter: form.provider_tools_code_interpreter,
+    file_ids: form.provider_tools_provider === "openai" && form.provider_tools_code_interpreter
+      ? Array.from(new Set(form.provider_tools_file_ids.split(/[\n,]/).map((id) => id.trim()).filter(Boolean))) : []
+  };
+}
+
+function validateProviderTools(form: ProfileFormState): TranslationKey | null {
+  const tools = providerToolsFromForm(form);
+  if (!tools) return null;
+  if (tools.web_extractor && !tools.web_search) return "llmProfile.extractorRequiresSearch";
+  if (form.api_mode === "chat" && (tools.web_search || tools.web_extractor || tools.code_interpreter)
+      && (tools.provider !== "aliyun" || tools.web_extractor || tools.code_interpreter)) return "llmProfile.toolsRequireResponses";
+  if (tools.provider === "aliyun" && (tools.web_extractor || tools.code_interpreter)
+      && form.reasoning_effort.trim().toLowerCase() === "none") return "llmProfile.toolsRequireThinking";
+  if (tools.file_ids.length > 100 || tools.file_ids.some((id) => !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(id))) return "llmProfile.invalidFileIds";
+  return null;
 }
 
 function stringifyNumber(value: number | null): string {

@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from agent_libos.config import LLMDefaults
+from agent_libos.config import LLMDefaults, ProviderToolsConfig, normalize_provider_tools
+from agent_libos.config.defaults import validate_provider_tools_api_mode
 
 
 def is_official_openai_endpoint(base_url: str | None) -> bool:
@@ -31,6 +32,8 @@ class ProviderPolicy:
     reasoning_effort: str | None
     reasoning_context: str | None
     responses_replay: bool
+    responses_replay_configured: bool | None
+    provider_tools: ProviderToolsConfig | None
     prompt_layout: str
     prompt_cache_mode: str
     prompt_cache_ttl: str | None
@@ -92,6 +95,7 @@ def resolve_provider_policy(
     reasoning_effort: str | None = None,
     reasoning_context: str | None = None,
     responses_replay: bool | None = None,
+    provider_tools: ProviderToolsConfig | dict[str, object] | None = None,
     prompt_layout: str | None = None,
     prompt_cache_mode: str | None = None,
     prompt_cache_ttl: str | None = None,
@@ -106,6 +110,10 @@ def resolve_provider_policy(
     official = is_official_openai_endpoint(base_url)
     selected_model = model or (defaults.openai_model if official else None)
     selected_api = defaults.api_mode if api_mode is None else api_mode
+    tools = normalize_provider_tools(provider_tools)
+    validate_provider_tools_api_mode(tools, selected_api, reasoning_effort)
+    if tools is not None and selected_api == "auto":
+        selected_api = "responses"
     uses_responses = selected_api == "responses" or (
         selected_api == "auto" and official
     )
@@ -114,6 +122,8 @@ def resolve_provider_policy(
         defaults, astra=astra, uses_responses=uses_responses,
         context=reasoning_context, replay=responses_replay,
     )
+    if tools is not None and tools.code_interpreter:
+        replay = False
     mode, ttl, retention = _cache_policy(
         defaults, official=official, mode=prompt_cache_mode,
         ttl=prompt_cache_ttl, retention=prompt_cache_retention,
@@ -128,6 +138,10 @@ def resolve_provider_policy(
         ),
         reasoning_context=context,
         responses_replay=replay,
+        responses_replay_configured=(
+            defaults.responses_replay if responses_replay is None else responses_replay
+        ),
+        provider_tools=tools,
         prompt_layout=_prompt_layout(defaults, prompt_layout, official=official),
         prompt_cache_mode=mode,
         prompt_cache_ttl=ttl,

@@ -19,11 +19,39 @@ class TaskRunLLMHook(Protocol):
     """Narrow boundary from validated local LLM transcripts to Task Runs.
 
     The executor calls this hook only after the provider completion is present
-    in the local LLM-call ledger and every normalized action in the completion
-    has passed dispatch validation.  Implementations must treat ``call_id`` as
-    the transcript authority.  Provider-side response state is deliberately
-    excluded from this recovery contract.
+    in the local LLM-call ledger. Action records require every normalized action
+    to pass dispatch validation; provider continuations use a separate contract
+    with no local dispatch. Implementations treat ``call_id`` as the transcript
+    authority. Provider-side response state is excluded from this contract.
     """
+
+    def transcript_settlement_scope_for_pid(
+        self,
+        pid: str,
+    ) -> AbstractContextManager[None]:
+        """Order transcript transaction locks without admitting new dispatch."""
+
+        ...
+
+    def record_provider_continuation(
+        self,
+        *,
+        pid: str,
+        call_id: str,
+        continuation_manifest: Mapping[str, Any],
+        context_generation: str,
+    ) -> None:
+        """Commit a provider result that still needs a local action decision."""
+
+        ...
+
+    def pending_provider_continuation_for_pid(
+        self,
+        pid: str,
+    ) -> Mapping[str, Any] | None:
+        """Return a durable instruction to disable hosted tools on the next call."""
+
+        ...
 
     def record_validated_transcript(
         self,
@@ -142,6 +170,50 @@ _VALIDATED_ACTION_KEYS = frozenset(
         "previous_response_id_used",
     }
 )
+_PROVIDER_CONTINUATION_KEYS = frozenset(
+    {
+        "schema_version",
+        "call_id",
+        "data_labels",
+        "previous_response_id_used",
+        "provider_tools_disabled_on_resume",
+    }
+)
+
+
+def provider_continuation_manifest(
+    *,
+    call_id: str,
+    data_labels: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Describe a provider-independent continuation without an empty action."""
+
+    return normalize_provider_continuation_manifest(
+        {
+            "schema_version": 1,
+            "call_id": call_id,
+            "data_labels": dict(data_labels),
+            "previous_response_id_used": False,
+            "provider_tools_disabled_on_resume": True,
+        }
+    )
+
+
+def normalize_provider_continuation_manifest(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the separate resume contract for a successful hosted result."""
+
+    label = "TaskRun provider continuation manifest"
+    _require_exact_keys(value, _PROVIDER_CONTINUATION_KEYS, label)
+    _require_schema_one(value, label)
+    _require_nonempty_text(value.get("call_id"), f"{label} call_id")
+    _require_mapping(value.get("data_labels"), f"{label} data_labels")
+    if value.get("previous_response_id_used") is not False:
+        raise ValueError("provider continuation must use local transcript evidence")
+    if value.get("provider_tools_disabled_on_resume") is not True:
+        raise ValueError("provider continuation must disable hosted tools on resume")
+    return _detached_object(value, label)
 
 
 def validated_action_manifest(
@@ -427,8 +499,10 @@ __all__ = [
     "TaskRunLLMHook",
     "completed_outcome_manifest",
     "normalize_validated_action_manifest",
+    "normalize_provider_continuation_manifest",
     "normalize_task_run_prompt_context",
     "task_run_contract_message",
     "task_run_dynamic_state_message",
     "validated_action_manifest",
+    "provider_continuation_manifest",
 ]

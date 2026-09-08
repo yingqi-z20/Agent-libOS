@@ -106,6 +106,9 @@ class PayloadRetentionPage(Generic[_RecordT]):
     # as ``None``. Keeping the classification beside the page prevents an N+1
     # latest-call lookup in the maintenance service.
     latest_llm_call_ids: frozenset[str] | None = None
+    # Hosted-tool continuations can point to an older successful call while a
+    # repair is running. They need a reference classification, not latest-only.
+    provider_continuation_call_ids: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
         if self.next_cursor is not None and not isinstance(
@@ -115,20 +118,20 @@ class PayloadRetentionPage(Generic[_RecordT]):
         if self.next_cursor is not None and not self.records:
             raise ValueError("empty payload retention page cannot have a next cursor")
         if self.latest_llm_call_ids is not None:
-            if not isinstance(self.latest_llm_call_ids, frozenset) or any(
-                not isinstance(call_id, str) or not call_id
-                for call_id in self.latest_llm_call_ids
-            ):
-                raise ValueError("payload retention latest LLM call ids are invalid")
-            record_ids = {
-                str(record.call_id)
-                for record in self.records
-                if isinstance(record, LLMCallRecord)
-            }
-            if not self.latest_llm_call_ids.issubset(record_ids):
-                raise ValueError(
-                    "payload retention latest LLM call ids must belong to the page"
-                )
+            self._validate_llm_ids(self.latest_llm_call_ids, "latest LLM call")
+        if self.provider_continuation_call_ids is not None:
+            self._validate_llm_ids(self.provider_continuation_call_ids, "provider continuation")
+
+    def _validate_llm_ids(self, ids: frozenset[str], label: str) -> None:
+        if not isinstance(ids, frozenset) or any(
+            not isinstance(call_id, str) or not call_id for call_id in ids
+        ):
+            raise ValueError(f"payload retention {label} ids are invalid")
+        record_ids = {
+            record.call_id for record in self.records if isinstance(record, LLMCallRecord)
+        }
+        if not ids.issubset(record_ids):
+            raise ValueError(f"payload retention {label} ids must belong to the page")
 
 
 @dataclass(frozen=True)
@@ -497,9 +500,14 @@ class PayloadRetentionMaintenance:
                 protected += 1
                 continue
             provider_chain_head = record.call_id in latest_call_ids
+            provider_continuation_pending = (
+                record.call_id in page.provider_continuation_call_ids
+                if page.provider_continuation_call_ids is not None else None
+            )
             if llm_call_payload_is_runtime_dependency(
                 record,
                 provider_chain_head=provider_chain_head,
+                provider_continuation_pending=provider_continuation_pending,
             ):
                 runtime_dependency += 1
                 continue
@@ -523,6 +531,7 @@ class PayloadRetentionMaintenance:
                 record,
                 target,
                 provider_chain_head=provider_chain_head,
+                provider_continuation_pending=provider_continuation_pending,
             )
 
             def apply(
@@ -691,6 +700,7 @@ def retain_llm_call_payload(
     target: PayloadRetentionTier,
     *,
     provider_chain_head: bool | None = None,
+    provider_continuation_pending: bool | None = None,
 ) -> LLMCallRecord:
     """Return a copy with payload fields monotonically reduced to ``target``."""
 
@@ -701,6 +711,7 @@ def retain_llm_call_payload(
     if llm_call_payload_is_runtime_dependency(
         record,
         provider_chain_head=provider_chain_head,
+        provider_continuation_pending=provider_continuation_pending,
     ):
         raise ValueError("runtime-dependent LLM call payloads cannot be retained")
     current = llm_call_payload_retention_tier(record)
@@ -1560,6 +1571,7 @@ def validate_llm_call_payload_retention_update(
     expected_payload_sha256: str,
     expected_tier: PayloadRetentionTier,
     provider_chain_head: bool | None = None,
+    provider_continuation_pending: bool | None = None,
 ) -> PayloadRetentionTier:
     """Validate one monotonic, content-free LLM payload reduction.
 
@@ -1574,6 +1586,7 @@ def validate_llm_call_payload_retention_update(
     if llm_call_payload_is_runtime_dependency(
         current,
         provider_chain_head=provider_chain_head,
+        provider_continuation_pending=provider_continuation_pending,
     ):
         raise ValueError("runtime-dependent LLM call payloads cannot be retained")
     current_tier = llm_call_payload_retention_tier(current)
@@ -1604,6 +1617,7 @@ def validate_llm_call_payload_retention_update(
         current,
         target_tier,
         provider_chain_head=provider_chain_head,
+        provider_continuation_pending=provider_continuation_pending,
     )
     if _llm_payload_write_projection(target) != _llm_payload_write_projection(
         canonical
@@ -1691,6 +1705,7 @@ def llm_call_payload_is_runtime_dependency(
     record: LLMCallRecord,
     *,
     provider_chain_head: bool | None = None,
+    provider_continuation_pending: bool | None = None,
 ) -> bool:
     """Protect rows that still carry executable/resume semantics.
 
@@ -1704,6 +1719,13 @@ def llm_call_payload_is_runtime_dependency(
 
     if provider_chain_head is not None and not isinstance(provider_chain_head, bool):
         raise ValueError("provider-chain head classification must be a boolean")
+    if provider_continuation_pending is not None and type(provider_continuation_pending) is not bool:
+        raise ValueError("provider continuation classification must be a boolean")
+    if llm_call_payload_can_be_provider_continuation(record):
+        # A standalone projection has no access to the live reference graph.
+        # Storage supplies the classification and rechecks it inside the CAS.
+        if provider_continuation_pending is not False:
+            return True
     if llm_call_payload_can_be_image_only_request_anchor(record):
         # A failed first image_only request can be the only durable copy of
         # the original goal after a Runtime reopen. The request-purpose stream
@@ -1742,6 +1764,26 @@ def llm_call_payload_is_runtime_dependency(
         if action.get("action") == "process_exit":
             return True
     return False
+
+
+def llm_call_payload_can_be_provider_continuation(record: LLMCallRecord) -> bool:
+    """Identify rows that may contain an unconsumed hosted-tool result."""
+
+    if record.status != "ok" or record.pid is None:
+        return False
+    if record.purpose == "provider_continuation":
+        marker = record.request_options.get("provider_continuation")
+        return not isinstance(marker, dict) or marker.get("state") != "consumed"
+    function_count = record.request_options.get("provider_tools_function_call_count")
+    return bool(
+        record.purpose == "action_selection"
+        and record.request_options.get("provider_tools_enabled") is True
+        and record.request_options.get("provider_tools_configured")
+        and (
+            _decode_retained_tool_calls(record.tool_calls) == []
+            or (type(function_count) is int and function_count == 0)
+        )
+    )
 
 
 def llm_call_payload_can_be_provider_chain_head(record: LLMCallRecord) -> bool:
