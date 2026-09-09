@@ -1,0 +1,23 @@
+schema_version: 1
+module_id: agent-libos-agentvfs:v0
+name: Agent libOS agentvfs module
+version: v0
+entrypoint: ./agentvfs_module.py:register_module
+provides:
+  tools:
+    - agentvfs_checkpoint
+    - agentvfs_rollback
+    - agentvfs_status
+  images:
+    - agentvfs-agent:v0
+  syscalls: []
+  provider_hooks: []
+  startup_hooks:
+    - initialize_agentvfs
+sha256: f9e331b9ae6f965929b13d17336b6b97ccb31f2e73c043caf29bf8774ab0c464
+metadata:
+  owner: local
+  external_effects:
+    - agentvfs.status
+    - agentvfs.checkpoint
+    - agentvfs.rollback

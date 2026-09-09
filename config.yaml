@@ -22,8 +22,10 @@ git:
 modules:
   manifest_paths:
     - modules/pty/module.yaml
+    - modules/agentvfs/module.yaml
   trusted_modules:
     - agent-libos-pty:v0:2bafedf56f29af97ab21d6bf93eda96b68e098f86cd6cb5e55c405cc71111181:3781eb9c417a1e399bce8a9f42b8c5557d40f817d49d6ae2694b67c43dbd7b7c
+    - agent-libos-agentvfs:v0:b1ea5949e28a0e6e7fd82906d4a326a028d27fbb7482578695d8528a59614921:f9e331b9ae6f965929b13d17336b6b97ccb31f2e73c043caf29bf8774ab0c464
 
 data_flow:
   default_trust_level: untrusted

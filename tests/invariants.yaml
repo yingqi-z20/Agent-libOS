@@ -51,6 +51,8 @@
         "tests/runtime/test_process_messages.py::TestProcessMessage::test_blocking_receive_rejects_oversized_wait_filters_before_status_write",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_shell_primitive_enforces_timeout_limit_without_tool_schema",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_create_requires_shell_policy_before_provider_spawn",
+        "tests/security/test_agentvfs_module.py::TestAgentVfsModule::test_tools_require_capability_before_any_socket_traffic",
+        "tests/security/test_agentvfs_module.py::TestAgentVfsModule::test_paired_checkpoint_requires_libos_authority_before_any_traffic",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_create_tool_explicit_cwd_uses_directory_read_authority",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_spawn_does_not_reuse_shell_run_timeout_scoped_capability",
         "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_input_limit_fails_closed_before_provider_write",
