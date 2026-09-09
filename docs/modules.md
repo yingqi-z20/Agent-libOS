@@ -14,6 +14,7 @@ model-controlled installation.
 - [Entrypoint](#entrypoint)
 - [Registration surfaces](#registration-surfaces)
 - [PTY module](#pty-module)
+- [agentvfs module](#agentvfs-module)
 - [CLI](#cli)
 - [Persistence and checkpoints](#persistence-and-checkpoints)
 - Return to the [documentation home](index.md).
@@ -594,6 +595,52 @@ support is needed:
 ```bash
 uv sync --frozen --extra pty
 ```
+
+## agentvfs Module
+
+`modules/agentvfs/module.yaml` is a trusted module that exposes an
+[agentvfs](https://github.com/thustorage/ContextFS) checkpointable FUSE
+workspace to agent processes. When loaded and trusted, it registers the tools
+`agentvfs_status`, `agentvfs_checkpoint`, and `agentvfs_rollback`, plus the
+`agentvfs-agent:v0` image. The module is self-contained: it speaks the
+daemon's newline-delimited JSON control protocol over its AF_UNIX socket
+using only the standard library, so it has no dependency on agentvfs source
+or Python bindings — the `agentvfs` binary is a Host-installed prerequisite,
+in the same sense as the configured Deno or Git executables.
+
+The Host starts and owns the daemon lifecycle (`agentvfs workspace init` /
+`start`); the module only attaches. Binding is Host-only composition: set the
+substrate attribute `agentvfs` to a workspace name (or a mapping with
+`workspace` and an optional explicit `socket`) before `Runtime.open`. The
+startup hook discovers the running workspace through its `session.json` and
+fails closed when it is not running; without a binding the module loads inert
+and every tool call fails closed. The model can never supply a socket path or
+workspace name.
+
+Tools enforce capability authority on `agentvfs:<workspace>` before any
+socket traffic: `read` for status, `write` for checkpoint, and the stronger
+`admin` for the destructive rollback, mirroring checkpoint-restore authority.
+Denials and operations are audited as `module.agentvfs.*` actions.
+
+Both mutating tools accept `pair_libos` to couple the two state planes. A
+paired checkpoint additionally creates a libOS checkpoint (requiring the
+process's `checkpoint:process:<pid>` write right, probed before any socket
+traffic) and records the agentvfs workspace, label, and commit in the libOS
+checkpoint's metadata. A paired rollback requires an explicit
+`libos_checkpoint_id`, validates the pairing by exact commit equality after
+the filesystem rollback, and then attempts the process-authorized libOS
+restore. Because the scheduler holds its run lock across every tool quantum,
+an in-quantum restore is refused by design; the tool then reports
+`libos_restore=pending_host_restore` with a Host hint (audited as
+`module.agentvfs.libos_restore_pending`), and the Host completes
+`CheckpointManager.restore` once the process is quiescent. With Host-granted
+checkpoint admin and an idle scheduler, both planes restore inside the one
+tool call.
+
+Tests live in `tests/security/test_agentvfs_module.py` and run against an
+in-process fake control daemon, so they need neither FUSE nor an agentvfs
+binary. Real-daemon end-to-end drivers live in the agentvfs repository under
+`extensions/agent-libos/`.
 
 ## CLI
 
