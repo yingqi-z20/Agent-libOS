@@ -188,7 +188,6 @@ def test_external_cancellation_propagates_with_finished_trace(enabled: bool) -> 
             temperature=0.2, max_tokens=64, parallel_tool_calls=False,
         ))
         await started.wait()
-        await asyncio.sleep(0.01)
         task.cancel("host cancelled")
         with pytest.raises(asyncio.CancelledError) as raised:
             await task
@@ -197,7 +196,9 @@ def test_external_cancellation_propagates_with_finished_trace(enabled: bool) -> 
         assert trace is not None and trace["selected_attempt"] is None
         attempt, = trace["attempts"]
         assert attempt["error"]["error_type"] == "CancelledError"
-        assert attempt["duration_ms"] > 0 and attempt["status"] == "error"
+        assert attempt["status"] == "error"
+        # Cancellation can finish within one monotonic clock tick on Windows.
+        assert attempt["duration_ms"] >= 0
         assert client_module._ACTIVE_LOGICAL_CALL_TIMEOUT.get() is None
 
     asyncio.run(exercise())
@@ -285,27 +286,34 @@ def test_transport_translated_cancellation_cannot_start_fresh_backoff(monkeypatc
 
 def test_concurrent_calls_have_independent_deadlines() -> None:
     async def exercise() -> None:
-        deadlines: list[float | None] = []
-        first_started = asyncio.Event()
+        timeouts: list[asyncio.Timeout] = []
+        both_started = asyncio.Event()
 
         async def create(**_kwargs: Any) -> Any:
             timeout = client_module._ACTIVE_LOGICAL_CALL_TIMEOUT.get()
             assert timeout is not None
-            deadlines.append(timeout.when())
-            first_started.set()
+            timeouts.append(timeout)
+            if len(timeouts) == 2:
+                both_started.set()
             await asyncio.Event().wait()
 
-        client = _client(create, logical_call_timeout_s=0.12)
+        client = _client(create, logical_call_timeout_s=30.0)
         first = asyncio.create_task(_complete(client))
-        await first_started.wait()
-        await asyncio.sleep(0.04)
         second = asyncio.create_task(_complete(client))
+        await both_started.wait()
+        assert timeouts[0] is not timeouts[1]
+        assert all(timeout.when() is not None for timeout in timeouts)
+        # Expire each scope explicitly: real short deadlines can both elapse
+        # while a busy worker is descheduled, obscuring their independence.
+        timeouts[0].reschedule(asyncio.get_running_loop().time() - 1)
         with pytest.raises(LLMTransientError):
             await first
         assert not second.done()
+        assert not timeouts[1].expired()
+        timeouts[1].reschedule(asyncio.get_running_loop().time() - 1)
         with pytest.raises(LLMTransientError):
             await second
-        assert len(deadlines) == 2 and deadlines[1] > deadlines[0]
+        assert all(timeout.expired() for timeout in timeouts)
         assert client_module._ACTIVE_LOGICAL_CALL_TIMEOUT.get() is None
 
     asyncio.run(exercise())

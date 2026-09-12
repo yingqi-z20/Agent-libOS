@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 from agent_libos.config import AgentLibOSConfig
+from agent_libos.llm.provider_continuation import load_continuation_data, pending_continuation_marker
 from agent_libos.llm.replay import LLMReplayService
 from agent_libos.models import CapabilityRight, DataFlowContext, ObjectLifecycleState, ProcessStatus
 from agent_libos.models.exceptions import ValidationError
@@ -63,6 +64,8 @@ class LLMReplaySourceRecovery:
             # Terminal owners need no volatile read grants. TaskRun preflight
             # already classified invalid Runs; recovery must isolate them.
             return
+        marker = self.processes.get_latest_llm_call(pid=pid, purpose="provider_continuation")
+        manifest = pending_continuation_marker(self.processes, pid=pid, marker=marker)
         head = self.processes.get_llm_replay_head(pid)
         pending = self.processes.get_llm_pending_action(pid)
         prepared = {}
@@ -73,11 +76,29 @@ class LLMReplaySourceRecovery:
             # It cannot establish authority for any retained replay sources.
             return
         reference = prepared.get("responses_replay_request")
-        if head is None and reference is None:
+        if manifest is None and head is None and reference is None:
             return
         profile = self.profile_snapshot(process.llm_profile_id or self.config.llm.default_profile_id)
+        if manifest is not None:
+            continuation = load_continuation_data(
+                self.processes, pid=pid, marker=marker,
+                profile_identity_sha256=profile.identity_sha256,
+            )
+            if continuation is not None:
+                # Independent hosted code execution disables native Responses
+                # replay, but its retained result needs the same source READ.
+                yield pid, DataFlowContext.from_dict(continuation["flow_context"])
+        if head is None and reference is None:
+            return
+        yield from self._replay_contexts(process, profile, prepared)
+
+    def _replay_contexts(
+        self, process: Any, profile: Any, prepared: dict[str, Any],
+    ) -> Iterator[tuple[str, DataFlowContext]]:
         if not profile.policy.responses_replay:
             return
+        pid = process.pid
+        reference = prepared.get("responses_replay_request")
         expected = (pid, process.task_run_id, profile.identity_sha256, profile.policy.model, self.processes.get_llm_context_generation(pid))
         current = self.service.load_current(pid)
         if current is not None:

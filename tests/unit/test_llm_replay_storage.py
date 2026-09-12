@@ -172,7 +172,7 @@ def test_replay_cas_facade_rolls_back_non_boolean_backend_results(invalid_result
 
 
 def test_replay_recovery_pid_pages_merge_deduplicate_and_use_pending_index() -> None:
-    from agent_libos.models import DataFlowContext
+    from agent_libos.models import DataFlowContext, LLMCallRecord
 
     store = SQLiteStore(":memory:")
     try:
@@ -185,8 +185,15 @@ def test_replay_recovery_pid_pages_merge_deduplicate_and_use_pending_index() -> 
                 "wait_type": "event", "status": status,
                 "data_flow_context": DataFlowContext().to_dict(),
             })
+        for index, pid in enumerate(("a", "d", "d", "e")):
+            store.insert_llm_call(LLMCallRecord(
+                call_id=f"continuation-{index}", pid=pid, image_id="test:v0",
+                purpose="provider_continuation",
+                status="ok", created_at=f"2026-09-07T00:00:0{index}Z",
+            ))
         assert store.list_llm_replay_recovery_pids(limit=2) == ["a", "b"]
-        assert store.list_llm_replay_recovery_pids(after_pid="b", limit=2) == ["c"]
+        assert store.list_llm_replay_recovery_pids(after_pid="b", limit=2) == ["c", "d"]
+        assert store.list_llm_replay_recovery_pids(after_pid="d", limit=2) == ["e"]
         with pytest.raises(ValidationError, match="bounds"):
             store.list_llm_replay_recovery_pids(limit=0)
         plan = store.conn.execute(

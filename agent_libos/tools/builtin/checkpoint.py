@@ -23,6 +23,7 @@ from agent_libos.tools.contracts import (
     DETACHED_PARENT,
     compact_checkpoint_created,
 )
+from agent_libos.tools.prompt_layout import model_prompt_layout
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _CANCELLED_HUMAN_REQS_KEY = "cancelled_human_re" "quests"
@@ -452,7 +453,7 @@ class CreateCheckpointTool(SyncAgentTool[CreateCheckpointArgs]):
             data=output.model_dump(),
             model_data=(
                 compact_checkpoint_created(output.reason)
-                if _cache_optimized_v2(runtime)
+                if model_prompt_layout(runtime, ctx.pid) == "cache_optimized_v2"
                 else output.model_dump()
             ),
         )
@@ -498,7 +499,7 @@ class ListCheckpointsTool(SyncAgentTool[ListCheckpointsArgs]):
                     "count": output.count,
                     "has_more": output.has_more,
                 }
-                if _cache_optimized_v2(runtime)
+                if model_prompt_layout(runtime, ctx.pid) == "cache_optimized_v2"
                 else output.model_dump()
             ),
         )
@@ -1037,19 +1038,6 @@ def _model_checkpoint_candidates(
         {"checkpoint_id": item.checkpoint_id, "reason": item.reason}
         for item in output.checkpoints
     ]
-
-
-def _cache_optimized_v2(runtime: Any) -> bool:
-    return (
-        str(
-            getattr(
-                getattr(getattr(runtime, "config", None), "llm", None),
-                "prompt_layout",
-                "legacy_v1",
-            )
-        )
-        == "cache_optimized_v2"
-    )
 
 
 def _resolve_checkpoint_selector(value: str, ctx: ToolContext) -> str:

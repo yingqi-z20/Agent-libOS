@@ -16,6 +16,7 @@ from agent_libos.tools.base import (
     ToolResult,
 )
 from agent_libos.tools.observability import json_size_bytes
+from agent_libos.tools.prompt_layout import model_prompt_layout
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 # One observed labelled message adds a fixed-width Object source reference.
@@ -449,7 +450,7 @@ def _bounded_message_result(
         acked_message_ids=predicted_acked_ids,
         acknowledge_selected=ack,
         expose_message_ids=True,
-        expose_acked_message_ids=not _cache_optimized_v2(runtime),
+        expose_acked_message_ids=model_prompt_layout(runtime, ctx.pid) != "cache_optimized_v2",
     )
 
     # Label observation is evidence/provenance materialization, so perform it
@@ -487,6 +488,7 @@ def _select_messages_for_result(
     ack: bool,
 ) -> list[ProcessMessage]:
     selected: list[ProcessMessage] = []
+    expose_acked_message_ids = model_prompt_layout(runtime, ctx.pid) != "cache_optimized_v2"
     for message in messages:
         candidate = [*selected, message]
         omitted_count = matching_count - len(candidate)
@@ -511,7 +513,7 @@ def _select_messages_for_result(
             acked_message_ids=acked_ids,
             acknowledge_selected=ack,
             expose_message_ids=True,
-            expose_acked_message_ids=not _cache_optimized_v2(runtime),
+            expose_acked_message_ids=expose_acked_message_ids,
         )
         estimate = _result_envelope_size(
             runtime,
@@ -600,19 +602,6 @@ def _message_result_limit(runtime: Any) -> int:
     return min(
         runtime.config.tools.tool_result_payload_hard_limit_bytes,
         runtime.config.tools.memory_payload_hard_limit_bytes,
-    )
-
-
-def _cache_optimized_v2(runtime: Any) -> bool:
-    return (
-        str(
-            getattr(
-                getattr(getattr(runtime, "config", None), "llm", None),
-                "prompt_layout",
-                "legacy_v1",
-            )
-        )
-        == "cache_optimized_v2"
     )
 
 

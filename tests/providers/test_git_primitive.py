@@ -1819,6 +1819,29 @@ def test_unborn_and_detached_head_lifecycle(tmp_path: Path) -> None:
         runtime.close()
 
 
+def test_git_reads_bind_observation_selection_and_extent(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    (root / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="retain distinct Git observations")
+        _grant_git_authority(runtime, pid)
+        status = runtime.git.status(pid, limit=1)
+        diff = runtime.git.diff(pid, paths=["tracked.txt"], max_bytes=32)
+        log = runtime.git.log(pid, ref="main", limit=1)
+
+        assert status.limit == 1
+        assert diff.paths_sha256 == hashlib.sha256(b"tracked.txt").hexdigest()
+        assert diff.max_bytes == 32 and diff.truncated
+        assert log["repository_id"] == diff.repository_id == status.repository_id
+        assert log["worktree_id"] == diff.worktree_id == status.worktree_id
+        assert log["ref_oid"] == status.head_oid
+        assert log["limit"] == 1
+    finally:
+        runtime.close()
+
+
 def test_status_and_diff_cover_rename_binary_and_symlink_changes(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     _init_repository(root)

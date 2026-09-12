@@ -3261,17 +3261,11 @@ _PINNED_FEEDBACK_TOOLS = frozenset(
 )
 # Observations whose newest instance supersedes earlier ones.  The value names
 # the result fields that identify the observed target; an empty tuple means
-# the tool observes one global target (for example Git status).
+# the tool observes one global target.
 _OBSERVATION_KEY_FIELDS: dict[str, tuple[str, ...]] = {
     "read_text_file": ("path",),
     "read_directory": ("path",),
     "get_working_directory": (),
-    "git_status": (),
-    # A staged-scope diff must not hide the worktree-scope diff issued in the
-    # same response; only a diff of the same scope and refs is stale.
-    "git_diff": ("scope", "base_oid", "head_oid", "worktree_id"),
-    "git_log": (),
-    "git_repository_info": (),
     # ``run_shell_command`` is deliberately absent: a command's outcome is
     # evidence with temporal meaning, not an observation of a stable target.
     # Letting a passing test run supersede the earlier failing run erased the
@@ -3293,6 +3287,18 @@ _OBSERVATION_KEY_FIELDS: dict[str, tuple[str, ...]] = {
     "list_mcp_tools": ("server_id",),
     "list_mcp_resources": ("server_id",),
     "get_current_time": (),
+}
+# Git results need the exact selection and requested extent. Changed paths
+# alone cannot distinguish independent path filters or a truncated patch.
+# Older result records lack this provenance and must not supersede each other.
+_GIT_OBSERVATION_KEY_FIELDS: dict[str, tuple[str, ...]] = {
+    "git_repository_info": ("repository_id", "worktree_id"),
+    "git_status": ("repository_id", "worktree_id", "limit"),
+    "git_diff": (
+        "repository_id", "worktree_id", "scope", "base_oid", "head_oid",
+        "paths_sha256", "max_bytes",
+    ),
+    "git_log": ("repository_id", "worktree_id", "ref_oid", "limit"),
 }
 _STUB_SUMMARY_RESULT_FIELDS = (
     "path",
@@ -3347,10 +3353,32 @@ def _observation_supersession_key(payload: Any) -> tuple[Any, ...] | None:
         return None
     if tool_name == "discover_skills":
         return _discovery_supersession_key(result)
+    if tool_name in _GIT_OBSERVATION_KEY_FIELDS:
+        return _git_observation_supersession_key(tool_name, result)
     fields = _OBSERVATION_KEY_FIELDS.get(tool_name)
     if fields is None:
         return None
     return (tool_name, *(_canonical_prompt_json(result.get(field)) for field in fields))
+
+
+def _git_observation_supersession_key(
+    tool_name: str, result: dict[str, Any],
+) -> tuple[Any, ...] | None:
+    """Require complete Git selection provenance before replacing a result."""
+
+    fields = _GIT_OBSERVATION_KEY_FIELDS[tool_name]
+    if any(field not in result for field in fields):
+        return None
+    for field in fields:
+        value = result[field]
+        if field in {"base_oid", "head_oid", "ref_oid"} and value is None:
+            continue
+        if field in {"limit", "max_bytes"}:
+            if type(value) is not int or value < 1:
+                return None
+        elif not isinstance(value, str) or not value:
+            return None
+    return (tool_name, *(_canonical_prompt_json(result[field]) for field in fields))
 
 
 def _discovery_supersession_key(result: dict[str, Any]) -> tuple[Any, ...] | None:

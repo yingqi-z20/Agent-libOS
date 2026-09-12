@@ -251,6 +251,54 @@ def test_runtime_no_full_io_never_persists_private_responses_state() -> None:
         runtime.close()
 
 
+@pytest.mark.parametrize("arrival", ["queued", "waiting", "reopened_wait"])
+def test_auto_wait_preserves_consumed_followup_at_replay_turn_limit(arrival: str, tmp_path: Path) -> None:
+    config = replace(CONFIG, llm=replace(
+        CONFIG.llm, responses_replay_max_turns=1,
+        profiles={"default": replace(
+            CONFIG.llm.profiles["default"], auto_wait_on_empty_tool_calls=True,
+        )},
+    ))
+    database = tmp_path / "final-turn-wait.sqlite"
+    runtime = Runtime.open(database, config=config)
+    try:
+        first = completion(1)
+        first.tool_calls = []
+        first.content = "Waiting for your message."
+        first.response_items = [{
+            "type": "message", "id": "message_1", "role": "assistant",
+            "content": [{"type": "output_text", "text": first.content, "annotations": []}],
+            "status": "completed",
+        }]
+        client = ReplayClient([first])
+        runtime.llm.client = client
+        pid = register(runtime, PROMPT_MODE_IMAGE_ONLY)
+        if arrival != "queued":
+            assert runtime.run_process_once(pid)["waiting_message"]
+            if arrival == "reopened_wait":
+                runtime.close()
+                runtime = Runtime.open(database, config=config)
+                client = ReplayClient([])
+                runtime.llm.client = client
+        runtime.human.send_process_message(pid, "FINAL_TURN_HUMAN_FOLLOWUP")
+        outcome = runtime.run_process_once(pid)
+        assert outcome["ok"], outcome
+        assert runtime.messages.unread(pid) == []
+        assert runtime.process.get(pid).status.value == "runnable"
+        assert len(client.inputs) == (0 if arrival == "reopened_wait" else 1)
+        head = runtime.store.get_llm_replay_head(pid)
+        turn = runtime.store.get_llm_replay_turn(head.turn_id)
+        assert dumps(turn.payload).count("FINAL_TURN_HUMAN_FOLLOWUP") == 1
+
+        runtime.close()
+        runtime = Runtime.open(database, config=config)
+        retained = runtime.store.get_llm_replay_turn(runtime.store.get_llm_replay_head(pid).turn_id)
+        assert retained.payload == turn.payload
+        assert runtime.process.get(pid).status.value == "runnable"
+    finally:
+        runtime.close()
+
+
 def test_runtime_preserves_configured_auto_cache_and_private_domain_evidence() -> None:
     runtime = Runtime.open("local", config=CONFIG)
     try:

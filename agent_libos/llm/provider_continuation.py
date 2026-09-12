@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from agent_libos.models import LLMCallRecord
+from agent_libos.models import DataFlowContext, LLMCallRecord
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.utils.serde import dumps, to_jsonable
 
@@ -78,6 +78,80 @@ def validated_continuation_marker(record: LLMCallRecord) -> dict[str, Any]:
     ):
         raise ValidationError("provider continuation manifest is invalid")
     return value
+
+
+def pending_continuation_marker(
+    processes: Any,
+    *,
+    pid: str,
+    marker: LLMCallRecord | None,
+) -> dict[str, Any] | None:
+    """Discard settled or obsolete markers before resolving provider state."""
+
+    if marker is None:
+        return None
+    if marker.pid != pid or marker.purpose != "provider_continuation":
+        raise ValidationError("provider continuation owner is invalid")
+    manifest = validated_continuation_marker(marker)
+    if manifest["state"] == "consumed":
+        return None
+    if manifest["context_generation"] != processes.get_llm_context_generation(pid):
+        # A discarded checkpoint/context generation cannot retain authority.
+        return None
+    return manifest
+
+
+def load_continuation_data(
+    processes: Any,
+    *,
+    pid: str,
+    marker: LLMCallRecord | None,
+    profile_identity_sha256: str,
+    volatile_payload: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Validate retained result bytes before dispatch or startup READ retention."""
+
+    manifest = pending_continuation_marker(processes, pid=pid, marker=marker)
+    if manifest is None:
+        return None
+    assert marker is not None
+    source = processes.get_llm_call(str(manifest.get("call_id") or ""))
+    _validate_continuation_source(source, marker=marker, manifest=manifest, pid=pid)
+    if manifest["profile_identity_sha256"] != profile_identity_sha256:
+        raise ValidationError("provider continuation profile changed; start a new task")
+    payload = volatile_payload if volatile_payload is not None else {
+        "message": marker.messages, "flow_context": marker.raw_response,
+    }
+    if hashlib.sha256(dumps(to_jsonable(payload)).encode("utf-8")).hexdigest() != manifest["payload_sha256"]:
+        raise ValidationError("provider continuation content is unavailable under the retention policy")
+    message = payload.get("message")
+    if (
+        not isinstance(message, dict) or set(message) != {"role", "content"}
+        or message["role"] != "assistant" or not isinstance(message["content"], str)
+        or not message["content"].strip()
+    ):
+        raise ValidationError("provider continuation transcript is invalid")
+    DataFlowContext.from_dict(payload["flow_context"])
+    return {"marker": marker, "manifest": manifest, **payload}
+
+
+def _validate_continuation_source(
+    source: LLMCallRecord | None,
+    *,
+    marker: LLMCallRecord,
+    manifest: dict[str, Any],
+    pid: str,
+) -> None:
+    if (
+        source is None or source.pid != manifest.get("source_pid", pid)
+        or source.status != "ok" or not source.completed_at
+        or source.image_id != marker.image_id
+        or source.purpose != "action_selection"
+        or source.request_options.get("provider_tools_enabled") is not True
+        or (source.tool_calls != [] and source.request_options.get("provider_tools_function_call_count") != 0)
+        or continuation_source_sha256(source) != manifest["source_sha256"]
+    ):
+        raise ValidationError("provider continuation source is unavailable or changed")
 
 
 def has_provider_continuation_result(completion: Any) -> bool:

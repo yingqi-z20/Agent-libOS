@@ -164,7 +164,8 @@ def _inspect_connection(
     calls = [_call_row(index, row) for index, row in enumerate(rows, start=1)]
     _attach_gaps(calls)
     pids = sorted({call["pid"] for call in calls if call["pid"]})
-    audit = _audit_summary(connection, pids)
+    # Audit activity can precede the first LLM call for the requested process.
+    audit = _audit_summary(connection, [pid] if pid else [])
     objects = _object_summary(connection, pids)
     return {
         "source": source,
@@ -359,14 +360,15 @@ def _audit_summary(connection: sqlite3.Connection, pids: list[str]) -> dict[str,
     if not _table_exists(connection, "audit_records"):
         return {}
     rows = connection.execute(
-        "SELECT actor, action, decision_json FROM audit_records"
+        "SELECT actor, action, target, decision_json FROM audit_records"
     ).fetchall()
+    process_targets = {f"process:{pid}" for pid in pids}
     selected = [
         row
         for row in rows
         if not pids
         or row["actor"] in pids
-        or str(row["action"]).startswith("scheduler.")
+        or row["target"] in process_targets
     ]
     actions: Counter[str] = Counter(str(row["action"]) for row in selected)
     repair_tool_calls = 0

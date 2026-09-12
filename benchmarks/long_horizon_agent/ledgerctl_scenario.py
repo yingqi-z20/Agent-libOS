@@ -793,7 +793,8 @@ def regression_coverage(workspace: str | Path) -> dict[str, bool]:
     consumer and configures precision 0 in any of the ordinary spellings: a
     ``LedgerConfig(precision=0)`` call, a module- or class-level name bound to
     such a call or to a dict literal with ``"precision": 0`` (used directly or
-    through ``**`` unpacking), ``load_config`` on a fixture whose INI declares
+    through ``**`` unpacking), an instance attribute initialized by ``setUp``,
+    ``load_config`` on a fixture whose INI declares
     ``precision = 0``, or an environment mapping with a ``*PRECISION`` key set to
     ``"0"``.  The oracle must not fail a legitimate solution because of its test
     style, so every spelling above is accepted.
@@ -802,17 +803,12 @@ def regression_coverage(workspace: str | Path) -> dict[str, bool]:
     root = Path(workspace).resolve()
     per_consumer = {name: False for name in sorted(CONSUMER_FUNCTIONS)}
     negative_half = dict.fromkeys(per_consumer, False)
-    for path in sorted(root.glob("tests/**/test*.py")):
+    for path in _discoverable_test_files(root):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue
-        zero_precision_names = _zero_precision_bindings(tree, root)
-        for function in ast.walk(tree):
-            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if not function.name.casefold().startswith("test"):
-                continue
+        for function, zero_precision_names in _test_precision_scopes(tree, root):
             calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
             consumer_calls = [call for call in calls if _callee_name(call) in CONSUMER_FUNCTIONS]
             if not consumer_calls:
@@ -840,21 +836,92 @@ def regression_coverage(workspace: str | Path) -> dict[str, bool]:
     }
 
 
-def _zero_precision_bindings(tree: ast.AST, root: Path) -> set[str]:
-    """Names (module constants or class attributes) that denote precision 0."""
+def _discoverable_test_files(root: Path) -> list[Path]:
+    """Match the file/package rules of ``unittest discover -s tests`` statically."""
+
+    tests_root = root / "tests"
+    return [
+        path
+        for path in sorted(tests_root.glob("**/test*.py"))
+        if re.fullmatch(r"[_a-z]\w*\.py", path.name, re.IGNORECASE)
+        and all(
+            (directory / "__init__.py").is_file()
+            for directory in path.parents
+            if directory != tests_root and tests_root in directory.parents
+        )
+    ]
+
+
+def _test_precision_scopes(
+    tree: ast.Module, root: Path,
+) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]]:
+    """Keep constants and setup attributes inside their owning test class."""
+
+    module_names = _zero_precision_bindings(tree, root)
+    selected: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]] = []
+    for scope in (node for node in tree.body if isinstance(node, ast.ClassDef)):
+        class_names = _zero_precision_bindings(scope, root)
+        setup_attributes: set[str] = set()
+        methods = [
+            node for node in scope.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for method in methods:
+            arguments = [*method.args.posonlyargs, *method.args.args]
+            if method.name not in {"setUp", "setUpClass", "asyncSetUp"} or not arguments:
+                continue
+            prefix = arguments[0].arg + "."
+            setup_attributes.update(
+                name[len(prefix):]
+                for name in _zero_precision_bindings(method, root)
+                if name.startswith(prefix)
+            )
+        for method in methods:
+            if not method.name.startswith("test"):
+                continue
+            names = set(module_names)
+            names.update(f"{scope.name}.{name}" for name in class_names)
+            arguments = [*method.args.posonlyargs, *method.args.args]
+            if arguments:
+                names.update(
+                    f"{arguments[0].arg}.{name}"
+                    for name in class_names | setup_attributes
+                )
+            names.update(_zero_precision_bindings(method, root))
+            selected.append((method, names))
+    return selected
+
+
+def _binding_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return f"{node.value.id}.{node.attr}"
+    return None
+
+
+def _zero_precision_bindings(
+    scope: ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+    root: Path,
+) -> set[str]:
+    """Collect bindings in this lexical scope without entering other scopes."""
 
     names: set[str] = set()
-    for node in ast.walk(tree):
+    for node in scope.body:
         if isinstance(node, ast.Assign):
-            targets = [target.id for target in node.targets if isinstance(target, ast.Name)]
+            targets = [_binding_name(target) for target in node.targets]
             value = node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            targets = [node.target.id]
+        elif isinstance(node, ast.AnnAssign):
+            targets = [_binding_name(node.target)]
             value = node.value
         else:
             continue
-        if value is not None and _denotes_zero_precision(value, root):
-            names.update(targets)
+        selected_targets = {target for target in targets if target is not None}
+        if value is not None:
+            is_zero = _denotes_zero_precision(value, root) or _binding_name(value) in names
+            names.difference_update(selected_targets)
+            if is_zero:
+                names.update(selected_targets)
     return names
 
 
@@ -905,9 +972,7 @@ def _function_uses_zero_precision(
     ):
         return True
     for node in ast.walk(function):
-        if isinstance(node, ast.Name) and node.id in zero_precision_names:
-            return True
-        if isinstance(node, ast.Attribute) and node.attr in zero_precision_names:
+        if _binding_name(node) in zero_precision_names:
             return True
         if _denotes_zero_precision(node, root) and isinstance(node, ast.Dict):
             return True

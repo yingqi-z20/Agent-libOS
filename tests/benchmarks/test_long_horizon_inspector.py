@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from agent_libos.llm.usage import LLM_USAGE_COUNTER_MAX
-from agent_libos.models import LLMCallRecord
+from agent_libos.models import AuditRecord, LLMCallRecord
 from agent_libos.storage import SQLiteStore
 from experiments.inspect_long_horizon_run import inspect_database
 
@@ -16,7 +16,7 @@ from experiments.inspect_long_horizon_run import inspect_database
 def test_inspector_keeps_committed_wal_calls_across_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    path = tmp_path / "runtime ? snapshot.sqlite"
+    path = tmp_path / "runtime # snapshot.sqlite"
     store = SQLiteStore(path)
     store.insert_llm_call(LLMCallRecord(
         call_id="before-wal", pid="pid", image_id=None,
@@ -66,6 +66,56 @@ def test_inspector_does_not_modify_the_source_schema(tmp_path: Path) -> None:
     assert inspect_database(path)["calls"] == []
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT sql FROM sqlite_master ORDER BY name").fetchall() == before
+
+
+@pytest.mark.parametrize(
+    ("pid", "quanta", "human_messages", "llm_requests"),
+    [
+        ("pid-a", 1, 1, 1),
+        ("pid-b", 2, 0, 1),
+        ("pid-without-calls", 1, 1, 0),
+        ("missing-pid", 0, 0, 0),
+        (None, 4, 2, 2),
+    ],
+)
+def test_inspector_attributes_external_audit_events_to_the_target_process(
+    tmp_path: Path,
+    pid: str | None,
+    quanta: int,
+    human_messages: int,
+    llm_requests: int,
+) -> None:
+    path = tmp_path / "runtime.sqlite"
+    store = SQLiteStore(path)
+    try:
+        for call_pid in ("pid-a", "pid-b"):
+            store.insert_llm_call(LLMCallRecord(
+                call_id=f"call-{call_pid}", pid=call_pid, image_id=None,
+                purpose="action_selection", status="ok", messages=[], tools=[],
+                tool_calls=[], created_at="2026-09-08T00:00:00+00:00",
+            ))
+        for index, (actor, action, target) in enumerate([
+            ("scheduler", "scheduler.run_quantum", "process:pid-a"),
+            ("scheduler", "scheduler.run_quantum", "process:pid-b"),
+            ("scheduler", "scheduler.run_quantum", "process:pid-b"),
+            ("scheduler", "scheduler.run_quantum", "process:pid-without-calls"),
+            ("human", "process.message.post", "process:pid-a"),
+            ("human", "process.message.post", "process:pid-without-calls"),
+            ("pid-a", "llm.request", "llm:test"),
+            ("pid-b", "llm.request", "llm:test"),
+        ]):
+            store.insert_audit(AuditRecord(
+                record_id=f"audit-{index}", timestamp="2026-09-08T00:00:00+00:00",
+                actor=actor, action=action, target=target, input_refs=[],
+                output_refs=[], capability_refs=[], decision={}, correlation_id=None,
+            ))
+    finally:
+        store.close()
+
+    audit = inspect_database(path, pid=pid)["audit"]
+    assert audit["quanta"] == quanta
+    assert audit["human_messages_posted"] == human_messages
+    assert audit["llm_requests"] == llm_requests
 
 
 @pytest.mark.parametrize(

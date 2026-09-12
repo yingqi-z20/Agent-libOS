@@ -46,6 +46,7 @@ from agent_libos.tools.base import (
     ToolResult,
 )
 from agent_libos.tools.observability import json_size_bytes
+from agent_libos.tools.prompt_layout import model_prompt_layout
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _CUMULATIVE_EXIT_REVIEW = "cumulative_review"
@@ -688,7 +689,7 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
                         "authority_changed": False,
                     },
                 )
-                if _runtime_prompt_layout(runtime) == "cache_optimized_v2":
+                if model_prompt_layout(runtime, ctx.pid) == "cache_optimized_v2":
                     # The v2 ToolResult is itself the safe Host-to-Model
                     # projection.  Full goal/message/requirement/receipt
                     # bindings remain in their authoritative stores and in the
@@ -1143,12 +1144,6 @@ def _completion_review_goal_evidence(
             _COMPLETION_REVIEW_GOAL_FALLBACK_MAX_CHARS,
         )
     return evidence
-
-
-def _runtime_prompt_layout(runtime: Any) -> str:
-    config = getattr(runtime, "config", None)
-    llm = getattr(config, "llm", None)
-    return str(getattr(llm, "prompt_layout", "legacy_v1"))
 
 
 def _semantic_completion_value(value: Any) -> Any:

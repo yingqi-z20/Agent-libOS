@@ -19880,9 +19880,18 @@ class SQLRuntimeStore:
             "SELECT pid FROM llm_pending_actions WHERE status = 'pending'"
             f"{suffix} ORDER BY pid LIMIT ?", [*params, limit],
         )
-        # Bound both sides before merging; a SQL UNION can materialize the
+        continuations = self._query(
+            "SELECT DISTINCT pid FROM llm_calls "
+            "WHERE purpose = 'provider_continuation' AND pid IS NOT NULL"
+            f"{suffix} ORDER BY pid LIMIT ?", [*params, limit],
+        )
+        # Bound each side before merging; a SQL UNION can materialize the
         # entire historical relation before applying an outer LIMIT.
-        return sorted({head.pid for head in heads} | {str(row["pid"]) for row in pending})[:limit]
+        return sorted(
+            {head.pid for head in heads}
+            | {str(row["pid"]) for row in pending}
+            | {str(row["pid"]) for row in continuations}
+        )[:limit]
 
     def compare_and_set_llm_replay_head(
         self, head: LLMReplayHead, *, expected_revision: int | None,

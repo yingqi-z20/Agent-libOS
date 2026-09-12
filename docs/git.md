@@ -107,6 +107,13 @@ operation supports it; crossing the configured hard limit raises
 `output_too_large`. A patch artifact must fit in full—no partial Object is
 created.
 
+Observation results retain their requested selection: status includes `limit`,
+diff includes `max_bytes` and `paths_sha256` (the SHA-256 of sorted, distinct
+literal path bytes joined by NUL), and log includes `repository_id`,
+`worktree_id`, resolved `ref_oid`, and `limit`. Working-set memory supersedes
+an earlier Git observation only when this selection and extent match. Older
+records without complete selection metadata remain independently visible.
+
 Every mutation accepts an opaque 64-hex `expected_state_token` obtained from a
 prior repository read. The token commits to repository/worktree identity,
 HEAD/ref state, index, effective configuration, refs, worktree registry,

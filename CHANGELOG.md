@@ -9,6 +9,15 @@ Git history remains the record for earlier development snapshots.
 Changes intended for the next published version must be summarized here before
 release. Do not treat an entry in this section as shipped behavior.
 
+- Align completion reviews, checkpoint results, and message projections with
+  the process's effective LLM profile layout. Preserve validated hosted-tool
+  continuation source reads across restart, and settle auto-wait Human input
+  within its admitted replay turn at the configured turn limit.
+- Keep independently filtered Git observations visible in the working set.
+  Match ledgerctl regression coverage to discoverable tests and recognize
+  per-test instance configuration; attribute inspector audit events to their
+  target processes and remove timing-dependent cancellation and concurrent
+  deadline assertions.
 - Define shared field and result contracts for model-facing tool semantics,
   generate matching Skill guidance, and gate schema/argument/result drift in CI.
   All core tools receive Chat/Responses and MCP schema checks; explicit semantic

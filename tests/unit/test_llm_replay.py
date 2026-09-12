@@ -170,6 +170,45 @@ def test_host_wait_observation_cannot_replace_native_tool_output():
         prepare(service)
 
 
+def test_host_wait_settles_at_turn_limit_without_admitting_another_provider_call():
+    store = ReplayStore()
+    service = LLMReplayService(store, max_bytes=1_000_000, max_turns=1)
+    stage(service, prepare(service))
+    observed = [{"role": "user", "content": "follow-up at the final provider turn"}]
+    args = dict(pid="p1", call_id="call-local", input_items=observed)
+    head = service.append_host_input(**args)
+
+    restored = LLMReplayService(store, max_bytes=1_000_000, max_turns=1)
+    assert restored.append_host_input(**args) == head
+    turn = store.get_llm_replay_turn(head.turn_id)
+    payload = restored.validate_checkpoint_turn(turn)
+    assert payload["groups"][-1]["input_items"] == observed
+    with pytest.raises(ReplayStateError, match="semantic compaction"):
+        prepare(restored)
+    assert store.get_llm_replay_head("p1") == head
+
+    # Compaction may summarize the provider reply but retain its Human input.
+    restored.compact(
+        pid="p1", context_generation="after-compaction",
+        messages=[{"role": "system", "content": "stable"}],
+        flow_context=flow(), retain_groups=1,
+    )
+    assert restored.load_current("p1")[2]["groups"][0]["input_items"] == observed
+    with pytest.raises(ReplayStateError, match="semantic compaction"):
+        prepare(restored, context_generation="after-compaction")
+
+
+def test_host_wait_pairing_cannot_hide_another_provider_turn():
+    store = ReplayStore()
+    service = LLMReplayService(store, max_bytes=1_000_000, max_turns=2)
+    stage(service, prepare(service))
+    stage(service, prepare(service), call_id="replay_host_input:call-local")
+    turn = store.get_llm_replay_turn(store.get_llm_replay_head("p1").turn_id)
+    bounded = LLMReplayService(store, max_bytes=1_000_000, max_turns=1)
+    with pytest.raises(ReplayStateError, match="turn bound"):
+        bounded.validate_turn(turn)
+
+
 def test_token_estimate_uses_generation_usage_not_ciphertext_length():
     service = LLMReplayService(ReplayStore(), max_bytes=1_000_000)
     stage(service, prepare(service))

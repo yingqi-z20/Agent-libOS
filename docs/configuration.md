@@ -319,6 +319,10 @@ serialization exclude the ciphertext.
 `llm.persist_full_io: false` disables durable Responses replay, including when
 the effective provider policy would enable it. Replay payloads are bounded by
 `responses_replay_max_bytes` (8 MiB) and `responses_replay_max_turns` (128).
+The turn limit counts a provider call together with its optional Host auto-wait
+observation, so acknowledging Human input can settle the final admitted turn.
+An observation retained on its own after compaction counts as one turn. The
+private byte limit still applies to the complete retained payload.
 Checkpoint snapshots contain local references only; restore and fork validate
 the retained payload, provider/model scope, and current source authority.
 Purging private payloads makes old checkpoint references unusable. Agent images

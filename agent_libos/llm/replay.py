@@ -127,7 +127,7 @@ class LLMReplayService:
             raise ReplayStateError("Responses replay payload integrity check failed")
         provider = self._payload_provider(payload)
         groups = payload["groups"]
-        if not isinstance(groups, list) or len(groups) > self.max_turns:
+        if not isinstance(groups, list) or len(groups) > 2 * self.max_turns:
             raise ReplayStateError("Responses replay turn bound is invalid")
         if not isinstance(payload["prefix"], list):
             raise ReplayStateError("Responses replay prefix is invalid")
@@ -135,6 +135,8 @@ class LLMReplayService:
         if context.labels.to_dict() != turn.source_labels:
             raise ReplayStateError("Responses replay source labels do not match its payload")
         self._validate_groups(groups, provider=provider)
+        if self._retained_turn_count(groups) > self.max_turns:
+            raise ReplayStateError("Responses replay turn bound is invalid")
         # Validation permits only the last group to be pending; every prior
         # complete request remains independently representable.
         if not groups or not self._pending_calls(groups[-1]):
@@ -177,6 +179,44 @@ class LLMReplayService:
             raise ReplayStateError("Responses replay action validation marker is invalid")
         if not isinstance(group["input_items"], list) or not isinstance(group["tool_outputs"], list):
             raise ReplayStateError("Responses replay turn items are invalid")
+
+    @staticmethod
+    def _retained_turn_count(groups: list[dict[str, Any]]) -> int:
+        """Count one provider turn and its optional Host wait result together.
+
+        Preserve the existing private group format and wire order. Only the
+        exact, adjacent Host observation can share its provider's admission;
+        an orphan retained by compaction counts as a turn of its own. Disjoint
+        pairs ensure that even a chain of Host-shaped groups stays bounded.
+        Callers have already validated the group shapes.
+        """
+        count = 0
+        index = 0
+        while index < len(groups):
+            owner = groups[index]
+            count += 1
+            index += 1
+            if index == len(groups):
+                break
+            observation = groups[index]
+            if (
+                owner["validated"]
+                and not any(item.get("type") == "function_call" for item in owner["output_items"])
+                and observation["call_id"] == f"replay_host_input:{owner['call_id']}"
+                and observation["response_id"] is None
+                and observation["validated"]
+                and observation["reasoning_tokens"] == 0
+                and not observation["output_items"]
+                and not observation["tool_outputs"]
+                and observation["input_items"]
+                and all(
+                    isinstance(item, dict) and item.get("role") == "user"
+                    and item.get("type", "message") == "message"
+                    for item in observation["input_items"]
+                )
+            ):
+                index += 1
+        return count
 
     def load_current(self, pid: str) -> tuple[LLMReplayHead, LLMReplayTurn, dict[str, Any]] | None:
         head = self.store.get_llm_replay_head(pid)
@@ -312,7 +352,7 @@ class LLMReplayService:
         return ReplayRequest(pid=pid, run_id=run_id, provider_fingerprint=provider_fingerprint, model=model, context_generation=context_generation, expected_head=head, response_items=items, payload=payload, input_items=current_items, flow_context=flow_context, estimated_input_tokens=estimate_replay_input_tokens(items, opaque_tokens=opaque_tokens, tools=tools))
 
     def _admit_request_payload(self, payload: dict[str, Any], input_items: list[dict[str, Any]]) -> None:
-        if len(payload["groups"]) >= self.max_turns:
+        if self._retained_turn_count(payload["groups"]) >= self.max_turns:
             raise ReplayStateError("Responses replay requires semantic compaction before another turn")
         # Include the new input before a paid Provider call. Generated output
         # is still checked separately at stage: ciphertext size cannot be
@@ -357,7 +397,7 @@ class LLMReplayService:
             payload["flow_context"] = DataFlowContext.aggregate([request.flow_context, flow_context]).to_dict()
         if any(group["call_id"] == call_id for group in payload["groups"]):
             raise ReplayStateError("Responses replay local call identity was reused")
-        if len(payload["groups"]) >= self.max_turns:
+        if self._retained_turn_count(payload["groups"]) >= self.max_turns:
             raise ReplayStateError("Responses replay requires semantic compaction before another turn")
         payload["groups"].append({"call_id": call_id, "response_id": response_id, "input_items": deepcopy(request.input_items), "output_items": items, "tool_outputs": [], "reasoning_tokens": reasoning_token_bound(items, usage, max_output_tokens), "validated": False})
         return self._publish(pid=request.pid, run_id=request.run_id, provider_fingerprint=request.provider_fingerprint, model=request.model, context_generation=request.context_generation, payload=payload, expected=request.expected_head)
@@ -447,8 +487,9 @@ class LLMReplayService:
             raise ReplayStateError("Responses replay Host observation does not match its validated turn")
         if any(item.get("type") == "function_call" for item in groups[-1]["output_items"]):
             raise ReplayStateError("Responses replay Host observation cannot replace a native tool output")
-        if len(groups) >= self.max_turns:
-            raise ReplayStateError("Responses replay requires semantic compaction before another turn")
+        # This observation settles the admitted provider turn. It must not
+        # consume another turn after the Host has already acknowledged input.
+        # Publication still validates the logical turn and private byte bounds.
         groups.append(group)
 
     def compact(self, *, pid: str, context_generation: str, messages: Sequence[Mapping[str, Any]], flow_context: DataFlowContext, retain_groups: int = 0, replaced_context_oid: str | None = None) -> LLMReplayHead:

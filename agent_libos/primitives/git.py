@@ -1226,6 +1226,7 @@ class GitPrimitive:
             truncated=total_entries > limit,
             bytes=len(state.status_porcelain),
             sha256=state.status_sha256,
+            limit=limit,
         )
 
     def repository_info(self, pid: str, *, worktree_id: str = "main") -> GitRepositoryInfo:
@@ -1483,6 +1484,8 @@ class GitPrimitive:
             truncated=len(full) > selected_limit,
             bytes=len(full),
             sha256=patch_result.stdout_sha256,
+            paths_sha256=_sha256(b"\0".join(sorted(set(paths)))),
+            max_bytes=selected_limit,
         )
         return result, {
             "repository_id": result.repository_id,
@@ -1586,6 +1589,10 @@ class GitPrimitive:
             if token.token != self._state_token(after).token:
                 raise GitError(GitErrorCode.STALE_STATE.value, "Git state changed while log was being read", retryable=True)
             payload = {
+                "repository_id": before.layout.repository_id,
+                "worktree_id": before.layout.worktree_id,
+                "ref_oid": oid,
+                "limit": selected_limit,
                 "commits": commits,
                 "truncated": truncated,
                 "bytes": len(raw),

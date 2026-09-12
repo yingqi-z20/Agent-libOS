@@ -67,8 +67,9 @@ from agent_libos.llm.provider_continuation import (
     continuation_source_sha256,
     has_provider_continuation_result,
     is_provider_continuation_completion,
+    load_continuation_data,
+    pending_continuation_marker,
     provider_repair_messages,
-    validated_continuation_marker,
 )
 from agent_libos.llm.provider_tools import provider_tool_result_text
 from agent_libos.llm.continuation_compaction import (
@@ -687,33 +688,40 @@ class LLMProcessExecutor:
             pid=pid, purpose=_PROVIDER_CONTINUATION_PURPOSE,
         )
         self._require_provider_continuation_settlement(pid, marker)
-        if marker is None:
+        if pending_continuation_marker(self._processes, pid=pid, marker=marker) is None:
             return None
-        manifest = validated_continuation_marker(marker)
-        if manifest.get("state") == "consumed":
-            return None
-        generation = self._processes.get_llm_context_generation(pid)
-        if manifest.get("context_generation") != generation:
-            # Checkpoint restore starts a new local context generation. A
-            # marker from the discarded generation cannot select new work.
-            return None
-        source = self._processes.get_llm_call(str(manifest.get("call_id") or ""))
-        if (
-            source is None or source.pid != manifest.get("source_pid", pid)
-            or source.status != "ok" or not source.completed_at
-            or (source.tool_calls != [] and source.request_options.get("provider_tools_function_call_count") != 0)
-            or continuation_source_sha256(source) != manifest.get("source_sha256")
-        ):
-            raise ValidationError("provider continuation source is unavailable or changed")
+        assert marker is not None
         resolved = self._llms.resolve_for_process(pid)
-        if manifest.get("profile_identity_sha256") != resolved.identity_sha256:
-            raise ValidationError("provider continuation profile changed; start a new task")
-        payload = self._provider_continuation_payloads.get(marker.call_id)
-        if payload is None:
-            payload = {"message": marker.messages, "flow_context": marker.raw_response}
-        if hashlib.sha256(dumps(to_jsonable(payload)).encode()).hexdigest() != manifest.get("payload_sha256"):
-            raise ValidationError("provider continuation content is unavailable under the retention policy")
-        return {"marker": marker, "manifest": manifest, **payload}
+        return load_continuation_data(
+            self._processes, pid=pid, marker=marker,
+            profile_identity_sha256=resolved.identity_sha256,
+            volatile_payload=self._provider_continuation_payloads.get(marker.call_id),
+        )
+
+    def _validate_provider_continuation_request_sources(self, state: _LLMCallState) -> bool:
+        call_id = state.request_options.get("provider_continuation_source_call_id")
+        if call_id is None:
+            return False
+        pending = self._provider_continuation_data(state.pid)
+        if (
+            pending is None or pending["manifest"]["call_id"] != call_id
+            or state.provider_tools_enabled
+        ):
+            raise ValidationError("provider continuation request lost its local result binding")
+        context = DataFlowContext.from_dict(pending["flow_context"])
+        if not set(context.source_refs).issubset(state.flow_context.source_refs):
+            raise ValidationError("provider continuation request lost its source references")
+
+        def resolve_file(path: str) -> str:
+            if self._file_resource_resolver is None:
+                raise ValidationError("provider continuation file authority resolver is unavailable")
+            return self._file_resource_resolver(path)
+
+        self._data_flow.validate_replay_sources(
+            state.pid, context, file_resource_resolver=resolve_file,
+            allow_recovered_source_snapshots=True,
+        )
+        return True
 
     def _require_provider_continuation_settlement(
         self, pid: str, marker: LLMCallRecord | None,
@@ -6069,14 +6077,17 @@ class LLMProcessExecutor:
         # after the complete request has been assembled. Prompt-mode notices
         # therefore participate in the exact payload admitted for dispatch.
         self._prepare_llm_budget_envelope(state)
+        continuation_sources = self._validate_provider_continuation_request_sources(state)
         self._data_flow.precheck_egress_clearance(
             pid=state.pid,
             sink=precheck_sink,
             context=state.flow_context,
             payload=state.egress_payload,
             **({"allow_recovered_source_snapshots": True} if (
-                state.replay_request is not None
-                and state.replay_request.expected_head is not None
+                continuation_sources or (
+                    state.replay_request is not None
+                    and state.replay_request.expected_head is not None
+                )
             ) else {}),
         )
         state.canonical_args = {
@@ -7017,6 +7028,7 @@ class LLMProcessExecutor:
         assert state.resolved is not None and state.sink is not None
         if state.resource_envelope is None:
             raise RuntimeError("LLM resource envelope was not prepared")
+        continuation_sources = self._validate_provider_continuation_request_sources(state)
         invocation = ProtectedOperationInvocation(
             pid=state.pid,
             actor=state.pid,
@@ -7038,7 +7050,7 @@ class LLMProcessExecutor:
             data_flow_payload=state.egress_payload,
             data_flow_operation="llm.complete",
             data_flow_allow_recovered_source_snapshots=(
-                state.resumed_release or (
+                state.resumed_release or continuation_sources or (
                     state.replay_request is not None
                     and state.replay_request.expected_head is not None
                 )
@@ -7137,6 +7149,7 @@ class LLMProcessExecutor:
     def _assert_llm_call_scope(self, state: _LLMCallState) -> None:
         assert state.resolved is not None and state.sink is not None
         self._validate_replay_request_sources(state)
+        self._validate_provider_continuation_request_sources(state)
         if state.previous_response_id is not None:
             raise _LLMProviderChainScopeChanged(
                 "provider-side Responses state is disabled for full-snapshot "
