@@ -35,6 +35,11 @@ from agent_libos.storage.mcp_v7_migration import (
     plan_store_v7_migration,
 )
 from agent_libos.storage.v7_schema_contract import V7_TABLES
+from agent_libos.storage.v8_schema_contract import V8_TABLES
+from agent_libos.storage.llm_v8_migration import (
+    apply_store_v8_migration,
+    plan_store_v8_migration,
+)
 from tests.runtime.test_semantic_v5_postgres_migration import _postgres_schema_dsn
 
 
@@ -144,11 +149,12 @@ def _downgrade_to_v6(dsn: str) -> None:
 
     PostgresStore(dsn).close()
     with psycopg.connect(dsn, autocommit=True) as connection:
-        for table in sorted(V7_TABLES):
+        connection.execute("DROP INDEX IF EXISTS idx_llm_pending_replay_recovery")
+        for table in sorted(V8_TABLES | V7_TABLES):
             connection.execute(sql.SQL("DROP TABLE {}").format(sql.Identifier(table)))
         changed = connection.execute(
             "UPDATE runtime_schema SET schema_version = 6 "
-            "WHERE singleton = 1 AND schema_version = 7"
+            "WHERE singleton = 1 AND schema_version = 8"
         )
         assert changed.rowcount == 1
         connection.execute(
@@ -255,7 +261,7 @@ def test_postgres_v7_fresh_catalog_reopen_and_atomic_cas() -> None:
             assert UnitOfWork(reopened).mcp_remote_tasks.get(task.task_ref) == task
             assert reopened.conn.execute(
                 "SELECT schema_version FROM runtime_schema WHERE singleton = 1"
-            ).fetchone() == {"schema_version": 7}
+            ).fetchone() == {"schema_version": 8}
         finally:
             reopened.close()
 
@@ -581,6 +587,11 @@ def test_postgres_v6_to_v7_plan_apply_and_reopen() -> None:
         )
 
         assert result.applied
+        v8_plan = plan_store_v8_migration(dsn)
+        apply_store_v8_migration(
+            dsn, expected_plan_sha256=v8_plan.plan_sha256,
+            postgres_snapshot_confirmed=True,
+        )
         reopened = PostgresStore(dsn)
         try:
             assert reopened.conn.execute(

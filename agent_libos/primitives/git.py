@@ -85,6 +85,7 @@ _BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}\Z")
 _REF_RE = re.compile(r"refs/(?:heads|tags|remotes|agent-libos)/[A-Za-z0-9][A-Za-z0-9._/-]{0,500}\Z")
 _REMOTE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _WORKTREE_ID_RE = re.compile(r"(?:main|wt_[A-Za-z0-9_-]{1,96})\Z")
+_WORKTREE_IDENTITY_RE = re.compile(r"[0-9a-f]{32}\Z")
 _PR_ID_RE = re.compile(r"pr_[A-Za-z0-9_-]{1,96}\Z")
 _GIT_ERROR_PATTERNS: tuple[tuple[GitErrorCode, tuple[bytes, ...]], ...] = (
     (GitErrorCode.NOT_REPOSITORY, (b"not a git repository",)),
@@ -213,6 +214,7 @@ class GitPrimitive:
         self.data_flow = data_flow
         self._dispatch_state = threading.local()
         self._resource_scope_state = threading.local()
+        self._main_worktree_identity: str | None = None
 
     @property
     def repository_resource(self) -> str:
@@ -228,13 +230,43 @@ class GitPrimitive:
 
     def _worktree_path(self, worktree_id: str) -> str | Path | None:
         if not isinstance(worktree_id, str) or not _WORKTREE_ID_RE.fullmatch(worktree_id):
-            raise GitError(GitErrorCode.INVALID_PATH.value, "invalid managed worktree id")
+            raise GitError(
+                GitErrorCode.INVALID_PATH.value,
+                "invalid managed worktree id",
+                details={"hint": "worktree_id_must_be_main_or_a_managed_wt_id"},
+            )
         if worktree_id == "main":
             return None
         root = getattr(self.provider, "managed_worktree_root", None)
         if root is None:
             raise GitError(GitErrorCode.UNSUPPORTED.value, "Git provider does not support managed worktrees")
         return Path(root) / worktree_id
+
+    def canonical_worktree_id(self, worktree_id: Any) -> Any:
+        """Map the main worktree's reported identity digest back to ``main``.
+
+        Read results echo ``layout.worktree_id``, a 32-hex identity digest, and
+        a model that copies it into the next call's ``worktree_id`` is doing the
+        natural thing; rejecting it cost real runs several retries.  Only the
+        current main worktree's own identity is mapped, never a guess, and the
+        tool layer applies this once so every ``== "main"`` check downstream
+        keeps its meaning.
+        """
+
+        if self._is_main_worktree_identity(worktree_id):
+            return "main"
+        return worktree_id
+
+    def _is_main_worktree_identity(self, value: Any) -> bool:
+        # The identity is learned from earlier protected reads (see ``_read``);
+        # no provider call happens here, so an unknown digest is simply rejected.
+        if not isinstance(value, str) or _WORKTREE_IDENTITY_RE.fullmatch(value) is None:
+            return False
+        return self._main_worktree_identity is not None and value == self._main_worktree_identity
+
+    def _remember_main_worktree_identity(self, value: Any) -> None:
+        if isinstance(value, str) and _WORKTREE_IDENTITY_RE.fullmatch(value) is not None:
+            self._main_worktree_identity = value
 
     @staticmethod
     def _validate_ref_name(value: str, *, branch_only: bool = False) -> str:
@@ -659,6 +691,8 @@ class GitPrimitive:
                         ProviderPhase(operation, information_flow=True),
                         guarded_callback,
                     )
+                    if worktree_id == "main":
+                        self._remember_main_worktree_identity(summary.get("worktree_id"))
                     current_flow = read_flow_snapshot.refresh()
                     reported_state_token = summary.get("state_token")
                     if (
@@ -1192,6 +1226,7 @@ class GitPrimitive:
             truncated=total_entries > limit,
             bytes=len(state.status_porcelain),
             sha256=state.status_sha256,
+            limit=limit,
         )
 
     def repository_info(self, pid: str, *, worktree_id: str = "main") -> GitRepositoryInfo:
@@ -1289,14 +1324,26 @@ class GitPrimitive:
         head_oid: str | None = None
         if scope == "worktree":
             if base is not None or head is not None:
-                raise GitError(GitErrorCode.INVALID_REF.value, "worktree diff does not accept base/head")
+                raise GitError(
+                    GitErrorCode.INVALID_REF.value,
+                    "worktree diff does not accept base/head",
+                    details={"hint": "worktree_scope_requires_null_base_and_head"},
+                )
         elif scope == "staged":
             if base is not None or head is not None:
-                raise GitError(GitErrorCode.INVALID_REF.value, "staged diff does not accept base/head")
+                raise GitError(
+                    GitErrorCode.INVALID_REF.value,
+                    "staged diff does not accept base/head",
+                    details={"hint": "staged_scope_requires_null_base_and_head"},
+                )
             args.append("--cached")
         elif scope == "range":
             if base is None or head is None:
-                raise GitError(GitErrorCode.INVALID_REF.value, "range diff requires base and head")
+                raise GitError(
+                    GitErrorCode.INVALID_REF.value,
+                    "range diff requires base and head",
+                    details={"hint": "range_scope_requires_base_and_head_refs"},
+                )
             base_oid = self._resolve_commit(base, worktree_id=worktree_id)
             head_oid = self._resolve_commit(head, worktree_id=worktree_id)
             args.extend([base_oid, head_oid])
@@ -1437,6 +1484,8 @@ class GitPrimitive:
             truncated=len(full) > selected_limit,
             bytes=len(full),
             sha256=patch_result.stdout_sha256,
+            paths_sha256=_sha256(b"\0".join(sorted(set(paths)))),
+            max_bytes=selected_limit,
         )
         return result, {
             "repository_id": result.repository_id,
@@ -1540,6 +1589,10 @@ class GitPrimitive:
             if token.token != self._state_token(after).token:
                 raise GitError(GitErrorCode.STALE_STATE.value, "Git state changed while log was being read", retryable=True)
             payload = {
+                "repository_id": before.layout.repository_id,
+                "worktree_id": before.layout.worktree_id,
+                "ref_oid": oid,
+                "limit": selected_limit,
                 "commits": commits,
                 "truncated": truncated,
                 "bytes": len(raw),

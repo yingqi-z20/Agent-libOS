@@ -399,8 +399,18 @@ def _git_tool_error(
         details={
             "git_error_code": exc.code,
             "operation": exc.operation,
+            # Identifier-shaped hints minted by the Git boundary reach the
+            # model as value-free codes; the free-text message stays hashed.
+            **{
+                key: value
+                for key, value in exc.details.items()
+                if key in _PUBLIC_GIT_DETAIL_KEYS and isinstance(value, str)
+            },
         },
     )
+
+
+_PUBLIC_GIT_DETAIL_KEYS = frozenset({"hint"})
 
 
 def _git_tool_error_is_retryable(
@@ -432,10 +442,23 @@ class _GitTool(SyncAgentTool[_StrictArgs]):
     def run(self, args: _StrictArgs, ctx: ToolContext) -> Any:
         if ctx.runtime is None or getattr(ctx.runtime, "git", None) is None:
             raise ToolExecutionError("Runtime Git boundary is unavailable.", code=ToolErrorCode.UNSUPPORTED)
+        kwargs = args.model_dump(exclude_none=True, by_alias=True)
+        if "worktree_id" in kwargs:
+            # Results report the main worktree as its identity digest; a model
+            # that echoes that digest back means the main worktree.  Test
+            # doubles without the real primitive are left untouched.
+            canonical = getattr(ctx.runtime.git, "canonical_worktree_id", None)
+            if callable(canonical):
+                try:
+                    mapped = canonical(kwargs["worktree_id"])
+                except Exception:
+                    mapped = None
+                if isinstance(mapped, str):
+                    kwargs["worktree_id"] = mapped
         try:
             result = getattr(ctx.runtime.git, self.method_name)(
                 pid=ctx.pid,
-                **args.model_dump(exclude_none=True, by_alias=True),
+                **kwargs,
             )
         except GitError as exc:
             raise _git_tool_error(

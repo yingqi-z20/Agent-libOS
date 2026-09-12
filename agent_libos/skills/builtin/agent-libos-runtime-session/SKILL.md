@@ -5,9 +5,10 @@ allowed-tools: process_exit compact_process_context get_current_time sleep
 ---
 # Manage time, context, and process completion
 
-Activating this Skill exposes schemas but grants no underlying authority. Make a
-wait, compaction, or exit the only call in its turn because it can stop later
-calls in a parallel batch.
+Activating this Skill exposes schemas but grants no underlying authority. A
+wait, compaction, or exit stops later calls in the same response, so make it
+the last call of its turn: a response may end with `human_output` followed by
+`process_exit`, but nothing may follow the exit.
 
 ## Tool guide
 
@@ -80,9 +81,16 @@ payload history even though generation, labels, and evidence survive.
 
 ### `process_exit`
 
-Call alone after every write, wait, merge, requested Git/checkpoint action,
-verification, queued message, and required Human output is complete. Result
-input precedence is exact:
+Call after every write, wait, merge, requested Git/checkpoint action,
+verification, and queued message is complete. Send required final `human_output`
+immediately before the confirmed exit in the same response, with `process_exit`
+last; do not send a final result again if it was already delivered. The initial
+result-bearing review call follows Prepare, call, ACK/review below.
+<!-- tool-contract: field:optional_result_object -->
+Existing non-empty object id to use as process result. When there is no existing result Object, pass JSON null; omission is also valid when allowed by the call schema. Never pass an empty string or the text 'None' or 'null'.
+<!-- /tool-contract -->
+
+Result input precedence is exact:
 
 1. Nonempty `result_oid` reuses an existing readable Object and overrides everything;
    an empty string is rejected before any terminal transition.
@@ -94,10 +102,12 @@ input precedence is exact:
    result inputs only when an intentionally empty terminal result is the known
    contract; never do so to discover whether an exit gate exists.
 
-`review_token` and `completion_evidence` are only for cumulative review. A
-committed exit returns `status="exited"` and `terminal_committed=true`; only that
-status confirms terminal completion. `status="completion_review_required"` is
-nonterminal. If post-commit cleanup fails, the same exited result includes a
+<!-- tool-contract: result:process_exit -->
+Only status=exited with terminal_committed=true confirms exit; completion_review_required is nonterminal. Failed calls retain safe diagnostics.
+<!-- /tool-contract -->
+
+`review_token` and `completion_evidence` are only for cumulative review.
+If post-commit cleanup fails, the same exited result includes a
 safe structured `error.code="terminal_cleanup_required"`, the committed
 `result_oid`, cleanup state, and Host recovery instructions.
 
@@ -125,8 +135,9 @@ those Host-managed runners.
 4. Before exit re-read the cumulative goal/ledger and queued messages. A notice
    pauses exit: follow source-neutral Skill discovery, activate a result that
    declares a message-read tool, read/ACK input, and merge cumulative follow-ups.
-   Send required `human_output` in a prior turn, then call `process_exit` alone
-   and follow Completion evidence on review.
+   Send required `human_output` in a prior turn or immediately before
+   `process_exit` in the same response (exit last), and follow Completion
+   evidence on review.
 
 ## Failure and recovery
 
@@ -212,10 +223,11 @@ nonempty `final_verification` list likewise contains only observed successful
 tool names.
 
 There is no separate “clear review” call. After the post-ACK review, complete
-missing tools, prepare evidence, and send required Human output in its own turn.
-Successful tools/Human output do not change the token; a goal version change,
-new Human message, or message ACK does. Then call `process_exit` alone with the
-latest token, evidence, and the same desired result. Validation rebuilds the
+missing tools and prepare evidence. Successful tools/Human output do not change
+the token; a goal version change, new Human message, or message ACK does. Then
+send any required final Human output and `process_exit` with the latest token,
+evidence, and the same desired result in one response, with `process_exit` as
+the last call. Validation rebuilds the
 current successful-tool list. If another review returns, resolve its newest
 errors and input, refresh after any ACK, and retry. Stop only on
 `status="exited"`.

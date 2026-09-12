@@ -11,7 +11,11 @@ Generic filesystem mutations are whole-target operations. Establish the current 
 
 ### `write_text_file`
 
-- Input: cwd-relative `path`, complete string `content`, optional `encoding`, `overwrite` (default `true`), and optional `expected_content_sha256`. Pass the full-content digest returned by a complete `read_text_file` to replace only that exact version, or pass `"missing"` to create only while the target is absent.
+<!-- tool-contract: field:content_precondition -->
+Compare-and-swap precondition. Pass the full-content SHA-256 returned by read_text_file, or 'missing' to require creation. JSON null disables this precondition; omission is also valid when allowed by the call schema. Do not replace a rejected precondition with null merely to make a write pass.
+<!-- /tool-contract -->
+
+- Input: cwd-relative `path`, complete string `content`, optional `encoding`, `overwrite` (default `true`), and optional `expected_content_sha256`.
 - It writes the entire encoded file, not a patch or range. Missing parent directories are created automatically. With `overwrite=false`, an existing file fails instead of being replaced; use that setting for creation when unexpected existence matters.
 - Conditional writes require a compare-and-swap-capable filesystem provider. A legacy provider still supports ordinary writes, but a request with `expected_content_sha256` fails before mutation when that capability is unavailable.
 - Output: root-relative `path`, encoded `bytes_written`, and `created`. `created=false` means an existing file was replaced; it does not mean no change. The result does not echo content or encoding, so verify both separately.
@@ -37,7 +41,7 @@ Generic filesystem mutations are whole-target operations. Establish the current 
 ## Recommended workflow
 
 1. Activate workspace navigation. Record cwd, root-relative target identity, current kind, relevant content/tree, and the user-approved scope. Preserve requested pre-change evidence before writing.
-2. For a new file, prefer `write_text_file` with `overwrite=false`. For replacement, compare the complete intended content against the current file, then call it with the intended encoding and explicit overwrite choice. Do not pass a diff fragment as `content`. Before dispatch, confirm that the resulting file can fit a complete fresh `read_text_file` result under both its read bound and the global result-persistence bound; otherwise use a bounded Object/file-transfer workflow with its own verification rather than this generic text-edit path.
+2. For a new file, prefer `write_text_file` with `overwrite=false`. For replacement, reuse complete content and its non-null `content_sha256` already visible in the current context when the target/cwd is unchanged and no later mutation is known. Compare the intended content against that version and pass its exact digest as `expected_content_sha256`, with the intended encoding and explicit overwrite choice; the conditional write checks for intervening changes. Do not repeat a complete read merely to refresh an unchanged baseline. Re-read when the content or digest is unavailable, the read was truncated, or a later mutation is known. Do not pass a diff fragment as `content`. Before dispatch, confirm that the resulting file can fit a complete fresh `read_text_file` result under both its read bound and the global result-persistence bound; otherwise use a bounded Object/file-transfer workflow with its own verification rather than this generic text-edit path.
 3. For directories, call `write_directory` with explicit `parents` and `exist_ok`. Avoid silently accepting an unexpected existing path.
 4. Before `delete_file` or `delete_directory`, re-observe the exact target immediately before deletion. Keep `missing_ok=false` unless idempotent cleanup explicitly accepts prior absence. Keep `recursive=false` unless the complete subtree and deletion scope were reviewed.
 5. After the last mutation, use a separately activated read tool: re-read written text with the same encoding, list a created/deleted directory's parent, and verify type and canonical path. In a Git worktree, use Git status/diff through the Git Skills to detect unintended tracked changes.
@@ -51,6 +55,7 @@ Generic filesystem mutations are whole-target operations. Establish the current 
 - A failed side-effecting call is not proof that nothing changed. Local filesystem mutations are not transactionally rolled back, and recursive deletion can remove earlier children before failing on a later child. On timeout, provider error, unknown settlement, or post-effect classification failure, inspect the exact target and parent before deciding whether any retry is safe.
 - The complete content is subject to the global tool-argument size limit before dispatch. The write argument limit can be larger than the read and result-persistence limits, so argument acceptance alone does not prove that the mandatory exact readback will fit. Establish a viable verification route before mutation. A preflight size rejection performs no write; use the appropriate Object/file-transfer boundary rather than silently splitting one intended whole-file replacement.
 - On exists/not-found/wrong-kind errors, observe state and correct the plan. Never recover automatically by enabling overwrite, `parents`, recursion, or `missing_ok`; each changes the accepted mutation scope.
+- On a content compare-and-swap conflict, re-read the target and reconcile the intended edit with that version before retrying with its new digest. If conditional writes are unsupported, report the missing provider capability. Never drop `expected_content_sha256` or replace it with `null` to retry a rejected conditional write.
 - `bytes_written` proves the accepted encoded byte count, not that another actor did not modify the file afterward. An earlier read, listing, diff, or checkpoint becomes stale after any later mutation.
 
 ## Completion evidence

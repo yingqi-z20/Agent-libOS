@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 
 import agent_libos.storage.mcp_v7_migration as mcp_v7_migration
+import agent_libos.storage.llm_v8_migration as llm_v8_migration
 import agent_libos.storage.semantic_v5_migration as semantic_v5_migration
 import agent_libos.storage.semantic_v6_migration as semantic_v6_migration
 from agent_libos.storage.mcp_v7_migration import (
@@ -31,6 +32,7 @@ from agent_libos.storage.semantic_v6_migration import (
     plan_store_v6_migration,
 )
 from tests.runtime.test_mcp_v7_postgres import _downgrade_to_v6
+from tests.runtime.test_llm_v8_postgres_migration import _downgrade_to_v7
 from tests.runtime.test_semantic_v5_postgres_migration import (
     _downgrade_to_v4,
     _postgres_schema_dsn,
@@ -54,6 +56,16 @@ class _MigrationCase:
 
 
 _CASES = (
+    _MigrationCase(
+        label="v7-to-v8",
+        module=llm_v8_migration,
+        setup_source=_downgrade_to_v7,
+        plan=llm_v8_migration.plan_store_v8_migration,
+        apply=llm_v8_migration.apply_store_v8_migration,
+        error=llm_v8_migration.StoreV8MigrationError,
+        from_version=7,
+        to_version=8,
+    ),
     _MigrationCase(
         label="v4-to-v5",
         module=semantic_v5_migration,

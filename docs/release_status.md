@@ -1,6 +1,6 @@
-# Agent libOS 1.5.2 Status
+# Agent libOS 1.5.3 Status
 
-Agent libOS 1.5.2 is the current release line for the core Python runtime scope
+Agent libOS 1.5.3 is the current release line for the core Python runtime scope
 defined in the [support matrix](support_matrix.md). Release status for any source tree is
 conditional on that exact tree passing the checked-in CI workflow; local
 deterministic results do not substitute for its Python-version, PostgreSQL, and
@@ -31,7 +31,7 @@ checkout or release artifact.
 
 ## Implemented release safeguards
 
-- A manual native workflow can build self-contained 1.5.2 internal desktop
+- A manual native workflow can build self-contained 1.5.3 internal desktop
   packages for macOS arm64 (DMG/ZIP), Windows x64 (NSIS/ZIP), and Ubuntu
   24.04/glibc x64 (AppImage/tar.gz). Each set carries checksums, a CycloneDX
   SBOM, component inventory, and third-party notices and must pass frozen
@@ -44,9 +44,9 @@ checkout or release artifact.
   one root AgentProcess tree. They persist requirements, idempotent command
   receipts, append-only ledger links, and locally integrity-bound resume points;
   they do not introduce a generic workflow DSL or distributed scheduler.
-- RuntimeStore schema v7 is the only store format accepted by ordinary 1.5.2
-  startup. A canonical v6 store has one explicit offline, digest-bound migration
-  path to v7; v5 must first migrate to v6 and v4 must first migrate to v5.
+- RuntimeStore schema v8 is the only store format accepted by ordinary 1.5.3
+  startup. A canonical v7 store has one explicit offline, digest-bound migration
+  path to v8; v6 must first migrate to v7, v5 to v6, and v4 to v5.
   Runtime startup never migrates a store. Schema v3 remains archive-only under
   1.0.1, and malformed/older stores have no read-only bridge or dual-schema mode.
 - Semantic approval and ingress classification remain default-off. Shadow adds
@@ -278,7 +278,7 @@ checkout or release artifact.
   Deterministic mocked MCP coverage is part of the normal matrix.
   Platform-specific skips stay documented and real Deno runs by default when
   installed.
-- The Durable Task Run gate requires fresh schema-v7 SQLite/PostgreSQL shape,
+- The Durable Task Run gate requires fresh schema-v8 SQLite/PostgreSQL shape,
   older-store zero-write refusal, revision/command conflicts, stale Runtime-epoch
   fencing, plaintext opt-in and terminal purge, unknown-effect/ObjectTask
   blocking, checkpoint intersection refusal, and GUI snapshot schema-v3 behavior. Its
@@ -416,7 +416,7 @@ checkout or release artifact.
   The profile must validate exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The `release-artifacts` CI job is configured to build one canonical 1.5.2
+- The `release-artifacts` CI job is configured to build one canonical 1.5.3
   wheel/source pair, reject extra or non-regular output, and record an exact
   checksum manifest.
   Python 3.11 through 3.14 smoke jobs download and verify that same pair, install
@@ -430,7 +430,7 @@ checkout or release artifact.
   protected paths.
   It also writes a self-contained OAuth fixture into the temporary smoke
   directory and runs Host-pinned loopback-TLS authorization-code/PKCE/Bearer
-  plus offline Store v6-to-v7 migration/reopen gates from the installed package. A
+  plus offline Store v6-to-v7-to-v8 migration/reopen gates from the installed package. A
   separate installed Runtime/SQLite/CLI smoke captures MRTR continuations and
   remote Tasks, reopens the Store, responds/cancels continuations, and performs
   Task get/update/cancel/re-observe while requiring exact dispatch counts and
@@ -456,7 +456,7 @@ endpoint to read a policy and CSV, compute a report, emit `human_output`, and
 exit. No provenance-bearing report for that run is checked in with the source
 revision, model/profile identity, redacted configuration, environment, and raw
 test outcome needed to reproduce or compare it. It is therefore an unarchived
-observation, not Agent libOS 1.5.2 release evidence, and supports no call-count,
+observation, not Agent libOS 1.5.3 release evidence, and supports no call-count,
 token-count, approval-count, latency, or serial-versus-parallel claim. Promote a
 future rerun only after using a documented opt-in real-model gate and preserving
 its reproducible report outside this status summary.
@@ -480,9 +480,9 @@ its reproducible report outside this status summary.
   artifacts depend on that job. This is a configured CI gate, not a claim that
   a separate local macOS or Windows CI run was performed.
 - SQLite and PostgreSQL implement the covered RuntimeStore contract. This
-  release accepts only store schema v7 at Runtime startup. A canonical v6 store
-  may use the explicit offline v6-to-v7 migration; v5 must first migrate to v6,
-  and v4 must first migrate to v5. A schema-v3 store is rejected before
+  release accepts only store schema v8 at Runtime startup. A canonical v7 store
+  may use the explicit offline v7-to-v8 migration; v6 must first migrate to v7,
+  v5 to v6, and v4 to v5. A schema-v3 store is rejected before
   mutation and may be viewed or archived only with Agent libOS 1.0.1; still
   older stores require their matching archived release. Checkpoint and Image
   artifact versions remain independent of the store schema.
@@ -495,7 +495,7 @@ its reproducible report outside this status summary.
   non-bare workspace repository and system Git 2.26 or newer; unavailable Git
   fails individual calls without preventing Runtime startup. Host-configured
   remotes are the only first-class Git network exception. There is no Git CLI,
-  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.5.2.
+  GUI/HTTP surface, or real GitHub/GitLab API integration in 1.5.3.
 
 ## Remaining environment gates and non-blocking debt
 

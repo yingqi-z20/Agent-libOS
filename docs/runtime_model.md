@@ -312,6 +312,20 @@ breaking replacement of the former Object-Memory-snapshot behavior: existing
 Images selecting `image_only` adopt these semantics after upgrade; there is no
 legacy compatibility mode.
 
+After a Runtime reopen, tool-result payloads held in runtime memory are gone
+and the `working_set` materialization omits them with reason
+`capability_denied` or `missing`. When that happens the volatile prompt section
+adds a payload-free digest, `Durable activity before the last Runtime reopen`,
+rebuilt from durable events older than the most recent `runtime_shutdown`:
+files read and directories listed, files written with byte counts, shell
+commands with return codes, Git inspections, Skills activated, checkpoints, and
+Human deliveries. It carries paths, argv, identifiers, and counts only, never
+tool output; it walks at most `llm_context.reopen_digest_event_scan_limit`
+event rows (4,000 by default), so a very long history yields a partial digest,
+never a wrong one. Without a recorded shutdown nothing is rendered. The digest
+lets the model re-read only what it must edit or verify instead of every file
+it had already inspected.
+
 A persistent Runtime reopen has one separate, narrow initial-goal recovery path.
 A committed root `ProcessManager.spawn` publication records a size-bounded,
 integrity-bound JSON recovery envelope for its immutable initial GOAL when
@@ -350,8 +364,9 @@ through Host configuration `llm_context.policy: llm_context_object` or a
 Host-issued `context:enrichment/execute` capability for that process.
 
 When explicitly enabled, the context helper uses the active Runtime's
-`llm_context.schema_version`, `llm_context.object_name_prefix`, and
-`llm_context.recent_event_limit`; these are not import-time constants. New
+`llm_context.schema_version`, `llm_context.object_name_prefix`,
+`llm_context.recent_event_limit`, and `llm_context.recent_event_scan_limit`;
+these are not import-time constants. New
 context Objects carry the active schema version, and an existing context Object
 with a different schema fails closed before reuse. Event capture consumes the
 same configured, store-bounded window. In Runtime-owned prompt modes, the
@@ -404,7 +419,12 @@ maintenance uses at most `llm_context.storage_compaction_max_chunks` stages
 tail entries by default via
 `llm_context.storage_compaction_preserve_recent_entries`; the cumulative
 compressor summary remains. This avoids feeding context-maintenance artifacts
-back into an immediate second compaction. After compaction, the first safe
+back into an immediate second compaction. The compactor chooses as few stages
+as the Host's `llm_context.compaction_chunk_target_tokens` permits, balances
+uneven entries by token volume when the stage cap is reached, and saves the
+exact partition for restart. It retains only a recent suffix that fits the
+rendered token target alongside the full cumulative summary. Prior compaction
+envelopes are summarized, not copied into that suffix. After compaction, the first safe
 projected payload becomes a durable baseline and the storage trigger is
 re-armed at one configured waterline of additional growth (capped immediately
 below the hard limit). This hysteresis prevents maintenance events and child
@@ -520,6 +540,14 @@ their tools are model-visible. The broader general-purpose images retain
 source-neutral on-demand Skill projection for tasks whose tool domain is not
 known at launch.
 
+These four Images and the coding Image select the `working_set` memory policy:
+the goal and newest action feedback precede accumulated historical evidence,
+alongside current constraints, plans, and summaries. This prevents older tool
+results from starving the next observation when a long task reaches its
+materialization budget. It changes selection, not the permission checks or
+the chronological rendering of the selected context; see
+[Context Materialization](object_memory.md#context-materialization).
+
 LLM selection is host-controlled and process-local. A process stores only an
 `llm_profile_id`; the host Runtime resolves that id to a configured
 OpenAI-compatible profile at LLM-call time. Root spawn uses an explicit host
@@ -562,6 +590,16 @@ Trace persistence is terminal-call evidence, not a crash-safe per-attempt
 journal; cancellation or process loss may therefore leave only the protected
 effect and budget evidence.
 
+Official Astra Responses profiles also keep bounded Host-private replay state
+when full-I/O retention is enabled. The Runtime preserves complete ordered
+reasoning/message/tool groups and pairs durable tool outputs without duplicating
+existing TaskRun or `image_only` history. Requests send this local history with
+no `previous_response_id`; public observations omit encrypted reasoning.
+Replay is bound to process, TaskRun, provider/model, source labels, and context
+generation. Checkpoints retain local references, image exports exclude them,
+and purged payloads cannot be recovered through old references. See
+[Responses replay configuration](configuration.md#responses-reasoning-and-local-replay).
+
 Prompt caching has a model-visible layout policy and an independent Provider
 transport policy. The repository default remains
 `llm.prompt_layout=legacy_v1`, `prompt_cache_mode=provider_default`, and no cache
@@ -576,12 +614,21 @@ select the v2 layout.
 explicit breakpoint; separately configured legacy key/retention fields retain
 their legacy Provider behavior. `implicit` sends request-wide implicit cache
 options, while `explicit` also marks one stable text breakpoint. Both opt-in
-modes require a nonempty Host-configured `prompt_cache_key`. The wire key is not
+modes require a nonempty Host-configured `prompt_cache_key` when selected
+directly. The wire key is not
 that plaintext value: the Runtime derives an `alibos:v2:` key from the configured
 privacy/routing domain, Provider endpoint, model, stable prompt projection, and
 normalized tool table, without a Run or process id. The only v2 TTL is `30m`;
 it is mutually exclusive with legacy `prompt_cache_retention`, and opt-in modes
 cannot use that retention field.
+
+The separate `auto` choices for layout and cache mode are Host opt-ins. On the
+official endpoint they select the v2 layout and implicit `30m` candidate;
+custom endpoints keep legacy/provider-default behavior. Auto cache mode
+generates a private per-profile domain when no key is configured, stable within
+the registry lifetime. Explicit keys retain their cross-restart domain. These
+resolved policies participate in the same request, tool-schema, and provider
+identity snapshot.
 
 Cache options are sent to the exact Host-selected OpenAI-compatible endpoint,
 including an explicitly allowed custom base URL. If an endpoint rejects any v2
@@ -1025,7 +1072,8 @@ quantum limit and no bounded-run drain deadline. In all cases, a run:
 
 1. runs runnable processes,
 2. processes pending human terminal messages when work is blocked on human I/O,
-3. delivers process-message notices at tool boundaries,
+3. delivers process-message notices before model tool selection and at tool
+   boundaries,
 4. observes processes that condition-owning managers have returned to
    `runnable`,
 5. stops when no runnable or human-resumable work remains, or when the quantum
@@ -1372,7 +1420,7 @@ status, timestamps, and audit linkage.
 
 If a primitive or human tool blocks on human approval, the process enters
 `waiting_human`. Human requests are terminally decided once: only pending
-requests can be approved or rejected. Store schema v7 gives every request a
+requests can be approved or rejected. Store schema v8 gives every request a
 durable non-negative `revision`. Response, cancellation, claim/delivery, and
 retryable delivery-state updates compare the expected revision and status; a
 winner increments the revision, so a stale response cannot exploit a
@@ -1469,7 +1517,12 @@ guidance exceptions are restricted `discover_skills` queries for message/mailbox
 help and activation of a Skill that exposes the required message tools, so a
 process can reach a reader without bypassing the mailbox gate. A read with
 `ack=false` leaves the interrupt unread and therefore still preempting. Normal
-messages notify after a tool call and do not block the current action.
+messages do not block the current action: an unread normal message is noticed
+before each quantum's tool selection, so the mandatory read directive appears
+in the very next prompt (including the first quantum after a Runtime reopen),
+and again after each tool call while it stays unread. A notice that arrives
+mid-batch still stops the remaining calls of that response; the runtime then
+emits `tool_batch_truncated` naming the calls that did not run.
 
 ObjectTask completion and waiting notices use the same queue. By default they
 arrive on channel `object-task` from sender `object_task:<task_id>`. A process
@@ -1605,7 +1658,10 @@ The built-in `process_exit` tool requests the `exited` state and can attach a
 final Object Memory result. For an image with cumulative completion review, an
 attempt can instead return `status="completion_review_required"` without making
 the process terminal; the caller must address the review and retry with its
-fresh token and evidence. The trusted Host API
+fresh token and evidence. Because a multi-call response is dispatched in order
+and stops after a terminal call, the final `human_output` and the confirmed
+`process_exit` may be sent in the same response with `process_exit` last; a
+call placed after an exit never runs. The trusted Host API
 `ProcessManager.exit(..., failed=True)` is the separate path that can mark a
 process `failed`; the model-facing tool has no failure-state argument. Callers
 should omit `result_oid` and `review_token` until they have real values;

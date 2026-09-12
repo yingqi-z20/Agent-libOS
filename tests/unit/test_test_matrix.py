@@ -546,7 +546,11 @@ class TestTestMatrix:
         assert status == test_matrix.PROCESS_TIMEOUT_EXIT_CODE
         assert time.monotonic() - started < 5
 
-    def test_timeout_terminates_a_spawned_descendant(self, tmp_path: Path) -> None:
+    def test_timeout_terminates_a_spawned_descendant(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         child_pid_file = tmp_path / "child.pid"
         child_ready_file = tmp_path / "child.ready"
         child_code = """
@@ -567,15 +571,29 @@ import time
 
 ready = pathlib.Path(sys.argv[1])
 child = subprocess.Popen([sys.executable, "-c", sys.argv[2], str(ready)])
-deadline = time.monotonic() + 5
-while not ready.exists() and time.monotonic() < deadline:
+while not ready.exists():
     time.sleep(0.01)
-if not ready.exists():
-    raise RuntimeError("descendant did not become ready")
 pathlib.Path(sys.argv[3]).write_text(str(child.pid))
 time.sleep(30)
 """
 
+        class ReadyDescendantProcess(test_matrix.subprocess.Popen):
+            wait_for_readiness = True
+
+            def wait(self, timeout: float | None = None) -> int:
+                if self.wait_for_readiness:
+                    self.wait_for_readiness = False
+                    # Start the short timeout after the descendant is ready;
+                    # interpreter startup can be slow on a busy Windows host.
+                    deadline = time.monotonic() + 30
+                    while not child_pid_file.exists() and self.poll() is None:
+                        if time.monotonic() >= deadline:
+                            # Use the production timeout cleanup on startup failure.
+                            raise test_matrix.subprocess.TimeoutExpired(self.args, 30)
+                        time.sleep(0.01)
+                return super().wait(timeout=timeout)
+
+        monkeypatch.setattr(test_matrix.subprocess, "Popen", ReadyDescendantProcess)
         status = test_matrix._run(
             test_matrix.Command(
                 "process-tree timeout regression",

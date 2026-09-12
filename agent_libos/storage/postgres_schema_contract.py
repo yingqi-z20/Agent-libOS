@@ -44,6 +44,10 @@ _V7_MCP_TABLES = frozenset(
         "mcp_side_effect_preparations",
     }
 )
+POSTGRES_V7_CATALOG_SHA256 = (
+    "41a8a0e3c02edb9fa7dd30918f6f6cc46787ae1936b5b561e3ff5298b3090927"
+)
+_V8_REPLAY_TABLES = frozenset({"llm_replay_turns", "llm_replay_heads"})
 POSTGRES_V6_CATALOG_SHA256 = (
     "5945b66467704dcf5b38983017c5227bca1dd8ccf30ba5dd17674e04fa2573ed"
 )
@@ -581,7 +585,7 @@ def build_postgres_manifest(
 
 
 @lru_cache(maxsize=1)
-def load_postgres_v7_manifest() -> dict[str, Any]:
+def load_postgres_v8_manifest() -> dict[str, Any]:
     try:
         payload = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -601,6 +605,24 @@ def load_postgres_v7_manifest() -> dict[str, Any]:
             "Agent libOS PostgreSQL canonical schema manifest is invalid"
         )
     return copy.deepcopy(payload)
+
+
+def load_postgres_v7_manifest() -> dict[str, Any]:
+    """Return the frozen historical v7 projection from the schema-v8 artifact."""
+
+    payload = load_postgres_v8_manifest()
+    catalog = _catalog_without_tables(payload["catalog"], _V8_REPLAY_TABLES)
+    catalog["indexes"] = [
+        item for item in catalog["indexes"]
+        if item["name"] != "idx_llm_pending_replay_recovery"
+    ]
+    _require_derived_catalog_digest(
+        catalog, expected_sha256=POSTGRES_V7_CATALOG_SHA256,
+        version=7, provenance="canonical v7 manifest",
+    )
+    return build_postgres_manifest(
+        catalog, generated_postgres_version_num=payload["generated_postgres_version_num"],
+    )
 
 
 def load_postgres_v6_manifest() -> dict[str, Any]:
@@ -713,6 +735,8 @@ def _derive_postgres_v4_catalog(v5_catalog: Mapping[str, Any]) -> dict[str, Any]
 
 
 def expected_postgres_catalog(store_version: int) -> dict[str, Any]:
+    if store_version == 8:
+        return copy.deepcopy(load_postgres_v8_manifest()["catalog"])
     v7_catalog = copy.deepcopy(load_postgres_v7_manifest()["catalog"])
     if store_version == 7:
         return v7_catalog

@@ -11,6 +11,155 @@ import { mergeLlmCallSummaries, mergeSnapshotLlmCallSummaries, ProviderTracePane
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 describe("ProviderTracePanel", () => {
+  it("distinguishes configured tools from unknown execution and reveals retained evidence on demand", async () => {
+    const evidence = {
+      provider: "aliyun" as const,
+      configured: ["web_search"],
+      effective: ["web_search"],
+      observed: "unknown" as const,
+      activity_count: 0,
+      citation_count: 0,
+      artifact_count: 0,
+      usage: null,
+      limited: false
+    };
+    const trace = detail();
+    trace.attempts[0].provider_tools = evidence;
+    trace.content.push({
+      ...trace.content[0],
+      field: "attempt_provider_tools",
+      content_type: "json",
+      cursor: "cursor_provider_tools"
+    });
+    const client = traceClient();
+    client.getProcessLlmCall = vi.fn(async () => trace);
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <I18nProvider initialLanguage="en">
+          <ProviderTracePanel pid="pid_1" client={client} snapshotCalls={[summary()]} mode="user" />
+        </I18nProvider>
+      );
+      await flushPromises();
+    });
+    await act(flushPromises);
+
+    expect(container.textContent).toMatch(/execution.*unknown/i);
+    expect(container.textContent).toContain("web_search");
+    expect(client.getProcessLlmCallContent).not.toHaveBeenCalled();
+    expect(container.querySelector(".attempt_provider_tools > button")).not.toBeNull();
+    await act(() => root.unmount());
+  });
+
+  it("renders built-in activities as text, allows only web citation links, and keeps artifact IDs inert", async () => {
+    const content = JSON.stringify({
+      provider: "openai",
+      configured: ["web_search", "code_interpreter"],
+      effective: ["web_search", "code_interpreter"],
+      observed: "returned",
+      limited: false,
+      usage: null,
+      activities: [{
+        type: "code_interpreter_call",
+        id: "ci_1",
+        status: "completed",
+        code: "print('<script>sentinel</script>')",
+        outputs: [{ type: "logs", logs: "computed total: 42" }]
+      }, {
+        type: "web_extractor_call", status: "completed", goal: "Summarize the source",
+        urls: ["https://docs.example.test/page"], output: "Extracted <script>page</script> content"
+      }, {
+        type: "code_interpreter_call", status: "completed", code: { omitted: true, reason: "bounds" }
+      }],
+      citations: [
+        { type: "url_citation", url: "https://docs.example.test/result", title: "Source document" },
+        { type: "url_citation", url: "javascript:alert('unsafe')", title: "Unsafe citation" },
+        { type: "url_citation", url: "data:text/html,<script>unsafe</script>", title: "Inline document" }
+      ],
+      artifacts: [{ type: "file", file_id: "file_result_1", filename: "result.csv", container_id: "container_reference" }]
+    });
+    const client = traceClient(async (_pid, _callId, field, options) => ({
+      schema_version: 1,
+      pid: "pid_1",
+      call_id: "llmcall_e2e_trace",
+      field,
+      attempt_sequence: options?.attemptSequence ?? null,
+      content,
+      next_cursor: null,
+      has_more: false,
+      content_hash: "a".repeat(64),
+      retention_tier: "full"
+    }));
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <I18nProvider initialLanguage="en">
+          <TraceContent
+            descriptor={{ ...detail().content[0], field: "attempt_provider_tools", content_type: "json" }}
+            field="attempt_provider_tools"
+            attemptSequence={1}
+            pid="pid_1"
+            callId="llmcall_e2e_trace"
+            client={client}
+            retentionTier="full"
+          />
+        </I18nProvider>
+      );
+      await flushPromises();
+    });
+    expect(container.textContent).not.toContain("computed total: 42");
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("button")?.click();
+      await flushPromises();
+    });
+
+    expect(container.textContent).toContain("computed total: 42");
+    expect(container.textContent).toContain("Extracted <script>page</script> content");
+    expect(container.textContent).toContain('"omitted": true');
+    expect(container.textContent).toContain("<script>sentinel</script>");
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.textContent).toContain("file_result_1");
+    expect(container.textContent).toContain("result.csv");
+    const links = Array.from(container.querySelectorAll<HTMLAnchorElement>("a"));
+    expect(links).toHaveLength(1);
+    expect(links[0].href).toBe("https://docs.example.test/result");
+    expect(links[0].textContent).toContain("Source document");
+    expect(links[0].rel).toContain("noopener");
+    await act(() => root.unmount());
+  });
+
+  it("does not fetch built-in tool bodies that retention has removed", async () => {
+    const client = traceClient();
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    await act(() => {
+      root.render(
+        <I18nProvider initialLanguage="en">
+          <TraceContent
+            descriptor={{
+              ...detail().content[0],
+              field: "attempt_provider_tools",
+              content_type: "json",
+              availability: "not_persisted",
+              cursor: null
+            }}
+            field="attempt_provider_tools"
+            attemptSequence={1}
+            pid="pid_1"
+            callId="llmcall_e2e_trace"
+            client={client}
+            retentionTier="summary"
+          />
+        </I18nProvider>
+      );
+    });
+    expect(container.querySelector("button")).toBeNull();
+    expect(client.getProcessLlmCallContent).not.toHaveBeenCalled();
+    await act(() => root.unmount());
+  });
+
   it("loads a selected-process trace and renders Provider text inertly in user mode", async () => {
     const requestedFields: LlmTraceContentField[] = [];
     const client = traceClient(async (_pid, _callId, field, options) => {

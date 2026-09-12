@@ -18,6 +18,7 @@ from agent_libos.storage.postgres_schema_contract import (
 from agent_libos.storage.semantic_v5_migration import plan_store_v5_migration
 from agent_libos.storage.v6_schema_contract import V6_TABLES
 from agent_libos.storage.v7_schema_contract import V7_TABLES
+from agent_libos.storage.v8_schema_contract import V8_TABLES
 
 
 @contextlib.contextmanager
@@ -177,7 +178,8 @@ def test_postgres_v4_plan_rejects_noncanonical_human_contract() -> None:
     with _postgres_schema_dsn() as dsn:
         PostgresStore(dsn).close()
         with psycopg.connect(dsn, autocommit=True) as connection:
-            for table in sorted(V7_TABLES | V6_TABLES):
+            connection.execute("DROP INDEX IF EXISTS idx_llm_pending_replay_recovery")
+            for table in sorted(V8_TABLES | V7_TABLES | V6_TABLES):
                 connection.execute(
                     sql.SQL("DROP TABLE {}").format(sql.Identifier(table))
                 )
@@ -379,7 +381,7 @@ def test_full_postgres_catalog_tamper_is_rejected(
 
         with pytest.raises(
             UnsupportedStoreVersion,
-            match="schema v7",
+            match="schema v8",
         ):
             PostgresStore(dsn)
 

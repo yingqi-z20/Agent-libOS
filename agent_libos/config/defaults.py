@@ -8,7 +8,7 @@ from typing import Annotated, Final, Literal
 from urllib.parse import SplitResult, unquote_plus, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BeforeValidator, ConfigDict, StrictBool, StrictFloat, StrictInt
+from pydantic import BeforeValidator, ConfigDict, StrictBool, StrictFloat, StrictInt, StrictStr
 from pydantic.dataclasses import dataclass
 
 from agent_libos.models.capability import AuthorityRule
@@ -56,9 +56,10 @@ PromptCacheRetention = Annotated[
     Literal["in_memory", "24h"] | None,
     BeforeValidator(_normalize_prompt_cache_retention),
 ]
-PromptLayout = Literal["legacy_v1", "cache_optimized_v2"]
-PromptCacheMode = Literal["provider_default", "implicit", "explicit"]
+PromptLayout = Literal["auto", "legacy_v1", "cache_optimized_v2"]
+PromptCacheMode = Literal["auto", "provider_default", "implicit", "explicit"]
 PromptCacheTTL = Literal["30m"] | None
+ReasoningContext = Literal["auto", "current_turn", "all_turns"]
 
 _SENSITIVE_LLM_URL_QUERY_KEY_NAMES = frozenset(
     {
@@ -484,7 +485,7 @@ class ProcessDefaults:
     max_tool_calls: StrictInt = 256
     max_child_processes: int = 16
     max_runtime_seconds: float | None = None
-    max_context_materialization_tokens: int = 65_536
+    max_context_materialization_tokens: int = 262_144
     max_context_materialization_total_tokens: int | None = None
     max_llm_calls: int | None = None
     max_llm_total_tokens: int | None = None
@@ -504,6 +505,68 @@ class ProcessDefaults:
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
+class ProviderToolsConfig:
+    """Host-owned, provider-specific hosted tools; no transport escape hatch."""
+
+    provider: Literal["openai", "aliyun"]
+    web_search: StrictBool = False
+    web_extractor: StrictBool = False
+    code_interpreter: StrictBool = False
+    file_ids: tuple[StrictStr, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.provider == "openai" and self.web_extractor:
+            raise ValueError("OpenAI provider tools do not support web_extractor")
+        if self.web_extractor and not self.web_search:
+            raise ValueError("provider web_extractor requires web_search")
+        if self.file_ids and self.provider != "openai":
+            raise ValueError("provider file_ids are supported only for OpenAI")
+        if self.file_ids and not self.code_interpreter:
+            raise ValueError("provider file_ids require code_interpreter")
+        if len(self.file_ids) > 100:
+            raise ValueError("provider file_ids must contain at most 100 identifiers")
+        if len(set(self.file_ids)) != len(self.file_ids):
+            raise ValueError("provider file_ids must not contain duplicates")
+        if any(
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", value) is None
+            for value in self.file_ids
+        ):
+            raise ValueError("provider file_ids must be bounded remote identifiers, not paths or URLs")
+
+    @property
+    def enabled(self) -> bool:
+        return self.web_search or self.web_extractor or self.code_interpreter
+
+
+def normalize_provider_tools(
+    value: ProviderToolsConfig | dict[str, object] | None,
+) -> ProviderToolsConfig | None:
+    """Validate an optional tools configuration and canonicalize disabled tools."""
+
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = ProviderToolsConfig(**value)
+    if not isinstance(value, ProviderToolsConfig):
+        raise ValueError("provider_tools must be a ProviderToolsConfig object or null")
+    return value if value.enabled else None
+
+
+def validate_provider_tools_api_mode(
+    tools: ProviderToolsConfig | None, api_mode: str | None,
+    reasoning_effort: str | None = None,
+) -> None:
+    if (tools is not None and tools.provider == "aliyun"
+            and (tools.code_interpreter or tools.web_extractor)
+            and isinstance(reasoning_effort, str) and reasoning_effort.strip().lower() == "none"):
+        raise ValueError("Aliyun code_interpreter and web_extractor require thinking; reasoning_effort cannot be none")
+    if tools is None or api_mode != "chat":
+        return
+    if tools.provider != "aliyun" or tools.code_interpreter or tools.web_extractor:
+        raise ValueError("Chat provider tools support only Aliyun web_search; select Responses")
+
+
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class LLMProfile:
     kind: Literal["openai_compatible"] = "openai_compatible"
     base_url: str | None = None
@@ -514,10 +577,14 @@ class LLMProfile:
     max_retries: int | None = None
     store: bool | None = None
     reasoning_effort: str | None = None
+    reasoning_context: ReasoningContext | None = None
+    responses_replay: StrictBool | None = None
+    provider_tools: ProviderToolsConfig | None = None
     verbosity: Literal["low", "medium", "high"] | None = None
     safety_identifier: str | None = None
     safety_identifier_env: str | None = None
     prompt_cache_key: str | None = None
+    prompt_layout: PromptLayout | None = None
     prompt_cache_retention: PromptCacheRetention = None
     prompt_cache_mode: PromptCacheMode | None = None
     prompt_cache_ttl: PromptCacheTTL = None
@@ -531,17 +598,27 @@ class LLMProfile:
     max_total_tokens_per_call: StrictInt | None = None
     context_window_tokens: int | None = None
     allow_custom_base_url: bool = False
+    logical_call_timeout_s: StrictFloat | None = None
+
+    def __post_init__(self) -> None:
+        tools = normalize_provider_tools(self.provider_tools)
+        object.__setattr__(self, "provider_tools", tools)
+        validate_provider_tools_api_mode(tools, self.api_mode, self.reasoning_effort)
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class LLMDefaults:
     default_profile_id: str = "default"
+    openai_model: str = "gpt-6-astra"
+    openai_reasoning_effort: str = "medium"
+    openai_reasoning_context: Literal["current_turn", "all_turns"] = "all_turns"
+    openai_prompt_cache_ttl: Literal["30m"] = "30m"
     profiles: dict[str, LLMProfile] = field(default_factory=lambda: {"default": LLMProfile()})
     temperature: StrictFloat = 0.2
     max_tokens: StrictInt = 16_384
-    max_input_tokens_per_call: StrictInt = 114_688
-    max_total_tokens_per_call: StrictInt = 131_072
-    context_window_tokens: int = 131_072
+    max_input_tokens_per_call: StrictInt = 245_760
+    max_total_tokens_per_call: StrictInt = 262_144
+    context_window_tokens: int = 262_144
     # Long-context completion and final evidence synthesis can legitimately
     # exceed one minute. A longer first attempt avoids three ambiguous,
     # potentially billable retries against a still-working provider.
@@ -549,7 +626,11 @@ class LLMDefaults:
     max_retries: int = 2
     api_mode: Literal["auto", "responses", "chat"] = "auto"
     store: bool = False
+    reasoning_context: ReasoningContext = "auto"
+    responses_replay: StrictBool | None = None
     safety_identifier: str | None = None
+    responses_replay_max_bytes: StrictInt = 8 * 1024 * 1024
+    responses_replay_max_turns: StrictInt = 128
     prompt_layout: PromptLayout = "legacy_v1"
     prompt_cache_key: str | None = None
     prompt_cache_retention: PromptCacheRetention = None
@@ -570,6 +651,9 @@ class LLMDefaults:
     persist_full_io: bool = True
     json_instruction: str = "You must respond with a valid JSON object."
     fallback_status_codes: tuple[int, ...] = (404, 405)
+    # Explicit Host opt-in: one deadline across every physical attempt in a
+    # logical call. timeout_s remains the SDK's independent I/O timeout.
+    logical_call_timeout_s: StrictFloat | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "profiles", _ImmutableDict(self.profiles))
@@ -919,7 +1003,7 @@ class ImageCommitDefaults:
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class ObjectMemoryDefaults:
     object_schema_version: str = "1"
-    materialize_budget_tokens: int = 8_000
+    materialize_budget_tokens: int = 262_144
     query_limit: int = 50
     context_policy: str = "plan_first"
     metadata_sensitivity: str = "normal"
@@ -931,6 +1015,18 @@ class ObjectMemoryDefaults:
     metadata_collection_max_items: StrictInt = 128
     metadata_collection_item_max_chars: StrictInt = 2_048
     metadata_max_bytes: StrictInt = 131_072
+    # ``working_set`` rendering window.  The newest N feedback Objects (tool
+    # results, error traces, test results) always render verbatim, and older
+    # feedback keeps rendering verbatim while its estimated rendered tokens fit
+    # the verbatim token window; feedback beyond that renders as a bounded stub
+    # that names the tool and its target, and an observation superseded by a
+    # fresher read of the same target is omitted.  A long task therefore keeps a
+    # record of what it already did without replaying every payload on every
+    # quantum, while a multi-file orientation stays fully in view.  Human input
+    # results (message reads, answers) are never compacted.
+    working_set_recent_feedback: StrictInt = 8
+    working_set_supersede_observations: bool = True
+    working_set_verbatim_feedback_tokens: StrictInt = 48_000
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -994,9 +1090,28 @@ class LLMContextDefaults:
     object_name_prefix: str = "llm_context"
     recent_event_limit: int = 20
     prompt_event_payload_max_chars: int = 2_048
+    compaction_chunk_target_tokens: StrictInt = 16_384
     storage_compaction_threshold_bytes: int = 96_000
     storage_compaction_max_chunks: int = 4
     storage_compaction_preserve_recent_entries: int = 0
+    # Source materialization budget headroom.  The executor derives the
+    # per-quantum materialization budget from the resolved per-call input limit
+    # minus the fixed prompt overhead (system prompt, loaded Skill bodies, tool
+    # schemas) and this reserve for the volatile sections, so ``working_set``
+    # omits stale feedback before provider admission would reject the request.
+    # The floor keeps a minimum context even when the fixed overhead is large.
+    materialization_headroom_tokens: StrictInt = 12_288
+    materialization_budget_floor_tokens: StrictInt = 16_384
+    # Events scanned past the process cursor each quantum.  Only the newest
+    # ``recent_event_limit`` visible events render; the rest are counted, so a
+    # busy multi-call quantum cannot leave actionable events stuck behind a
+    # backlog of bookkeeping rows for several quanta.
+    recent_event_scan_limit: StrictInt = 200
+    # Global event-log rows walked backwards (newest first) to rebuild the
+    # payload-free digest of what a process did before the last Runtime
+    # reopen.  Tool results are released on reopen; without this digest the
+    # model re-reads every file it had already read or written.
+    reopen_digest_event_scan_limit: StrictInt = 4_000
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -1046,6 +1161,14 @@ class SkillDefaults:
     max_package_directories: StrictInt = 256
     max_package_depth: StrictInt = 32
     catalog_scan_limit: StrictInt = 1_000
+    # Prompt ergonomics only: once a loaded Skill's tool has succeeded for this
+    # process, that tool's ``### `name``` subsection of the ``## Tool guide``
+    # is left out of later prompts (the tool schema still carries parameter
+    # semantics).  The subsection returns after a failure of that tool or a
+    # Runtime reopen.  Activation, authority, and the package hash are
+    # unaffected.  Off by default: each compaction changes the stable prompt
+    # prefix once, so the provider-cache trade-off depends on task length.
+    compact_tool_guides_after_use: bool = False
 
     @property
     def manifest_max_bytes(self) -> int:
@@ -1234,6 +1357,10 @@ def _validate_llm_context_config(
     llm_context: LLMContextDefaults,
     tools: ToolDefaults,
 ) -> None:
+    _positive(
+        "llm_context.compaction_chunk_target_tokens",
+        llm_context.compaction_chunk_target_tokens,
+    )
     if llm_context.policy not in {"source_only", "llm_context_object"}:
         raise ValueError(
             "llm_context.policy must be source_only or llm_context_object"
@@ -1241,6 +1368,25 @@ def _validate_llm_context_config(
     _positive(
         "llm_context.prompt_event_payload_max_chars",
         llm_context.prompt_event_payload_max_chars,
+    )
+    _positive(
+        "llm_context.materialization_headroom_tokens",
+        llm_context.materialization_headroom_tokens,
+    )
+    _positive(
+        "llm_context.materialization_budget_floor_tokens",
+        llm_context.materialization_budget_floor_tokens,
+    )
+    _positive("llm_context.recent_event_limit", llm_context.recent_event_limit)
+    _require_at_least(
+        "llm_context.recent_event_scan_limit",
+        llm_context.recent_event_scan_limit,
+        "llm_context.recent_event_limit",
+        llm_context.recent_event_limit,
+    )
+    _positive(
+        "llm_context.reopen_digest_event_scan_limit",
+        llm_context.reopen_digest_event_scan_limit,
     )
     if llm_context.prompt_event_payload_max_chars < 512:
         raise ValueError(
@@ -1289,6 +1435,17 @@ def _validate_object_memory_config(memory: ObjectMemoryDefaults) -> None:
         "metadata_max_bytes",
     ):
         _positive(f"memory.{name}", getattr(memory, name))
+    _positive(
+        "memory.working_set_recent_feedback",
+        memory.working_set_recent_feedback,
+    )
+    if (
+        isinstance(memory.working_set_verbatim_feedback_tokens, bool)
+        or memory.working_set_verbatim_feedback_tokens < 0
+    ):
+        raise ValueError("memory.working_set_verbatim_feedback_tokens must be non-negative")
+    if type(memory.working_set_supersede_observations) is not bool:
+        raise ValueError("memory.working_set_supersede_observations must be a boolean")
     _require_at_least(
         "memory.query_scan_ceiling",
         memory.query_scan_ceiling,
@@ -1836,6 +1993,8 @@ def _validate_llm_config(
     semantic: SemanticDefaults | None = None,
 ) -> None:
     _require_non_empty("llm.default_profile_id", llm.default_profile_id)
+    _require_non_empty("llm.openai_model", llm.openai_model)
+    _require_non_empty("llm.openai_reasoning_effort", llm.openai_reasoning_effort)
     if llm.default_profile_id not in llm.profiles:
         raise ValueError(
             "llm.default_profile_id does not reference a configured profile: "
@@ -1855,6 +2014,8 @@ def _validate_llm_config(
         ttl=llm.prompt_cache_ttl,
     )
     _nonnegative("llm.temperature", llm.temperature)
+    _positive("llm.responses_replay_max_bytes", llm.responses_replay_max_bytes)
+    _positive("llm.responses_replay_max_turns", llm.responses_replay_max_turns)
     _positive("llm.max_tokens", llm.max_tokens)
     _positive("llm.max_input_tokens_per_call", llm.max_input_tokens_per_call)
     _positive("llm.max_total_tokens_per_call", llm.max_total_tokens_per_call)
@@ -1871,6 +2032,7 @@ def _validate_llm_config(
             "llm.max_tokens must not exceed llm.max_total_tokens_per_call"
         )
     _positive("llm.timeout_s", llm.timeout_s)
+    _positive_optional("llm.logical_call_timeout_s", llm.logical_call_timeout_s)
     _nonnegative("llm.max_retries", llm.max_retries)
     _positive("llm.compatibility_retry_attempts", llm.compatibility_retry_attempts)
     _positive("llm.action_repair_attempts", llm.action_repair_attempts)
@@ -1916,6 +2078,7 @@ def _validate_llm_profile(
         "chat",
     }:
         raise ValueError(f"{prefix}.api_mode is not supported: {profile.api_mode}")
+    validate_provider_tools_api_mode(profile.provider_tools, profile.api_mode or llm.api_mode, profile.reasoning_effort)
     _optional_non_empty(f"{prefix}.safety_identifier", profile.safety_identifier)
     _optional_max_chars(f"{prefix}.safety_identifier", profile.safety_identifier, 64)
     _optional_non_empty(
@@ -1925,6 +2088,7 @@ def _validate_llm_profile(
     _optional_non_empty(f"{prefix}.prompt_cache_key", profile.prompt_cache_key)
     _validate_llm_profile_cache(profile, llm, prefix=prefix)
     _positive_optional(f"{prefix}.timeout_s", profile.timeout_s)
+    _positive_optional(f"{prefix}.logical_call_timeout_s", profile.logical_call_timeout_s)
     _nonnegative_optional(f"{prefix}.max_retries", profile.max_retries)
     _nonnegative_optional(f"{prefix}.temperature", profile.temperature)
     for field in (
@@ -2138,6 +2302,8 @@ def _validate_semantic_external_profile(
         raise ValueError("semantic.external_profile_id does not reference an LLM profile")
     if profile.model is None or not profile.model.strip():
         raise ValueError("semantic external LLM profile must set model explicitly")
+    if profile.provider_tools is not None:
+        raise ValueError("semantic external LLM profile must disable provider tools")
     if profile.store is not False:
         raise ValueError("semantic external LLM profile must set store=false")
     if profile.max_retries != 0:
@@ -2146,6 +2312,13 @@ def _validate_semantic_external_profile(
         raise ValueError("semantic external LLM profile must set a finite timeout_s")
     if profile.api_mode not in {"chat", "responses"}:
         raise ValueError("semantic external LLM profile must set api_mode explicitly")
+    _validate_semantic_external_retention(profile, llm)
+
+
+def _validate_semantic_external_retention(
+    profile: LLMProfile,
+    llm: LLMDefaults,
+) -> None:
     if (
         profile.prompt_cache_key is not None
         or profile.prompt_cache_retention is not None
@@ -2153,12 +2326,14 @@ def _validate_semantic_external_profile(
         or profile.prompt_cache_ttl is not None
         or llm.prompt_cache_key is not None
         or llm.prompt_cache_retention is not None
-        or llm.prompt_cache_mode != "provider_default"
+        or llm.prompt_cache_mode not in {"auto", "provider_default"}
         or llm.prompt_cache_ttl is not None
     ):
         raise ValueError("semantic external LLM profile must disable prompt caching")
     if profile.responses_previous_response_id is not False:
         raise ValueError("semantic external LLM profile must disable response chaining")
+    if profile.responses_replay is True:
+        raise ValueError("semantic external LLM profile must disable Responses replay")
     if profile.fallback_json_actions is not False:
         raise ValueError("semantic external LLM profile must disable JSON action fallback")
 
@@ -2178,7 +2353,7 @@ def _validate_prompt_cache_policy(
     retention: str | None,
     ttl: str | None,
 ) -> None:
-    if mode not in {"provider_default", "implicit", "explicit"}:
+    if mode not in {"auto", "provider_default", "implicit", "explicit"}:
         raise ValueError(f"{prefix}.prompt_cache_mode is not supported: {mode}")
     if ttl is not None and ttl != "30m":
         raise ValueError(f"{prefix}.prompt_cache_ttl must be 30m or null")
@@ -2186,7 +2361,7 @@ def _validate_prompt_cache_policy(
         raise ValueError(
             f"{prefix}.prompt_cache_retention and prompt_cache_ttl are mutually exclusive"
         )
-    if mode != "provider_default" and not str(key or "").strip():
+    if mode in {"implicit", "explicit"} and not str(key or "").strip():
         raise ValueError(
             f"{prefix}.prompt_cache_key is required when prompt_cache_mode is {mode}"
         )
@@ -2194,7 +2369,7 @@ def _validate_prompt_cache_policy(
         raise ValueError(
             f"{prefix}.prompt_cache_ttl requires implicit or explicit prompt_cache_mode"
         )
-    if mode != "provider_default" and retention is not None:
+    if mode in {"implicit", "explicit"} and retention is not None:
         raise ValueError(
             f"{prefix}.prompt_cache_retention cannot be combined with prompt_cache_mode {mode}"
         )

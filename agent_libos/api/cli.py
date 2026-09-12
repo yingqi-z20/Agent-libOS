@@ -656,7 +656,7 @@ def _add_store_parser_args(parser: argparse.ArgumentParser) -> None:
         "--to",
         dest="store_schema_version",
         type=int,
-        choices=(5, 6, 7),
+        choices=(5, 6, 7, 8),
         required=True,
         help="Target offline Runtime store schema version to plan or apply a migration to.",
     )
@@ -1070,7 +1070,7 @@ def _run_store_command(
 ) -> dict[str, Any]:
     if args.store_command != "migrate":
         raise AssertionError(f"unsupported store command: {args.store_command}")
-    if args.store_schema_version not in {5, 6, 7}:
+    if args.store_schema_version not in {5, 6, 7, 8}:
         raise AssertionError("argparse admitted an unsupported store migration target")
     if args.apply and args.expected_plan_sha256 is None:
         parser.error("store migrate --apply requires --expected-plan-sha256")
@@ -1124,7 +1124,7 @@ def _run_store_command(
             if args.apply
             else plan_store_v6_migration(target, **common)
         )
-    else:
+    elif args.store_schema_version == 7:
         from agent_libos.storage.mcp_v7_migration import (
             apply_store_v7_migration,
             plan_store_v7_migration,
@@ -1138,6 +1138,21 @@ def _run_store_command(
             )
             if args.apply
             else plan_store_v7_migration(target, **common)
+        )
+    else:
+        from agent_libos.storage.llm_v8_migration import (
+            apply_store_v8_migration,
+            plan_store_v8_migration,
+        )
+
+        result = (
+            apply_store_v8_migration(
+                target,
+                expected_plan_sha256=args.expected_plan_sha256,
+                **common,
+            )
+            if args.apply
+            else plan_store_v8_migration(target, **common)
         )
     return _semantic_mapping(result, label="store migration result")
 

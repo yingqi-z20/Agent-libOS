@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace
 
 import pytest
 
-from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.config import DEFAULT_CONFIG, LLMProfile
 from benchmarks.live_evaluation_provenance import (
     _safe_llm_config_digest,
     build_evaluation_provenance,
@@ -75,6 +76,107 @@ def test_custom_endpoint_authorization_is_part_of_config_identity(
     assert denied["llm"]["endpoint"]["custom_endpoint_allowed"] is False
     assert allowed["llm"]["endpoint"]["custom_endpoint_allowed"] is True
     assert denied["llm"]["config_sha256"] != allowed["llm"]["config_sha256"]
+
+
+def test_disabled_logical_deadline_preserves_existing_report_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_LOGICAL_CALL_TIMEOUT", raising=False)
+    historical = stable_evaluation_provenance()
+    snapshot = capture_evaluation_provenance(DEFAULT_CONFIG)
+
+    assert "logical_call_timeout_s" not in snapshot["llm"]["request"]
+    assert valid_evaluation_provenance(historical) is True
+    monkeypatch.setenv("OPENAI_LOGICAL_CALL_TIMEOUT", "  ")
+    assert capture_evaluation_provenance(DEFAULT_CONFIG)["llm"] == snapshot["llm"]
+
+
+@pytest.mark.parametrize(
+    ("global_timeout", "environment_timeout", "profile_timeout", "expected"),
+    (
+        (60.0, None, None, 60.0),
+        (60.0, "45.5", None, 45.5),
+        (60.0, "45.5", 30.0, 30.0),
+        (None, "45.5", None, 45.5),
+        (None, "invalid-but-overridden", 30.0, 30.0),
+    ),
+)
+def test_logical_deadline_provenance_records_effective_host_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    global_timeout: float | None,
+    environment_timeout: str | None,
+    profile_timeout: float | None,
+    expected: float,
+) -> None:
+    if environment_timeout is None:
+        monkeypatch.delenv("OPENAI_LOGICAL_CALL_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("OPENAI_LOGICAL_CALL_TIMEOUT", environment_timeout)
+    profile_id = DEFAULT_CONFIG.llm.default_profile_id
+    config = replace(
+        DEFAULT_CONFIG,
+        llm=replace(
+            DEFAULT_CONFIG.llm,
+            logical_call_timeout_s=global_timeout,
+            profiles={
+                profile_id: LLMProfile(logical_call_timeout_s=profile_timeout)
+            },
+        ),
+    )
+
+    snapshot = capture_evaluation_provenance(config)
+    assert snapshot["llm"]["request"]["logical_call_timeout_s"] == expected
+    provenance = build_evaluation_provenance(snapshot, copy.deepcopy(snapshot))
+    assert valid_evaluation_provenance(provenance) is True
+
+
+def test_logical_deadline_changes_config_digest_and_requires_matching_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_LOGICAL_CALL_TIMEOUT", raising=False)
+    disabled = capture_evaluation_provenance(DEFAULT_CONFIG)
+    monkeypatch.setenv("OPENAI_LOGICAL_CALL_TIMEOUT", "420.0")
+    enabled = capture_evaluation_provenance(DEFAULT_CONFIG)
+
+    assert disabled["llm"]["config_sha256"] != enabled["llm"]["config_sha256"]
+    assert valid_evaluation_provenance(
+        build_evaluation_provenance(disabled, enabled)
+    ) is False
+    tampered = build_evaluation_provenance(enabled, copy.deepcopy(enabled))
+    for boundary in ("start", "end"):
+        tampered[boundary]["llm"]["request"]["logical_call_timeout_s"] = 421.0
+    assert valid_evaluation_provenance(tampered) is False
+
+
+@pytest.mark.parametrize(
+    "value", (0.0, -1.0, True, None, "30", float("nan"), float("inf"))
+)
+def test_logical_deadline_validator_rejects_invalid_values_even_with_valid_digest(
+    value: object,
+) -> None:
+    provenance = stable_evaluation_provenance()
+    for boundary in ("start", "end"):
+        llm = provenance[boundary]["llm"]
+        llm["request"]["logical_call_timeout_s"] = value
+        safe = dict(llm)
+        safe.pop("config_sha256")
+        llm["config_sha256"] = _safe_llm_config_digest(safe)
+
+    assert valid_evaluation_provenance(provenance) is False
+
+
+@pytest.mark.parametrize("value", ("0", "-1", "nan", "inf", "invalid"))
+def test_invalid_logical_deadline_environment_is_unavailable_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("OPENAI_LOGICAL_CALL_TIMEOUT", value)
+    snapshot = capture_evaluation_provenance(DEFAULT_CONFIG)
+
+    assert snapshot["llm"]["available"] is False
+    assert valid_evaluation_provenance(
+        build_evaluation_provenance(snapshot, copy.deepcopy(snapshot))
+    ) is False
 
 
 def test_validator_recomputes_config_digest_and_rejects_unknown_fields() -> None:

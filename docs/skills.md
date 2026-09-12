@@ -48,7 +48,7 @@ skills/review-helper/
 name: review-helper
 description: Focused code-review workflow helpers.
 license: Apache-2.0
-compatibility: agent-libos==1.5.2
+compatibility: agent-libos==1.5.3
 allowed-tools: read_text_file read_directory
 metadata:
   agent-libos.version: v0
@@ -146,9 +146,15 @@ needed. `text` and `limit` apply to every visible Skill in one uniformly bounded
 page. Discovery case-folds and de-duplicates Unicode word terms from the query,
 and drops one-character and common low-information terms when at least one
 informative term remains. A one-term query requires that term to match Skill
-id, name, or description. A query with two or more selected terms requires at
-least two distinct term matches; it does not require every term to match.
-An exact full id or name match returns only exact matches. Otherwise results
+id, name, description, or the terms of a declared tool name. A query with two
+or more selected terms requires at least two distinct term matches; it does not
+require every term to match. Declared tool names are first-class keys: a
+whitespace-delimited query token equal to a tool the Skill declares
+(`human_output`, `create_checkpoint`) always matches and outranks description
+mentions, so a goal that names its required tools can list them all in one
+query and receive every owning Skill.
+An exact full id or name match, or a single-token query equal to a declared
+tool name, returns only exact matches. Otherwise results
 combine a normalized-phrase bonus with the number and location of matched
 terms; id/name hits weigh more than description-only hits. The combined score
 sorts descending, with deterministic case-folded name and id tie-breaking.
@@ -499,7 +505,7 @@ are rejected before a result set can become unbounded.
 The workspace includes `skills/swe-agent`, named and registerable as
 `swe-agent`. It reproduces the useful SWE-Agent Agent Computer Interface shape
 inside Agent libOS. The shipped package pins `compatibility` to
-`agent-libos==1.5.2`: its JIT manifest uses extension fields from this release,
+`agent-libos==1.5.3`: its JIT manifest uses extension fields from this release,
 so older parsers must not be promised compatibility merely because the
 frontmatter itself can be read. This exact pin is a publisher/Host-facing
 declaration, not a Runtime-enforced version gate.

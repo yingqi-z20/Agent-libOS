@@ -13,6 +13,7 @@ from typing import Any
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.human.manager import HumanObjectManager
+from agent_libos.llm.client import LLMError
 from agent_libos.utils.openai_schema import openai_chat_tool_schema
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
@@ -81,6 +82,9 @@ _CANONICAL_JSON_NUMBER = re.compile(
     r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z"
 )
 _MODEL_SCALAR_STRING_MAX_CHARS = 128
+# A JSON-encoded object/array argument may legitimately be as large as a
+# tool-call argument; keep the decode bounded below the argument hard limit.
+_MODEL_CONTAINER_STRING_MAX_CHARS = 262_144
 _MODEL_ARGUMENT_NORMALIZATION_MAX_DEPTH = 32
 _MODEL_ARGUMENT_NORMALIZATION_MAX_FIELDS = 64
 
@@ -90,6 +94,15 @@ _SKILL_TOOL_BOOTSTRAP = (
     "read_skill_resource",
     "unload_skill",
     "process_exit",
+)
+# Queued Human or process input is a mandatory control action.  An image that
+# owns the message-read tools projects them from the start so acknowledging a
+# follow-up costs one call instead of a discover/activate/read round trip.
+# Visibility is not authority: the message primitives keep enforcing their
+# own Capability, data-flow, budget, and audit rules.
+_SKILL_TOOL_BOOTSTRAP_OPTIONAL = (
+    "read_process_messages",
+    "receive_process_messages",
 )
 
 _JIT_MULTIPLEXER_INPUT_SCHEMA = {
@@ -155,7 +168,10 @@ def _normalize_schema_scalar_strings(
 
     if isinstance(value, str):
         allowed_types = _schema_variant_types(variants)
-        normalized = _normalize_scalar_string(value, allowed_types)
+        normalized = _normalize_scalar_string(
+            value,
+            allowed_types,
+        )
         if normalized is value:
             return value
         changed.append(_normalization_path(path))
@@ -325,12 +341,21 @@ def _schema_variant_types(variants: list[dict[str, Any]]) -> set[str]:
     return selected
 
 
-def _normalize_scalar_string(value: str, allowed_types: set[str]) -> Any:
-    if not allowed_types or "string" in allowed_types:
+def _normalize_scalar_string(
+    value: str,
+    allowed_types: set[str],
+) -> Any:
+    if not allowed_types:
+        return value
+    if "string" in allowed_types:
+        # A string already accepted by the schema is literal data, including
+        # "null" and "None". Intent cannot be inferred from its spelling.
         return value
     stripped = value.strip()
-    if not stripped or len(stripped) > _MODEL_SCALAR_STRING_MAX_CHARS:
+    if not stripped:
         return value
+    if len(stripped) > _MODEL_SCALAR_STRING_MAX_CHARS:
+        return _normalize_container_string(stripped, allowed_types)
     lowered = stripped.casefold()
     if "null" in allowed_types and lowered == "null":
         return None
@@ -352,7 +377,36 @@ def _normalize_scalar_string(value: str, allowed_types: set[str]) -> Any:
             and (not isinstance(normalized, float) or math.isfinite(normalized))
         ):
             return normalized
-    return value
+    return _normalize_container_string(stripped, allowed_types)
+
+
+def _normalize_container_string(stripped: str, allowed_types: set[str]) -> Any:
+    """Decode a JSON-encoded object/array where the schema forbids strings.
+
+    Some providers hand structured arguments back as one JSON string (for
+    example ``completion_evidence`` or a ``payload`` declared as an object).
+    Only an argument whose every schema variant excludes ``string`` and admits
+    the decoded container type is repaired, so a legitimately string-typed
+    field is never reinterpreted.  The decoded value is bounded by the same
+    argument-size limits as any other argument.
+    """
+
+    if not (
+        ("object" in allowed_types and stripped.startswith("{"))
+        or ("array" in allowed_types and stripped.startswith("["))
+    ):
+        return stripped
+    if len(stripped) > _MODEL_CONTAINER_STRING_MAX_CHARS:
+        return stripped
+    try:
+        decoded = json.loads(stripped)
+    except (TypeError, ValueError):
+        return stripped
+    if isinstance(decoded, dict) and "object" in allowed_types:
+        return decoded
+    if isinstance(decoded, list) and "array" in allowed_types:
+        return decoded
+    return stripped
 
 
 def _normalization_path(path: tuple[str, ...]) -> str:
@@ -1002,7 +1056,7 @@ class ToolBroker:
             for row in self.extensions.list_tools()
             if row["tool_id"] in visible_ids
         ]
-        rows = self._model_projected_tool_rows(rows)
+        rows = self._model_projected_tool_rows(rows, prompt_layout=self._model_prompt_layout(pid))
         if self._jit_exposure_for_process(pid) != JIT_TOOL_EXPOSURE_MULTIPLEXED:
             return rows
         static_rows = [
@@ -1016,6 +1070,8 @@ class ToolBroker:
     def _model_projected_tool_rows(
         self,
         rows: builtins.list[dict[str, Any]],
+        *,
+        prompt_layout: str | None = None,
     ) -> builtins.list[dict[str, Any]]:
         projected: builtins.list[dict[str, Any]] = []
         for row in rows:
@@ -1026,10 +1082,32 @@ class ToolBroker:
                     implementation.spec(
                         config=self.config,
                         model_visible=True,
+                        prompt_layout=prompt_layout,
                     )
                 )
             projected.append(selected)
         return projected
+
+    def _model_prompt_layout(self, pid: str | None) -> str:
+        """Resolve model schema layout without constructing a Provider client."""
+
+        registry = getattr(self._tool_context_host, "llms", None)
+        if registry is None:
+            return self.config.llm.prompt_layout
+        process = self.processes.get_process(pid) if pid is not None else None
+        profile_id = (
+            process.llm_profile_id if process is not None else None
+        ) or self.config.llm.default_profile_id
+        try:
+            return registry.profile_snapshot(profile_id).policy.prompt_layout
+        except (ValidationError, LLMError):
+            # The executor records unknown profiles through its protected LLM
+            # failure path. Schema construction must not bypass that boundary.
+            return (
+                "legacy_v1"
+                if self.config.llm.prompt_layout == "auto"
+                else self.config.llm.prompt_layout
+            )
 
     def initial_tool_projection(self, image: Any) -> list[str]:
         metadata = getattr(image, "metadata", {})
@@ -1053,7 +1131,10 @@ class ToolBroker:
                 "image metadata tool_projection='skills' requires all bootstrap "
                 f"tools; missing: {', '.join(missing)}"
             )
-        return list(_SKILL_TOOL_BOOTSTRAP)
+        return [
+            *_SKILL_TOOL_BOOTSTRAP,
+            *(name for name in _SKILL_TOOL_BOOTSTRAP_OPTIONAL if name in allowed),
+        ]
 
     def configure_model_tool_projection(
         self,
@@ -1161,6 +1242,7 @@ class ToolBroker:
         return self._redact_hidden_jit_names(value, hidden)
 
     def openai_tool_schemas(self, pid: str | None = None) -> builtins.list[dict[str, Any]]:
+        prompt_layout = self._model_prompt_layout(pid)
         tool_ids = (
             self._model_visible_tool_ids(pid)
             if pid is not None
@@ -1172,7 +1254,9 @@ class ToolBroker:
         for tool_id in sorted(tool_ids, key=self._tool_sort_key):
             implementation = self.registry.implementation(tool_id)
             if implementation is not None:
-                schemas.append(implementation.to_openai_chat_tool(config=self.config))
+                schemas.append(implementation.to_openai_chat_tool(
+                    config=self.config, prompt_layout=prompt_layout
+                ))
                 continue
             if not self.registry.is_jit(tool_id):
                 continue

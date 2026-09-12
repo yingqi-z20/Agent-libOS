@@ -6,8 +6,10 @@ import email.utils
 import hashlib
 import inspect
 import json
+import math
 import os
 import random
+import secrets
 import threading
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
@@ -16,7 +18,9 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMDefaults
+from agent_libos.config import (
+    DEFAULT_CONFIG, AgentLibOSConfig, LLMDefaults, ProviderToolsConfig, normalize_provider_tools,
+)
 from agent_libos.utils.openai_schema import (
     normalize_openai_chat_tool_schema,
     normalize_openai_structured_output_schema,
@@ -24,6 +28,12 @@ from agent_libos.utils.openai_schema import (
 )
 from agent_libos.models.exceptions import LibOSError
 from agent_libos.ports.blocking_work import run_blocking_once
+from agent_libos.llm.provider_tools import (
+    ProviderToolsResponseError, apply_provider_tools, project_provider_tool_results,
+    provider_tool_request_observation,
+)
+from agent_libos.llm.provider_policy import is_astra_model, resolve_provider_policy
+from agent_libos.llm.response_items import ResponseItemsError, validate_response_items
 from agent_libos.llm.provider_trace import (
     ProviderAttemptKind,
     ProviderTraceBuilder,
@@ -40,7 +50,7 @@ from agent_libos.utils.serde import to_jsonable
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 _API_MODES = {"auto", "responses", "chat"}
-_PROMPT_CACHE_MODES = {"provider_default", "implicit", "explicit"}
+_PROMPT_CACHE_MODES = {"auto", "provider_default", "implicit", "explicit"}
 _CACHE_STABLE_MESSAGE_KEY = "_agent_libos_cache_stable"
 _CACHE_STABLE_PREFIX_CHARS_KEY = "_agent_libos_cache_stable_prefix_chars"
 _CACHE_STABLE_PROJECTION_KEY = "_agent_libos_cache_stable_projection"
@@ -49,6 +59,9 @@ _ACTIVE_PROVIDER_TRACE: contextvars.ContextVar[ProviderTraceBuilder | None] = (
 )
 _ACTIVE_PROVIDER_ATTEMPT_KIND: contextvars.ContextVar[ProviderAttemptKind] = (
     contextvars.ContextVar("agent_libos_provider_attempt_kind", default="initial")
+)
+_ACTIVE_LOGICAL_CALL_TIMEOUT: contextvars.ContextVar[asyncio.Timeout | None] = (
+    contextvars.ContextVar("agent_libos_logical_call_timeout", default=None)
 )
 
 # These are inbound trust-boundary limits, not generation preferences. They
@@ -72,6 +85,10 @@ class LLMTransientError(LLMError):
     """Provider failure that is safe to retry in a later process quantum."""
 
 
+class _LogicalCallTimeoutError(TimeoutError):
+    """Host deadline expired; never eligible for another client attempt."""
+
+
 _PROVIDER_FAILURE_MARKER = object()
 _PROVIDER_FAILURE_MARKER_ATTR = "_agent_libos_provider_failure_marker"
 _PROVIDER_FAILURE_OBSERVATION_ATTR = (
@@ -83,7 +100,7 @@ _PROVIDER_FAILURE_OBSERVATION_ATTR = (
 class LLMCompletion:
     content: str
     tool_calls: list[dict[str, Any]]
-    raw: Any | None = None
+    raw: Any | None = field(default=None, repr=False, metadata={"serialize": False})
     api: str | None = None
     response_id: str | None = None
     request_id: str | None = None
@@ -95,9 +112,16 @@ class LLMCompletion:
     # identifiers are intentionally represented as booleans rather than copied
     # into durable call records by downstream consumers.
     provider_request_options: dict[str, Any] = field(default_factory=dict)
+    provider_tool_activities: list[dict[str, Any]] = field(default_factory=list)
+    citations: list[dict[str, Any]] = field(default_factory=list)
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
     compatibility_removed_options: list[str] = field(default_factory=list)
     provider_trace: dict[str, Any] | None = None
     _provider_attempt_sequence: int | None = field(default=None, repr=False)
+    # Host-private state, never a public observation or generic serialization.
+    response_items: list[dict[str, Any]] = field(
+        default_factory=list, repr=False, metadata={"serialize": False}
+    )
 
 
 @dataclass(frozen=True)
@@ -119,60 +143,99 @@ class LLMClient:
     api_mode: Literal["auto", "responses", "chat"] | None = None
     store: bool | None = None
     reasoning_effort: str | None = None
+    reasoning_context: str | None = None
+    responses_replay: bool | None = None
+    prompt_layout: str | None = None
     verbosity: Literal["low", "medium", "high"] | None = None
     safety_identifier: str | None = None
     prompt_cache_key: str | None = None
     prompt_cache_retention: Literal["in_memory", "24h"] | None = None
-    prompt_cache_mode: Literal["provider_default", "implicit", "explicit"] | None = None
+    prompt_cache_mode: Literal["auto", "provider_default", "implicit", "explicit"] | None = None
     prompt_cache_ttl: Literal["30m"] | None = None
+    # Host policy evidence; these fields never become provider wire options.
+    prompt_cache_mode_configured: str | None = None
+    prompt_cache_key_source: str | None = None
     responses_previous_response_id: bool | None = None
     parallel_tool_calls: bool | None = None
     fallback_json_actions: bool | None = None
     enable_thinking: bool | None = None
+    provider_tools: ProviderToolsConfig | None = None
     organization: str | None = None
     project: str | None = None
     inherit_ambient_openai_sdk_config: bool = True
     allow_custom_base_url: bool = False
     defaults: LLMDefaults = field(default_factory=lambda: DEFAULT_CONFIG.llm, repr=False)
+    logical_call_timeout_s: float | None = None
     _client: Any | None = field(default=None, init=False, repr=False)
     _async_client: Any | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.timeout = self.defaults.timeout_s if self.timeout is None else self.timeout
+        self.logical_call_timeout_s = _resolve_logical_call_timeout(
+            self.logical_call_timeout_s, self.defaults.logical_call_timeout_s,
+        )
         self.max_retries = self.defaults.max_retries if self.max_retries is None else self.max_retries
-        self.api_mode = self.defaults.api_mode if self.api_mode is None else self.api_mode
         self.store = self.defaults.store if self.store is None else self.store
         self.safety_identifier = self.defaults.safety_identifier if self.safety_identifier is None else self.safety_identifier
         self.prompt_cache_key = self.defaults.prompt_cache_key if self.prompt_cache_key is None else self.prompt_cache_key
-        self.prompt_cache_retention = _normalize_prompt_cache_retention(
-            self.defaults.prompt_cache_retention
-            if self.prompt_cache_retention is None
-            else self.prompt_cache_retention,
-            label="prompt_cache_retention",
-        )
-        self.prompt_cache_mode = _normalize_prompt_cache_mode(
-            self.defaults.prompt_cache_mode
-            if self.prompt_cache_mode is None
-            else self.prompt_cache_mode,
-            label="prompt_cache_mode",
-        )
-        self.prompt_cache_ttl = _normalize_prompt_cache_ttl(
-            self.defaults.prompt_cache_ttl
-            if self.prompt_cache_ttl is None
-            else self.prompt_cache_ttl,
-            label="prompt_cache_ttl",
-        )
+        configured_cache_mode = self.defaults.prompt_cache_mode if self.prompt_cache_mode is None else self.prompt_cache_mode
+        if self.prompt_cache_mode_configured is None:
+            self.prompt_cache_mode_configured = configured_cache_mode
+        if self.prompt_cache_key_source is None:
+            self.prompt_cache_key_source = "configured" if self.prompt_cache_key else "none"
+        if self.inherit_ambient_openai_sdk_config and self.base_url is None:
+            # Freeze the endpoint before policy resolution and lazy SDK startup.
+            self.base_url = os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        self._validate_base_url_policy()
+        try:
+            self.provider_tools = normalize_provider_tools(self.provider_tools)
+            policy = resolve_provider_policy(
+                defaults=self.defaults,
+                base_url=self.base_url,
+                model=self.model,
+                api_mode=self.api_mode,
+                reasoning_effort=self.reasoning_effort,
+                reasoning_context=self.reasoning_context,
+                responses_replay=self.responses_replay,
+                prompt_layout=self.prompt_layout,
+                prompt_cache_mode=self.prompt_cache_mode,
+                prompt_cache_ttl=self.prompt_cache_ttl,
+                prompt_cache_retention=self.prompt_cache_retention,
+                provider_tools=self.provider_tools,
+            )
+        except ValueError as exc:
+            raise LLMError(str(exc)) from exc
+        self.provider_tools = policy.provider_tools
+        self.model = policy.model
+        self.api_mode = policy.api_mode  # type: ignore[assignment]
+        self.reasoning_effort = policy.reasoning_effort
+        self.reasoning_context = policy.reasoning_context
+        self.responses_replay = policy.responses_replay
+        self.prompt_layout = policy.prompt_layout
+        self.prompt_cache_mode = _normalize_prompt_cache_mode(policy.prompt_cache_mode, label="prompt_cache_mode")
+        self.prompt_cache_retention = _normalize_prompt_cache_retention(policy.prompt_cache_retention, label="prompt_cache_retention")
+        self.prompt_cache_ttl = _normalize_prompt_cache_ttl(policy.prompt_cache_ttl, label="prompt_cache_ttl")
+        if configured_cache_mode == "auto" and self.prompt_cache_mode != "provider_default" and not self.prompt_cache_key:
+            # Standalone clients get a lifecycle-local Host privacy domain;
+            # registry clients arrive with their own stable profile domain.
+            self.prompt_cache_key = secrets.token_hex(32)
+            self.prompt_cache_key_source = "host_generated"
         _validate_prompt_cache_options(
             mode=self.prompt_cache_mode,
             key=self.prompt_cache_key,
             retention=self.prompt_cache_retention,
             ttl=self.prompt_cache_ttl,
         )
+        self._initialize_action_defaults()
+
+    def _initialize_action_defaults(self) -> None:
         self.responses_previous_response_id = (
             self.defaults.responses_previous_response_id
             if self.responses_previous_response_id is None
             else self.responses_previous_response_id
         )
+        if self.provider_tools is not None and self.provider_tools.code_interpreter:
+            self.responses_previous_response_id = False
         self.parallel_tool_calls = (
             self.defaults.parallel_tool_calls if self.parallel_tool_calls is None else self.parallel_tool_calls
         )
@@ -181,13 +244,6 @@ class LLMClient:
             if self.fallback_json_actions is None
             else self.fallback_json_actions
         )
-        if self.inherit_ambient_openai_sdk_config and self.base_url is None:
-            # Freeze the SDK's ambient endpoint before policy validation.  If
-            # this remains unset, the OpenAI SDK re-reads OPENAI_BASE_URL at
-            # lazy client construction and can dispatch to an endpoint that
-            # Agent libOS never authorized or included in provider identity.
-            self.base_url = os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
-        self._validate_base_url_policy()
 
     @classmethod
     def from_env(
@@ -216,10 +272,21 @@ class LLMClient:
             api_key=env.get("OPENAI_API_KEY"),
             api_key_env="OPENAI_API_KEY",
             timeout=_float_env_from(env, "OPENAI_TIMEOUT", default=defaults.timeout_s),
+            logical_call_timeout_s=_optional_float_env_from(
+                env,
+                "OPENAI_LOGICAL_CALL_TIMEOUT",
+                default=defaults.logical_call_timeout_s,
+            ),
             max_retries=_int_env_from(env, "OPENAI_MAX_RETRIES", default=defaults.max_retries),
             api_mode=api_mode,  # type: ignore[arg-type]
             store=_bool_env_from(env, "OPENAI_STORE", default=defaults.store),
             reasoning_effort=_optional_env_from(env, "OPENAI_REASONING_EFFORT"),
+            reasoning_context=_optional_env_from(env, "OPENAI_REASONING_CONTEXT"),
+            responses_replay=(
+                _bool_env_from(env, "OPENAI_RESPONSES_REPLAY", default=False)
+                if "OPENAI_RESPONSES_REPLAY" in env else None
+            ),
+            prompt_layout=_optional_env_from(env, "OPENAI_PROMPT_LAYOUT"),
             verbosity=_verbosity_env_from(env, "OPENAI_VERBOSITY"),
             safety_identifier=_optional_env_from(env, "OPENAI_SAFETY_IDENTIFIER") or defaults.safety_identifier,
             prompt_cache_key=_optional_env_from(env, "OPENAI_PROMPT_CACHE_KEY") or defaults.prompt_cache_key,
@@ -309,6 +376,8 @@ class LLMClient:
         json_mode: bool = True,
         json_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
+        *,
+        responses_items: list[dict[str, Any]] | None = None,
     ) -> str:
         return self.complete_with_metadata(
             messages=messages,
@@ -317,6 +386,7 @@ class LLMClient:
             json_mode=json_mode,
             json_schema=json_schema,
             schema_name=schema_name,
+            responses_items=responses_items,
         ).content
 
     def complete_with_metadata(
@@ -327,6 +397,8 @@ class LLMClient:
         json_mode: bool = True,
         json_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
+        *,
+        responses_items: list[dict[str, Any]] | None = None,
     ) -> LLMCompletion:
         return _run_sync(
             self.acomplete_with_metadata(
@@ -336,6 +408,7 @@ class LLMClient:
                 json_mode=json_mode,
                 json_schema=json_schema,
                 schema_name=schema_name,
+                responses_items=responses_items,
             )
         )
 
@@ -347,6 +420,8 @@ class LLMClient:
         json_mode: bool = True,
         json_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
+        *,
+        responses_items: list[dict[str, Any]] | None = None,
     ) -> str:
         return (
             await self.acomplete_with_metadata(
@@ -356,6 +431,7 @@ class LLMClient:
                 json_mode=json_mode,
                 json_schema=json_schema,
                 schema_name=schema_name,
+                responses_items=responses_items,
             )
         ).content
 
@@ -367,34 +443,38 @@ class LLMClient:
         json_mode: bool = True,
         json_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
+        *,
+        responses_items: list[dict[str, Any]] | None = None,
     ) -> LLMCompletion:
         trace = ProviderTraceBuilder()
         trace_token = _ACTIVE_PROVIDER_TRACE.set(trace)
         kind_token = _ACTIVE_PROVIDER_ATTEMPT_KIND.set("initial")
         try:
-            selected_messages = (
-                self._messages_with_json_instruction(messages)
-                if json_mode and json_schema is None
-                else messages
-            )
-            completion = await self._complete_without_tools(
-                messages=selected_messages,
-                temperature=self._temperature(temperature),
-                max_tokens=self._max_tokens(max_tokens),
-                json_mode=json_mode,
-                json_schema=json_schema,
-                schema_name=schema_name,
-            )
-            if not completion.content:
-                error = llm_provider_failure_error(
-                    "empty content",
-                    diagnostic_type="ProviderEmptyResponse",
+            async with self._logical_call_scope():
+                selected_messages = (
+                    self._messages_with_json_instruction(messages)
+                    if json_mode and json_schema is None
+                    else messages
                 )
-                _reject_active_provider_sequence(
-                    completion._provider_attempt_sequence,
-                    error,
+                completion = await self._complete_without_tools(
+                    messages=selected_messages,
+                    temperature=self._temperature(temperature),
+                    max_tokens=self._max_tokens(max_tokens),
+                    json_mode=json_mode,
+                    json_schema=json_schema,
+                    schema_name=schema_name,
+                    responses_items=responses_items,
                 )
-                raise error
+                if not completion.content:
+                    error = llm_provider_failure_error(
+                        "empty content",
+                        diagnostic_type="ProviderEmptyResponse",
+                    )
+                    _reject_active_provider_sequence(
+                        completion._provider_attempt_sequence,
+                        error,
+                    )
+                    raise error
             trace.mark_selected(completion._provider_attempt_sequence)
             completion.provider_trace = trace.to_dict()
             return completion
@@ -413,6 +493,9 @@ class LLMClient:
         max_tokens: int | None = None,
         previous_response_id: str | None = None,
         parallel_tool_calls: bool | None = None,
+        *,
+        responses_items: list[dict[str, Any]] | None = None,
+        provider_tools_enabled: bool = True,
     ) -> LLMCompletion:
         return _run_sync(
             self.acomplete_action(
@@ -422,6 +505,8 @@ class LLMClient:
                 max_tokens=max_tokens,
                 previous_response_id=previous_response_id,
                 parallel_tool_calls=parallel_tool_calls,
+                responses_items=responses_items,
+                provider_tools_enabled=provider_tools_enabled,
             )
         )
 
@@ -433,19 +518,25 @@ class LLMClient:
         max_tokens: int | None = None,
         previous_response_id: str | None = None,
         parallel_tool_calls: bool | None = None,
+        *,
+        responses_items: list[dict[str, Any]] | None = None,
+        provider_tools_enabled: bool = True,
     ) -> LLMCompletion:
         trace = ProviderTraceBuilder()
         trace_token = _ACTIVE_PROVIDER_TRACE.set(trace)
         kind_token = _ACTIVE_PROVIDER_ATTEMPT_KIND.set("initial")
         try:
-            completion = await self._acomplete_action_untraced(
-                messages=messages,
-                tools=tools,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                previous_response_id=previous_response_id,
-                parallel_tool_calls=parallel_tool_calls,
-            )
+            async with self._logical_call_scope():
+                completion = await self._acomplete_action_untraced(
+                    messages=messages,
+                    tools=tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    previous_response_id=previous_response_id,
+                    parallel_tool_calls=parallel_tool_calls,
+                    responses_items=responses_items,
+                    provider_tools_enabled=provider_tools_enabled,
+                )
             trace.mark_selected(completion._provider_attempt_sequence)
             completion.provider_trace = trace.to_dict()
             return completion
@@ -456,6 +547,28 @@ class LLMClient:
             _ACTIVE_PROVIDER_ATTEMPT_KIND.reset(kind_token)
             _ACTIVE_PROVIDER_TRACE.reset(trace_token)
 
+    @asynccontextmanager
+    async def _logical_call_scope(self) -> Any:
+        if self.logical_call_timeout_s is None:
+            yield
+            return
+        # Enter in the same event loop that owns the SDK coroutine. Cancelling
+        # a caller-side thread Future cannot reliably stop provider work.
+        timeout = asyncio.timeout(self.logical_call_timeout_s)
+        token = _ACTIVE_LOGICAL_CALL_TIMEOUT.set(timeout)
+        try:
+            try:
+                async with timeout:
+                    yield
+                    _check_logical_call_deadline()
+            except TimeoutError as exc:
+                if not timeout.expired() and not isinstance(exc, _LogicalCallTimeoutError):
+                    raise
+                deadline_error = _LogicalCallTimeoutError("LLM logical call deadline exceeded")
+                raise llm_provider_failure_error(deadline_error, transient=True) from deadline_error
+        finally:
+            _ACTIVE_LOGICAL_CALL_TIMEOUT.reset(token)
+
     async def _acomplete_action_untraced(
         self,
         messages: list[dict[str, Any]],
@@ -464,7 +577,16 @@ class LLMClient:
         max_tokens: int | None = None,
         previous_response_id: str | None = None,
         parallel_tool_calls: bool | None = None,
+        *,
+        responses_items: list[dict[str, Any]] | None = None,
+        provider_tools_enabled: bool = True,
     ) -> LLMCompletion:
+        if type(provider_tools_enabled) is not bool:
+            raise LLMError("provider_tools_enabled must be a Host boolean")
+        if responses_items is not None and not self._use_responses_api():
+            raise LLMError("Responses replay requires the Responses API")
+        if responses_items is not None and previous_response_id is not None:
+            raise LLMError("Responses replay cannot use previous_response_id")
         selected_temperature = self._temperature(temperature)
         selected_max_tokens = self._max_tokens(max_tokens)
         selected_parallel_tool_calls = self._parallel_tool_calls(parallel_tool_calls)
@@ -477,8 +599,14 @@ class LLMClient:
                     selected_max_tokens,
                     previous_response_id=previous_response_id,
                     parallel_tool_calls=selected_parallel_tool_calls,
+                    responses_items=responses_items,
+                    provider_tools_enabled=provider_tools_enabled,
                 )
             except LLMError as exc:
+                if (self.provider_tools is not None and provider_tools_enabled) or responses_items is not None or self.responses_replay or (self._use_openai_request_options() and is_astra_model(self.model)):
+                    # A fallback cannot preserve native ordered reasoning/tool
+                    # state. The caller must resolve this protocol failure.
+                    raise
                 cause = exc.__cause__ or exc
                 if self.api_mode == "auto" and self._should_fallback_to_chat(cause):
                     pass
@@ -500,6 +628,7 @@ class LLMClient:
                     selected_temperature,
                     selected_max_tokens,
                     parallel_tool_calls=selected_parallel_tool_calls,
+                    provider_tools_enabled=provider_tools_enabled,
                 )
         return await self._chat_complete_action(
             messages,
@@ -507,6 +636,7 @@ class LLMClient:
             selected_temperature,
             selected_max_tokens,
             parallel_tool_calls=selected_parallel_tool_calls,
+            provider_tools_enabled=provider_tools_enabled,
         )
 
     async def _complete_without_tools(
@@ -517,12 +647,16 @@ class LLMClient:
         json_mode: bool,
         json_schema: dict[str, Any] | None,
         schema_name: str,
+        *,
+        responses_items: list[dict[str, Any]] | None = None,
     ) -> LLMCompletion:
+        if responses_items is not None and not self._use_responses_api():
+            raise LLMError("Responses replay requires the Responses API")
         if self._use_responses_api():
             try:
-                return await self._responses_complete(messages, temperature, max_tokens, json_mode, json_schema, schema_name)
+                return await self._responses_complete(messages, temperature, max_tokens, json_mode, json_schema, schema_name, responses_items=responses_items)
             except LLMError as exc:
-                if self.api_mode != "auto" or not self._should_fallback_to_chat(exc.__cause__ or exc):
+                if responses_items is not None or self.responses_replay or self.api_mode != "auto" or not self._should_fallback_to_chat(exc.__cause__ or exc):
                     raise
             with _provider_attempt_kind("responses_to_chat"):
                 return await self._chat_complete(
@@ -543,15 +677,21 @@ class LLMClient:
         json_mode: bool,
         json_schema: dict[str, Any] | None,
         schema_name: str,
+        *,
+        responses_items: list[dict[str, Any]] | None = None,
     ) -> LLMCompletion:
-        payload = self._responses_payload(messages, temperature=temperature, max_tokens=max_tokens)
+        payload = self._responses_payload(messages, temperature=temperature, max_tokens=max_tokens, responses_items=responses_items)
         if json_schema is not None:
             payload["text"] = self._responses_text_config_for_schema(json_schema, schema_name)
         elif json_mode:
             payload["text"] = self._text_config(json_mode=True)
+            if responses_items is not None:
+                # Public messages do not supply the native replay input. Keep
+                # JSON-mode's Host instruction without changing ordered items.
+                payload["instructions"] = self.defaults.json_instruction
         provider_call = await self._create_response(payload)
         try:
-            return self._completion_from_response(provider_call)
+            return self._completion_from_response(provider_call, capture_replay=responses_items is not None)
         except Exception as exc:
             _reject_active_provider_attempt(provider_call, exc)
             raise
@@ -565,12 +705,15 @@ class LLMClient:
         *,
         previous_response_id: str | None = None,
         parallel_tool_calls: bool,
+        responses_items: list[dict[str, Any]] | None = None,
+        provider_tools_enabled: bool = True,
     ) -> LLMCompletion:
         payload = self._responses_payload(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
             previous_response_id=previous_response_id,
+            responses_items=responses_items,
         )
         payload.update(
             {
@@ -579,9 +722,10 @@ class LLMClient:
                 "parallel_tool_calls": parallel_tool_calls,
             }
         )
+        apply_provider_tools(payload, self.provider_tools, api="responses", enabled=provider_tools_enabled)
         provider_call = await self._create_response(payload)
         try:
-            return self._completion_from_response(provider_call)
+            return self._completion_from_response(provider_call, capture_replay=responses_items is not None)
         except Exception as exc:
             _reject_active_provider_attempt(provider_call, exc)
             raise
@@ -642,13 +786,15 @@ class LLMClient:
         max_tokens: int,
         *,
         parallel_tool_calls: bool,
+        provider_tools_enabled: bool = True,
     ) -> LLMCompletion:
         payload = self._chat_payload(messages=messages, temperature=temperature, max_tokens=max_tokens)
         payload.update({"tools": _chat_tools(tools), "tool_choice": "auto", "parallel_tool_calls": parallel_tool_calls})
+        apply_provider_tools(payload, self.provider_tools, api="chat", enabled=provider_tools_enabled)
         try:
             provider_call = await self._create_chat_completion(payload)
         except LLMError as exc:
-            if self.fallback_json_actions and self._is_tool_protocol_rejection(
+            if not (self.provider_tools is not None and provider_tools_enabled) and self.fallback_json_actions and self._is_tool_protocol_rejection(
                 exc.__cause__ or exc
             ):
                 with _provider_attempt_kind("json_action_fallback"):
@@ -781,15 +927,32 @@ class LLMClient:
     async def _async_client_scope(self) -> Any:
         client = self._async_client_or_raise()
         owned = self._async_client is None
+        primary_error: BaseException | None = None
         try:
             yield client
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
             if owned:
                 close = getattr(client, "aclose", None) or getattr(client, "close", None)
                 if callable(close):
-                    result = close()
-                    if inspect.isawaitable(result):
-                        await result
+                    try:
+                        timeout = _ACTIVE_LOGICAL_CALL_TIMEOUT.get()
+                        # Cancellation has already been delivered to the
+                        # request. Reuse its absolute deadline for cleanup so
+                        # a slow close cannot restart the logical-call budget.
+                        async with asyncio.timeout_at(timeout.when() if timeout else None):
+                            result = close()
+                            if inspect.isawaitable(result):
+                                await result
+                    except BaseException as cleanup_error:
+                        if isinstance(primary_error, asyncio.CancelledError):
+                            pass
+                        elif primary_error is not None and isinstance(cleanup_error, Exception):
+                            pass
+                        else:
+                            raise
 
     def _client_kwargs(self) -> dict[str, Any]:
         self._validate_base_url_policy()
@@ -841,31 +1004,39 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
         previous_response_id: str | None = None,
+        *,
+        responses_items: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if not self.model:
             raise LLMError("OPENAI_LANGUAGE_MODEL or OPENAI_MODEL is not configured")
-        will_use_previous_response_id = bool(
-            previous_response_id
-            and self.store
-            and self._use_openai_request_options()
-            and not _messages_have_unrepresentable_tool_output(messages)
+        messages = self._responses_history_messages(
+            messages, responses_items=responses_items, previous_response_id=previous_response_id,
         )
-        provider_messages = _messages_for_provider(
-            messages,
-            api="responses",
-            add_cache_breakpoint=self.prompt_cache_mode == "explicit",
+        will_use_previous_response_id = self._can_use_previous_response_id(
+            previous_response_id, messages=messages, responses_items=responses_items
         )
-        instructions, input_items = _messages_to_responses_parts(
-            provider_messages,
-            native_tool_outputs=will_use_previous_response_id,
-            tool_output_max_chars=self.defaults.tool_output_prompt_max_chars,
-        )
+        if responses_items is not None:
+            if previous_response_id is not None:
+                raise LLMError("Responses replay cannot use previous_response_id")
+            input_items = self._native_replay_input(responses_items)
+            instructions = None
+        else:
+            provider_messages = _messages_for_provider(
+                messages,
+                api="responses",
+                add_cache_breakpoint=self._uses_prompt_cache_breakpoint(),
+            )
+            instructions, input_items = _messages_to_responses_parts(
+                provider_messages,
+                native_tool_outputs=will_use_previous_response_id,
+                tool_output_max_chars=self.defaults.tool_output_prompt_max_chars,
+            )
         payload: dict[str, Any] = {
             "model": self.model,
             "input": input_items,
             "max_output_tokens": max_tokens,
             "store": self.store,
-            "truncation": "auto",
+            "truncation": "disabled" if responses_items is not None or self.responses_replay else "auto",
         }
         if instructions:
             payload["instructions"] = instructions
@@ -873,12 +1044,17 @@ class LLMClient:
             payload[_CACHE_STABLE_PROJECTION_KEY] = (
                 _host_stable_message_projection(messages)
             )
-        if temperature is not None:
+        if temperature is not None and not (self._use_openai_request_options() and is_astra_model(self.model)):
             payload["temperature"] = temperature
         if will_use_previous_response_id:
             payload["previous_response_id"] = previous_response_id
+        reasoning: dict[str, str] = {}
         if self.reasoning_effort:
-            payload["reasoning"] = {"effort": self.reasoning_effort}
+            reasoning["effort"] = self.reasoning_effort
+        if self.reasoning_context:
+            reasoning["context"] = self.reasoning_context
+        if reasoning:
+            payload["reasoning"] = reasoning
         text_config = self._text_config(json_mode=False)
         if text_config:
             payload["text"] = text_config
@@ -887,6 +1063,59 @@ class LLMClient:
         if extra_body:
             payload["extra_body"] = extra_body
         return payload
+
+    def _responses_history_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        responses_items: list[dict[str, Any]] | None,
+        previous_response_id: str | None,
+    ) -> list[dict[str, Any]]:
+        if self.provider_tools is not None and self.provider_tools.code_interpreter:
+            if responses_items is not None or previous_response_id is not None:
+                raise LLMError("Code interpreter requires stateless history; start a new process or task")
+            # Strip structured provider annotations even on Host cache-marked
+            # messages. Only plain content and Runtime function history survive.
+            messages = [
+                {**message, "content": _message_content_for_search(message)}
+                for message in messages
+            ]
+        return messages
+
+    def _can_use_previous_response_id(
+        self,
+        response_id: str | None,
+        *,
+        messages: list[dict[str, Any]],
+        responses_items: list[dict[str, Any]] | None,
+    ) -> bool:
+        return bool(
+            response_id
+            and responses_items is None
+            and not self.responses_replay
+            and not (self.provider_tools is not None and self.provider_tools.code_interpreter)
+            and self.store
+            and self._use_openai_request_options()
+            and not _messages_have_unrepresentable_tool_output(messages)
+        )
+
+    def _native_replay_input(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        try:
+            selected = validate_response_items(items, provider=self.provider_tools.provider if self.provider_tools else None)
+        except ResponseItemsError as exc:
+            raise LLMError(str(exc)) from exc
+        if not self._uses_prompt_cache_breakpoint():
+            return selected
+        # Only mark leading Host instructions. Keep the complete private
+        # transcript order and its dynamic snapshots unchanged.
+        target: int | None = None
+        for index, item in enumerate(selected):
+            if item.get("role") not in {"system", "developer"}:
+                break
+            target = index
+        if target is not None:
+            _attach_cache_breakpoint(selected[target], api="responses", stable_prefix_chars=None)
+        return selected
 
     def _chat_payload(self, messages: list[dict[str, Any]], temperature: float, max_tokens: int) -> dict[str, Any]:
         if not self.model:
@@ -902,6 +1131,8 @@ class LLMClient:
             "temperature": temperature,
             "max_completion_tokens": max_tokens,
         }
+        if self._use_openai_request_options() and is_astra_model(self.model):
+            payload.pop("temperature", None)
         if self.store:
             payload["store"] = True
         if self.reasoning_effort:
@@ -987,20 +1218,36 @@ class LLMClient:
     ) -> tuple[Any, int | None]:
         max_retries = max(0, int(self.max_retries or 0))
         for retry_index in range(max_retries + 1):
+            _check_logical_call_deadline()
             trace = _ACTIVE_PROVIDER_TRACE.get()
             sequence = (
                 trace.start_attempt(
                     api="responses" if api == "responses" else "chat",
                     kind=kind if retry_index == 0 else "transport_retry",
+                    provider_tools=provider_tool_request_observation(
+                        self.provider_tools, request, replay=bool(self.responses_replay),
+                    ),
                 )
                 if trace is not None
                 else None
             )
             try:
                 response = await create(**request)
-            except Exception as exc:
+            except BaseException as exc:
                 if trace is not None and sequence is not None:
-                    trace.finish_error(sequence, exc)
+                    timeout = _ACTIVE_LOGICAL_CALL_TIMEOUT.get()
+                    trace.finish_error(
+                        sequence,
+                        _LogicalCallTimeoutError("LLM logical call deadline exceeded")
+                        if isinstance(exc, asyncio.CancelledError)
+                        and timeout is not None and timeout.expired()
+                        else exc,
+                    )
+                if not isinstance(exc, Exception):
+                    raise
+                # A transport can translate cancellation to its own exception.
+                # Do not enter a fresh backoff after the Host budget is spent.
+                _check_logical_call_deadline()
                 if (
                     not _is_openai_sdk_error(exc)
                     or not _should_retry_openai_sdk_error(exc)
@@ -1011,6 +1258,9 @@ class LLMClient:
                 continue
             if trace is not None and sequence is not None:
                 trace.finish_response(sequence, response)
+            # A custom transport may suppress cancellation. Keep any returned
+            # usage evidence, but never select a response past the Host deadline.
+            _check_logical_call_deadline()
             return response, sequence
         raise AssertionError("unreachable Provider retry loop")
 
@@ -1022,10 +1272,14 @@ class LLMClient:
     ) -> dict[str, Any] | None:
         message = str(exc).lower()
         retry = dict(payload)
+        has_replay = api == "responses" and (
+            self.responses_replay or _has_responses_replay_items(payload.get("input"))
+        )
+        if has_replay and any(option in message for option in ("reasoning", "encrypted_content", "previous_response_id", "truncation", "store")):
+            return None
 
         if "enable_thinking" in message and "extra_body" in retry:
-            retry.pop("extra_body", None)
-            return retry
+            return self._without_optional_thinking(retry)
         if "max_completion_tokens" in message and "max_completion_tokens" in retry:
             retry["max_tokens"] = retry.pop("max_completion_tokens")
             return retry
@@ -1046,14 +1300,33 @@ class LLMClient:
             return cache_retry
         return _generic_compatibility_retry(retry, message)
 
+    def _without_optional_thinking(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """Compatibility may remove optional thinking but never hosted-tool policy."""
+        retry = dict(payload)
+        observation = provider_tool_request_observation(self.provider_tools, payload, replay=False)
+        if (self.provider_tools is not None and self.provider_tools.provider == "aliyun"
+                and observation is not None
+                and any(name in observation["effective"] for name in ("code_interpreter", "web_extractor"))):
+            return None
+        extra_body = dict(retry["extra_body"])
+        if "enable_thinking" not in extra_body:
+            return None
+        extra_body.pop("enable_thinking")
+        if extra_body:
+            retry["extra_body"] = extra_body
+        else:
+            retry.pop("extra_body")
+        return retry
+
     def _completion_from_response(
         self,
         provider_call: _ProviderCallResult,
         *,
         additional_removed: tuple[str, ...] = (),
+        capture_replay: bool = False,
     ) -> LLMCompletion:
         response = provider_call.response
-        error = getattr(response, "error", None)
+        error = _get_attr_or_key(response, "error")
         if error is not None:
             raise llm_provider_failure_error(
                 error,
@@ -1068,7 +1341,7 @@ class LLMClient:
                 diagnostic_type="ProviderResponseStatus",
             )
         output = _bounded_provider_items(
-            getattr(response, "output", None),
+            _get_attr_or_key(response, "output"),
             limit=LLM_RESPONSE_OUTPUT_MAX_ITEMS,
             label="response.output",
         )
@@ -1110,16 +1383,29 @@ class LLMClient:
                     "arguments": arguments,
                 }
             )
+        response_items: list[dict[str, Any]] = []
+        if self.responses_replay or capture_replay:
+            try:
+                response_items = validate_response_items(
+                    output, output=True, provider=self.provider_tools.provider if self.provider_tools else None,
+                )
+            except ResponseItemsError as exc:
+                raise LLMError(str(exc)) from exc
+        managed = self._managed_response_projection(output, provider_call)
         completion = LLMCompletion(
+            provider_tool_activities=managed.activities,
+            citations=managed.citations,
+            artifacts=managed.artifacts,
             content=self._response_text(response, output=output),
             tool_calls=tool_calls,
-            raw=response,
+            raw=project_provider_raw_response(response),
             api="responses",
-            response_id=getattr(response, "id", None),
-            request_id=getattr(response, "_request_id", None),
-            model=str(getattr(response, "model", "")) or None,
+            response_id=_get_attr_or_key(response, "id"),
+            request_id=_get_attr_or_key(response, "_request_id"),
+            model=_get_attr_or_key(response, "model"),
             usage=_usage_from_response(response),
             reasoning=_reasoning_from_response(response, output=output),
+            response_items=response_items,
             provider_request_options=_provider_request_option_observation(
                 provider_call.request
             ),
@@ -1130,6 +1416,7 @@ class LLMClient:
             ),
             _provider_attempt_sequence=provider_call.attempt_sequence,
         )
+        self._add_provider_tools_observation(completion, provider_call, managed)
         _enrich_active_provider_trace(completion)
         return completion
 
@@ -1193,7 +1480,14 @@ class LLMClient:
                 diagnostic_type="ProviderFinishReason",
             )
 
+        managed = self._managed_response_projection(
+            [{"type": "message", "content": [{"annotations": _get_attr_or_key(message, "annotations")}]}],
+            provider_call,
+        )
         result = LLMCompletion(
+            provider_tool_activities=managed.activities,
+            citations=managed.citations,
+            artifacts=managed.artifacts,
             content=content,
             tool_calls=tool_calls,
             raw=completion,
@@ -1213,8 +1507,29 @@ class LLMClient:
             ),
             _provider_attempt_sequence=provider_call.attempt_sequence,
         )
+        self._add_provider_tools_observation(result, provider_call, managed)
         _enrich_active_provider_trace(result)
         return result
+
+    def _managed_response_projection(self, output: list[Any], provider_call: _ProviderCallResult) -> Any:
+        try:
+            return project_provider_tool_results(
+                output, self.provider_tools, provider_call.request, response=provider_call.response,
+            )
+        except ProviderToolsResponseError as exc:
+            raise LLMError(str(exc)) from exc
+
+    def _add_provider_tools_observation(
+        self, completion: LLMCompletion, provider_call: _ProviderCallResult, managed: Any,
+    ) -> None:
+        observation = provider_tool_request_observation(
+            self.provider_tools, provider_call.request, replay=bool(self.responses_replay),
+        )
+        if observation is not None:
+            if managed.activities or managed.citations or managed.artifacts or managed.usage:
+                observation["observed"] = "returned"
+            observation["usage"] = managed.usage
+            completion.provider_request_options["provider_tools"] = observation
 
     def _use_responses_api(self) -> bool:
         if self.api_mode == "responses":
@@ -1301,6 +1616,12 @@ class LLMClient:
             self.prompt_cache_retention = selected_retention
             payload["prompt_cache_retention"] = selected_retention
 
+    def _uses_prompt_cache_breakpoint(self) -> bool:
+        return self.prompt_cache_mode == "explicit" or (
+            self.prompt_layout == "cache_optimized_v2"
+            and self.prompt_cache_mode == "implicit"
+        )
+
     def _finalize_prompt_cache_request(self, payload: dict[str, Any]) -> None:
         """Bind an opt-in cache key to the stable prefix and tool set.
 
@@ -1338,6 +1659,11 @@ class LLMClient:
                     "model": payload.get("model"),
                     "stable_prefix": stable,
                     "tools": payload.get("tools", []),
+                    **({"provider_tools": {
+                        "provider": self.provider_tools.provider,
+                        "effective": provider_tool_request_observation(self.provider_tools, payload, replay=bool(self.responses_replay)),
+                        "extra_body": payload.get("extra_body", {}),
+                    }} if self.provider_tools is not None else {}),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -1514,6 +1840,13 @@ class LLMClient:
         return [{"role": "system", "content": json_instruction}] + new_messages
 
 
+def _has_responses_replay_items(items: Any) -> bool:
+    return isinstance(items, list) and any(
+        isinstance(item, dict) and item.get("type") in {"reasoning", "function_call", "function_call_output"}
+        for item in items
+    )
+
+
 def _responses_tools_from_chat_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
     for tool in tools:
@@ -1575,6 +1908,12 @@ def _enrich_active_provider_trace(completion: LLMCompletion) -> None:
             model=completion.model,
             request_id=completion.request_id,
             response_id=completion.response_id,
+            provider_tools=(
+                {**completion.provider_request_options["provider_tools"],
+                 "activities": completion.provider_tool_activities,
+                 "citations": completion.citations, "artifacts": completion.artifacts}
+                if "provider_tools" in completion.provider_request_options else None
+            ),
         )
     except Exception:
         # Trace construction is diagnostic and must never turn a valid Provider
@@ -2561,6 +2900,40 @@ def _bool_env_from(env: dict[str, str], name: str, default: bool) -> bool:
     if value is None or not value.strip():
         return default
     return _bool_env_value(value)
+
+
+def _resolve_logical_call_timeout(
+    value: float | None, default: float | None,
+) -> float | None:
+    selected = default if value is None else value
+    if selected is not None and (
+        isinstance(selected, bool)
+        or not isinstance(selected, (int, float))
+        or not math.isfinite(selected)
+        or selected <= 0
+    ):
+        raise LLMError("logical_call_timeout_s must be a finite positive number or None")
+    return selected
+
+
+def _check_logical_call_deadline() -> None:
+    timeout = _ACTIVE_LOGICAL_CALL_TIMEOUT.get()
+    if timeout is None:
+        return
+    deadline = timeout.when()
+    if timeout.expired() or (
+        deadline is not None and asyncio.get_running_loop().time() >= deadline
+    ):
+        raise _LogicalCallTimeoutError("LLM logical call deadline exceeded")
+
+
+def _optional_float_env_from(
+    env: dict[str, str], name: str, default: float | None
+) -> float | None:
+    value = _optional_env_from(env, name)
+    if value is None:
+        return default
+    return _float_env_from(env, name, default=0.0)
 
 
 def _float_env(name: str, default: float) -> float:

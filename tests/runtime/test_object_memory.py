@@ -932,6 +932,7 @@ class TestObjectMemoryName:
         [
             ('error_debug', ObjectType.ERROR_TRACE),
             ('evidence_first', ObjectType.EVIDENCE),
+            ('working_set', ObjectType.GOAL),
         ],
     )
     def test_policy_selection_preserves_root_order_and_cache_prefix(
@@ -2524,7 +2525,8 @@ class TestObjectMemoryName:
         assert second['objects'] == []
         assert self.runtime.store.get_capability(once.cap_id).uses_remaining == 0
 
-    def test_query_with_read_only_authority_does_not_grant_materialize_or_link(self) -> None:
+    @pytest.mark.parametrize('policy', ['plan_first', 'working_set'])
+    def test_query_with_read_only_authority_does_not_grant_materialize_or_link(self, policy: str) -> None:
         owner = self.runtime.process.spawn(image='base-agent:v0', goal='owner query materialize')
         reader = self.runtime.process.spawn(image='base-agent:v0', goal='reader query materialize')
         handle = self.runtime.memory.create_object(
@@ -2542,9 +2544,10 @@ class TestObjectMemoryName:
         assert len(results) == 1
         assert results[0].rights == {'read'}
         view = self.runtime.memory.create_view(reader, results)
-        context = self.runtime.memory.materialize_context(reader, view)
+        context = self.runtime.memory.materialize_context(reader, view, policy=policy)
         assert handle.oid in context.omitted_objects
         assert 'query must not materialize this' not in context.text
+        assert context.object_manifest[0]['reason'] == 'capability_denied'
 
     @pytest.mark.parametrize('limit', (0, -1))
     def test_query_limit_is_validated_before_scan(self, limit: int) -> None:

@@ -1064,6 +1064,52 @@ class TestLLMClient:
         assert tool['strict'] is False
         assert tool['parameters'] == {'type': 'object', 'additionalProperties': True}
 
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    def test_dynamic_tool_wire_schema_keeps_optional_arguments_optional(self, api: str) -> None:
+        schema = {
+            "title": "StoreRecord",
+            "type": "object",
+            "properties": {
+                "result": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}], "default": None},
+                "payload": {"type": "object", "additionalProperties": True},
+            },
+            "required": ["payload"],
+        }
+        original = dumps(schema)
+        if api == "responses":
+            response = SimpleNamespace(id="resp_optional", model="gpt-test", output_text="", output=[])
+            fake = FakeAsyncOpenAI(responses=FakeResponses(response))
+        else:
+            response = SimpleNamespace(
+                id="chatcmpl_optional", model="gpt-test",
+                choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content="", tool_calls=[]))],
+            )
+            fake = FakeAsyncOpenAI(chat=FakeChat(FakeChatCompletions(response)))
+        client = LLMClient(model="gpt-test", api_key="key", api_mode=api)
+        client._async_client = fake
+
+        asyncio.run(client.acomplete_action(
+            messages=[{"role": "user", "content": "Store the record."}],
+            tools=[{"type": "function", "function": {
+                "name": "store_record", "description": "Store a record.", "parameters": schema,
+            }}],
+        ))
+
+        if api == "responses":
+            tool = fake.responses.payloads[0]["tools"][0]
+        else:
+            tool = fake.chat.completions.payloads[0]["tools"][0]["function"]
+        assert tool["strict"] is False
+        assert tool["parameters"] == {
+            "type": "object",
+            "properties": {
+                "result": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}], "default": None},
+                "payload": {"type": "object", "additionalProperties": True},
+            },
+            "required": ["payload"],
+        }
+        assert dumps(schema) == original
+
     def test_responses_text_request_uses_json_schema_when_provided(self) -> None:
         response = SimpleNamespace(id='resp_schema', model='gpt-test', output_text='{"ok":true}', output=[])
         fake = FakeAsyncOpenAI(responses=FakeResponses(response))

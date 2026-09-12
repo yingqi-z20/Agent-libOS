@@ -80,8 +80,9 @@ def normalize_openai_strict_schema(
 
     OpenAI strict function/schema mode requires closed objects and all declared
     properties in ``required``. Schemas that intentionally accept arbitrary keys
-    are left unchanged and marked non-strict so runtime validation semantics stay
-    compatible.
+    are left unchanged except for generated title annotations and marked
+    non-strict so runtime validation semantics stay compatible. A failed
+    strict-mode conversion never exposes its partial rewrites.
     """
 
     _validate_schema_bounds(schema)
@@ -89,7 +90,9 @@ def normalize_openai_strict_schema(
     _strip_model_annotation_titles(candidate)
     if _normalize_schema(candidate):
         return candidate, True
-    return candidate, False
+    fallback = deepcopy(schema)
+    _strip_model_annotation_titles(fallback)
+    return fallback, False
 
 
 def compact_model_json_schema(schema: dict[str, Any]) -> dict[str, Any]:

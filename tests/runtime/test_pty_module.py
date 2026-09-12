@@ -892,9 +892,16 @@ class TestPtyModule:
                 deadline = (
                     time.monotonic() + _PTY_PROCESS_OBSERVATION_TIMEOUT_S
                 )
-                while time.monotonic() < deadline and not marker.exists():
+                observed = None
+                while time.monotonic() < deadline:
+                    if marker.exists():
+                        observed = marker.read_text(encoding="utf-8")
+                        if observed == "ran":
+                            break
+                    # Shell redirection creates the file before printf writes
+                    # its content; existence alone is not dispatch evidence.
                     time.sleep(0.01)
-                assert marker.read_text(encoding="utf-8") == "ran"
+                assert observed == "ran"
                 adapter.close(pid, created.session_oid)
             finally:
                 runtime.close()

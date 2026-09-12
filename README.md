@@ -363,8 +363,8 @@ use the same RuntimeStore contract and enforce a single active writable Runtime
 lease for one store target. A custom SQLite target inside the workspace is
 rejected before database or sidecar creation; there is no unsafe override.
 
-The current Runtime creates and opens only RuntimeStore schema v7. A canonical
-v6 store requires the explicit, offline, digest-bound v6-to-v7 migration; older
+The current Runtime creates and opens only RuntimeStore schema v8. A canonical
+v7 store requires the explicit, offline, digest-bound v7-to-v8 migration; older
 supported stores must traverse the documented ordered migrations. Startup never
 performs an automatic migration, backfill, dual-schema bridge, or speculative
 repair. Legacy project-root `.agent_libos.sqlite` databases are not moved

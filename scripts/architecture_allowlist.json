@@ -25,7 +25,7 @@
     "agent_libos/tools/builtin/context.py::CompactProcessContextTool.run": 25,
     "agent_libos/tools/sandbox.py::DenoTypescriptSandbox._contains_runtime_code_generation": 22,
     "agent_libos/tools/sandbox.py::DenoTypescriptSandbox.arun_source": 22,
-    "agent_libos/utils/serde.py::to_jsonable": 23
+    "agent_libos/utils/serde.py::to_jsonable": 22
   },
   "function_line_budgets": {
     "agent_libos/config/defaults.py::_validate_config": 317,

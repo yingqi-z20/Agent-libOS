@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextvars import Token
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from agent_libos.models import (
     DataFlowContext,
@@ -35,6 +35,17 @@ class DataFlowPort(Protocol):
         *,
         exclude_oids: Iterable[str] = (),
     ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        ...
+
+    def validate_replay_sources(
+        self,
+        pid: str,
+        context: DataFlowContext,
+        *,
+        file_resource_resolver: Callable[[str], str],
+        captured_objects: Mapping[str, tuple[int, Any]] | None = None,
+        allow_recovered_source_snapshots: bool = False,
+    ) -> None:
         ...
 
 
@@ -101,6 +112,7 @@ class HumanDataFlowPort(Protocol):
         context: DataFlowContext | None,
         payload: Any,
         minimum_integrity: DataIntegrity | str = DataIntegrity.UNTRUSTED,
+        allow_recovered_source_snapshots: bool = False,
     ) -> DataFlowDecision:
         ...
 

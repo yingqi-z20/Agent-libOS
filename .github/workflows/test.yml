@@ -12,8 +12,8 @@ permissions:
   contents: read
 
 env:
-  RELEASE_WHEEL: dist/agent_libos-1.5.2-py3-none-any.whl
-  RELEASE_SDIST: dist/agent_libos-1.5.2.tar.gz
+  RELEASE_WHEEL: dist/agent_libos-1.5.3-py3-none-any.whl
+  RELEASE_SDIST: dist/agent_libos-1.5.3.tar.gz
   RELEASE_CHECKSUMS: dist/SHA256SUMS
 
 jobs:
@@ -65,6 +65,9 @@ jobs:
 
       - name: Check generated configuration reference
         run: uv run python scripts/generate_config_reference.py --check
+
+      - name: Check builtin tool contracts
+        run: uv run python scripts/check_tool_contracts.py
 
       - name: Check documentation navigation and workflow contracts
         run: >-

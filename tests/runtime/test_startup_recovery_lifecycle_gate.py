@@ -43,11 +43,13 @@ def test_checkpoint_payload_recovery_precedes_missing_payload_sweep(
         repository: ObjectRepository,
         *,
         require_recovery_lease: Callable[[], None],
+        retained_read_capabilities: Any = None,
     ) -> object:
         order.append("missing_payload_sweep")
         return original_payload_sweep(
             repository,
             require_recovery_lease=require_recovery_lease,
+            retained_read_capabilities=retained_read_capabilities,
         )
 
     monkeypatch.setattr(

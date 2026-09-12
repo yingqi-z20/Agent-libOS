@@ -348,7 +348,7 @@ custom-protocol BrowserWindow, its API origin, and the preload bridge.
 
 ## Self-contained internal desktop distribution
 
-Agent libOS 1.5.2 also has a manually triggered, internal-only native desktop
+Agent libOS 1.5.3 also has a manually triggered, internal-only native desktop
 build for macOS arm64, Windows x64, and Ubuntu 24.04/glibc x64. The exact
 runtime closure is Electron 43.2.0, a PyInstaller 6.21.0 one-folder sidecar
 built with CPython 3.11.15, Agent libOS with the complete MCP extra (including
@@ -730,7 +730,7 @@ Either kind of lookahead becomes a `source_limited` lower-bound entry in
 Event and audit rows persist a derived `gui_snapshot_visible` flag. Snapshot
 queries filter that indexed flag before applying `LIMIT`, preventing internal
 GUI-presentation evidence from displacing causal runtime rows. The flag is
-required by store schema v7; missing or malformed persisted visibility state is
+required by store schema v8; missing or malformed persisted visibility state is
 rejected rather than repaired during open. Bounded event/audit page endpoints
 can still include presentation evidence when requested.
 The process window orders non-terminal processes before the most recently
@@ -966,7 +966,7 @@ Important endpoints:
   Collection, ledger, and Human pages accept opaque `cursor` values and return
   `next_cursor`; clients must not parse or synthesize them. The embedded
   requirements page also returns `next_cursor`. Requirement changes are linked
-  ledger items, and 1.5.2 has no independent Task Run requirements or wait HTTP
+  ledger items, and 1.5.3 has no independent Task Run requirements or wait HTTP
   route.
 - `POST /api/task-runs/{run_id}/run|pause|resume|cancel|follow-ups|recover|rerun`.
   Every existing-Run mutation carries a command id and expected revision.

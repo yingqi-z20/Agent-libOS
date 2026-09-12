@@ -12,10 +12,11 @@ from typing import Any
 
 from pydantic import ValidationError as PydanticValidationError
 
-from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMProfile
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMProfile, normalize_provider_tools
 from agent_libos.config.defaults import (
     sanitize_llm_base_url_for_summary,
     validate_llm_base_url,
+    validate_provider_tools_api_mode,
 )
 from agent_libos.models.exceptions import NotFound, ValidationError
 
@@ -33,7 +34,9 @@ _STRING_LIMITS = {
 }
 _API_MODES = {"auto", "responses", "chat"}
 _VERBOSITY = {"low", "medium", "high"}
-_PROMPT_CACHE_MODES = {"provider_default", "implicit", "explicit"}
+_PROMPT_CACHE_MODES = {"auto", "provider_default", "implicit", "explicit"}
+_PROMPT_LAYOUTS = {"auto", "legacy_v1", "cache_optimized_v2"}
+_REASONING_CONTEXTS = {"auto", "current_turn", "all_turns"}
 _USER_PROFILE_FIELDS = (
     "kind",
     "base_url",
@@ -44,6 +47,10 @@ _USER_PROFILE_FIELDS = (
     "max_retries",
     "store",
     "reasoning_effort",
+    "reasoning_context",
+    "responses_replay",
+    "provider_tools",
+    "prompt_layout",
     "verbosity",
     "safety_identifier_env",
     "prompt_cache_retention",
@@ -63,6 +70,11 @@ _USER_PROFILE_FIELDS = (
 _CORE_ONLY_PROFILE_FIELDS = (
     "max_input_tokens_per_call",
     "max_total_tokens_per_call",
+    "reasoning_context",
+    "responses_replay",
+    "prompt_layout",
+    "prompt_cache_mode",
+    "prompt_cache_ttl",
 )
 
 
@@ -123,8 +135,8 @@ class UserLLMProfileStore:
         selected_payload = dict(payload)
         existing = profiles.get(selected_id)
         if existing is not None:
-            # The bundled GUI intentionally has no controls for these core-only
-            # limits. Preserve an existing override when an older/editor payload
+            # The bundled GUI has no controls for these Host policy fields.
+            # Preserve an existing override when an older/editor payload
             # omits it; an explicit null still clears the override.
             for field_name in _CORE_ONLY_PROFILE_FIELDS:
                 if field_name not in selected_payload:
@@ -201,7 +213,9 @@ def validate_user_llm_profile_payload(
     _validate_user_llm_profile_token_bounds(raw, selected_config)
     _validate_user_llm_profile_cache(raw, selected_config)
     try:
-        return LLMProfile(**cleaned)
+        profile = LLMProfile(**cleaned)
+        validate_provider_tools_api_mode(profile.provider_tools, profile.api_mode or selected_config.llm.api_mode)
+        return profile
     except (TypeError, ValueError, PydanticValidationError) as exc:
         raise ValidationError(f"invalid LLM profile {profile_id}: {exc}") from exc
 
@@ -216,6 +230,16 @@ def _normalize_user_llm_profile_fields(raw: dict[str, Any]) -> None:
     raw["api_mode"] = _optional_choice(raw.get("api_mode"), "api_mode", _API_MODES)
     raw["verbosity"] = _optional_choice(raw.get("verbosity"), "verbosity", _VERBOSITY)
     raw["reasoning_effort"] = _optional_string(raw.get("reasoning_effort"), "reasoning_effort")
+    raw["reasoning_context"] = _optional_choice(
+        raw.get("reasoning_context"), "reasoning_context", _REASONING_CONTEXTS,
+    )
+    try:
+        raw["provider_tools"] = normalize_provider_tools(raw.get("provider_tools"))
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"invalid provider_tools: {exc}") from exc
+    raw["prompt_layout"] = _optional_choice(
+        raw.get("prompt_layout"), "prompt_layout", _PROMPT_LAYOUTS,
+    )
     raw["safety_identifier_env"] = _optional_env_name(raw.get("safety_identifier_env"), "safety_identifier_env")
     raw["prompt_cache_retention"] = _optional_prompt_cache_retention(
         raw.get("prompt_cache_retention")
@@ -246,6 +270,7 @@ def _normalize_user_llm_profile_fields(raw: dict[str, Any]) -> None:
     raw["temperature"] = _optional_nonnegative_float(raw.get("temperature"), "temperature")
     for key in (
         "store",
+        "responses_replay",
         "responses_previous_response_id",
         "parallel_tool_calls",
         "auto_wait_on_empty_tool_calls",
@@ -309,7 +334,7 @@ def _validate_user_llm_profile_cache(
             "LLM profile prompt_cache_retention and prompt_cache_ttl are mutually exclusive"
         )
     if (
-        effective_cache_mode != "provider_default"
+        effective_cache_mode in {"implicit", "explicit"}
         and not str(config.llm.prompt_cache_key or "").strip()
     ):
         raise ValidationError(
@@ -319,7 +344,7 @@ def _validate_user_llm_profile_cache(
         raise ValidationError(
             "LLM profile prompt_cache_ttl requires implicit or explicit mode"
         )
-    if effective_cache_mode != "provider_default" and effective_cache_retention is not None:
+    if effective_cache_mode in {"implicit", "explicit"} and effective_cache_retention is not None:
         raise ValidationError(
             "LLM profile legacy prompt_cache_retention cannot be combined with implicit/explicit mode"
         )
@@ -338,6 +363,8 @@ def serialize_user_llm_profile(profile: LLMProfile) -> dict[str, Any]:
             value = _optional_prompt_cache_retention(value)
         if key == "prompt_cache_ttl":
             value = _optional_prompt_cache_ttl(value)
+        if key == "provider_tools":
+            value = {**value, "file_ids": list(value["file_ids"])}
         serialized[key] = value
     return serialized
 
@@ -364,6 +391,13 @@ def summarize_llm_profile(
         "max_retries": profile.max_retries,
         "store": profile.store,
         "reasoning_effort": profile.reasoning_effort,
+        "reasoning_context": profile.reasoning_context,
+        "responses_replay": profile.responses_replay,
+        "provider_tools": (
+            {**asdict(profile.provider_tools), "file_ids": list(profile.provider_tools.file_ids)}
+            if profile.provider_tools is not None else None
+        ),
+        "prompt_layout": profile.prompt_layout,
         "verbosity": profile.verbosity,
         "safety_identifier_env": profile.safety_identifier_env,
         "prompt_cache_retention": _optional_prompt_cache_retention(

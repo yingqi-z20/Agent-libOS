@@ -9,6 +9,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.llm.compaction import plan_compaction_chunks
 from agent_libos.llm.context_memory import context_object_name
 from agent_libos.llm.tool_protocol import tool_call_to_action
 from agent_libos.models import ObjectMetadata, ObjectPatch, ObjectRight, ObjectType, ProcessStatus
@@ -123,7 +124,11 @@ class CompactProcessContextTool(SyncAgentTool[CompactProcessContextArgs]):
                     compacted_tokens=source_tokens,
                     reason="context_under_target",
                 )
-            job = _new_job_payload(ctx.pid, args, context.oid, context.version, context.payload, source_tokens)
+            job = _new_job_payload(
+                ctx.pid, args, context.oid, context.version, context.payload,
+                source_tokens,
+                chunk_target_tokens=runtime.config.llm_context.compaction_chunk_target_tokens,
+            )
             if job_handle is None:
                 job_obj, job_handle = _create_job(runtime, ctx.pid, job)
             else:
@@ -133,10 +138,10 @@ class CompactProcessContextTool(SyncAgentTool[CompactProcessContextArgs]):
 
         try:
             _assert_source_unchanged(context, job)
+            chunks = _job_entry_chunks(job)
         except ToolExecutionError as exc:
             _fail_job(runtime, ctx.pid, job_handle, job, exc)
             raise
-        chunks = _entry_chunks(job["source_payload"], int(job["max_chunks"]))
         if not chunks:
             chunks = [[]]
 
@@ -261,6 +266,8 @@ def _new_job_payload(
     context_version: int,
     context_payload: dict[str, Any],
     source_tokens: int,
+    *,
+    chunk_target_tokens: int = DEFAULT_CONFIG.llm_context.compaction_chunk_target_tokens,
 ) -> dict[str, Any]:
     return {
         "kind": "context_compaction_job",
@@ -274,6 +281,13 @@ def _new_job_payload(
         "target_tokens": args.target_tokens,
         "preserve_recent_entries": args.preserve_recent_entries,
         "max_chunks": args.max_chunks,
+        # Freeze boundaries with the source before any child is spawned. A
+        # Host configuration change on reopen must not shift stage coverage.
+        "chunk_end_indices": plan_compaction_chunks(
+            _context_entries(context_payload),
+            target_tokens=chunk_target_tokens,
+            max_chunks=args.max_chunks,
+        ),
         "force": args.force,
         "stage_index": 0,
         "current_child_pid": None,
@@ -372,12 +386,36 @@ def _assert_source_unchanged(context: Any | None, job: dict[str, Any]) -> None:
 
 
 def _entry_chunks(payload: dict[str, Any], max_chunks: int) -> list[list[dict[str, Any]]]:
-    entries = [entry for entry in payload.get("entries", []) if isinstance(entry, dict)]
+    """Keep pre-planner jobs' original stage boundaries during recovery."""
+    entries = _context_entries(payload)
     if not entries:
         return []
     chunk_count = max(1, min(max_chunks, len(entries)))
     chunk_size = max(1, ceil(len(entries) / chunk_count))
     return [entries[index : index + chunk_size] for index in range(0, len(entries), chunk_size)]
+
+
+def _context_entries(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [entry for entry in payload.get("entries", []) if isinstance(entry, dict)]
+
+
+def _job_entry_chunks(job: dict[str, Any]) -> list[list[dict[str, Any]]]:
+    if "chunk_end_indices" not in job:
+        return _entry_chunks(job["source_payload"], int(job["max_chunks"]))
+    entries = _context_entries(job["source_payload"])
+    boundaries = job["chunk_end_indices"]
+    if (
+        not isinstance(boundaries, list)
+        or len(boundaries) > int(job["max_chunks"])
+        or any(type(end) is not int for end in boundaries)
+        or any(start >= end for start, end in zip([0, *boundaries], boundaries))
+        or (boundaries[-1] if boundaries else 0) != len(entries)
+    ):
+        raise ToolExecutionError(
+            "Invalid context compaction chunk plan.",
+            code=ToolErrorCode.VALIDATION_ERROR,
+        )
+    return [entries[start:end] for start, end in zip([0, *boundaries], boundaries)]
 
 
 def _stage_goal(pid: str, job: dict[str, Any], chunks: list[list[dict[str, Any]]], index: int) -> dict[str, Any]:
@@ -728,7 +766,7 @@ def restore_pending_compaction_child_goal(
         return
     if child.goal_oid and objects.get_object(child.goal_oid) is not None:
         return
-    chunks = _entry_chunks(job["source_payload"], int(job["max_chunks"])) or [[]]
+    chunks = _job_entry_chunks(job) or [[]]
     index = int(job.get("stage_index", 0))
     if index >= len(chunks):
         return

@@ -10,6 +10,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.tools.contracts import OPTIONAL_RESULT_OBJECT
 from agent_libos.llm.prompt import recover_initial_goal_context
 from agent_libos.memory.data_labels import flow_context_parts, flow_context_value
 from agent_libos.models.exceptions import (
@@ -45,6 +46,7 @@ from agent_libos.tools.base import (
     ToolResult,
 )
 from agent_libos.tools.observability import json_size_bytes
+from agent_libos.tools.prompt_layout import model_prompt_layout
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 _CUMULATIVE_EXIT_REVIEW = "cumulative_review"
@@ -221,15 +223,7 @@ class ProcessExitArgs(BaseModel):
             "this restriction does not alter user-supplied business data."
         ),
     )
-    result_oid: str | None = Field(
-        default=None,
-        min_length=1,
-        description=(
-            "Existing non-empty object id to use as process result. Omit this "
-            "field when there is no existing result Object; do not pass the "
-            "text 'None' or 'null'."
-        ),
-    )
+    result_oid: str | None = OPTIONAL_RESULT_OBJECT.field()
     message: str | None = Field(
         default=None,
         description=(
@@ -608,7 +602,8 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
         "item, then retry with its fresh review_token and structured "
         "completion_evidence. "
         "This does not present the result to the human; interactive images "
-        "should call human_output in a prior quantum. "
+        "should call human_output first, either in a prior quantum or in the same "
+        "response immediately before process_exit, which must be the last call. "
         "This is a Skills/Tools Layer wrapper over process lifecycle primitives."
     )
     args_schema = ProcessExitArgs
@@ -694,7 +689,7 @@ class ProcessExitTool(SyncAgentTool[ProcessExitArgs]):
                         "authority_changed": False,
                     },
                 )
-                if _runtime_prompt_layout(runtime) == "cache_optimized_v2":
+                if model_prompt_layout(runtime, ctx.pid) == "cache_optimized_v2":
                     # The v2 ToolResult is itself the safe Host-to-Model
                     # projection.  Full goal/message/requirement/receipt
                     # bindings remain in their authoritative stores and in the
@@ -1149,12 +1144,6 @@ def _completion_review_goal_evidence(
             _COMPLETION_REVIEW_GOAL_FALLBACK_MAX_CHARS,
         )
     return evidence
-
-
-def _runtime_prompt_layout(runtime: Any) -> str:
-    config = getattr(runtime, "config", None)
-    llm = getattr(config, "llm", None)
-    return str(getattr(llm, "prompt_layout", "legacy_v1"))
 
 
 def _semantic_completion_value(value: Any) -> Any:

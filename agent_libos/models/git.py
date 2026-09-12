@@ -118,6 +118,8 @@ class GitStatusResult:
     truncated: bool
     bytes: int
     sha256: str
+    # Absent on historical or third-party result records.
+    limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +136,9 @@ class GitDiffResult:
     truncated: bool
     bytes: int
     sha256: str
+    # Bind the requested selection, independently of the paths that changed.
+    paths_sha256: str | None = None
+    max_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

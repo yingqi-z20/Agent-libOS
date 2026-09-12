@@ -83,7 +83,7 @@ def build_analysis_agent_image(
             "run_shell_command",
             "write_text_file",
         ],
-        context_policy="evidence_first",
+        context_policy="working_set",
         safety_profile="analysis",
         required_capabilities=[
             {

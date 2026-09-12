@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 from agent_libos.evidence.payload_retention import PayloadRetentionStore
+from agent_libos.models.llm_replay import LLMReplayHead, LLMReplayTurn
 from agent_libos.storage.base import StoreAssemblyReadiness
 from agent_libos.storage.semantic import (
     SemanticAssessmentCursor,
@@ -1027,6 +1028,8 @@ class RuntimePublicationRepositoryProtocol(Protocol):
         pid: str | None = None,
     ) -> list[RuntimePublicationRecord]: ...
 
+    def get_latest_committed_exec_publication(self, pid: str) -> RuntimePublicationRecord | None: ...
+
     def get_committed_root_spawn_publication(
         self,
         pid: str,
@@ -1525,6 +1528,11 @@ class AuthorityRecoveryBackendProtocol(TransactionBackendProtocol, Protocol):
     ) -> list[PersistedFileLabelPathIdentity]: ...
 
 
+RetainedObjectReadCapabilities = Callable[
+    [tuple[str, ...]], Mapping[tuple[str, str], frozenset[str]]
+]
+
+
 class ObjectRecoveryBackendProtocol(TransactionBackendProtocol, Protocol):
     """Lifecycle-gated cleanup of volatile Object payload rows."""
 
@@ -1532,6 +1540,7 @@ class ObjectRecoveryBackendProtocol(TransactionBackendProtocol, Protocol):
         self,
         *,
         require_recovery_lease: Callable[[], None],
+        retained_read_capabilities: RetainedObjectReadCapabilities | None = None,
     ) -> ObjectPayloadRecoverySummary: ...
 
     def get_persisted_object_state(
@@ -1576,6 +1585,31 @@ class ProcessBackendProtocol(
     Protocol,
 ):
     """SQL backend operations consumed by ``ProcessRepository``."""
+
+    def insert_llm_replay_turn(self, turn: LLMReplayTurn) -> None: ...
+
+    def get_llm_replay_turn(self, turn_id: str) -> LLMReplayTurn | None: ...
+
+    def get_llm_replay_head(self, pid: str) -> LLMReplayHead | None: ...
+
+    def list_llm_replay_heads(
+        self, *, after_pid: str | None = None, limit: int = 100,
+    ) -> list[LLMReplayHead]: ...
+
+    def list_llm_replay_recovery_pids(
+        self, *, after_pid: str | None = None, limit: int = 100,
+    ) -> list[str]: ...
+
+    def compare_and_set_llm_replay_head(
+        self, head: LLMReplayHead, *, expected_revision: int | None,
+    ) -> bool: ...
+
+    def clear_llm_replay_head(self, pid: str) -> None: ...
+
+    def purge_llm_replay(
+        self, *, pid: str | None = None, run_id: str | None = None,
+        purged_at: str | None = None,
+    ) -> int: ...
 
     def insert_process(self, process: AgentProcess) -> None: ...
 
@@ -1978,6 +2012,8 @@ class RuntimePublicationBackendProtocol(TransactionBackendProtocol, Protocol):
         states: Iterable[RuntimePublicationState | str] | None = None,
         pid: str | None = None,
     ) -> list[Mapping[str, Any]]: ...
+
+    def get_latest_committed_exec_publication(self, pid: str) -> Mapping[str, Any] | None: ...
 
     def get_committed_root_spawn_publication(
         self,

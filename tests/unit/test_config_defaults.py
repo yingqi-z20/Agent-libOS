@@ -757,10 +757,12 @@ class TestConfigDefaults:
         assert DEFAULT_CONFIG.llm.timeout_s == 180.0
         assert DEFAULT_CONFIG.llm.auto_wait_on_empty_tool_calls is False
         assert DEFAULT_CONFIG.llm.fallback_json_actions is False
-        assert DEFAULT_CONFIG.llm.context_window_tokens == 131_072
+        assert DEFAULT_CONFIG.memory.materialize_budget_tokens == 262_144
+        assert DEFAULT_CONFIG.process.max_context_materialization_tokens == 262_144
+        assert DEFAULT_CONFIG.llm.context_window_tokens == 262_144
         assert DEFAULT_CONFIG.llm.max_tokens == 16_384
-        assert DEFAULT_CONFIG.llm.max_input_tokens_per_call == 114_688
-        assert DEFAULT_CONFIG.llm.max_total_tokens_per_call == 131_072
+        assert DEFAULT_CONFIG.llm.max_input_tokens_per_call == 245_760
+        assert DEFAULT_CONFIG.llm.max_total_tokens_per_call == 262_144
         assert DEFAULT_CONFIG.llm.max_tokens < DEFAULT_CONFIG.llm.context_window_tokens
 
     def test_llm_per_call_budget_envelope_is_positive_and_consistent(self) -> None:

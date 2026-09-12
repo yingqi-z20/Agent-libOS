@@ -162,6 +162,7 @@ class CheckpointManager:
         transitions: ProcessTransitionService | None = None,
         config: AgentLibOSConfig | None = None,
         task_runs: Any | None = None,
+        responses_replay: Any | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self._unit_of_work = unit_of_work
@@ -192,6 +193,7 @@ class CheckpointManager:
         self._snapshot_rows = unit_of_work.snapshots
         self._modules: Any | None = None
         self._image_registry: Any | None = None
+        self._responses_replay = responses_replay
         if task_runs is not None:
             active_runs_for_pids = getattr(task_runs, "active_runs_for_pids", None)
             if not callable(active_runs_for_pids):
@@ -248,6 +250,23 @@ class CheckpointManager:
 
     def bind_image_registry(self, image_registry: Any) -> None:
         self._image_registry = image_registry
+
+    def bind_responses_replay(self, replay: Any) -> None:
+        """Bind the Host-private replay adapter at Runtime composition time."""
+
+        self._responses_replay = replay
+
+    def _validate_responses_replay(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        remapped: dict[str, Any] | None = None,
+    ) -> None:
+        if not snapshot.get("responses_replay_refs") and not snapshot.get("provider_continuation_refs"):
+            return
+        if self._responses_replay is None:
+            raise ValidationError("checkpoint requires unavailable private Responses replay storage")
+        self._responses_replay.validate(snapshot, remapped=remapped)
 
     def process_resource(self, pid: str) -> str:
         return f"{self.PROCESS_RESOURCE_PREFIX}{pid}"
@@ -837,6 +856,7 @@ class CheckpointManager:
         self._reject_active_task_runs_for_restore(snapshot_pids, current_pids)
         self._reject_active_object_tasks_for_restore(snapshot, current_pids)
         self._validate_snapshot_restore_assets(snapshot)
+        self._validate_responses_replay(snapshot)
         stale_tool_ids = self._stale_ephemeral_tool_ids_for_restore(
             snapshot,
             current_pids,
@@ -1175,6 +1195,7 @@ class CheckpointManager:
             parent_pid=parent_pid,
             root_pid=checkpoint.pid,
         )
+        self._validate_responses_replay(snapshot, remapped=remapped)
         publication = _CheckpointForkPublication(
             actor=actor,
             checkpoint=checkpoint,
@@ -2119,6 +2140,13 @@ class CheckpointManager:
             "jit_sources": self._jit_source_snapshot(process_rows),
             "modules": self._module_snapshot(),
         }
+        if self._responses_replay is not None:
+            references = self._responses_replay.capture(subtree_pids)
+            if references:
+                snapshot["responses_replay_refs"] = references
+            continuations = self._responses_replay.capture_provider_continuations(subtree_pids)
+            if continuations:
+                snapshot["provider_continuation_refs"] = continuations
         return self.snapshots.normalize(snapshot)
 
     def _module_snapshot(self) -> list[dict[str, Any]]:
@@ -2270,6 +2298,7 @@ class CheckpointManager:
                 list(rows.processes),
                 restored_capability_rows,
             )
+            self._validate_responses_replay(snapshot)
             # Pending human/message state belongs to the same reconstructable
             # restore boundary as process rows. If a later insert fails, these
             # status changes must roll back with the SQLite rows and in-memory
@@ -2302,6 +2331,11 @@ class CheckpointManager:
                 restored_capability_rows=restored_capability_rows,
                 before_insert=self._insert_row,
             )
+            if self._responses_replay is not None:
+                self._responses_replay.publish_restore(
+                    snapshot,
+                    current_pids=current_pids,
+                )
             self._reconcile_restored_wait_states(
                 None,
                 [str(row["pid"]) for row in restored_process_rows],
@@ -3020,6 +3054,8 @@ class CheckpointManager:
                         overwrite_existing=False,
                     )
             self._revalidate_remapped_fork_capabilities(remapped)
+            if image_snapshot is not None:
+                self._validate_responses_replay(image_snapshot, remapped=remapped)
             published_rows = SnapshotRows.from_mapping(
                 deepcopy(remapped["rows"])
             )
@@ -3049,6 +3085,8 @@ class CheckpointManager:
                 before_insert=self._insert_row,
             )
             self._bind_fork_authority_manifests(remapped, actor=actor)
+            if self._responses_replay is not None and image_snapshot is not None:
+                self._responses_replay.publish_fork(image_snapshot, remapped=remapped)
             if fork_parent_pid is not None:
                 # Storage helpers now honor the outer transaction, so the
                 # parent charge, reservation, and fork rows become visible as

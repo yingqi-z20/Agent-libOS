@@ -110,6 +110,49 @@ def test_snapshot_codec_round_trip_is_strict_and_lossless() -> None:
     assert SnapshotCodec.encode_mapping(snapshot) == _snapshot()
 
 
+def _replay_reference(**changes: object) -> dict[str, object]:
+    return {
+        "turn_id": "replay_1",
+        "pid": "pid_1",
+        "run_id": None,
+        "provider_fingerprint": "b" * 64,
+        "model": "gpt-6-astra",
+        "context_generation": "initial",
+        "payload_sha256": "c" * 64,
+        **changes,
+    }
+
+
+def test_snapshot_replay_reference_is_optional_and_lossless() -> None:
+    legacy = _snapshot()
+    assert SnapshotCodec.decode_mapping(legacy).responses_replay_refs == {}
+    assert SnapshotCodec.encode_mapping(SnapshotCodec.decode_mapping(legacy)) == legacy
+    snapshot = {**legacy, "responses_replay_refs": {"pid_1": _replay_reference()}}
+    typed = SnapshotCodec.decode_mapping(snapshot)
+    assert typed.responses_replay_refs["pid_1"].turn_id == "replay_1"
+    assert SnapshotCodec.encode_mapping(typed) == snapshot
+
+
+@pytest.mark.parametrize("changes", [
+    {"run_id": "run_1"},
+    {"pid": "another_process"},
+    {"payload_sha256": "invalid"},
+    {"context_generation": 1},
+    {"encrypted_content": "must-not-be-in-checkpoint"},
+])
+def test_snapshot_replay_reference_rejects_cross_scope_and_opaque_payload(changes: dict) -> None:
+    snapshot = {**_snapshot(), "responses_replay_refs": {"pid_1": _replay_reference(**changes)}}
+    with pytest.raises(ValidationError, match="replay reference"):
+        SnapshotCodec.decode_mapping(snapshot)
+
+
+def test_pure_snapshot_remapping_cannot_rebind_private_replay_authority() -> None:
+    typed = SnapshotCodec.decode_mapping({**_snapshot(), "responses_replay_refs": {"pid_1": _replay_reference()}})
+    assert SnapshotRemapper.remap(typed, SnapshotIdentityMap()).responses_replay_refs == typed.responses_replay_refs
+    with pytest.raises(ValidationError, match="authorized local rebind"):
+        SnapshotRemapper.remap(typed, SnapshotIdentityMap(pids={"pid_1": "pid_2"}))
+
+
 @pytest.mark.parametrize(
     "replacement",
     [

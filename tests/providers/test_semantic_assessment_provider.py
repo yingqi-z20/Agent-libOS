@@ -405,6 +405,7 @@ def test_external_source_refs_require_nonserializable_host_invocation() -> None:
         ({"store": True}, "store=false"),
         ({"prompt_cache_key": "cache-key"}, "prompt cache keys"),
         ({"prompt_cache_retention": "24h"}, "cache retention"),
+        ({"responses_replay": True}, "Responses replay"),
         ({"responses_previous_response_id": True}, "response chaining"),
         ({"fallback_json_actions": True}, "JSON action fallback"),
         ({"max_retries": 1}, "max_retries=0"),

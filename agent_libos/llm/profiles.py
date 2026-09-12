@@ -3,14 +3,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import math
 import os
+import secrets
 import threading
 from dataclasses import asdict, dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMProfile
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMProfile, ProviderToolsConfig
+from agent_libos.config.defaults import validate_provider_tools_api_mode
 from agent_libos.llm.client import LLMClient, LLMError
+from agent_libos.llm.provider_policy import ProviderPolicy, resolve_provider_policy
 from agent_libos.models.exceptions import NotFound, ValidationError
 from agent_libos.ports.blocking_work import run_blocking_once
 from agent_libos.storage import ProcessRepository
@@ -24,6 +28,7 @@ _LEGACY_PROFILE_ENV_KEYS = {
     "OPENAI_ENABLE_THINKING",
     "OPENAI_FALLBACK_JSON_ACTIONS",
     "OPENAI_LANGUAGE_MODEL",
+    "OPENAI_LOGICAL_CALL_TIMEOUT",
     "OPENAI_MAX_RETRIES",
     "OPENAI_MODEL",
     "OPENAI_ORGANIZATION",
@@ -33,9 +38,12 @@ _LEGACY_PROFILE_ENV_KEYS = {
     "OPENAI_PROMPT_CACHE_MODE",
     "OPENAI_PROMPT_CACHE_RETENTION",
     "OPENAI_PROMPT_CACHE_TTL",
+    "OPENAI_PROMPT_LAYOUT",
     "OPENAI_PROJECT",
     "OPENAI_PROJECT_ID",
     "OPENAI_REASONING_EFFORT",
+    "OPENAI_REASONING_CONTEXT",
+    "OPENAI_RESPONSES_REPLAY",
     "OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID",
     "OPENAI_SAFETY_IDENTIFIER",
     "OPENAI_STORE",
@@ -58,17 +66,19 @@ class ResolvedLLMProfile:
     parallel_tool_calls: bool
     auto_wait_on_empty_tool_calls: bool
     fallback_json_actions: bool
+    prompt_layout: str = "legacy_v1"
+    provider_tools: ProviderToolsConfig | None = None
+    responses_replay_configured: bool | None = None
+    responses_previous_response_id_configured: bool = False
 
 
 @dataclass(frozen=True)
-class _ResolvedLLMPolicy:
-    api_mode: str
+class _ResolvedLLMPolicy(ProviderPolicy):
     store: bool
-    prompt_cache_retention: str | None
-    prompt_cache_mode: str
-    prompt_cache_ttl: str | None
     responses_previous_response_id: bool
+    responses_previous_response_id_configured: bool
     fallback_json_actions: bool
+    prompt_cache_mode_configured: str
 
 
 @dataclass(frozen=True)
@@ -102,6 +112,7 @@ class LLMProfileRegistry:
         self._clients: dict[str, Any] = {}
         self._client_cache_sha256: dict[str, str] = {}
         self._test_clients: dict[str, Any] = {}
+        self._cache_privacy_domains: dict[str, str] = {}
         self._lock = threading.RLock()
 
     def register_profile(self, profile_id: str, profile: LLMProfile | dict[str, Any]) -> None:
@@ -215,6 +226,12 @@ class LLMProfileRegistry:
                 parallel_tool_calls=self._resolved_parallel_tool_calls(profile, client),
                 auto_wait_on_empty_tool_calls=self._resolved_auto_wait_on_empty_tool_calls(profile),
                 fallback_json_actions=snapshot.policy.fallback_json_actions,
+                prompt_layout=snapshot.policy.prompt_layout,
+                provider_tools=snapshot.policy.provider_tools,
+                responses_replay_configured=snapshot.policy.responses_replay_configured,
+                responses_previous_response_id_configured=(
+                    snapshot.policy.responses_previous_response_id_configured
+                ),
             )
 
     @property
@@ -279,8 +296,13 @@ class LLMProfileRegistry:
                 if key in environment
             }
         )
-        policy = self._resolved_policy(profile, legacy_env)
+        policy = self._resolved_policy(profile, legacy_env, profile_id=profile_id)
         identity_profile = asdict(profile)
+        # Additive optional controls must not invalidate trust for existing
+        # profiles whose effective Provider behavior remains unchanged.
+        for optional_field in ("reasoning_context", "responses_replay", "prompt_layout", "provider_tools"):
+            if identity_profile.get(optional_field) is None:
+                identity_profile.pop(optional_field, None)
         identity_profile["prompt_cache_retention"] = _normalize_prompt_cache_retention(
             profile.prompt_cache_retention,
             label=f"LLM profile {profile_id} prompt_cache_retention",
@@ -290,6 +312,7 @@ class LLMProfileRegistry:
         # and must not invalidate existing trust rules when hosts change them.
         for local_policy_field in (
             "context_window_tokens",
+            "logical_call_timeout_s",
             "max_input_tokens_per_call",
             "max_total_tokens_per_call",
         ):
@@ -300,15 +323,22 @@ class LLMProfileRegistry:
             "profile": identity_profile,
             "effective": {
                 "base_url": profile.base_url or _optional_env(legacy_env, "OPENAI_BASE_URL"),
-                "model": profile.model
-                or _optional_env(legacy_env, "OPENAI_LANGUAGE_MODEL")
-                or _optional_env(legacy_env, "OPENAI_MODEL"),
+                "model": policy.model,
                 "api_mode": policy.api_mode,
                 "store": policy.store,
                 "prompt_cache_retention": policy.prompt_cache_retention,
                 "prompt_cache_mode": policy.prompt_cache_mode,
                 "prompt_cache_ttl": policy.prompt_cache_ttl,
                 "responses_previous_response_id": policy.responses_previous_response_id,
+                **(
+                    {"provider_tools": asdict(policy.provider_tools)}
+                    if policy.provider_tools is not None else {}
+                ),
+                **({"responses_replay": True} if policy.responses_replay else {}),
+                **(
+                    {"reasoning_context": policy.reasoning_context}
+                    if policy.reasoning_context is not None else {}
+                ),
                 "fallback_json_actions": policy.fallback_json_actions,
                 "api_key_env": profile.api_key_env,
                 "enable_thinking": (
@@ -328,6 +358,7 @@ class LLMProfileRegistry:
         }
         client_options = self._client_options(
             profile,
+            profile_id=profile_id,
             legacy_env=legacy_env,
             client_env=client_env,
             policy=policy,
@@ -406,6 +437,7 @@ class LLMProfileRegistry:
             raise ValidationError(f"unsupported LLM profile kind for {profile_id}: {profile.kind}")
         options = self._client_options(
             profile,
+            profile_id=profile_id,
             legacy_env=snapshot.legacy_env,
             client_env=snapshot.client_env,
             policy=snapshot.policy,
@@ -422,30 +454,49 @@ class LLMProfileRegistry:
         self,
         profile: LLMProfile,
         *,
+        profile_id: str,
         legacy_env: Mapping[str, str],
         client_env: Mapping[str, str],
         policy: _ResolvedLLMPolicy,
     ) -> dict[str, Any]:
         """Resolve every client-construction input from one environment snapshot."""
 
+        cache_key = (
+            profile.prompt_cache_key
+            if profile.prompt_cache_key is not None
+            else _optional_env(legacy_env, "OPENAI_PROMPT_CACHE_KEY")
+            or self.config.llm.prompt_cache_key
+        )
+        cache_key_source = "configured" if cache_key is not None else "none"
+        if (
+            cache_key is None
+            and policy.prompt_cache_mode_configured == "auto"
+            and policy.prompt_cache_mode in {"implicit", "explicit"}
+        ):
+            if profile_id not in self._cache_privacy_domains:
+                self._cache_privacy_domains[profile_id] = secrets.token_hex(32)
+            cache_key = self._cache_privacy_domains[profile_id]
+            cache_key_source = "host_generated"
         return {
             "base_url": (
                 profile.base_url
                 if profile.base_url is not None
                 else _optional_env(legacy_env, "OPENAI_BASE_URL")
             ),
-            "model": (
-                profile.model
-                if profile.model is not None
-                else _optional_env(legacy_env, "OPENAI_LANGUAGE_MODEL")
-                or _optional_env(legacy_env, "OPENAI_MODEL")
-            ),
+            "model": policy.model,
             "api_key": client_env.get(profile.api_key_env),
             "api_key_env": profile.api_key_env,
             "timeout": (
                 profile.timeout_s
                 if profile.timeout_s is not None
                 else _float_env(legacy_env, "OPENAI_TIMEOUT", self.config.llm.timeout_s)
+            ),
+            "logical_call_timeout_s": (
+                profile.logical_call_timeout_s
+                if profile.logical_call_timeout_s is not None
+                else _float_env(legacy_env, "OPENAI_LOGICAL_CALL_TIMEOUT", 0.0)
+                if _optional_env(legacy_env, "OPENAI_LOGICAL_CALL_TIMEOUT") is not None
+                else self.config.llm.logical_call_timeout_s
             ),
             "max_retries": (
                 profile.max_retries
@@ -454,11 +505,11 @@ class LLMProfileRegistry:
             ),
             "api_mode": policy.api_mode,
             "store": policy.store,
-            "reasoning_effort": (
-                profile.reasoning_effort
-                if profile.reasoning_effort is not None
-                else _optional_env(legacy_env, "OPENAI_REASONING_EFFORT")
-            ),
+            "reasoning_effort": policy.reasoning_effort,
+            "reasoning_context": policy.reasoning_context,
+            "responses_replay": policy.responses_replay,
+            "provider_tools": policy.provider_tools,
+            "prompt_layout": policy.prompt_layout,
             "verbosity": (
                 profile.verbosity
                 if profile.verbosity is not None
@@ -469,14 +520,15 @@ class LLMProfileRegistry:
                 legacy_env,
                 client_env,
             ),
-            "prompt_cache_key": (
-                profile.prompt_cache_key
-                if profile.prompt_cache_key is not None
-                else _optional_env(legacy_env, "OPENAI_PROMPT_CACHE_KEY")
-                or self.config.llm.prompt_cache_key
-            ),
+            "prompt_cache_key": cache_key,
+            "prompt_cache_key_source": cache_key_source,
+            "prompt_cache_mode_configured": policy.prompt_cache_mode_configured,
             "prompt_cache_retention": policy.prompt_cache_retention,
-            "prompt_cache_mode": policy.prompt_cache_mode,
+            # The client applies defaults before resolving endpoint policy.
+            # Keep auto here so a custom endpoint clears an inherited TTL
+            # again, rather than treating the resolved None as unspecified
+            # alongside an already-resolved provider_default mode.
+            "prompt_cache_mode": policy.prompt_cache_mode_configured,
             "prompt_cache_ttl": policy.prompt_cache_ttl,
             "responses_previous_response_id": policy.responses_previous_response_id,
             "fallback_json_actions": policy.fallback_json_actions,
@@ -528,64 +580,119 @@ class LLMProfileRegistry:
         self,
         profile: LLMProfile,
         legacy_env: Mapping[str, str],
+        *,
+        profile_id: str,
     ) -> _ResolvedLLMPolicy:
+        defaults = self.config.llm
+        classifier = profile_id == self.config.semantic.external_profile_id
+        if classifier and profile.provider_tools is not None:
+            raise ValidationError("semantic classifier profile must disable provider tools")
+        mode = _normalize_prompt_cache_mode(
+            profile.prompt_cache_mode
+            if profile.prompt_cache_mode is not None
+            else "provider_default" if classifier
+            else _prompt_cache_mode_env(legacy_env) or defaults.prompt_cache_mode,
+            label="prompt_cache_mode",
+        )
+        replay = profile.responses_replay
+        if classifier and replay is None:
+            replay = False
+        if replay is None:
+            replay = (
+                _bool_env(legacy_env, "OPENAI_RESPONSES_REPLAY", False)
+                if "OPENAI_RESPONSES_REPLAY" in legacy_env
+                else defaults.responses_replay
+            )
+        provider = self._provider_policy(profile, legacy_env, mode=mode, replay=replay)
+        previous_response_id_configured = (
+            profile.responses_previous_response_id
+            if profile.responses_previous_response_id is not None
+            else _bool_env(
+                legacy_env, "OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID",
+                defaults.responses_previous_response_id,
+            )
+        )
         return _ResolvedLLMPolicy(
-            api_mode=(
-                profile.api_mode
-                or _optional_env(legacy_env, "OPENAI_API_MODE")
-                or self.config.llm.api_mode
-            ).strip().lower(),
+            **{**asdict(provider), "provider_tools": provider.provider_tools},
+            prompt_cache_mode_configured=mode,
             store=(
                 profile.store
                 if profile.store is not None
-                else _bool_env(legacy_env, "OPENAI_STORE", self.config.llm.store)
-            ),
-            prompt_cache_retention=(
-                _normalize_prompt_cache_retention(
-                    profile.prompt_cache_retention
-                    if profile.prompt_cache_retention is not None
-                    else _prompt_cache_retention_env(legacy_env)
-                    or self.config.llm.prompt_cache_retention,
-                    label="prompt_cache_retention",
-                )
-            ),
-            prompt_cache_mode=(
-                _normalize_prompt_cache_mode(
-                    profile.prompt_cache_mode
-                    if profile.prompt_cache_mode is not None
-                    else _prompt_cache_mode_env(legacy_env)
-                    or self.config.llm.prompt_cache_mode,
-                    label="prompt_cache_mode",
-                )
-            ),
-            prompt_cache_ttl=(
-                _normalize_prompt_cache_ttl(
-                    profile.prompt_cache_ttl
-                    if profile.prompt_cache_ttl is not None
-                    else _prompt_cache_ttl_env(legacy_env)
-                    or self.config.llm.prompt_cache_ttl,
-                    label="prompt_cache_ttl",
-                )
+                else _bool_env(legacy_env, "OPENAI_STORE", defaults.store)
             ),
             responses_previous_response_id=(
-                profile.responses_previous_response_id
-                if profile.responses_previous_response_id is not None
-                else _bool_env(
-                    legacy_env,
-                    "OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID",
-                    self.config.llm.responses_previous_response_id,
-                )
+                False if provider.provider_tools is not None and provider.provider_tools.code_interpreter
+                else previous_response_id_configured
             ),
+            responses_previous_response_id_configured=previous_response_id_configured,
             fallback_json_actions=(
                 profile.fallback_json_actions
                 if profile.fallback_json_actions is not None
                 else _bool_env(
-                    legacy_env,
-                    "OPENAI_FALLBACK_JSON_ACTIONS",
-                    self.config.llm.fallback_json_actions,
+                    legacy_env, "OPENAI_FALLBACK_JSON_ACTIONS", defaults.fallback_json_actions,
                 )
             ),
         )
+
+    def _provider_policy(
+        self,
+        profile: LLMProfile,
+        legacy_env: Mapping[str, str],
+        *,
+        mode: str,
+        replay: bool | None,
+    ) -> ProviderPolicy:
+        defaults = self.config.llm
+        try:
+            return resolve_provider_policy(
+                defaults=defaults,
+                base_url=profile.base_url or _optional_env(legacy_env, "OPENAI_BASE_URL"),
+                model=(
+                    profile.model
+                    or _optional_env(legacy_env, "OPENAI_LANGUAGE_MODEL")
+                    or _optional_env(legacy_env, "OPENAI_MODEL")
+                ),
+                api_mode=(
+                    profile.api_mode
+                    or _optional_env(legacy_env, "OPENAI_API_MODE")
+                    or defaults.api_mode
+                ).strip().lower(),
+                reasoning_effort=(
+                    profile.reasoning_effort
+                    if profile.reasoning_effort is not None
+                    else _optional_env(legacy_env, "OPENAI_REASONING_EFFORT")
+                ),
+                reasoning_context=(
+                    profile.reasoning_context
+                    if profile.reasoning_context is not None
+                    else _optional_env(legacy_env, "OPENAI_REASONING_CONTEXT")
+                    or defaults.reasoning_context
+                ),
+                responses_replay=replay,
+                provider_tools=profile.provider_tools,
+                prompt_layout=(
+                    profile.prompt_layout
+                    if profile.prompt_layout is not None
+                    else _optional_env(legacy_env, "OPENAI_PROMPT_LAYOUT")
+                    or defaults.prompt_layout
+                ),
+                prompt_cache_mode=mode,
+                prompt_cache_retention=_normalize_prompt_cache_retention(
+                    profile.prompt_cache_retention
+                    if profile.prompt_cache_retention is not None
+                    else _prompt_cache_retention_env(legacy_env)
+                    or defaults.prompt_cache_retention,
+                    label="prompt_cache_retention",
+                ),
+                prompt_cache_ttl=_normalize_prompt_cache_ttl(
+                    profile.prompt_cache_ttl
+                    if profile.prompt_cache_ttl is not None
+                    else _prompt_cache_ttl_env(legacy_env) or defaults.prompt_cache_ttl,
+                    label="prompt_cache_ttl",
+                ),
+            )
+        except ValueError as exc:
+            raise LLMError(str(exc)) from exc
 
     def _resolved_parallel_tool_calls(self, profile: LLMProfile, client: Any) -> bool:
         if profile.parallel_tool_calls is not None:
@@ -617,6 +724,19 @@ class LLMProfileRegistry:
             raise ValidationError(f"unsupported LLM profile kind for {profile_id}: {profile.kind}")
         if not profile.api_key_env.strip():
             raise ValidationError(f"LLM profile api_key_env must be non-empty: {profile_id}")
+        if profile_id == self.config.semantic.external_profile_id and profile.provider_tools is not None:
+            raise ValidationError("semantic classifier profile must disable provider tools")
+        try:
+            validate_provider_tools_api_mode(profile.provider_tools, profile.api_mode or self.config.llm.api_mode)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        if profile.logical_call_timeout_s is not None and (
+            not math.isfinite(profile.logical_call_timeout_s)
+            or profile.logical_call_timeout_s <= 0
+        ):
+            raise ValidationError(
+                f"LLM profile logical_call_timeout_s must be finite and positive: {profile_id}"
+            )
         for field_name in (
             "max_tokens",
             "max_input_tokens_per_call",
@@ -911,9 +1031,9 @@ def _normalize_prompt_cache_retention(value: str | None, *, label: str) -> str |
 
 def _normalize_prompt_cache_mode(value: str, *, label: str) -> str:
     selected = str(value).strip().lower()
-    if selected not in {"provider_default", "implicit", "explicit"}:
+    if selected not in {"auto", "provider_default", "implicit", "explicit"}:
         raise LLMError(
-            f"{label} must be one of provider_default, implicit, explicit"
+            f"{label} must be one of auto, provider_default, implicit, explicit"
         )
     return selected
 

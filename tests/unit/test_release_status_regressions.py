@@ -46,7 +46,7 @@ def test_mcp_docs_lock_manifest_client_info_identities() -> None:
         in normalized
     )
     assert (
-        "| v3 exact `2026-07-28` | `agent-libos` | `1.5.2` |"
+        "| v3 exact `2026-07-28` | `agent-libos` | `1.5.3` |"
         in normalized
     )
     assert "v1 and v2 values are frozen compatibility identities" in normalized

@@ -63,6 +63,9 @@ The current built-in tool surface includes tools for:
 - Git: 32 strict tools for bounded inspection, local mutation, managed
   worktrees, immutable patch Objects, existing remotes, and repository-local
   simulated pull requests through `Runtime.git`; no arbitrary Git argv or URL.
+  Results report the main worktree as its identity digest, and every Git tool
+  accepts that digest in `worktree_id` as an alias for `main` once a read has
+  reported it.
 - JSON-RPC: list/inspect registered endpoints and call registered methods.
 - MCP: list/inspect registered servers, list manifest-allowed tools, call
   registered MCP tools, and page/read model-visible Manifest v3 Resources
@@ -80,23 +83,70 @@ The current built-in tool surface includes tools for:
 
 Use `uv run agent-libos tools` to inspect registered tools in a runtime.
 
+### Model-facing failure codes and argument repair
+
+A failed tool call reaches the model as a bounded envelope: the error code, the
+exception class name, a correlation id, and any identifier-shaped diagnostic
+codes the tool boundary attached, for example `git_error_code: invalid_ref`
+with `hint: worktree_scope_requires_null_base_and_head`. Codes must satisfy the
+closed identifier grammar (ASCII letters, digits, `._:-`, at most 64
+characters), so free text cannot ride along; the exception text itself is
+hashed, never copied. Without such a code a model that sent one malformed
+argument tends to retry the same call. Before dispatch the broker repairs the
+provider quirks that the declared schema makes unambiguous: a JSON-encoded
+container for an object- or array-only field and canonical scalars for
+non-string fields. When the schema accepts strings, text such as `"null"` or
+`"None"` stays literal, including in string-or-null and JSON-value fields;
+callers must send JSON `null` to select the null value. Enum literals are never
+reinterpreted, and every repair is audited as `llm.tool_arguments_normalized`.
+
+### Shared contract definitions and drift checks
+
+Canonical field semantics live in `agent_libos/tools/contracts.py`. Pydantic
+fields reuse the declarations to generate descriptions, defaults, and lexical
+constraints; the owning Skill embeds generated guidance from the same source.
+Result declarations also select specialized replay handling. Local contract
+metadata is not sent as provider schema extensions and grants no authority.
+
+`uv run python scripts/check_tool_contracts.py` inventories every core tool and
+checks native/transport schemas, accepted and rejected canonical arguments,
+Skill blocks, and result replay. CI runs the check without LLM calls. Independent
+coverage fixtures prevent a removed declaration from silently reducing coverage;
+mutation tests verify that the check detects drift. Runtime workflow tests then
+execute serialized wire-valid calls through the broker and primitives, including
+denials and non-mutating CAS conflicts. These tests complement domain tests;
+they do not prove every business effect or remote provider's schema support.
+
+See the [generated contract reference](tool_contracts.md) for exact coverage,
+regeneration, and extension instructions. Existing compatibility validators
+remain unchanged; declaring a canonical value does not introduce an alias or a
+new coercion. Prompt-cache v2 remains a Host opt-in with its own release gate.
+
 ## On-Demand Tool Skills
 
 An image with `metadata.tool_projection: skills` starts with a small
 model-facing projection instead of exposing every image tool schema at once.
 The fixed bootstrap requires the complete image-authorized set of
 `discover_skills`, `activate_skill`, `read_skill_resource`, `unload_skill`, and
-`process_exit`; a Skills-projection image missing any member is rejected. The
+`process_exit`; a Skills-projection image missing any member is rejected. When
+the image table also binds `read_process_messages` and
+`receive_process_messages`, the initial projection includes them so mandatory
+queued-input handling never needs a discovery round trip. The
 image's full process tool table is unchanged.
 
 Fresh shipped images contain neither Skill catalog metadata nor Skill bodies in
 the prompt. `discover_skills` searches every source visible under current
 catalog authority using one common, `text`/`limit`-bounded result schema.
-Concrete query terms are matched independently against id, name, and
-description metadata and results are relevance-ranked. A one-term query must
-match that term; a longer query requires at least two matching terms, allowing
-one task intent to surface separate narrowly owned Skills without admitting a
-result on one generic word alone. `next_step` tells the model to activate an
+Concrete query terms are matched independently against id, name,
+description, and declared tool-name metadata and results are relevance-ranked.
+A one-term query must match that term; a longer query requires at least two
+matching terms, allowing one task intent to surface separate narrowly owned
+Skills without admitting a result on one generic word alone. A query token that
+equals a declared tool name always matches its owning Skill, so listing the
+exact tools a goal requires resolves every owning Skill in one call. When the
+model selects a tool the image binds but no active Skill projects, the action
+repair names the owning built-in Skill and its package hash so the next
+response can activate it directly. `next_step` tells the model to activate an
 inactive plausible exact id, use a current loaded snapshot, or refine a
 zero-result query. `active` is true only when loaded and catalog package hashes
 match. `activate_skill` passes the discovered hash as

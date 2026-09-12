@@ -20,6 +20,7 @@ from agent_libos.storage.sql import (
     _V5_REQUIRED_COLUMNS,
     _V6_REQUIRED_COLUMNS,
     _V7_REQUIRED_COLUMNS,
+    _V8_REQUIRED_COLUMNS,
 )
 from agent_libos.storage.v5_schema_contract import (
     HUMAN_REQUEST_INDEX_CONTRACTS,
@@ -39,6 +40,11 @@ from agent_libos.storage.v7_schema_contract import (
     V7_STORAGE_COLUMN_CONTRACTS,
     V7_STORAGE_KEY_CONSTRAINTS,
     V7_STORAGE_POSTGRES_CHECKS,
+)
+from agent_libos.storage.v8_schema_contract import (
+    V8_STORAGE_COLUMN_CONTRACTS,
+    V8_STORAGE_KEY_CONSTRAINTS,
+    V8_STORAGE_POSTGRES_CHECKS,
 )
 
 
@@ -114,6 +120,8 @@ class _PostgresDialect:
             "(package_json::jsonb ->> 'description')",
             transformed,
         )
+        for sqlite_expression, postgres_expression in _PROVIDER_CONTINUATION_JSON_EXPRESSIONS.items():
+            transformed = transformed.replace(sqlite_expression, postgres_expression)
         transformed = re.sub(
             r"\s+INDEXED\s+BY\s+[A-Za-z_][A-Za-z0-9_]*",
             "",
@@ -522,6 +530,46 @@ class PostgresStore(SQLRuntimeStore):
         cls._require_canonical_catalog_contract(conn, store_version=7)
 
     @classmethod
+    def _require_v8_schema_shape(cls, conn: Any) -> None:
+        """Require every schema-v8 manifest relation to be an ordinary table."""
+
+        required_tables = sorted(_V8_REQUIRED_COLUMNS)
+        placeholders = ", ".join("?" for _ in required_tables)
+        rows = conn.execute(
+            f"""
+            SELECT relation.relname AS name,
+                   relation.relkind AS relation_kind
+              FROM pg_catalog.pg_class AS relation
+              JOIN pg_catalog.pg_namespace AS namespace
+                ON namespace.oid = relation.relnamespace
+             WHERE namespace.nspname = current_schema()
+               AND relation.relname IN ({placeholders})
+            """,
+            required_tables,
+        )
+        relation_kinds = {
+            str(row["name"]): str(row["relation_kind"])
+            for row in rows
+        }
+        invalid_relations = {
+            table: relation_kinds.get(table, "missing")
+            for table in required_tables
+            if relation_kinds.get(table) != "r"
+        }
+        if invalid_relations:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v8 "
+                "manifest relation types: "
+                f"{invalid_relations}; expected PostgreSQL relkind 'r'"
+            )
+        super()._require_v8_schema_shape(conn)
+        cls._require_v5_storage_contract(conn)
+        cls._require_v6_storage_contract(conn)
+        cls._require_v7_storage_contract(conn)
+        cls._require_v8_storage_contract(conn)
+        cls._require_canonical_catalog_contract(conn, store_version=8)
+
+    @classmethod
     def _require_canonical_catalog_contract(
         cls,
         conn: Any,
@@ -601,6 +649,22 @@ class PostgresStore(SQLRuntimeStore):
         if problems:
             raise UnsupportedStoreVersion(
                 "unsupported Agent libOS schema v7 storage contract: "
+                f"{problems}"
+            )
+
+    @classmethod
+    def _require_v8_storage_contract(cls, conn: Any) -> None:
+        problems = {
+            **cls._storage_column_problems(conn, V8_STORAGE_COLUMN_CONTRACTS),
+            **cls._storage_check_problems(conn, V8_STORAGE_POSTGRES_CHECKS),
+            **cls._storage_key_constraint_problems(
+                conn,
+                V8_STORAGE_KEY_CONSTRAINTS,
+            ),
+        }
+        if problems:
+            raise UnsupportedStoreVersion(
+                "unsupported Agent libOS schema v8 storage contract: "
                 f"{problems}"
             )
 
@@ -1137,6 +1201,22 @@ _SQLITE_SKILL_DESCRIPTION_JSON_EXTRACT = re.compile(
     r"json_extract\(\s*package_json\s*,\s*'\$\.description'\s*\)",
     re.IGNORECASE,
 )
+_PROVIDER_CONTINUATION_JSON_EXPRESSIONS = {
+    "json_extract(checkpoint.snapshot_json, '$.provider_continuation_refs')":
+        "(checkpoint.snapshot_json::json -> 'provider_continuation_refs')",
+    "json_extract(continuation_ref.value, '$.marker_call_id')":
+        "(continuation_ref.value ->> 'marker_call_id')",
+    "json_extract(continuation_ref.value, '$.source_call_id')":
+        "(continuation_ref.value ->> 'source_call_id')",
+    "json_extract(marker.request_options_json, '$.provider_continuation.state')":
+        "(marker.request_options_json::json -> 'provider_continuation' ->> 'state')",
+    "json_extract(marker.request_options_json, '$.provider_continuation.call_id')":
+        "(marker.request_options_json::json -> 'provider_continuation' ->> 'call_id')",
+    "json_extract(marker.request_options_json, '$.provider_continuation.context_generation')":
+        "(marker.request_options_json::json -> 'provider_continuation' ->> 'context_generation')",
+    "json_type(marker.request_options_json, '$.provider_continuation.context_generation') = 'text'":
+        "json_typeof(marker.request_options_json::json -> 'provider_continuation' -> 'context_generation') = 'string'",
+}
 
 
 def _prepare_parameterized_sql(sql: str) -> str:

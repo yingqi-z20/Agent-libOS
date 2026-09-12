@@ -448,6 +448,7 @@ DATA_FLOW_PUBLIC_MUTATION_METHODS = frozenset(
         "tombstone_file",
         "tombstone_path_tree",
         "unregister_sink_trust",
+        "validate_replay_sources",
         "watch_directory_labels",
     }
 )

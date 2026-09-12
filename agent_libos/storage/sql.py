@@ -31,6 +31,7 @@ from agent_libos.evidence.payload_retention import (
     PayloadRetentionTier,
     external_effect_payload_retention_tier,
     llm_call_payload_can_be_image_only_transcript_head,
+    llm_call_payload_can_be_provider_continuation,
     llm_call_payload_sha256,
     llm_call_payload_requires_latest_guard,
     llm_call_payload_retention_tier,
@@ -47,6 +48,8 @@ from agent_libos.models.exceptions import (
     ValidationError,
 )
 from agent_libos.models.semantic import SemanticAssessmentStatus, SemanticDomain
+from agent_libos.models.llm_replay import LLMReplayHead, LLMReplayTurn, canonical_replay_payload
+from agent_libos.storage.v8_schema_contract import V8_STORAGE_COLUMN_CONTRACTS
 from agent_libos.process_execution import (
     current_post_exec_completion_mutation,
     current_process_control_mutation,
@@ -281,6 +284,7 @@ from agent_libos.storage.semantic_v6 import (
 from agent_libos.storage.contracts import (
     PersistedCapabilityResourceIdentity,
     PersistedFileLabelPathIdentity,
+    RetainedObjectReadCapabilities,
 )
 from agent_libos.utils.serde import bounded_json_loads, dumps, loads
 
@@ -876,7 +880,7 @@ def _dumps_strict_checkpoint_snapshot(snapshot: Any) -> str:
         ) from exc
 
 
-STORE_SCHEMA_VERSION = 7
+STORE_SCHEMA_VERSION = 8
 # Python cursor models compare strings by Unicode code point.  SQLite BINARY
 # and PostgreSQL "C" are the backend collations that preserve that ordering for
 # UTF-8 text.  Every durable text component used by a startup/recovery keyset
@@ -1018,6 +1022,11 @@ _V7_KEYSET_TEXT_COLUMNS: dict[str, frozenset[str]] = {
             "updated_at",
         }
     ),
+}
+_V8_KEYSET_TEXT_COLUMNS = {
+    **_V7_KEYSET_TEXT_COLUMNS,
+    **{table: frozenset(name for name, contract in columns if contract.keyset_collation)
+       for table, columns in V8_STORAGE_COLUMN_CONTRACTS.items()},
 }
 _PROCESS_REVISION_COUNTER_PREFIX = "process_revision:"
 _PROCESS_EXECUTION_COUNTER_PREFIX = "process_execution_generation:"
@@ -1428,6 +1437,11 @@ _V7_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
         "metadata_json created_at updated_at".split()
     ),
 }
+_V8_REQUIRED_COLUMNS = {
+    **_V7_REQUIRED_COLUMNS,
+    **{table: frozenset(name for name, _ in columns)
+       for table, columns in V8_STORAGE_COLUMN_CONTRACTS.items()},
+}
 _SEMANTIC_TYPED_TABLES = frozenset(
     {
         "semantic_assessment_jobs",
@@ -1724,9 +1738,9 @@ class SQLRuntimeStore:
                 self._write_store_schema_version()
                 # Validate the exact fresh contract inside the bootstrap
                 # transaction. A failed DDL surface rolls back to an empty
-                # database; existing v7 stores were already checked before
+                # database; existing v8 stores were already checked before
                 # initializer entry and cannot be repaired opportunistically.
-                self._require_v7_schema_shape(conn)
+                self._require_v8_schema_shape(conn)
 
     def _issue_checkpoint_restore_writer_token(self) -> object:
         """Issue the internal checkpoint publication mutation capability."""
@@ -1734,7 +1748,7 @@ class SQLRuntimeStore:
         return self.__checkpoint_restore_writer_token
 
     def _require_supported_store_version(self) -> bool:
-        """Reject every non-v7 store before initialization can mutate it."""
+        """Reject every non-v8 store before initialization can mutate it."""
 
         return self._require_supported_store_version_for(self.conn)
 
@@ -1744,6 +1758,11 @@ class SQLRuntimeStore:
         if marker_exists:
             version = marker_row.get("schema_version") if marker_row is not None else None
             if version != STORE_SCHEMA_VERSION:
+                if version == 7:
+                    raise UnsupportedStoreVersion(
+                        "Agent libOS store schema v7 requires the explicit offline "
+                        "v7-to-v8 migration; no migration was attempted"
+                    )
                 if version == 6:
                     raise UnsupportedStoreVersion(
                         "Agent libOS store schema v6 requires the explicit offline "
@@ -1762,14 +1781,14 @@ class SQLRuntimeStore:
                 if version == 3:
                     raise UnsupportedStoreVersion(
                         "Agent libOS store schema v3 is not writable or readable by "
-                        "this runtime; expected 7. Use Agent libOS 1.0.1 to view or "
+                        "this runtime; expected 8. Use Agent libOS 1.0.1 to view or "
                         "archive this store. No migration was attempted."
                     )
                 raise UnsupportedStoreVersion(
                     f"unsupported Agent libOS store schema: {version!r}; "
                     f"expected {STORE_SCHEMA_VERSION}; no migration was attempted"
                 )
-            cls._require_v7_schema_shape(conn)
+            cls._require_v8_schema_shape(conn)
             return False
         if cls._probe_user_schema_objects(conn):
             raise UnsupportedStoreVersion(
@@ -1864,6 +1883,37 @@ class SQLRuntimeStore:
         cls._require_v5_semantic_index_manifest(conn)
         cls._require_v6_semantic_index_manifest(conn)
         cls._require_v7_mcp_index_manifest(conn)
+        cls._require_v4_counter_seed(conn)
+
+    @classmethod
+    def _require_v8_schema_shape(cls, conn: SqlEngine) -> None:
+        mismatched: dict[str, dict[str, list[str]]] = {}
+        for table, required in _V8_REQUIRED_COLUMNS.items():
+            columns = cls._probe_columns(conn, table)
+            missing = sorted(required - columns)
+            extra = sorted(columns - required)
+            if missing or extra:
+                mismatched[table] = {"missing": missing, "extra": extra}
+        extra_tables = sorted(
+            cls._probe_user_tables(conn) - set(_V8_REQUIRED_COLUMNS)
+        )
+        if extra_tables:
+            mismatched["<tables>"] = {"missing": [], "extra": extra_tables}
+        if mismatched:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v8: "
+                f"{mismatched}"
+            )
+        cls._require_keyset_text_collations(
+            conn,
+            version=8,
+            keyset_columns=_V8_KEYSET_TEXT_COLUMNS,
+        )
+        cls._require_v4_index_manifest(conn)
+        cls._require_v5_semantic_index_manifest(conn)
+        cls._require_v6_semantic_index_manifest(conn)
+        cls._require_v7_mcp_index_manifest(conn)
+        cls._require_v8_replay_index_manifest(conn)
         cls._require_v4_counter_seed(conn)
 
     @classmethod
@@ -2996,6 +3046,36 @@ class SQLRuntimeStore:
                 f"index manifest: {problems}"
             )
 
+    @classmethod
+    def _require_v8_replay_index_manifest(cls, conn: SqlEngine) -> None:
+        from agent_libos.storage.v8_schema_contract import (
+            V8_INDEX_CONTRACTS,
+            V8_TABLES,
+        )
+
+        shapes = cls._probe_index_shapes(
+            conn,
+            {spec[0] for spec in V8_INDEX_CONTRACTS.values()},
+        )
+        problems: dict[str, Any] = {}
+        for name, expected in V8_INDEX_CONTRACTS.items():
+            problem = cls._v5_index_shape_problem(name, expected, shapes.get(name))
+            if problem is not None:
+                problems[name] = problem
+        declared = {
+            name
+            for name, shape in shapes.items()
+            if shape.get("origin") == "declared" and shape.get("table") in V8_TABLES
+        }
+        extra = sorted(declared - set(V8_INDEX_CONTRACTS))
+        if extra:
+            problems["<extra indexes>"] = extra
+        if problems:
+            raise UnsupportedStoreVersion(
+                "unsupported or incomplete Agent libOS store schema v8 replay "
+                f"index manifest: {problems}"
+            )
+
     def _runtime_ownership_released(self) -> bool:
         """Return backend-observed lease/session ownership, without probing SQL."""
 
@@ -4110,6 +4190,42 @@ class SQLRuntimeStore:
         self._create_v5_semantic_schema()
         self._create_v6_semantic_schema()
         self._create_v7_mcp_schema()
+        self._create_v8_llm_replay_schema()
+
+    def _create_v8_llm_replay_schema(self) -> None:
+        """Create private local replay payloads, outside generic export tables."""
+
+        self._execute_script(
+            """
+            CREATE INDEX IF NOT EXISTS idx_llm_pending_replay_recovery
+              ON llm_pending_actions(status, pid COLLATE BINARY);
+            CREATE TABLE IF NOT EXISTS llm_replay_turns (
+              turn_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+              pid TEXT COLLATE BINARY NOT NULL,
+              run_id TEXT COLLATE BINARY,
+              provider_fingerprint TEXT NOT NULL,
+              model TEXT NOT NULL,
+              context_generation TEXT NOT NULL,
+              payload_json TEXT,
+              source_labels_json TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
+              payload_bytes BIGINT NOT NULL CHECK (payload_bytes >= 0),
+              created_at TEXT COLLATE BINARY NOT NULL,
+              purged_at TEXT,
+              CHECK ((payload_json IS NULL) = (purged_at IS NOT NULL))
+            );
+            CREATE INDEX IF NOT EXISTS idx_llm_replay_turns_pid
+              ON llm_replay_turns(pid COLLATE BINARY, created_at COLLATE BINARY, turn_id COLLATE BINARY);
+            CREATE INDEX IF NOT EXISTS idx_llm_replay_turns_run
+              ON llm_replay_turns(run_id COLLATE BINARY, turn_id COLLATE BINARY);
+            CREATE TABLE IF NOT EXISTS llm_replay_heads (
+              pid TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+              turn_id TEXT COLLATE BINARY NOT NULL,
+              revision BIGINT NOT NULL CHECK (revision > 0),
+              updated_at TEXT NOT NULL
+            );
+            """
+        )
 
     def _create_v7_mcp_schema(self) -> None:
         """Create payload-free modern MCP continuation/control state."""
@@ -7871,6 +7987,16 @@ class SQLRuntimeStore:
             )
         return publications
 
+    def get_latest_committed_exec_publication(self, pid: str) -> dict[str, Any] | None:
+        """Read one process's latest committed exec without loading its history."""
+        rows = self._query(
+            "SELECT publication_id FROM runtime_publications "
+            "WHERE pid = ? AND kind = ? AND state = ? "
+            "ORDER BY created_at DESC, publication_id DESC LIMIT 1",
+            (pid, RuntimePublicationKind.PROCESS_EXEC.value, "committed"),
+        )
+        return self.get_runtime_publication(rows[0]["publication_id"]) if rows else None
+
     def get_committed_root_spawn_publication(
         self,
         pid: str,
@@ -10354,6 +10480,7 @@ class SQLRuntimeStore:
             )
             purged_count = int(changed.rowcount)
             cur.execute("DELETE FROM task_run_resume_points WHERE run_id = ?", (run_id,))
+            self.purge_llm_replay(run_id=run_id, purged_at=purged_at)
             return purged_count
 
     def upsert_task_run_resume_point(self, point: TaskRunResumePoint) -> None:
@@ -19256,6 +19383,156 @@ class SQLRuntimeStore:
             return selected
         return owned
 
+    def _provider_continuation_retention_ids(
+        self, records: tuple[LLMCallRecord, ...], *, cursor: Any = None,
+    ) -> frozenset[str]:
+        """Classify pending hosted evidence in one bounded query per page.
+
+        The write path calls this again inside its transaction. A page selected
+        before a continuation was committed therefore cannot erase its source.
+        """
+
+        candidates = tuple(
+            record for record in records
+            if llm_call_payload_can_be_provider_continuation(record)
+        )
+        if not candidates:
+            return frozenset()
+        placeholders = ",".join("?" for _ in candidates)
+        query = f"""
+            SELECT candidate.pid, marker.call_id AS marker_id,
+                   marker.created_at AS marker_created_at,
+                   marker.request_options_json AS marker_options,
+                   latest.call_id AS latest_success_id,
+                   COALESCE(generation.generation, 'initial') AS context_generation,
+                   point.pending_action_payload_id,
+                   pending.canonical_json AS pending_json
+              FROM (
+                SELECT DISTINCT pid FROM llm_calls WHERE call_id IN ({placeholders})
+              ) AS candidate
+              LEFT JOIN llm_calls AS marker ON marker.call_id = (
+                SELECT call_id FROM llm_calls
+                 WHERE pid = candidate.pid AND purpose = 'provider_continuation'
+                 ORDER BY created_at COLLATE BINARY DESC, call_id COLLATE BINARY DESC
+                 LIMIT 1
+              )
+              LEFT JOIN llm_calls AS latest ON latest.call_id = (
+                SELECT call_id FROM llm_calls
+                 WHERE pid = candidate.pid AND purpose = 'action_selection' AND status = 'ok'
+                 ORDER BY created_at COLLATE BINARY DESC, call_id COLLATE BINARY DESC
+                 LIMIT 1
+              )
+              LEFT JOIN task_run_resume_points AS point
+                ON point.pid = candidate.pid AND point.complete = 1
+              LEFT JOIN llm_context_generations AS generation
+                ON generation.pid = candidate.pid
+              LEFT JOIN task_run_payloads AS pending
+                ON pending.payload_id = point.pending_action_payload_id
+        """
+        parameters = tuple(record.call_id for record in candidates)
+        rows = list(cursor.execute(query, parameters)) if cursor is not None else self._query(query, parameters)
+        by_pid = {row["pid"]: row for row in rows}
+        local_refs = frozenset(
+            record.call_id for record in candidates
+            if self._provider_continuation_reference_protects(record, by_pid.get(record.pid))
+        )
+        external_candidates = tuple(record for record in candidates if record.call_id not in local_refs)
+        return local_refs | self._external_provider_continuation_retention_ids(external_candidates, cursor=cursor)
+
+    def _external_provider_continuation_retention_ids(
+        self, candidates: tuple[LLMCallRecord, ...], *, cursor: Any = None,
+    ) -> frozenset[str]:
+        """Protect exact checkpoint refs and pending forks without copying bodies.
+
+        Fixed JSON paths are Host schema fields; PostgreSQL's dialect translates
+        only these reviewed expressions. Query results remain page-bounded IDs.
+        """
+
+        if not candidates:
+            return frozenset()
+        placeholders = ",".join("?" for _ in candidates)
+        query = f"""
+            SELECT candidate.call_id FROM llm_calls AS candidate
+             WHERE candidate.call_id IN ({placeholders}) AND (
+               EXISTS (
+                 SELECT 1 FROM checkpoints AS checkpoint,
+                   json_each(json_extract(checkpoint.snapshot_json, '$.provider_continuation_refs')) AS continuation_ref
+                  WHERE json_extract(continuation_ref.value, '$.marker_call_id') = candidate.call_id
+                     OR json_extract(continuation_ref.value, '$.source_call_id') = candidate.call_id
+               ) OR EXISTS (
+                 SELECT 1 FROM llm_calls AS marker
+                  LEFT JOIN llm_context_generations AS generation
+                    ON generation.pid = marker.pid
+                  WHERE marker.purpose = 'provider_continuation'
+                    AND json_extract(marker.request_options_json, '$.provider_continuation.state') = 'pending'
+                    AND json_extract(marker.request_options_json, '$.provider_continuation.call_id') = candidate.call_id
+                    AND CASE
+                      WHEN json_type(marker.request_options_json, '$.provider_continuation.context_generation') = 'text'
+                       AND json_extract(marker.request_options_json, '$.provider_continuation.context_generation') <> ''
+                      THEN json_extract(marker.request_options_json, '$.provider_continuation.context_generation') = COALESCE(generation.generation, 'initial')
+                      ELSE 1 = 1
+                    END
+                    AND NOT EXISTS (
+                      SELECT 1 FROM llm_calls AS newer
+                       WHERE newer.pid = marker.pid AND newer.purpose = marker.purpose
+                         AND (newer.created_at COLLATE BINARY, newer.call_id COLLATE BINARY)
+                             > (marker.created_at COLLATE BINARY, marker.call_id COLLATE BINARY)
+                    )
+               )
+             )
+        """
+        parameters = tuple(record.call_id for record in candidates)
+        rows = list(cursor.execute(query, parameters)) if cursor is not None else self._query(query, parameters)
+        return frozenset(row["call_id"] for row in rows)
+
+    @staticmethod
+    def _provider_continuation_reference_state(row: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        options = loads(row["marker_options"], {})
+        marker = options.get("provider_continuation", {})
+        pending = loads(row["pending_json"], {})
+        if not isinstance(marker, dict) or not isinstance(pending, dict):
+            raise ValueError("invalid continuation projection")
+        if row["marker_id"] is not None and (
+            type(marker.get("schema_version")) is not int
+            or marker.get("schema_version") not in {1, 2}
+            or marker.get("state") not in {"pending", "consumed"}
+            or not isinstance(marker.get("call_id"), str)
+        ):
+            raise ValueError("invalid continuation marker")
+        return marker, pending
+
+    def _provider_continuation_reference_protects(self, record: LLMCallRecord, row: Any) -> bool:
+        if row is None:
+            return True
+        try:
+            marker, pending = self._provider_continuation_reference_state(row)
+        except (AttributeError, TypeError, ValueError):
+            return True
+        if row["pending_action_payload_id"] is not None and row["pending_json"] is None:
+            # Diagnose a missing active resume payload before erasing evidence.
+            return True
+        if pending.get("kind") == "provider_continuation" and pending.get("call_id") == record.call_id:
+            return True
+        marker_generation = marker.get("context_generation")
+        marker_obsolete = (
+            isinstance(marker_generation, str) and bool(marker_generation)
+            and marker_generation != row["context_generation"]
+        )
+        # Restoring an earlier checkpoint discards later markers without
+        # consuming them. Exact checkpoint/fork references are checked
+        # separately; an obsolete local marker is no longer a dependency.
+        if record.purpose == "provider_continuation":
+            return row["marker_id"] == record.call_id and not marker_obsolete
+        if marker.get("call_id") == record.call_id:
+            return marker.get("state") != "consumed" and not marker_obsolete
+        # Protect the success-to-commit interval, including when the last
+        # continuation belongs to an older turn. Errors cannot supersede it.
+        return row["latest_success_id"] == record.call_id and (
+            row["marker_id"] is None
+            or (record.created_at, record.call_id)
+            > (row["marker_created_at"], row["marker_id"])
+        )
+
     def scan_llm_call_payloads_for_retention(
         self,
         *,
@@ -19357,6 +19634,7 @@ class SQLRuntimeStore:
             records=records,
             next_cursor=next_cursor,
             latest_llm_call_ids=latest_llm_call_ids,
+            provider_continuation_call_ids=self._provider_continuation_retention_ids(records),
         )
 
     def update_llm_call_payload_retention(
@@ -19378,6 +19656,9 @@ class SQLRuntimeStore:
             if len(rows) != 1:
                 return False
             current = self._row_to_llm_call(rows[0])
+            continuation_pending = current.call_id in self._provider_continuation_retention_ids(
+                (current,), cursor=cur,
+            )
             latest_guard_kind = (
                 2
                 if llm_call_payload_can_be_image_only_transcript_head(current)
@@ -19390,6 +19671,7 @@ class SQLRuntimeStore:
                     expected_payload_sha256=expected_payload_sha256,
                     expected_tier=expected_tier,
                     provider_chain_head=False,
+                    provider_continuation_pending=continuation_pending,
                 )
             except (TypeError, ValueError):
                 return False
@@ -19538,6 +19820,155 @@ class SQLRuntimeStore:
             (pid, response_id),
         )
         return [dict(row) for row in rows]
+
+    def insert_llm_replay_turn(self, turn: LLMReplayTurn) -> None:
+        """Insert immutable local continuation; exact retries are idempotent."""
+
+        if not self.config.llm.persist_full_io:
+            raise ValidationError("persistent LLM replay requires persist_full_io")
+        # Frozen dataclasses can still contain mutable dicts: revalidate at the
+        # durable boundary instead of trusting the original construction.
+        turn = replace(turn)
+        if turn.payload is None:
+            raise ValidationError("cannot insert a purged LLM replay turn")
+        max_bytes = self.config.llm.responses_replay_max_bytes
+        if turn.payload_bytes > max_bytes:
+            raise ValidationError("LLM replay payload exceeds the configured byte limit")
+        payload_json = canonical_replay_payload(turn.payload)
+        labels_json = canonical_replay_payload(turn.source_labels)
+        values = (turn.turn_id, turn.pid, turn.run_id, turn.provider_fingerprint,
+                  turn.model, turn.context_generation, payload_json, labels_json,
+                  turn.payload_sha256, turn.payload_bytes, turn.created_at, None)
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT INTO llm_replay_turns (turn_id, pid, run_id, "
+                "provider_fingerprint, model, context_generation, payload_json, "
+                "source_labels_json, payload_sha256, payload_bytes, created_at, purged_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(turn_id) DO NOTHING", values,
+            )
+            if cur.rowcount == 1:
+                return
+            row = cur.execute("SELECT * FROM llm_replay_turns WHERE turn_id = ?", (turn.turn_id,)).fetchone()
+            if row is None or self._row_to_llm_replay_turn(row) != turn:
+                raise ValidationError("conflicting immutable LLM replay turn")
+
+    @staticmethod
+    def _row_to_llm_replay_turn(row: Any) -> LLMReplayTurn:
+        with _persisted_model_decode("LLM replay turn"):
+            return LLMReplayTurn(
+                turn_id=row["turn_id"], pid=row["pid"], run_id=row["run_id"],
+                provider_fingerprint=row["provider_fingerprint"], model=row["model"],
+                context_generation=row["context_generation"],
+                payload=loads(row["payload_json"]) if row["payload_json"] is not None else None,
+                source_labels=loads(row["source_labels_json"]),
+                payload_sha256=row["payload_sha256"], payload_bytes=row["payload_bytes"],
+                created_at=row["created_at"], purged_at=row["purged_at"],
+            )
+
+    def get_llm_replay_turn(self, turn_id: str) -> LLMReplayTurn | None:
+        rows = self._query("SELECT * FROM llm_replay_turns WHERE turn_id = ?", (turn_id,))
+        return self._row_to_llm_replay_turn(rows[0]) if rows else None
+
+    def get_llm_replay_head(self, pid: str) -> LLMReplayHead | None:
+        rows = self._query("SELECT * FROM llm_replay_heads WHERE pid = ?", (pid,))
+        return LLMReplayHead(**dict(rows[0])) if rows else None
+
+    def list_llm_replay_heads(
+        self, *, after_pid: str | None = None, limit: int = 100,
+    ) -> list[LLMReplayHead]:
+        if type(limit) is not int or not 1 <= limit <= self.config.llm.call_record_hard_limit:
+            raise ValidationError("LLM replay head page limit is outside configured bounds")
+        clauses = "" if after_pid is None else " WHERE pid > ?"
+        params: list[Any] = [] if after_pid is None else [after_pid]
+        rows = self._query(
+            f"SELECT * FROM llm_replay_heads{clauses} ORDER BY pid LIMIT ?",
+            [*params, limit],
+        )
+        return [LLMReplayHead(**dict(row)) for row in rows]
+
+    def list_llm_replay_recovery_pids(
+        self, *, after_pid: str | None = None, limit: int = 100,
+    ) -> list[str]:
+        if type(limit) is not int or not 1 <= limit <= self.config.llm.call_record_hard_limit:
+            raise ValidationError("LLM replay recovery page limit is outside configured bounds")
+        suffix = "" if after_pid is None else " AND pid > ?"
+        params: list[Any] = [] if after_pid is None else [after_pid]
+        heads = self.list_llm_replay_heads(after_pid=after_pid, limit=limit)
+        pending = self._query(
+            "SELECT pid FROM llm_pending_actions WHERE status = 'pending'"
+            f"{suffix} ORDER BY pid LIMIT ?", [*params, limit],
+        )
+        continuations = self._query(
+            "SELECT DISTINCT pid FROM llm_calls "
+            "WHERE purpose = 'provider_continuation' AND pid IS NOT NULL"
+            f"{suffix} ORDER BY pid LIMIT ?", [*params, limit],
+        )
+        # Bound each side before merging; a SQL UNION can materialize the
+        # entire historical relation before applying an outer LIMIT.
+        return sorted(
+            {head.pid for head in heads}
+            | {str(row["pid"]) for row in pending}
+            | {str(row["pid"]) for row in continuations}
+        )[:limit]
+
+    def compare_and_set_llm_replay_head(
+        self, head: LLMReplayHead, *, expected_revision: int | None,
+    ) -> bool:
+        """Advance a process-local head after its immutable payload is durable."""
+
+        if not self.config.llm.persist_full_io:
+            raise ValidationError("persistent LLM replay requires persist_full_io")
+        head = replace(head)
+        if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 1):
+            raise ValidationError("invalid expected LLM replay head revision")
+        if head.revision != (1 if expected_revision is None else expected_revision + 1):
+            raise ValidationError("LLM replay head revision must advance exactly once")
+        with self.transaction() as cur:
+            row = cur.execute("SELECT * FROM llm_replay_turns WHERE turn_id = ?", (head.turn_id,)).fetchone()
+            if row is None:
+                raise ValidationError("LLM replay head references a missing turn")
+            turn = self._row_to_llm_replay_turn(row)
+            if turn.pid != head.pid or turn.payload is None:
+                raise ValidationError("LLM replay head cannot reference another process or a purged turn")
+            if expected_revision is None:
+                cur.execute(
+                    "INSERT INTO llm_replay_heads (pid, turn_id, revision, updated_at) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT(pid) DO NOTHING",
+                    (head.pid, head.turn_id, head.revision, head.updated_at),
+                )
+            else:
+                cur.execute(
+                    "UPDATE llm_replay_heads SET turn_id = ?, revision = ?, updated_at = ? "
+                    "WHERE pid = ? AND revision = ?",
+                    (head.turn_id, head.revision, head.updated_at, head.pid, expected_revision),
+                )
+            return cur.rowcount == 1
+
+    def clear_llm_replay_head(self, pid: str) -> None:
+        """Detach the current head without erasing retained checkpoint payloads."""
+
+        self._execute("DELETE FROM llm_replay_heads WHERE pid = ?", (pid,))
+
+    def purge_llm_replay(
+        self, *, pid: str | None = None, run_id: str | None = None,
+        purged_at: str | None = None,
+    ) -> int:
+        """Remove private bodies and heads while retaining immutable tombstones."""
+
+        if (pid is None) == (run_id is None):
+            raise ValidationError("LLM replay purge requires exactly one process or TaskRun scope")
+        column, value = ("pid", pid) if pid is not None else ("run_id", run_id)
+        with self.transaction() as cur:
+            cur.execute(
+                "DELETE FROM llm_replay_heads WHERE turn_id IN "
+                f"(SELECT turn_id FROM llm_replay_turns WHERE {column} = ?)", (value,),
+            )
+            cur.execute(
+                "UPDATE llm_replay_turns SET payload_json = NULL, purged_at = ? "
+                f"WHERE {column} = ? AND purged_at IS NULL", (purged_at or utc_now(), value),
+            )
+            return cur.rowcount
 
     def get_llm_context_generation(self, pid: str) -> str:
         rows = self._query(
@@ -20827,6 +21258,10 @@ class SQLRuntimeStore:
                 name=package.name,
                 description=package.description,
                 text=query,
+                tool_names=[
+                    *package.allowed_tools,
+                    *(tool.name for tool in package.jit_tools),
+                ],
             )
             if score is not None:
                 scored.append((score, package, self._skill_row_metadata(row)))
@@ -21971,6 +22406,7 @@ class SQLRuntimeStore:
         self,
         *,
         require_recovery_lease: Callable[[], None],
+        retained_read_capabilities: RetainedObjectReadCapabilities | None = None,
     ) -> ObjectPayloadRecoverySummary:
         """Release volatile payload rows in keyset-paged, constant-size writes."""
 
@@ -21986,9 +22422,13 @@ class SQLRuntimeStore:
             )
             if not rows:
                 break
-            released = self._release_object_payload_recovery_page(
-                rows,
-            )
+            with self._join_or_begin_transaction():
+                retained = self._retained_object_read_capability_page(
+                    rows, retained_read_capabilities,
+                )
+                released = self._release_object_payload_recovery_page(
+                    rows, retained_read_capabilities=retained,
+                )
             total_count += len(released)
             remaining = page_size - len(sample_oids)
             if remaining > 0:
@@ -22022,9 +22462,112 @@ class SQLRuntimeStore:
             params,
         )
 
+    def _retained_object_read_capability_page(
+        self,
+        rows: Sequence[Any],
+        resolver: RetainedObjectReadCapabilities | None,
+    ) -> dict[str, dict[str, str]]:
+        if resolver is None:
+            return {}
+        oids = tuple(str(row["oid"]) for row in rows)
+        selected = resolver(oids)
+        if not isinstance(selected, Mapping):
+            raise ValidationError("retained Object capability resolver must return a mapping")
+        # The Host retention preflight bounds the total selection. Query page
+        # size does not limit how many existing grants one Object can have.
+        result: dict[str, dict[str, str]] = {}
+        for key, cap_ids in selected.items():
+            if (
+                not isinstance(key, tuple) or len(key) != 2
+                or not all(isinstance(value, str) and value for value in key)
+                or key[1] not in oids
+                or not isinstance(cap_ids, (set, frozenset))
+            ):
+                raise ValidationError("retained Object capability entry is outside the recovery page")
+            pid, oid = key
+            for cap_id in cap_ids:
+                if not isinstance(cap_id, str) or not cap_id:
+                    raise ValidationError("retained Object capability ID must be nonempty")
+                subjects = result.setdefault(oid, {})
+                if cap_id in subjects and subjects[cap_id] != pid:
+                    raise ValidationError("retained Object capability has conflicting subjects")
+                subjects[cap_id] = pid
+        return result
+
+    def _release_object_payload_capabilities(
+        self,
+        cur: Any,
+        oid: str,
+        *,
+        retained_read_subjects: Mapping[str, str],
+    ) -> None:
+        resource = f"object:{oid}"
+        if not retained_read_subjects:
+            cur.execute(
+                "UPDATE capabilities SET status = ? WHERE resource = ? AND status = ?",
+                (CapabilityStatus.REVOKED.value, resource, CapabilityStatus.ACTIVE.value),
+            )
+            return
+        # A selected capability is never revoked and then reactivated. Read
+        # and narrow only the exact currently active row in this transaction;
+        # the old preflight cannot resurrect a grant revoked in the meantime.
+        after: str | None = None
+        while True:
+            suffix = "" if after is None else " AND cap_id COLLATE BINARY > ?"
+            params: list[Any] = [resource, CapabilityStatus.ACTIVE.value]
+            if after is not None:
+                params.append(after)
+            rows = list(cur.execute(
+                f"SELECT * FROM capabilities WHERE resource = ? AND status = ?{suffix} "
+                "ORDER BY cap_id COLLATE BINARY LIMIT ?",
+                (*params, self.config.capability.list_limit),
+            ))
+            if not rows:
+                return
+            for row in rows:
+                self._narrow_retained_object_read_capability(cur, row, retained_read_subjects)
+            after = str(rows[-1]["cap_id"])
+
+    def _narrow_retained_object_read_capability(
+        self,
+        cur: Any,
+        row: Any,
+        retained_read_subjects: Mapping[str, str],
+    ) -> None:
+        capability = self._row_to_capability(row)
+        selected_grant = retained_read_subjects.get(capability.cap_id) == capability.subject
+        retained_policy = (
+            capability.effect in {CapabilityEffect.DENY, CapabilityEffect.ASK}
+            and capability.subject in retained_read_subjects.values()
+        )
+        retain = (
+            CapabilityRight.READ.value in capability.rights
+            and (selected_grant or retained_policy)
+        )
+        if retain:
+            # Preserve effect, restrictions, lineage, expiry and remaining
+            # uses; DENY/ASK policy rows must not disappear while ALLOW stays.
+            cur.execute(
+                "UPDATE capabilities SET rights_json = ?, delegable = 0 "
+                "WHERE cap_id = ? AND subject = ? AND resource = ? "
+                "AND status = ? AND rights_json = ?",
+                (dumps([CapabilityRight.READ.value]), capability.cap_id,
+                 capability.subject, capability.resource, CapabilityStatus.ACTIVE.value,
+                 row["rights_json"]),
+            )
+        else:
+            cur.execute(
+                "UPDATE capabilities SET status = ? "
+                "WHERE cap_id = ? AND resource = ? AND status = ?",
+                (CapabilityStatus.REVOKED.value, capability.cap_id,
+                 capability.resource, CapabilityStatus.ACTIVE.value),
+            )
+
     def _release_object_payload_recovery_page(
         self,
         rows: Iterable[Any],
+        *,
+        retained_read_capabilities: Mapping[str, Mapping[str, str]] | None = None,
     ) -> list[str]:
         released: list[str] = []
         now = utc_now()
@@ -22062,16 +22605,9 @@ class SQLRuntimeStore:
                     "DELETE FROM object_links WHERE src_oid = ? OR dst_oid = ?",
                     (oid, oid),
                 )
-                cur.execute(
-                    """
-                    UPDATE capabilities SET status = ?
-                     WHERE resource = ? AND status = ?
-                    """,
-                    (
-                        CapabilityStatus.REVOKED.value,
-                        f"object:{oid}",
-                        CapabilityStatus.ACTIVE.value,
-                    ),
+                self._release_object_payload_capabilities(
+                    cur, oid,
+                    retained_read_subjects=(retained_read_capabilities or {}).get(oid, {}),
                 )
                 released.append(oid)
         return released

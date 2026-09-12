@@ -2,6 +2,25 @@
   "schema_version": 2,
   "invariants": [
     {
+      "id": "declared-tool-contracts-preserve-canonical-semantics",
+      "title": "Declared tool semantics agree across native/transport schemas, parser, generated Skill guidance, and result replay; wire-valid Runtime workflows preserve authority and state boundaries.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_tool_result_profile_layout.py::test_profile_review_reaches_the_model_and_allows_terminal_exit[legacy_v1-cache_optimized_v2]",
+        "tests/runtime/test_tool_result_profile_layout.py::test_profile_review_reaches_the_model_and_allows_terminal_exit[cache_optimized_v2-legacy_v1]",
+        "tests/unit/test_tool_contract_consistency.py::test_all_builtin_contracts_pass_without_rewriting_files",
+        "tests/unit/test_tool_contract_consistency.py::test_removing_one_contract_from_a_multi_contract_tool_cannot_reduce_coverage",
+        "tests/unit/test_tool_contract_consistency.py::test_failure_checks_cannot_be_disabled_by_changing_the_registry",
+        "tests/runtime/test_tool_contract_workflows.py::test_wire_valid_contract_workflow_preserves_state_and_authority[chat-legacy_v1]",
+        "tests/runtime/test_tool_contract_workflows.py::test_wire_valid_contract_workflow_preserves_state_and_authority[chat-cache_optimized_v2]",
+        "tests/runtime/test_tool_contract_workflows.py::test_wire_valid_contract_workflow_preserves_state_and_authority[responses-legacy_v1]",
+        "tests/runtime/test_tool_contract_workflows.py::test_wire_valid_contract_workflow_preserves_state_and_authority[responses-cache_optimized_v2]",
+        "tests/runtime/test_checkpoint_target_contract.py::test_literal_self_and_foreign_checkpoint_targets_remain_unauthorized",
+        "tests/runtime/test_prompt_namespace_targets.py::test_foreign_and_literal_self_namespaces_remain_literal_and_enforced"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
       "id": "tool-visibility-is-not-authority",
       "title": "Tool visibility does not grant protected resource authority.",
       "lane": "security",
@@ -583,6 +602,7 @@
       "title": "Object Memory materialization is bounded by rendered object text.",
       "lane": "runtime",
       "node_ids": [
+        "tests/runtime/test_long_horizon_context.py::test_working_set_keeps_goal_plan_and_latest_feedback_under_pressure",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_mutable_payload_update_refreshes_token_estimate_for_materialization_budget",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_append_refreshes_token_estimate_for_materialization_budget",
         "tests/runtime/test_object_memory.py::TestObjectMemoryName::test_materialization_budget_uses_rendered_text_not_stale_metadata_estimate",
@@ -616,6 +636,10 @@
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_replace_with_compacted_summary_final_version_cas_preserves_concurrent_append",
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_compact_process_context_uses_multiple_chunks",
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_pending_context_compaction_survives_runtime_reopen",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_repeated_small_compactions_fit_a_three_child_budget[legacy_v1]",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_repeated_small_compactions_fit_a_three_child_budget[cache_optimized_v2]",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_compaction_tail_fits_rendered_target_and_keeps_latest_entry",
+        "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_repeated_compaction_does_not_retain_older_summaries",
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_reopen_after_compressor_exit_reruns_missing_result_stage",
         "tests/runtime/test_llm_context_pressure_runtime.py::test_auto_compaction_generation_change_rebuilds_before_model_call[result]",
         "tests/runtime/test_llm_context_pressure_runtime.py::test_auto_compaction_generation_change_rebuilds_before_model_call[exception]",
@@ -862,11 +886,14 @@
       "benchmark_attack_classes": []
     },
     {
-      "id": "v7-persisted-state-is-strict-and-versioned",
-      "title": "Runtime startup accepts only the complete v7 schema and canonical security carriers; ordered canonical v4-to-v5, v5-to-v6, and v6-to-v7 migrations are explicit, source/cluster-bound, plan-receipted, safely reconcilable after uncertain commit, and reject older, drifted, generic same-version, or malformed state without mutation.",
+      "id": "v8-persisted-state-is-strict-and-versioned",
+      "title": "Runtime startup accepts only the complete v8 schema and canonical security carriers; ordered canonical v4-to-v5, v5-to-v6, v6-to-v7, and v7-to-v8 migrations are explicit, source/cluster-bound, plan-receipted, safely reconcilable after uncertain commit, and reject older, drifted, generic same-version, or malformed state without mutation.",
       "lane": "runtime",
       "node_ids": [
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_schema_v3_is_zero_write_rejected_with_101_archive_hint",
+        "tests/unit/test_llm_v8_migration.py::test_runtime_refuses_v7_without_automatic_v8_migration",
+        "tests/unit/test_llm_v8_migration.py::test_v8_plan_requires_an_independent_exact_v7_backup",
+        "tests/unit/test_llm_v8_migration.py::test_v8_plan_rejects_noncanonical_source_without_writing",
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_wrong_schema_marker_is_rejected_without_mutation",
         "tests/unit/test_storage_recovery.py::TestUnsupportedStoreVersion::test_v7_schema_manifest_matches_fresh_store",
         "tests/unit/test_v5_storage_schema_contract.py::test_tampered_v5_sqlite_human_primary_key_is_rejected_on_reopen",
@@ -2816,7 +2843,8 @@
         "tests/unit/test_llm_prompt_modes.py::TestLLMPromptModes::test_image_only_restored_pending_release_rebinds_generation",
         "tests/unit/test_llm_prompt_modes.py::TestLLMPromptModes::test_image_only_fails_before_provider_when_full_io_is_disabled",
         "tests/unit/test_llm_client.py::TestLLMClient::test_responses_action_request_preserves_native_function_transcript",
-        "tests/security/test_image_only_transcript.py::test_historical_sensitive_tool_output_denies_next_image_only_egress",
+        "tests/security/test_image_only_transcript.py::test_historical_sensitive_tool_output_denies_next_image_only_egress[legacy]",
+        "tests/security/test_image_only_transcript.py::test_historical_sensitive_tool_output_denies_next_image_only_egress[first-native-replay]",
         "tests/runtime/test_payload_retention_store_contract.py::test_image_only_retention_protects_only_the_active_transcript_head[sqlite]",
         "tests/runtime/test_payload_retention_store_contract.py::test_image_only_request_anchor_is_protected_until_success_tombstone[sqlite]"
       ],
@@ -2856,7 +2884,7 @@
     },
     {
       "id": "llm-provider-state-is-scope-bound-and-nonreplayable",
-      "title": "The Runtime records scope-sensitive provider fingerprints while the AgentProcess executor stays stateless, and claimed durable actions are never replayed after an interrupted resume; the low-level client does not enforce those Runtime fingerprints.",
+      "title": "The Runtime records scope-sensitive provider fingerprints and sends locally assembled full snapshots without server-side response chaining; claimed durable actions never execute again after an interrupted resume, and the low-level client does not enforce Runtime fingerprints.",
       "lane": "runtime",
       "node_ids": [
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_openai_responses_state_chain_resets_when_provider_identity_changes[gpt-next-key]",
@@ -2866,6 +2894,128 @@
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_pending_claim_token_prevents_aba_claim_of_new_wait_generation",
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_checkpoint_restore_rehydrates_restored_pending_action_in_current_executor",
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_pending_resume_claim_prevents_replay_after_effect_before_clear"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "llm-provider-tools-remain-host-scoped-and-content-retained",
+      "title": "Provider-hosted tools preserve profile-bound egress authority, internal-call isolation, and payload retention.",
+      "lane": "security",
+      "node_ids": [
+        "tests/unit/test_provider_tools_config.py::test_provider_tools_are_typed_immutable_and_detached",
+        "tests/unit/test_provider_tools_config.py::test_semantic_classifier_rejects_configured_and_dynamically_registered_tools",
+        "tests/security/test_provider_tools_governance.py::test_changed_provider_tools_cannot_inherit_existing_secret_sink_clearance",
+        "tests/runtime/test_provider_tools_executor.py::test_pending_stateless_result_rejects_removing_profile_tools_before_provider_dispatch",
+        "tests/security/test_provider_tools_governance.py::test_hosted_code_result_repair_cannot_execute_provider_tools_again",
+        "tests/runtime/test_provider_tools_repairs.py::test_hosted_result_survives_two_local_action_repairs[search-and-text]",
+        "tests/runtime/test_provider_tools_repairs.py::test_hosted_result_survives_two_local_action_repairs[code-logs-only]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_pending_provider_result_fails_closed_when_payload_unavailable",
+        "tests/security/test_provider_tools_governance.py::test_context_compressor_cannot_inherit_hosted_tools_from_its_profile",
+        "tests/security/test_provider_tools_governance.py::test_internal_text_completion_never_inherits_profile_tools",
+        "tests/security/test_provider_tools_governance.py::test_provider_tool_private_content_is_absent_when_full_io_is_disabled"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "llm-provider-code-execution-does-not-reuse-containers",
+      "title": "Independent code requests exclude native container continuations across process and restart boundaries.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_provider_tools_governance.py::test_code_requests_never_reuse_native_container_history_across_processes[libos_default]",
+        "tests/security/test_provider_tools_governance.py::test_code_requests_never_reuse_native_container_history_across_processes[image_only]",
+        "tests/security/test_provider_tools_governance.py::test_code_request_after_reopen_has_no_container_continuation",
+        "tests/security/test_provider_tools_governance.py::test_checkpoint_recovery_never_restores_provider_container_state[restore]",
+        "tests/security/test_provider_tools_governance.py::test_checkpoint_recovery_never_restores_provider_container_state[fork]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_rebinds_pending_local_provider_result_without_repeating_hosted_work[restore-code-libos_default]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_rebinds_pending_local_provider_result_without_repeating_hosted_work[restore-code-image_only]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_rebinds_pending_local_provider_result_without_repeating_hosted_work[fork-code-libos_default]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_rebinds_pending_local_provider_result_without_repeating_hosted_work[fork-code-image_only]"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "llm-provider-continuations-resume-without-repeating-hosted-work",
+      "title": "Successful hosted-only results have idempotent local continuation safe points whose successors cannot repeat provider tools.",
+      "lane": "security",
+      "node_ids": [
+        "tests/runtime/test_provider_continuation_source_recovery.py::test_provider_continuation_after_local_tool_survives_source_recovery[code-libos_default]",
+        "tests/runtime/test_provider_continuation_source_recovery.py::test_provider_continuation_after_local_tool_survives_source_recovery[code-image_only]",
+        "tests/runtime/test_provider_continuation_source_recovery.py::test_provider_continuation_after_local_tool_survives_source_recovery[search-without-replay-libos_default]",
+        "tests/runtime/test_provider_continuation_source_recovery.py::test_provider_continuation_after_local_tool_survives_source_recovery[search-without-replay-image_only]",
+        "tests/runtime/test_provider_continuation_source_recovery.py::test_settled_continuation_does_not_require_retired_profile_on_reopen[consumed]",
+        "tests/runtime/test_provider_continuation_source_recovery.py::test_settled_continuation_does_not_require_retired_profile_on_reopen[obsolete-generation]",
+        "tests/security/test_provider_continuation_source_authority.py::test_provider_continuation_recovery_cannot_restore_revoked_or_changed_source[revoke-before]",
+        "tests/security/test_provider_continuation_source_authority.py::test_provider_continuation_recovery_cannot_restore_revoked_or_changed_source[revoke-after]",
+        "tests/security/test_provider_continuation_source_authority.py::test_provider_continuation_recovery_cannot_restore_revoked_or_changed_source[source-version]",
+        "tests/security/test_provider_continuation_source_authority.py::test_provider_continuation_recovery_cannot_restore_revoked_or_changed_source[source-deleted]",
+        "tests/security/test_provider_continuation_source_authority.py::test_provider_continuation_recovery_validates_retained_bindings_before_read_retention[source-call]",
+        "tests/security/test_provider_continuation_source_authority.py::test_provider_continuation_recovery_validates_retained_bindings_before_read_retention[payload]",
+        "tests/security/test_provider_continuation_source_authority.py::test_provider_continuation_recovery_validates_retained_bindings_before_read_retention[profile]",
+        "tests/runtime/test_task_run_provider_continuation.py::test_hosted_result_commits_one_idempotent_completed_safe_point",
+        "tests/runtime/test_task_run_provider_continuation.py::test_hosted_continuation_survives_reopen_and_is_consumed_by_local_action",
+        "tests/runtime/test_task_run_provider_continuation.py::test_continuation_does_not_replace_or_repeat_pending_hosted_work",
+        "tests/runtime/test_task_run_provider_continuation.py::test_continuation_successor_cannot_reenable_hosted_tools",
+        "tests/runtime/test_task_run_provider_continuation.py::test_activity_only_result_and_pause_cancel_remain_durable",
+        "tests/runtime/test_task_run_provider_continuation.py::test_continuation_rejects_source_call_change_before_dispatch",
+        "tests/runtime/test_task_run_provider_continuation.py::test_continuation_startup_prevalidation_uses_only_persisted_bindings",
+        "tests/runtime/test_task_run_provider_continuation.py::test_continuation_manifest_is_separate_from_strict_action_manifest",
+        "tests/runtime/test_task_run_provider_continuation.py::test_runtime_task_run_continues_hosted_result_with_one_tools_disabled_call[False]",
+        "tests/runtime/test_task_run_provider_continuation.py::test_runtime_task_run_continues_hosted_result_with_one_tools_disabled_call[True]",
+        "tests/runtime/test_provider_tools_executor.py::test_content_free_continuation_after_reopen_fails_closed_without_reexecuting_code",
+        "tests/runtime/test_provider_tools_executor.py::test_successful_hosted_result_without_continuation_marker_blocks_repeated_dispatch[content-free-same-runtime]",
+        "tests/runtime/test_provider_tools_executor.py::test_successful_hosted_result_without_continuation_marker_blocks_repeated_dispatch[content-free-reopen]",
+        "tests/runtime/test_provider_tools_executor.py::test_successful_hosted_result_without_continuation_marker_blocks_repeated_dispatch[full-io-same-runtime]",
+        "tests/runtime/test_provider_tools_executor.py::test_successful_hosted_result_without_continuation_marker_blocks_repeated_dispatch[full-io-reopen]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_rebinds_pending_local_provider_result_without_repeating_hosted_work[restore-search-libos_default]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_rebinds_pending_local_provider_result_without_repeating_hosted_work[restore-search-image_only]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_rebinds_pending_local_provider_result_without_repeating_hosted_work[fork-search-libos_default]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_rebinds_pending_local_provider_result_without_repeating_hosted_work[fork-search-image_only]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_predating_hosted_result_does_not_restore_later_marker[restore]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_predating_hosted_result_does_not_restore_later_marker[fork]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_continuation_corruption_fails_before_publication[marker_sha256]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_continuation_corruption_fails_before_publication[source_sha256]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_continuation_corruption_fails_before_publication[source_pid]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_checkpoint_continuation_corruption_fails_before_publication[payload_sha256]",
+        "tests/self_evolution/test_checkpoint_provider_continuation.py::test_rebound_fork_continuation_retains_local_source_after_reopen",
+        "tests/runtime/test_provider_continuation_compaction.py::test_certified_compaction_preserves_pending_result_and_local_only_next_call[code-libos_default]",
+        "tests/runtime/test_provider_continuation_compaction.py::test_certified_compaction_preserves_pending_result_and_local_only_next_call[code-image_only]",
+        "tests/runtime/test_provider_continuation_compaction.py::test_certified_compaction_preserves_pending_result_and_local_only_next_call[search-libos_default]",
+        "tests/runtime/test_provider_continuation_compaction.py::test_certified_compaction_preserves_pending_result_and_local_only_next_call[search-image_only]",
+        "tests/runtime/test_provider_continuation_compaction.py::test_unretained_pending_result_refuses_compaction_without_changing_generation",
+        "tests/runtime/test_provider_continuation_compaction.py::test_pending_task_run_refuses_compaction_without_changing_safe_point",
+        "tests/runtime/test_provider_continuation_compaction.py::test_compaction_certificate_failure_rolls_back_generation_payload_and_marker",
+        "tests/runtime/test_provider_continuation_compaction.py::test_host_context_append_preserves_pending_result_and_exact_source[code-retained]",
+        "tests/runtime/test_provider_continuation_compaction.py::test_host_context_append_preserves_pending_result_and_exact_source[code-volatile]",
+        "tests/runtime/test_provider_continuation_compaction.py::test_host_context_append_preserves_pending_result_and_exact_source[search-retained]",
+        "tests/runtime/test_provider_continuation_compaction.py::test_host_context_append_preserves_pending_result_and_exact_source[search-volatile]",
+        "tests/runtime/test_provider_continuation_compaction.py::test_pending_result_rejects_changed_source_before_context_transition[version-compaction]",
+        "tests/runtime/test_provider_continuation_compaction.py::test_pending_result_rejects_changed_source_before_context_transition[version-append]",
+        "tests/runtime/test_provider_continuation_compaction.py::test_pending_result_rejects_changed_source_before_context_transition[read_denied-compaction]",
+        "tests/runtime/test_provider_continuation_compaction.py::test_pending_result_rejects_changed_source_before_context_transition[read_denied-append]",
+        "tests/runtime/test_provider_continuation_exec.py::test_host_exec_preserves_pending_search_result_in_fresh_local_only_request[libos_default]",
+        "tests/runtime/test_provider_continuation_exec.py::test_host_exec_preserves_pending_search_result_in_fresh_local_only_request[image_only]"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "llm-provider-continuation-evidence-is-a-retention-dependency",
+      "title": "Pending hosted success and continuation evidence survive retention and stale-page races until consumed or invalidated by a context generation change, while checkpoint and active fork references remain protected.",
+      "lane": "security",
+      "node_ids": [
+        "tests/security/test_provider_continuation_retention.py::test_pending_continuation_source_and_marker_survive_retention_and_repairs",
+        "tests/security/test_provider_continuation_retention.py::test_consumed_continuation_releases_both_retained_payloads",
+        "tests/security/test_provider_continuation_retention.py::test_restoring_checkpoint_predating_continuation_releases_discarded_payloads",
+        "tests/security/test_provider_continuation_retention.py::test_fork_reference_survives_original_generation_change_until_fork_is_obsolete",
+        "tests/security/test_provider_continuation_retention.py::test_unknown_fork_marker_generation_preserves_remaining_evidence[None]",
+        "tests/security/test_provider_continuation_retention.py::test_checkpoint_references_keep_consumed_source_and_marker_payloads",
+        "tests/security/test_provider_continuation_retention.py::test_checkpoint_body_mentions_do_not_become_continuation_references",
+        "tests/security/test_provider_continuation_retention.py::test_fork_pending_marker_protects_source_in_original_pid_until_consumption",
+        "tests/security/test_provider_continuation_retention.py::test_postgres_translates_only_fixed_continuation_reference_paths",
+        "tests/security/test_provider_continuation_retention.py::test_retention_cannot_erase_hosted_success_before_continuation_is_committed",
+        "tests/security/test_provider_continuation_retention.py::test_content_free_continuation_still_protects_its_integrity_bound_envelopes",
+        "tests/security/test_provider_continuation_retention.py::test_retention_rechecks_new_pending_reference_after_page_selection",
+        "tests/security/test_provider_continuation_retention.py::test_malformed_continuation_marker_preserves_remaining_evidence",
+        "tests/security/test_provider_continuation_retention.py::test_task_run_continuation_source_survives_without_executor_marker"
       ],
       "benchmark_attack_classes": []
     },
@@ -3642,6 +3792,10 @@
         "tests/runtime/test_llm_usage_reservations.py::test_inconsistent_provider_usage_charges_maximum_before_tool_dispatch[6]",
         "tests/runtime/test_llm_usage_reservations.py::test_inconsistent_provider_usage_charges_maximum_before_tool_dispatch[8]",
         "tests/runtime/test_llm_usage_reservations.py::test_malformed_usage_is_not_treated_as_compatible_missing_usage",
+        "tests/runtime/test_llm_reasoning_usage.py::test_reasoning_usage_is_persisted_as_output_subset_without_extra_charge[0-True-responses]",
+        "tests/runtime/test_llm_reasoning_usage.py::test_reasoning_usage_is_persisted_as_output_subset_without_extra_charge[2-True-responses]",
+        "tests/runtime/test_llm_reasoning_usage.py::test_reasoning_usage_is_persisted_as_output_subset_without_extra_charge[2-False-chat]",
+        "tests/runtime/test_llm_reasoning_usage.py::test_reasoning_usage_is_persisted_as_output_subset_without_extra_charge[3-True-responses]",
         "tests/runtime/test_resource_budgets.py::TestResourceBudgets::test_failed_llm_provider_call_consumes_call_budget_and_persists_sanitized_error_record"
       ],
       "benchmark_attack_classes": []
@@ -3657,6 +3811,108 @@
         "tests/unit/test_llm_client.py::TestLLMClient::test_provider_trace_cap_matches_durable_serializer",
         "tests/runtime/test_llm_usage_reservations.py::test_llm_reservation_is_active_before_provider_and_settles_exactly",
         "tests/runtime/test_llm_context_memory.py::TestLLMContextMemory::test_llm_call_records_persist_full_io_by_default"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "llm-responses-replay-is-private-scoped-and-lossless",
+      "title": "Responses replay preserves ordered native turns in bounded private storage, excludes public and semantic projections, and rejects invalid protocol or retained state.",
+      "lane": "unit",
+      "node_ids": [
+        "tests/runtime/test_hosted_replay_release_recovery.py::test_hosted_replay_release_reopens_and_dispatches_frozen_input_once[openai]",
+        "tests/runtime/test_hosted_replay_release_recovery.py::test_hosted_replay_release_reopens_and_dispatches_frozen_input_once[aliyun]",
+        "tests/runtime/test_hosted_replay_release_recovery.py::test_taskrun_hosted_release_preflight_validates_persisted_provider_binding[openai]",
+        "tests/runtime/test_hosted_replay_release_recovery.py::test_taskrun_hosted_release_preflight_validates_persisted_provider_binding[aliyun]",
+        "tests/unit/test_llm_replay.py::test_host_wait_settles_at_turn_limit_without_admitting_another_provider_call",
+        "tests/unit/test_llm_replay.py::test_host_wait_pairing_cannot_hide_another_provider_turn",
+        "tests/runtime/test_responses_replay_executor.py::test_auto_wait_preserves_consumed_followup_at_replay_turn_limit[queued]",
+        "tests/runtime/test_responses_replay_executor.py::test_auto_wait_preserves_consumed_followup_at_replay_turn_limit[waiting]",
+        "tests/runtime/test_responses_replay_executor.py::test_auto_wait_preserves_consumed_followup_at_replay_turn_limit[reopened_wait]",
+        "tests/unit/test_llm_replay_privacy.py::test_generic_serializer_excludes_nested_explicit_private_dataclass_fields",
+        "tests/unit/test_llm_replay_privacy.py::test_completion_private_replay_is_excluded_from_generic_serialization",
+        "tests/unit/test_llm_replay_privacy.py::test_private_replay_does_not_enter_protected_result_identity_or_text",
+        "tests/unit/test_llm_replay_privacy.py::test_observability_never_previews_ciphertext_keys[encrypted_content]",
+        "tests/unit/test_responses_replay_client.py::test_replay_keeps_exact_order_ids_phase_and_parallel_tool_results",
+        "tests/unit/test_responses_replay_client.py::test_sdk_function_calls_roundtrip_through_native_tool_loop[dict]",
+        "tests/unit/test_responses_replay_client.py::test_sdk_function_calls_roundtrip_through_native_tool_loop[sdk]",
+        "tests/unit/test_responses_replay_client.py::test_function_call_replay_does_not_drop_unsupported_metadata[sdk-metadata0]",
+        "tests/unit/test_responses_replay_client.py::test_function_call_replay_does_not_drop_unsupported_metadata[sdk-metadata2]",
+        "tests/unit/test_responses_replay_client.py::test_input_replay_rejects_orphan_duplicate_or_unfinished_tool_groups[items0]",
+        "tests/unit/test_responses_replay_client.py::test_opaque_replay_bounds_fail_without_copying_secret_to_error",
+        "tests/unit/test_responses_replay_client.py::test_replay_protocol_error_never_drops_state_or_falls_back[reasoning is unsupported]",
+        "tests/unit/test_responses_replay_client.py::test_replay_protocol_error_never_drops_state_or_falls_back[Responses endpoint not found]",
+        "tests/unit/test_llm_replay_storage.py::test_replay_is_private_persistent_and_exact_insert_retry_is_idempotent",
+        "tests/unit/test_llm_replay_storage.py::test_replay_heads_compare_and_swap_and_reject_cross_process_or_missing_turn",
+        "tests/unit/test_llm_replay_storage.py::test_replay_body_cannot_be_replaced_corrupted_or_resurrected_after_purge",
+        "tests/unit/test_llm_replay_storage.py::test_replay_revalidates_mutable_payload_and_enforces_host_retention_limit",
+        "tests/unit/test_llm_replay_storage.py::test_task_run_purge_erases_private_replay_and_other_runs_survive",
+        "tests/unit/test_snapshot_types.py::test_pure_snapshot_remapping_cannot_rebind_private_replay_authority",
+        "tests/self_evolution/test_checkpoint_responses_replay.py::test_checkpoint_restore_refuses_purged_or_missing_replay_before_effects[purged]",
+        "tests/self_evolution/test_checkpoint_responses_replay.py::test_checkpoint_restore_refuses_changed_provider_scope_before_effects",
+        "tests/self_evolution/test_checkpoint_responses_replay.py::test_checkpoint_replay_rechecks_source_read_authority_for_restore_and_fork",
+        "tests/self_evolution/test_checkpoint_responses_replay.py::test_checkpoint_fork_rebinds_replay_and_image_commit_excludes_it",
+        "tests/self_evolution/test_checkpoint_responses_replay.py::test_checkpoint_refuses_incomplete_private_replay_group",
+        "tests/self_evolution/test_checkpoint_responses_replay.py::test_checkpoint_replay_rebind_rolls_back_with_failed_restore_evidence",
+        "tests/self_evolution/test_checkpoint_responses_replay.py::test_payload_retention_disabled_does_not_capture_private_replay",
+        "tests/runtime/test_responses_replay_executor.py::test_runtime_replays_reasoning_and_tool_result_once_without_public_ciphertext[libos_default]",
+        "tests/runtime/test_responses_replay_executor.py::test_runtime_replays_reasoning_and_tool_result_once_without_public_ciphertext[image_only]",
+        "tests/runtime/test_responses_replay_executor.py::test_runtime_reopens_private_reasoning_without_repeating_provider_or_tool",
+        "tests/runtime/test_responses_replay_lifecycle.py::test_context_object_refresh_preserves_replay_across_quanta[legacy_v1]",
+        "tests/runtime/test_responses_replay_lifecycle.py::test_context_object_refresh_preserves_replay_across_quanta[cache_optimized_v2]",
+        "tests/runtime/test_responses_replay_lifecycle.py::test_exec_starts_replay_with_current_image_and_goal[same-image-image_only]",
+        "tests/runtime/test_responses_replay_lifecycle.py::test_exec_starts_replay_with_current_image_and_goal[different-image-libos_default]",
+        "tests/runtime/test_responses_replay_lifecycle.py::test_failed_exec_keeps_replay_head_and_context_generation",
+        "tests/runtime/test_responses_replay_lifecycle.py::test_model_exec_settles_old_tool_output_and_starts_new_replay",
+        "tests/runtime/test_responses_replay_lifecycle.py::test_taskrun_exec_reopens_without_changing_durable_context_generation",
+        "tests/runtime/test_responses_replay_lifecycle.py::test_repeated_exec_before_next_call_uses_the_latest_goal",
+        "tests/runtime/test_responses_replay_lifecycle.py::test_non_replay_pending_wait_reopens_after_profile_removal",
+        "tests/security/test_replay_lifecycle_authority.py::test_context_refresh_cannot_bypass_prior_source_integrity_or_read_authority[version]",
+        "tests/security/test_replay_lifecycle_authority.py::test_context_refresh_cannot_bypass_prior_source_integrity_or_read_authority[hash]",
+        "tests/security/test_replay_lifecycle_authority.py::test_context_refresh_cannot_bypass_prior_source_integrity_or_read_authority[read-denied]",
+        "tests/security/test_replay_lifecycle_authority.py::test_context_refresh_preserves_other_mutable_source_checks",
+        "tests/security/test_replay_lifecycle_authority.py::test_context_update_rolls_back_with_private_head_publication",
+        "tests/security/test_replay_lifecycle_authority.py::test_missing_exec_receipt_cannot_discard_pending_tool_output",
+        "tests/security/test_replay_lifecycle_authority.py::test_exec_receipt_does_not_excuse_missing_later_replay",
+        "tests/security/test_replay_lifecycle_authority.py::test_actual_replay_still_requires_its_profile_at_startup",
+        "tests/runtime/test_responses_replay_executor.py::test_first_image_only_replay_seeds_legacy_tool_history_once[live]",
+        "tests/runtime/test_responses_replay_executor.py::test_first_image_only_replay_seeds_legacy_tool_history_once[reopen]",
+        "tests/runtime/test_responses_replay_executor.py::test_first_image_only_replay_rejects_incomplete_legacy_tool_history",
+        "tests/security/test_image_only_transcript.py::test_historical_sensitive_tool_output_denies_next_image_only_egress[first-native-replay]",
+        "tests/runtime/test_responses_replay_executor.py::test_runtime_replay_refuses_changed_provider_before_network",
+        "tests/runtime/test_responses_replay_executor.py::test_runtime_replay_repairs_invalid_action_without_orphan_tool_items",
+        "tests/runtime/test_responses_replay_compaction.py::test_certified_compaction_replaces_whole_replay_with_one_current_summary[legacy_v1-libos_default]",
+        "tests/runtime/test_responses_replay_compaction.py::test_certified_compaction_replaces_whole_replay_with_one_current_summary[cache_optimized_v2-image_only]",
+        "tests/runtime/test_responses_replay_compaction.py::test_arbitrary_generation_change_cannot_discard_private_replay",
+        "tests/runtime/test_responses_replay_compaction.py::test_compaction_rejects_pending_group_without_changing_private_head[True]",
+        "tests/runtime/test_responses_replay_compaction.py::test_compaction_rolls_back_private_head_when_request_source_validation_fails",
+        "tests/runtime/test_responses_replay_compaction.py::test_compaction_requires_current_read_authority_before_replacing_context_source",
+        "tests/runtime/test_responses_replay_compaction.py::test_compaction_certificate_must_cover_exact_old_and_current_context_versions[source_version]",
+        "tests/runtime/test_responses_replay_model_compaction.py::test_model_selected_compaction_resumes_private_replay_after_child_settles",
+        "tests/security/test_replay_source_authority.py::test_private_replay_requires_current_object_read_authority",
+        "tests/security/test_replay_source_authority.py::test_private_replay_requires_current_file_source_read_authority",
+        "tests/security/test_replay_source_authority.py::test_private_replay_rejects_changed_file_binding[version]",
+        "tests/security/test_replay_source_authority.py::test_private_replay_recovery_exception_does_not_accept_explicit_source_deletion",
+        "tests/security/test_replay_source_authority.py::test_startup_private_replay_retains_only_existing_read_authority[active-read-only]",
+        "tests/security/test_replay_source_authority.py::test_startup_private_replay_retains_only_existing_read_authority[user-revoked]",
+        "tests/security/test_replay_source_authority.py::test_startup_does_not_retain_replay_source_authority_when_full_io_is_disabled",
+        "tests/security/test_replay_source_authority.py::test_private_replay_recovery_decodes_history_once_across_object_pages",
+        "tests/security/test_replay_source_authority.py::test_private_replay_recovery_never_invents_delegation_ancestor_authority[False]",
+        "tests/security/test_replay_source_authority.py::test_startup_retains_valid_read_grants_across_capability_pages"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "llm-auto-provider-policy-is-host-scoped-and-cache-defaults-stay-gated",
+      "title": "Host profile snapshots scope automatic OpenAI behavior and cache privacy domains while preserving explicit settings, semantic classifier isolation, and legacy release defaults.",
+      "lane": "unit",
+      "node_ids": [
+        "tests/unit/test_llm_provider_policy.py::test_official_unset_model_uses_astra_defaults[None]",
+        "tests/unit/test_llm_provider_policy.py::test_custom_endpoint_has_no_implicit_openai_policy[gpt-6-astra]",
+        "tests/unit/test_llm_provider_policy.py::test_auto_candidate_is_endpoint_scoped_and_keeps_explicit_legacy_retention",
+        "tests/unit/test_llm_provider_policy.py::test_profile_and_environment_precedence_is_frozen_without_sdk_construction",
+        "tests/unit/test_llm_provider_policy.py::test_auto_cache_domains_are_private_profile_scoped_and_stable",
+        "tests/unit/test_llm_provider_policy.py::test_semantic_classifier_isolated_from_auto_cache_and_replay_defaults",
+        "tests/unit/test_responses_replay_client.py::test_candidate_replay_cache_marks_only_stable_host_prefix"
       ],
       "benchmark_attack_classes": []
     },
@@ -4174,6 +4430,17 @@
       "title": "Runtime-mediated payload egress is bound to trusted source labels, Host Sink clearance, ordinary authority, and exact one-shot release.",
       "lane": "security",
       "node_ids": [
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-read_text]",
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-read_directory]",
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-write_text]",
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-write_directory]",
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-read_then_delete]",
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-write_text_source]",
+        "tests/security/test_reopen_digest_data_flow.py::test_reopen_digest_enforces_historical_metadata_labels[denied-write_directory_source]",
+        "tests/security/test_reopen_digest_data_flow.py::test_shell_event_retains_explicit_source_labels_after_reopen",
+        "tests/security/test_reopen_digest_data_flow.py::test_digest_rejects_incomplete_trusted_labels",
+        "tests/security/test_reopen_digest_data_flow.py::test_directory_state_event_keeps_labels_when_binding_is_deleted",
+        "tests/security/test_reopen_digest_data_flow.py::test_digest_ignores_labels_of_events_without_rendered_activity[True-payload2]",
         "tests/unit/test_data_flow_models.py::test_authority_data_flow_schema_versions_reject_non_integer_aliases[True]",
         "tests/unit/test_data_flow_models.py::test_authority_data_flow_schema_versions_reject_non_integer_aliases[1.0]",
         "tests/unit/test_data_flow_models.py::test_authority_data_flow_schema_versions_reject_non_integer_aliases[1]",
@@ -5425,6 +5692,86 @@
       "lane": "runtime",
       "node_ids": [
         "tests/runtime/test_runtime_infra_release_repairs.py::test_rating_update_and_audit_failure_share_one_transaction"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "working-set-feedback-window-is-a-prompt-projection",
+      "title": "Older or superseded working_set feedback renders as content-free stubs while Human input stays verbatim and durable Objects are unchanged.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_long_horizon_working_set.py::test_working_set_supersedes_repeated_observations_and_stubs_older_feedback",
+        "tests/runtime/test_long_horizon_working_set.py::test_working_set_stubs_apply_only_to_that_policy_and_keep_stable_prefix",
+        "tests/runtime/test_long_horizon_working_set.py::test_supersession_keys_cover_observations_but_never_actions_or_failures",
+        "tests/runtime/test_long_horizon_working_set.py::test_feedback_stub_summary_describes_without_copying_content",
+        "tests/runtime/test_long_horizon_working_set.py::test_discovery_supersession_keys_follow_the_surfaced_skills",
+        "tests/runtime/test_long_horizon_working_set.py::test_working_set_keeps_independent_memory_selections[subtrees]",
+        "tests/runtime/test_long_horizon_working_set.py::test_working_set_keeps_independent_memory_selections[byte-pages]",
+        "tests/runtime/test_long_horizon_working_set.py::test_working_set_keeps_capability_pages_and_supersedes_identical_repeats",
+        "tests/unit/test_prompt_omitted_object_guidance.py::test_superseded_only_omissions_do_not_ask_for_re_observation",
+        "tests/unit/test_prompt_projection_compaction.py::test_v2_compaction_strips_object_ids_from_feedback_stubs"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "source-materialization-stays-within-admission-headroom",
+      "title": "The per-quantum materialization budget never exceeds the process window or the resolved per-call input headroom.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_long_horizon_working_set.py::test_materialization_budget_follows_per_call_admission_headroom",
+        "tests/runtime/test_long_horizon_working_set.py::test_materialization_budget_never_exceeds_the_process_window"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "unexecuted-batch-calls-are-reported-not-assumed",
+      "title": "Calls of a multi-call response that never ran are reported to the model as an event, and queued normal input is noticed before tool selection without copying its body.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_long_horizon_working_set.py::test_truncated_batch_reports_unexecuted_calls_to_the_model",
+        "tests/runtime/test_long_horizon_working_set.py::test_queued_normal_message_directive_appears_before_first_tool_selection"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "container-argument-repair-is-schema-guided",
+      "title": "A JSON-encoded container argument is decoded only when every schema variant forbids strings, and the repair is audited.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_long_horizon_working_set.py::test_json_string_container_arguments_are_decoded_only_when_schema_forbids_strings"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "schema-accepted-tool-strings-remain-literal",
+      "title": "Tool argument normalization preserves schema-accepted strings, including null and None spellings in nullable fields and direct JSON memory values; only unambiguous non-string repairs are allowed.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_long_horizon_working_set.py::test_schema_accepted_strings_remain_literal_memory_values[null]",
+        "tests/runtime/test_long_horizon_working_set.py::test_schema_accepted_strings_remain_literal_memory_values[None]"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "tool-failures-expose-identifier-codes-not-text",
+      "title": "Model-facing tool failures carry only identifier-shaped diagnostic codes from the tool boundary while exception text stays hashed.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_tool_failure_public_details.py::test_public_identifier_details_keep_codes_and_drop_text",
+        "tests/runtime/test_tool_failure_public_details.py::test_git_diff_scope_failure_tells_the_model_why"
+      ],
+      "benchmark_attack_classes": []
+    },
+    {
+      "id": "reopen-digest-is-payload-free",
+      "title": "After a reopen released earlier tool results, the prompt digest of prior activity is rebuilt from durable pre-shutdown events and carries paths, argv, identifiers, and counts only.",
+      "lane": "runtime",
+      "node_ids": [
+        "tests/runtime/test_reopen_activity_digest.py::test_collection_pages_backwards_and_keeps_only_pre_shutdown_process_events",
+        "tests/runtime/test_reopen_activity_digest.py::test_rendering_is_bounded_and_payload_free",
+        "tests/runtime/test_reopen_activity_digest.py::test_prompt_after_reopen_names_earlier_reads_writes_and_commands",
+        "tests/runtime/test_reopen_activity_digest.py::test_filesystem_digest_ignores_unknown_mutations_and_noop_deletions",
+        "tests/runtime/test_reopen_activity_digest.py::test_prompt_without_lost_results_has_no_digest"
       ],
       "benchmark_attack_classes": []
     }

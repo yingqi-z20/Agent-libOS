@@ -45,6 +45,7 @@ from agent_libos.evidence.payload_retention import (
     PayloadRetentionTier,
     llm_call_payload_retention_tier,
 )
+from agent_libos.llm.provider_trace import project_provider_tools, provider_tools_summary
 from agent_libos.llm.user_profiles import (
     UserLLMProfileStore,
     default_user_llm_profiles_path,
@@ -189,10 +190,11 @@ _GUI_LLM_CONTENT_FIELDS = frozenset(
         "attempt_reasoning",
         "attempt_output",
         "attempt_tool_calls",
+        "attempt_provider_tools",
     }
 )
 _GUI_LLM_ATTEMPT_FIELDS = frozenset(
-    {"attempt_reasoning", "attempt_output", "attempt_tool_calls"}
+    {"attempt_reasoning", "attempt_output", "attempt_tool_calls", "attempt_provider_tools"}
 )
 _GUI_LLM_REASONING_AVAILABILITY = frozenset(
     {"returned", "not_returned", "not_persisted", "purged", "limited"}
@@ -1598,6 +1600,11 @@ def _gui_llm_normalize_trace_attempt(
     api = _gui_llm_optional_text(raw.get("api"), limit=64) or record.api
     status = raw.get("status") if raw.get("status") in {"ok", "error"} else "error"
     kind = _gui_llm_optional_text(raw.get("kind"), limit=64) or "initial"
+    provider_tools = (
+        project_provider_tools(raw.get("provider_tools"))
+        if tier is PayloadRetentionTier.FULL
+        else None
+    )
     return {
         "sequence": int(sequence),
         "kind": kind,
@@ -1619,6 +1626,11 @@ def _gui_llm_normalize_trace_attempt(
         "_reasoning_text": reasoning_text,
         "_output_text": output_text,
         "_tool_calls": attempt_tool_calls,
+        "_provider_tools": provider_tools,
+        **(
+            {"provider_tools": provider_tools_summary(provider_tools)}
+            if provider_tools is not None else {}
+        ),
     }
 
 
@@ -1674,6 +1686,7 @@ def _gui_llm_legacy_attempt(
         "_reasoning_text": reasoning_text,
         "_output_text": output_text,
         "_tool_calls": tool_calls,
+        "_provider_tools": None,
     }
 
 
@@ -1870,6 +1883,46 @@ def _gui_llm_bound_content(content: _GuiLlmContent) -> _GuiLlmContent:
     )
 
 
+def _gui_llm_provider_tools_content(attempt: dict[str, Any]) -> _GuiLlmContent:
+    provider_tools = attempt.get("_provider_tools")
+    serialized = (
+        _gui_llm_json_text(_gui_llm_redacted_projection(provider_tools))
+        if provider_tools is not None else None
+    )
+    return _gui_llm_bound_content(
+        _GuiLlmContent(
+            availability=(
+                "limited" if provider_tools is not None and provider_tools.get("limited")
+                else "available" if serialized is not None
+                else "not_returned"
+            ),
+            content_type="json",
+            text=serialized,
+        )
+    )
+
+
+def _gui_llm_structured_attempt_content(
+    attempt: dict[str, Any], *, field: str, tier: PayloadRetentionTier,
+) -> _GuiLlmContent:
+    if field == "attempt_provider_tools":
+        return _gui_llm_provider_tools_content(attempt)
+    serialized = (
+        _gui_llm_json_text(attempt["_tool_calls"])
+        if attempt["_tool_calls"] is not None else None
+    )
+    return _gui_llm_bound_content(
+        _GuiLlmContent(
+            availability=(
+                "available" if serialized is not None
+                else _gui_llm_retention_availability(tier)
+            ),
+            content_type="json",
+            text=serialized,
+        )
+    )
+
+
 def _gui_llm_call_content(
     record: LLMCallRecord,
     trace: dict[str, Any],
@@ -1890,7 +1943,7 @@ def _gui_llm_call_content(
         if attempt is None:
             return _GuiLlmContent(
                 availability=_gui_llm_retention_availability(tier),
-                content_type="json" if field == "attempt_tool_calls" else "text",
+                content_type="json" if field in {"attempt_tool_calls", "attempt_provider_tools"} else "text",
                 text=None,
             )
         if field == "attempt_reasoning":
@@ -1917,22 +1970,7 @@ def _gui_llm_call_content(
                     text=attempt["_output_text"],
                 )
             )
-        serialized = (
-            _gui_llm_json_text(attempt["_tool_calls"])
-            if attempt["_tool_calls"] is not None
-            else None
-        )
-        return _gui_llm_bound_content(
-            _GuiLlmContent(
-                availability=(
-                    "available"
-                    if serialized is not None
-                    else _gui_llm_retention_availability(tier)
-                ),
-                content_type="json",
-                text=serialized,
-            )
-        )
+        return _gui_llm_structured_attempt_content(attempt, field=field, tier=tier)
 
     if field == "request_options":
         value = _gui_llm_redacted_projection(record.request_options)
@@ -2767,6 +2805,7 @@ class GuiRuntimeService:
                 "attempt_reasoning",
                 "attempt_output",
                 "attempt_tool_calls",
+                "attempt_provider_tools",
             ):
                 content = _gui_llm_call_content(
                     record,

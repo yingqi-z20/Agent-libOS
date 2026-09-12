@@ -207,7 +207,8 @@ and unregister from changing the registry.
 Provider/Sink identity components. Changing only those values therefore does
 not invalidate an otherwise identical trusted LLM Sink rule.
 Conversely, changing an identity-bound effective provider policy such as
-`prompt_cache_mode`, `prompt_cache_ttl`, or `fallback_json_actions` changes the
+`reasoning_context`, `responses_replay`, `prompt_layout`, `prompt_cache_mode`,
+`prompt_cache_ttl`, or `fallback_json_actions` changes the
 profile identity hash, so a trusted Sink rule bound to the old
 `identity_sha256` no longer matches.
 
@@ -517,7 +518,7 @@ incrementally by local Host DLP; hits persist only closed category/reason/
 evidence-digest findings and monotonically stricter advisory sensitivity, not
 the matched text or a label writeback.
 
-Store schema v7 separately records a payload-free FlowGraph of root goals,
+Store schema v8 separately records a payload-free FlowGraph of root goals,
 Object/file versions, provider/Tool/model results, materializations, and their
 Process/provider/Tool/LLM/Object/file activities. `direct`, `indirect`, and
 `control` edges are append-only. Model assertions may only raise sensitivity

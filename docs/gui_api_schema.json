@@ -7,6 +7,8 @@
   "x-agent-libos-contract-scope": {
     "snapshot": "GET /api/snapshot",
     "llm_call_summary": "GET /api/snapshot and llm_call.appended SSE payloads",
+    "llm_provider_tools_summary": "Optional provider_tools in GET /api/processes/{pid}/llm-calls/{call_id} attempts; no query, code, citation URL, or file ID bodies",
+    "llm_provider_tools_content": "JSON decoded from the paged attempt_provider_tools content field; full-retention payload only",
     "task_run_summary": "GET /api/snapshot and task_run.updated SSE payloads",
     "task_run_detail": "GET /api/task-runs/{run_id}",
     "error_envelope": "JSON errors from /api routes",
@@ -417,6 +419,51 @@
         "interrupt_count": { "type": "integer", "minimum": 0 }
       },
       "additionalProperties": true
+    },
+    "llmProviderToolName": {
+      "enum": ["web_search", "web_extractor", "code_interpreter"]
+    },
+    "llmProviderToolsSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "configured", "effective", "observed", "activity_count", "citation_count", "artifact_count", "usage", "limited"],
+      "properties": {
+        "provider": { "enum": ["openai", "aliyun", null] },
+        "configured": { "type": "array", "maxItems": 3, "uniqueItems": true, "items": { "$ref": "#/$defs/llmProviderToolName" } },
+        "effective": { "type": "array", "maxItems": 3, "uniqueItems": true, "items": { "$ref": "#/$defs/llmProviderToolName" } },
+        "observed": { "enum": ["returned", "unknown", "not_returned"] },
+        "replay": { "enum": ["native", "stateless"] },
+        "file_count": { "type": "integer", "minimum": 0 },
+        "activity_count": { "type": "integer", "minimum": 0, "maximum": 256 },
+        "citation_count": { "type": "integer", "minimum": 0, "maximum": 256 },
+        "artifact_count": { "type": "integer", "minimum": 0, "maximum": 256 },
+        "usage": { "type": ["object", "null"] },
+        "limited": { "type": "boolean" }
+      }
+    },
+    "llmProviderToolsContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "configured", "effective", "observed", "activities", "citations", "artifacts", "usage", "limited"],
+      "properties": {
+        "provider": { "enum": ["openai", "aliyun", null] },
+        "configured": { "type": "array", "maxItems": 3, "uniqueItems": true, "items": { "$ref": "#/$defs/llmProviderToolName" } },
+        "effective": { "type": "array", "maxItems": 3, "uniqueItems": true, "items": { "$ref": "#/$defs/llmProviderToolName" } },
+        "observed": { "enum": ["returned", "unknown", "not_returned"] },
+        "replay": { "enum": ["native", "stateless"] },
+        "file_count": { "type": "integer", "minimum": 0 },
+        "activities": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/jsonObject" } },
+        "citations": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/jsonObject" } },
+        "artifacts": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/jsonObject" } },
+        "activities_limited": { "$ref": "#/$defs/jsonObject" },
+        "citations_limited": { "$ref": "#/$defs/jsonObject" },
+        "artifacts_limited": { "$ref": "#/$defs/jsonObject" },
+        "usage": { "type": ["object", "null"] },
+        "limited": { "type": "boolean" }
+      }
+    },
+    "llmTraceContentField": {
+      "enum": ["messages", "tools", "request_options", "raw_response", "response_content", "attempt_reasoning", "attempt_output", "attempt_tool_calls", "attempt_provider_tools"]
     },
     "llmCallSummary": {
       "type": "object",

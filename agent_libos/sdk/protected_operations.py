@@ -363,6 +363,8 @@ _HOST_RESULT_IGNORED_FIELDS = {
         {
             "raw",
             "reasoning",
+            "response_items",
+            "responses_items",
             "provider_request_options",
             "compatibility_removed_options",
             "provider_trace",
@@ -3531,11 +3533,28 @@ class ProtectedOperation:
         self,
         evidence: ProtectedOperationEvidence,
     ) -> tuple[Event, AuditRecord]:
+        event_payload = dict(evidence.event_payload)
+        if self.sdk.data_flow is not None and evidence.event_type in {
+            EventType.EXTERNAL_READ, EventType.EXTERNAL_WRITE,
+        }:
+            # Durable metadata (including paths and argv) is also a data-flow
+            # source when replayed in a later prompt. Preserve the labels at
+            # observation time; current file bindings can later be deleted.
+            labels = [self.sdk.data_flow.current_context().labels]
+            for context in (
+                self.invocation.data_flow_context,
+                self.invocation.data_flow_ingress_context,
+            ):
+                if context is not None:
+                    labels.append(context.labels)
+            if "data_labels" in event_payload:
+                labels.append(DataLabels.from_dict(event_payload["data_labels"]))
+            event_payload["data_labels"] = DataLabels.aggregate(labels).to_dict()
         event = self.sdk.events.emit(
             evidence.event_type,
             source=evidence.event_source,
             target=evidence.event_target,
-            payload=dict(evidence.event_payload),
+            payload=event_payload,
             priority=evidence.event_priority,
             correlation_id=evidence.correlation_id,
             causality=(

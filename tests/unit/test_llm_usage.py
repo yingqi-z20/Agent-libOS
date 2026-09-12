@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from agent_libos.llm.usage import (
     LLM_USAGE_COUNTER_MAX,
     aggregate_cache_usage,
@@ -163,3 +165,115 @@ def test_usage_counters_reject_values_outside_finite_accounting_range() -> None:
 
     assert usage == {"prompt_tokens": LLM_USAGE_COUNTER_MAX}
     assert invalid == {"completion_tokens", "total_tokens"}
+
+
+@pytest.mark.parametrize(
+    ("api", "output_key", "detail_key", "other_detail_key"),
+    [
+        ("responses", "output_tokens", "output_tokens_details", "completion_tokens_details"),
+        ("chat", "completion_tokens", "completion_tokens_details", "output_tokens_details"),
+    ],
+)
+def test_reasoning_usage_prefers_formal_api_details_without_changing_billable_usage(
+    api: str, output_key: str, detail_key: str, other_detail_key: str,
+) -> None:
+    usage, invalid = canonicalize_llm_usage(
+        {
+            "input_tokens": 20,
+            output_key: 10,
+            "total_tokens": 30,
+            detail_key: {"reasoning_tokens": 6},
+            other_detail_key: {"reasoning_tokens": 7},
+            "reasoning_tokens": 8,
+        },
+        api=api,
+    )
+
+    assert invalid == set()
+    assert usage == {
+        "input_tokens": 20,
+        output_key: 10,
+        "total_tokens": 30,
+        "reasoning_tokens": 6,
+    }
+    assert canonicalize_llm_usage(usage, api=api) == (usage, set())
+
+
+@pytest.mark.parametrize("api", ["responses", "chat", None])
+def test_reasoning_usage_preserves_reported_zero_and_missing_counter(api: str | None) -> None:
+    assert canonicalize_llm_usage({"reasoning_tokens": 0}, api=api) == (
+        {"reasoning_tokens": 0}, set(),
+    )
+    assert canonicalize_llm_usage({"output_tokens": 0}, api=api) == (
+        {"output_tokens": 0}, set(),
+    )
+    assert canonicalize_llm_usage({"reasoning_tokens": None}, api=api) == ({}, set())
+
+
+@pytest.mark.parametrize(
+    ("formal", "expected", "invalid"),
+    [
+        (0, {"reasoning_tokens": 0}, set()),
+        (None, {}, set()),
+        (False, {}, {"reasoning_tokens"}),
+        (-1, {}, {"reasoning_tokens"}),
+        (1.0, {}, {"reasoning_tokens"}),
+        ("1", {}, {"reasoning_tokens"}),
+        (float("inf"), {}, {"reasoning_tokens"}),
+        (LLM_USAGE_COUNTER_MAX + 1, {}, {"reasoning_tokens"}),
+    ],
+)
+def test_formal_reasoning_counter_never_falls_back_to_alias(
+    formal: object, expected: dict[str, int], invalid: set[str],
+) -> None:
+    assert canonicalize_llm_usage(
+        {
+            "output_tokens_details": {"reasoning_tokens": formal},
+            "completion_tokens_details": {"reasoning_tokens": 2},
+            "reasoning_tokens": 3,
+        },
+        api="responses",
+    ) == (expected, invalid)
+
+
+@pytest.mark.parametrize("reasoning", [True, -1, 1.0, "1", LLM_USAGE_COUNTER_MAX + 1])
+def test_retained_reasoning_counter_is_validated_without_coercion(reasoning: object) -> None:
+    assert canonicalize_llm_usage({"reasoning_tokens": reasoning}) == (
+        {}, {"reasoning_tokens"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("api", "output_key", "detail_key"),
+    [
+        ("responses", "output_tokens", "output_tokens_details"),
+        ("chat", "completion_tokens", "completion_tokens_details"),
+    ],
+)
+def test_reasoning_counter_cannot_exceed_output_token_subset(
+    api: str, output_key: str, detail_key: str,
+) -> None:
+    usage, invalid = canonicalize_llm_usage(
+        {
+            output_key: 2,
+            "total_tokens": 7,
+            detail_key: {"reasoning_tokens": 3},
+        },
+        api=api,
+    )
+
+    assert usage == {output_key: 2, "total_tokens": 7}
+    assert invalid == {"reasoning_tokens"}
+
+
+def test_reasoning_counter_supports_compatible_details_and_safe_integer_boundary() -> None:
+    assert canonicalize_llm_usage(
+        {
+            "output_tokens": LLM_USAGE_COUNTER_MAX,
+            "completion_tokens_details": {"reasoning_tokens": LLM_USAGE_COUNTER_MAX},
+        },
+        api="responses",
+    ) == (
+        {"output_tokens": LLM_USAGE_COUNTER_MAX, "reasoning_tokens": LLM_USAGE_COUNTER_MAX},
+        set(),
+    )

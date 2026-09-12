@@ -143,11 +143,11 @@ you need an unambiguous diagnostic environment.
 
 ### Runtime reports an unsupported store version
 
-Ordinary startup accepts only RuntimeStore schema v7 and never migrates it
+Ordinary startup accepts only RuntimeStore schema v8 and never migrates it
 implicitly. Stop every Runtime using the database, make and verify an independent
 owner-only backup, then follow the exact offline migration sequence in
-[Storage](storage.md#offline-v6-to-v7-migration). A v5 store must migrate to v6
-before v7; v4 must migrate to v5 first. Older, malformed, and unversioned stores
+[Storage](storage.md#offline-v7-to-v8-migration). A v6 store must migrate to v7
+before v8; v5 must first migrate to v6, and v4 to v5. Older, malformed, and unversioned stores
 remain unsupported.
 
 Do not improvise DDL, edit the schema marker, or delete lease sidecars. Dry-run,

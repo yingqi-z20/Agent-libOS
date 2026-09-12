@@ -171,7 +171,7 @@ PY
 | `process.max_tool_calls` | `StrictInt` | `256` | — |
 | `process.max_child_processes` | `int` | `16` | — |
 | `process.max_runtime_seconds` | `float \| None` | `null` | seconds |
-| `process.max_context_materialization_tokens` | `int` | `65536` | tokens |
+| `process.max_context_materialization_tokens` | `int` | `262144` | tokens |
 | `process.max_context_materialization_total_tokens` | `int \| None` | `null` | tokens |
 | `process.max_llm_calls` | `int \| None` | `null` | — |
 | `process.max_llm_total_tokens` | `int \| None` | `null` | tokens |
@@ -194,6 +194,10 @@ PY
 | Path | Type | Default | Unit |
 | --- | --- | --- | --- |
 | `llm.default_profile_id` | `str` | `"default"` | — |
+| `llm.openai_model` | `str` | `"gpt-6-astra"` | — |
+| `llm.openai_reasoning_effort` | `str` | `"medium"` | — |
+| `llm.openai_reasoning_context` | `Literal['current_turn', 'all_turns']` | `"all_turns"` | — |
+| `llm.openai_prompt_cache_ttl` | `Literal['30m']` | `"30m"` | — |
 | `llm.profiles` | `dict[str, LLMProfile]` | `mapping with 1 default key(s): "default"` | — |
 | `llm.profiles.<key>.kind` | `Literal['openai_compatible']` | `"openai_compatible"` | — |
 | `llm.profiles.<key>.base_url` | `str \| None` | `null` | — |
@@ -204,12 +208,21 @@ PY
 | `llm.profiles.<key>.max_retries` | `int \| None` | `null` | — |
 | `llm.profiles.<key>.store` | `bool \| None` | `null` | — |
 | `llm.profiles.<key>.reasoning_effort` | `str \| None` | `null` | — |
+| `llm.profiles.<key>.reasoning_context` | `Literal['auto', 'current_turn', 'all_turns'] \| None` | `null` | — |
+| `llm.profiles.<key>.responses_replay` | `StrictBool \| None` | `null` | — |
+| `llm.profiles.<key>.provider_tools` | `ProviderToolsConfig \| None` | `null` | — |
+| `llm.profiles.<key>.provider_tools.provider` | `Literal['openai', 'aliyun']` | `required` | — |
+| `llm.profiles.<key>.provider_tools.web_search` | `StrictBool` | `false` | — |
+| `llm.profiles.<key>.provider_tools.web_extractor` | `StrictBool` | `false` | — |
+| `llm.profiles.<key>.provider_tools.code_interpreter` | `StrictBool` | `false` | — |
+| `llm.profiles.<key>.provider_tools.file_ids` | `tuple[str, ...]` | `[]` | — |
 | `llm.profiles.<key>.verbosity` | `Literal['low', 'medium', 'high'] \| None` | `null` | — |
 | `llm.profiles.<key>.safety_identifier` | `str \| None` | `null` | — |
 | `llm.profiles.<key>.safety_identifier_env` | `str \| None` | `null` | — |
 | `llm.profiles.<key>.prompt_cache_key` | `str \| None` | `null` | — |
+| `llm.profiles.<key>.prompt_layout` | `Literal['auto', 'legacy_v1', 'cache_optimized_v2'] \| None` | `null` | — |
 | `llm.profiles.<key>.prompt_cache_retention` | `Literal['in_memory', '24h'] \| None` | `null` | — |
-| `llm.profiles.<key>.prompt_cache_mode` | `Literal['provider_default', 'implicit', 'explicit'] \| None` | `null` | — |
+| `llm.profiles.<key>.prompt_cache_mode` | `Literal['auto', 'provider_default', 'implicit', 'explicit'] \| None` | `null` | — |
 | `llm.profiles.<key>.prompt_cache_ttl` | `Literal['30m'] \| None` | `null` | — |
 | `llm.profiles.<key>.responses_previous_response_id` | `bool \| None` | `null` | — |
 | `llm.profiles.<key>.parallel_tool_calls` | `bool \| None` | `null` | — |
@@ -221,20 +234,25 @@ PY
 | `llm.profiles.<key>.max_total_tokens_per_call` | `StrictInt \| None` | `null` | tokens |
 | `llm.profiles.<key>.context_window_tokens` | `int \| None` | `null` | tokens |
 | `llm.profiles.<key>.allow_custom_base_url` | `bool` | `false` | — |
+| `llm.profiles.<key>.logical_call_timeout_s` | `StrictFloat \| None` | `null` | seconds |
 | `llm.temperature` | `StrictFloat` | `0.2` | — |
 | `llm.max_tokens` | `StrictInt` | `16384` | tokens |
-| `llm.max_input_tokens_per_call` | `StrictInt` | `114688` | tokens |
-| `llm.max_total_tokens_per_call` | `StrictInt` | `131072` | tokens |
-| `llm.context_window_tokens` | `int` | `131072` | tokens |
+| `llm.max_input_tokens_per_call` | `StrictInt` | `245760` | tokens |
+| `llm.max_total_tokens_per_call` | `StrictInt` | `262144` | tokens |
+| `llm.context_window_tokens` | `int` | `262144` | tokens |
 | `llm.timeout_s` | `float` | `180.0` | seconds |
 | `llm.max_retries` | `int` | `2` | — |
 | `llm.api_mode` | `Literal['auto', 'responses', 'chat']` | `"auto"` | — |
 | `llm.store` | `bool` | `false` | — |
+| `llm.reasoning_context` | `Literal['auto', 'current_turn', 'all_turns']` | `"auto"` | — |
+| `llm.responses_replay` | `StrictBool \| None` | `null` | — |
 | `llm.safety_identifier` | `str \| None` | `null` | — |
-| `llm.prompt_layout` | `Literal['legacy_v1', 'cache_optimized_v2']` | `"legacy_v1"` | — |
+| `llm.responses_replay_max_bytes` | `StrictInt` | `8388608` | bytes |
+| `llm.responses_replay_max_turns` | `StrictInt` | `128` | — |
+| `llm.prompt_layout` | `Literal['auto', 'legacy_v1', 'cache_optimized_v2']` | `"legacy_v1"` | — |
 | `llm.prompt_cache_key` | `str \| None` | `null` | — |
 | `llm.prompt_cache_retention` | `Literal['in_memory', '24h'] \| None` | `null` | — |
-| `llm.prompt_cache_mode` | `Literal['provider_default', 'implicit', 'explicit']` | `"provider_default"` | — |
+| `llm.prompt_cache_mode` | `Literal['auto', 'provider_default', 'implicit', 'explicit']` | `"provider_default"` | — |
 | `llm.prompt_cache_ttl` | `Literal['30m'] \| None` | `null` | — |
 | `llm.responses_previous_response_id` | `bool` | `false` | — |
 | `llm.parallel_tool_calls` | `bool` | `false` | — |
@@ -251,6 +269,7 @@ PY
 | `llm.persist_full_io` | `bool` | `true` | — |
 | `llm.json_instruction` | `str` | `"You must respond with a valid JSON object."` | — |
 | `llm.fallback_status_codes` | `tuple[int, ...]` | `[404, 405]` | — |
+| `llm.logical_call_timeout_s` | `StrictFloat \| None` | `null` | seconds |
 
 ## `tools`
 
@@ -499,7 +518,7 @@ PY
 | Path | Type | Default | Unit |
 | --- | --- | --- | --- |
 | `memory.object_schema_version` | `str` | `"1"` | — |
-| `memory.materialize_budget_tokens` | `int` | `8000` | tokens |
+| `memory.materialize_budget_tokens` | `int` | `262144` | tokens |
 | `memory.query_limit` | `int` | `50` | — |
 | `memory.context_policy` | `str` | `"plan_first"` | — |
 | `memory.metadata_sensitivity` | `str` | `"normal"` | — |
@@ -511,6 +530,9 @@ PY
 | `memory.metadata_collection_max_items` | `StrictInt` | `128` | — |
 | `memory.metadata_collection_item_max_chars` | `StrictInt` | `2048` | characters |
 | `memory.metadata_max_bytes` | `StrictInt` | `131072` | bytes |
+| `memory.working_set_recent_feedback` | `StrictInt` | `8` | — |
+| `memory.working_set_supersede_observations` | `bool` | `true` | — |
+| `memory.working_set_verbatim_feedback_tokens` | `StrictInt` | `48000` | tokens |
 
 ## `object_tasks`
 
@@ -548,9 +570,14 @@ PY
 | `llm_context.object_name_prefix` | `str` | `"llm_context"` | — |
 | `llm_context.recent_event_limit` | `int` | `20` | — |
 | `llm_context.prompt_event_payload_max_chars` | `int` | `2048` | characters |
+| `llm_context.compaction_chunk_target_tokens` | `StrictInt` | `16384` | tokens |
 | `llm_context.storage_compaction_threshold_bytes` | `int` | `96000` | bytes |
 | `llm_context.storage_compaction_max_chunks` | `int` | `4` | — |
 | `llm_context.storage_compaction_preserve_recent_entries` | `int` | `0` | — |
+| `llm_context.materialization_headroom_tokens` | `StrictInt` | `12288` | tokens |
+| `llm_context.materialization_budget_floor_tokens` | `StrictInt` | `16384` | tokens |
+| `llm_context.recent_event_scan_limit` | `StrictInt` | `200` | — |
+| `llm_context.reopen_digest_event_scan_limit` | `StrictInt` | `4000` | — |
 
 ## `checkpoint`
 
@@ -592,6 +619,7 @@ PY
 | `skills.max_package_directories` | `StrictInt` | `256` | — |
 | `skills.max_package_depth` | `StrictInt` | `32` | — |
 | `skills.catalog_scan_limit` | `StrictInt` | `1000` | — |
+| `skills.compact_tool_guides_after_use` | `bool` | `false` | — |
 
 ## `modules`
 

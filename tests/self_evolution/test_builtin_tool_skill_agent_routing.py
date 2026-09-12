@@ -509,10 +509,16 @@ def test_adjacent_navigation_skill_near_miss_does_not_project_editing_tools(
             if record.action == "llm.action_repair_requested"
         ]
         assert len(repairs) == 1
-        assert (
-            repairs[0].decision["error"]
-            == "selected action is not in this process model tool projection: write_text_file"
+        repair_error = repairs[0].decision["error"]
+        assert repair_error.startswith(
+            "selected action is not in this process model tool projection: write_text_file"
         )
+        # The repair names the owning built-in Skill and its package hash so the
+        # model can activate it directly instead of guessing discovery terms.
+        editing = get_builtin_skill_catalog().get("agent-libos-workspace-editing")
+        assert editing is not None
+        assert "'agent-libos-workspace-editing'" in repair_error
+        assert editing.package_sha256 in repair_error
         assert repairs[0].decision["tool_calls_preview"][0]["name"] == "write_text_file"
     finally:
         runtime.close()

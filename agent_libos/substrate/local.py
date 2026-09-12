@@ -1491,7 +1491,8 @@ class LocalFilesystemProvider:
         except FileExistsError:
             if expected_missing:
                 raise FilesystemContentConflict(
-                    "filesystem content changed before compare-and-swap write"
+                    "filesystem content changed before compare-and-swap write",
+                    details={"hint": "expected_content_sha256_mismatch_reread_then_retry"},
                 ) from None
             if not overwrite:
                 raise
@@ -1507,7 +1508,8 @@ class LocalFilesystemProvider:
         except FileNotFoundError:
             if expected_snapshot is not None:
                 raise FilesystemContentConflict(
-                    "filesystem content changed before compare-and-swap write"
+                    "filesystem content changed before compare-and-swap write",
+                    details={"hint": "expected_content_sha256_mismatch_reread_then_retry"},
                 ) from None
             raise
         try:
@@ -1519,7 +1521,8 @@ class LocalFilesystemProvider:
                 )
                 if observed != expected_snapshot:
                     raise FilesystemContentConflict(
-                        "filesystem content changed before compare-and-swap write"
+                        "filesystem content changed before compare-and-swap write",
+                        details={"hint": "expected_content_sha256_mismatch_reread_then_retry"},
                     )
             os.ftruncate(fd, 0)
             return os.fdopen(fd, "w", encoding=encoding, newline=newline)
@@ -3097,7 +3100,8 @@ class LocalFilesystemProvider:
             after_snapshot = self._snapshot_from_stat(digest.hexdigest(), after)
             if before_snapshot != after_snapshot:
                 raise FilesystemContentConflict(
-                    "filesystem content changed while computing compare-and-swap identity"
+                    "filesystem content changed while computing compare-and-swap identity",
+                    details={"hint": "expected_content_sha256_mismatch_reread_then_retry"},
                 )
             return after_snapshot
 
@@ -3129,7 +3133,8 @@ class LocalFilesystemProvider:
         )
         if not matches:
             raise FilesystemContentConflict(
-                f"filesystem content compare-and-swap conflict: {target}"
+                f"filesystem content compare-and-swap conflict: {target}",
+                details={"hint": "expected_content_sha256_mismatch_reread_then_retry"},
             )
 
     @staticmethod
@@ -4990,7 +4995,7 @@ def _mcp_client_info(
         return mcp_types.Implementation(name="mcp", version="0.1.0")
     return mcp_types.Implementation(
         name="agent-libos",
-        version="1.5.2" if governed_modern else "1.4.2",
+        version="1.5.3" if governed_modern else "1.4.2",
     )
 
 

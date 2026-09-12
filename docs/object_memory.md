@@ -633,10 +633,63 @@ hard limit fails instead of entering an ineffective retry loop.
 
 Selection order comes from `memory.context_policy`, whose default is
 `plan_first`: goal, task, plan, and step objects are ordered ahead of the rest.
-`evidence_first`, `recency_first`, and `error_debug` are the other supported
-orderings, and an Image may select its own policy. One materialization pass is
-bounded by `memory.materialize_budget_tokens` (8,000 tokens by default), again
+`evidence_first`, `recency_first`, `error_debug`, and `working_set` are the other
+supported orderings, and an Image may select its own policy. One materialization pass is
+bounded by `memory.materialize_budget_tokens` (262,144 tokens by default), again
 capped by the per-call window and cumulative budget described below.
+
+The coding, maintenance, research, analysis, and operator Images use
+`working_set` for sustained tasks. Selection prioritizes goals, then the
+verbatim ToolResult/error/test feedback inside the recent window, then
+constraints and Human decisions, then tasks, plans, and summaries. Remaining
+evidence competes by recency. This keeps the next action grounded in its latest
+results while retaining a concise acceptance ledger. Keep that ledger current
+and bounded; this policy does not infer which requirements are complete or make
+an oversized Object fit.
+
+`working_set` also bounds long tasks by projection rather than by dropping
+history. The newest `memory.working_set_recent_feedback` feedback Objects (8 by
+default) always render verbatim, and older feedback keeps rendering verbatim
+while its estimated rendered tokens fit
+`memory.working_set_verbatim_feedback_tokens` (48,000 by default), so a
+multi-file orientation stays fully in view. Feedback beyond that window renders
+as a compact stub record of type `object_memory_feedback_stub` that names the
+tool, its target (path, argv, namespace, changed paths), the outcome, and
+result sizes, never result content. With
+`memory.working_set_supersede_observations` (default on), a repeated
+observation of the same target (the same file path read again, the same
+directory listed, the newest Git status, a Git diff of the same scope and
+refs, discovery, or completion review) supersedes the earlier copy, which is omitted with manifest
+reason `superseded`, so stale file contents cannot contradict the current
+workspace after an edit. A Skill discovery supersedes only an earlier discovery
+that surfaced the same Skill set, so two different queries issued in one
+response both stay visible. When every omission is `superseded`, the legacy
+prompt names the reason without a re-observation cue; that cue is reserved for
+results whose payloads are actually gone. Shell command results are never
+superseded: a failing run followed by a passing run is exactly the evidence a
+task needs, so older runs fall back to stubs that keep argv and return code. Results that carry Human or process input
+(`read_process_messages`, `receive_process_messages`, `ask_human`) are never
+compacted. Stubs are `included` manifest entries with transform `compacted`,
+keep their root position, and are counted in the legacy prompt metadata as
+`compacted_feedback_stubs`; the durable Objects are unchanged and remain
+readable through their authorized references. Other policies render every
+selected Object verbatim.
+
+The LLM executor derives each quantum's source materialization budget from the
+real request headroom: the resolved `llm.max_input_tokens_per_call` minus the
+estimated system prompt, loaded Skill bodies, tool schemas, and
+`llm_context.materialization_headroom_tokens`, floored at
+`llm_context.materialization_budget_floor_tokens` and never above the process
+`max_context_materialization_tokens` window. A long task therefore omits stale
+feedback under the selection policy instead of being denied at budget admission
+after the prompt was already built.
+
+Within each priority class, the selection policies prefer recently updated
+Objects; equal timestamps prefer the later MemoryView root. Selection still
+honors the exact view, filters, handles, and token budget. Selected Objects are
+rendered in original root order, so an append that fits preserves the existing
+prompt prefix. Omitted Objects remain available through their authorized
+references and are recorded in the materialization manifest.
 
 Materialization budgets use the final rendered object text, not stored
 `metadata.token_estimate`. Object creation, payload updates, file imports, and

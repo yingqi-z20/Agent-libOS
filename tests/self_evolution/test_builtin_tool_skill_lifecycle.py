@@ -57,7 +57,9 @@ def test_same_image_fork_inherits_builtin_projection_but_spawn_child_is_fresh(
         assert spawned_process.tool_table == parent_full_table
         assert WORKSPACE_EDITING_SKILL not in spawned_process.loaded_skills
         assert OVERLAP_TOOL not in spawned_process.model_tool_table
-        assert len(spawned_process.model_tool_table) == 5
+        # Fresh bootstrap: five Skill lifecycle tools plus the two message-read
+        # tools the coding image binds; no inherited Skill projection.
+        assert len(spawned_process.model_tool_table) == 7
         assert spawned_process.loaded_skills == {}
         _assert_no_skill_capabilities(runtime, spawned)
     finally:
@@ -377,6 +379,16 @@ def test_reopen_reproduces_old_builtin_snapshot_after_catalog_upgrade(
         )
         assert not stale.ok
         assert stale.payload["error"]["details"]["error_type"] == "SkillPackageChanged"
+        # The failure names the current hash so one retry can re-pin without a
+        # second discovery; a mistyped 64-character hash otherwise costs two calls.
+        assert (
+            stale.payload["error"]["details"]["current_package_sha256"]
+            == upgraded.package_sha256
+        )
+        assert (
+            stale.payload["error"]["details"]["hint"]
+            == "retry_activation_with_current_package_sha256"
+        )
         assert (
             reopened.process.get(pid).loaded_skills[WORKSPACE_EDITING_SKILL]
             == loaded_snapshot
@@ -528,7 +540,7 @@ def test_cross_image_fork_rebases_builtin_model_baseline_before_unload(
 
         child_process = runtime.process.get(child)
         assert editing_tools.isdisjoint(child_process.model_tool_table)
-        assert len(child_process.model_tool_table) == 5
+        assert len(child_process.model_tool_table) == 7
     finally:
         runtime.close()
 

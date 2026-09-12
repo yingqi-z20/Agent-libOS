@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
 from dataclasses import replace
 from typing import Any, TYPE_CHECKING
@@ -143,6 +144,7 @@ class LLMContextMemory:
         resources: ResourcePort | None,
         *,
         config: AgentLibOSConfig | None = None,
+        provider_continuation_compaction_scope: Callable[[str], AbstractContextManager[None]] | None = None,
     ) -> None:
         self._processes = processes
         self._objects = objects
@@ -152,6 +154,9 @@ class LLMContextMemory:
         self._operations = operations
         self._resources = resources
         self._config = config or DEFAULT_CONFIG
+        self._provider_continuation_compaction_scope = (
+            provider_continuation_compaction_scope or (lambda _pid: nullcontext())
+        )
 
     def object_name(self, pid: str) -> str:
         return context_object_name(pid, config=self._config)
@@ -582,7 +587,7 @@ class LLMContextMemory:
         return handle
 
     def view_without_context(self, pid: str, view: MemoryView) -> MemoryView:
-        context_oid = self._context_oid(pid)
+        context_oid = self.context_oid(pid)
         if context_oid is None:
             roots = list(view.roots)
         else:
@@ -616,7 +621,7 @@ class LLMContextMemory:
         Object payload after validation.
         """
 
-        context_oid = self._context_oid(pid)
+        context_oid = self.context_oid(pid)
         if context_oid is None:
             return None
         context = self._objects.get_object(context_oid)
@@ -697,137 +702,138 @@ class LLMContextMemory:
         source_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Atomically replace LLM context entries with a validated compact summary."""
-        obj = self._objects.get_object(context_oid)
-        if obj is None and source_payload is None:
-            raise ValidationError(f"LLM context object not found: {context_oid}")
-        if obj is not None and obj.version != expected_version:
-            raise ValidationError(
-                "LLM context changed during compaction: "
-                f"expected version {expected_version}, found {obj.version}"
-            )
-        if obj is None:
-            current = self._objects.get_object_by_name(
-                self.object_name(pid),
-                namespace=self._memory.resolve_namespace(pid),
-            )
-            if current is not None:
+        with self._provider_continuation_compaction_scope(pid):
+            obj = self._objects.get_object(context_oid)
+            if obj is None and source_payload is None:
+                raise ValidationError(f"LLM context object not found: {context_oid}")
+            if obj is not None and obj.version != expected_version:
                 raise ValidationError(
                     "LLM context changed during compaction: "
-                    f"expected missing oid {context_oid}, found {current.oid} version {current.version}"
+                    f"expected version {expected_version}, found {obj.version}"
                 )
-            payload = self._payload_dict(source_payload)
-        else:
-            payload = self._payload(obj)
-        compacted_payload, compacted_tokens, preserved_count = self._build_compacted_payload(
-            context_oid=context_oid,
-            expected_version=expected_version,
-            payload=payload,
-            summary=summary,
-            compaction_method=compaction_method,
-            compaction_metadata=compaction_metadata,
-            preserve_recent_entries=preserve_recent_entries,
-            source_tokens=source_tokens,
-            target_tokens=target_tokens,
-            compressor_pids=compressor_pids,
-        )
-        # Advance the durable provider-chain epoch before replacing volatile
-        # context payload state. If the replacement is interrupted, the next
-        # Responses request resets stateless rather than continuing against a
-        # context generation whose exact contents are uncertain.
-        self._processes.set_llm_context_generation(
-            pid,
-            str(compacted_payload["cache_strategy"]["compacted_at"]),
-        )
-        metadata = ObjectMetadata(
-            title=f"LLM context for {pid}",
-            summary="Compacted process prompt context optimized for bounded long-running sessions.",
-            tags=[
-                "llm_context",
-                "prompt_cache",
-                "compacted",
-                f"compaction_method:{compaction_method}",
-                f"compacted_at:{compacted_payload['cache_strategy']['compacted_at']}",
-            ],
-            token_estimate=estimate_tokens(compacted_payload),
-        )
-        historical_metadata = (
-            obj.metadata
-            if obj is not None
-            else metadata_from_labels(compacted_payload.get("label_history"))
-        )
-        if historical_metadata is None:
-            # A payload-only recovery cannot prove the original classification.
-            # Preserve confidentiality by choosing the top/lowest labels instead
-            # of silently recreating a normal, unknown-integrity context.
-            historical_metadata = ObjectMetadata(
-                sensitivity="secret",
-                trust_level="untrusted",
-                integrity="untrusted",
-                origin="derived",
-                tenant="mixed",
-                principal="mixed",
+            if obj is None:
+                current = self._objects.get_object_by_name(
+                    self.object_name(pid),
+                    namespace=self._memory.resolve_namespace(pid),
+                )
+                if current is not None:
+                    raise ValidationError(
+                        "LLM context changed during compaction: "
+                        f"expected missing oid {context_oid}, found {current.oid} version {current.version}"
+                    )
+                payload = self._payload_dict(source_payload)
+            else:
+                payload = self._payload(obj)
+            compacted_payload, compacted_tokens, preserved_count = self._build_compacted_payload(
+                context_oid=context_oid,
+                expected_version=expected_version,
+                payload=payload,
+                summary=summary,
+                compaction_method=compaction_method,
+                compaction_metadata=compaction_metadata,
+                preserve_recent_entries=preserve_recent_entries,
+                source_tokens=source_tokens,
+                target_tokens=target_tokens,
+                compressor_pids=compressor_pids,
             )
-        historical_sources = [historical_metadata]
-        durable_metadata = self._durable_context_label_metadata(pid)
-        if durable_metadata is not None:
-            historical_sources.append(durable_metadata)
-        metadata = propagate_object_labels(metadata, historical_sources)
-        metadata = self._persist_context_label_history(pid, metadata)
-        compacted_payload["label_history"] = labels_for_explain(metadata)
-        metadata.token_estimate = estimate_tokens(compacted_payload)
-        if obj is None:
-            handle = self._memory.create_object(
-                pid=pid,
-                object_type=ObjectType.PROCESS_STATE,
-                payload=compacted_payload,
-                metadata=metadata,
-                immutable=False,
-                name=self.object_name(pid),
-            )
-            updated_obj = self._memory.get_object(pid, handle)
-        else:
-            handle = self._memory.handle_for_oid(
+            # Advance the durable provider-chain epoch before replacing volatile
+            # context payload state. If the replacement is interrupted, the next
+            # Responses request resets stateless rather than continuing against a
+            # context generation whose exact contents are uncertain.
+            self._processes.set_llm_context_generation(
                 pid,
-                context_oid,
-                required_rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
-                optional_rights={ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value, ObjectRight.DIFF.value},
+                str(compacted_payload["cache_strategy"]["compacted_at"]),
+            )
+            metadata = ObjectMetadata(
+                title=f"LLM context for {pid}",
+                summary="Compacted process prompt context optimized for bounded long-running sessions.",
+                tags=[
+                    "llm_context",
+                    "prompt_cache",
+                    "compacted",
+                    f"compaction_method:{compaction_method}",
+                    f"compacted_at:{compacted_payload['cache_strategy']['compacted_at']}",
+                ],
+                token_estimate=estimate_tokens(compacted_payload),
+            )
+            historical_metadata = (
+                obj.metadata
+                if obj is not None
+                else metadata_from_labels(compacted_payload.get("label_history"))
+            )
+            if historical_metadata is None:
+                # A payload-only recovery cannot prove the original classification.
+                # Preserve confidentiality by choosing the top/lowest labels instead
+                # of silently recreating a normal, unknown-integrity context.
+                historical_metadata = ObjectMetadata(
+                    sensitivity="secret",
+                    trust_level="untrusted",
+                    integrity="untrusted",
+                    origin="derived",
+                    tenant="mixed",
+                    principal="mixed",
+                )
+            historical_sources = [historical_metadata]
+            durable_metadata = self._durable_context_label_metadata(pid)
+            if durable_metadata is not None:
+                historical_sources.append(durable_metadata)
+            metadata = propagate_object_labels(metadata, historical_sources)
+            metadata = self._persist_context_label_history(pid, metadata)
+            compacted_payload["label_history"] = labels_for_explain(metadata)
+            metadata.token_estimate = estimate_tokens(compacted_payload)
+            if obj is None:
+                handle = self._memory.create_object(
+                    pid=pid,
+                    object_type=ObjectType.PROCESS_STATE,
+                    payload=compacted_payload,
+                    metadata=metadata,
+                    immutable=False,
+                    name=self.object_name(pid),
+                )
+                updated_obj = self._memory.get_object(pid, handle)
+            else:
+                handle = self._memory.handle_for_oid(
+                    pid,
+                    context_oid,
+                    required_rights={ObjectRight.READ.value, ObjectRight.WRITE.value},
+                    optional_rights={ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value, ObjectRight.DIFF.value},
+                    issued_by="llm.context.compact",
+                )
+                try:
+                    updated = self._memory.update_object(
+                        pid,
+                        handle,
+                        ObjectPatch(payload=compacted_payload, metadata=metadata),
+                        expected_version=expected_version,
+                        _trusted_label_propagation=True,
+                    )
+                except ObjectVersionConflict as exc:
+                    raise ValidationError(
+                        "LLM context changed during compaction: "
+                        f"expected version {exc.expected_version}, found {exc.actual_version}"
+                    ) from exc
+                updated_obj = self._memory.get_object(pid, updated)
+            view_handle = self._capabilities.handle_for_object(
+                pid,
+                updated_obj.oid,
+                {
+                    ObjectRight.READ.value,
+                    ObjectRight.WRITE.value,
+                    ObjectRight.MATERIALIZE.value,
+                    ObjectRight.LINK.value,
+                    ObjectRight.DIFF.value,
+                },
                 issued_by="llm.context.compact",
             )
-            try:
-                updated = self._memory.update_object(
-                    pid,
-                    handle,
-                    ObjectPatch(payload=compacted_payload, metadata=metadata),
-                    expected_version=expected_version,
-                    _trusted_label_propagation=True,
-                )
-            except ObjectVersionConflict as exc:
-                raise ValidationError(
-                    "LLM context changed during compaction: "
-                    f"expected version {exc.expected_version}, found {exc.actual_version}"
-                ) from exc
-            updated_obj = self._memory.get_object(pid, updated)
-        view_handle = self._capabilities.handle_for_object(
-            pid,
-            updated_obj.oid,
-            {
-                ObjectRight.READ.value,
-                ObjectRight.WRITE.value,
-                ObjectRight.MATERIALIZE.value,
-                ObjectRight.LINK.value,
-                ObjectRight.DIFF.value,
-            },
-            issued_by="llm.context.compact",
-        )
-        self._add_handle_to_view(pid, view_handle)
-        return {
-            "context_oid": updated_obj.oid,
-            "old_version": expected_version,
-            "new_version": updated_obj.version,
-            "source_tokens": source_tokens,
-            "compacted_tokens": compacted_tokens,
-            "preserved_recent_entries": preserved_count,
-        }
+            self._add_handle_to_view(pid, view_handle)
+            return {
+                "context_oid": updated_obj.oid,
+                "old_version": expected_version,
+                "new_version": updated_obj.version,
+                "source_tokens": source_tokens,
+                "compacted_tokens": compacted_tokens,
+                "preserved_recent_entries": preserved_count,
+            }
 
     def _build_compacted_payload(
         self,
@@ -847,9 +853,12 @@ class LLMContextMemory:
         selected_method = self._validate_compaction_method(compaction_method)
         selected_metadata = self._validate_compaction_metadata(compaction_metadata)
         entries = list(payload.get("entries", []))
-        preserved_count = max(0, min(int(preserve_recent_entries), len(entries)))
-        preserved_entries = deepcopy(entries[-preserved_count:]) if preserved_count else []
-        compacted_payload = deepcopy(payload)
+        recent_limit = max(0, min(int(preserve_recent_entries), len(entries)))
+        # Do not clone the full history only to discard it. Copy retained
+        # entries after fitting them within the rendered context target.
+        compacted_payload = {
+            key: deepcopy(value) for key, value in payload.items() if key != "entries"
+        }
         compact_entry = {
             "kind": "context_compacted",
             "at": utc_now(),
@@ -862,9 +871,10 @@ class LLMContextMemory:
             "compaction_metadata": selected_metadata,
             "compressor_pids": list(compressor_pids),
             "summary": compact_summary,
-            "preserved_recent_entries": preserved_count,
+            "preserved_recent_entries": 0,
+            "compacted_tokens": 0,
         }
-        compacted_payload["entries"] = [compact_entry, *preserved_entries]
+        compacted_payload["entries"] = [compact_entry]
         captured = dict(compacted_payload.get("captured") or {})
         captured["process_signature"] = None
         captured["capability_signature"] = None
@@ -882,10 +892,36 @@ class LLMContextMemory:
             "storage_compaction_baseline_bytes": None,
             "storage_compaction_rearm_at_bytes": None,
         }
-        rendered = self.render(compacted_payload)
-        compacted_tokens = estimate_tokens(rendered)
-        compact_entry["compacted_tokens"] = compacted_tokens
+        # The cumulative summary is mandatory even when it exceeds the soft
+        # target. Verbatim history is optional: keep only a fitting, contiguous
+        # recent suffix. Older compaction envelopes have already been merged
+        # into the new summary and must never accumulate as nested history.
+        preserved_entries: list[Any] = []
+        candidates = entries[-recent_limit:] if recent_limit else []
+        for entry in reversed(candidates):
+            if isinstance(entry, Mapping) and entry.get("kind") == "context_compacted":
+                break
+            compacted_payload["entries"] = [compact_entry, entry, *preserved_entries]
+            compact_entry["preserved_recent_entries"] = len(preserved_entries) + 1
+            if self._measure_compacted_payload(compacted_payload) > target_tokens:
+                break
+            preserved_entries.insert(0, deepcopy(entry))
+        preserved_count = len(preserved_entries)
+        compacted_payload["entries"] = [compact_entry, *preserved_entries]
+        compact_entry["preserved_recent_entries"] = preserved_count
+        compacted_tokens = self._measure_compacted_payload(compacted_payload)
         return compacted_payload, compacted_tokens, preserved_count
+
+    def _measure_compacted_payload(self, payload: dict[str, Any]) -> int:
+        entry = payload["entries"][0]
+        # The reported count itself occupies prompt space. Start at zero to
+        # reach the same fixed point after either growing or shrinking a tail.
+        entry["compacted_tokens"] = 0
+        while True:
+            measured = estimate_tokens(self.render(payload))
+            if measured == entry["compacted_tokens"]:
+                return measured
+            entry["compacted_tokens"] = measured
 
     def _validate_compaction_method(self, method: str) -> str:
         if not isinstance(method, str) or not method.strip():
@@ -1356,7 +1392,8 @@ class LLMContextMemory:
             )
         return payload
 
-    def _context_oid(self, pid: str) -> str | None:
+    def context_oid(self, pid: str) -> str | None:
+        """Locate the Host-maintained context without creating it or granting access."""
         obj = self._objects.get_object_by_name(
             self.object_name(pid),
             namespace=self._memory.resolve_namespace(pid),

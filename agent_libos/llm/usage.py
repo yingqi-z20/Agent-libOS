@@ -23,7 +23,13 @@ def canonicalize_llm_usage(
     *,
     api: str | None = None,
 ) -> tuple[dict[str, int], set[str]]:
-    """Normalize billable and prompt-cache counters without coercing telemetry."""
+    """Normalize billable and diagnostic counters without coercing telemetry.
+
+    Reasoning tokens are an output-token subset, never an additional billable
+    component. A missing counter remains absent; an explicitly reported zero
+    remains zero. Formal provider detail fields take precedence over retained
+    canonical counters, including when the formal value is null or invalid.
+    """
 
     if not isinstance(raw_usage, Mapping):
         return {}, set()
@@ -35,7 +41,7 @@ def canonicalize_llm_usage(
         _store_counter(usage, invalid_fields, key, raw_usage[key])
 
     detail_maps = _usage_detail_maps(raw_usage, api=api)
-    _store_cache_counter(
+    _store_detail_counter(
         usage,
         invalid_fields,
         normalized_key="cache_read_tokens",
@@ -44,7 +50,7 @@ def canonicalize_llm_usage(
         raw_usage=raw_usage,
         aliases=("cache_read_tokens", "cached_tokens", "cache_read_input_tokens"),
     )
-    _store_cache_counter(
+    _store_detail_counter(
         usage,
         invalid_fields,
         normalized_key="cache_write_tokens",
@@ -53,6 +59,23 @@ def canonicalize_llm_usage(
         raw_usage=raw_usage,
         aliases=("cache_write_tokens", "cache_creation_input_tokens"),
     )
+    _store_detail_counter(
+        usage,
+        invalid_fields,
+        normalized_key="reasoning_tokens",
+        detail_maps=_usage_detail_maps(raw_usage, api=api, output=True),
+        formal_key="reasoning_tokens",
+        raw_usage=raw_usage,
+        aliases=("reasoning_tokens",),
+    )
+    output_tokens = _output_tokens(usage, api=api)
+    if (
+        "reasoning_tokens" in usage
+        and output_tokens is not None
+        and usage["reasoning_tokens"] > output_tokens
+    ):
+        usage.pop("reasoning_tokens")
+        invalid_fields.add("reasoning_tokens")
     return usage, invalid_fields
 
 
@@ -137,12 +160,14 @@ def _usage_detail_maps(
     raw_usage: Mapping[str, Any],
     *,
     api: str | None,
+    output: bool = False,
 ) -> tuple[Mapping[str, Any], ...]:
-    ordered_keys = (
-        ("input_tokens_details", "prompt_tokens_details")
-        if api == "responses"
-        else ("prompt_tokens_details", "input_tokens_details")
+    response_key, chat_key = (
+        ("output_tokens_details", "completion_tokens_details")
+        if output
+        else ("input_tokens_details", "prompt_tokens_details")
     )
+    ordered_keys = (response_key, chat_key) if api == "responses" else (chat_key, response_key)
     details: list[Mapping[str, Any]] = []
     for key in ordered_keys:
         candidate = raw_usage.get(key)
@@ -151,7 +176,7 @@ def _usage_detail_maps(
     return tuple(details)
 
 
-def _store_cache_counter(
+def _store_detail_counter(
     usage: dict[str, int],
     invalid_fields: set[str],
     *,
@@ -214,6 +239,19 @@ def _input_tokens(usage: Mapping[str, int], *, api: Any) -> int | None:
         ("input_tokens", "prompt_tokens")
         if api == "responses"
         else ("prompt_tokens", "input_tokens")
+    )
+    for key in ordered_keys:
+        value = usage.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _output_tokens(usage: Mapping[str, int], *, api: Any) -> int | None:
+    ordered_keys = (
+        ("output_tokens", "completion_tokens")
+        if api == "responses"
+        else ("completion_tokens", "output_tokens")
     )
     for key in ordered_keys:
         value = usage.get(key)

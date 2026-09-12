@@ -85,7 +85,7 @@ def build_operator_agent_image(
             "receive_process_messages",
             "sleep",
         ],
-        context_policy="evidence_first",
+        context_policy="working_set",
         safety_profile="operator",
         required_capabilities=[
             {

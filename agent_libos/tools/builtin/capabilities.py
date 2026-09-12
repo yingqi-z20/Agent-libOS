@@ -154,7 +154,10 @@ def _model_capability(runtime: Any, ctx: ToolContext, value: Any) -> Any:
         if item not in (None, "", [], {}):
             selected[key] = item
     resource = selected.get("resource")
-    if isinstance(resource, str):
+    if isinstance(resource, str) and not resource.startswith("object_namespace:"):
+        # Namespace authority is consumed as a literal resource by permission
+        # and delegation tools. "process:self" is a different namespace, not
+        # an alias for the caller's namespace.
         process = runtime.process.get(ctx.pid)
         resource = resource.replace(ctx.pid, "self")
         if process.goal_oid:
