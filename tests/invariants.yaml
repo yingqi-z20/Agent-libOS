@@ -2999,11 +2999,14 @@
     },
     {
       "id": "llm-provider-continuation-evidence-is-a-retention-dependency",
-      "title": "Pending hosted success and continuation evidence survive retention and stale-page races until their dependency is consumed.",
+      "title": "Pending hosted success and continuation evidence survive retention and stale-page races until consumed or invalidated by a context generation change, while checkpoint and active fork references remain protected.",
       "lane": "security",
       "node_ids": [
         "tests/security/test_provider_continuation_retention.py::test_pending_continuation_source_and_marker_survive_retention_and_repairs",
         "tests/security/test_provider_continuation_retention.py::test_consumed_continuation_releases_both_retained_payloads",
+        "tests/security/test_provider_continuation_retention.py::test_restoring_checkpoint_predating_continuation_releases_discarded_payloads",
+        "tests/security/test_provider_continuation_retention.py::test_fork_reference_survives_original_generation_change_until_fork_is_obsolete",
+        "tests/security/test_provider_continuation_retention.py::test_unknown_fork_marker_generation_preserves_remaining_evidence[None]",
         "tests/security/test_provider_continuation_retention.py::test_checkpoint_references_keep_consumed_source_and_marker_payloads",
         "tests/security/test_provider_continuation_retention.py::test_checkpoint_body_mentions_do_not_become_continuation_references",
         "tests/security/test_provider_continuation_retention.py::test_fork_pending_marker_protects_source_in_original_pid_until_consumption",
@@ -3816,6 +3819,10 @@
       "title": "Responses replay preserves ordered native turns in bounded private storage, excludes public and semantic projections, and rejects invalid protocol or retained state.",
       "lane": "unit",
       "node_ids": [
+        "tests/runtime/test_hosted_replay_release_recovery.py::test_hosted_replay_release_reopens_and_dispatches_frozen_input_once[openai]",
+        "tests/runtime/test_hosted_replay_release_recovery.py::test_hosted_replay_release_reopens_and_dispatches_frozen_input_once[aliyun]",
+        "tests/runtime/test_hosted_replay_release_recovery.py::test_taskrun_hosted_release_preflight_validates_persisted_provider_binding[openai]",
+        "tests/runtime/test_hosted_replay_release_recovery.py::test_taskrun_hosted_release_preflight_validates_persisted_provider_binding[aliyun]",
         "tests/unit/test_llm_replay.py::test_host_wait_settles_at_turn_limit_without_admitting_another_provider_call",
         "tests/unit/test_llm_replay.py::test_host_wait_pairing_cannot_hide_another_provider_turn",
         "tests/runtime/test_responses_replay_executor.py::test_auto_wait_preserves_consumed_followup_at_replay_turn_limit[queued]",
@@ -5700,6 +5707,7 @@
         "tests/runtime/test_long_horizon_working_set.py::test_discovery_supersession_keys_follow_the_surfaced_skills",
         "tests/runtime/test_long_horizon_working_set.py::test_working_set_keeps_independent_memory_selections[subtrees]",
         "tests/runtime/test_long_horizon_working_set.py::test_working_set_keeps_independent_memory_selections[byte-pages]",
+        "tests/runtime/test_long_horizon_working_set.py::test_working_set_keeps_capability_pages_and_supersedes_identical_repeats",
         "tests/unit/test_prompt_omitted_object_guidance.py::test_superseded_only_omissions_do_not_ask_for_re_observation",
         "tests/unit/test_prompt_projection_compaction.py::test_v2_compaction_strips_object_ids_from_feedback_stubs"
       ],
@@ -5762,6 +5770,7 @@
         "tests/runtime/test_reopen_activity_digest.py::test_collection_pages_backwards_and_keeps_only_pre_shutdown_process_events",
         "tests/runtime/test_reopen_activity_digest.py::test_rendering_is_bounded_and_payload_free",
         "tests/runtime/test_reopen_activity_digest.py::test_prompt_after_reopen_names_earlier_reads_writes_and_commands",
+        "tests/runtime/test_reopen_activity_digest.py::test_filesystem_digest_ignores_unknown_mutations_and_noop_deletions",
         "tests/runtime/test_reopen_activity_digest.py::test_prompt_without_lost_results_has_no_digest"
       ],
       "benchmark_attack_classes": []

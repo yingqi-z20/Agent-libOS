@@ -116,6 +116,10 @@ class LLMReplaySourceRecovery:
             reference, pid=pid, run_id=process.task_run_id,
             provider_fingerprint=profile.identity_sha256, model=profile.policy.model,
             context_generation=expected[-1],
+            provider=(
+                profile.policy.provider_tools.provider
+                if profile.policy.provider_tools is not None else None
+            ),
         )
         yield pid, request.flow_context
 

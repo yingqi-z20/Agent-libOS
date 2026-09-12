@@ -7498,6 +7498,17 @@ class TaskRunManager:
         frozen = self._store.get_llm_replay_turn(reference.get("turn_id"))
         if frozen is None or frozen.pid != pid or frozen.run_id != run_id:
             raise ValidationError("TaskRun replay release payload is missing")
+        # This first preflight validates retained request bindings only. The
+        # later source-recovery/resume phases compare the live Host profile.
+        options = prepared.get("request_options", {})
+        if not isinstance(options, Mapping):
+            raise ValidationError("TaskRun replay release request options are invalid")
+        configured = options.get("provider_tools_configured")
+        if configured is not None and (
+            not isinstance(configured, Mapping)
+            or not isinstance(configured.get("provider"), str)
+        ):
+            raise ValidationError("TaskRun replay release provider binding is invalid")
         replay.load_request(
             reference,
             pid=pid,
@@ -7505,6 +7516,7 @@ class TaskRunManager:
             model=frozen.model,
             context_generation=frozen.context_generation,
             run_id=run_id,
+            provider=configured["provider"] if configured is not None else None,
         )
 
     def _prevalidate_replay_call(

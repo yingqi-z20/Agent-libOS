@@ -21,8 +21,8 @@ REOPEN_DIGEST_HEADING = (
     "(payload-free, from runtime events):"
 )
 REOPEN_DIGEST_GUIDANCE = (
-    "- guidance: these effects persist in the workspace and Git worktree although "
-    "their result Objects were released. Re-read only the files you must edit or "
+    "- guidance: these are historical operations; later changes may have replaced "
+    "or deleted their results. Re-read only the files you must edit or "
     "verify next, and use the Git inspection tools to see your own earlier edits "
     "instead of re-reading every file."
 )
@@ -133,6 +133,9 @@ class _Activity:
         self.reads: list[str] = []
         self.directories: list[str] = []
         self.writes: dict[str, tuple[int, int]] = {}
+        self.files_deleted: list[str] = []
+        self.directories_ensured: list[str] = []
+        self.directories_deleted: list[str] = []
         self.commands: list[tuple[str, Any, int]] = []
         self.git_operations: dict[str, int] = {}
         self.skills: list[str] = []
@@ -185,18 +188,41 @@ def _note_read(activity: _Activity, payload: Mapping[str, Any]) -> bool:
 def _note_write(activity: _Activity, payload: Mapping[str, Any]) -> bool:
     adapter = payload.get("adapter")
     if adapter == "filesystem":
-        path = payload.get("path")
-        if isinstance(path, str) and path:
-            count, _ = activity.writes.get(path, (0, 0))
-            written = payload.get("bytes_written")
-            activity.writes[path] = (count + 1, written if isinstance(written, int) else 0)
-            return True
+        return _note_filesystem_write(activity, payload)
     elif adapter == "shell":
         argv = payload.get("argv")
         if isinstance(argv, list):
             _note_command(activity, argv, payload.get("returncode"))
             return True
     return False
+
+
+def _note_filesystem_write(activity: _Activity, payload: Mapping[str, Any]) -> bool:
+    path = payload.get("path")
+    if not isinstance(path, str) or not path:
+        return False
+    operation = payload.get("operation")
+    if operation is not None and not isinstance(operation, str):
+        return False
+    if operation in {"delete_file", "delete_directory"} and payload.get("deleted") is False:
+        return False
+    target = {
+        "delete_file": activity.files_deleted,
+        "write_directory": activity.directories_ensured,
+        "delete_directory": activity.directories_deleted,
+    }.get(operation)
+    if target is not None:
+        if path not in target:
+            target.append(path)
+        return True
+    # write_text events historically omit operation, but include a byte count.
+    # Unknown mutations must not be guessed to be successful file writes.
+    written = payload.get("bytes_written")
+    if operation not in {None, "write_text"} or type(written) is not int or written < 0:
+        return False
+    count, _ = activity.writes.get(path, (0, 0))
+    activity.writes[path] = (count + 1, written)
+    return True
 
 
 def _note_command(activity: _Activity, argv: list[Any], returncode: Any) -> None:
@@ -259,6 +285,13 @@ def _render(activity: Mapping[str, Any], *, items_per_line: int) -> str:
             for path, (count, written) in activity["writes"].items()
         ]
         lines.append("- files written: " + _join(entries, items_per_line))
+    for field, label in (
+        ("files_deleted", "files deleted"),
+        ("directories_ensured", "directories ensured"),
+        ("directories_deleted", "directories deleted"),
+    ):
+        if activity[field]:
+            lines.append(f"- {label}: " + _join(activity[field], items_per_line))
     if activity["commands"]:
         entries = [
             f"{command} -> returncode {returncode}{f' x{repeats}' if repeats > 1 else ''}"

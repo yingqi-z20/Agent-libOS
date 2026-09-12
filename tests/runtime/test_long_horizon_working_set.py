@@ -29,6 +29,10 @@ from tests.support.fakes import RecordingActionClient
 
 
 def _tool_result(runtime: Runtime, pid: str, tool_name: str, result: dict[str, Any]):
+    if tool_name == "read_text_file":
+        result = {"encoding": "utf-8", "truncated": False, **result}
+    elif tool_name == "read_directory":
+        result = {"truncated": False, **result}
     return runtime.memory.create_object(
         pid,
         ObjectType.TOOL_RESULT,
@@ -249,14 +253,22 @@ def test_working_set_token_window_keeps_a_multi_file_orientation_verbatim() -> N
 
 def test_supersession_keys_cover_observations_but_never_actions_or_failures() -> None:
     assert _observation_supersession_key(
-        {"tool_name": "read_text_file", "result": {"path": "src/a.py", "content": "x"}}
+        {"tool_name": "read_text_file", "result": {
+            "path": "src/a.py", "content": "x", "encoding": "utf-8", "truncated": False,
+        }}
     ) == _observation_supersession_key(
-        {"tool_name": "read_text_file", "result": {"path": "src/a.py", "content": "y"}}
+        {"tool_name": "read_text_file", "result": {
+            "path": "src/a.py", "content": "y", "encoding": "utf-8", "truncated": False,
+        }}
     )
     assert _observation_supersession_key(
-        {"tool_name": "read_text_file", "result": {"path": "src/a.py"}}
+        {"tool_name": "read_text_file", "result": {
+            "path": "src/a.py", "encoding": "utf-8", "truncated": False,
+        }}
     ) != _observation_supersession_key(
-        {"tool_name": "read_text_file", "result": {"path": "src/b.py"}}
+        {"tool_name": "read_text_file", "result": {
+            "path": "src/b.py", "encoding": "utf-8", "truncated": False,
+        }}
     )
     # A shell run is evidence, never superseded: a passing suite must not hide
     # the earlier failing run that proves the defect was reproduced first.
@@ -657,3 +669,104 @@ def test_working_set_keeps_independent_memory_selections(paged: bool) -> None:
         assert second["result_oid"] in context.omitted_objects
     finally:
         runtime.close()
+
+
+def test_working_set_keeps_capability_pages_and_supersedes_identical_repeats() -> None:
+    runtime = Runtime.open("local")
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="inspect all permissions")
+        first = runtime.tools.call(pid, "list_capabilities", {"limit": 1})
+        assert first.ok and first.payload["has_more"]
+        second = runtime.tools.call(pid, "list_capabilities", {
+            "limit": 1, "after_cap_id": first.payload["next_cursor"],
+        })
+        assert second.ok and second.payload["capabilities"]
+        assert first.payload["capabilities"] != second.payload["capabilities"]
+        handles = [first.result_handle, second.result_handle]
+        context = runtime.memory.materialize_context(
+            pid, runtime.memory.create_view(pid, handles), policy="working_set",
+            budget_tokens=100_000, charge_resources=False,
+        )
+        assert context.object_refs == [handle.oid for handle in handles]
+        assert not context.omitted_objects
+
+        # Repeating the same observed page remains compactable. Copy its actual
+        # result because listing itself creates result capabilities, which can
+        # change the next live capability page between calls.
+        repeated = runtime.memory.create_object(
+            pid, ObjectType.TOOL_RESULT,
+            runtime.memory.get_object(pid, first.result_handle).payload,
+        )
+        context = runtime.memory.materialize_context(
+            pid, runtime.memory.create_view(pid, [*handles, repeated]),
+            policy="working_set", budget_tokens=100_000, charge_resources=False,
+        )
+        assert context.object_refs == [second.result_handle.oid, repeated.oid]
+        assert context.omitted_objects == [first.result_handle.oid]
+        assert next(
+            entry for entry in context.object_manifest if entry["oid"] == first.result_handle.oid
+        )["reason"] == "superseded"
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "first", "second"),
+    [
+        ("list_memory_namespace", {"namespace": "project", "objects": [{"name": "a"}]},
+         {"namespace": "project", "objects": [{"name": "b"}]}),
+        ("list_checkpoints", {"checkpoints": [{"pid": "first"}]},
+         {"checkpoints": [{"pid": "second"}]}),
+        ("list_child_processes", {"children": [{"pid": "exited"}, {"pid": "running"}]},
+         {"children": [{"pid": "running"}]}),
+        ("list_object_tasks", {"tasks": [{"owner_oid": "first"}]},
+         {"tasks": [{"owner_oid": "second"}]}),
+        ("list_jsonrpc_endpoints", {"endpoints": [{"endpoint_id": "first"}]},
+         {"endpoints": [{"endpoint_id": "second"}]}),
+        ("list_mcp_servers", {"servers": [{"server_id": "first"}]},
+         {"servers": [{"server_id": "second"}]}),
+        ("list_mcp_tools", {"server_id": "server", "tools": [{"name": "cached"}]},
+         {"server_id": "server", "tools": [{"name": "live"}]}),
+        ("list_mcp_resources", {"server_id": "server", "kind": "resource", "items": []},
+         {"server_id": "server", "kind": "template", "items": []}),
+        ("list_mcp_resources", {"server_id": "server", "items": [{"resource_id": "first"}]},
+         {"server_id": "server", "items": [{"resource_id": "second"}]}),
+    ],
+)
+def test_listing_supersession_requires_identical_observed_results(
+    tool_name: str, first: dict[str, Any], second: dict[str, Any],
+) -> None:
+    key = _observation_supersession_key({"tool_name": tool_name, "result": first})
+    assert key is not None
+    assert key != _observation_supersession_key({"tool_name": tool_name, "result": second})
+    assert key == _observation_supersession_key({
+        "tool_name": tool_name, "result": dict(reversed(list(first.items()))),
+    })
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "fields", "extent_field"),
+    [
+        ("read_text_file", {"encoding": "utf-8"}, "bytes_read"),
+        ("read_directory", {}, "count"),
+    ],
+)
+def test_filesystem_supersession_keeps_independent_prefixes(
+    tool_name: str, fields: dict[str, Any], extent_field: str,
+) -> None:
+    def key(**changes: Any):
+        return _observation_supersession_key({
+            "tool_name": tool_name,
+            "result": {"path": "target", **fields, **changes},
+        })
+
+    complete = key(truncated=False, **{extent_field: 100})
+    assert complete is not None
+    assert complete == key(truncated=False, **{extent_field: 200})
+    prefix = key(truncated=True, **{extent_field: 10})
+    assert prefix is not None and prefix != complete
+    assert prefix != key(truncated=True, **{extent_field: 20})
+    assert key() is None, "legacy results without extent provenance are not replaced"
+    assert key(truncated=True) is None
+    if tool_name == "read_text_file":
+        assert complete != key(truncated=False, encoding="latin-1")

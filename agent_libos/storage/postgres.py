@@ -1212,6 +1212,10 @@ _PROVIDER_CONTINUATION_JSON_EXPRESSIONS = {
         "(marker.request_options_json::json -> 'provider_continuation' ->> 'state')",
     "json_extract(marker.request_options_json, '$.provider_continuation.call_id')":
         "(marker.request_options_json::json -> 'provider_continuation' ->> 'call_id')",
+    "json_extract(marker.request_options_json, '$.provider_continuation.context_generation')":
+        "(marker.request_options_json::json -> 'provider_continuation' ->> 'context_generation')",
+    "json_type(marker.request_options_json, '$.provider_continuation.context_generation') = 'text'":
+        "json_typeof(marker.request_options_json::json -> 'provider_continuation' -> 'context_generation') = 'string'",
 }
 
 

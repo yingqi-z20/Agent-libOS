@@ -524,7 +524,11 @@ class LLMProfileRegistry:
             "prompt_cache_key_source": cache_key_source,
             "prompt_cache_mode_configured": policy.prompt_cache_mode_configured,
             "prompt_cache_retention": policy.prompt_cache_retention,
-            "prompt_cache_mode": policy.prompt_cache_mode,
+            # The client applies defaults before resolving endpoint policy.
+            # Keep auto here so a custom endpoint clears an inherited TTL
+            # again, rather than treating the resolved None as unspecified
+            # alongside an already-resolved provider_default mode.
+            "prompt_cache_mode": policy.prompt_cache_mode_configured,
             "prompt_cache_ttl": policy.prompt_cache_ttl,
             "responses_previous_response_id": policy.responses_previous_response_id,
             "fallback_json_actions": policy.fallback_json_actions,

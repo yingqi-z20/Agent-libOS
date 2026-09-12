@@ -3263,8 +3263,6 @@ _PINNED_FEEDBACK_TOOLS = frozenset(
 # the result fields that identify the observed target; an empty tuple means
 # the tool observes one global target.
 _OBSERVATION_KEY_FIELDS: dict[str, tuple[str, ...]] = {
-    "read_text_file": ("path",),
-    "read_directory": ("path",),
     "get_working_directory": (),
     # ``run_shell_command`` is deliberately absent: a command's outcome is
     # evidence with temporal meaning, not an observation of a stable target.
@@ -3272,22 +3270,22 @@ _OBSERVATION_KEY_FIELDS: dict[str, tuple[str, ...]] = {
     # "reproduced the failure first" evidence, and a literal-minded model then
     # reverted its fix to reproduce the failure again, in a loop.  Older runs
     # fall back to stubs that keep argv and returncode.
-    "list_memory_namespace": ("namespace",),
     # A subtree or byte page is an independent observation. Replacing it
     # requires the same selection, including the extent of the returned page.
     "read_memory_object": (
         "namespace", "name", "json_pointer", "page_offset_bytes", "page_bytes",
     ),
-    "list_checkpoints": (),
-    "list_capabilities": (),
-    "list_child_processes": (),
-    "list_object_tasks": (),
-    "list_jsonrpc_endpoints": (),
-    "list_mcp_servers": (),
-    "list_mcp_tools": ("server_id",),
-    "list_mcp_resources": ("server_id",),
     "get_current_time": (),
 }
+# Listing results do not retain their complete request selection (for example
+# capability cursors, ObjectTask owners, or endpoint search filters). Only an
+# identical result can safely replace an earlier one without that provenance.
+# A later page or a narrower listing must not erase already observed entries.
+_EXACT_RESULT_OBSERVATION_TOOLS = frozenset({
+    "list_memory_namespace", "list_checkpoints", "list_capabilities",
+    "list_child_processes", "list_object_tasks", "list_jsonrpc_endpoints",
+    "list_mcp_servers", "list_mcp_tools", "list_mcp_resources",
+})
 # Git results need the exact selection and requested extent. Changed paths
 # alone cannot distinguish independent path filters or a truncated patch.
 # Older result records lack this provenance and must not supersede each other.
@@ -3353,12 +3351,39 @@ def _observation_supersession_key(payload: Any) -> tuple[Any, ...] | None:
         return None
     if tool_name == "discover_skills":
         return _discovery_supersession_key(result)
+    if tool_name in _EXACT_RESULT_OBSERVATION_TOOLS:
+        return (
+            tool_name,
+            hashlib.sha256(_canonical_prompt_json(result).encode("utf-8")).hexdigest(),
+        )
+    if tool_name in {"read_text_file", "read_directory"}:
+        return _filesystem_observation_supersession_key(tool_name, result)
     if tool_name in _GIT_OBSERVATION_KEY_FIELDS:
         return _git_observation_supersession_key(tool_name, result)
     fields = _OBSERVATION_KEY_FIELDS.get(tool_name)
     if fields is None:
         return None
     return (tool_name, *(_canonical_prompt_json(result.get(field)) for field in fields))
+
+
+def _filesystem_observation_supersession_key(
+    tool_name: str, result: dict[str, Any],
+) -> tuple[Any, ...] | None:
+    """Replace full observations or prefixes with the same encoding and extent."""
+
+    path = result.get("path")
+    truncated = result.get("truncated")
+    if not isinstance(path, str) or type(truncated) is not bool:
+        return None
+    encoding = result.get("encoding") if tool_name == "read_text_file" else None
+    if tool_name == "read_text_file" and not isinstance(encoding, str):
+        return None
+    extent = None
+    if truncated:
+        extent = result.get("bytes_read" if tool_name == "read_text_file" else "count")
+        if type(extent) is not int or extent < 0:
+            return None
+    return (tool_name, path, encoding, truncated, extent)
 
 
 def _git_observation_supersession_key(

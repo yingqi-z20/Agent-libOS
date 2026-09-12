@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from agent_libos.llm.usage import LLM_USAGE_COUNTER_MAX
-from agent_libos.models import AuditRecord, LLMCallRecord
+from agent_libos.models import AgentObject, AuditRecord, LLMCallRecord, ObjectMetadata, ObjectType, Provenance
 from agent_libos.storage import SQLiteStore
 from experiments.inspect_long_horizon_run import inspect_database
 
@@ -116,6 +116,36 @@ def test_inspector_attributes_external_audit_events_to_the_target_process(
     assert audit["quanta"] == quanta
     assert audit["human_messages_posted"] == human_messages
     assert audit["llm_requests"] == llm_requests
+
+
+@pytest.mark.parametrize(
+    ("pid", "expected_count"),
+    [("pid-a", 1), ("pid-without-calls", 2), ("missing-pid", 0), (None, 3)],
+)
+def test_inspector_scopes_objects_independently_of_llm_calls(
+    tmp_path: Path, pid: str | None, expected_count: int,
+) -> None:
+    path = tmp_path / "runtime.sqlite"
+    store = SQLiteStore(path)
+    timestamp = "2026-09-08T00:00:00+00:00"
+    try:
+        store.insert_llm_call(LLMCallRecord(
+            call_id="call-a", pid="pid-a", image_id=None,
+            purpose="action_selection", status="ok", messages=[], tools=[],
+            tool_calls=[], created_at=timestamp,
+        ))
+        for index, owner in enumerate(("pid-a", "pid-without-calls", "pid-without-calls")):
+            store.insert_object(AgentObject(
+                oid=f"obj-{index}", namespace="root", name=f"evidence-{index}",
+                type=ObjectType.EVIDENCE, schema_version="1", payload={"index": index},
+                metadata=ObjectMetadata(), provenance=Provenance(), version=1,
+                immutable=False, created_by=owner, created_at=timestamp, updated_at=timestamp,
+            ))
+    finally:
+        store.close()
+
+    objects = inspect_database(path, pid=pid)["objects"]
+    assert sum(entry["count"] for entry in objects.values()) == expected_count
 
 
 @pytest.mark.parametrize(

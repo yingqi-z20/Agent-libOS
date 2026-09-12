@@ -19404,6 +19404,7 @@ class SQLRuntimeStore:
                    marker.created_at AS marker_created_at,
                    marker.request_options_json AS marker_options,
                    latest.call_id AS latest_success_id,
+                   COALESCE(generation.generation, 'initial') AS context_generation,
                    point.pending_action_payload_id,
                    pending.canonical_json AS pending_json
               FROM (
@@ -19423,6 +19424,8 @@ class SQLRuntimeStore:
               )
               LEFT JOIN task_run_resume_points AS point
                 ON point.pid = candidate.pid AND point.complete = 1
+              LEFT JOIN llm_context_generations AS generation
+                ON generation.pid = candidate.pid
               LEFT JOIN task_run_payloads AS pending
                 ON pending.payload_id = point.pending_action_payload_id
         """
@@ -19458,9 +19461,17 @@ class SQLRuntimeStore:
                      OR json_extract(continuation_ref.value, '$.source_call_id') = candidate.call_id
                ) OR EXISTS (
                  SELECT 1 FROM llm_calls AS marker
+                  LEFT JOIN llm_context_generations AS generation
+                    ON generation.pid = marker.pid
                   WHERE marker.purpose = 'provider_continuation'
                     AND json_extract(marker.request_options_json, '$.provider_continuation.state') = 'pending'
                     AND json_extract(marker.request_options_json, '$.provider_continuation.call_id') = candidate.call_id
+                    AND CASE
+                      WHEN json_type(marker.request_options_json, '$.provider_continuation.context_generation') = 'text'
+                       AND json_extract(marker.request_options_json, '$.provider_continuation.context_generation') <> ''
+                      THEN json_extract(marker.request_options_json, '$.provider_continuation.context_generation') = COALESCE(generation.generation, 'initial')
+                      ELSE 1 = 1
+                    END
                     AND NOT EXISTS (
                       SELECT 1 FROM llm_calls AS newer
                        WHERE newer.pid = marker.pid AND newer.purpose = marker.purpose
@@ -19502,10 +19513,18 @@ class SQLRuntimeStore:
             return True
         if pending.get("kind") == "provider_continuation" and pending.get("call_id") == record.call_id:
             return True
+        marker_generation = marker.get("context_generation")
+        marker_obsolete = (
+            isinstance(marker_generation, str) and bool(marker_generation)
+            and marker_generation != row["context_generation"]
+        )
+        # Restoring an earlier checkpoint discards later markers without
+        # consuming them. Exact checkpoint/fork references are checked
+        # separately; an obsolete local marker is no longer a dependency.
         if record.purpose == "provider_continuation":
-            return row["marker_id"] == record.call_id
+            return row["marker_id"] == record.call_id and not marker_obsolete
         if marker.get("call_id") == record.call_id:
-            return marker.get("state") != "consumed"
+            return marker.get("state") != "consumed" and not marker_obsolete
         # Protect the success-to-commit interval, including when the last
         # continuation belongs to an older turn. Errors cannot supersede it.
         return row["latest_success_id"] == record.call_id and (

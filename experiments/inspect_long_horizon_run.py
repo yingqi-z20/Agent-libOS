@@ -164,9 +164,10 @@ def _inspect_connection(
     calls = [_call_row(index, row) for index, row in enumerate(rows, start=1)]
     _attach_gaps(calls)
     pids = sorted({call["pid"] for call in calls if call["pid"]})
-    # Audit activity can precede the first LLM call for the requested process.
-    audit = _audit_summary(connection, [pid] if pid else [])
-    objects = _object_summary(connection, pids)
+    # Activity and Objects can precede the process's first LLM call.
+    requested_pids = [pid] if pid else []
+    audit = _audit_summary(connection, requested_pids)
+    objects = _object_summary(connection, requested_pids)
     return {
         "source": source,
         "pids": pids,

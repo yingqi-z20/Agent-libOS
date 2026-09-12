@@ -95,6 +95,8 @@ REQUIRED_CHANGED_FILES = frozenset(
 )
 DEFAULT_PHASE_ONE_QUANTA = 8
 DEFAULT_MAX_QUANTA = 160
+_STATIC_TEST_MODULE_LIMIT = 64
+_STATIC_TEST_MODULE_BYTES = 1_048_576
 
 GOAL = """
 Act as the maintainer of this small `ledgerctl` repository. Follow AGENTS.md and
@@ -808,7 +810,7 @@ def regression_coverage(workspace: str | Path) -> dict[str, bool]:
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue
-        for function, zero_precision_names in _test_precision_scopes(tree, root):
+        for function, zero_precision_names in _test_precision_scopes(tree, root, path):
             calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
             consumer_calls = [call for call in calls if _callee_name(call) in CONSUMER_FUNCTIONS]
             if not consumer_calls:
@@ -853,19 +855,31 @@ def _discoverable_test_files(root: Path) -> list[Path]:
 
 
 def _test_precision_scopes(
-    tree: ast.Module, root: Path,
+    tree: ast.Module, root: Path, path: Path,
 ) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]]:
-    """Keep constants and setup attributes inside their owning test class."""
+    """Keep bindings inside statically discoverable unittest test classes."""
 
-    module_names = _zero_precision_bindings(tree, root)
     selected: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]] = []
-    for scope in (node for node in tree.body if isinstance(node, ast.ClassDef)):
-        class_names = _zero_precision_bindings(scope, root)
+    class_scopes, defining_modules = _unittest_class_scopes(tree, root, path)
+    for scopes in class_scopes:
+        scope = scopes[0]
+        class_names: set[str] = set()
+        method_names: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+        method_modules: dict[ast.FunctionDef | ast.AsyncFunctionDef, ast.Module] = {}
+        # Derived attributes and methods replace inherited definitions, just as
+        # TestLoader's getattr-based discovery does. Plain mixins only count
+        # when a discoverable TestCase subclass actually inherits their tests.
+        for inherited in reversed(scopes):
+            for member in inherited.body:
+                for name in _statement_bindings(member):
+                    class_names.discard(name)
+                    method_names.pop(name, None)
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    method_names[member.name] = member
+                    method_modules[member] = defining_modules[inherited]
+            class_names.update(_zero_precision_bindings(inherited, root))
         setup_attributes: set[str] = set()
-        methods = [
-            node for node in scope.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ]
+        methods = list(method_names.values())
         for method in methods:
             arguments = [*method.args.posonlyargs, *method.args.args]
             if method.name not in {"setUp", "setUpClass", "asyncSetUp"} or not arguments:
@@ -879,7 +893,7 @@ def _test_precision_scopes(
         for method in methods:
             if not method.name.startswith("test"):
                 continue
-            names = set(module_names)
+            names = _zero_precision_bindings(method_modules[method], root)
             names.update(f"{scope.name}.{name}" for name in class_names)
             arguments = [*method.args.posonlyargs, *method.args.args]
             if arguments:
@@ -890,6 +904,175 @@ def _test_precision_scopes(
             names.update(_zero_precision_bindings(method, root))
             selected.append((method, names))
     return selected
+
+
+def _statement_bindings(statement: ast.stmt) -> list[str]:
+    if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        return [statement.name]
+    if isinstance(statement, ast.AnnAssign) and statement.value is None:
+        return []
+    if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.Delete)):
+        targets = (
+            [statement.target] if isinstance(statement, ast.AnnAssign)
+            else statement.targets
+        )
+        return [
+            node.id for target in targets for node in ast.walk(target)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+        ]
+    if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        return [alias.asname or alias.name.split(".")[0] for alias in statement.names]
+    return []
+
+
+def _unittest_class_scopes(
+    tree: ast.Module, root: Path, path: Path,
+) -> tuple[list[tuple[ast.ClassDef, ...]], dict[ast.ClassDef, ast.Module]]:
+    """Resolve unittest bases, aliases, and workspace MROs without importing code.
+
+    TestLoader collects module-bound TestCase subclasses regardless of their
+    names. An ordinary class containing test-prefixed methods is not a suite.
+    """
+
+    testcase_bases = {
+        "unittest.TestCase", "unittest.case.TestCase",
+        "unittest.IsolatedAsyncioTestCase", "unittest.async_case.IsolatedAsyncioTestCase",
+    }
+    modules: dict[Path, dict[str, str | ast.ClassDef | Path]] = {}
+    defining_modules: dict[ast.ClassDef, ast.Module] = {}
+    linearizations: dict[ast.ClassDef, tuple[str | ast.ClassDef, ...]] = {}
+
+    def local_path(candidate: Path) -> Path | None:
+        for selected in (candidate / "__init__.py", candidate.with_suffix(".py")):
+            try:
+                resolved = selected.resolve()
+                if resolved.is_relative_to(root) and resolved.is_file():
+                    return resolved
+            except (OSError, RuntimeError):
+                continue
+        return None
+
+    def module_ref(name: str, current: Path, level: int = 0) -> str | Path | None:
+        if level == 0 and (name == "unittest" or name.startswith("unittest.")):
+            return name
+        search = [root / "tests", root]
+        if level:
+            search = [current.parent.joinpath(*([".."] * (level - 1)))]
+        return next((
+            selected for directory in search
+            if (selected := local_path(directory.joinpath(*name.split(".")))) is not None
+        ), None)
+
+    def member(owner: str | Path, name: str) -> str | ast.ClassDef | Path | None:
+        if isinstance(owner, str):
+            return f"{owner}.{name}"
+        exports = load_module(owner)
+        if name in exports:
+            return exports[name]
+        return local_path(owner.parent / name) if owner.name == "__init__.py" else None
+
+    def load_module(
+        module_path: Path, source: ast.Module | None = None,
+    ) -> dict[str, str | ast.ClassDef | Path]:
+        if module_path in modules:
+            # Partially populated exports also terminate circular imports.
+            return modules[module_path]
+        if len(modules) >= _STATIC_TEST_MODULE_LIMIT:
+            return {}
+        bindings: dict[str, str | ast.ClassDef | Path] = {}
+        modules[module_path] = bindings
+        if source is None:
+            try:
+                if module_path.stat().st_size > _STATIC_TEST_MODULE_BYTES:
+                    return bindings
+                source = ast.parse(module_path.read_text(encoding="utf-8"))
+            except (OSError, SyntaxError, UnicodeDecodeError):
+                return bindings
+
+        def resolve(node: ast.AST | None) -> str | ast.ClassDef | Path | None:
+            if isinstance(node, ast.Name):
+                return bindings.get(node.id)
+            if isinstance(node, ast.Attribute):
+                owner = resolve(node.value)
+                if isinstance(owner, (str, Path)):
+                    return member(owner, node.attr)
+            return None
+
+        for statement in source.body:
+            value = (
+                resolve(statement.value)
+                if isinstance(statement, (ast.Assign, ast.AnnAssign)) else None
+            )
+            bases = (
+                [
+                    base for node in statement.bases
+                    if isinstance((base := resolve(node)), (str, ast.ClassDef))
+                ]
+                if isinstance(statement, ast.ClassDef) else []
+            )
+            for name in _statement_bindings(statement):
+                bindings.pop(name, None)
+            if isinstance(statement, ast.Import):
+                for alias in statement.names:
+                    imported = module_ref(
+                        alias.name if alias.asname else alias.name.split(".")[0], module_path,
+                    )
+                    if imported is not None:
+                        bindings[alias.asname or alias.name.split(".")[0]] = imported
+            elif isinstance(statement, ast.ImportFrom):
+                imported = module_ref(statement.module or "", module_path, statement.level)
+                if imported is not None:
+                    for alias in statement.names:
+                        if alias.name == "*":
+                            if isinstance(imported, Path):
+                                bindings.update({
+                                    name: value for name, value in load_module(imported).items()
+                                    if not name.startswith("_")
+                                })
+                            else:
+                                bindings.update({
+                                    base.rsplit(".", 1)[1]: base for base in testcase_bases
+                                    if base.rsplit(".", 1)[0] == imported
+                                })
+                        elif (value := member(imported, alias.name)) is not None:
+                            bindings[alias.asname or alias.name] = value
+            elif isinstance(statement, (ast.Assign, ast.AnnAssign)) and value is not None:
+                for name in _statement_bindings(statement):
+                    bindings[name] = value
+            elif isinstance(statement, ast.ClassDef):
+                remaining = [
+                    list(linearizations[base]) if isinstance(base, ast.ClassDef) else [base]
+                    for base in bases
+                ]
+                remaining.append(list(bases))
+                order: list[str | ast.ClassDef] = [statement]
+                while any(remaining):
+                    head = next((
+                        group[0] for group in remaining if group
+                        and not any(group[0] in other[1:] for other in remaining)
+                    ), None)
+                    if head is None:
+                        # An inconsistent MRO cannot produce an importable suite.
+                        order = [statement]
+                        break
+                    order.append(head)
+                    for group in remaining:
+                        if group and group[0] == head:
+                            group.pop(0)
+                linearizations[statement] = tuple(order)
+                defining_modules[statement] = source
+                bindings[statement.name] = statement
+        return bindings
+
+    bindings = load_module(path.resolve(), tree)
+    discovered = dict.fromkeys(
+        value for value in bindings.values() if isinstance(value, ast.ClassDef)
+    )
+    return [
+        tuple(base for base in linearizations[scope] if isinstance(base, ast.ClassDef))
+        for scope in discovered
+        if any(base in testcase_bases for base in linearizations[scope] if isinstance(base, str))
+    ], defining_modules
 
 
 def _binding_name(node: ast.AST) -> str | None:

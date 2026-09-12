@@ -978,8 +978,9 @@ longer defines.
   call, active marker, and integrity-bound content-free envelopes remain
   protected through failed repairs and TaskRun recovery. Retention updates
   recheck current references after selecting a page, so stale dependency views
-  cannot erase pending evidence. Consuming a continuation releases its own
-  dependency; checkpoint references and cross-process pending forks still
+  cannot erase pending evidence. Consuming a continuation or changing its
+  context generation releases its own dependency; checkpoint references and
+  cross-process pending forks in their current generation still
   protect the original evidence. Arbitrary snapshot body IDs create no such
   dependency, and malformed markers preserve remaining evidence.
 - `automatic-context-management-does-not-grant-authority`: context pressure
@@ -1522,8 +1523,9 @@ longer defines.
   observation of the same target renders as a content-free stub; Human and
   process input results stay verbatim, the durable Objects are unchanged, and
   the cache-optimized layout strips stub Object ids like any other envelope.
-  Different JSON subtrees and byte pages of one memory Object are independent
-  observations; only the same selection supersedes an earlier result.
+  Different JSON subtrees, byte pages, and listing selections are independent
+  observations; only the same selection supersedes an earlier result. Listings
+  without complete request provenance only supersede identical result content.
 - `source-materialization-stays-within-admission-headroom`: the per-quantum
   source materialization budget never exceeds the process window or the
   resolved per-call input limit minus the fixed prompt overhead and headroom,

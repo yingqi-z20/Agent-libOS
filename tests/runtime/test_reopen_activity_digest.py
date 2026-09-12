@@ -162,12 +162,15 @@ def test_prompt_after_reopen_names_earlier_reads_writes_and_commands() -> None:
             runtime.activate_skill(pid, "agent-libos-workspace-navigation")
             runtime.activate_skill(pid, "agent-libos-workspace-editing")
             runtime.filesystem.grant_directory(
-                pid, ".", [CapabilityRight.READ, CapabilityRight.WRITE], issued_by="test"
+                pid, ".", [CapabilityRight.READ, CapabilityRight.WRITE, CapabilityRight.DELETE], issued_by="test"
             )
             first = runtime.run_process_once(pid)
             assert first["ok"] is True, first
             second = runtime.run_process_once(pid)
             assert second["ok"] is True, second
+            runtime.filesystem.delete_file(pid, "notes.md")
+            runtime.filesystem.write_directory(pid, "scratch")
+            runtime.filesystem.delete_directory(pid, "scratch")
         finally:
             runtime.close()
 
@@ -186,11 +189,32 @@ def test_prompt_after_reopen_names_earlier_reads_writes_and_commands() -> None:
             digest = prompt.split(REOPEN_DIGEST_HEADING, 1)[1].split("\n\n", 1)[0]
             assert "AGENTS.md" in digest
             assert "notes.md (" in digest
+            assert "- files deleted: notes.md" in digest
+            assert "- directories ensured: scratch" in digest
+            assert "- directories deleted: scratch" in digest
             assert "skills activated: agent-libos-workspace-navigation" in digest
             assert "PRIVATE_NOTE_BODY" not in prompt, "the digest never carries payloads"
             assert "follow me" not in prompt
         finally:
             reopened.close()
+
+
+def test_filesystem_digest_ignores_unknown_mutations_and_noop_deletions() -> None:
+    events = [
+        _event(1, EventType.EXTERNAL_WRITE, {
+            "adapter": "filesystem", "operation": "delete_file", "path": "missing.txt", "deleted": False,
+        }),
+        _event(2, EventType.EXTERNAL_WRITE, {
+            "adapter": "filesystem", "operation": "delete_directory", "path": "missing-dir", "deleted": False,
+        }),
+        _event(3, EventType.EXTERNAL_WRITE, {
+            "adapter": "filesystem", "operation": "unknown_mutation", "path": "unknown.txt", "bytes_written": 5,
+        }),
+    ]
+    included: list[Event] = []
+
+    assert render_reopen_activity_digest(events, on_included_event=included.append) == ""
+    assert included == [], "omitted facts must not contribute data-flow labels"
 
 
 def test_prompt_without_lost_results_has_no_digest() -> None:

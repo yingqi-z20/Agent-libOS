@@ -36,6 +36,7 @@ def _marker(*, state: str = "pending", second: int = 1) -> LLMCallRecord:
         ],
         request_options={"provider_continuation": {
             "schema_version": 1, "state": state, "call_id": "hosted-call",
+            "context_generation": "initial",
         }},
     )
 
@@ -114,6 +115,7 @@ def test_checkpoint_references_keep_consumed_source_and_marker_payloads() -> Non
                 "payload_sha256": "d" * 64,
             }}},
         )
+        store.set_llm_context_generation(source.pid, "restored-generation")
         assert _retention_ids(store) == {source.call_id, marker.call_id}
         assert _attempt_retention(store, source) is False
         assert _attempt_retention(store, marker) is False
@@ -148,7 +150,7 @@ def test_fork_pending_marker_protects_source_in_original_pid_until_consumption()
             _marker(second=3), pid="fork-pid", call_id="fork-marker",
             request_options={"provider_continuation": {
                 "schema_version": 2, "state": "pending", "call_id": source.call_id,
-                "source_pid": source.pid,
+                "source_pid": source.pid, "context_generation": "initial",
             }},
         )
         for record in (source, _marker(), _marker(state="consumed", second=2), fork_marker):
@@ -185,9 +187,91 @@ def test_postgres_translates_only_fixed_continuation_reference_paths(monkeypatch
         assert "continuation_ref.value ->> 'marker_call_id'" in translated
         assert "continuation_ref.value ->> 'source_call_id'" in translated
         assert "marker.request_options_json::json -> 'provider_continuation' ->> 'call_id'" in translated
+        assert "marker.request_options_json::json -> 'provider_continuation' ->> 'context_generation'" in translated
+        assert "json_typeof(marker.request_options_json::json -> 'provider_continuation' -> 'context_generation') = 'string'" in translated
+        assert "COALESCE(generation.generation, 'initial')" in translated
+        assert "json_type(" not in translated
         assert translated.count("%s") == len(params) == 1
         assert "COLLATE BINARY" not in translated
         assert _PostgresDialect().prepare("SELECT json_extract(arbitrary_json, '$.arbitrary')") == "SELECT json_extract(arbitrary_json, '$.arbitrary')"
+    finally:
+        store.close()
+
+
+def test_restoring_checkpoint_predating_continuation_releases_discarded_payloads() -> None:
+    from agent_libos import Runtime
+    from tests.runtime.test_provider_tools_executor import _Responses, _capture, _config, _spawn
+
+    runtime = Runtime.open("local", config=_config(code=True))
+    try:
+        provider = _Responses("hosted", "action", code=True)
+        _capture(runtime, provider)
+        pid = _spawn(runtime)
+        checkpoint_id = runtime.checkpoint.create(pid, "before hosted result", actor=pid)
+        result = runtime.run_process_once(pid)
+        assert result.get("provider_continuation") is True
+        source = runtime.store.get_llm_call(result["call_id"])
+        marker = runtime.store.get_latest_llm_call(pid=pid, purpose="provider_continuation")
+        assert {source.call_id, marker.call_id}.issubset(_retention_ids(runtime.store))
+
+        runtime.checkpoint.restore(pid, checkpoint_id, require_capability=False)
+        assert runtime.llm._provider_continuation_data(pid) is None
+        assert runtime.run_process_once(pid)["ok"]
+
+        assert not {source.call_id, marker.call_id} & _retention_ids(runtime.store)
+        assert _attempt_retention(runtime.store, source) is True
+        assert _attempt_retention(runtime.store, marker) is True
+    finally:
+        runtime.close()
+
+
+def test_fork_reference_survives_original_generation_change_until_fork_is_obsolete() -> None:
+    store = SQLiteStore(":memory:")
+    try:
+        source, marker = _source(), _marker()
+        fork_marker = replace(
+            marker, pid="fork-pid", call_id="fork-marker",
+            request_options={"provider_continuation": {
+                **marker.request_options["provider_continuation"],
+                "schema_version": 2, "source_pid": source.pid,
+            }},
+        )
+        for record in (source, marker, fork_marker):
+            store.insert_llm_call(record)
+        store.set_llm_context_generation(source.pid, "restored-original")
+        assert _retention_ids(store) == {source.call_id, fork_marker.call_id}
+        assert _attempt_retention(store, source) is False
+        assert _attempt_retention(store, fork_marker) is False
+        assert _attempt_retention(store, marker) is True
+
+        store.set_llm_context_generation(fork_marker.pid, "restored-fork")
+        assert _retention_ids(store) == frozenset()
+        assert _attempt_retention(store, source) is True
+        assert _attempt_retention(store, fork_marker) is True
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("generation", [None, "", 42, []])
+def test_unknown_fork_marker_generation_preserves_remaining_evidence(generation) -> None:
+    store = SQLiteStore(":memory:")
+    try:
+        source = _source()
+        marker = _marker()
+        fork_marker = replace(
+            marker, pid="fork-pid", call_id="fork-marker",
+            request_options={"provider_continuation": {
+                **marker.request_options["provider_continuation"],
+                "schema_version": 2, "source_pid": source.pid,
+                "context_generation": generation,
+            }},
+        )
+        for record in (source, marker, _marker(state="consumed", second=2), fork_marker):
+            store.insert_llm_call(record)
+        store.set_llm_context_generation(fork_marker.pid, "restored-fork")
+        assert _retention_ids(store) == {source.call_id, fork_marker.call_id}
+        assert _attempt_retention(store, source) is False
+        assert _attempt_retention(store, fork_marker) is False
     finally:
         store.close()
 
