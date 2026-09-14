@@ -366,7 +366,7 @@ class TestTestMatrix:
 
     @pytest.mark.parametrize(
         ("lane", "shard_count"),
-        [("runtime", 2), ("providers", 3)],
+        [("runtime", 2), ("providers", 3), ("benchmark", 2)],
     )
     def test_lane_shards_are_complete_disjoint_and_weight_balanced(
         self,

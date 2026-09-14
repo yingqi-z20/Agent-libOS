@@ -18,6 +18,11 @@ from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import SQLiteStore
 
 
+# Startup synchronization must tolerate slower CI hosts. Workers stay at the
+# cancellation barrier until the caller releases them, even if this wait fails.
+_STARTUP_BARRIER_TIMEOUT_S = 30.0
+
+
 def _contains_cancellation(error: BaseException) -> bool:
     if isinstance(error, asyncio.CancelledError):
         return True
@@ -104,7 +109,7 @@ def test_cancelled_async_open_closes_store_returned_by_open_worker(
 
     def delayed_open_store(*_args: object, **_kwargs: object) -> SQLiteStore:
         open_entered.set()
-        allow_open_to_finish.wait(timeout=1.0)
+        allow_open_to_finish.wait()
         return store
 
     monkeypatch.setattr(
@@ -114,9 +119,11 @@ def test_cancelled_async_open_closes_store_returned_by_open_worker(
 
     async def exercise() -> tuple[BaseException | None, bool]:
         opening = asyncio.create_task(Runtime.aopen("local"))
-        assert await asyncio.to_thread(open_entered.wait, 2.0)
-        opening.cancel()
-        allow_open_to_finish.set()
+        try:
+            assert await asyncio.to_thread(open_entered.wait, _STARTUP_BARRIER_TIMEOUT_S)
+            opening.cancel()
+        finally:
+            allow_open_to_finish.set()
 
         caught: BaseException | None = None
         leaked_runtime: Runtime | None = None
@@ -179,7 +186,7 @@ def test_cancelled_successful_async_assembly_normally_shuts_down_runtime(
         original_assemble(host, selected_store, **kwargs)  # type: ignore[arg-type]
         assembled_hosts.append(host)
         assembly_succeeded.set()
-        allow_assembly_to_return.wait(timeout=1.0)
+        allow_assembly_to_return.wait()
 
     monkeypatch.setattr(
         RuntimeBuilder,
@@ -191,9 +198,13 @@ def test_cancelled_successful_async_assembly_normally_shuts_down_runtime(
         opening = asyncio.create_task(
             RuntimeBuilder.configured(Runtime).afrom_store(store)
         )
-        assert await asyncio.to_thread(assembly_succeeded.wait, 2.0)
-        opening.cancel()
-        allow_assembly_to_return.set()
+        try:
+            assert await asyncio.to_thread(
+                assembly_succeeded.wait, _STARTUP_BARRIER_TIMEOUT_S,
+            )
+            opening.cancel()
+        finally:
+            allow_assembly_to_return.set()
 
         caught: BaseException | None = None
         leaked_runtime: Runtime | None = None
@@ -308,7 +319,7 @@ def test_cancelled_open_publishes_retriable_normal_shutdown_handle(
             host.scheduler.shutdown = fail_first_scheduler_shutdown  # type: ignore[method-assign]
         assembled_hosts.append(host)
         assembly_succeeded.set()
-        allow_assembly_to_return.wait(timeout=1.0)
+        allow_assembly_to_return.wait()
 
     monkeypatch.setattr(
         RuntimeBuilder,
@@ -318,9 +329,13 @@ def test_cancelled_open_publishes_retriable_normal_shutdown_handle(
 
     async def exercise() -> RuntimeAssemblyCleanupRequired:
         opening = asyncio.create_task(Runtime.aopen("local"))
-        assert await asyncio.to_thread(assembly_succeeded.wait, 2.0)
-        opening.cancel()
-        allow_assembly_to_return.set()
+        try:
+            assert await asyncio.to_thread(
+                assembly_succeeded.wait, _STARTUP_BARRIER_TIMEOUT_S,
+            )
+            opening.cancel()
+        finally:
+            allow_assembly_to_return.set()
 
         with pytest.raises(BaseExceptionGroup) as caught:
             await opening

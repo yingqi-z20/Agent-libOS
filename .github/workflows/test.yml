@@ -263,7 +263,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.14"]
-        lane: ["unit", "self-evolution", "providers", "benchmark"]
+        lane: ["unit", "self-evolution", "providers"]
         include:
           - python-version: "3.11"
             lane: runtime
@@ -276,6 +276,18 @@ jobs:
             shard_args: --shard-count 2 --shard-index 0
           - python-version: "3.14"
             lane: runtime
+            shard_args: --shard-count 2 --shard-index 1
+          - python-version: "3.11"
+            lane: benchmark
+            shard_args: --shard-count 2 --shard-index 0
+          - python-version: "3.11"
+            lane: benchmark
+            shard_args: --shard-count 2 --shard-index 1
+          - python-version: "3.14"
+            lane: benchmark
+            shard_args: --shard-count 2 --shard-index 0
+          - python-version: "3.14"
+            lane: benchmark
             shard_args: --shard-count 2 --shard-index 1
 
     steps:
