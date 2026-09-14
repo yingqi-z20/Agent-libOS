@@ -39,7 +39,9 @@ def test_six_durability_barriers_use_independent_fsync_provider_truth(
     )
     assert all(result.runtime_reopened and result.root_present for result in results)
     assert all(result.settlement_reopen_stable for result in results)
-    assert all(result.passed for result in results)
+    assert all(result.passed for result in results), {
+        result.barrier.value: result for result in results if not result.passed
+    }
     assert {
         result.recovery_class for result in results
     } == set(RecoveryClass)
@@ -55,7 +57,10 @@ def test_six_durability_barriers_use_independent_fsync_provider_truth(
     assert all("unknown_effect" in result.blocker_kinds for result in unknown)
     action = by_barrier[DurabilityBarrier.ACTION_COMMITTED]
     assert action.validated_action_present
+    assert action.resume_point_present
     assert action.pending_action_present
+    assert not action.tool_call_present
+    assert not action.effect_link_present
     assert action.local_llm_call_count == 1
     assert by_barrier[DurabilityBarrier.RESUME_POINT_COMMITTED].resume_point_present
     assert by_barrier[DurabilityBarrier.PROVIDER_RESULT_DURABLE].resume_point_present

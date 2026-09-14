@@ -233,13 +233,13 @@ def _install_commit_barrier(
     idempotency_key: str,
 ) -> None:
     if barrier is DurabilityBarrier.ACTION_COMMITTED:
-        original = runtime.task_runs.record_validated_transcript
-
-        def crash_after_validated(**kwargs: Any) -> Any:
-            original(**kwargs)
+        # Validated transcript persistence is nested in the executor's atomic
+        # transcript/replay transaction. Crash at the following claim boundary,
+        # after that outer transaction commits and before tool dispatch begins.
+        def crash_before_action_claim(_pid: str, _expected: Any) -> NoReturn:
             _crash(False)
 
-        runtime.task_runs.record_validated_transcript = crash_after_validated  # type: ignore[method-assign]
+        runtime.llm._claim_task_run_validated_action = crash_before_action_claim  # type: ignore[method-assign]  # noqa: SLF001
         return
     if barrier is DurabilityBarrier.EFFECT_PREPARED:
         original = runtime.task_runs.expected_tool_id_for_pending_action
