@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from agent_libos.llm.prompt import (
     FEEDBACK_STUB_RECORD_TYPE,
+    PROMPT_LAYOUT_CACHE_OPTIMIZED_V2,
     PROMPT_LAYOUT_LEGACY_V1,
     _compact_materialized_context_text,
     _context_metadata_section,
@@ -154,7 +157,8 @@ def test_v2_compaction_strips_object_ids_from_feedback_stubs() -> None:
     assert json.loads(compact)["stub_reason"] == "superseded"
 
 
-def test_legacy_metadata_explains_compacted_feedback_stubs() -> None:
+@pytest.mark.parametrize("layout", [PROMPT_LAYOUT_LEGACY_V1, PROMPT_LAYOUT_CACHE_OPTIMIZED_V2])
+def test_metadata_explains_compacted_feedback_stubs(layout: str) -> None:
     context = MaterializedContext(
         text="goal",
         object_refs=["obj-goal", "obj-old"],
@@ -167,11 +171,13 @@ def test_legacy_metadata_explains_compacted_feedback_stubs() -> None:
         ],
     )
 
-    section = _context_metadata_section(context, prompt_layout=PROMPT_LAYOUT_LEGACY_V1)
+    section = _context_metadata_section(context, prompt_layout=layout)
 
     assert "compacted_feedback_stubs: 1" in section
     assert FEEDBACK_STUB_RECORD_TYPE in section
-    assert "do not re-read files merely to re-establish context" in section
+    assert "Do not repeat an effect just to recover its output" in section
+    assert "token_budget stub may never have been shown in full" in section
+    assert "read_memory_object" in section
 
     plain = MaterializedContext(
         text="goal",
@@ -182,5 +188,5 @@ def test_legacy_metadata_explains_compacted_feedback_stubs() -> None:
         object_manifest=[{"oid": "obj-goal", "disposition": "included", "transform": "verbatim"}],
     )
     assert "compacted_feedback_stubs" not in _context_metadata_section(
-        plain, prompt_layout=PROMPT_LAYOUT_LEGACY_V1
+        plain, prompt_layout=layout
     )

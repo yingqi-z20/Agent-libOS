@@ -1155,11 +1155,13 @@ def _context_metadata_section(
     prompt_layout: str,
 ) -> str:
     if prompt_layout == PROMPT_LAYOUT_CACHE_OPTIMIZED_V2:
-        if not context.omitted_objects:
+        stub_guidance = _compacted_feedback_guidance(context)
+        if not context.omitted_objects and not stub_guidance:
             return ""
         return (
             "Materialized context warning:\n"
             f"- omitted_object_count: {len(context.omitted_objects)}"
+            f"{stub_guidance}"
         )
     return (
         "Materialized context metadata (volatile):\n"
@@ -1173,7 +1175,7 @@ def _context_metadata_section(
 
 
 def _compacted_feedback_guidance(context: MaterializedContext) -> str:
-    """Tell the model that stub records stand for earlier feedback, not lost work."""
+    """Explain bounded receipts without claiming their payloads were seen."""
 
     stubs = sum(
         1
@@ -1186,12 +1188,18 @@ def _compacted_feedback_guidance(context: MaterializedContext) -> str:
         return ""
     return (
         f"\n- compacted_feedback_stubs: {stubs} (records of type "
-        f"`{FEEDBACK_STUB_RECORD_TYPE}` stand for the oldest tool results of this "
-        "long task; their payloads were already shown in earlier quanta and every "
-        "newer result is still verbatim. They are a record that the action "
-        "happened, not a request to redo it: do not re-read files merely to "
-        "re-establish context, and re-read a stubbed file only when you need its "
-        "exact current content for an edit you are about to make.)"
+        f"`{FEEDBACK_STUB_RECORD_TYPE}` summarize older feedback or a result too "
+        "large for this budget. A token_budget stub may never have been shown "
+        "in full. Preserve its outcome and truncation flags; absent flags do "
+        "not prove completeness. A read_memory_object stub's retrieved_payload "
+        "is the exact selected value: use it directly instead of reading the "
+        "same selection again. To inspect other retained content, use "
+        "read_memory_object with the stub's exact name and namespace, a focused "
+        "json_pointer such as /result/stderr, and a small max_payload_chars; "
+        "follow next_cursor with expected_sha256 for further pages. Load the "
+        "Object Memory Skill if needed. Do not repeat an effect just to recover "
+        "its output. Re-read the external source when you need its current "
+        "state, including complete file content and its digest before editing.)"
     )
 
 
@@ -1658,6 +1666,10 @@ def _compact_materialized_context_record(
         )
     if record.get("record_type") == FEEDBACK_STUB_RECORD_TYPE:
         compact = dict(record)
+        if "namespace" in compact:
+            compact["namespace"] = _semantic_memory_namespace(
+                compact["namespace"], current_namespace=current_namespace,
+            )
         if not include_object_ids:
             compact.pop("object_oid", None)
         return compact

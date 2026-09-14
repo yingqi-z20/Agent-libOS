@@ -454,6 +454,97 @@ def test_negative_half_coverage_is_required_for_each_consumer(tmp_path: Path, co
     assert regression_coverage(root)["negative_half_unit"] is False
 
 
+_MODULE_FIXTURE_TESTS = _REGRESSION_TESTS.replace(
+    "class RoundingConsumerTests(unittest.TestCase):",
+    'JPY_ROWS = [{"date": "d", "account": "a", "amount": "-2.5"}]\n\n'
+    "class RoundingConsumerTests(unittest.TestCase):",
+).replace(
+    'summarize(rows("-2.5"), JPY_UP)', 'summarize(JPY_ROWS, JPY_UP)',
+).replace(
+    'export_rows(rows("-40961.5"), JPY_UP)[0]["amount"], "-40962"',
+    'export_rows(JPY_ROWS, JPY_UP)[0]["amount"], "-3"',
+).replace(
+    'check_balance(rows("-2.5", "3"), JPY_UP)',
+    'check_balance(JPY_ROWS + rows("3"), JPY_UP)',
+)
+
+
+@pytest.mark.parametrize("annotated", [False, True])
+def test_negative_half_detector_follows_referenced_module_literal_fixtures(
+    tmp_path: Path, annotated: bool,
+) -> None:
+    root = tmp_path / "workspace"
+    prepare_workspace(root)
+    _apply_reference_fix(root)
+    source = _MODULE_FIXTURE_TESTS
+    if annotated:
+        source = source.replace("JPY_ROWS =", "JPY_ROWS: list[dict[str, str]] =")
+    root.joinpath("tests/test_rounding_consumers.py").write_text(source, encoding="utf-8")
+
+    suite = _run(root, "-m", "unittest", "discover", "-s", "tests", "-q")
+    assert suite.returncode == 0, suite.stderr
+    assert regression_coverage(root) == {
+        "whole_unit_per_consumer": True,
+        "negative_half_unit": True,
+    }
+
+    # These are executable regressions: the referenced fixture exposes a
+    # consumer that handles positive values correctly but rounds negatives wrong.
+    mutant = _FIXED_EXPORTER.replace(
+        "config.precision, config.rounding)",
+        'config.precision, "ROUND_HALF_EVEN" if parse_amount(row["amount"]) < 0 '
+        "else config.rounding)",
+    )
+    root.joinpath("ledgerctl/exporter.py").write_text(mutant, encoding="utf-8")
+    failed = _run(root, "-m", "unittest", "discover", "-s", "tests", "-q")
+    assert failed.returncode != 0
+    assert "test_exporter_negative_half" in failed.stderr
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["unused", "local_shadow", "import_shadow", "module_rebound", "dynamic_fixture", "nonfinite"],
+)
+def test_negative_half_detector_does_not_borrow_unrelated_module_literals(
+    tmp_path: Path, change: str,
+) -> None:
+    root = tmp_path / "workspace"
+    prepare_workspace(root)
+    _apply_reference_fix(root)
+    source = _MODULE_FIXTURE_TESTS
+    if change == "unused":
+        source = source.replace("export_rows(JPY_ROWS, JPY_UP)", 'export_rows(rows("2"), JPY_UP)')
+    elif change == "local_shadow":
+        source = source.replace(
+            "    def test_exporter_negative_half(self) -> None:\n",
+            "    def test_exporter_negative_half(self) -> None:\n"
+            '        JPY_ROWS = rows("2")\n',
+        )
+    elif change == "import_shadow":
+        source = source.replace(
+            "    def test_exporter_negative_half(self) -> None:\n",
+            "    def test_exporter_negative_half(self) -> None:\n"
+            "        from fixture_data import JPY_ROWS\n",
+        )
+    elif change == "module_rebound":
+        source = source.replace(
+            "class RoundingConsumerTests(unittest.TestCase):",
+            'JPY_ROWS = [{"date": "d", "account": "a", "amount": "2"}]\n\n'
+            "class RoundingConsumerTests(unittest.TestCase):",
+        )
+    elif change == "dynamic_fixture":
+        source = source.replace(
+            'JPY_ROWS = [{"date": "d", "account": "a", "amount": "-2.5"}]',
+            'JPY_ROWS = rows("-2.5")',
+        )
+    else:
+        source = source.replace('"amount": "-2.5"', '"amount": "NaN"')
+    root.joinpath("tests/test_rounding_consumers.py").write_text(source, encoding="utf-8")
+
+    assert regression_coverage(root)["whole_unit_per_consumer"] is True
+    assert regression_coverage(root)["negative_half_unit"] is False
+
+
 def test_hidden_probe_rejects_validator_with_wrong_negative_rounding(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     prepare_workspace(root)

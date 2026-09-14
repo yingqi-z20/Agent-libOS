@@ -1016,17 +1016,22 @@ class ObjectMemoryDefaults:
     metadata_collection_item_max_chars: StrictInt = 2_048
     metadata_max_bytes: StrictInt = 131_072
     # ``working_set`` rendering window.  The newest N feedback Objects (tool
-    # results, error traces, test results) always render verbatim, and older
+    # results, error traces, test results) prefer verbatim rendering, and older
     # feedback keeps rendering verbatim while its estimated rendered tokens fit
     # the verbatim token window; feedback beyond that renders as a bounded stub
     # that names the tool and its target, and an observation superseded by a
     # fresher read of the same target is omitted.  A long task therefore keeps a
     # record of what it already did without replaying every payload on every
     # quantum, while a multi-file orientation stays fully in view.  Human input
-    # results (message reads, answers) are never compacted.
+    # results (message reads, answers) are never compacted and compete before
+    # observations and plans. A result too large to fit beside the selected
+    # goal/input renders as a retrievable stub even inside the recent window.
     working_set_recent_feedback: StrictInt = 8
     working_set_supersede_observations: bool = True
     working_set_verbatim_feedback_tokens: StrictInt = 48_000
+    # A focused memory read can have a tiny value inside a large receipt.
+    # Preserve that exact value in a budget stub when it fits; zero disables.
+    working_set_inline_read_payload_chars: StrictInt = 512
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
@@ -1438,6 +1443,10 @@ def _validate_object_memory_config(memory: ObjectMemoryDefaults) -> None:
     _positive(
         "memory.working_set_recent_feedback",
         memory.working_set_recent_feedback,
+    )
+    _nonnegative(
+        "memory.working_set_inline_read_payload_chars",
+        memory.working_set_inline_read_payload_chars,
     )
     if (
         isinstance(memory.working_set_verbatim_feedback_tokens, bool)

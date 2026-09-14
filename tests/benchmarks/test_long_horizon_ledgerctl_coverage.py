@@ -12,6 +12,7 @@ from benchmarks.long_horizon_agent.ledgerctl_scenario import (
 )
 from tests.benchmarks.test_long_horizon_ledgerctl import (
     _CLASS_DICT_STYLE_TESTS,
+    _MODULE_FIXTURE_TESTS,
     _REGRESSION_TESTS,
     _apply_reference_fix,
     _run,
@@ -223,6 +224,37 @@ def test_coverage_counts_mixin_methods_only_when_inherited_by_testcase(
     assert regression_coverage(root) == {
         "whole_unit_per_consumer": not override_methods,
         "negative_half_unit": not override_methods,
+    }
+
+
+@pytest.mark.parametrize("negative_fixture", [False, True])
+def test_inherited_methods_use_literals_from_their_defining_module(
+    tmp_path: Path, negative_fixture: bool,
+) -> None:
+    root = _reference_workspace(tmp_path)
+    source = _MODULE_FIXTURE_TESTS.replace(
+        "class RoundingConsumerTests(unittest.TestCase):", "class RoundingConsumerTests:",
+    )
+    if not negative_fixture:
+        source = source.replace('"amount": "-2.5"', '"amount": "2"')
+        source = source.replace('Decimal("-3")', 'Decimal("2")')
+        source = source.replace('["amount"], "-3"', '["amount"], "2"')
+        source = source.replace('JPY_ROWS + rows("3")', 'JPY_ROWS + rows("-2")')
+    (root / "tests/case_support.py").write_text(source, encoding="utf-8")
+    other_amount = "2" if negative_fixture else "-2.5"
+    (root / "tests/test_rounding_consumers.py").write_text(
+        "import unittest\n"
+        "from case_support import RoundingConsumerTests\n"
+        f'JPY_ROWS = [{{"date": "d", "account": "a", "amount": "{other_amount}"}}]\n'
+        "class DiscoveredTests(RoundingConsumerTests, unittest.TestCase):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    _assert_suite_count(root, 17)
+    assert regression_coverage(root) == {
+        "whole_unit_per_consumer": True,
+        "negative_half_unit": negative_fixture,
     }
 
 

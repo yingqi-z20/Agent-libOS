@@ -85,6 +85,11 @@ and both Tokyo fixtures, CHANGELOG structure with byte-identical released
 history, AST-parsed whole-unit and negative-half regressions for each consumer
 (including tests in unittest subpackages), the documented CLI smoke receipt
 after the last edit, and the absence of any successful delete receipt.
+Negative-half inputs may be inline or in referenced module-level literal
+fixtures, including annotated assignments. The static check ignores unused,
+rebound, locally shadowed, computed, and non-finite fixture values; it does not
+execute fixture expressions to discover test data. Independent behavior probes
+and the full executable suite remain required.
 Changed files must include the changelog and
 all three consumers and may add test modules other than `tests/test_config.py`.
 
@@ -160,6 +165,51 @@ prompt layouts. It also checks selection of recent feedback and constraints
 over stale plans. This tests the `working_set` policy's continuation contract;
 it is not evidence of real-model task success or a substitute for the restart
 and independent workspace oracles above.
+
+For context pressure with large tool outputs and an acknowledged follow-up:
+
+```bash
+uv run python -m pytest tests/runtime/test_working_set_pressure.py -q
+```
+
+The `working_set` policy selects acknowledged message/answer results alongside
+constraints, before observations and old plans. It leaves their content intact.
+Repeated complete message reads are omitted only when equally labelled,
+identical message content is already selected in the current prompt. A change
+to the body, identity, or labels remains visible; an unselected larger page
+cannot replace earlier input. Empty polls do not reserve permanent input space.
+When a tool result cannot fit beside the selected goal and input, the policy
+includes a bounded receipt with its exact Object Memory name and namespace,
+outcome, available truncation flags, and pagination/digest fields. The model can
+read a small subtree or page of that retained result through `read_memory_object`
+without executing the action again. If that read's wrapper also exceeds the
+budget, its exact selected value can appear as `retrieved_payload`, bounded by
+`memory.working_set_inline_read_payload_chars` (512 characters by default, zero
+to disable) and the remaining token budget. Partial reads never take this path.
+This prevents a small recovered value from disappearing inside another stub.
+This is a prompt projection: it neither
+changes the stored result nor grants read authority. A receipt that itself
+cannot fit is still omitted; missing flags never establish completeness.
+`token_budget` receipts may represent output the model has never seen in full.
+
+The deterministic pressure test follows 32 model turns, retrieves 16 oversized
+diagnostics exactly once each under a 2,000-token materialization budget, and
+checks retention of the original goal and the acknowledged follow-up throughout,
+including repeated reads of that follow-up.
+Both prompt layouts are covered, together with revoked handles and tiny budgets.
+Two additional opt-in tests ask the real model to recover an unpredictable
+failure marker and the follow-up filename from the same bounded context:
+
+```bash
+uv run --env-file .env python -m pytest tests/runtime/test_working_set_pressure.py \
+  -k real_model --run-real-llm -q
+```
+
+These focused real-model tests allow six scheduler quanta, with a 60-second
+logical-call deadline and no transport retries per call. They are a retrieval
+and constraint-retention smoke, separate from the full repository-maintenance
+oracle and the multi-provider prompt-cache release qualification. The default
+prompt layout remains `legacy_v1`.
 
 Add `--artifacts-root .benchmark_runs/long-horizon/artifacts` to retain the
 synthetic workspace and Runtime database when a failed run needs tool-argument

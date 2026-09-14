@@ -2445,9 +2445,24 @@ class ObjectMemoryManager:
         rendered_by_oid: dict[str, str] = {}
         selected_oids: set[str] = set()
         total = 0
+        protected_tokens = 0
+        selected_message_fingerprints: set[str] = set()
         stub_plan, priority_feedback, prerendered = self._working_set_stub_plan(objects, policy)
         for obj in self._sort_for_policy(objects, policy, priority_feedback=priority_feedback):
+            pinned_input = (
+                obj.type in _WORKING_SET_FEEDBACK_TYPES
+                and _feedback_is_pinned(self.prompt_payload(obj))
+            )
             stub_reason = stub_plan.get(obj.oid)
+            message_fingerprints = (
+                _message_feedback_fingerprints(self.prompt_payload(obj), obj.metadata)
+                if policy == "working_set" and pinned_input else set()
+            )
+            if message_fingerprints and message_fingerprints <= selected_message_fingerprints:
+                # Only an actually selected, equally labelled copy may replace
+                # an earlier message read. A newer page that cannot fit, is
+                # revoked, or omits an independent constraint cannot erase it.
+                stub_reason = "superseded"
             if stub_reason == "superseded":
                 # A fresher observation of the same target is already rendered;
                 # the stale copy would only contradict the current workspace.
@@ -2463,8 +2478,24 @@ class ObjectMemoryManager:
             else:
                 rendered = self._render_feedback_stub(obj, stub_reason)
                 transform = "compacted"
-            rendered_by_oid[obj.oid] = rendered
             tokens = estimate_tokens(rendered)
+            if (
+                policy == "working_set"
+                and stub_reason is None
+                and obj.type in _WORKING_SET_FEEDBACK_TYPES
+                and not pinned_input
+                and protected_tokens + tokens > budget_tokens
+            ):
+                # This result cannot fit even without competing feedback or
+                # plans. Keep a retrievable receipt instead of hiding the
+                # outcome of the action entirely. Ordinary first-fit misses
+                # still yield to the next candidate, preserving plan headroom.
+                rendered = self._render_feedback_stub(
+                    obj, "token_budget", budget_tokens=max(0, budget_tokens - total),
+                )
+                transform = "compacted"
+                tokens = estimate_tokens(rendered)
+            rendered_by_oid[obj.oid] = rendered
             if total + tokens > budget_tokens:
                 omitted.append(obj.oid)
                 manifest_by_oid[obj.oid] = self._manifest_entry(
@@ -2474,6 +2505,11 @@ class ObjectMemoryManager:
                 continue
             selected_oids.add(obj.oid)
             total += tokens
+            selected_message_fingerprints.update(message_fingerprints)
+            if pinned_input or obj.type in {
+                ObjectType.GOAL, ObjectType.CONSTRAINT, ObjectType.HUMAN_DECISION,
+            }:
+                protected_tokens += tokens
             manifest_by_oid[obj.oid] = self._manifest_entry(
                 obj, disposition="included", reason="selected",
                 transform=transform, rendered=rendered,
@@ -2528,7 +2564,7 @@ class ObjectMemoryManager:
         Object id to ``"superseded"`` (a fresher observation of the same target
         exists: the stale copy is omitted) or ``"older_feedback"`` (rendered as
         a bounded stub).  Feedback newer than the window renders verbatim: the
-        newest ``memory.working_set_recent_feedback`` Objects always do, and
+        newest ``memory.working_set_recent_feedback`` Objects prefer to, and
         older ones keep rendering verbatim while their estimated rendered
         tokens fit ``memory.working_set_verbatim_feedback_tokens``.  A file
         read or command output a maintainer still needs therefore stays in
@@ -2537,6 +2573,8 @@ class ObjectMemoryManager:
         verbatim Objects that selection ranks with the latest result.
         ``prerendered`` caches the verbatim renders computed while planning.
         Human input results (message reads, answers) are never compacted.
+        Selection may still stub a result too large to fit alongside the
+        goal and input, even when it is inside the verbatim window.
         The durable Objects are unchanged; this is a prompt projection.
         """
 
@@ -2583,24 +2621,46 @@ class ObjectMemoryManager:
             plan[obj.oid] = "older_feedback"
         return plan, priority_feedback, prerendered
 
-    def _render_feedback_stub(self, obj: AgentObject, reason: str) -> str:
+    def _render_feedback_stub(
+        self, obj: AgentObject, reason: str, *, budget_tokens: int | None = None,
+    ) -> str:
         """Render one older or superseded feedback Object as a compact record.
 
         The stub keeps the identity of the action (tool, target, outcome and
-        sizes) so the model knows what it already did without replaying the
-        payload.  It never copies result content.
+        sizes) so the model knows what it already did without replaying a
+        large payload. A budget stub may include a small, exact value from a
+        focused memory read; otherwise recovering a stub can itself produce
+        only a stub and the model never observes the retrieved value.
         """
 
         payload = self.prompt_payload(obj)
         record: dict[str, Any] = {
             "content_trust": "untrusted_data",
             "name": obj.name,
+            "namespace": obj.namespace,
             "object_oid": obj.oid,
             "record_type": FEEDBACK_STUB_RECORD_TYPE,
             "stub_reason": reason,
             "summary": _feedback_stub_summary(payload),
             "type": obj.type.value,
         }
+        result = payload.get("result") if isinstance(payload, dict) else None
+        inline_limit = self.config.memory.working_set_inline_read_payload_chars
+        if (
+            reason == "token_budget"
+            and inline_limit > 0
+            and isinstance(payload, dict)
+            and payload.get("tool_name") == "read_memory_object"
+            and payload.get("ok") is not False
+            and isinstance(result, dict)
+            and result.get("representation") == "json_value"
+            and result.get("truncated") is False
+            and "payload" in result
+            and len(_canonical_prompt_json(result["payload"])) <= inline_limit
+        ):
+            record["retrieved_payload"] = result["payload"]
+            if budget_tokens is not None and estimate_tokens(_canonical_prompt_json(record)) > budget_tokens:
+                record.pop("retrieved_payload")
         return _canonical_prompt_json(record)
 
     def _matches_view_filters(self, obj: AgentObject, filters: list[ObjectFilter]) -> bool:
@@ -2677,16 +2737,25 @@ class ObjectMemoryManager:
                     windowed_feedback.add(latest_feedback)
             priority = {
                 ObjectType.GOAL: 0,
-                ObjectType.CONSTRAINT: 2,
-                ObjectType.HUMAN_DECISION: 2,
+                ObjectType.CONSTRAINT: 1,
+                ObjectType.HUMAN_DECISION: 1,
                 ObjectType.TASK: 3,
                 ObjectType.PLAN: 3,
                 ObjectType.SUMMARY: 3,
             }
-            return sorted(
-                recent,
-                key=lambda obj: 1 if obj.oid in windowed_feedback else priority.get(obj.type, 4),
-            )
+            pinned_feedback = {
+                obj.oid for obj in recent
+                if obj.type in _WORKING_SET_FEEDBACK_TYPES
+                and _feedback_is_pinned(self.prompt_payload(obj))
+            }
+            # Not compacting Human input is insufficient: after it is read,
+            # its tool-result wrapper must also outrank accumulated plans and
+            # observations when the prompt no longer fits them all.
+            return sorted(recent, key=lambda obj: (
+                1 if obj.oid in pinned_feedback
+                else 2 if obj.oid in windowed_feedback
+                else priority.get(obj.type, 4)
+            ))
         if policy == "evidence_first":
             return sorted(recent, key=lambda obj: obj.type != ObjectType.EVIDENCE)
         if policy == "plan_first":
@@ -3313,6 +3382,18 @@ _STUB_SUMMARY_RESULT_FIELDS = (
     "checkpoint_id",
     "delivered",
     "kind",
+    "encoding",
+    "bytes_read",
+    "content_sha256",
+    "truncated",
+    "stdout_truncated",
+    "stderr_truncated",
+    "json_pointer",
+    "page_offset_bytes",
+    "page_bytes",
+    "next_cursor",
+    "sha256",
+    "has_more",
 )
 _STUB_SUMMARY_SIZE_FIELDS = (
     "content",
@@ -3328,7 +3409,53 @@ _STUB_LIST_MAX_ITEMS = 6
 def _feedback_is_pinned(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
-    return str(payload.get("tool_name") or "") in _PINNED_FEEDBACK_TOOLS
+    tool_name = str(payload.get("tool_name") or "")
+    if tool_name not in _PINNED_FEEDBACK_TOOLS:
+        return False
+    result = payload.get("result")
+    if tool_name != "ask_human" and isinstance(result, dict) and result.get("messages") == []:
+        # An empty poll has no Human input to preserve for the rest of a task.
+        return False
+    return True
+
+
+def _message_feedback_fingerprints(payload: Any, metadata: ObjectMetadata) -> set[str]:
+    """Identify complete message copies without conflating content or labels.
+
+    Delivery acknowledgement bookkeeping may change between reads; all other
+    message fields and the carrier's data labels must match. Incomplete pages
+    keep their own continuation information even when their bodies repeat.
+    """
+
+    if not isinstance(payload, dict) or payload.get("ok") is False:
+        return set()
+    if payload.get("tool_name") not in {"read_process_messages", "receive_process_messages"}:
+        return set()
+    result = payload.get("result")
+    if not isinstance(result, dict) or (
+        result.get("has_more") or result.get("omitted_count") or result.get("continuation")
+    ):
+        return set()
+    messages = result.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return set()
+    fingerprints: set[str] = set()
+    for message in messages:
+        if (
+            not isinstance(message, dict)
+            or not isinstance(message.get("message_id"), str)
+            or not message["message_id"]
+            or not isinstance(message.get("body"), str)
+            or message.get("status") not in {"unread", "acked"}
+        ):
+            return set()
+        identity = {
+            "message": {key: value for key, value in message.items()
+                        if key not in {"status", "acked_at"}},
+            "labels": labels_for_explain(metadata),
+        }
+        fingerprints.add(hashlib.sha256(_canonical_prompt_json(identity).encode("utf-8")).hexdigest())
+    return fingerprints
 
 
 def _observation_supersession_key(payload: Any) -> tuple[Any, ...] | None:

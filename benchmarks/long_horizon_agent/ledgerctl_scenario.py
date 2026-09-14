@@ -20,6 +20,7 @@ import ast
 import hashlib
 import json
 import re
+from collections import Counter
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -788,6 +789,69 @@ def _zero_precision_keyword(call: ast.Call) -> bool:
     )
 
 
+def _scope_bindings(statements: list[ast.stmt]) -> Counter[str]:
+    """Count bindings in one scope without borrowing nested function locals."""
+
+    bindings: Counter[str] = Counter()
+    pending: list[ast.AST] = list(statements)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bindings[node.name] += 1
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bindings[node.id] += 1
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            bindings.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bindings[node.name] += 1
+        pending.extend(ast.iter_child_nodes(node))
+    return bindings
+
+
+def _module_literal_fixtures(tree: ast.Module) -> dict[str, ast.expr]:
+    """Select unambiguous literal fixtures without executing candidate code."""
+
+    bindings = _scope_bindings(tree.body)
+    fixtures: dict[str, ast.expr] = {}
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            targets, value = statement.targets, statement.value
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            targets, value = [statement.target], statement.value
+        else:
+            continue
+        try:
+            ast.literal_eval(value)
+        except (ValueError, TypeError, SyntaxError, RecursionError):
+            # Calls, aliases and computed data need execution/data-flow evidence;
+            # a negative literal in their syntax does not prove their value.
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and bindings[target.id] == 1:
+                fixtures[target.id] = value
+    return fixtures
+
+
+def _regression_literal_nodes(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    fixtures: dict[str, ast.expr],
+) -> list[ast.AST]:
+    nodes = list(ast.walk(function))
+    locals_ = set(_scope_bindings(function.body))
+    locals_.update(node.arg for node in ast.walk(function.args) if isinstance(node, ast.arg))
+    referenced = {
+        node.id for node in nodes
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        and node.id not in locals_ and node.id in fixtures
+    }
+    for name in sorted(referenced):
+        nodes.extend(ast.walk(fixtures[name]))
+    return nodes
+
+
 def regression_coverage(workspace: str | Path) -> dict[str, bool]:
     """Parse executable regressions: whole-unit coverage per consumer, negative half.
 
@@ -800,6 +864,8 @@ def regression_coverage(workspace: str | Path) -> dict[str, bool]:
     ``precision = 0``, or an environment mapping with a ``*PRECISION`` key set to
     ``"0"``.  The oracle must not fail a legitimate solution because of its test
     style, so every spelling above is accepted.
+    Negative-half inputs may also live in a referenced module-level literal
+    fixture. Unused, rebound, locally shadowed or computed fixtures do not count.
     """
 
     root = Path(workspace).resolve()
@@ -810,19 +876,28 @@ def regression_coverage(workspace: str | Path) -> dict[str, bool]:
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue
-        for function, zero_precision_names in _test_precision_scopes(tree, root, path):
+        module_fixtures: dict[ast.Module, dict[str, ast.expr]] = {}
+        for function, zero_precision_names, defining_module in _test_precision_scopes(tree, root, path):
             calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
             consumer_calls = [call for call in calls if _callee_name(call) in CONSUMER_FUNCTIONS]
             if not consumer_calls:
                 continue
             if not _function_uses_zero_precision(function, calls, zero_precision_names, root):
                 continue
+            # Inherited methods keep the globals of their defining module,
+            # including when the discovered subclass uses the same fixture name.
+            if defining_module not in module_fixtures:
+                module_fixtures[defining_module] = _module_literal_fixtures(defining_module)
+            literal_fixtures = module_fixtures[defining_module]
             for call in consumer_calls:
                 per_consumer[_callee_name(call)] = True
             literals = [
                 value
-                for value in (_decimal_literal(node) for node in ast.walk(function))
-                if value is not None
+                for value in (
+                    _decimal_literal(node)
+                    for node in _regression_literal_nodes(function, literal_fixtures)
+                )
+                if value is not None and value.is_finite()
             ]
             if any(
                 value < 0
@@ -856,10 +931,10 @@ def _discoverable_test_files(root: Path) -> list[Path]:
 
 def _test_precision_scopes(
     tree: ast.Module, root: Path, path: Path,
-) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]]:
+) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, set[str], ast.Module]]:
     """Keep bindings inside statically discoverable unittest test classes."""
 
-    selected: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]] = []
+    selected: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, set[str], ast.Module]] = []
     class_scopes, defining_modules = _unittest_class_scopes(tree, root, path)
     for scopes in class_scopes:
         scope = scopes[0]
@@ -902,7 +977,7 @@ def _test_precision_scopes(
                     for name in class_names | setup_attributes
                 )
             names.update(_zero_precision_bindings(method, root))
-            selected.append((method, names))
+            selected.append((method, names, method_modules[method]))
     return selected
 
 
