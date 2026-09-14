@@ -4194,7 +4194,10 @@ class TestLLMContextMemory:
             runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
             _grant_context_compressor_authority(runtime, pid)
 
-            results = runtime.run_until_idle(max_quanta=3)
+            results = runtime.run_until_idle(
+                max_quanta=3,
+                cancel_inflight_on_budget_exhaustion=False,
+            )
 
             completed = _last_action_result(results, 'compact_process_context')
             assert completed['result']['ok']
@@ -4527,7 +4530,10 @@ class TestLLMContextMemory:
             before_version = before.version
             before_payload = json.loads(json.dumps(before.payload))
 
-            results = runtime.run_until_idle(max_quanta=2)
+            results = runtime.run_until_idle(
+                max_quanta=2,
+                cancel_inflight_on_budget_exhaustion=False,
+            )
 
             completed = _last_action_result(results, 'compact_process_context')
             assert completed['result']['ok'] is False
@@ -4675,7 +4681,10 @@ class TestLLMContextMemory:
             changed_payload['entries'].append({'kind': 'external_update', 'value': 'must survive'})
             runtime.memory.update_object(pid, handle, ObjectPatch(payload=changed_payload))
 
-            results = runtime.run_until_idle(max_quanta=2)
+            results = runtime.run_until_idle(
+                max_quanta=2,
+                cancel_inflight_on_budget_exhaustion=False,
+            )
 
             completed = _last_action_result(results, 'compact_process_context')
             assert completed['result']['ok'] is False
@@ -4864,7 +4873,10 @@ class TestLLMContextMemory:
             runtime.skills.activate_skill(pid, RUNTIME_SESSION_SKILL, actor=pid)
             _grant_context_compressor_authority(runtime, pid)
 
-            results = runtime.run_until_idle(max_quanta=5)
+            results = runtime.run_until_idle(
+                max_quanta=5,
+                cancel_inflight_on_budget_exhaustion=False,
+            )
 
             completed = _last_action_result(results, 'compact_process_context')
             assert completed['result']['ok']

@@ -1136,7 +1136,10 @@ def test_storage_pressure_builtin_compactor_resumes_without_reconsuming_finite_a
             ObjectPatch(payload=payload),
         )
 
-        results = runtime.run_until_idle(max_quanta=7)
+        results = runtime.run_until_idle(
+            max_quanta=7,
+            cancel_inflight_on_budget_exhaustion=False,
+        )
 
         assert any(result.get("waiting_event") for result in results)
         compacted_results = [
@@ -1734,6 +1737,10 @@ def test_builtin_auto_compaction_waits_for_child_then_rebuilds_context(
             },
             {"action": "process_exit", "payload": {"done": True}},
         ],
+        config=replace(
+            DEFAULT_CONFIG,
+            scheduler=replace(DEFAULT_CONFIG.scheduler, drain_window_s=0.0),
+        ),
     )
     runtime.capability.grant(
         pid,
@@ -1749,7 +1756,12 @@ def test_builtin_auto_compaction_waits_for_child_then_rebuilds_context(
     )
     monkeypatch.setattr("agent_libos.llm.executor.assess_context_pressure", _forced_pressure)
     try:
-        results = runtime.run_until_idle(max_quanta=4)
+        # Observe the admitted child/resume work without a wall-clock race at
+        # the quantum limit; cancellation behavior is tested by the scheduler.
+        results = runtime.run_until_idle(
+            max_quanta=4,
+            cancel_inflight_on_budget_exhaustion=False,
+        )
 
         assert any(result.get("waiting_event") for result in results)
         compacted = next(
