@@ -4946,9 +4946,11 @@ class TestLLMContextMemory:
 
     @pytest.mark.parametrize('prompt_layout', ['legacy_v1', 'cache_optimized_v2'])
     def test_repeated_small_compactions_fit_a_three_child_budget(self, prompt_layout: str) -> None:
-        config = replace(DEFAULT_CONFIG, llm=replace(
-            DEFAULT_CONFIG.llm, prompt_layout=prompt_layout,
-        ))
+        config = replace(
+            DEFAULT_CONFIG,
+            llm=replace(DEFAULT_CONFIG.llm, prompt_layout=prompt_layout),
+            scheduler=replace(DEFAULT_CONFIG.scheduler, drain_window_s=0.0),
+        )
         runtime = Runtime.open('local', config=config)
         try:
             pid = runtime.process.spawn(
@@ -4965,7 +4967,12 @@ class TestLLMContextMemory:
                     {'action': 'compact_process_context', 'force': True},
                     {'action': 'process_exit', 'payload': summary},
                 ])
-                results = runtime.run_until_idle(max_quanta=3)
+                # Bound new admissions while letting the final compaction
+                # quantum settle, even when the Host has no drain grace period.
+                results = runtime.run_until_idle(
+                    max_quanta=3,
+                    cancel_inflight_on_budget_exhaustion=False,
+                )
                 completed = _last_action_result(results, 'compact_process_context')
                 assert completed['result']['ok'] is True, completed
                 assert len(completed['result']['payload']['compressor_pids']) == 1
