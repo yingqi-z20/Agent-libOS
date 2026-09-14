@@ -533,6 +533,7 @@ PY
 | `memory.working_set_recent_feedback` | `StrictInt` | `8` | — |
 | `memory.working_set_supersede_observations` | `bool` | `true` | — |
 | `memory.working_set_verbatim_feedback_tokens` | `StrictInt` | `48000` | tokens |
+| `memory.working_set_inline_read_payload_chars` | `StrictInt` | `512` | characters |
 
 ## `object_tasks`
 
