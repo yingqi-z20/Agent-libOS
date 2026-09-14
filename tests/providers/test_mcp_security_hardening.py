@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.mcp import manifest as mcp_manifest
 from agent_libos.models import (
     CapabilityRight,
     ExternalEffectClassification,
@@ -610,8 +612,81 @@ def _regex_runtime(
     return Runtime.open("local", config=config)
 
 
-def test_schema_regex_timeout_fails_closed_before_provider_or_effect() -> None:
-    runtime = _regex_runtime(timeout_s=0.001)
+@pytest.mark.parametrize("with_pattern", [False, True])
+def test_schema_regex_budget_excludes_validator_class_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    with_pattern: bool,
+) -> None:
+    clock = [0.0]
+    original_extend = mcp_manifest.extend_jsonschema_validator
+
+    def delayed_extend(*args: Any, **kwargs: Any) -> Any:
+        clock[0] += 0.1
+        return original_extend(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_manifest, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(mcp_manifest, "extend_jsonschema_validator", delayed_extend)
+    text_schema = {"type": "string", "enum": ["ok"]}
+    if with_pattern:
+        text_schema["pattern"] = "^ok$"
+    schema = {"type": "object", "properties": {"text": text_schema}}
+    base_validator = mcp_manifest.jsonschema_validator_for(schema)
+    original_keywords = dict(base_validator.VALIDATORS)
+
+    mcp_manifest.validate_mcp_v3_tool_arguments(schema, {"text": "ok"}, deadline=1.0)
+    with pytest.raises(ValidationError, match="MCP tool arguments failed schema validation"):
+        mcp_manifest.validate_mcp_v3_tool_arguments(schema, {"text": "bad"}, deadline=1.0)
+
+    assert base_validator.VALIDATORS == original_keywords
+
+
+def test_schema_validator_setup_preserves_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _regex_runtime()
+    schema = {"type": "object", "properties": {"text": {"type": "string"}}}
+    provider = _SecurityBoundaryMcpProvider(live_schema=schema)
+    runtime.mcp.provider = provider
+    original_extend = mcp_manifest.extend_jsonschema_validator
+    clock = [mcp_manifest.time.monotonic()]
+
+    def delayed_extend(*args: Any, **kwargs: Any) -> Any:
+        clock[0] += 10.0
+        return original_extend(*args, **kwargs)
+
+    try:
+        server_id = "validator-setup-deadline"
+        manifest = _manifest(server_id, input_schema=schema)
+        manifest.update(schema_version=3, protocol_mode="2026-07-28")
+        runtime.mcp.register_server(
+            manifest,
+            actor="test",
+            require_capability=False,
+        )
+        pid = runtime.process.spawn(image="base-agent:v0", goal="bound validator setup")
+        _grant_call_authority(runtime, pid, server_id, list_tools=True)
+        before_audit = runtime.audit.trace(actor=pid)
+        before_events = runtime.store.list_events()
+        monkeypatch.setattr(mcp_manifest, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        monkeypatch.setattr(mcp_manifest, "extend_jsonschema_validator", delayed_extend)
+
+        with pytest.raises(ValidationError, match="MCP tool argument validation deadline expired"):
+            runtime.mcp.call_tool(pid, server_id, "echo", {"text": "ok"})
+
+        assert provider.list_calls == 0
+        assert provider.call_argument_objects == []
+        assert runtime.store.list_external_effects(pid=pid) == []
+        assert runtime.audit.trace(actor=pid) == before_audit
+        assert runtime.store.list_events() == before_events
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("schema_version", [1, 3])
+def test_schema_regex_timeout_fails_closed_before_provider_or_effect(
+    schema_version: int,
+) -> None:
+    runtime = _regex_runtime()
     schema = {
         "type": "object",
         "properties": {
@@ -627,8 +702,11 @@ def test_schema_regex_timeout_fails_closed_before_provider_or_effect() -> None:
     runtime.mcp.provider = provider
     try:
         server_id = "bounded-regex-timeout"
+        manifest = _manifest(server_id, input_schema=schema)
+        if schema_version == 3:
+            manifest.update(schema_version=3, protocol_mode="2026-07-28")
         runtime.mcp.register_server(
-            _manifest(server_id, input_schema=schema),
+            manifest,
             actor="test",
             require_capability=False,
         )
@@ -636,7 +714,7 @@ def test_schema_regex_timeout_fails_closed_before_provider_or_effect() -> None:
             image="base-agent:v0",
             goal="bound MCP schema regex",
         )
-        _grant_call_authority(runtime, pid, server_id)
+        _grant_call_authority(runtime, pid, server_id, list_tools=schema_version == 3)
 
         with pytest.raises(
             ValidationError,

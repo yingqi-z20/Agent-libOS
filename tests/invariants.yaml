@@ -3740,7 +3740,11 @@
         "tests/providers/test_mcp_security_hardening.py::test_noncanonical_arguments_fail_before_authority_effect_or_provider[dict-subclass]",
         "tests/providers/test_mcp_security_hardening.py::test_reflected_transport_credential_never_reaches_results_or_sqlite",
         "tests/providers/test_mcp_security_hardening.py::test_short_reflected_credential_redaction_preserves_wire_byte_accounting",
-        "tests/providers/test_mcp_security_hardening.py::test_schema_regex_timeout_fails_closed_before_provider_or_effect",
+        "tests/providers/test_mcp_security_hardening.py::test_schema_regex_budget_excludes_validator_class_setup[False]",
+        "tests/providers/test_mcp_security_hardening.py::test_schema_regex_budget_excludes_validator_class_setup[True]",
+        "tests/providers/test_mcp_security_hardening.py::test_schema_validator_setup_preserves_absolute_deadline",
+        "tests/providers/test_mcp_security_hardening.py::test_schema_regex_timeout_fails_closed_before_provider_or_effect[1]",
+        "tests/providers/test_mcp_security_hardening.py::test_schema_regex_timeout_fails_closed_before_provider_or_effect[3]",
         "tests/providers/test_mcp_security_hardening.py::test_schema_pattern_length_and_evaluation_budget_fail_closed",
         "tests/providers/test_mcp_security_hardening.py::test_bounded_schema_regex_preserves_legitimate_pattern_semantics",
         "tests/providers/test_mcp_security_hardening.py::test_bounded_schema_regex_preserves_unevaluated_properties_semantics"

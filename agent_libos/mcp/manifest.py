@@ -1630,13 +1630,16 @@ def validate_mcp_v3_tool_arguments(
     _validate_tool_argument_deadline(deadline)
     if not schema:
         return
-    budget = _McpV3SchemaRegexBudget(bounds, deadline=deadline)
     base_validator = jsonschema_validator_for(schema)
+    # Extending a validator constructs a class and can trigger cyclic GC.
+    # Keep that setup outside the regex budget, but inside the call deadline.
+    bounded_validator_type = extend_jsonschema_validator(base_validator)
+    _validate_tool_argument_deadline(deadline)
+    budget = _McpV3SchemaRegexBudget(bounds, deadline=deadline)
     keywords = _McpV3ArgumentValidatorKeywords(budget)
-    bounded_validator = extend_jsonschema_validator(
-        base_validator,
-        validators=keywords.mapping(base_validator),
-    )(schema)
+    # extend() gives this per-call class its own validator mapping.
+    bounded_validator_type.VALIDATORS.update(keywords.mapping(base_validator))
+    bounded_validator = bounded_validator_type(schema)
     try:
         bounded_validator.validate(arguments)
         budget.remaining()

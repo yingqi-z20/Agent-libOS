@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+from itertools import count
+from types import SimpleNamespace
 
 import pytest
 
+from agent_libos.mcp import manifest as mcp_manifest
 from agent_libos.mcp.manifest import (
     MCP_TASKS_EXTENSION_ID,
     McpManifestV3HostPolicy,
@@ -510,7 +513,9 @@ def test_json_schema_accepts_bounded_acyclic_local_references() -> None:
     parse_mcp_v3_manifest_mapping(mapping)
 
 
-def test_schema_policy_bounds_composition_regex_budget_and_deadline() -> None:
+def test_schema_policy_bounds_composition_regex_budget_and_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     mapping = _stdio_manifest()
     mapping["tools"][0]["input_schema"] = {  # type: ignore[index]
         "type": "object",
@@ -541,11 +546,15 @@ def test_schema_policy_bounds_composition_regex_budget_and_deadline() -> None:
             enforce_host_policy=True,
         )
 
+    clock = count()
+    monkeypatch.setattr(
+        mcp_manifest, "time", SimpleNamespace(monotonic=lambda: float(next(clock)))
+    )
     with pytest.raises(ValidationError, match="timed out"):
         parse_mcp_v3_manifest_mapping(
             mapping,
             host_policy=McpManifestV3HostPolicy(
-                schema_regex_match_timeout_s=1e-12
+                schema_regex_match_timeout_s=0.01
             ),
             enforce_host_policy=True,
         )

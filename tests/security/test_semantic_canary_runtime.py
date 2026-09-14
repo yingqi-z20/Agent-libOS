@@ -64,7 +64,7 @@ _TENANT = "tenant-canary-security"
 _PROFILE_ID = "semantic-canary-security"
 _MODEL = "semantic-canary-model"
 _RULE_ID = "canary-reports-read"
-_REAL_GIT_ASSESSMENT_TIMEOUT_S = 180.0
+_STRUCTURAL_ASSESSMENT_TIMEOUT_S = 180.0
 
 
 class _SuccessfulSemanticClient:
@@ -392,8 +392,8 @@ def _real_git_canary_config(rule: SemanticApprovalRule) -> AgentLibOSConfig:
         config,
         semantic=replace(
             config.semantic,
-            assessment_timeout_s=_REAL_GIT_ASSESSMENT_TIMEOUT_S,
-            job_lease_s=_REAL_GIT_ASSESSMENT_TIMEOUT_S,
+            assessment_timeout_s=_STRUCTURAL_ASSESSMENT_TIMEOUT_S,
+            job_lease_s=_STRUCTURAL_ASSESSMENT_TIMEOUT_S,
         ),
     )
 
@@ -654,7 +654,9 @@ def _issue_exact_canary_capability(
     pending = runtime.human.get(request_id)
     context = dict(pending.payload["context"])
     _drain_semantic(runtime)
-    assert runtime.human.get(request_id).status is HumanRequestStatus.APPROVED
+    assert runtime.human.get(request_id).status is HumanRequestStatus.APPROVED, (
+        runtime.semantic.status()
+    )
     settlements = runtime.uow.semantic.query_semantic_machine_settlements(
         after=None,
         limit=20,
@@ -2305,9 +2307,20 @@ def test_real_capability_manager_structural_violation_trip_matrix(
     target = workspace / "reports" / f"{suffix}.txt"
     target.parent.mkdir(parents=True)
     target.write_text("manager structural trip input\n", encoding="utf-8")
+    config = _canary_config()
+    # Loaded Windows workers can delay the setup grant beyond 30 seconds.
+    # This matrix checks binding violations after a successful grant.
+    config = replace(
+        config,
+        semantic=replace(
+            config.semantic,
+            assessment_timeout_s=_STRUCTURAL_ASSESSMENT_TIMEOUT_S,
+            job_lease_s=_STRUCTURAL_ASSESSMENT_TIMEOUT_S,
+        ),
+    )
     runtime = Runtime.open(
         tmp_path / f"{violation}.sqlite",
-        config=_canary_config(),
+        config=config,
         substrate=LocalResourceProviderSubstrate(workspace),
         semantic_tenant_bucketer=_tenant_bucket,
     )
